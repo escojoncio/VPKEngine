@@ -217,6 +217,11 @@ public:
     // Residency: images unused for `idleSubmits` submits, or the least recently used ones past
     // `byteBudget` of GPU memory, are written back (when they own newer bytes) and destroyed.
     void setResidency(uint64_t idleSubmits, uint64_t byteBudget);
+    // Host memory the renderer may hold: dedicated staging (decoded block-compressed textures, big uploads; default 512 MiB,
+    // 128 MiB on a host without BC), the geometry pipeline's scratch (default 768 MiB), and, on a host without BC, the bytes
+    // of block-compressed textures decoded per frame (one submit; default 64 MiB; the first decode of a frame is always
+    // admitted). A texture past a limit is not filled and tried again later; its draw is left out meanwhile.
+    void setMemoryLimits(uint64_t stagingBytes, uint64_t geometryScratchBytes, uint64_t bcDecodedBytesPerFrame);
     const MemoryTracker& tracker() const;
     // Whether work recorded since the last gpuIdle() may read or write guest [address, +size).
     // Ranges of submitted frames retire as the GPU finishes them (Device::completedFrames).

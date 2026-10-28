@@ -2305,33 +2305,66 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         s.fillPath = 2, s.fillWhy = "";
         return true;
     }
+    // Block-compressed textures on a host without BC: the decoded bytes (the memory they take, and the CPU time when the CPU
+    // decodes) admitted per frame (r.frame_, one submit). A texture past it stays unfilled and its draw is left out, until
+    // a later frame; the first decode of a frame is always admitted, so a texture bigger than the budget still gets through.
+    uint64_t bcFrameBytes = 64ull << 20, bcSpent = 0, bcSpentFrame = ~uint64_t(0);
+    bool bcAdmits(uint64_t bytes) {
+        if (bcSpentFrame != r.frame_) bcSpentFrame = r.frame_, bcSpent = 0;
+        return !bcSpent || bcSpent + bytes <= bcFrameBytes;
+    }
+    // A fill that stays undone for a reason that passes: the image is not filled, tried again at its next use, and
+    // textureRef leaves the draw out (the reason is the skip's).
+    const char* fillDeferred = nullptr;
+    bool deferFill(Surface& s, const char* why) {
+        s.fillPath = 4, s.fillWhy = why, fillDeferred = why;
+        return fillRetry = true, false;
+    }
     // A block-compressed texture on a host without BC. First choice: the BC kernel of the GPU tiler reads the blocks from
     // guest memory (detiling as it goes) and decodes them on the GPU, only the levels whose memory changed since they were
-    // last decoded. While that kernel is still compiling (or refuses): every level is read from guest memory (detiled on
-    // the CPU when tiled), decoded on the CPU to the host format and copied in as plain texels, at the texel size of each
-    // level.
+    // last decoded. While that kernel is still compiling the texture waits for it (the draw is left out: decoding on the
+    // render thread would hold the frame for seconds). When it refuses (or cannot compile): every level is read from guest
+    // memory (detiled on the CPU when tiled), decoded on the CPU to the host format and copied in as plain texels, at the
+    // texel size of each level. Either way within the frame's budget of decoded bytes (bcAdmits), all of the levels or none.
     bool fillSoftBlock(Surface& s, const SurfaceLayout& lay) {
         bc::Kind kind{};
         bc::kindOf(s.softBc, kind);  // (the plan sets softBc for the data formats 35..41 only)
         const uint32_t levelCount = uint32_t(lay.levels.size());
         const uint32_t allLevels = levelCount >= 32 ? ~0u : (1u << levelCount) - 1;
+        const bool volume = s.type == vpgpu::TextureType::Tex3D;
+        const uint32_t texel = bc::texelBytes(kind);
+        // (the texels of a level as the host holds them)
+        auto texels = [&](uint32_t li, uint32_t& w, uint32_t& h, uint32_t& slices) {
+            w = std::max(s.width >> li, 1u), h = std::max(s.height >> li, 1u);
+            slices = volume ? std::max(s.depth >> li, 1u) : s.layers;
+        };
         if (gpuTiling) {
             BufferId gb;
             uint64_t at = 0, available = 0;
             if (guestBuffer(s.address, lay.bytes, gb, at, available) && available >= lay.bytes && at % 4 == 0) {
                 bool recorded = false, refused = false;
-                closePass();
-                for (uint32_t li = 0; li < levelCount && !refused; ++li) {
+                uint32_t todo = 0;  // (the levels whose memory changed since they were last decoded)
+                uint64_t need = 0;
+                for (uint32_t li = 0; li < levelCount; ++li) {
                     const LevelLayout& l = lay.levels[li];
                     if ((s.bcLevels >> li & 1u) && !tracker.writtenByOthers(s.address + l.offset, l.bytes, s.wid, s.version)) continue;
+                    uint32_t w, h, n;
+                    texels(li, w, h, n);
+                    todo |= 1u << li, need += uint64_t(w) * h * n * texel;
+                }
+                if (need && !bcAdmits(need)) return deferFill(s, "bc decode budget");
+                closePass();
+                for (uint32_t li = 0; li < levelCount && !refused; ++li) {
+                    if (!(todo >> li & 1u)) continue;
                     Subresource sub;
                     sub.firstLevel = li;
                     sub.levelCount = 1;
                     sub.sliceCount = s.type == vpgpu::TextureType::Tex3D ? 0 : s.layers;
                     const GpuTiler::Result res = tiler().decodeBc(frame, {gb, at, available}, s.id, lay, sub, {uint32_t(kind), s.softSigned});
+                    if (res == GpuTiler::Result::NotReady) return deferFill(s, "bc kernel compiling");
                     if (res != GpuTiler::Result::Recorded) {
                         refused = true;
-                        if (res == GpuTiler::Result::Unsupported) note("GPU block decode refused the request: decoded on the CPU");
+                        note("GPU block decode refused the request: decoded on the CPU");
                         break;
                     }
                     s.bcLevels |= 1u << li;
@@ -2341,6 +2374,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
                 }
                 if (!refused) {
                     if (recorded) ++r.stats_.detiled;
+                    bcSpent += need;
                     s.fillPath = 1, s.fillWhy = "";
                     return true;
                 }
@@ -2351,8 +2385,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
             }
         }
         s.bcLevels = 0;
-        const uint32_t texel = bc::texelBytes(kind), blockBytes = vpgpu::formatInfo(s.layout).bytesPerBlock;
-        const bool volume = s.type == vpgpu::TextureType::Tex3D;
+        const uint32_t blockBytes = vpgpu::formatInfo(s.layout).bytesPerBlock;
         const uint32_t layers = volume ? 1 : s.layers;
         const uint32_t levels = uint32_t(lay.levels.size());
         const bool linear = linearTiling(s.tile);
@@ -2363,16 +2396,13 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
             return note(linear ? "linear texture outside guest memory: left unfilled" : "tiled texture outside guest memory: left unfilled"), false;
         }
         const uint8_t* src = static_cast<const uint8_t*>(g.host) + (s.address - g.base);
-        auto texels = [&](uint32_t li, uint32_t& w, uint32_t& h, uint32_t& slices) {
-            w = std::max(s.width >> li, 1u), h = std::max(s.height >> li, 1u);
-            slices = volume ? std::max(s.depth >> li, 1u) : layers;
-        };
         uint64_t total = 0;
         for (uint32_t li = 0; li < levels; ++li) {
             uint32_t w, h, n;
             texels(li, w, h, n);
             total += uint64_t(w) * h * n * texel;
         }
+        if (!bcAdmits(total)) return deferFill(s, "bc decode budget");
         BufferId buffer;
         uint64_t offset = 0;
         uint8_t* dst = staging(total, buffer, offset);
@@ -2413,6 +2443,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
             at += uint64_t(w) * h * n * texel;
         }
         s.bcLevels = allLevels;
+        bcSpent += total;
         ++r.stats_.detiled;
         s.fillPath = linear ? 3 : 2, s.fillWhy = "";
         return true;
@@ -2510,7 +2541,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         s.version = tracker.current();
         s.filled = true;  // (a layout that cannot be filled is noted once, not retried every use)
         if (!ok) return;
-        //MUT
+        ++s.writeSeq;  // (the fill wrote the image: a copy of it, see mirrorTarget, is out of date)
         if (s.isDepth) {  // (the fill moves Z only: it makes that plane the image's own, and a failed one leaves it behind memory)
             if (s.format != vpgpu::Format::S8Uint) s.zAuthoritative = true;
             else s.stencilAuthoritative = true;
@@ -3553,7 +3584,9 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
             ++texGen;
         }
         tex.lastUse = r.frame_;
+        fillDeferred = nullptr;
         refresh(tex, &tex);
+        if (fillDeferred) return texWhy = fillDeferred, TexRef{};
         if (probeOpen())
             probeSampled(desc, tex, tex.filled && tracker.writerAt(tex.address) == tex.wid ? "texture written by the GPU" : "texture from memory", storage);
         if (write) markWrite(tex);
@@ -3683,13 +3716,14 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         void* memory;
         BufferId id;
         uint64_t after;
-        uint64_t size = 0;  // dedicated buffers only (counted against kStagingLimit)
+        uint64_t size = 0;  // dedicated buffers only (counted against stagingLimit)
     };
     std::vector<Staging> stagings;
     // Dedicated staging (a copy source larger than half the ring: decoded block-compressed textures, big uploads) is kept
     // until the GPU is done with the frame; past this much alive a request is refused (the image stays unfilled and is
-    // tried again at its next use, when earlier frames released theirs).
-    static constexpr uint64_t kStagingLimit = 512ull << 20;
+    // tried again at its next use, when earlier frames released theirs). A host without BC decodes every block-compressed
+    // texture into it (up to 8x the guest bytes): less of it (Renderer::setMemoryLimits).
+    uint64_t stagingLimit = 512ull << 20;
     uint8_t* staging(uint64_t bytes, BufferId& id, uint64_t& offset) {
         Ring& ring = rings[ringIndex];
         if (bytes <= ring.cap / 2) {
@@ -3705,7 +3739,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         const uint64_t size = (bytes + kPage - 1) / kPage * kPage;
         uint64_t live = 0;
         for (const Staging& x : stagings) live += x.size;
-        if (live + size > kStagingLimit) {
+        if (live + size > stagingLimit) {
             note("staging memory limit reached: copy source refused");
             return nullptr;
         }
@@ -3755,7 +3789,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
     std::array<uint64_t, kFrames> scratchDone{};  // slot -> 1 + the device frame its slabs were last used by (0: none)
     uint64_t scratchBytes = 0;
     static constexpr uint64_t kScratchSlab = 32ull << 20;
-    static constexpr uint64_t kScratchLimit = 768ull << 20;
+    uint64_t scratchLimit = 768ull << 20;  // (Renderer::setMemoryLimits)
     bool scratch(uint64_t bytes, RingBinding& out) {
         bytes = std::max<uint64_t>((bytes + 255) / 256 * 256, 256);
         std::vector<ScratchSlab>& slabs = scratchSlots[ringIndex];
@@ -3766,8 +3800,8 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
                 return true;
             }
         const uint64_t size = bytes > kScratchSlab ? (bytes + kPage - 1) / kPage * kPage : kScratchSlab;
-        if (scratchBytes + size > kScratchLimit) reclaimScratch();
-        if (scratchBytes + size > kScratchLimit) return false;
+        if (scratchBytes + size > scratchLimit) reclaimScratch();
+        if (scratchBytes + size > scratchLimit) return false;
         void* memory = std::aligned_alloc(kPage, size);
         if (!memory) return false;
         const BufferId id = r.device_.createBuffer({size, memory, "vpps4 geometry scratch"});
@@ -5521,7 +5555,10 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
 
 Renderer::Renderer(vpgpu::Device& device, Hooks hooks)
     : device_(device), hooks_(std::move(hooks)), impl_(std::make_unique<Impl>(*this)) {
-    if (!formatCaps().bc) impl_->tiler().prefetchBc();  // (block-compressed textures are decoded by that kernel)
+    if (!formatCaps().bc) {
+        impl_->stagingLimit = 128ull << 20;  // (every block-compressed texture is decoded into it)
+        impl_->tiler().prefetchBc();         // (block-compressed textures are decoded by that kernel)
+    }
 }
 
 Renderer::~Renderer() {
@@ -5611,6 +5648,11 @@ void Renderer::coherencePoint(uint64_t address, uint64_t size) { impl_->coherenc
 void Renderer::noteGpuWrite(uint64_t address, uint64_t size) {
     impl_->syncOwners(address, size, true);
     impl_->tracker.markGpuWrite(address, size, MemoryTracker::kGpuRaw);
+}
+void Renderer::setMemoryLimits(uint64_t stagingBytes, uint64_t geometryScratchBytes, uint64_t bcDecodedBytesPerFrame) {
+    impl_->stagingLimit = stagingBytes;
+    impl_->scratchLimit = geometryScratchBytes;
+    impl_->bcFrameBytes = bcDecodedBytesPerFrame;
 }
 void Renderer::setResidency(uint64_t idleSubmits, uint64_t byteBudget) {
     impl_->idleSubmits = idleSubmits;

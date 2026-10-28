@@ -2726,6 +2726,26 @@ void seedThenColorClear() {
     CHECK(cleared);
 }
 
+// A texture holding the host's seed is not looked at in memory (its source is not what it holds): a later use without a
+// seed does not take the difference for a CPU write and fill it from memory.
+void seededTextureNotChecked() {
+    Fixture f;
+    std::vector<uint8_t> pixels;
+    f.seed = [&](const vpps4::SeedRequest& q, vpps4::SeedImage& img) {
+        if (q.kind != vpps4::SeedRequest::Kind::Texture) return false;
+        pixels.assign(size_t(q.width) * q.height * vpgpu::formatInfo(q.format).bytesPerBlock, 0x7f);
+        img.data = pixels.data();
+        return true;
+    };
+    f.renderer.draw(f.state());
+    f.renderer.submit();
+    CHECK(f.renderer.stats().seeded == 1 && f.renderer.stats().refilled == 0);
+    f.seed = nullptr;
+    *f.at(kBase + 0x10000) ^= 0xff;  // (the memory differs from what the texture holds)
+    f.renderer.draw(f.state());
+    CHECK(f.renderer.stats().drawn == 2 && f.renderer.stats().refilled == 0);
+}
+
 // The guest buffers (no-copy wraps of the host's windows) are given up on request, destroyed, and made afresh by the next use.
 void dropGuestBuffers() {
     Fixture f;
@@ -2760,6 +2780,7 @@ int main(int argc, char** argv) {
     else if (t == "seed_then_clear") seedThenClear();
     else if (t == "seed_depth_stencil") seedDepthStencil();
     else if (t == "seed_then_color_clear") seedThenColorClear();
+    else if (t == "seeded_texture_not_checked") seededTextureNotChecked();
     else if (t == "drop_guest_buffers") dropGuestBuffers();
     else if (t == "resolved_cleared") resolvedCleared();
     else if (t == "program_rewritten_in_place") programRewrittenInPlace();

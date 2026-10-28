@@ -2,6 +2,8 @@
 // buffer, storage image, raw buffer or by DMA, and read as any of them. Frames are captured so the
 // ORDER of dispatches, draws and copies on the GPU timeline can be asserted.
 // Usage: vpps4_coherence_tests TEST
+#include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -10,6 +12,7 @@
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <vector>
 
 #include "vpgpu/core/device.h"
@@ -68,8 +71,10 @@ public:
     void destroySampler(vpgpu::SamplerId i) override { inner.destroySampler(i); }
     uint64_t bufferAddress(vpgpu::BufferId i) const override { return inner.bufferAddress(i); }
     static inline bool refuseBcKernel = false;  // the block decoding kernel does not compile (the CPU decoder takes over)
+    static inline std::atomic<bool> holdBcKernel{false};  // ... is still compiling (on a compile worker, see Fixture::workers)
     bool compilePipeline(const vpgpu::PipelineState& s, std::string& e) override {
         if (refuseBcKernel && s.label == "bcdecode") return e = "refused", false;
+        while (holdBcKernel && s.label == "bcdecode") std::this_thread::sleep_for(std::chrono::milliseconds(1));
         return inner.compilePipeline(s, e);
     }
     void destroyPipeline(vpgpu::PipelineKey k) override { inner.destroyPipeline(k); }
@@ -91,10 +96,12 @@ constexpr uint64_t kImg = kBase + 0x20000;    // storage image 64x64 RGBA8
 constexpr uint64_t kDepth = kBase + 0x60000;  // 128x128 D32, 64 KiB
 
 struct Fixture {
-    void* host = std::aligned_alloc(16384, kSize);
+    static inline uint64_t memSize = kSize;   // guest memory (a test of a big texture makes more)
+    static inline unsigned workers = 0;       // pipeline compile workers (0: compiled inside the request)
+    void* host = std::aligned_alloc(16384, memSize);
     Recording backend;
     std::vector<std::string> log;
-    vpgpu::Device device{backend, 0, [this](const std::string& s) { log.push_back(s); }};
+    vpgpu::Device device{backend, workers, [this](const std::string& s) { log.push_back(s); }};
     bool mirrored = false;
     std::vector<std::pair<uint64_t, uint64_t>> watchedWrites, ownedOn, ownedOff;
     std::vector<vpps4::ViewRequest> viewRequests;
@@ -102,7 +109,7 @@ struct Fixture {
     Program vs = load("vs_fetch"), ps = load("ps_textured"), store = load("cs_partial_store"), atomic = load("cs_image_atomic");
 
     explicit Fixture(bool mirror = false, bool views = false) : mirrored(mirror) {
-        std::memset(host, 0, kSize);
+        std::memset(host, 0, memSize);
         (void)views;
     }
     ~Fixture() { std::free(host); }
@@ -111,8 +118,8 @@ struct Fixture {
     vpps4::Hooks hooks() {
         vpps4::Hooks h;
         h.region = [this](uint64_t a, uint64_t s, vpps4::GuestRegion& g) {
-            if (a < kBase || a + s > kBase + kSize) return false;
-            g = {kBase, kSize, host, mirrored};
+            if (a < kBase || a + s > kBase + memSize) return false;
+            g = {kBase, memSize, host, mirrored};
             return true;
         };
         h.shader = [](uint64_t, vpir::Stage, const vpmsl::MslShader&) {};
@@ -364,6 +371,26 @@ void colorMirrorRefill() {
     if (failures) f.dump();
 }
 
+// An image ahead of memory that cannot be written back (the guest memory is read only here) leaves the texture over its range
+// unfilled, not marked as filled with stale bytes: once the write back can be done, the next use does it and fills.
+void syncRefusedFill() {
+    Fixture f;
+    f.renderer.setGuestReadOnly(true);
+    f.renderer.draw(f.state());
+    f.sample(kRt, 128, 128, 3, 0, 8);  // 8_8: another texel size, through memory
+    auto image = [&] { return vpps4::decodeImage(std::span<const uint32_t>(f.at(kBase + 0x200), 8)); };
+    CHECK(f.renderer.textureFor(image()));
+    CHECK(f.renderer.stats().notes.count("image newer than memory cannot be written back (layout not covered): raw readers see stale bytes") == 1);
+    auto e = f.events();
+    CHECK(Fixture::indexOf(e, "copy retile " + Fixture::hex(kRt)) < 0 && Fixture::indexOf(e, "copy upload " + Fixture::hex(kRt)) < 0);
+    f.renderer.setGuestReadOnly(false);
+    CHECK(f.renderer.textureFor(image()));
+    e = f.events();
+    const long retile = Fixture::indexOf(e, "copy retile " + Fixture::hex(kRt));
+    CHECK(retile >= 0 && Fixture::indexOf(e, "copy upload " + Fixture::hex(kRt)) > retile);
+    if (failures) f.dump();
+}
+
 // A depth target sampled through a smaller T#: the copy of its corner is made again after every write of the target, a draw
 // or a clear.
 void depthMirror() {
@@ -572,6 +599,114 @@ void softBcGpu() {
         CHECK(countLabel(f, m0, true) == 0 && countLabel(f, "decode " + Fixture::hex(kTex), false) == 1);
         if (failures) f.dump();
     }
+    vpps4::setFormatCaps({true});
+}
+
+// Block-compressed textures on a host without BC are decoded within a budget per frame: a texture past it stays unfilled, its
+// draw is left out (it says why) and it is decoded at a later frame; the first decode of a frame is always admitted. Through
+// the GPU kernel, and through the CPU decoder (GPU tiling off, or the kernel not compiling).
+void softBcBudget() {
+    vpps4::setFormatCaps({false});
+    const uint64_t second = kBase + 0x30000;
+    const uint8_t blue[8] = {0x1F, 0x00, 0x1F, 0x00, 0, 0, 0, 0};
+    for (int mode = 0; mode < 3; ++mode) {  // GPU kernel, GPU tiling off, kernel refused
+        Recording::refuseBcKernel = mode == 2;
+        Fixture f(true);
+        if (mode == 1) f.renderer.setGpuTiling(false);
+        vpps4::DrawState d = f.state();
+        std::memcpy(f.at(kTex), blue, 8), std::memcpy(f.at(second), blue, 8);
+        f.renderer.setMemoryLimits(512ull << 20, 768ull << 20, 100);  // (a 6x5 texture with 3 levels decodes 148 bytes)
+        auto drawAt = [&](uint64_t address) {
+            f.sample(address, 6, 5, 35, 0, 8);
+            f.at(kBase + 0x200)[3] |= 2u << 16;  // last level 2
+            f.renderer.draw(d);
+        };
+        auto skipped = [&] {
+            const auto& m = f.renderer.stats().skipped;
+            return m.count("ps: texture unavailable: bc decode budget") ? m.at("ps: texture unavailable: bc decode budget") : 0;
+        };
+        auto decodes = [&] {  // (submits: a new frame)
+            const auto e = f.events();
+            unsigned n = unsigned(Fixture::count(e, "copy gpu bcdecode mip 0"));  // (the level 0 of each texture)
+            for (const std::string& x : e) n += x == "copy decode " + Fixture::hex(kTex) || x == "copy decode " + Fixture::hex(second);
+            return n;
+        };
+        drawAt(kTex);  // (the first decode of the frame: admitted, though over the budget)
+        CHECK(f.renderer.stats().drawn == 1 && skipped() == 0);
+        drawAt(second);  // the same frame: over the budget
+        CHECK(f.renderer.stats().drawn == 1 && skipped() == 1);
+        drawAt(second);
+        CHECK(f.renderer.stats().drawn == 1 && skipped() == 2);
+        CHECK(decodes() == 1);  // (only the first texture's)
+        drawAt(second);         // the next frame
+        CHECK(f.renderer.stats().drawn == 2 && skipped() == 2);
+        CHECK(decodes() == 2);
+        drawAt(second);  // filled: nothing decoded again
+        CHECK(f.renderer.stats().drawn == 3);
+        CHECK(decodes() == 2);
+        if (failures) f.dump();
+    }
+    Recording::refuseBcKernel = false;
+    vpps4::setFormatCaps({true});
+}
+
+// While the BC kernel is still compiling nothing is decoded on the render thread: the draw is left out and the texture is
+// decoded by the kernel once it is ready.
+void softBcKernelWait() {
+    vpps4::setFormatCaps({false});
+    Recording::holdBcKernel = true;
+    Fixture::workers = 2;  // (one worker waits for the kernel, the other compiles the draw's pipelines)
+    {
+        Fixture f;
+        vpps4::DrawState d = f.state();
+        for (int i = 0; i < 5000 && f.renderer.stats().drawn == 0; ++i) {  // (a plain texture: no kernel)
+            f.renderer.draw(d);
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        CHECK(f.renderer.stats().drawn == 1);
+        const uint8_t blue[8] = {0x1F, 0x00, 0x1F, 0x00, 0, 0, 0, 0};
+        std::memcpy(f.at(kTex), blue, 8);
+        f.sample(kTex, 6, 5, 35, 0, 8);
+        f.at(kBase + 0x200)[3] |= 2u << 16;
+        f.renderer.draw(d);
+        f.renderer.draw(d);
+        const auto& skipped = f.renderer.stats().skipped;
+        CHECK(skipped.count("ps: texture unavailable: bc kernel compiling") && skipped.at("ps: texture unavailable: bc kernel compiling") == 2);
+        CHECK(f.renderer.stats().drawn == 1);
+        CHECK(countLabel(f, "decode " + Fixture::hex(kTex), false) == 0 && countLabel(f, "gpu bcdecode mip 0", false) == 0);
+        Recording::holdBcKernel = false;
+        f.device.pipelines().waitIdle();
+        f.renderer.draw(d);
+        CHECK(f.renderer.stats().drawn == 2);
+        CHECK(countLabel(f, "gpu bcdecode mip 0", true) == 1 && countLabel(f, "decode " + Fixture::hex(kTex), false) == 0);
+        if (failures) f.dump();
+    }
+    Recording::holdBcKernel = false;
+    Fixture::workers = 0;
+    vpps4::setFormatCaps({true});
+}
+
+// A host without BC holds less staging memory (every block-compressed texture is decoded into it): a texture whose decoded
+// texels do not fit is not decoded (noted), and is when the limit is raised.
+void softBcStagingLimit() {
+    vpps4::setFormatCaps({false});
+    Fixture::memSize = 32ull << 20;
+    {
+        Fixture f;
+        f.renderer.setGpuTiling(false);
+        // BC6H 4096x4224 (17.3 MiB of blocks, linear): decoded to 16-bit float RGBA, 138 MiB.
+        const uint64_t big = kBase + 0x100000;
+        vpps4::DrawState d = f.state();
+        f.sample(big, 4096, 4224, 40, 0, 8);
+        f.renderer.draw(d);
+        CHECK(f.renderer.stats().notes.count("staging memory limit reached: copy source refused") == 1);
+        CHECK(countLabel(f, "decode " + Fixture::hex(big), false) == 0);
+        f.renderer.setMemoryLimits(512ull << 20, 768ull << 20, 1ull << 30);
+        f.renderer.draw(d);
+        CHECK(countLabel(f, "decode " + Fixture::hex(big), false) == 1);
+        if (failures) f.dump();
+    }
+    Fixture::memSize = kSize;
     vpps4::setFormatCaps({true});
 }
 
@@ -1301,7 +1436,11 @@ int main(int argc, char** argv) {
     else if (t == "soft_bc_upload") softBcUpload();
     else if (t == "soft_bc_tiled") softBcTiled();
     else if (t == "soft_bc_gpu") softBcGpu();
+    else if (t == "soft_bc_budget") softBcBudget();
+    else if (t == "soft_bc_kernel_wait") softBcKernelWait();
+    else if (t == "soft_bc_staging_limit") softBcStagingLimit();
     else if (t == "color_mirror_refill") colorMirrorRefill();
+    else if (t == "sync_refused_fill") syncRefusedFill();
     else if (t == "depth_mirror") depthMirror();
     else if (t == "msaa_mirror") msaaMirror();
     else if (t == "channel_order") channelOrder();
