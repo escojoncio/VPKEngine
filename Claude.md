@@ -81,7 +81,6 @@ reader.md
 - tools: Read, Grep, Glob, Bash
 - model: haiku
 - effort: low
-- maxTurns: 25
 - omitClaudeMd: true
 - body: Read-only. Use Bash only for reading: tail, head, wc, git log, git blame, git diff. Do not edit, commit or run builds. Return, in 12 lines max: file:line references, the likely cause, and what you could not confirm. Do not paste whole files.
 
@@ -91,7 +90,6 @@ coder.md
 - tools: Read, Edit, Write, Grep, Glob, Bash
 - model: sonnet
 - effort: high
-- maxTurns: 70
 - body: You are the Coder, not the Director. Ignore the Logbook, Roles and Workflow sections of CLAUDE.md. Do not read or edit bitacora.md, do not delegate, and do not commit or push. Follow the Code rules section. Implement exactly the blueprint. Read only the files it names. For a bugfix, write a failing test first, then make it pass, and run only the affected tests. Report: changed files, tests run with result, and any doubt. Do not claim the work is verified.
 
 Explore.md
