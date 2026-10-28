@@ -1,0 +1,3 @@
+attempt 1: exit=1 why=exit done=1 open=None remaining=9
+attempt 2: exit=1 why=exit done=9 open=None remaining=0
+{"Fail": 8, "Other": 1, "Pass": 1}
