@@ -1450,6 +1450,245 @@ struct MetalBackend::Impl {
   uint64_t nativeValue = 0, nativeSubmits = 0;
 };
 
+// EXPERIMENT (temporary): VPVK_SGFRAGTEST=1 renders the hanging CTS fragment shader (vote.graphics.subgroupallequal_bvec2) with
+// variants (VAR) and logs SGFRAG lines.
+static void sgFragTest(id<MTLDevice> dev, id<MTLCommandQueue> q, const std::function<void(const std::string&)>& say) {
+  @autoreleasepool {
+    static const char* kVs = R"MSL(#include <metal_stdlib>
+using namespace metal;
+#ifndef VP_PSZ
+#define VP_PSZ point_size
+#endif
+
+struct VpOut {
+    float vp_clip [[clip_distance]] [1];
+    float4 position [[position]];
+    float point_size [[VP_PSZ]];
+};
+
+vertex VpOut vp_main(uint in_vertex_id [[vertex_id]]) {
+    VpOut vp_out;
+    float vp_p0_0{};
+    float vp_p1_0{};
+    float4 l0{};
+    float l1{};
+    float l2{};
+    uint l3{};
+    l0 = float4(0.0f);
+    l1 = 0.0f;
+    l2 = 0.0f;
+    l3 = 0u;
+    vp_p0_0 = 0.00195313f;
+    const float v7 = vp_p0_0;
+    const float v9 = v7 / 2.0f;
+    const float v11 = v9 - 1.0f;
+    vp_p1_0 = v11;
+    const int v14 = as_type<int>(in_vertex_id);
+    const float v15 = float(v14);
+    const float v17 = vp_p0_0;
+    const float v18 = v15 * v17;
+    const float v20 = vp_p1_0;
+    const float v21 = v18 + v20;
+    const float4 v25 = float4(v21, 0.0f, 0.0f, 1.0f);
+    l0 = v25;
+    l1 = 1.0f;
+    const float4 v27 = l0;
+    const float v29 = -v27.y;
+    float4 v30 = v27;
+    v30.y = v29;
+    vp_out.position = v30;
+    const float v31 = l1;
+    vp_out.point_size = v31;
+    const float v32 = l2;
+    vp_out.vp_clip[0] = v32;
+    return vp_out;
+}
+)MSL";
+    static const char* kFs = R"MSL(#include <metal_stdlib>
+using namespace metal;
+#if VAR==2 || VAR==6
+#define BFV(X) (X)
+#elif VAR==1
+#define BFV(X) uint2(simd_broadcast_first((X).x), simd_broadcast_first((X).y))
+#else
+#define BFV(X) simd_broadcast_first(X)
+#endif
+#if VAR==3 || VAR==6
+#define ALLF(X) (X)
+#else
+#define ALLF(X) simd_all(X)
+#endif
+#ifndef VP_PSZ
+#define VP_PSZ point_size
+#endif
+
+struct VpArgs {
+    const device uchar* b0;
+    ulong bs0;
+};
+
+struct VpOut {
+    uint4 color0 [[color(0)]];
+};
+
+fragment VpOut vp_main(constant VpArgs& vp_args [[buffer(0)]],
+        uint in_subgroup_invocation [[thread_index_in_simdgroup]]) {
+    VpOut vp_out;
+    uint2 vp_p0_0{};
+    uint2 vp_p1_0{};
+    uint vp_p2_0{};
+    uint l0{};
+    uint l1{};
+    l0 = 0u;
+    l1 = 0u;
+    const uint v4 = in_subgroup_invocation * 8u;
+    uint2 v5 = uint2(0);
+#if VAR==5
+    v5 = uint2(5u);
+#else
+    if (ulong(v4) + 8ul <= ((vp_args.bs0 + 3ul) & ~3ul)) v5 = uint2(*(const device packed_uint2*)(vp_args.b0 + v4));
+#endif
+    const uint2 v6 = uint2(0u);
+    const bool2 v7 = v5 != v6;
+    const float2 v10 = select(float2(0.0f), float2(1.0f), v7);
+    const float v13 = 1.25f * v10.x;
+    const float v15 = v13 + 5.0f;
+    const bool v17 = v15 != 0.0f;
+    const bool2 v18 = bool2(v17);
+    const uint2 v19 = uint2(1u);
+    const uint2 v21 = select(v6, v19, v18);
+    vp_p0_0 = v21;
+    const uint4 v24 = uint4(simd_or(1u << in_subgroup_invocation), 0u, 0u, 0u);
+    const uint v26 = ctz(v24.x);
+    const bool v28 = in_subgroup_invocation == v26;
+    const bool2 v29 = bool2(v28);
+    const uint2 v32 = select(v6, v19, v29);
+    vp_p1_0 = v32;
+    const uint2 v38 = BFV(v19);
+    const bool2 v40 = v38 != v6;
+    const bool2 v41 = bool2(true) == v40;
+    const bool v44 = v41.x && v41.y;
+    const bool v45 = ALLF(v44);
+    const int v48 = v45 ? 1 : 0;
+    const uint v49 = as_type<uint>(v48);
+    vp_p2_0 = v49;
+    const uint v52 = vp_p2_0;
+    const uint v54 = v52 | 2u;
+    vp_p2_0 = v54;
+    uint2 v57 = uint2(0);
+#if VAR==5
+    v57 = uint2(5u);
+#else
+    if (ulong(0u) + 8ul <= ((vp_args.bs0 + 3ul) & ~3ul)) v57 = uint2(*(const device packed_uint2*)(vp_args.b0));
+#endif
+    const bool2 v59 = v57 != v6;
+    const uint2 v62 = select(v6, v19, v59);
+    const uint2 v63 = BFV(v62);
+    const bool2 v65 = v63 != v6;
+    const bool2 v66 = v59 == v65;
+    const bool v69 = v66.x && v66.y;
+    const bool v70 = ALLF(v69);
+    const int v73 = v70 ? 4 : 0;
+    const uint v74 = as_type<uint>(v73);
+    const uint v76 = vp_p2_0;
+    const uint v77 = v76 | v74;
+    vp_p2_0 = v77;
+    const uint2 v80 = vp_p0_0;
+    const bool2 v82 = v80 != v6;
+    const uint2 v85 = select(v6, v19, v82);
+    const uint2 v86 = BFV(v85);
+    const bool2 v88 = v86 != v6;
+    const bool2 v89 = v82 == v88;
+    const bool v92 = v89.x && v89.y;
+    const bool v93 = ALLF(v92);
+    const int v96 = v93 ? 8 : 0;
+    const uint v97 = as_type<uint>(v96);
+    const uint v99 = vp_p2_0;
+    const uint v100 = v99 | v97;
+    vp_p2_0 = v100;
+    const uint2 v103 = vp_p1_0;
+    const bool2 v105 = v103 != v6;
+    const uint2 v108 = select(v6, v19, v105);
+    const uint2 v109 = BFV(v108);
+    const bool2 v111 = v109 != v6;
+    const bool2 v112 = v105 == v111;
+    const bool v115 = v112.x && v112.y;
+    const bool v116 = ALLF(v115);
+    const int v119 = v116 ? 0 : 16;
+    const uint v120 = as_type<uint>(v119);
+    const uint v122 = vp_p2_0;
+    const uint v123 = v122 | v120;
+    vp_p2_0 = v123;
+    const uint4 v126 = uint4(simd_or(1u << in_subgroup_invocation), 0u, 0u, 0u);
+    const uint v128 = ctz(v126.x);
+    const bool v130 = in_subgroup_invocation == v128;
+#if VAR!=4 && VAR!=6
+    if (v130) {
+        const uint v132 = vp_p2_0;
+        const uint v134 = v132 | 18u;
+        vp_p2_0 = v134;
+    }
+#endif
+    const uint v137 = vp_p2_0;
+    l0 = v137;
+    const uint v138 = l0;
+    vp_out.color0 = uint4(v138, 0u, 0u, 1u);
+    return vp_out;
+}
+)MSL";
+    NSError* e = nil;
+    id<MTLLibrary> vlib = [dev newLibraryWithSource:@(kVs) options:nil error:&e];
+    if (!vlib) { say(std::string("SGFRAG vs_compile_failed ") + (e ? e.localizedDescription.UTF8String : "?")); return; }
+    id<MTLFunction> vf = [vlib newFunctionWithName:@"vp_main"];
+    uint32_t data[2048];
+    for (uint32_t i = 0; i < 2048; ++i) data[i] = (i * 2654435761u) | 1u;
+    id<MTLBuffer> db = [dev newBufferWithBytes:data length:sizeof data options:MTLResourceStorageModeShared];
+    struct Args { uint64_t b0, bs0; } args = {db.gpuAddress, sizeof data};
+    MTLTextureDescriptor* td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatR32Uint width:1024 height:1 mipmapped:NO];
+    td.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+    td.storageMode = MTLStorageModeShared;
+    id<MTLTexture> rt = [dev newTextureWithDescriptor:td];
+    for (int v : {6, 2, 3, 4, 5, 1, 0}) {
+      MTLCompileOptions* co = [MTLCompileOptions new];
+      co.preprocessorMacros = @{@"VAR": @(v)};
+      id<MTLLibrary> flib = [dev newLibraryWithSource:@(kFs) options:co error:&e];
+      if (!flib) { say(std::string("SGFRAG fs_compile_failed ") + (e ? e.localizedDescription.UTF8String : "?")); continue; }
+      id<MTLFunction> ff = [flib newFunctionWithName:@"vp_main"];
+      MTLRenderPipelineDescriptor* pd = [MTLRenderPipelineDescriptor new];
+      pd.vertexFunction = vf;
+      pd.fragmentFunction = ff;
+      pd.colorAttachments[0].pixelFormat = MTLPixelFormatR32Uint;
+      id<MTLRenderPipelineState> ps = [dev newRenderPipelineStateWithDescriptor:pd error:&e];
+      if (!ps) { say(std::string("SGFRAG pso_failed ") + (e ? e.localizedDescription.UTF8String : "?")); continue; }
+      for (uint32_t w : {1u, 7u}) {
+        char b0[96];
+        std::snprintf(b0, sizeof b0, "SGFRAG start var=%d w=%u", v, w);
+        say(b0);
+        MTLRenderPassDescriptor* rp = [MTLRenderPassDescriptor renderPassDescriptor];
+        rp.colorAttachments[0].texture = rt;
+        rp.colorAttachments[0].loadAction = MTLLoadActionClear;
+        rp.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 0);
+        rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+        id<MTLCommandBuffer> cb = [q commandBuffer];
+        id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:rp];
+        [enc setRenderPipelineState:ps];
+        [enc setFragmentBytes:&args length:sizeof args atIndex:0];
+        [enc useResource:db usage:MTLResourceUsageRead stages:MTLRenderStageFragment];
+        [enc drawPrimitives:MTLPrimitiveTypePoint vertexStart:0 vertexCount:w];
+        [enc endEncoding];
+        [cb commit];
+        [cb waitUntilCompleted];
+        uint32_t px[8] = {};
+        [rt getBytes:px bytesPerRow:4096 fromRegion:MTLRegionMake2D(0, 0, 8, 1) mipmapLevel:0];
+        char buf[256];
+        std::snprintf(buf, sizeof buf, "SGFRAG var=%d w=%u status=%d err=%s px=%x %x %x", v, w, int(cb.status),
+                      cb.error ? cb.error.localizedDescription.UTF8String : "none", px[0], px[1], px[2]);
+        say(buf);
+      }
+    }
+  }
+}
+
 void MetalBackend::Impl::init() {
   device = MTLCreateSystemDefaultDevice();
   if (!device) {
@@ -1458,6 +1697,7 @@ void MetalBackend::Impl::init() {
   }
   queue = [device newCommandQueueWithMaxCommandBufferCount:256];  // room for the draw-budget cuts
   queue.label = @"vpgpu";
+  if (const char* st = std::getenv("VPVK_SGFRAGTEST"); st && *st == '1') sgFragTest(device, queue, [this](const std::string& l) { info(l); });  // EXPERIMENT
   caps.simulator = TARGET_OS_SIMULATOR;
   caps.metal3 = [device supportsFamily:MTLGPUFamilyMetal3];
   caps.apple4 = [device supportsFamily:MTLGPUFamilyApple4];
