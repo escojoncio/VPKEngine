@@ -1,0 +1,2 @@
+attempt 1: exit=0 why=exit done=8186 open=None remaining=0
+{"NotSupported": 2239, "Pass": 5947}
