@@ -218,6 +218,7 @@ struct Texture {
     // External OES image (EGLImage / video): sampled from this image.
     VkImageView sampledView();
     uint64_t viewKey() const;
+    bool depthPlain() const;
 };
 
 // A VkBufferView over a range of a buffer's storage (texel buffer descriptor of a samplerBuffer).
@@ -690,7 +691,7 @@ public:
                       bool sub, GLint xo, GLint yo, GLint zo);
     void generateMipmap(GLenum target);
     void copyBufferToImage(Image& img, uint32_t level, uint32_t layer, int32_t x, int32_t y, int32_t z, uint32_t w,
-                           uint32_t h, uint32_t d, const uint8_t* data, size_t bytes);
+                           uint32_t h, uint32_t d, const uint8_t* data, size_t bytes, bool stencilPlane = false);
     // Keeps an upload to a level above 0 until level 0 defines the image (Texture::pending) / uploads the kept ones.
     void queuePending(Texture& t, uint32_t level, uint32_t layer, int32_t x, int32_t y, int32_t z, uint32_t w, uint32_t h,
                       uint32_t d, const uint8_t* data, size_t bytes);

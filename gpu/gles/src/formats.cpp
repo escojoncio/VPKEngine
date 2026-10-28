@@ -149,6 +149,7 @@ std::vector<FormatInfo>& table() {
             FormatInfo f;
             f.vk = vk, f.internal = internal, f.baseFormat = internal, f.texelBytes = bytes, f.componentType = ctype;
             f.swz[0] = r, f.swz[1] = g, f.swz[2] = b, f.swz[3] = a;
+            if (ctype == FLOAT) f.redBits = 16;  // half float (OES_texture_half_float)
             v.push_back(f);
         };
         lum(LUMINANCE, VK_FORMAT_R8_UNORM, 1, VK_COMPONENT_SWIZZLE_R, VK_COMPONENT_SWIZZLE_R, VK_COMPONENT_SWIZZLE_R,
@@ -157,6 +158,13 @@ std::vector<FormatInfo>& table() {
             VK_COMPONENT_SWIZZLE_R, UNORM);
         lum(LUMINANCE_ALPHA, VK_FORMAT_R8G8_UNORM, 2, VK_COMPONENT_SWIZZLE_R, VK_COMPONENT_SWIZZLE_R,
             VK_COMPONENT_SWIZZLE_R, VK_COMPONENT_SWIZZLE_G, UNORM);
+        // The same with HALF_FLOAT_OES data (found by formatFor, after the 8-bit rows of the same internal format).
+        lum(LUMINANCE, VK_FORMAT_R16_SFLOAT, 2, VK_COMPONENT_SWIZZLE_R, VK_COMPONENT_SWIZZLE_R, VK_COMPONENT_SWIZZLE_R,
+            VK_COMPONENT_SWIZZLE_ONE, FLOAT);
+        lum(ALPHA, VK_FORMAT_R16_SFLOAT, 2, VK_COMPONENT_SWIZZLE_ZERO, VK_COMPONENT_SWIZZLE_ZERO, VK_COMPONENT_SWIZZLE_ZERO,
+            VK_COMPONENT_SWIZZLE_R, FLOAT);
+        lum(LUMINANCE_ALPHA, VK_FORMAT_R16G16_SFLOAT, 4, VK_COMPONENT_SWIZZLE_R, VK_COMPONENT_SWIZZLE_R,
+            VK_COMPONENT_SWIZZLE_R, VK_COMPONENT_SWIZZLE_G, FLOAT);
         return v;
     }();
     return t;
@@ -173,7 +181,10 @@ const FormatInfo* bySized(GLenum internal) {
 const FormatInfo* formatFor(GLenum internal, GLenum format, GLenum type) {
     if (const FormatInfo* f = bySized(internal)) {
         if (internal == LUMINANCE || internal == ALPHA || internal == LUMINANCE_ALPHA) {
-            // Float luminance (OES_texture_float / half_float) is not emulated: report unknown.
+            // Half-float luminance / alpha (OES_texture_half_float) is R16F / RG16F with a swizzle; float is not emulated: unknown.
+            if (type == HALF_FLOAT_OES)
+                for (const FormatInfo& x : table())
+                    if (x.internal == internal && x.componentType == FLOAT) return &x;
             if (type != 0 && type != UNSIGNED_BYTE) return nullptr;
         }
         return f;

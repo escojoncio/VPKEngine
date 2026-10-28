@@ -987,6 +987,10 @@ void Context::getUniform(Program& p, GLint location, void* out, Kind kind) {
     else if (t == 0x8B5A) cols = 2, comps = 2;
     else if (t == 0x8B5B) cols = 3, comps = 3;
     else if (t == 0x8B5C) cols = 4, comps = 4;
+    else if (t >= 0x8B65 && t <= 0x8B6A) {
+        static const int kCols[] = {2, 2, 3, 3, 4, 4}, kRows[] = {3, 4, 2, 4, 2, 3};  // mat2x3 mat2x4 mat3x2 mat3x4 mat4x2 mat4x3
+        cols = kCols[t - 0x8B65], comps = kRows[t - 0x8B65];
+    }
     const bool isFloat = t == 0x1406 || (t >= 0x8B50 && t <= 0x8B52) || (t >= 0x8B5A && t <= 0x8B5C) || (t >= 0x8B65 && t <= 0x8B6A);
     const bool isUint = t == 0x1405 || (t >= 0x8DC6 && t <= 0x8DC8);
     const uint8_t* src = p.defaultBlock.data() + u.offset + uint32_t(loc.element) * (u.arrayStride ? u.arrayStride : 16);
@@ -1510,8 +1514,9 @@ void Context::setDynamicState(const FbInfo& fb) {
         s = {{x0, y0}, {uint32_t(std::max(0, x1 - x0)), uint32_t(std::max(0, y1 - y0))}};
     }
     dev->vk.vkCmdSetScissor(c, 0, 1, &s);
-    dev->vk.vkCmdSetStencilReference(c, VK_STENCIL_FACE_FRONT_BIT, uint32_t(stencil[0].ref));
-    dev->vk.vkCmdSetStencilReference(c, VK_STENCIL_FACE_BACK_BIT, uint32_t(stencil[1].ref));
+    // GL clamps the reference to the stencil range (Vulkan keeps the low 8 bits: 256 would compare as 0).
+    dev->vk.vkCmdSetStencilReference(c, VK_STENCIL_FACE_FRONT_BIT, uint32_t(std::clamp(stencil[0].ref, 0, 255)));
+    dev->vk.vkCmdSetStencilReference(c, VK_STENCIL_FACE_BACK_BIT, uint32_t(std::clamp(stencil[1].ref, 0, 255)));
     dev->vk.vkCmdSetStencilCompareMask(c, VK_STENCIL_FACE_FRONT_BIT, stencil[0].mask);
     dev->vk.vkCmdSetStencilCompareMask(c, VK_STENCIL_FACE_BACK_BIT, stencil[1].mask);
     dev->vk.vkCmdSetStencilWriteMask(c, VK_STENCIL_FACE_FRONT_BIT, stencil[0].writeMask);
@@ -2092,7 +2097,41 @@ void Context::drawElements(GLenum mode, GLsizei count, GLenum type, const void* 
     VkPrimitiveTopology topo;
     VkBuffer unused;
     provokeOk_ = true;
-    if (!prepareDraw(mode, topo, 0, 0, uint32_t(instances), true, unused)) return;
+    // Vulkan ignores primitiveRestartEnable on list topologies (and line loops are strips closed by the caller): with restart
+    // on, those modes are split at the restart index here and drawn as a plain list.
+    const bool splitRestart = primitiveRestart && (mode == gl::POINTS || mode == gl::LINES || mode == gl::TRIANGLES || mode == gl::LINE_LOOP);
+    const GLenum dm = splitRestart && mode == gl::LINE_LOOP ? GLenum(gl::LINES) : mode;
+    if (!prepareDraw(dm, topo, 0, 0, uint32_t(instances), true, unused)) return;
+    if (splitRestart) {
+        const size_t per = mode == gl::POINTS ? 1 : mode == gl::TRIANGLES ? 3 : 2;
+        std::vector<uint32_t> list, seg;
+        auto flush = [&]() {
+            if (mode == gl::LINE_LOOP) {
+                if (seg.size() >= 2)
+                    for (size_t i = 0; i < seg.size(); ++i) list.insert(list.end(), {seg[i], seg[(i + 1) % seg.size()]});
+            } else {
+                for (size_t i = 0; i + per <= seg.size(); i += per) list.insert(list.end(), seg.begin() + i, seg.begin() + i + per);
+            }
+            seg.clear();
+        };
+        for (GLsizei i = 0; i < count; ++i) {
+            const uint32_t v = at(i);
+            if (v == restart) flush();
+            else seg.push_back(v);
+        }
+        flush();
+        if (provoke_) {
+            std::vector<uint32_t> rot;
+            provokeList(dm, list, rot);
+            list.swap(rot);
+        }
+        if (list.empty()) return;
+        Alloc s = stream(list.size() * 4, 4);
+        std::memcpy(s.host, list.data(), list.size() * 4);
+        dev->vk.vkCmdBindIndexBuffer(cmd(), s.buffer, s.offset, VK_INDEX_TYPE_UINT32);
+        dev->vk.vkCmdDrawIndexed(cmd(), uint32_t(list.size()), uint32_t(instances), 0, baseVertex, 0);
+        return;
+    }
     if (provoke_) {
         std::vector<uint32_t> verts, list;
         verts.resize(size_t(count));
@@ -2571,6 +2610,27 @@ void Context::readPixels(GLint x, GLint y, GLsizei w, GLsizei h, GLenum format, 
     }
 }
 
+// One axis of a blit rectangle (source s0..s1 onto destination d0..d1, either may run backwards) cut to [0, sSize] and [0, dSize]
+// with the same scale; the cut ends are rounded to pixels. False when nothing is left.
+static bool clipBlitAxis(int32_t& s0, int32_t& s1, int32_t& d0, int32_t& d1, int32_t sSize, int32_t dSize) {
+    const double ds = double(s1) - s0, dd = double(d1) - d0;
+    if (ds == 0 || dd == 0) return false;
+    double lo = 0, hi = 1;  // the position along the destination rectangle: d0 + u * dd
+    auto limit = [&](double a, double span, double size) {
+        double u0 = (0 - a) / span, u1 = (size - a) / span;
+        if (u0 > u1) std::swap(u0, u1);
+        lo = std::max(lo, u0), hi = std::min(hi, u1);
+    };
+    limit(d0, dd, dSize);
+    limit(s0, ds, sSize);
+    if (hi <= lo) return false;
+    const int32_t nd0 = int32_t(std::lround(d0 + lo * dd)), nd1 = int32_t(std::lround(d0 + hi * dd));
+    const int32_t ns0 = int32_t(std::lround(s0 + lo * ds)), ns1 = int32_t(std::lround(s0 + hi * ds));
+    if (nd0 == nd1 || ns0 == ns1) return false;
+    s0 = ns0, s1 = ns1, d0 = nd0, d1 = nd1;
+    return true;
+}
+
 void Context::blitFramebuffer(GLint sx0, GLint sy0, GLint sx1, GLint sy1, GLint dx0, GLint dy0, GLint dx1, GLint dy1,
                               GLbitfield mask, GLenum filter) {
     FbInfo rf = resolveFramebuffer(readFbo, false), df = resolveFramebuffer(drawFbo, true);
@@ -2603,6 +2663,7 @@ void Context::blitFramebuffer(GLint sx0, GLint sy0, GLint sx1, GLint sy1, GLint 
             return setError(gl::INVALID_OPERATION);
     }
     barrier();
+    int32_t blitDst[4] = {0, 0, 0, 0};  // the destination rectangle the last single-sample blit wrote (clipped)
     auto blit = [&](const FbTarget& s, const FbTarget& d, VkImageAspectFlags aspect) {
         if (!s.image || !d.image) return;
         s.image->invalid.clear(), d.image->invalid.clear();
@@ -2660,20 +2721,119 @@ void Context::blitFramebuffer(GLint sx0, GLint sy0, GLint sx1, GLint sy1, GLint 
             dev->vk.vkCmdBlitImage(cmd(), tmp->image, VK_IMAGE_LAYOUT_GENERAL, d.image->image, VK_IMAGE_LAYOUT_GENERAL, 1, &cp, VK_FILTER_NEAREST);
             return;
         }
+        // GL clips both rectangles to their framebuffers keeping the scale (the destination pixels whose source lies outside are
+        // not written); the backend would clamp instead. A destination cut at its far edge only is the backend's (exact) job.
+        int32_t bx0 = sx0, by0 = sy0, bx1 = sx1, by1 = sy1, cx0 = dx0, cy0 = dy0, cx1 = dx1, cy1 = dy1;
+        const int32_t sw = int32_t(std::max(1u, s.image->width >> s.level)), sh = int32_t(std::max(1u, s.image->height >> s.level));
+        const int32_t dw = int32_t(std::max(1u, d.image->width >> d.level)), dh = int32_t(std::max(1u, d.image->height >> d.level));
+        auto outside = [](int32_t a, int32_t b, int32_t size) { return std::min(a, b) < 0 || std::max(a, b) > size; };
+        if (outside(sx0, sx1, sw) || outside(sy0, sy1, sh) || std::min(dx0, dx1) < 0 || std::min(dy0, dy1) < 0)
+            if (!clipBlitAxis(bx0, bx1, cx0, cx1, sw, dw) || !clipBlitAxis(by0, by1, cy0, cy1, sh, dh)) return;
+        blitDst[0] = std::min(cx0, cx1), blitDst[1] = std::min(cy0, cy1), blitDst[2] = std::max(cx0, cx1), blitDst[3] = std::max(cy0, cy1);
+        if (aspect != VK_IMAGE_ASPECT_COLOR_BIT) {
+            const bool packed = s.image->format->depth && s.image->format->stencil;
+            const VkImageAspectFlags other = aspect == VK_IMAGE_ASPECT_DEPTH_BIT ? VK_IMAGE_ASPECT_STENCIL_BIT : VK_IMAGE_ASPECT_DEPTH_BIT;
+            const uint32_t tb = s.image->format->vk == VK_FORMAT_D16_UNORM ? 2 : 4;  // bytes per texel of a depth plane
+            auto plane = [&](VkImageAspectFlags a) { return a == VK_IMAGE_ASPECT_STENCIL_BIT ? 1u : tb; };
+            if ((bx1 - bx0) != (cx1 - cx0) || (by1 - by0) != (cy1 - cy0)) {
+                // Scaled or mirrored depth / stencil: vkCmdBlitImage cannot do it, so one plane goes through the host (nearest).
+                const int32_t ax0 = std::min(bx0, bx1), ax1 = std::max(bx0, bx1), ay0 = std::min(by0, by1), ay1 = std::max(by0, by1);
+                const uint32_t cw = uint32_t(ax1 - ax0), ch = uint32_t(ay1 - ay0), px = plane(aspect);
+                const int32_t ex0 = blitDst[0], ey0 = blitDst[1];
+                const uint32_t ew = uint32_t(blitDst[2] - ex0), eh = uint32_t(blitDst[3] - ey0);
+                Alloc rb = stream(VkDeviceSize(cw) * ch * px, 16);
+                barrier();
+                VkBufferImageCopy rc2{};
+                rc2.bufferOffset = rb.offset;
+                rc2.imageSubresource = {aspect, s.level, s.layer, 1};
+                rc2.imageOffset = {ax0, ay0, 0};
+                rc2.imageExtent = {cw, ch, 1};
+                dev->vk.vkCmdCopyImageToBuffer(cmd(), s.image->image, VK_IMAGE_LAYOUT_GENERAL, rb.buffer, 1, &rc2);
+                const uint8_t* host = rb.host;
+                StorageP keepAlive = chunks_.back().storage;  // the chunk survives the flush
+                flush(true);
+                Alloc wb = stream(VkDeviceSize(ew) * eh * px, 16);
+                for (uint32_t y = 0; y < eh; ++y)
+                    for (uint32_t x = 0; x < ew; ++x) {
+                        const double u = (double(ex0) + x + 0.5 - cx0) / double(cx1 - cx0), v = (double(ey0) + y + 0.5 - cy0) / double(cy1 - cy0);
+                        const int32_t px0 = std::clamp<int32_t>(int32_t(std::floor(bx0 + u * (bx1 - bx0))), ax0, ax1 - 1);
+                        const int32_t py0 = std::clamp<int32_t>(int32_t(std::floor(by0 + v * (by1 - by0))), ay0, ay1 - 1);
+                        std::memcpy(wb.host + (size_t(y) * ew + x) * px, host + (size_t(py0 - ay0) * cw + size_t(px0 - ax0)) * px, px);
+                    }
+                barrier();
+                VkBufferImageCopy wc{};
+                wc.bufferOffset = wb.offset;
+                wc.imageSubresource = {aspect, d.level, d.layer, 1};
+                wc.imageOffset = {ex0, ey0, 0};
+                wc.imageExtent = {ew, eh, 1};
+                dev->vk.vkCmdCopyBufferToImage(cmd(), wb.buffer, d.image->image, VK_IMAGE_LAYOUT_GENERAL, 1, &wc);
+                return;
+            }
+            // One plane of a packed depth/stencil image: the backend's copy moves both, so the other one is saved and put back.
+            if (packed && !((mask & gl::DEPTH_BUFFER_BIT) && (mask & gl::STENCIL_BUFFER_BIT))) {
+                const int32_t ex0 = blitDst[0], ey0 = blitDst[1];
+                const uint32_t ew = uint32_t(blitDst[2] - ex0), eh = uint32_t(blitDst[3] - ey0), px = plane(other);
+                Alloc sv = stream(VkDeviceSize(ew) * eh * px, 16);
+                VkBufferImageCopy sc{};
+                sc.bufferOffset = sv.offset;
+                sc.imageSubresource = {other, d.level, d.layer, 1};
+                sc.imageOffset = {ex0, ey0, 0};
+                sc.imageExtent = {ew, eh, 1};
+                barrier();
+                dev->vk.vkCmdCopyImageToBuffer(cmd(), d.image->image, VK_IMAGE_LAYOUT_GENERAL, sv.buffer, 1, &sc);
+                barrier();
+                VkImageBlit bb{};
+                bb.srcSubresource = {aspect, s.level, s.layer, 1};
+                bb.dstSubresource = {aspect, d.level, d.layer, 1};
+                bb.srcOffsets[0] = {bx0, by0, 0}, bb.srcOffsets[1] = {bx1, by1, 1};
+                bb.dstOffsets[0] = {cx0, cy0, 0}, bb.dstOffsets[1] = {cx1, cy1, 1};
+                dev->vk.vkCmdBlitImage(cmd(), s.image->image, VK_IMAGE_LAYOUT_GENERAL, d.image->image, VK_IMAGE_LAYOUT_GENERAL, 1, &bb,
+                                       VK_FILTER_NEAREST);
+                barrier();
+                dev->vk.vkCmdCopyBufferToImage(cmd(), sv.buffer, d.image->image, VK_IMAGE_LAYOUT_GENERAL, 1, &sc);
+                return;
+            }
+        }
         VkImageBlit b{};
         b.srcSubresource = {aspect, s.level, s.layer, 1};
         b.dstSubresource = {aspect, d.level, d.layer, 1};
-        b.srcOffsets[0] = {sx0, sy0, 0}, b.srcOffsets[1] = {sx1, sy1, 1};
-        b.dstOffsets[0] = {dx0, dy0, 0}, b.dstOffsets[1] = {dx1, dy1, 1};
+        b.srcOffsets[0] = {bx0, by0, 0}, b.srcOffsets[1] = {bx1, by1, 1};
+        b.dstOffsets[0] = {cx0, cy0, 0}, b.dstOffsets[1] = {cx1, cy1, 1};
         dev->vk.vkCmdBlitImage(cmd(), s.image->image, VK_IMAGE_LAYOUT_GENERAL, d.image->image, VK_IMAGE_LAYOUT_GENERAL, 1, &b,
                                filter == gl::LINEAR ? VK_FILTER_LINEAR : VK_FILTER_NEAREST);
     };
+    int32_t alphaRect[4] = {0, 0, 0, 0};
+    uint32_t alphaOne = 0;  // draw buffers that get alpha 1: a source without alpha reads 1
     if (mask & gl::COLOR_BUFFER_BIT)
         for (int i = 0; i < kMaxDrawBuffers; ++i)
-            if (bufs[size_t(i)] != gl::NONE) blit(rc, df.color[size_t(i)], VK_IMAGE_ASPECT_COLOR_BIT);
+            if (bufs[size_t(i)] != gl::NONE) {
+                blitDst[2] = blitDst[0] = 0;
+                blit(rc, df.color[size_t(i)], VK_IMAGE_ASPECT_COLOR_BIT);
+                const FbTarget& dc = df.color[size_t(i)];
+                if (rc.image && dc.image && blitDst[2] > blitDst[0] && !rc.image->format->integer && !dc.image->format->integer &&
+                    rc.image->format->alphaBits == 0 && dc.image->format->alphaBits > 0 && rc.image->samples <= 1) {
+                    alphaOne |= 1u << i;
+                    std::copy(blitDst, blitDst + 4, alphaRect);
+                }
+            }
     if (mask & gl::DEPTH_BUFFER_BIT) blit(rf.depth, df.depth, VK_IMAGE_ASPECT_DEPTH_BIT);
     if (mask & gl::STENCIL_BUFFER_BIT) blit(rf.stencil, df.stencil, VK_IMAGE_ASPECT_STENCIL_BIT);
     barrier();
+    if (alphaOne) {
+        // Alpha 1 over the rectangle, through the clear draw with only the alpha channel writable.
+        ClearDraw cd;
+        const auto savedBlend = blend;
+        for (int i = 0; i < kMaxDrawBuffers; ++i)
+            if (alphaOne >> i & 1) {
+                cd.colorBits |= 1u << i;
+                const float v[4] = {0, 0, 0, 1};
+                std::memcpy(cd.value[size_t(i)].data(), v, 16);
+                blend[size_t(i)].mask[0] = blend[size_t(i)].mask[1] = blend[size_t(i)].mask[2] = false, blend[size_t(i)].mask[3] = true;
+            }
+        VkRect2D rect{{alphaRect[0], alphaRect[1]}, {uint32_t(alphaRect[2] - alphaRect[0]), uint32_t(alphaRect[3] - alphaRect[1])}};
+        clearByDraw(df, rect, cd);
+        blend = savedBlend;
+    }
 }
 
 }  // namespace vpgles

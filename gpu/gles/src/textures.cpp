@@ -164,13 +164,14 @@ bool Context::makeStorage(Texture& t) {
 }
 
 void Context::copyBufferToImage(Image& img, uint32_t level, uint32_t layer, int32_t x, int32_t y, int32_t z,
-                                uint32_t w, uint32_t h, uint32_t d, const uint8_t* data, size_t bytes) {
+                                uint32_t w, uint32_t h, uint32_t d, const uint8_t* data, size_t bytes, bool stencilPlane) {
     Alloc a = stream(bytes, 16);
     std::memcpy(a.host, data, bytes);
     barrier();
     VkBufferImageCopy r{};
     r.bufferOffset = a.offset;
-    r.imageSubresource = {img.aspect() & ~VkImageAspectFlags(img.format->stencil && img.format->depth ? VK_IMAGE_ASPECT_STENCIL_BIT : 0),
+    r.imageSubresource = {stencilPlane ? VkImageAspectFlags(VK_IMAGE_ASPECT_STENCIL_BIT)
+                                       : img.aspect() & ~VkImageAspectFlags(img.format->stencil && img.format->depth ? VK_IMAGE_ASPECT_STENCIL_BIT : 0),
                           level, img.type == VK_IMAGE_TYPE_3D ? 0 : layer, img.type == VK_IMAGE_TYPE_3D ? 1 : d};
     r.imageOffset = {x, y, img.type == VK_IMAGE_TYPE_3D ? z : 0};
     r.imageExtent = {w, h, img.type == VK_IMAGE_TYPE_3D ? d : 1};
@@ -383,7 +384,26 @@ void Context::texImage(GLenum target, GLint level, GLenum internalFormat, GLsize
     }
     if (early)
         queuePending(*t, uint32_t(level), layer, xo, yo, zo, uint32_t(w), uint32_t(h), depthN, converted.data(), converted.size());
-    else
+    else if (fi->depth && fi->stencil && format == gl::DEPTH_STENCIL) {
+        // Packed depth/stencil data: the depth plane (4 bytes per texel) and the stencil plane (1 byte) are two copies.
+        const size_t cnt = size_t(w) * h * depthN;
+        const bool f32 = fi->vk == VK_FORMAT_D32_SFLOAT_S8_UINT;
+        std::vector<uint8_t> dplane(cnt * 4), splane(cnt);
+        for (size_t i = 0; i < cnt; ++i) {
+            if (f32) {
+                std::memcpy(&dplane[4 * i], &converted[8 * i], 4);
+                splane[i] = converted[8 * i + 4];
+            } else {
+                uint32_t q;
+                std::memcpy(&q, &converted[4 * i], 4);
+                const uint32_t dq = q & 0xFFFFFFu;
+                std::memcpy(&dplane[4 * i], &dq, 4);
+                splane[i] = uint8_t(q >> 24);
+            }
+        }
+        copyBufferToImage(*t->image, uint32_t(level), layer, xo, yo, zo, uint32_t(w), uint32_t(h), depthN, dplane.data(), dplane.size());
+        copyBufferToImage(*t->image, uint32_t(level), layer, xo, yo, zo, uint32_t(w), uint32_t(h), depthN, splane.data(), splane.size(), true);
+    } else
         copyBufferToImage(*t->image, uint32_t(level), layer, xo, yo, zo, uint32_t(w), uint32_t(h), depthN, converted.data(),
                           converted.size());
 }
@@ -580,6 +600,40 @@ void Context::copyTexImage(GLenum target, GLint level, GLenum internalFormat, GL
     int32_t sx = std::max(0, x), sy = std::max(0, y);
     int32_t ex = std::min<int32_t>(x + w, int32_t(fb.width)), ey = std::min<int32_t>(y + h, int32_t(fb.height));
     if (ex <= sx || ey <= sy) return;
+    const FormatInfo& tf = *t->image->format;
+    if ((tf.baseFormat == gl::ALPHA || tf.baseFormat == gl::LUMINANCE_ALPHA) && tf.componentType == 0x8C17 /* UNSIGNED_NORMALIZED */ &&
+        (tf.vk == VK_FORMAT_R8_UNORM || tf.vk == VK_FORMAT_R8G8_UNORM) && !src.image->format->depth && !src.image->format->stencil &&
+        !src.image->format->integer) {
+        // Alpha and luminance-alpha are stored as R8 / RG8 (luminance in red, alpha in green or red): a blit would copy the source's
+        // red and green, so the pixels go through the host (read like glReadPixels, RGBA8).
+        const FormatInfo& sf = *src.image->format;
+        const uint32_t cw = uint32_t(ex - sx), ch = uint32_t(ey - sy);
+        Alloc rb = stream(VkDeviceSize(cw) * ch * sf.texelBytes, 16);
+        barrier();
+        VkBufferImageCopy rc{};
+        rc.bufferOffset = rb.offset;
+        rc.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, src.level, src.layer, 1};
+        rc.imageOffset = {sx, sy, 0};
+        rc.imageExtent = {cw, ch, 1};
+        src.image->invalid.clear();
+        dev->vk.vkCmdCopyImageToBuffer(cmd(), src.image->image, VK_IMAGE_LAYOUT_GENERAL, rb.buffer, 1, &rc);
+        const uint8_t* host = rb.host;
+        StorageP keepAlive = chunks_.back().storage;  // the chunk survives the flush below
+        flush(true);
+        const uint32_t tb = tf.texelBytes;
+        std::vector<uint8_t> row(size_t(cw) * 4), out(size_t(cw) * ch * tb);
+        for (uint32_t j = 0; j < ch; ++j) {
+            if (!convertReadback(sf, gl::RGBA, gl::UNSIGNED_BYTE, host + size_t(j) * cw * sf.texelBytes, cw, row.data())) return;
+            for (uint32_t i = 0; i < cw; ++i) {
+                uint8_t* o = &out[(size_t(j) * cw + i) * tb];
+                if (tb == 1) o[0] = row[4 * i + 3];
+                else o[0] = row[4 * i], o[1] = row[4 * i + 3];
+            }
+        }
+        copyBufferToImage(*t->image, uint32_t(level), isCubeFace(target) ? face : 0, xo + (sx - x), yo + (sy - y), isCubeFace(target) ? 0 : zo, cw,
+                          ch, 1, out.data(), out.size());
+        return;
+    }
     barrier();
     VkImageBlit b{};
     b.srcSubresource = {src.image->aspect(), src.level, src.layer, 1};

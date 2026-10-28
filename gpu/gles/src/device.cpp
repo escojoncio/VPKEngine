@@ -314,7 +314,14 @@ uint64_t Texture::viewKey() const {
     for (int i = 0; i < 4; ++i) k |= uint64_t(swizzle[i] & 0xF) << (16 + 4 * i);
     k |= uint64_t(depthStencilMode == gl::STENCIL_INDEX) << 32;
     k |= uint64_t(!srgbDecode) << 33;
+    k |= uint64_t(depthPlain()) << 34;
     return k;
+}
+
+// A depth texture read without a comparison gives (d, 0, 0, 1): the view says so, whatever the backend puts in the other channels.
+bool Texture::depthPlain() const {
+    return image && image->format->depth && sampler.compareMode == gl::NONE &&
+           !(image->format->stencil && depthStencilMode == gl::STENCIL_INDEX);
 }
 
 static VkComponentSwizzle glSwizzle(GLenum s, VkComponentSwizzle base[4]) {
@@ -346,6 +353,7 @@ VkImageView Texture::sampledView() {
     if (!srgbDecode && image->format->vk == VK_FORMAT_R8G8B8A8_SRGB) ci.format = VK_FORMAT_R8G8B8A8_UNORM;
     VkComponentSwizzle base[4];
     for (int i = 0; i < 4; ++i) base[i] = image->format->swz[i];
+    if (depthPlain()) base[1] = base[2] = VK_COMPONENT_SWIZZLE_ZERO, base[3] = VK_COMPONENT_SWIZZLE_ONE;
     ci.components = {glSwizzle(swizzle[0], base), glSwizzle(swizzle[1], base), glSwizzle(swizzle[2], base),
                      glSwizzle(swizzle[3], base)};
     VkImageAspectFlags aspect = image->aspect();
