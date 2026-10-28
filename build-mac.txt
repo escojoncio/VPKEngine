@@ -1,0 +1,131 @@
+-- The CXX compiler identification is AppleClang 21.0.0.21000101
+-- Detecting CXX compiler ABI info
+-- Detecting CXX compiler ABI info - done
+-- Check for working CXX compiler: /usr/bin/c++ - skipped
+-- Detecting CXX compile features
+-- Detecting CXX compile features - done
+-- vpmsl translator fingerprint a07b8495dcae8dc5
+-- Performing Test CMAKE_HAVE_LIBC_PTHREAD
+-- Performing Test CMAKE_HAVE_LIBC_PTHREAD - Success
+-- Found Threads: TRUE
+-- The OBJCXX compiler identification is AppleClang 21.0.0.21000101
+-- Detecting OBJCXX compiler ABI info
+-- Detecting OBJCXX compiler ABI info - done
+-- Check for working OBJCXX compiler: /usr/bin/clang++ - skipped
+-- Configuring done (5.3s)
+-- Generating done (0.0s)
+-- Build files have been written to: /Users/runner/work/VPKEngine/VPKEngine/build/gpu-mac
+ninja: Entering directory `build/gpu-mac'
+[0/2] Re-checking globbed directories...
+[1/93] Building CXX object shader/ir/CMakeFiles/vpir.dir/src/ir.cpp.o
+[2/93] Building CXX object shader/ir/CMakeFiles/vpir.dir/src/print.cpp.o
+[3/93] Building CXX object shader/ir/CMakeFiles/vpir.dir/src/builder.cpp.o
+[4/93] Building CXX object shader/ir/CMakeFiles/vpir.dir/src/parse.cpp.o
+[5/93] Building CXX object core/CMakeFiles/vpgpu_core.dir/src/resources.cpp.o
+[6/93] Building CXX object shader/ir/CMakeFiles/vpir.dir/src/verify.cpp.o
+[7/93] Building CXX object shader/ir/CMakeFiles/vpir.dir/src/fbfetch.cpp.o
+[8/93] Building CXX object shader/ir/CMakeFiles/vpir.dir/src/optimize.cpp.o
+[9/93] Building CXX object core/CMakeFiles/vpgpu_core.dir/src/commands.cpp.o
+[10/93] Building CXX object core/CMakeFiles/vpgpu_core.dir/src/pipeline_cache.cpp.o
+[11/93] Building CXX object core/CMakeFiles/vpgpu_core.dir/src/diagnostics.cpp.o
+[12/93] Building CXX object core/CMakeFiles/vpgpu_core.dir/src/null_backend.cpp.o
+[13/93] Building CXX object core/CMakeFiles/vpgpu_core.dir/src/background.cpp.o
+[14/93] Building CXX object core/CMakeFiles/vpgpu_core.dir/src/device.cpp.o
+[15/93] Building CXX object gles/CMakeFiles/vpglsl.dir/glsl/types.cpp.o
+[16/93] Building CXX object core/CMakeFiles/vpgpu_core.dir/src/frame_compiler.cpp.o
+[17/93] Building CXX object gles/CMakeFiles/vpglsl.dir/glsl/pp.cpp.o
+/Users/runner/work/VPKEngine/VPKEngine/gpu/gles/glsl/pp.cpp:764:11: warning: private field 'stage_' is not used [-Wunused-private-field]
+  764 |     Stage stage_;
+      |           ^
+/Users/runner/work/VPKEngine/VPKEngine/gpu/gles/glsl/pp.cpp:774:9: warning: private field 'physLine_' is not used [-Wunused-private-field]
+  774 |     int physLine_ = 0;
+      |         ^
+2 warnings generated.
+[18/93] Building CXX object gles/CMakeFiles/vpglsl.dir/glsl/builtins.cpp.o
+[19/93] Linking CXX static library shader/ir/libvpir.a
+[20/93] Building CXX object gles/CMakeFiles/vpglsl.dir/glsl/link.cpp.o
+[21/93] Building CXX object gles/CMakeFiles/vpglsl.dir/glsl/emit.cpp.o
+/Users/runner/work/VPKEngine/VPKEngine/gpu/gles/glsl/emit.cpp:258:14: warning: private field 'fragDataVar_' is not used [-Wunused-private-field]
+  258 |     uint32_t fragDataVar_ = 0;
+      |              ^
+1 warning generated.
+[22/93] Linking CXX static library core/libvpgpu_core.a
+[23/93] Building CXX object gles/CMakeFiles/vpglsl.dir/glsl/parser.cpp.o
+[24/93] Linking CXX static library gles/libvpglsl.a
+[25/93] Building CXX object shader/spirv/CMakeFiles/vpspirv.dir/src/parse.cpp.o
+[26/93] Building CXX object gles/CMakeFiles/vpgles.dir/src/vk.cpp.o
+[27/93] Building CXX object gles/CMakeFiles/vpgles.dir/src/formats.cpp.o
+[28/93] Building CXX object shader/msl/CMakeFiles/vpmsl.dir/src/msl.cpp.o
+[29/93] Building CXX object gles/CMakeFiles/vpgles.dir/src/device.cpp.o
+[30/93] Building CXX object gles/CMakeFiles/vpgles.dir/src/textures.cpp.o
+[31/93] Building CXX object gles/CMakeFiles/vpgles.dir/src/xfb.cpp.o
+[32/93] Building CXX object gles/CMakeFiles/vpgles.dir/src/egl.cpp.o
+[33/93] Linking CXX static library shader/msl/libvpmsl.a
+[34/93] Building CXX object shader/spirv/CMakeFiles/vpspirv.dir/src/lower.cpp.o
+[35/93] Linking CXX static library shader/spirv/libvpspirv.a
+[36/93] Building CXX object gles/CMakeFiles/vpgles.dir/src/draw.cpp.o
+[37/93] Building CXX object vulkan/CMakeFiles/vpreplay.dir/src/vpcap.cpp.o
+[38/93] Building CXX object gles/CMakeFiles/vpgles.dir/src/gl_api.cpp.o
+[39/93] Linking CXX static library gles/libvpgles.a
+[40/93] Building CXX object shader/spirv/CMakeFiles/vpspirv_tests.dir/__/gcn/tests/diff/vpir_eval.cpp.o
+[41/93] Building CXX object shader/spirv/CMakeFiles/vpspirv_tests.dir/tests/spirv_tests.cpp.o
+[42/93] Building CXX object metal2/CMakeFiles/vpgpu_metal2_tests.dir/tests/metal_tests.cpp.o
+[43/93] Building CXX object gles/CMakeFiles/vpglsl_tests.dir/tests/glsl_tests.cpp.o
+/Users/runner/work/VPKEngine/VPKEngine/gpu/gles/tests/glsl_tests.cpp:1485:10: warning: unused variable 'vec4' [-Wunused-variable]
+ 1485 |     auto vec4 = [](float a, float b, float c, float d) {
+      |          ^~~~
+1 warning generated.
+[44/93] Linking CXX executable shader/spirv/vpspirv_tests
+[45/93] Building CXX object gles/CMakeFiles/vpglsl_tests.dir/__/shader/gcn/tests/diff/vpir_eval.cpp.o
+[46/93] Linking CXX executable gles/vpglsl_tests
+[47/93] Building CXX object core/CMakeFiles/vpgpu_core_tests.dir/tests/core_tests.cpp.o
+[48/93] Linking CXX executable core/vpgpu_core_tests
+[49/93] Building OBJCXX object metal2/CMakeFiles/vpgpu_metal2.dir/src/metal_backend.mm.o
+/Users/runner/work/VPKEngine/VPKEngine/gpu/metal2/src/metal_backend.mm:7347:34: warning: missing field 'fsr' initializer [-Wmissing-field-initializers]
+ 7347 |     Res r{c, 0, 0, 0, 0, 0, false};
+      |                                  ^
+1 warning generated.
+[50/93] Linking CXX static library metal2/libvpgpu_metal2.a
+[51/93] Generating gen/vpktaa_native_msl.h
+[52/93] Linking CXX executable metal2/vpgpu_metal2_tests
+[53/93] Building CXX object vulkan/CMakeFiles/vpreplay.dir/tools/vpreplay.cpp.o
+[54/93] Building CXX object vulkan/CMakeFiles/VPVulkan.dir/src/config.cpp.o
+[55/93] Building CXX object vulkan/CMakeFiles/VPVulkan.dir/src/physical_device.cpp.o
+[56/93] Building CXX object vulkan/CMakeFiles/VPVulkan.dir/src/commands.cpp.o
+[57/93] Building CXX object vulkan/CMakeFiles/VPVulkan.dir/src/precompile.cpp.o
+[58/93] Building CXX object vulkan/CMakeFiles/VPVulkan.dir/src/taa_native.cpp.o
+[59/93] Building CXX object vulkan/CMakeFiles/VPVulkan.dir/src/entry.cpp.o
+[60/93] Building CXX object vulkan/CMakeFiles/VPVulkan.dir/src/recipes.cpp.o
+[61/93] Building CXX object vulkan/CMakeFiles/VPVulkan.dir/src/foveation.cpp.o
+[62/93] Building CXX object vulkan/CMakeFiles/VPVulkan.dir/src/vpcap.cpp.o
+[63/93] Building CXX object vulkan/CMakeFiles/VPVulkan.dir/src/ext.cpp.o
+[64/93] Building CXX object vulkan/CMakeFiles/VPVulkan.dir/src/pipelines.cpp.o
+[65/93] Building CXX object vulkan/CMakeFiles/VPVulkan.dir/src/texdecode.cpp.o
+[66/93] Linking CXX executable vulkan/vpreplay
+[67/93] Building CXX object vulkan/CMakeFiles/VPVulkan.dir/src/pending.cpp.o
+[68/93] Building OBJCXX object vulkan/CMakeFiles/VPVulkan.dir/src/platform_metal.mm.o
+[69/93] Building OBJCXX object vulkan/CMakeFiles/VPVulkan.dir/src/taa_native_metal.mm.o
+[70/93] Building CXX object gles/CMakeFiles/vpgles_tests.dir/src/formats.cpp.o
+[71/93] Building CXX object gles/CMakeFiles/vpgles_tests.dir/src/xfb.cpp.o
+[72/93] Building CXX object gles/CMakeFiles/vpgles_tests.dir/tests/gles_tests.cpp.o
+[73/93] Building CXX object vulkan/CMakeFiles/vpvk_tests.dir/src/physical_device.cpp.o
+[74/93] Building CXX object vulkan/CMakeFiles/vpvk_tests.dir/src/config.cpp.o
+[75/93] Building CXX object vulkan/CMakeFiles/vpvk_tests.dir/src/commands.cpp.o
+[76/93] Building CXX object vulkan/CMakeFiles/vpvk_tests.dir/src/entry.cpp.o
+[77/93] Building CXX object vulkan/CMakeFiles/VPVulkan.dir/src/capture.cpp.o
+[78/93] Linking CXX shared library vulkan/libVPVulkan.dylib
+[79/93] Building CXX object vulkan/CMakeFiles/vpvk_tests.dir/src/recipes.cpp.o
+[80/93] Building CXX object vulkan/CMakeFiles/vpvk_tests.dir/src/precompile.cpp.o
+[81/93] Building CXX object vulkan/CMakeFiles/vpvk_tests.dir/src/taa_native.cpp.o
+[82/93] Building CXX object vulkan/CMakeFiles/vpvk_tests.dir/src/foveation.cpp.o
+[83/93] Building CXX object vulkan/CMakeFiles/vpvk_tests.dir/src/vpcap.cpp.o
+[84/93] Building CXX object vulkan/CMakeFiles/vpvk_tests.dir/src/ext.cpp.o
+[85/93] Building CXX object vulkan/CMakeFiles/vpvk_tests.dir/src/pipelines.cpp.o
+[86/93] Building CXX object vulkan/CMakeFiles/vpvk_tests.dir/src/texdecode.cpp.o
+[87/93] Linking CXX executable gles/vpgles_tests
+[88/93] Building CXX object vulkan/CMakeFiles/vpvk_tests.dir/src/platform_null.cpp.o
+[89/93] Building CXX object vulkan/CMakeFiles/vpvk_tests.dir/src/pending.cpp.o
+[90/93] Building CXX object vulkan/CMakeFiles/vpvk_tests.dir/tests/vk_tests.cpp.o
+[91/93] Building CXX object vulkan/CMakeFiles/vpvk_tests.dir/src/capture.cpp.o
+[92/93] Linking CXX executable vulkan/vpvk_tests
+ld: warning: ignoring duplicate libraries: 'core/libvpgpu_core.a'
