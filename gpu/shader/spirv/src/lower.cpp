@@ -3341,14 +3341,7 @@ private:
                 Type to = vt(rtId);
                 if (op == OpConvertSToF) v = intOperand(w(in, 3), Scalar::I32);
                 if (op == OpConvertUToF) v = intOperand(w(in, 3), Scalar::U32);
-                if (op == OpConvertFToS) {
-                    ValueId r = un(Op::Convert, v, Type(Scalar::I32, to.width));
-                    return one(castBits(r, to));
-                }
-                if (op == OpConvertFToU) {
-                    ValueId r = un(Op::Convert, v, Type(Scalar::U32, to.width));
-                    return one(castBits(r, to));
-                }
+                if (op == OpConvertFToS || op == OpConvertFToU) return one(castBits(floatToInt(v, op == OpConvertFToS, rtId), to));
                 if (typeOfValue(v) == to) return one(v);
                 return one(un(Op::Convert, v, to));
             }
@@ -3675,6 +3668,27 @@ private:
         return bin(Op::Dot, a, c, t.element());
     }
 
+    // OpConvertFToS / OpConvertFToU: out-of-range values saturate (to the result type's range) and NaN gives 0, the
+    // behaviour hardware conversions have and the CTS expects; Metal's own conversion of such values is undefined.
+    ValueId floatToInt(ValueId v, bool sign, uint32_t resultType) {
+        const uint8_t n = typeOfValue(v).width;
+        const Type f32t(Scalar::F32, n), it(sign ? Scalar::I32 : Scalar::U32, n);
+        ValueId x = typeOfValue(v).scalar == Scalar::F32 ? v : un(Op::Convert, v, f32t);
+        ValueId nan = un(Op::IsNan, x, vpir::kBool.withWidth(n));
+        ValueId lo = splat(f32t, floatBits(sign ? -2147483648.0f : 0.0f));
+        ValueId hi = splat(f32t, floatBits(sign ? 2147483520.0f : 4294967040.0f));  // largest floats below 2^31 / 2^32
+        ValueId r = un(Op::Convert, bin(Op::Min, bin(Op::Max, x, lo, f32t), hi, f32t), it);
+        ValueId big = bin(Op::Ge, x, splat(f32t, floatBits(sign ? 2147483648.0f : 4294967296.0f)), vpir::kBool.withWidth(n));
+        r = select(big, splat(it, sign ? 0x7FFFFFFFu : 0xFFFFFFFFu), r);  // +2^31 / +2^32 and above: the type's maximum
+        r = select(nan, splat(it, 0), r);
+        const uint32_t bits = intBits(resultType);
+        if (bits == 8 || bits == 16) {
+            const uint32_t top = sign ? (1u << (bits - 1)) - 1 : (1u << bits) - 1;
+            const uint32_t bot = sign ? uint32_t(-int32_t(1u << (bits - 1))) : 0;
+            r = bin(Op::Min, bin(Op::Max, r, splat(it, bot), it), splat(it, top), it);
+        }
+        return r;
+    }
     // OpSDot / OpUDot / OpSUDot and their saturating-accumulate forms. Vector operands (8/16/32-bit components,
     // held in 32-bit lanes) or one packed 4x8-bit word. The sum wraps in 32 bits; the AccSat forms add the
     // accumulator exactly (64-bit {lo, hi} words) and clamp to the result range.

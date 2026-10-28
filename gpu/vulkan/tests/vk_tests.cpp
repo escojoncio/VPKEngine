@@ -1212,6 +1212,20 @@ void testNativeIdentity() {
     CHECK(has(VK_KHR_SHADER_INTEGER_DOT_PRODUCT_EXTENSION_NAME) && has(VK_EXT_IMAGE_ROBUSTNESS_EXTENSION_NAME) &&
           has(VK_EXT_PIPELINE_CREATION_CACHE_CONTROL_EXTENSION_NAME) && has(VK_KHR_ZERO_INITIALIZE_WORKGROUP_MEMORY_EXTENSION_NAME) &&
           has(VK_KHR_SHADER_SUBGROUP_EXTENDED_TYPES_EXTENSION_NAME));
+    // Linear multi-planar 4:2:0: transfers only, one mip level and one layer.
+    VkFormatProperties pf;
+    vkGetPhysicalDeviceFormatProperties(c.pd, VK_FORMAT_G8_B8R8_2PLANE_420_UNORM, &pf);
+    CHECK((pf.linearTilingFeatures & (VK_FORMAT_FEATURE_TRANSFER_SRC_BIT | VK_FORMAT_FEATURE_TRANSFER_DST_BIT)) ==
+          (VK_FORMAT_FEATURE_TRANSFER_SRC_BIT | VK_FORMAT_FEATURE_TRANSFER_DST_BIT));
+    VkImageFormatProperties lp{};
+    CHECK(vkGetPhysicalDeviceImageFormatProperties(c.pd, VK_FORMAT_G8_B8R8_2PLANE_420_UNORM, VK_IMAGE_TYPE_2D,
+                                                   VK_IMAGE_TILING_LINEAR,
+                                                   VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, 0,
+                                                   &lp) == VK_SUCCESS &&
+          lp.maxMipLevels == 1 && lp.maxArrayLayers == 1);
+    CHECK(vkGetPhysicalDeviceImageFormatProperties(c.pd, VK_FORMAT_G8_B8R8_2PLANE_420_UNORM, VK_IMAGE_TYPE_2D,
+                                                   VK_IMAGE_TILING_LINEAR, VK_IMAGE_USAGE_SAMPLED_BIT, 0, &lp) ==
+          VK_ERROR_FORMAT_NOT_SUPPORTED);
   }
   // Explicit VPVK_EXTRA_EXTENSIONS=0 turns the extras off even here; the API version stays 1.3.
   setenv("VPVK_EXTRA_EXTENSIONS", "0", 1);
@@ -3728,7 +3742,7 @@ void testYcbcr() {
     CHECK((fp.optimalTilingFeatures & want) == want);
     CHECK(!(fp.optimalTilingFeatures & (VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT | VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT |
                                         VK_FORMAT_FEATURE_SAMPLED_IMAGE_YCBCR_CONVERSION_SEPARATE_RECONSTRUCTION_FILTER_BIT)));
-    CHECK(fp.linearTilingFeatures == 0 && fp.bufferFeatures == 0);
+    CHECK(fp.linearTilingFeatures == (VK_FORMAT_FEATURE_TRANSFER_SRC_BIT | VK_FORMAT_FEATURE_TRANSFER_DST_BIT) && fp.bufferFeatures == 0);
     VkSamplerYcbcrConversionImageFormatProperties yp{VK_STRUCTURE_TYPE_SAMPLER_YCBCR_CONVERSION_IMAGE_FORMAT_PROPERTIES};
     VkImageFormatProperties2 ip{VK_STRUCTURE_TYPE_IMAGE_FORMAT_PROPERTIES_2, &yp};
     VkPhysicalDeviceImageFormatInfo2 info{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_FORMAT_INFO_2};
@@ -5206,7 +5220,7 @@ void testFoveation() {
 // CMake source fingerprint: a refactor that leaves the output alone keeps the digest (and every cache), a change of
 // output moves it. When this test fails the translator's OUTPUT changed: bump kLowerVersion (SPIR-V -> VPIR) or
 // kEmitVersion (VPIR -> MSL) in recipes.h, then update kCorpusDigest to the printed value in the same change.
-constexpr uint64_t kCorpusDigest = 0x191d39b936d37740ull;  // the "corpus digest" line the test prints
+constexpr uint64_t kCorpusDigest = 0x1a593fdf16f6ed12ull;  // the "corpus digest" line the test prints
 
 uint64_t corpusDigest(unsigned& modules, unsigned& failed) {
   std::vector<std::string> names;
@@ -5892,6 +5906,7 @@ void testSyncPipelines() {
   // 2. FAIL_ON_PIPELINE_COMPILE_REQUIRED: cull front was never created, so it is refused and nothing is requested.
   VkGraphicsPipelineCreateInfo fail = gp[2];
   fail.flags = VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT;
+  cache.waitIdle();  // background compiles of the device (engine kernels) are not part of the count
   const uint32_t compiled0 = cache.totals().compiled;
   VkPipeline refused = batch[0];  // overwritten with VK_NULL_HANDLE
   CHECK(vkCreateGraphicsPipelines(c.dev, VK_NULL_HANDLE, 1, &fail, nullptr, &refused) == VK_PIPELINE_COMPILE_REQUIRED);

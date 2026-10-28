@@ -38,7 +38,7 @@ env:
 jobs:
   probe:
     concurrency:
-      group: cts-probe-${{ github.ref }}
+      group: cts-probe-${{ github.run_id }}
       cancel-in-progress: true
     if: github.event_name == 'workflow_dispatch' || contains(github.event.head_commit.message, '[cts')
     runs-on: macos-26
@@ -72,7 +72,7 @@ jobs:
 
   vpvulkan:
     concurrency:
-      group: cts-vpvulkan-${{ github.ref }}
+      group: cts-vpvulkan-${{ github.run_id }}
       cancel-in-progress: true
     if: github.event_name == 'workflow_dispatch' || contains(github.event.head_commit.message, '[cts')
     runs-on: macos-26
@@ -229,7 +229,7 @@ jobs:
       VPVK_QUEST_IDENTITY: "1"
       VPVK_STRICT_FEATURES: "1"  # vkCreateDevice refuses features reported false (create_device_unsupported_features)
     concurrency:
-      group: cts-smoke-${{ github.ref }}
+      group: cts-smoke-${{ github.run_id }}
       cancel-in-progress: true
     runs-on: macos-26
     timeout-minutes: 40

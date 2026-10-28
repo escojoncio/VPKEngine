@@ -688,13 +688,13 @@ void robust(const std::string& dir) {
         CHECK(r.ok);
         if (!r.ok) return;
         const std::string& src = r.msl.source;
-        CHECK(src.find("ul <= vp_args.bs") != std::string::npos);
+        CHECK(src.find("ul <= ((vp_args.bs") != std::string::npos);
         bool hasSize = false;
         for (auto& a : r.msl.arguments) hasSize |= a.kind == vpir::ResourceKind::BufferSize;
         CHECK(hasSize);
         if (atomics) CHECK(src.find(") atomic_fetch_") != std::string::npos || src.find(" = atomic_fetch_") != std::string::npos);
         Result plain = run(dir + "/" + file, o);
-        CHECK(plain.ok && plain.msl.source.find("ul <= vp_args.bs") == std::string::npos);
+        CHECK(plain.ok && plain.msl.source.find("ul <= ((vp_args.bs") == std::string::npos);
         CHECK(src.find("// vp:int16") == std::string::npos);  // no 16-bit integers here
         if (failures || std::getenv("VP_PRINT")) std::fprintf(stderr, "%s\n", src.c_str());
     };
@@ -855,6 +855,38 @@ void dotProduct(const std::string& dir) {
     CHECK(got[3] == 0x80000000u);          // INT_MIN + 16 - 128 saturates
     CHECK(got[4] == 0xFFFFFFFFu);          // UINT_MAX - 15 + 65920 saturates
     CHECK(int32_t(got[5]) == -284);        // -384 + 100
+}
+
+// OpConvertFToS / OpConvertFToU (ftoi.comp.spvasm), evaluated: out-of-range values saturate, NaN gives 0.
+// in = {NaN, 3e10, -3e10, -1.5, 200.5}.
+void floatToInt(const std::string& dir) {
+    spirv::SpirvLowerOptions o;
+    o.entry = "main";
+    o.stage = vpir::Stage::Compute;
+    o.layout = {bind(0, 0, vpgpu::BindKind::Buffer, 0), bind(0, 1, vpgpu::BindKind::Buffer, 1)};
+    Result r = run(dir + "/ftoi.comp.spv", o);
+    CHECK(r.ok);
+    if (!r.ok) return;
+    // The evaluator's own conversion already saturates; what the lowering must emit for Metal is explicit.
+    const std::string text = vpir::print(r.module);
+    CHECK(text.find("isnan") != std::string::npos && text.find("min") != std::string::npos);
+    const float in[5] = {std::nanf(""), 3e10f, -3e10f, -1.5f, 200.5f};
+    vpireval::Invocation inv;
+    inv.memory[0].resize(20);
+    std::memcpy(inv.memory[0].data(), in, 20);
+    inv.memory[1].assign(60, 0);
+    std::string err;
+    CHECK(vpireval::run(r.module, inv, err));
+    if (!err.empty()) std::fprintf(stderr, "  eval: %s\n", err.c_str());
+    uint32_t got[15] = {};
+    if (inv.memory[1].size() >= 60) std::memcpy(got, inv.memory[1].data(), 60);
+    const uint32_t want[15] = {0, 0x7FFFFFFFu, 0x80000000u, uint32_t(-1), 200,  //
+                               0, 0xFFFFFFFFu, 0,           0,            200,  //
+                               0, 255,         0,           0,            200};
+    for (int i = 0; i < 15; ++i) {
+        CHECK(got[i] == want[i]);
+        if (got[i] != want[i]) std::fprintf(stderr, "  [%d] got %08x want %08x\n", i, got[i], want[i]);
+    }
 }
 
 // shaderZeroInitializeWorkgroupMemory: a Workgroup variable with an OpConstantNull initializer is cleared by a
@@ -1522,6 +1554,7 @@ int main(int argc, char** argv) {
     else if (c == "int8") int8(dir);
     else if (c == "dot") dotProduct(dir);
     else if (c == "zero_init") zeroInit(dir);
+    else if (c == "float_to_int") floatToInt(dir);
     else if (c == "ycbcr") ycbcr(dir);
     else if (c == "robust") robust(dir);
     else if (c == "correctness") correctness(dir);

@@ -1280,7 +1280,10 @@ private:
     std::string guard(uint32_t target, ValueId addr, unsigned bytes) const {
         auto it = sizeOf_.find(target);
         if (it == sizeOf_.end()) return {};
-        return "ulong(" + ex(addr) + ") + " + std::to_string(bytes ? bytes : 4) + "ul <= " + texture(it->second);
+        // The range counts rounded up to a word (robustStorageBufferAccessSizeAlignment = 4): 8/16-bit members at the
+        // end of a buffer of an odd size are read and merged as whole words (spirv lower.cpp load16 / store16).
+        return "ulong(" + ex(addr) + ") + " + std::to_string(bytes ? bytes : 4) + "ul <= ((" + texture(it->second) +
+               " + 3ul) & ~3ul)";
     }
     // An atomic's result (or the bare statement when unused), under the bounds guard when robust.
     void atomicDefine(const Inst& in, const std::string& e) {

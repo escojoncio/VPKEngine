@@ -946,10 +946,11 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkGetPhysicalDeviceFormatProperties(VkPhy
                                                                            VkFormatProperties* p) {
   p->optimalTilingFeatures = formatFeatures(f, false);
   // Linear images are only offered for transfers (staging): Metal linear textures are restrictive.
-  p->linearTilingFeatures = multiPlane(f).planes ? 0
-                            : p->optimalTilingFeatures &
-                                  (VK_FORMAT_FEATURE_TRANSFER_SRC_BIT | VK_FORMAT_FEATURE_TRANSFER_DST_BIT |
-                                   VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT);
+  // Multi-planar linear images: transfers only (each plane is a linear image of its own, see vkCreateImage).
+  p->linearTilingFeatures = p->optimalTilingFeatures &
+                            (multiPlane(f).planes ? (VK_FORMAT_FEATURE_TRANSFER_SRC_BIT | VK_FORMAT_FEATURE_TRANSFER_DST_BIT)
+                                                  : (VK_FORMAT_FEATURE_TRANSFER_SRC_BIT | VK_FORMAT_FEATURE_TRANSFER_DST_BIT |
+                                                     VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT));
   p->bufferFeatures = formatFeatures(f, true);
   // A format the game asks about and gets nothing for: the first 64 are named (an engine that refuses to start over a
   // missing format then says which one in the log).
@@ -1009,8 +1010,10 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkGetPhysicalDeviceImageFormatPropert
       !(ff & (VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT | VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT)))
     return VK_ERROR_FORMAT_NOT_SUPPORTED;
   // Multi-planar (Y'CbCr) formats: optimal-tiling 2D images only.
-  if (multiPlane(f).planes && (tiling != VK_IMAGE_TILING_OPTIMAL || type != VK_IMAGE_TYPE_2D ||
-                               (flags & VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT)))
+  // Linear ones: transfers only (one mip level, one layer: see maxMipLevels / maxArrayLayers below).
+  if (multiPlane(f).planes && (type != VK_IMAGE_TYPE_2D || (flags & VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT) ||
+                               (tiling == VK_IMAGE_TILING_LINEAR &&
+                                (usage & ~(VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT)))))
     return VK_ERROR_FORMAT_NOT_SUPPORTED;
   if (tiling == VK_IMAGE_TILING_LINEAR &&
       (usage & ~(VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT)))
@@ -1043,6 +1046,7 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkGetPhysicalDeviceImageFormatPropert
     out->maxExtent = {l.maxImageDimension3D, l.maxImageDimension3D, l.maxImageDimension3D};
   out->maxMipLevels = 15;
   out->maxArrayLayers = type == VK_IMAGE_TYPE_3D ? 1 : l.maxImageArrayLayers;
+  if (multiPlane(f).planes && tiling == VK_IMAGE_TILING_LINEAR) out->maxMipLevels = out->maxArrayLayers = 1;
   // Multisample only where Vulkan allows it: optimal 2D, not cube-compatible, an attachment format
   // (Metal renders MSAA into it), not storage (storageImageSampleCounts = 1), and not transfer-only.
   const bool msaa = tiling == VK_IMAGE_TILING_OPTIMAL && type == VK_IMAGE_TYPE_2D &&
@@ -1597,8 +1601,10 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkCreateImage(VkDevice, const VkImage
   VkImageCreateInfo plane0 = *ci;
   if (mp.planes) {
     if (ci->imageType != VK_IMAGE_TYPE_2D || ci->samples != VK_SAMPLE_COUNT_1_BIT ||
-        ci->tiling != VK_IMAGE_TILING_OPTIMAL || (ci->flags & VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT) ||
-        ci->extent.width < 2 || ci->extent.height < 2)
+        (ci->flags & VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT) || ci->extent.width < 2 || ci->extent.height < 2 ||
+        (ci->tiling == VK_IMAGE_TILING_LINEAR &&
+         (ci->mipLevels != 1 || ci->arrayLayers != 1 ||
+          (ci->usage & ~(VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT)))))
       return VK_ERROR_FORMAT_NOT_SUPPORTED;
     plane0.format = mp.plane[0];
   }
@@ -1676,8 +1682,8 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkCreateImage(VkDevice, const VkImage
   // by the format features, multisampled ones by the image format properties.
   {
     const vpgpu::FormatInfo& fi = vpgpu::formatInfo(img->desc.format);
-    img->linear = ci->tiling == VK_IMAGE_TILING_LINEAR && !fi.depth() && !fi.stencil() && img->desc.samples == 1 &&
-                  !mp.planes;
+    img->linear = ci->tiling == VK_IMAGE_TILING_LINEAR && !fi.depth() && !fi.stencil() && img->desc.samples == 1;
+    for (auto& pl : img->planes) pl->linear = img->linear;  // planes of a linear multi-planar image are linear as well
   }
   *out = to<VkImage>(img);
   const bool linearTiling = ci->tiling == VK_IMAGE_TILING_LINEAR;
@@ -1860,14 +1866,23 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkBindImageMemory2(VkDevice dv, uint3
 VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkGetImageSubresourceLayout(VkDevice, VkImage im,
                                                                    const VkImageSubresource* sub,
                                                                    VkSubresourceLayout* out) {
-  // Only meaningful for linear images (the layout their memory really has, see linearLayout).
-  const vpgpu::TextureDesc& d = from<Image>(im)->desc;
+  // Only meaningful for linear images (the layout their memory really has, see linearLayout). Multi-planar: the plane
+  // asked for, its offset after the earlier planes (they follow each other, see planeOffset).
+  const Image* whole = from<Image>(im);
+  const Image* pl = whole;
+  VkDeviceSize planeBase = 0;
+  if (!whole->planes.empty()) {
+    const uint32_t k = (sub->aspectMask & VK_IMAGE_ASPECT_PLANE_2_BIT) ? 2 : (sub->aspectMask & VK_IMAGE_ASPECT_PLANE_1_BIT) ? 1 : 0;
+    if (k > 0 && k <= whole->planes.size()) pl = whole->planes[k - 1].get();
+    for (uint32_t j = 0; j < k; ++j) planeBase += imageBytes(j == 0 ? whole->desc : whole->planes[j - 1]->desc);
+  }
+  const vpgpu::TextureDesc& d = pl->desc;
   if (sub->mipLevel >= d.mips || sub->arrayLayer >= d.layers) {
     *out = {};
     return;
   }
   const LinearLayout l = linearLayout(d, sub->mipLevel, sub->arrayLayer);
-  out->offset = l.offset;
+  out->offset = planeBase + l.offset;
   out->size = l.size;
   out->rowPitch = l.rowPitch;
   out->arrayPitch = l.arrayPitch;
