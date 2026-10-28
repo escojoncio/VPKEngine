@@ -1,0 +1,629 @@
+Writing test log into /Users/runner/work/VPKEngine/VPKEngine/build/focus/out1/attempt-1.qpa
+dEQP Core vulkan-cts-1.4.6.2-0-gf6a29701220f34dd1407513bfe80d74ca7b392ce (0xf6a29701) starting..
+  target implementation = 'Default'
+vpk.version sha=58f736a419de
+vk.instance app=deqp engine=deqp api=1.3 exts=0
+vk.unimpl vkAcquireDrmDisplayEXT
+vk.unimpl vkAcquireXlibDisplayEXT
+vk.unimpl vkCreateAndroidSurfaceKHR
+vk.unimpl vkCreateDebugReportCallbackEXT
+vk.unimpl vkCreateDebugUtilsMessengerEXT
+vk.unimpl vkCreateDirectFBSurfaceEXT
+vk.unimpl vkCreateDisplayModeKHR
+vk.unimpl vkCreateDisplayPlaneSurfaceKHR
+vk.unimpl vkCreateHeadlessSurfaceEXT
+vk.unimpl vkCreateIOSSurfaceMVK
+vk.unimpl vkCreateImagePipeSurfaceFUCHSIA
+vk.unimpl vkCreateMacOSSurfaceMVK
+vk.unimpl vkCreateMetalSurfaceEXT
+vk.unimpl vkCreateScreenSurfaceQNX
+vk.unimpl vkCreateStreamDescriptorSurfaceGGP
+vk.unimpl vkCreateSurfaceOHOS
+vk.unimpl vkCreateUbmSurfaceSEC
+vk.unimpl vkCreateViSurfaceNN
+vk.unimpl vkCreateWaylandSurfaceKHR
+vk.unimpl vkCreateWin32SurfaceKHR
+vk.unimpl vkCreateXcbSurfaceKHR
+vk.unimpl vkCreateXlibSurfaceKHR
+vk.unimpl vkDebugReportMessageEXT
+vk.unimpl vkDestroyDebugReportCallbackEXT
+vk.unimpl vkDestroyDebugUtilsMessengerEXT
+vk.unimpl vkDestroySurfaceKHR
+vk.unimpl vkEnumeratePhysicalDeviceQueueFamilyPerformanceCountersByRegionARM
+vk.unimpl vkEnumeratePhysicalDeviceQueueFamilyPerformanceQueryCountersKHR
+vk.unimpl vkGetDisplayModeProperties2KHR
+vk.unimpl vkGetDisplayModePropertiesKHR
+vk.unimpl vkGetDisplayPlaneCapabilities2KHR
+vk.unimpl vkGetDisplayPlaneCapabilitiesKHR
+vk.unimpl vkGetDisplayPlaneSupportedDisplaysKHR
+vk.unimpl vkGetDrmDisplayEXT
+vk.unimpl vkGetPhysicalDeviceCalibrateableTimeDomainsKHR
+vk.unimpl vkGetPhysicalDeviceCalibrateableTimeDomainsEXT
+vk.unimpl vkGetPhysicalDeviceCooperativeMatrixFlexibleDimensionsPropertiesNV
+vk.unimpl vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR
+vk.unimpl vkGetPhysicalDeviceCooperativeMatrixPropertiesNV
+vk.unimpl vkGetPhysicalDeviceCooperativeVectorPropertiesNV
+vk.unimpl vkGetPhysicalDeviceDescriptorSizeEXT
+vk.unimpl vkGetPhysicalDeviceDirectFBPresentationSupportEXT
+vk.unimpl vkGetPhysicalDeviceDisplayPlaneProperties2KHR
+vk.unimpl vkGetPhysicalDeviceDisplayPlanePropertiesKHR
+vk.unimpl vkGetPhysicalDeviceDisplayProperties2KHR
+vk.unimpl vkGetPhysicalDeviceDisplayPropertiesKHR
+vk.unimpl vkGetPhysicalDeviceExternalImageFormatPropertiesNV
+vk.unimpl vkGetPhysicalDeviceExternalTensorPropertiesARM
+vk.unimpl vkGetPhysicalDeviceFragmentShadingRatesKHR
+vk.unimpl vkGetPhysicalDeviceMultisamplePropertiesEXT
+vk.unimpl vkGetPhysicalDevicePresentRectanglesKHR
+vk.unimpl vkGetPhysicalDeviceQueueFamilyDataGraphProcessingEnginePropertiesARM
+vk.unimpl vkGetPhysicalDeviceQueueFamilyDataGraphPropertiesARM
+vk.unimpl vkGetPhysicalDeviceQueueFamilyPerformanceQueryPassesKHR
+vk.unimpl vkGetPhysicalDeviceScreenPresentationSupportQNX
+vk.unimpl vkGetPhysicalDeviceSupportedFramebufferMixedSamplesCombinationsNV
+vk.unimpl vkGetPhysicalDeviceSurfaceCapabilities2EXT
+vk.unimpl vkGetPhysicalDeviceSurfaceCapabilities2KHR
+vk.unimpl vkGetPhysicalDeviceSurfaceCapabilitiesKHR
+vk.unimpl vkGetPhysicalDeviceSurfaceFormats2KHR
+vk.unimpl vkGetPhysicalDeviceSurfaceFormatsKHR
+vk.unimpl vkGetPhysicalDeviceSurfacePresentModes2EXT
+vk.unimpl vkGetPhysicalDeviceSurfacePresentModesKHR
+vk.unimpl vkGetPhysicalDeviceSurfaceSupportKHR
+vk.unimpl vkGetPhysicalDeviceUbmPresentationSupportSEC
+vk.unimpl vkGetPhysicalDeviceVideoCapabilitiesKHR
+vk.unimpl vkGetPhysicalDeviceVideoEncodeQualityLevelPropertiesKHR
+vk.unimpl vkGetPhysicalDeviceVideoFormatPropertiesKHR
+vk.unimpl vkGetPhysicalDeviceWaylandPresentationSupportKHR
+vk.unimpl vkGetPhysicalDeviceWin32PresentationSupportKHR
+vk.unimpl vkGetPhysicalDeviceXcbPresentationSupportKHR
+vk.unimpl vkGetPhysicalDeviceXlibPresentationSupportKHR
+vk.unimpl vkGetRandROutputDisplayEXT
+vk.unimpl vkReleaseDisplayEXT
+vk.unimpl vkSubmitDebugUtilsMessageEXT
+vk.caps identity=quest vendor=0x5143 device="Adreno (TM) 740"
+vk.caps limits apiVersion=1.3.0 maxVertexOutputComponents=124 maxFragmentInputComponents=124 maxColorAttachments=8 maxComputeWorkGroupInvocations=1024 maxComputeSharedMemorySize=32768 maxImageDimension2D=16384 maxImageArrayLayers=2048 maxPerStageDescriptorStorageBuffers=24 maxPerStageDescriptorStorageImages=8 maxBoundDescriptorSets=7 maxSamplerAnisotropy=16 framebufferColorSampleCounts=0x7 sampledImageColorSampleCounts=0x7
+vk.instance app=deqp engine=deqp api=1.3 exts=0
+vk.format device bc_texture_compression=1
+vk.caps features geometryShader=0 tessellationShader=0 imageCubeArray=1 sampleRateShading=1 fragmentStoresAndAtomics=1 vertexPipelineStoresAndAtomics=1 shaderInt16=1 shaderFloat64=0 shaderStorageImageMultisample=0 shaderClipDistance=1 multiViewport=0 astc=1 etc2=1 bc=1 depthClamp=1 independentBlend=1 dualSrcBlend=1 logicOp=0 multiDrawIndirect=1
+vk.robust app=0 mode=default effective=1
+gpu.cfg frames_in_flight=3
+SGTEST k_cts shape=32x1x1 tid=0: 2d10 2d10 ffffffff | eeee abababab abababab abababab abababab
+SGTEST k_cts shape=32x1x1 tid=1: 2d10 2d10 ffffffff | 2d10 1790 ffffffff aaaaaaaa 1790
+SGTEST k_cts shape=32x1x1 tid=2: 2d10 2d10 ffffffff | eeee abababab abababab abababab abababab
+SGTEST k_cts shape=32x1x1 tid=3: 2d10 2d10 ffffffff | 2d10 1790 ffffffff aaaaaaaa 1790
+SGTEST k_cts shape=32x1x1 tid=31: 2d10 2d10 ffffffff | 2d10 1790 ffffffff aaaaaaaa 1790
+SGTEST k_cts shape=8x1x1 tid=0: e4 e4 ff | eeee abababab abababab abababab abababab
+SGTEST k_cts shape=8x1x1 tid=1: e4 e4 ff | e4 84 ff aa 84
+SGTEST k_cts shape=8x1x1 tid=2: e4 e4 ff | eeee abababab abababab abababab abababab
+SGTEST k_cts shape=8x1x1 tid=3: e4 e4 ff | e4 84 ff aa 84
+SGTEST k_bf shape=32x1x1 tid=0: 0 4 4 | 4 eeee abababab abababab abababab
+SGTEST k_bf shape=32x1x1 tid=1: 0 4 4 | 4 1 7 7 fffffffe
+SGTEST k_bf shape=32x1x1 tid=2: 0 4 4 | 4 1 7 7 fffffffe
+SGTEST k_bf shape=32x1x1 tid=3: 0 4 4 | 4 1 7 7 fffffffe
+SGTEST k_bf shape=32x1x1 tid=31: 0 4 4 | 4 1 7 7 fffffffe
+SGTEST k_bf shape=8x1x1 tid=0: 0 4 4 | 4 eeee abababab abababab abababab
+SGTEST k_bf shape=8x1x1 tid=1: 0 4 4 | 4 1 7 7 fe
+SGTEST k_bf shape=8x1x1 tid=2: 0 4 4 | 4 1 7 7 fe
+SGTEST k_bf shape=8x1x1 tid=3: 0 4 4 | 4 1 7 7 fe
+SGTEST v_a shape=32x1x1 tid=0: 2d10 2d10 ffffffff | eeee abababab abababab abababab abababab
+SGTEST v_a shape=32x1x1 tid=1: 2d10 2d10 ffffffff | 2d10 1790 ffffffff abababab abababab
+SGTEST v_a shape=32x1x1 tid=2: 2d10 2d10 ffffffff | eeee abababab abababab abababab abababab
+SGTEST v_a shape=32x1x1 tid=3: 2d10 2d10 ffffffff | 2d10 1790 ffffffff abababab abababab
+SGTEST v_a shape=32x1x1 tid=31: 2d10 2d10 ffffffff | 2d10 1790 ffffffff abababab abababab
+SGTEST v_a shape=8x1x1 tid=0: e4 e4 ff | eeee abababab abababab abababab abababab
+SGTEST v_a shape=8x1x1 tid=1: e4 e4 ff | e4 84 ff abababab abababab
+SGTEST v_a shape=8x1x1 tid=2: e4 e4 ff | eeee abababab abababab abababab abababab
+SGTEST v_a shape=8x1x1 tid=3: e4 e4 ff | e4 84 ff abababab abababab
+SGTEST v_b shape=32x1x1 tid=0: 2d10 2d10 ffffffff | eeee abababab abababab abababab abababab
+SGTEST v_b shape=32x1x1 tid=1: 2d10 2d10 ffffffff | 2d10 1790 ffffffff abababab abababab
+SGTEST v_b shape=32x1x1 tid=2: 2d10 2d10 ffffffff | eeee abababab abababab abababab abababab
+SGTEST v_b shape=32x1x1 tid=3: 2d10 2d10 ffffffff | 2d10 1790 ffffffff abababab abababab
+SGTEST v_b shape=32x1x1 tid=31: 2d10 2d10 ffffffff | 2d10 1790 ffffffff abababab abababab
+SGTEST v_b shape=8x1x1 tid=0: e4 e4 ff | eeee abababab abababab abababab abababab
+SGTEST v_b shape=8x1x1 tid=1: e4 e4 ff | e4 84 ff abababab abababab
+SGTEST v_b shape=8x1x1 tid=2: e4 e4 ff | eeee abababab abababab abababab abababab
+SGTEST v_b shape=8x1x1 tid=3: e4 e4 ff | e4 84 ff abababab abababab
+SGTEST v_c shape=32x1x1 tid=0: 2d10 2d10 ffffffff | eeee abababab abababab abababab abababab
+SGTEST v_c shape=32x1x1 tid=1: 2d10 2d10 ffffffff | 2d10 1790 ffffffff abababab abababab
+SGTEST v_c shape=32x1x1 tid=2: 2d10 2d10 ffffffff | eeee abababab abababab abababab abababab
+SGTEST v_c shape=32x1x1 tid=3: 2d10 2d10 ffffffff | 2d10 1790 ffffffff abababab abababab
+SGTEST v_c shape=32x1x1 tid=31: 2d10 2d10 ffffffff | 2d10 1790 ffffffff abababab abababab
+SGTEST v_c shape=8x1x1 tid=0: e4 e4 ff | eeee abababab abababab abababab abababab
+SGTEST v_c shape=8x1x1 tid=1: e4 e4 ff | e4 84 ff abababab abababab
+SGTEST v_c shape=8x1x1 tid=2: e4 e4 ff | eeee abababab abababab abababab abababab
+SGTEST v_c shape=8x1x1 tid=3: e4 e4 ff | e4 84 ff abababab abababab
+SGTEST v_d shape=32x1x1 tid=0: 2d10 2d10 ffffffff | eeee abababab abababab abababab abababab
+SGTEST v_d shape=32x1x1 tid=1: 2d10 2d10 ffffffff | 2d10 1790 ffffffff abababab abababab
+SGTEST v_d shape=32x1x1 tid=2: 2d10 2d10 ffffffff | eeee abababab abababab abababab abababab
+SGTEST v_d shape=32x1x1 tid=3: 2d10 2d10 ffffffff | 2d10 1790 ffffffff abababab abababab
+SGTEST v_d shape=32x1x1 tid=31: 2d10 2d10 ffffffff | 2d10 1790 ffffffff abababab abababab
+SGTEST v_d shape=8x1x1 tid=0: e4 e4 ff | eeee abababab abababab abababab abababab
+SGTEST v_d shape=8x1x1 tid=1: e4 e4 ff | e4 84 ff abababab abababab
+SGTEST v_d shape=8x1x1 tid=2: e4 e4 ff | eeee abababab abababab abababab abababab
+SGTEST v_d shape=8x1x1 tid=3: e4 e4 ff | e4 84 ff abababab abababab
+SGTEST v_e shape=32x1x1 tid=0: 2d10 2d10 ffffffff | eeee abababab abababab abababab abababab
+SGTEST v_e shape=32x1x1 tid=1: 2d10 2d10 ffffffff | 1790 1790 aaaaaaaa abababab abababab
+SGTEST v_e shape=32x1x1 tid=2: 2d10 2d10 ffffffff | eeee abababab abababab abababab abababab
+SGTEST v_e shape=32x1x1 tid=3: 2d10 2d10 ffffffff | 1790 1790 aaaaaaaa abababab abababab
+SGTEST v_e shape=32x1x1 tid=31: 2d10 2d10 ffffffff | 1790 1790 aaaaaaaa abababab abababab
+SGTEST v_e shape=8x1x1 tid=0: e4 e4 ff | eeee abababab abababab abababab abababab
+SGTEST v_e shape=8x1x1 tid=1: e4 e4 ff | 84 84 aa abababab abababab
+SGTEST v_e shape=8x1x1 tid=2: e4 e4 ff | eeee abababab abababab abababab abababab
+SGTEST v_e shape=8x1x1 tid=3: e4 e4 ff | 84 84 aa abababab abababab
+SGTEST v_f shape=32x1x1 tid=0: 2d10 2d10 ffffffff | eeee abababab abababab abababab abababab
+SGTEST v_f shape=32x1x1 tid=1: 2d10 2d10 ffffffff | 2d10 1790 ffffffff abababab abababab
+SGTEST v_f shape=32x1x1 tid=2: 2d10 2d10 ffffffff | eeee abababab abababab abababab abababab
+SGTEST v_f shape=32x1x1 tid=3: 2d10 2d10 ffffffff | 2d10 1790 ffffffff abababab abababab
+SGTEST v_f shape=32x1x1 tid=31: 2d10 2d10 ffffffff | 2d10 1790 ffffffff abababab abababab
+SGTEST v_f shape=8x1x1 tid=0: e4 e4 ff | eeee abababab abababab abababab abababab
+SGTEST v_f shape=8x1x1 tid=1: e4 e4 ff | e4 84 ff abababab abababab
+SGTEST v_f shape=8x1x1 tid=2: e4 e4 ff | eeee abababab abababab abababab abababab
+SGTEST v_f shape=8x1x1 tid=3: e4 e4 ff | e4 84 ff abababab abababab
+SGTEST v_g shape=32x1x1 tid=0: 2d10 2d10 ffffffff | eeee abababab abababab abababab abababab
+SGTEST v_g shape=32x1x1 tid=1: 2d10 2d10 ffffffff | 1790 1790 aaaaaaaa abababab abababab
+SGTEST v_g shape=32x1x1 tid=2: 2d10 2d10 ffffffff | eeee abababab abababab abababab abababab
+SGTEST v_g shape=32x1x1 tid=3: 2d10 2d10 ffffffff | 1790 1790 aaaaaaaa abababab abababab
+SGTEST v_g shape=32x1x1 tid=31: 2d10 2d10 ffffffff | 1790 1790 aaaaaaaa abababab abababab
+SGTEST v_g shape=8x1x1 tid=0: e4 e4 ff | eeee abababab abababab abababab abababab
+SGTEST v_g shape=8x1x1 tid=1: e4 e4 ff | 84 84 aa abababab abababab
+SGTEST v_g shape=8x1x1 tid=2: e4 e4 ff | eeee abababab abababab abababab abababab
+SGTEST v_g shape=8x1x1 tid=3: e4 e4 ff | 84 84 aa abababab abababab
+SGTEST v_h shape=32x1x1 tid=0: 2d10 2d10 ffffffff | eeee abababab abababab abababab abababab
+SGTEST v_h shape=32x1x1 tid=1: 2d10 2d10 ffffffff | 2d10 1790 ffffffff abababab abababab
+SGTEST v_h shape=32x1x1 tid=2: 2d10 2d10 ffffffff | eeee abababab abababab abababab abababab
+SGTEST v_h shape=32x1x1 tid=3: 2d10 2d10 ffffffff | 2d10 1790 ffffffff abababab abababab
+SGTEST v_h shape=32x1x1 tid=31: 2d10 2d10 ffffffff | 2d10 1790 ffffffff abababab abababab
+SGTEST v_h shape=8x1x1 tid=0: e4 e4 ff | eeee abababab abababab abababab abababab
+SGTEST v_h shape=8x1x1 tid=1: e4 e4 ff | e4 84 ff abababab abababab
+SGTEST v_h shape=8x1x1 tid=2: e4 e4 ff | eeee abababab abababab abababab abababab
+SGTEST v_h shape=8x1x1 tid=3: e4 e4 ff | e4 84 ff abababab abababab
+gpu.metal.info what=no_residency_set fallback=use_resource error=unknown_error
+gpu.state elide on=1
+gpu.state buf_immutable on=1
+gpu.state full_barriers on=0
+gpu.metal device=Apple_Paravirtual_device simulator=0 metal3=0 apple4=1 apple7=0 argument_buffers_tier=2 bindless=0 stage_timestamps=0 residency=0 archive=0 tile_memory=1
+gpu.hold armed max_ms=1500
+gpu.msaa resolve_on_tile=colour
+gpu.tile heavy_max_draws=2000 heavy_max_vertices=3000000 heavy_mode=on
+vk.translator mode=0 native_fetch=0 amplify=0 unpack_fetch=0 kill_exit=1 id=34
+vk.device exts=10 multiview=0 fdm=0 metal_objects=0
+vk.cfg VPVK_FORCE_ANISO=0 -> anisotropy override off (game's own)
+vk.msaa device_max=4 (supportsTextureSampleCount 8=0 4=1 2=1)
+vk.cfg effective gen=0 fov=off sharp=0.35 periphery=0.50 vpktaa=0 50% sharp=0.50 scale=1.00 taa_native=0 taa_ui_mask=0 rcas=0.00 asw_off=1 quest3=1 anisotropy=0 prewarm=1 force_1x=0 msaa_override=0 msaa_device_max=4 fov_apply=0 fov_active=0 set_by_app=no(defaults)
+vk.unimpl vkAcquireFullScreenExclusiveModeEXT
+vk.unimpl vkAcquireNextImage2KHR
+vk.unimpl vkAcquireNextImageKHR
+vk.unimpl vkAcquirePerformanceConfigurationINTEL
+vk.unimpl vkAcquireProfilingLockKHR
+vk.unimpl vkBindAccelerationStructureMemoryNV
+vk.unimpl vkBindDataGraphPipelineSessionMemoryARM
+vk.unimpl vkBindTensorMemoryARM
+vk.unimpl vkBindVideoSessionMemoryKHR
+vk.unimpl vkBuildAccelerationStructuresKHR
+vk.unimpl vkBuildMicromapsEXT
+vk.unimpl vkCmdBeginConditionalRendering2EXT
+vk.unimpl vkCmdBeginConditionalRenderingEXT
+vk.unimpl vkCmdBeginCustomResolveEXT
+vk.unimpl vkCmdBeginDebugUtilsLabelEXT
+vk.unimpl vkCmdBeginQueryIndexedEXT
+vk.unimpl vkCmdBeginTransformFeedback2EXT
+vk.unimpl vkCmdBeginTransformFeedbackEXT
+vk.unimpl vkCmdBeginVideoCodingKHR
+vk.unimpl vkCmdBindDescriptorBufferEmbeddedSamplers2EXT
+vk.unimpl vkCmdBindDescriptorBufferEmbeddedSamplersEXT
+vk.unimpl vkCmdBindDescriptorBuffersEXT
+vk.unimpl vkCmdBindDescriptorSets2KHR
+vk.unimpl vkCmdBindIndexBuffer2KHR
+vk.unimpl vkCmdBindIndexBuffer3KHR
+vk.unimpl vkCmdBindInvocationMaskHUAWEI
+vk.unimpl vkCmdBindPipelineShaderGroupNV
+vk.unimpl vkCmdBindResourceHeapEXT
+vk.unimpl vkCmdBindSamplerHeapEXT
+vk.unimpl vkCmdBindShadersEXT
+vk.unimpl vkCmdBindShadingRateImageNV
+vk.unimpl vkCmdBindTransformFeedbackBuffers2EXT
+vk.unimpl vkCmdBindTransformFeedbackBuffersEXT
+vk.unimpl vkCmdBindVertexBuffers3KHR
+vk.unimpl vkCmdBuildAccelerationStructureNV
+vk.unimpl vkCmdBuildAccelerationStructuresIndirectKHR
+vk.unimpl vkCmdBuildAccelerationStructuresKHR
+vk.unimpl vkCmdBuildMicromapsEXT
+vk.unimpl vkCmdControlVideoCodingKHR
+vk.unimpl vkCmdConvertCooperativeVectorMatrixNV
+vk.unimpl vkCmdCopyAccelerationStructureKHR
+vk.unimpl vkCmdCopyAccelerationStructureNV
+vk.unimpl vkCmdCopyAccelerationStructureToMemoryKHR
+vk.unimpl vkCmdCopyImageToMemoryKHR
+vk.unimpl vkCmdCopyMemoryIndirectKHR
+vk.unimpl vkCmdCopyMemoryKHR
+vk.unimpl vkCmdCopyMemoryToAccelerationStructureKHR
+vk.unimpl vkCmdCopyMemoryToImageIndirectKHR
+vk.unimpl vkCmdCopyMemoryToImageKHR
+vk.unimpl vkCmdCopyMemoryToMicromapEXT
+vk.unimpl vkCmdCopyMicromapEXT
+vk.unimpl vkCmdCopyMicromapToMemoryEXT
+vk.unimpl vkCmdCopyQueryPoolResultsToMemoryKHR
+vk.unimpl vkCmdCopyTensorARM
+vk.unimpl vkCmdDecodeVideoKHR
+vk.unimpl vkCmdDecompressMemoryEXT
+vk.unimpl vkCmdDecompressMemoryIndirectCountEXT
+vk.unimpl vkCmdDispatchDataGraphARM
+vk.unimpl vkCmdDispatchIndirect2KHR
+vk.unimpl vkCmdDrawClusterHUAWEI
+vk.unimpl vkCmdDrawClusterIndirectHUAWEI
+vk.unimpl vkCmdDrawIndexedIndirect2KHR
+vk.unimpl vkCmdDrawIndexedIndirectCount2KHR
+vk.unimpl vkCmdDrawIndirect2KHR
+vk.unimpl vkCmdDrawIndirectByteCount2EXT
+vk.unimpl vkCmdDrawIndirectByteCountEXT
+vk.unimpl vkCmdDrawIndirectCount2KHR
+vk.unimpl vkCmdDrawMeshTasksEXT
+vk.unimpl vkCmdDrawMeshTasksIndirect2EXT
+vk.unimpl vkCmdDrawMeshTasksIndirectCount2EXT
+vk.unimpl vkCmdDrawMeshTasksIndirectCountEXT
+vk.unimpl vkCmdDrawMeshTasksIndirectCountNV
+vk.unimpl vkCmdDrawMeshTasksIndirectEXT
+vk.unimpl vkCmdDrawMeshTasksIndirectNV
+vk.unimpl vkCmdDrawMeshTasksNV
+vk.unimpl vkCmdEncodeVideoKHR
+vk.unimpl vkCmdEndConditionalRenderingEXT
+vk.unimpl vkCmdEndDebugUtilsLabelEXT
+vk.unimpl vkCmdEndQueryIndexedEXT
+vk.unimpl vkCmdEndRendering2KHR
+vk.unimpl vkCmdEndRendering2EXT
+vk.unimpl vkCmdEndTransformFeedback2EXT
+vk.unimpl vkCmdEndTransformFeedbackEXT
+vk.unimpl vkCmdEndVideoCodingKHR
+vk.unimpl vkCmdExecuteGeneratedCommandsEXT
+vk.unimpl vkCmdExecuteGeneratedCommandsNV
+vk.unimpl vkCmdFillMemoryKHR
+vk.unimpl vkCmdInsertDebugUtilsLabelEXT
+vk.unimpl vkCmdPreprocessGeneratedCommandsEXT
+vk.unimpl vkCmdPreprocessGeneratedCommandsNV
+vk.unimpl vkCmdPushConstants2KHR
+vk.unimpl vkCmdPushDataEXT
+vk.unimpl vkCmdPushDescriptorSet2KHR
+vk.unimpl vkCmdPushDescriptorSetWithTemplate2KHR
+vk.unimpl vkCmdSetAlphaToCoverageEnableEXT
+vk.unimpl vkCmdSetAlphaToOneEnableEXT
+vk.unimpl vkCmdSetAttachmentFeedbackLoopEnableEXT
+vk.unimpl vkCmdSetCoarseSampleOrderNV
+vk.unimpl vkCmdSetColorBlendAdvancedEXT
+vk.unimpl vkCmdSetColorBlendEnableEXT
+vk.unimpl vkCmdSetColorBlendEquationEXT
+vk.unimpl vkCmdSetColorWriteEnableEXT
+vk.unimpl vkCmdSetConservativeRasterizationModeEXT
+vk.unimpl vkCmdSetCoverageModulationModeNV
+vk.unimpl vkCmdSetCoverageModulationTableEnableNV
+vk.unimpl vkCmdSetCoverageModulationTableNV
+vk.unimpl vkCmdSetCoverageReductionModeNV
+vk.unimpl vkCmdSetCoverageToColorEnableNV
+vk.unimpl vkCmdSetCoverageToColorLocationNV
+vk.unimpl vkCmdSetDepthBias2EXT
+vk.unimpl vkCmdSetDepthClampEnableEXT
+vk.unimpl vkCmdSetDepthClampRangeEXT
+vk.unimpl vkCmdSetDepthClipEnableEXT
+vk.unimpl vkCmdSetDepthClipNegativeOneToOneEXT
+vk.unimpl vkCmdSetDescriptorBufferOffsets2EXT
+vk.unimpl vkCmdSetDescriptorBufferOffsetsEXT
+vk.unimpl vkCmdSetDiscardRectangleEXT
+vk.unimpl vkCmdSetDiscardRectangleEnableEXT
+vk.unimpl vkCmdSetDiscardRectangleModeEXT
+vk.unimpl vkCmdSetExclusiveScissorEnableNV
+vk.unimpl vkCmdSetExclusiveScissorNV
+vk.unimpl vkCmdSetExtraPrimitiveOverestimationSizeEXT
+vk.unimpl vkCmdSetFragmentShadingRateEnumNV
+vk.unimpl vkCmdSetFragmentShadingRateKHR
+vk.unimpl vkCmdSetLineRasterizationModeEXT
+vk.unimpl vkCmdSetLineStippleKHR
+vk.unimpl vkCmdSetLineStippleEXT
+vk.unimpl vkCmdSetLineStippleEnableEXT
+vk.unimpl vkCmdSetLogicOpEnableEXT
+vk.unimpl vkCmdSetPerformanceMarkerINTEL
+vk.unimpl vkCmdSetPerformanceOverrideINTEL
+vk.unimpl vkCmdSetPerformanceStreamMarkerINTEL
+vk.unimpl vkCmdSetPolygonModeEXT
+vk.unimpl vkCmdSetProvokingVertexModeEXT
+vk.unimpl vkCmdSetRasterizationSamplesEXT
+vk.unimpl vkCmdSetRasterizationStreamEXT
+vk.unimpl vkCmdSetRayTracingPipelineStackSizeKHR
+vk.unimpl vkCmdSetRepresentativeFragmentTestEnableNV
+vk.unimpl vkCmdSetSampleLocationsEXT
+vk.unimpl vkCmdSetSampleLocationsEnableEXT
+vk.unimpl vkCmdSetSampleMaskEXT
+vk.unimpl vkCmdSetShadingRateImageEnableNV
+vk.unimpl vkCmdSetTessellationDomainOriginEXT
+vk.unimpl vkCmdSetVertexInputEXT
+vk.unimpl vkCmdSetViewportShadingRatePaletteNV
+vk.unimpl vkCmdSetViewportSwizzleNV
+vk.unimpl vkCmdSetViewportWScalingEnableNV
+vk.unimpl vkCmdSetViewportWScalingNV
+vk.unimpl vkCmdTraceRaysIndirect2KHR
+vk.unimpl vkCmdTraceRaysIndirectKHR
+vk.unimpl vkCmdTraceRaysKHR
+vk.unimpl vkCmdTraceRaysNV
+vk.unimpl vkCmdUpdateMemoryKHR
+vk.unimpl vkCmdUpdatePipelineIndirectBufferNV
+vk.unimpl vkCmdWriteAccelerationStructuresPropertiesKHR
+vk.unimpl vkCmdWriteAccelerationStructuresPropertiesNV
+vk.unimpl vkCmdWriteBufferMarker2AMD
+vk.unimpl vkCmdWriteBufferMarkerAMD
+vk.unimpl vkCmdWriteMarkerToMemoryAMD
+vk.unimpl vkCmdWriteMicromapsPropertiesEXT
+vk.unimpl vkCompileDeferredNV
+vk.unimpl vkConvertCooperativeVectorMatrixNV
+vk.unimpl vkCopyAccelerationStructureKHR
+vk.unimpl vkCopyAccelerationStructureToMemoryKHR
+vk.unimpl vkCopyMemoryToAccelerationStructureKHR
+vk.unimpl vkCopyMemoryToMicromapEXT
+vk.unimpl vkCopyMicromapEXT
+vk.unimpl vkCopyMicromapToMemoryEXT
+vk.unimpl vkCreateAccelerationStructure2KHR
+vk.unimpl vkCreateAccelerationStructureKHR
+vk.unimpl vkCreateAccelerationStructureNV
+vk.unimpl vkCreateDataGraphPipelineSessionARM
+vk.unimpl vkCreateDataGraphPipelinesARM
+vk.unimpl vkCreateDeferredOperationKHR
+vk.unimpl vkCreateIndirectCommandsLayoutEXT
+vk.unimpl vkCreateIndirectCommandsLayoutNV
+vk.unimpl vkCreateIndirectExecutionSetEXT
+vk.unimpl vkCreateMicromapEXT
+vk.unimpl vkCreatePipelineBinariesKHR
+vk.unimpl vkCreateRayTracingPipelinesKHR
+vk.unimpl vkCreateRayTracingPipelinesNV
+vk.unimpl vkCreateShadersEXT
+vk.unimpl vkCreateSharedSwapchainsKHR
+vk.unimpl vkCreateSwapchainKHR
+vk.unimpl vkCreateTensorARM
+vk.unimpl vkCreateTensorViewARM
+vk.unimpl vkCreateVideoSessionKHR
+vk.unimpl vkCreateVideoSessionParametersKHR
+vk.unimpl vkDeferredOperationJoinKHR
+vk.unimpl vkDestroyAccelerationStructureKHR
+vk.unimpl vkDestroyAccelerationStructureNV
+vk.unimpl vkDestroyDataGraphPipelineSessionARM
+vk.unimpl vkDestroyDeferredOperationKHR
+vk.unimpl vkDestroyIndirectCommandsLayoutEXT
+vk.unimpl vkDestroyIndirectCommandsLayoutNV
+vk.unimpl vkDestroyIndirectExecutionSetEXT
+vk.unimpl vkDestroyMicromapEXT
+vk.unimpl vkDestroyPipelineBinaryKHR
+vk.unimpl vkDestroyShaderEXT
+vk.unimpl vkDestroySwapchainKHR
+vk.unimpl vkDestroyTensorARM
+vk.unimpl vkDestroyTensorViewARM
+vk.unimpl vkDestroyVideoSessionKHR
+vk.unimpl vkDestroyVideoSessionParametersKHR
+vk.unimpl vkDisplayPowerControlEXT
+vk.unimpl vkGetAccelerationStructureBuildSizesKHR
+vk.unimpl vkGetAccelerationStructureDeviceAddressKHR
+vk.unimpl vkGetAccelerationStructureHandleNV
+vk.unimpl vkGetAccelerationStructureMemoryRequirementsNV
+vk.unimpl vkGetAccelerationStructureOpaqueCaptureDescriptorDataEXT
+vk.unimpl vkGetAndroidHardwareBufferPropertiesANDROID
+vk.unimpl vkGetBufferOpaqueCaptureDescriptorDataEXT
+vk.unimpl vkGetCalibratedTimestampsKHR
+vk.unimpl vkGetCalibratedTimestampsEXT
+vk.unimpl vkGetDataGraphPipelineAvailablePropertiesARM
+vk.unimpl vkGetDataGraphPipelinePropertiesARM
+vk.unimpl vkGetDataGraphPipelineSessionBindPointRequirementsARM
+vk.unimpl vkGetDataGraphPipelineSessionMemoryRequirementsARM
+vk.unimpl vkGetDeferredOperationMaxConcurrencyKHR
+vk.unimpl vkGetDeferredOperationResultKHR
+vk.unimpl vkGetDescriptorEXT
+vk.unimpl vkGetDescriptorSetLayoutBindingOffsetEXT
+vk.unimpl vkGetDescriptorSetLayoutSizeEXT
+vk.unimpl vkGetDeviceAccelerationStructureCompatibilityKHR
+vk.unimpl vkGetDeviceFaultInfoEXT
+vk.unimpl vkGetDeviceGroupPresentCapabilitiesKHR
+vk.unimpl vkGetDeviceGroupSurfacePresentModes2EXT
+vk.unimpl vkGetDeviceGroupSurfacePresentModesKHR
+vk.unimpl vkGetDeviceImageSubresourceLayoutKHR
+vk.unimpl vkGetDeviceMicromapCompatibilityEXT
+vk.unimpl vkGetDeviceTensorMemoryRequirementsARM
+vk.unimpl vkGetEncodedVideoSessionParametersKHR
+vk.unimpl vkGetFenceFdKHR
+vk.unimpl vkGetFenceWin32HandleKHR
+vk.unimpl vkGetGeneratedCommandsMemoryRequirementsEXT
+vk.unimpl vkGetGeneratedCommandsMemoryRequirementsNV
+vk.unimpl vkGetImageDrmFormatModifierPropertiesEXT
+vk.unimpl vkGetImageOpaqueCaptureDataEXT
+vk.unimpl vkGetImageOpaqueCaptureDescriptorDataEXT
+vk.unimpl vkGetImageViewOpaqueCaptureDescriptorDataEXT
+vk.unimpl vkGetLatencyTimingsNV
+vk.unimpl vkGetMemoryAndroidHardwareBufferANDROID
+vk.unimpl vkGetMemoryFdKHR
+vk.unimpl vkGetMemoryFdPropertiesKHR
+vk.unimpl vkGetMemoryHostPointerPropertiesEXT
+vk.unimpl vkGetMemoryMetalHandleEXT
+vk.unimpl vkGetMemoryMetalHandlePropertiesEXT
+vk.unimpl vkGetMemoryWin32HandleKHR
+vk.unimpl vkGetMemoryWin32HandlePropertiesKHR
+vk.unimpl vkGetMemoryZirconHandleFUCHSIA
+vk.unimpl vkGetMemoryZirconHandlePropertiesFUCHSIA
+vk.unimpl vkGetMicromapBuildSizesEXT
+vk.unimpl vkGetPastPresentationTimingEXT
+vk.unimpl vkGetPastPresentationTimingGOOGLE
+vk.unimpl vkGetPerformanceParameterINTEL
+vk.unimpl vkGetPipelineBinaryDataKHR
+vk.unimpl vkGetPipelineExecutableInternalRepresentationsKHR
+vk.unimpl vkGetPipelineExecutablePropertiesKHR
+vk.unimpl vkGetPipelineExecutableStatisticsKHR
+vk.unimpl vkGetPipelineIndirectDeviceAddressNV
+vk.unimpl vkGetPipelineIndirectMemoryRequirementsNV
+vk.unimpl vkGetPipelineKeyKHR
+vk.unimpl vkGetPipelinePropertiesEXT
+vk.unimpl vkGetRayTracingCaptureReplayShaderGroupHandlesKHR
+vk.unimpl vkGetRayTracingShaderGroupHandlesKHR
+vk.unimpl vkGetRayTracingShaderGroupHandlesNV
+vk.unimpl vkGetRayTracingShaderGroupStackSizeKHR
+vk.unimpl vkGetRefreshCycleDurationGOOGLE
+vk.unimpl vkGetRenderingAreaGranularityKHR
+vk.unimpl vkGetSamplerOpaqueCaptureDescriptorDataEXT
+vk.unimpl vkGetScreenBufferPropertiesQNX
+vk.unimpl vkGetSemaphoreFdKHR
+vk.unimpl vkGetSemaphoreWin32HandleKHR
+vk.unimpl vkGetSemaphoreZirconHandleFUCHSIA
+vk.unimpl vkGetShaderBinaryDataEXT
+vk.unimpl vkGetShaderModuleCreateInfoIdentifierEXT
+vk.unimpl vkGetShaderModuleIdentifierEXT
+vk.unimpl vkGetSwapchainCounterEXT
+vk.unimpl vkGetSwapchainImagesKHR
+vk.unimpl vkGetSwapchainStatusKHR
+vk.unimpl vkGetSwapchainTimeDomainPropertiesEXT
+vk.unimpl vkGetSwapchainTimingPropertiesEXT
+vk.unimpl vkGetTensorMemoryRequirementsARM
+vk.unimpl vkGetTensorOpaqueCaptureDataARM
+vk.unimpl vkGetTensorOpaqueCaptureDescriptorDataARM
+vk.unimpl vkGetTensorViewOpaqueCaptureDescriptorDataARM
+vk.unimpl vkGetVideoSessionMemoryRequirementsKHR
+vk.unimpl vkImportFenceFdKHR
+vk.unimpl vkImportFenceWin32HandleKHR
+vk.unimpl vkImportSemaphoreFdKHR
+vk.unimpl vkImportSemaphoreWin32HandleKHR
+vk.unimpl vkImportSemaphoreZirconHandleFUCHSIA
+vk.unimpl vkInitializePerformanceApiINTEL
+vk.unimpl vkLatencySleepNV
+vk.unimpl vkMapMemory2KHR
+vk.unimpl vkQueueBeginDebugUtilsLabelEXT
+vk.unimpl vkQueueBindSparse
+vk.unimpl vkQueueEndDebugUtilsLabelEXT
+vk.unimpl vkQueueInsertDebugUtilsLabelEXT
+vk.unimpl vkQueueNotifyOutOfBandNV
+vk.unimpl vkQueuePresentKHR
+vk.unimpl vkQueueSetPerformanceConfigurationINTEL
+vk.unimpl vkRegisterCustomBorderColorEXT
+vk.unimpl vkRegisterDeviceEventEXT
+vk.unimpl vkRegisterDisplayEventEXT
+vk.unimpl vkReleaseCapturedPipelineDataKHR
+vk.unimpl vkReleaseFullScreenExclusiveModeEXT
+vk.unimpl vkReleasePerformanceConfigurationINTEL
+vk.unimpl vkReleaseProfilingLockKHR
+vk.unimpl vkReleaseSwapchainImagesKHR
+vk.unimpl vkReleaseSwapchainImagesEXT
+vk.unimpl vkSetDebugUtilsObjectNameEXT
+vk.unimpl vkSetDebugUtilsObjectTagEXT
+vk.unimpl vkSetDeviceMemoryPriorityEXT
+vk.unimpl vkSetHdrMetadataEXT
+vk.unimpl vkSetLatencyMarkerNV
+vk.unimpl vkSetLatencySleepModeNV
+vk.unimpl vkSetSwapchainPresentTimingQueueSizeEXT
+vk.unimpl vkUninitializePerformanceApiINTEL
+vk.unimpl vkUnmapMemory2KHR
+vk.unimpl vkUnregisterCustomBorderColorEXT
+vk.unimpl vkUpdateIndirectExecutionSetPipelineEXT
+vk.unimpl vkUpdateIndirectExecutionSetShaderEXT
+vk.unimpl vkUpdateVideoSessionParametersKHR
+vk.unimpl vkWaitForPresent2KHR
+vk.unimpl vkWaitForPresentKHR
+vk.unimpl vkWriteAccelerationStructuresPropertiesKHR
+vk.unimpl vkWriteMicromapsPropertiesEXT
+vk.unimpl vkWriteResourceDescriptorsEXT
+vk.unimpl vkWriteSamplerDescriptorsEXT
+
+Test case 'dEQP-VK.subgroups.arithmetic.compute.subgroupadd_uint'..
+gpu.shader.lib compiled=1 dedup=0 prewarmed=0 ms_total=38 ms_max=38 last_ms=38 bytes=790 wait_ms=0 src=demand
+gpu.pso.hot label=vk.indirect_patch ms=11
+gpu.pso.miss n=1 kind=compute label=vk.indirect_patch key=5739658356830076479 ms=11
+gpu.pso.aot archived=0 hot=1 hot_ms_total=11 hot_ms_max=11
+vk.pso.census created=1 compiled=1 failed=0 timed_out=0 archived=0 not_archived_depth_only=0 not_archived_other=0 archive_hits=0 compiled_in_session=1 archive_dup=0 archive_pending=0 archive_spilled=0
+gpu.shader.lib index=0
+gpu.shader.lib miss id=d4e5901cc9d81af8
+gpu.shader.lib hit=0 miss=1 recipe_hit=0
+gpu.shader.key stage=compute views=1 specs=3 slots=2 src=d4e5901cc9d81af8 bytes=6010 args=b0,b1,bs0,bs1 wg=32,1,1 colors=0x0
+gpu.shader.mem id=5b0ad3d805465c08 stage=compute pipe=vk.comp1 slots=10 bytes=160 dyn_slots=0 dyn_bytes=0 loops=2
+gpu.shader.lib miss id=1fc0468aec2a9d5a
+gpu.shader.lib hit=0 miss=2 recipe_hit=0
+gpu.shader.msl translated=1 ms_total=11 ms_max=10.6
+gpu.shader.key stage=compute views=1 specs=3 slots=2 src=1fc0468aec2a9d5a bytes=5963 args=b0,b1,bs0,bs1 wg=1,1,1 colors=0x0
+gpu.shader.mem id=e4957288a7a4d29a stage=compute pipe=vk.comp0 slots=10 bytes=160 dyn_slots=0 dyn_bytes=0 loops=2
+gpu.shader.msl translated=2 ms_total=22 ms_max=11.3
+gpu.shader.lib miss id=95b4fe030739149c
+gpu.shader.lib hit=0 miss=3 recipe_hit=0
+gpu.shader.key stage=compute views=1 specs=3 slots=2 src=95b4fe030739149c bytes=6010 args=b0,b1,bs0,bs1 wg=1,32,1 colors=0x0
+gpu.shader.mem id=883baceb9636c8cc stage=compute pipe=vk.comp2 slots=10 bytes=160 dyn_slots=0 dyn_bytes=0 loops=2
+gpu.shader.msl translated=3 ms_total=22 ms_max=11.3
+gpu.shader.lib miss id=ce9b9658864f7bf0
+gpu.shader.lib hit=0 miss=4 recipe_hit=0
+gpu.shader.key stage=compute views=1 specs=3 slots=2 src=ce9b9658864f7bf0 bytes=6010 args=b0,b1,bs0,bs1 wg=1,1,32 colors=0x0
+gpu.shader.mem id=376b0161d778c540 stage=compute pipe=vk.comp3 slots=10 bytes=160 dyn_slots=0 dyn_bytes=0 loops=2
+gpu.shader.msl translated=4 ms_total=23 ms_max=11.3
+gpu.shader.lib miss id=12fca303bc5500e5
+gpu.shader.lib hit=0 miss=5 recipe_hit=0
+gpu.shader.key stage=compute views=1 specs=3 slots=2 src=12fca303bc5500e5 bytes=6011 args=b0,b1,bs0,bs1 wg=32,4,1 colors=0x0
+gpu.shader.mem id=8fc13e9f7ec9ee55 stage=compute pipe=vk.comp4 slots=10 bytes=160 dyn_slots=0 dyn_bytes=0 loops=2
+gpu.shader.lib miss id=b47a58f438aa02ff
+gpu.shader.lib hit=0 miss=6 recipe_hit=0
+gpu.shader.key stage=compute views=1 specs=3 slots=2 src=b47a58f438aa02ff bytes=6011 args=b0,b1,bs0,bs1 wg=1,4,32 colors=0x0
+gpu.shader.mem id=32378af4f6ec2d2f stage=compute pipe=vk.comp5 slots=10 bytes=160 dyn_slots=0 dyn_bytes=0 loops=2
+gpu.shader.lib miss id=5d31206da358600f
+gpu.shader.lib hit=0 miss=7 recipe_hit=0
+gpu.shader.mem id=cfa5d881e226d63f stage=compute pipe=vk.comp6 slots=10 bytes=160 dyn_slots=0 dyn_bytes=0 loops=2
+gpu.shader.lib compiled=2 dedup=0 prewarmed=0 ms_total=109 ms_max=72 last_ms=72 bytes=6010 wait_ms=0 src=prewarm
+gpu.shader.lib compiled=3 dedup=1 prewarmed=1 ms_total=183 ms_max=74 last_ms=74 bytes=5963 wait_ms=0 src=demand
+gpu.pso.hot label=vk.comp1 ms=24
+gpu.pso.miss n=2 kind=compute label=vk.comp1 key=31933246641323409 ms=23
+gpu.pso.aot archived=0 hot=2 hot_ms_total=35 hot_ms_max=24
+gpu.pso.hot label=vk.comp0 ms=35
+gpu.pso.miss n=3 kind=compute label=vk.comp0 key=7465885500395585812 ms=35
+gpu.pso.aot archived=0 hot=3 hot_ms_total=70 hot_ms_max=35
+vk.pipeline_wait what=persistent_target submit=1 pipelines=1 ms=105 complete=1 budget_ms=120000 pending_draws_by_dest{eye=0 no_color=0 transient_rt=0 persistent_rt=0 eye_sized_not_marked=0}
+gpu.shader.lib compiled=4 dedup=1 prewarmed=1 ms_total=197 ms_max=74 last_ms=14 bytes=6010 wait_ms=0 src=demand
+gpu.pso.hot label=vk.comp2 ms=18
+gpu.pso.miss n=4 kind=compute label=vk.comp2 key=6470389480096211670 ms=17
+gpu.pso.aot archived=0 hot=4 hot_ms_total=88 hot_ms_max=35
+gpu.frame f=0 enc=1 render=0 compute=1 naive=1 passes=0 merged=0 hoisted=0 sunk=0 dropped=0 barriers=0 intra=0 raw=0 war=0 waw=0 tile_local=0 tile_rejected=0 saved_mb=0.0 split=0 verts=0 tile_max=3000000 heavy_enc=0 cpu_ms=2.967
+gpu.cut f=0 FrameStart=0 AttachmentChange=0 ClearLoad=0 Feedback=0 TileBudget=0 PinnedCopy=0 ComputeBetween=0 ComputeWork=1 CopyWork=0 ViewSplit=0 TileSplit=0
+gpu.pso f=0 compiled=4 failed=0 hits=0 misses=8 ms=297.48 max_ms=108.92
+gpu.enc f=0 i=0 kind=compute reason=ComputeWork cmds=1 label=vk.comp0
+vk.submit n=1 cbs=1 passes=0 draws=0 dispatches=1 copies=0 clears=0 vk_barriers=1 draws_skipped=0 dispatch_skipped=0 dropped=0
+gpu.pso.hot label=vk.comp3 ms=13
+gpu.pso.miss n=5 kind=compute label=vk.comp3 key=17672852671042496192 ms=13
+gpu.pso.aot archived=0 hot=5 hot_ms_total=101 hot_ms_max=35
+gpu.slowcb f=0 ms=12.9 draws=0 passes=1 est_cost=0 label=vpgpu.f0
+gpu.frame f=1 enc=1 render=0 compute=1 naive=1 passes=0 merged=0 hoisted=0 sunk=0 dropped=0 barriers=0 intra=0 raw=0 war=0 waw=0 tile_local=0 tile_rejected=0 saved_mb=0.0 split=0 verts=0 tile_max=3000000 heavy_enc=0 cpu_ms=0.016
+gpu.cut f=1 FrameStart=0 AttachmentChange=0 ClearLoad=0 Feedback=0 TileBudget=0 PinnedCopy=0 ComputeBetween=0 ComputeWork=1 CopyWork=0 ViewSplit=0 TileSplit=0
+gpu.pso f=1 compiled=1 failed=0 hits=0 misses=0 ms=34.73 max_ms=34.73
+gpu.time f=0 gpu_ms=12.943 t=1112.1
+vk.submit n=2 cbs=1 passes=0 draws=0 dispatches=1 copies=0 clears=0 vk_barriers=1 draws_skipped=0 dispatch_skipped=0 dropped=0
+gpu.frame f=2 enc=1 render=0 compute=1 naive=1 passes=0 merged=0 hoisted=0 sunk=0 dropped=0 barriers=0 intra=0 raw=0 war=0 waw=0 tile_local=0 tile_rejected=0 saved_mb=0.0 split=0 verts=0 tile_max=3000000 heavy_enc=0 cpu_ms=0.008
+gpu.cut f=2 FrameStart=0 AttachmentChange=0 ClearLoad=0 Feedback=0 TileBudget=0 PinnedCopy=0 ComputeBetween=0 ComputeWork=1 CopyWork=0 ViewSplit=0 TileSplit=0
+gpu.time f=1 gpu_ms=1.651 t=1115.0
+vk.submit n=3 cbs=1 passes=0 draws=0 dispatches=1 copies=0 clears=0 vk_barriers=1 draws_skipped=0 dispatch_skipped=0 dropped=0
+gpu.pso.hot label=vk.comp4 ms=14
+gpu.pso.miss n=6 kind=compute label=vk.comp4 key=9965073497101518395 ms=14
+gpu.pso.aot archived=0 hot=6 hot_ms_total=116 hot_ms_max=35
+gpu.slowcb f=2 ms=11.9 draws=0 passes=1 est_cost=0 label=vpgpu.f2
+gpu.frame f=3 enc=1 render=0 compute=1 naive=1 passes=0 merged=0 hoisted=0 sunk=0 dropped=0 barriers=0 intra=0 raw=0 war=0 waw=0 tile_local=0 tile_rejected=0 saved_mb=0.0 split=0 verts=0 tile_max=3000000 heavy_enc=0 cpu_ms=0.008
+gpu.cut f=3 FrameStart=0 AttachmentChange=0 ClearLoad=0 Feedback=0 TileBudget=0 PinnedCopy=0 ComputeBetween=0 ComputeWork=1 CopyWork=0 ViewSplit=0 TileSplit=0
+gpu.pso f=3 compiled=1 failed=0 hits=0 misses=0 ms=36.13 max_ms=36.13
+gpu.time f=2 gpu_ms=11.866 t=1129.9
+gpu.frame f=4 enc=1 render=0 compute=1 naive=1 passes=0 merged=0 hoisted=0 sunk=0 dropped=0 barriers=0 intra=0 raw=0 war=0 waw=0 tile_local=0 tile_rejected=0 saved_mb=0.0 split=0 verts=0 tile_max=3000000 heavy_enc=0 cpu_ms=0.007
+gpu.cut f=4 FrameStart=0 AttachmentChange=0 ClearLoad=0 Feedback=0 TileBudget=0 PinnedCopy=0 ComputeBetween=0 ComputeWork=1 CopyWork=0 ViewSplit=0 TileSplit=0
+gpu.time f=3 gpu_ms=1.025 t=1131.3
+gpu.pso.hot label=vk.comp5 ms=15
+gpu.pso.miss n=7 kind=compute label=vk.comp5 key=4103881677796117235 ms=15
+gpu.pso.aot archived=0 hot=7 hot_ms_total=131 hot_ms_max=35
+vk.pipeline_wait what=persistent_target submit=6 pipelines=1 ms=13 complete=1 budget_ms=120000 pending_draws_by_dest{eye=0 no_color=0 transient_rt=0 persistent_rt=0 eye_sized_not_marked=0}
+gpu.frame f=5 enc=1 render=0 compute=1 naive=1 passes=0 merged=0 hoisted=0 sunk=0 dropped=0 barriers=0 intra=0 raw=0 war=0 waw=0 tile_local=0 tile_rejected=0 saved_mb=0.0 split=0 verts=0 tile_max=3000000 heavy_enc=0 cpu_ms=0.008
+gpu.cut f=5 FrameStart=0 AttachmentChange=0 ClearLoad=0 Feedback=0 TileBudget=0 PinnedCopy=0 ComputeBetween=0 ComputeWork=1 CopyWork=0 ViewSplit=0 TileSplit=0
+gpu.pso f=5 compiled=1 failed=0 hits=0 misses=0 ms=35.24 max_ms=35.24
+gpu.time f=4 gpu_ms=0.865 t=1145.4
+gpu.pso.hot label=vk.comp6 ms=20
+gpu.pso.miss n=8 kind=compute label=vk.comp6 key=11562207540903771918 ms=19
+gpu.pso.aot archived=0 hot=8 hot_ms_total=151 hot_ms_max=35
+vk.pipeline_wait what=persistent_target submit=7 pipelines=1 ms=25 complete=1 budget_ms=120000 pending_draws_by_dest{eye=0 no_color=0 transient_rt=0 persistent_rt=0 eye_sized_not_marked=0}
+gpu.frame f=6 enc=1 render=0 compute=1 naive=1 passes=0 merged=0 hoisted=0 sunk=0 dropped=0 barriers=0 intra=0 raw=0 war=0 waw=0 tile_local=0 tile_rejected=0 saved_mb=0.0 split=0 verts=0 tile_max=3000000 heavy_enc=0 cpu_ms=0.020
+gpu.cut f=6 FrameStart=0 AttachmentChange=0 ClearLoad=0 Feedback=0 TileBudget=0 PinnedCopy=0 ComputeBetween=0 ComputeWork=1 CopyWork=0 ViewSplit=0 TileSplit=0
+gpu.pso f=6 compiled=1 failed=0 hits=0 misses=0 ms=42.32 max_ms=42.32
+gpu.time f=5 gpu_ms=1.633 t=1172.4
+  Fail (Failed!)
+vk.boot_summary final=1 t_s=0 mode=async translator=b13.l11.e9.d1 | stages cached=0 translated=7 translate_ms=24 miss{new_content=0 new_options=0 lower=0 emit=0 driver=0 baseline=0 no_msl=0 uncached=7} | pso compiled=8 failed=0 hits=0 compile_ms=446 max_ms=109 ar_hits=0 ar_misses=8 ar_files=0 ar_keyed=0 ar_evicted=0 reason=new_pipelines | pipelines created=7 async=7 | draws_skipped=0 skip_frames=0 | blocked_ms{create=0 record=13 gate=143} record_waits=1 record_timeouts=0 hard_waits=3 hard_timeouts=0 indirect_patch_fb=0
+vk.pso.census created=7 compiled=8 failed=0 timed_out=0 archived=0 not_archived_depth_only=0 not_archived_other=0 archive_hits=0 compiled_in_session=8 archive_dup=0 archive_pending=0 archive_spilled=0
+
+DONE!
+
+Test run totals:
+  Passed:        0/1 (0.0%)
+  Failed:        1/1 (100.0%)
+  Not supported: 0/1 (0.0%)
+  Warnings:      0/1 (0.0%)
+  Waived:        0/1 (0.0%)
