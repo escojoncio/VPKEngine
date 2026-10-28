@@ -32,6 +32,7 @@ struct PpResult {
     std::set<std::string> extensions;  // enabled / required / warned
     int numViews = 0;                  // not set here (layout); kept for symmetry
     bool ok = true;
+    std::vector<std::string> lenient;  // strict-mode rules let through (see ParseResult::lenient)
 };
 
 PpResult runPreprocessor(const std::string& source, Stage stage, std::string& log);

@@ -54,6 +54,9 @@ struct Variable {
     // Samplers and images: the texture / image unit declared with layout(binding = N), -1 = none
     // (the program must start with that unit as the uniform's value).
     int unit = -1;
+    // Uniforms: the location of element 0 (consecutive for the elements and for the leaves of a struct), explicit from
+    // layout(location = N) or the lowest free one; -1 for atomic counters (they have none) and non-uniforms.
+    int uniformLocation = -1;
     // Atomic counters (glType GL_UNSIGNED_INT_ATOMIC_COUNTER): the GL buffer binding point they live
     // at (their byte offset in it is `offset`); -1 for every other variable. They have no place in
     // the default uniform block.
@@ -111,6 +114,9 @@ struct ParseResult {
     std::shared_ptr<Shader> shader;  // null when compilation failed
     std::string log;                 // info log (errors and warnings)
     int version = 100;
+    // Strict-mode rules the shader breaks that lenient mode (the default) let through: one entry per rule, in
+    // order of appearance. Empty in strict mode (they were errors) and for conforming shaders.
+    std::vector<std::string> lenient;
 };
 
 // Preprocesses, parses and type-checks one shader source (the concatenated glShaderSource strings).
@@ -126,6 +132,7 @@ struct LinkResult {
     // Diagnostic, empty unless a fragment input is unwritten or its varying fails to link:
     // "vs_out=[name@location ...] fs_in=[name@location!why ...]" (location "-" = none declared).
     std::string varyingDiag;
+    std::vector<std::string> lenient;  // see ParseResult::lenient (link-time rules)
     std::vector<uint32_t> vertexSpirv, fragmentSpirv, computeSpirv;
     Reflection reflection;
 };
@@ -145,6 +152,14 @@ struct Caps {
 };
 void setCaps(const Caps& caps);  // process-wide, set before compiling
 Caps caps();
+
+// Strict GLSL: the compiler of a real driver (Adreno on the headset) is lenient and games ship shaders a strict
+// compiler rejects, so every "this must not compile" rule of the language that is not needed to generate code is
+// gated: strict mode (VPGLES_STRICT_GLSL=1 in the environment, read once; the conformance CI sets it) makes it an
+// error, lenient mode (the default, games) accepts the shader and records the rule in ParseResult::lenient /
+// LinkResult::lenient. setStrictMode overrides the environment: 1 strict, 0 lenient, -1 back to the environment.
+bool strictMode();
+void setStrictMode(int mode);
 
 // Preprocessor only (exposed for tests): the token text after macro expansion, one space between
 // tokens and a newline per source line kept.

@@ -521,6 +521,7 @@ bool Context::linkShaders(Program& p, Shader* vs, Shader* fs, Shader* cs) {
     }
     p.log = lr.log;
     p.varyingDiag = lr.varyingDiag;
+    logLenient(lr.lenient, "program", p.name);
     if (!lr.ok) return false;
     p.refl = lr.reflection;
     auto module = [&](const std::vector<uint32_t>& w) {
@@ -566,7 +567,10 @@ bool Context::linkShaders(Program& p, Shader* vs, Shader* fs, Shader* cs) {
     p.samplerUnits.assign(p.refl.uniforms.size(), {});
     for (size_t i = 0; i < p.refl.uniforms.size(); ++i) {
         const auto& u = p.refl.uniforms[i];
-        for (int e = 0; e < u.arraySize; ++e) p.locations.push_back({int(i), e});
+        if (u.uniformLocation >= 0) {
+            if (p.locations.size() < size_t(u.uniformLocation + u.arraySize)) p.locations.resize(size_t(u.uniformLocation + u.arraySize), {-1, 0});
+            for (int e = 0; e < u.arraySize; ++e) p.locations[size_t(u.uniformLocation + e)] = {int(i), e};
+        }
         if (u.binding >= 0) {
             // layout(binding = N) gives the initial unit (consecutive for arrays).
             p.samplerUnits[i].assign(size_t(u.arraySize), 0);
@@ -599,12 +603,10 @@ static GLint locationOf(const Program& p, const std::string& name) {
         element = std::atoi(base.c_str() + lb + 1);
         base = base.substr(0, lb);
     }
-    GLint loc = 0;
     for (const auto& u : p.refl.uniforms) {
         std::string un = u.name;
         if (u.isArray && un.size() > 3 && un.compare(un.size() - 3, 3, "[0]") == 0) un.resize(un.size() - 3);
-        if (un == base && element < u.arraySize && (element == 0 || u.isArray)) return loc + element;
-        loc += u.arraySize;
+        if (un == base && element < u.arraySize && (element == 0 || u.isArray)) return u.uniformLocation < 0 ? -1 : u.uniformLocation + element;
     }
     return -1;
 }
@@ -672,6 +674,10 @@ void Context::setUniform(GLint location, int comps, Kind kind, GLsizei count, co
         return setError(gl::INVALID_OPERATION);
     }
     const Program::Loc loc = p->locations[size_t(location)];
+    if (loc.uniform < 0) {  // a gap between explicit locations
+        logUniformErr(nullptr, location, count, comps, cols, isInt, isUint, "location_unused");
+        return setError(gl::INVALID_OPERATION);
+    }
     const vpglsl::Variable& u = p->refl.uniforms[size_t(loc.uniform)];
     auto note = [&](const char* reason) { logUniformErr(&u, location, count, comps, cols, isInt, isUint, reason, loc.element); };
     if (count > 1 && !u.isArray) return note("count_on_non_array"), setError(gl::INVALID_OPERATION);
@@ -759,6 +765,7 @@ void Context::setUniform(GLint location, int comps, Kind kind, GLsizei count, co
 void Context::getUniform(Program& p, GLint location, void* out, Kind kind) {
     if (location < 0 || size_t(location) >= p.locations.size()) return setError(gl::INVALID_OPERATION);
     const Program::Loc loc = p.locations[size_t(location)];
+    if (loc.uniform < 0) return setError(gl::INVALID_OPERATION);
     const vpglsl::Variable& u = p.refl.uniforms[size_t(loc.uniform)];
     if (u.binding >= 0) {
         GLint unit = p.samplerUnits[size_t(loc.uniform)][size_t(loc.element)];

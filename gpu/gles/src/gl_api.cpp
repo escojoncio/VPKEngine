@@ -2323,6 +2323,7 @@ void CompileShader(GLuint n) {
     s->compiled = r.shader != nullptr;
     if (s->compiled) s->compiledSource = s->source;  // the same object: no second copy of the text
     s->log = r.log;
+    logLenient(r.lenient, "shader", n);
     if (!s->compiled) logf("gles.shader compile_failed name=%u log=%s", n, r.log.c_str());
 }
 void GetShaderiv(GLuint n, GLenum p, GLint* v) {
@@ -2870,9 +2871,7 @@ const std::string* resourceName(const Program& p, GLenum iface, GLuint i) {
     }
 }
 GLint locationBase(const Program& p, GLuint uniformIndex) {  // first location of default-block uniform `uniformIndex`
-    GLint loc = 0;
-    for (GLuint i = 0; i < uniformIndex; ++i) loc += p.refl.uniforms[i].arraySize;
-    return loc;
+    return p.refl.uniforms[uniformIndex].uniformLocation;
 }
 std::string stripSubscripts(std::string n) {
     while (!n.empty() && n.back() == ']') {

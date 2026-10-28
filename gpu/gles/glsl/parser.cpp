@@ -30,6 +30,9 @@ struct Qual {
     bool std430 = false, std140 = false, rowMajor = false, colMajor = false, earlyFragmentTests = false;
     uint8_t mem = 0;     // MemQual
     uint8_t ifmt = 0;    // image format layout qualifier (SPIR-V ImageFormat)
+    uint8_t prec = 0;    // precision qualifier: 1 lowp, 2 mediump, 3 highp
+    uint8_t packing = 0; // layout(shared|packed|std140|std430): 1 shared, 2 packed, 3 std140, 4 std430
+    bool layoutOther = false;  // a layout id other than row_major / column_major
     bool any() const {
         return isConst || uniform || in || out || inout || attribute || varying || centroid || flat || smooth ||
                invariant || shared || buffer || location >= 0 || binding >= 0 || mem != 0;
@@ -55,6 +58,7 @@ public:
                     // Prototype without a definition is only an error when called; checked at link.
                 }
             if (!sh_->main()) throw ParseError(0, "missing main()");
+            checkRecursion();
             if (stage_ == Stage::Compute) {
                 if (pp_.version < 310) throw ParseError(0, "compute shaders need #version 310 es");
                 if (!sh_->hasLocalSize) throw ParseError(0, "compute shaders must declare layout(local_size_x...) in");
@@ -70,6 +74,21 @@ public:
     }
 
 private:
+    // Recursion (static, not even through a chain of calls) cannot be compiled: SPIR-V forbids it and the hardware has
+    // no stack. Always an error, in lenient mode too.
+    void checkRecursion() {
+        std::map<Function*, int> state;  // 1 on the DFS stack, 2 done
+        std::function<void(Function*)> visit = [&](Function* f) {
+            state[f] = 1;
+            for (Function* c : callGraph_[f]) {
+                if (state[c] == 1) throw ParseError(0, "'" + c->name + "' : recursion is not allowed");
+                if (state[c] == 0) visit(c);
+            }
+            state[f] = 2;
+        };
+        if (Function* m = sh_->main()) visit(m);
+    }
+
     // ---- tokens ---------------------------------------------------------------------------------
     const Token& peek(size_t k = 0) const {
         size_t i = std::min(pos_ + k, pp_.tokens.size() - 1);
@@ -92,6 +111,12 @@ private:
     }
     [[noreturn]] void err(const std::string& m) const { throw ParseError(peek().line, m); }
     [[noreturn]] void errAt(int line, const std::string& m) const { throw ParseError(line, m); }
+    // A rule of the language that a lenient driver lets through (see strictMode()): an error in strict mode, otherwise
+    // noted in lenient_ and ignored. Code after it must be valid whether or not the shader broke the rule.
+    void strictAt(const char* rule, int line, const std::string& m) {
+        if (strictMode()) errAt(line, m);
+        if (std::find(lenient_.begin(), lenient_.end(), rule) == lenient_.end()) lenient_.push_back(rule);
+    }
     bool es3() const { return pp_.version >= 300; }
 
     // ---- scopes ---------------------------------------------------------------------------------
@@ -119,7 +144,7 @@ private:
         return nullptr;
     }
     // Keywords and reserved words cannot name anything the shader declares (GLSL ES 1.00 / 3.00 / 3.10 spec, "Keywords").
-    void checkName(const std::string& n, int line) const {
+    void checkName(const std::string& n, int line) {
         static const std::set<std::string> kw100 = {
             "attribute", "const", "uniform", "varying", "break", "continue", "do", "for", "while", "if", "else", "in", "out", "inout",
             "float", "int", "void", "bool", "true", "false", "lowp", "mediump", "highp", "precision", "invariant", "discard", "return",
@@ -153,8 +178,8 @@ private:
             "usampler2DMSArray", "sizeof", "cast", "namespace", "using"};
         const bool bad = es3() ? (kw300.count(n) != 0 || (pp_.version >= 310 && (n == "buffer" || n == "shared")))
                                : (kw100.count(n) != 0 || n.find("__") != std::string::npos);
-        if (bad) errAt(line, "'" + n + "' : reserved word or keyword used as an identifier");
-        if (n.size() > 1024) errAt(line, "'" + n.substr(0, 16) + "...' : identifier too long");
+        if (bad) strictAt("keyword_as_identifier", line, "'" + n + "' : reserved word or keyword used as an identifier");
+        if (n.size() > 1024) strictAt("identifier_length", line, "'" + n.substr(0, 16) + "...' : identifier too long");
     }
     void declare(Symbol* s, int line) {
         if (s->storage != Storage::Builtin) checkName(s->name, line);
@@ -162,6 +187,9 @@ private:
             errAt(line, "'" + s->name + "' : identifiers starting with \"gl_\" are reserved");
         auto& v = scopes_.back().vars;
         if (v.count(s->name)) errAt(line, "'" + s->name + "' : redefinition");
+        if (s->storage != Storage::Builtin && !s->name.empty() &&
+            (scopes_.back().structs.count(s->name) || (scopes_.size() == 2 && (functions_.count(s->name) || blockNames_.count(s->name)))))
+            strictAt("name_conflict", line, "'" + s->name + "' : name already used");
         v[s->name] = s;
     }
 
@@ -175,7 +203,7 @@ private:
     void builtinConst(const char* name, int v) {
         Symbol* s = sh_->newSymbol();
         s->name = name, s->type = Type::make(Base::Int), s->storage = Storage::Const;
-        s->hasConst = true, s->constI = v, s->constF = v;
+        s->hasConst = true, s->constI = v, s->constF = v, s->constant = true;
         scopes_.back().vars[name] = s;
     }
     void declareBuiltins() {
@@ -259,6 +287,23 @@ private:
 
     // ---- types ----------------------------------------------------------------------------------
     static bool precisionWord(const std::string& s) { return s == "highp" || s == "mediump" || s == "lowp"; }
+    static uint8_t precisionOf(const std::string& s) { return s == "highp" ? 3 : s == "mediump" ? 2 : 1; }
+    // The precision a declaration gets: its own qualifier, else the type's (`mediump float`), else the default in force
+    // (`precision` statements; the built-in ones: sampler2D and samplerCube lowp, vertex float / int highp, fragment int mediump).
+    uint8_t effectivePrecision(uint8_t qualifier, uint8_t typeWord, const Type& t) const {
+        if (qualifier) return qualifier;
+        if (typeWord) return typeWord;
+        std::string key;
+        if (t.base == Base::Float) key = "float";
+        else if (t.base == Base::Int || t.base == Base::Uint) key = "int";
+        else if (t.base == Base::Sampler) key = t.str();
+        else return 0;
+        auto it = defaultPrec_.find(key);
+        if (it != defaultPrec_.end()) return it->second;
+        if (key == "sampler2D" || key == "samplerCube") return 1;
+        if (key == "float" || key == "int") return stage_ == Stage::Vertex ? 3 : key == "int" ? 2 : 0;
+        return 0;
+    }
 
     std::optional<Type> basicType(const std::string& n) const {
         static const std::map<std::string, Type> kTypes = [] {
@@ -373,17 +418,30 @@ private:
     static int imageFormatKind(int f) { return f >= 30 ? 2 : f >= 21 ? 1 : 0; }
 
     void layoutQualifier(Qual& q) {
+        const int qline = peek().line;
         expectP("(");
+        if (isP(")")) strictAt("layout_qualifier", qline, "'layout' : empty layout qualifier list");
+        static const std::set<std::string> valued = {"location", "binding", "num_views", "offset", "local_size_x", "local_size_y",
+                                                     "local_size_z", "index"};
+        static const std::set<std::string> flags = {"std140", "std430", "shared", "packed", "row_major", "column_major",
+                                                    "early_fragment_tests"};
         while (!isP(")")) {
+            const int idLine = peek().line;
             std::string id = expectIdent();
             int v = 0;
             bool hasValue = acceptP("=");
             if (hasValue) v = constIntExpr();
+            const bool known = valued.count(id) || flags.count(id) || imageFormat(id) || id.rfind("blend_support_", 0) == 0;
+            if (!known) strictAt("layout_qualifier", idLine, "'" + id + "' : unknown layout qualifier id");
+            else if (valued.count(id) && !hasValue) strictAt("layout_qualifier", idLine, "'" + id + "' : layout qualifier needs a value");
+            else if (!valued.count(id) && hasValue) strictAt("layout_qualifier", idLine, "'" + id + "' : layout qualifier takes no value");
             if (id == "location") q.location = v;
             else if (id == "binding") q.binding = v;
             else if (id == "num_views") q.numViews = v;
-            else if (id == "std430") q.std430 = true, q.std140 = false;
-            else if (id == "std140") q.std140 = true, q.std430 = false;
+            else if (id == "std430") q.std430 = true, q.std140 = false, q.packing = 4;
+            else if (id == "std140") q.std140 = true, q.std430 = false, q.packing = 3;
+            else if (id == "shared") q.packing = 1;
+            else if (id == "packed") q.packing = 2;
             else if (id == "offset") q.offset = v;
             else if (id == "row_major") q.rowMajor = true, q.colMajor = false;
             else if (id == "column_major") q.rowMajor = false, q.colMajor = true;
@@ -392,7 +450,8 @@ private:
             else if (id == "local_size_z") q.localSize[2] = v;
             else if (id == "early_fragment_tests") q.earlyFragmentTests = true;
             else if (int f = imageFormat(id)) q.ifmt = uint8_t(f);
-            // shared/packed, index, blend_support_*: accepted and ignored.
+            // index, blend_support_*: accepted and ignored.
+            if (id != "row_major" && id != "column_major") q.layoutOther = true;
             if (!acceptP(",")) break;
         }
         expectP(")");
@@ -416,7 +475,7 @@ private:
                 else if (w == "highp" || w == "mediump" || w == "lowp") rank = 4;
                 else rank = 3;  // centroid, const, in, out, uniform, attribute, varying
                 if (rank < lastRank || (!param && w == "centroid" && sawStorage))
-                    errAt(wline, "'" + w + "' : qualifiers in the wrong order");
+                    strictAt("qualifier_order", wline, "'" + w + "' : qualifiers in the wrong order");
                 lastRank = rank;
                 if (!param && rank == 3 && w != "centroid") sawStorage = true;
             }
@@ -439,27 +498,38 @@ private:
             else if (w == "coherent") q.mem |= kCoherent;
             else if (w == "volatile") q.mem |= kVolatile;
             else if (w == "restrict") q.mem |= kRestrict;
-            // precisions and precise: no effect on code generation.
+            else if (precisionWord(w)) q.prec = precisionOf(w);
+            // precise: no effect on code generation.
         }
-        if (pp_.version == 300 && q.invariant && q.in) errAt(peek().line, "'invariant' : only shader outputs can be invariant in GLSL ES 3.00");
+        if (q.invariant && (q.uniform || q.attribute))
+            strictAt("invariant_storage", peek().line, "'invariant' : only shader outputs can be invariant");
+        if (pp_.version == 300 && q.invariant && q.in)
+            strictAt("invariant_input", peek().line, "'invariant' : only shader outputs can be invariant in GLSL ES 3.00");
         return q;
     }
 
     Type typeSpecifier() {
-        while (peek().kind == Tok::Ident && precisionWord(peek().text)) next();
+        uint8_t pr = 0;
+        while (peek().kind == Tok::Ident && precisionWord(peek().text)) pr = precisionOf(next().text);
         const Token t = peek();
         if (t.kind != Tok::Ident) err("expected a type");
-        if (t.text == "struct") return structSpecifier();
+        if (t.text == "struct") {
+            Type ty = structSpecifier();
+            tsPrec_ = 0;
+            return ty;
+        }
         next();
         if (auto b = basicType(t.text)) {
             Type ty = *b;
             arraySuffix(ty);
+            tsPrec_ = pr;
             return ty;
         }
         if (StructDef* s = findStruct(t.text)) {
             Type ty;
             ty.base = Base::Struct, ty.st = s;
             arraySuffix(ty);
+            tsPrec_ = 0;
             return ty;
         }
         errAt(t.line, "'" + t.text + "' : unknown type");
@@ -479,6 +549,8 @@ private:
             d.push_back(n);
         }
         if (!d.empty() && !es3() && (d.size() > 1 || !t.dims.empty())) err("arrays of arrays need GLSL ES 3.10");
+        if (!d.empty() && pp_.version < 310 && (d.size() > 1 || !t.dims.empty()))
+            strictAt("arrays_of_arrays", peek().line, "arrays of arrays need GLSL ES 3.10");
         t.dims.insert(t.dims.end(), d.begin(), d.end());
     }
 
@@ -491,12 +563,15 @@ private:
         while (!acceptP("}")) {
             Qual q = qualifiers();
             Type base = typeSpecifier();
+            const uint8_t basePrec = tsPrec_;
             do {
                 Member m;
                 m.name = expectIdent();
                 checkName(m.name, peek().line);
                 m.type = base;
                 arraySuffix(m.type);
+                m.prec = effectivePrecision(q.prec, basePrec, m.type);
+                needPrecision(m.prec, m.type, line, m.name);
                 m.rowMajor = q.rowMajor;
                 for (auto& o : def->members)
                     if (o.name == m.name) errAt(line, "'" + m.name + "' : duplicate member");
@@ -509,6 +584,8 @@ private:
         sh_->structs.push_back(std::move(def));
         if (p->name.rfind("__anon", 0) != 0) {
             if (scopes_.back().structs.count(p->name)) errAt(line, "'" + p->name + "' : redefinition");
+            if (scopes_.size() == 2 && (functions_.count(p->name) || blockNames_.count(p->name) || scopes_.back().vars.count(p->name)))
+                strictAt("name_conflict", line, "'" + p->name + "' : name already used");
             scopes_.back().structs[p->name] = p;
         }
         Type t;
@@ -521,10 +598,7 @@ private:
     void externalDeclaration() {
         if (acceptP(";")) return;
         if (isId("precision")) {
-            next();
-            next();             // precision word
-            typeSpecifier();    // type
-            expectP(";");
+            precisionStatement();
             return;
         }
         int line = peek().line;
@@ -542,8 +616,11 @@ private:
             if (q.buffer) {
                 if (q.std430 || q.std140) defaultBufferStd430_ = q.std430;
                 if (q.rowMajor || q.colMajor) defaultBufferRowMajor_ = q.rowMajor;
+                if (q.packing) defaultBufferPacking_ = q.packing;
             }
             if (q.uniform && (q.rowMajor || q.colMajor)) defaultUniformRowMajor_ = q.rowMajor;
+            if (q.uniform && q.packing == 4) strictAt("uniform_std430", line, "std430 is only for shader storage blocks");
+            if (q.uniform && q.packing) defaultUniformPacking_ = q.packing;
             return;
         }
         if (stage_ == Stage::Compute && (q.in || q.out || q.attribute || q.varying))
@@ -561,14 +638,29 @@ private:
             return;
         }
         Type t = typeSpecifier();
+        declTypePrec_ = tsPrec_;
         if (acceptP(";")) return;  // struct declaration only
         std::string name = expectIdent();
         if (name != "main") checkName(name, peek().line);
         if (isP("(")) {
+            if (q.any() || q.layoutOther)
+                strictAt("return_qualifier", line, "'" + name + "' : a function return type takes no qualifiers other than precision");
+            needPrecision(effectivePrecision(q.prec, declTypePrec_, t), t, line, name);
             functionDefinition(t, name, line);
             return;
         }
         globalDeclarators(q, t, name, line);
+    }
+
+    // precision <highp|mediump|lowp> <type>; sets the default of that type (float, int, or a sampler) from here on.
+    void precisionStatement() {
+        next();  // precision
+        const std::string word = peek().kind == Tok::Ident && precisionWord(peek().text) ? next().text : "";
+        if (word.empty()) err("expected a precision qualifier");
+        const std::string type = peek().text;
+        typeSpecifier();
+        defaultPrec_[type == "uint" ? "int" : type] = precisionOf(word);
+        expectP(";");
     }
 
     void interfaceBlock(const Qual& q, int line) {
@@ -577,22 +669,37 @@ private:
         if (!q.uniform && !q.buffer) errAt(line, "only uniform and shader storage blocks are supported (I/O blocks are not)");
         auto b = std::make_unique<UniformBlockDecl>();
         checkName(peek().text, peek().line);
+        if (peek().text.rfind("gl_", 0) == 0) strictAt("reserved_name", peek().line, "'" + peek().text + "' : identifiers starting with \"gl_\" are reserved");
         b->name = next().text;
+        if (blockNames_.count(b->name)) strictAt("repeated_block", line, "'" + b->name + "' : interface block declared twice");
+        if (functions_.count(b->name) || scopes_[1].vars.count(b->name) || scopes_[1].structs.count(b->name))
+            strictAt("name_conflict", line, "'" + b->name + "' : name already used");
+        blockNames_.insert(b->name);
         b->binding = q.binding;
         b->buffer = q.buffer;
+        if (!q.buffer && q.packing == 4) strictAt("uniform_std430", line, "std430 is only for shader storage blocks");
+        b->packing = q.packing ? q.packing : q.buffer ? defaultBufferPacking_ : defaultUniformPacking_;
         // std430 only for shader storage blocks; `shared`/`packed`/unspecified use std140 (as for uniform blocks).
         b->std430 = q.buffer && (q.std430 || (!q.std140 && defaultBufferStd430_));
         const bool defaultRow = q.buffer ? defaultBufferRowMajor_ : defaultUniformRowMajor_;
+        b->rowMajor = q.colMajor ? false : (q.rowMajor || defaultRow);
         expectP("{");
         while (!acceptP("}")) {
+            if (isId("struct")) strictAt("block_member_struct", peek().line, "struct definitions are not allowed inside an interface block");
             Qual mq = qualifiers();
+            if (mq.isConst || (mq.uniform && !q.uniform) || mq.in || mq.out || mq.inout || mq.attribute || mq.varying || mq.centroid || mq.flat ||
+                mq.smooth || mq.invariant || mq.shared || (mq.buffer && !q.buffer) || mq.layoutOther || mq.location >= 0 || mq.binding >= 0)
+                strictAt("block_member_qualifier", peek().line, "an interface block member takes only matrix layout, memory and precision qualifiers");
             Type base = typeSpecifier();
+            const uint8_t basePrec = tsPrec_;
             do {
                 Member m;
                 m.name = expectIdent();
                 checkName(m.name, peek().line);
                 m.type = base;
                 arraySuffix(m.type);
+                m.prec = effectivePrecision(mq.prec, basePrec, m.type);
+                needPrecision(m.prec, m.type, line, m.name);
                 m.rowMajor = mq.colMajor || q.colMajor ? false : (mq.rowMajor || q.rowMajor || defaultRow);
                 m.mem = uint8_t(q.mem | mq.mem);
                 if (m.type.containsOpaque()) errAt(line, "opaque types are not allowed in blocks");
@@ -613,6 +720,7 @@ private:
         inst->type.base = Base::Void;
         if (peek().kind == Tok::Ident) {
             bp->instance = next().text;
+            if (bp->instance == b->name) strictAt("name_conflict", line, "'" + b->name + "' : the instance has the name of its block");
             Type at;
             arraySuffix(at);
             bp->dims = at.dims;
@@ -643,6 +751,8 @@ private:
             arraySuffix(s->type);
             s->location = q.location;
             s->binding = q.binding;
+            s->prec = effectivePrecision(q.prec, declTypePrec_, base);
+            needPrecision(s->prec, base, line, name);
             s->invariant = q.invariant;
             s->interp = q.flat ? Interp::Flat : q.centroid ? Interp::Centroid : Interp::Smooth;
             if (q.isConst) s->storage = Storage::Const;
@@ -664,8 +774,12 @@ private:
                 s->storage = Storage::Shared;
             } else s->storage = Storage::Global;
             s->mem = q.mem;
-            if (s->storage == Storage::In && stage_ == Stage::Fragment && s->type.isIntegral() && s->interp != Interp::Flat && es3())
-                errAt(line, "integer fragment inputs must be 'flat'");
+            if (s->storage == Storage::In && stage_ == Stage::Fragment && s->type.isIntegral() && s->interp != Interp::Flat && es3()) {
+                strictAt("integer_input_not_flat", line, "integer fragment inputs must be 'flat'");
+                s->interp = Interp::Flat;  // the only interpolation integers have
+            }
+            if ((s->storage == Storage::In || s->storage == Storage::Out) && !s->fbFetch && !interfaceTypeOk(s->type))
+                strictAt("interface_type", line, "'" + name + "' : invalid type for a shader input or output");
             if (s->type.containsOpaque() && s->storage != Storage::Uniform)
                 errAt(line, "'" + name + "' : samplers, images and atomic counters must be uniform");
             if (s->type.base == Base::Image) {
@@ -676,6 +790,7 @@ private:
                 }
             }
             if (s->type.base == Base::AtomicUint) {
+                if (q.location >= 0) strictAt("atomic_location", line, "'" + name + "' : atomic counters have no location");
                 if (s->binding < 0) s->binding = 0;
                 const int count = s->type.isArray() ? s->type.dims[0] : 1;
                 int& next = atomicNext_[s->binding];
@@ -698,6 +813,8 @@ private:
                     if (init->hasConst) {
                         s->hasConst = true, s->constF = init->constF, s->constI = init->constI;
                     }
+                    s->constant = isConstExpr(*init);
+                    if (!s->constant) strictAt("const_initializer", line, "'" + name + "' : the initializer of a const must be a constant expression");
                 }
             } else if (s->storage == Storage::Const) {
                 errAt(line, "'" + name + "' : const variables need an initialiser");
@@ -710,6 +827,27 @@ private:
             name = expectIdent();
         }
         expectP(";");
+    }
+
+    // Every float / integer / sampler declaration needs a precision (its own or a default in force).
+    void needPrecision(uint8_t effective, const Type& t, int line, const std::string& name) {
+        if (effective || !(t.base == Base::Float || t.base == Base::Int || t.base == Base::Uint || t.base == Base::Sampler)) return;
+        strictAt("unspecified_precision", line, "'" + name + "' : no precision specified and no default precision for '" + t.str() + "'");
+    }
+
+    // Types a shader input / output (attribute, varying, in, out) may have: ES 1.00 float-based only; ES 3.00 no bool, no
+    // array of arrays, structs of non-array / non-struct / non-bool members and not in arrays.
+    bool interfaceTypeOk(const Type& t) const {
+        if (t.base == Base::Bool) return false;
+        if (!es3()) return t.base == Base::Float;
+        if (pp_.version != 300) return true;  // 3.10 / 3.20 relaxed these
+        if (t.dims.size() > 1) return false;
+        if (t.base == Base::Struct) {
+            if (t.isArray()) return false;
+            for (const Member& m : t.st->members)
+                if (m.type.isArray() || m.type.base == Base::Struct || m.type.base == Base::Bool) return false;
+        }
+        return true;
     }
 
     static void resolveImplicitSize(Type& decl, const Type& init, int line) {
@@ -729,6 +867,9 @@ private:
         if (isId("void") && isP(")", 1)) next();
         while (!isP(")")) {
             Qual q = qualifiers(true);
+            if (q.uniform || q.varying || q.attribute || q.centroid || q.flat || q.smooth || q.invariant || q.shared || q.buffer ||
+                (q.layoutOther && !q.ifmt) || (q.isConst && (q.out || q.inout)))
+                strictAt("param_qualifier", peek().line, "'" + name + "' : invalid parameter qualifier");
             Type t = typeSpecifier();
             if (t.base == Base::Image && q.ifmt) t.ifmt = q.ifmt;
             if (t.base == Base::AtomicUint) errAt(line, "atomic counters cannot be passed to functions");
@@ -738,7 +879,10 @@ private:
             if (peek().kind == Tok::Ident) p->name = next().text;
             p->type = t;
             arraySuffix(p->type);
-            if (q.isConst) p->storage = Storage::Param;
+            p->constParam = q.isConst;
+            needPrecision(effectivePrecision(q.prec, tsPrec_, t), t, line, p->name.empty() ? name : p->name);
+            for (int d : p->type.dims)
+                if (d == 0) strictAt("unsized_param_array", line, "'" + name + "' : a parameter array needs a size");
             params.push_back(p);
             if (!acceptP(",")) break;
         }
@@ -752,8 +896,27 @@ private:
             if (same) existing = f;
         }
         if (existing && existing->ret != ret) errAt(line, "'" + name + "' : return type differs from prototype");
-        if (Builtins::isBuiltinName(name) && !existing && es3())
-            errAt(line, "'" + name + "' : cannot redefine a built-in function");
+        if (existing)
+            for (size_t i = 0; i < params.size(); ++i)
+                if (existing->params[i]->dir != params[i]->dir || existing->params[i]->constParam != params[i]->constParam)
+                    strictAt("prototype_mismatch", line, "'" + name + "' : parameter qualifiers differ from the prototype");
+        if (!es3() && (ret.isArray() || (ret.base == Base::Struct && structHasArray(ret.st))))
+            strictAt("return_type", line, "'" + name + "' : GLSL ES 1.00 functions cannot return arrays");
+        if (Builtins::isBuiltinName(name) && !existing) {
+            bool redefines = es3();  // ES 3.00: no function can share a built-in's name; ES 1.00: only the same signature
+            if (!es3()) {
+                std::vector<Type> ts;
+                for (Symbol* p : params) ts.push_back(p->type);
+                BuiltinCtx ctx{stage_, pp_.version, &pp_.extensions};
+                std::string why;
+                redefines = Builtins::resolve(name, ts, ctx, why).has_value();
+            }
+            if (redefines) strictAt("redefine_builtin", line, "'" + name + "' : cannot redefine a built-in function");
+        }
+        if (!existing && (scopes_[1].vars.count(name) || scopes_[1].structs.count(name) || blockNames_.count(name)))
+            strictAt("name_conflict", line, "'" + name + "' : name already used");
+        if (existing && isP(";") && pp_.version < 300)
+            strictAt("function_redeclared", line, "'" + name + "' : function declared twice");
         Function* f = existing;
         if (!f) {
             fn->params = params;
@@ -775,6 +938,12 @@ private:
         f->body = compound(false);
         cur_ = saved;
         popScope();
+    }
+
+    static bool structHasArray(const StructDef* st) {
+        for (const Member& m : st->members)
+            if (m.type.isArray() || (m.type.base == Base::Struct && structHasArray(m.type.st))) return true;
+        return false;
     }
 
     // ---- statements -----------------------------------------------------------------------------
@@ -892,6 +1061,8 @@ private:
             expectP("{");
             pushScope();
             ++switches_;
+            std::set<int64_t> caseValues;
+            bool sawDefault = false;
             while (!acceptP("}")) {
                 int l = peek().line;
                 if (isId("case")) {
@@ -899,16 +1070,22 @@ private:
                     auto c = mk(SK::Case, l);
                     c->e = conditional();
                     if (!c->e->hasConst || c->e->type != s->e->type) errAt(l, "case label must be a constant of the selector's type");
+                    if (!caseValues.insert(c->e->constI).second) errAt(l, "duplicate case label");
                     expectP(":");
                     s->list.push_back(std::move(c));
                 } else if (isId("default")) {
                     next();
+                    if (sawDefault) errAt(l, "duplicate default label");
+                    sawDefault = true;
                     expectP(":");
                     s->list.push_back(mk(SK::Default, l));
                 } else {
+                    if (s->list.empty()) strictAt("switch_statement_before_label", l, "a statement before the first case label of a switch");
                     s->list.push_back(statement());
                 }
             }
+            if (!s->list.empty() && (s->list.back()->k == SK::Case || s->list.back()->k == SK::Default))
+                strictAt("switch_empty_label", peek().line, "the last label of a switch needs a statement after it");
             --switches_;
             popScope();
             return s;
@@ -982,15 +1159,13 @@ private:
     StmtP simpleStatement() {
         int line = peek().line;
         if (isId("precision")) {
-            next();
-            next();
-            typeSpecifier();
-            expectP(";");
+            precisionStatement();
             return mk(SK::Empty, line);
         }
         if (atDeclaration()) {
             Qual q = qualifiers();
             Type base = typeSpecifier();
+            const uint8_t basePrec = tsPrec_;
             auto s = mk(SK::Decl, line);
             if (acceptP(";")) return mk(SK::Empty, line);  // local struct declaration
             for (;;) {
@@ -998,6 +1173,7 @@ private:
                 v->name = expectIdent();
                 v->type = base;
                 arraySuffix(v->type);
+                needPrecision(effectivePrecision(q.prec, basePrec, base), base, line, v->name);
                 v->storage = q.isConst ? Storage::Const : Storage::Local;
                 if (v->type.containsOpaque()) errAt(line, "samplers, images and atomic counters cannot be local variables");
                 ExprP init;
@@ -1007,8 +1183,15 @@ private:
                     if (init->type != v->type)
                         errAt(line, "'=' : cannot convert from '" + init->type.str() + "' to '" + v->type.str() + "'");
                     if (q.isConst && init->hasConst) v->hasConst = true, v->constF = init->constF, v->constI = init->constI;
+                    if (q.isConst) {
+                        v->constant = isConstExpr(*init);
+                        if (!v->constant) strictAt("const_initializer", line, "'" + v->name + "' : the initializer of a const must be a constant expression");
+                    }
                 } else if (q.isConst) {
                     errAt(line, "const variables need an initialiser");
+                } else {
+                    for (int d : v->type.dims)
+                        if (d == 0) errAt(line, "'" + v->name + "' : implicitly sized array without initialiser");
                 }
                 declare(v, line);  // after the initialiser: `float x = x;` sees the outer x
                 s->decls.emplace_back(v, std::move(init));
@@ -1043,7 +1226,36 @@ private:
         return e;
     }
 
-    bool isLValue(const Expr& e, std::string& why) const {
+    // A constant expression (GLSL ES 3.00 §4.3.2): literals, `const` variables initialised with one, constructors,
+    // operators and built-in calls (but not texture / derivative / image / atomic functions) on constant operands.
+    // Parameters, uniforms, user function calls, assignments and the comma operator are not.
+    bool isConstExpr(const Expr& e) const {
+        switch (e.k) {
+            case EK::IntLit: case EK::UintLit: case EK::FloatLit: case EK::BoolLit: return true;
+            case EK::Var:
+                return e.sym && ((e.sym->storage == Storage::Const && e.sym->constant) ||
+                                 (e.sym->builtin == BuiltinVar::WorkGroupSize && sh_->hasLocalSize));
+            case EK::Length: return e.a.empty() || isConstExpr(*e.a[0]);
+            case EK::Call: case EK::Assign: case EK::Comma: case EK::PreInc: case EK::PreDec: case EK::PostInc: case EK::PostDec:
+                return false;
+            case EK::Builtin: {
+                Builtins::TexCall tc;
+                Builtins::ImageCall ic;
+                if (Builtins::textureCall(e.op, tc) || Builtins::imageCall(e.op, ic) || Builtins::isAtomicMemoryFunction(e.op) ||
+                    e.op == "dFdx" || e.op == "dFdy" || e.op == "fwidth" || e.op == "barrier" || e.op.rfind("memoryBarrier", 0) == 0 ||
+                    e.op == "groupMemoryBarrier" || e.op == "interpolateAtCentroid" || e.op == "interpolateAtSample" ||
+                    e.op == "interpolateAtOffset")
+                    return false;
+                break;
+            }
+            default: break;
+        }
+        for (const ExprP& a : e.a)
+            if (!isConstExpr(*a)) return false;
+        return true;
+    }
+
+    bool isLValue(const Expr& e, std::string& why) {
         switch (e.k) {
             case EK::Var: {
                 const Symbol* s = e.sym;
@@ -1059,6 +1271,8 @@ private:
                     why = "l-value required (can't modify '" + s->name + "')";
                     return false;
                 }
+                if (s->storage == Storage::Param && s->constParam)
+                    strictAt("const_param_write", peek().line, "l-value required (can't modify the const parameter '" + s->name + "')");
                 if (s->storage == Storage::Param && s->dir == ParamDir::In) return true;  // copies
                 return true;
             }
@@ -1347,6 +1561,10 @@ private:
                 else errAt(line, "'[' : not an array, matrix or vector");
                 if (idx->hasConst && (idx->constI < 0 || (limit > 0 && idx->constI >= limit)))
                     errAt(line, "'[' : index " + std::to_string(idx->constI) + " out of range");
+                // ES 1.00: gl_FragData has gl_MaxDrawBuffers elements, which is 1 without GL_EXT_draw_buffers.
+                if (e->k == EK::Var && e->sym->builtin == BuiltinVar::FragData && !pp_.extensions.count("GL_EXT_draw_buffers") &&
+                    !(idx->hasConst && idx->constI == 0))
+                    strictAt("fragdata_index", line, "'gl_FragData' : only element 0 exists without GL_EXT_draw_buffers");
                 if (bt.isArray() && bt.containsSampler() && !idx->hasConst && !es3())
                     errAt(line, "sampler arrays need constant indices in GLSL ES 1.00");
                 ExprP x = mkE(EK::Index, t, line);
@@ -1498,6 +1716,7 @@ private:
         if (t.kind != Tok::Ident) err("syntax error, unexpected '" + t.text + "'");
         // Constructors: type names (incl. arrays T[N](...)) and struct names.
         if (atTypeStart() && !findVar(t.text)) {
+            if (precisionWord(t.text)) strictAt("precision_in_expression", line, "a precision qualifier cannot start an expression");
             Type ty = typeSpecifier();
             if (!isP("(")) errAt(line, "'" + t.text + "' : unexpected type name");
             return constructor(ty, line);
@@ -1513,6 +1732,10 @@ private:
         if (s->storage == Storage::Builtin && std::find(sh_->builtins.begin(), sh_->builtins.end(), s) == sh_->builtins.end())
             sh_->builtins.push_back(s);
         s->used = true;
+        if (s->builtin == BuiltinVar::FragColor) usesFragColor_ = true;
+        if (s->builtin == BuiltinVar::FragData) usesFragData_ = true;
+        if (usesFragColor_ && usesFragData_)
+            strictAt("fragcolor_and_fragdata", line, "gl_FragColor and gl_FragData cannot both be written");
         if (s->block) s->block->instanceSym->used = true;
         ExprP e = mkE(EK::Var, s->type, line);
         e->sym = s;
@@ -1619,11 +1842,12 @@ private:
                 }
                 ExprP e = mkE(EK::Call, f->ret, line);
                 e->fn = f;
+                if (cur_) callGraph_[cur_].insert(f);
                 e->a = std::move(args);
                 return e;
             }
         }
-        BuiltinCtx ctx{stage_, pp_.version, &pp_.extensions};
+        BuiltinCtx ctx{stage_, pp_.version, &pp_.extensions, &lenient_};
         std::string why;
         std::optional<Type> rt = Builtins::resolve(name, types, ctx, why);
         if (rt) {
@@ -1645,8 +1869,18 @@ private:
         errAt(line, "'" + name + "' : no matching overloaded function found");
     }
 
+public:
+    std::vector<std::string> lenient_;  // strict-mode rules let through
+private:
     std::map<int, int> atomicNext_;  // atomic counter binding -> next free byte offset
     bool defaultBufferStd430_ = false, defaultBufferRowMajor_ = false, defaultUniformRowMajor_ = false;
+    uint8_t defaultBufferPacking_ = 0, defaultUniformPacking_ = 0;  // layout(...) buffer; / layout(...) uniform;
+    uint8_t declTypePrec_ = 0;                    // tsPrec_ of the declaration being parsed (it survives nested type parsing)
+    uint8_t tsPrec_ = 0;                          // precision word typeSpecifier() consumed before the type (0 = none)
+    std::map<std::string, uint8_t> defaultPrec_;  // `precision p T;` statements: type keyword -> precision
+    std::set<std::string> blockNames_;            // interface block names (a namespace shared with functions and variables)
+    std::map<Function*, std::set<Function*>> callGraph_;
+    bool usesFragColor_ = false, usesFragData_ = false;
 
     Stage stage_;
     PpResult pp_;
@@ -1663,10 +1897,13 @@ ParseResult parse(Stage stage, const std::string& source) {
     ParseResult r;
     PpResult pp = runPreprocessor(source, stage, r.log);
     r.version = pp.version;
+    r.lenient = pp.lenient;
     if (!pp.ok) return r;
     Parser p(stage, std::move(pp), r.log);
     r.shader = p.run();
     if (r.shader) r.shader->version = r.version;
+    for (const std::string& l : p.lenient_)
+        if (std::find(r.lenient.begin(), r.lenient.end(), l) == r.lenient.end()) r.lenient.push_back(l);
     return r;
 }
 

@@ -73,6 +73,7 @@ struct Member {
     Type type;
     bool rowMajor = false;
     uint8_t mem = 0;  // buffer block members: MemQual
+    uint8_t prec = 0;  // declared precision (1 lowp, 2 mediump, 3 highp; explicit or the default in force), 0 = none
 };
 
 struct StructDef {
@@ -114,6 +115,9 @@ struct Symbol {
     int member = -1;                     // BlockMember: index in the block
     int id = 0;                          // unique per shader (emitter maps)
     bool used = false;                   // referenced by any expression
+    uint8_t prec = 0;                    // uniforms: declared precision (Member::prec)
+    bool constant = false;               // a `const` whose value is a constant expression (usable in one)
+    bool constParam = false;             // a function parameter declared `const`
 };
 
 struct UniformBlockDecl {
@@ -122,6 +126,8 @@ struct UniformBlockDecl {
     std::vector<int> dims;  // instance array
     int binding = -1;
     bool std430 = false;
+    uint8_t packing = 0;  // declared layout: 0 none (shared), 1 shared, 2 packed, 3 std140, 4 std430
+    bool rowMajor = false;  // the block's default matrix layout
     bool buffer = false;  // shader storage block
     Symbol* instanceSym = nullptr;  // the variable that names the block (instance or hidden)
 };

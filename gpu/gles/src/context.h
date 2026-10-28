@@ -37,6 +37,9 @@
 namespace vpgles {
 
 void logf(const char* fmt, ...) __attribute__((format(printf, 1, 2)));
+// One `gles.glsl.lenient rule=... <what>=<name>` line per rule a shader (what "shader") or program ("program") broke that
+// strict GLSL (VPGLES_STRICT_GLSL=1) would have rejected and the default lenient mode let through.
+void logLenient(const std::vector<std::string>& rules, const char* what, unsigned name);
 
 // Diagnostics: textures defined per sized internal format ("gles.tex fmt=0x.... count=N"); texStatsTick prints the
 // changed counts every 10 s (force: now, at eglTerminate / device shutdown; called from eglSwapBuffers and vpgles_flush),

@@ -62,7 +62,28 @@ void flatten(const std::string& n, const Type& t, uint32_t offset, bool rowMajor
     out.push_back(v);
 }
 
+// Uniform locations a declaration takes: one per array element of every basic-type leaf.
+int locationCount(const Type& t) {
+    int n = 1;
+    for (int d : t.dims) n *= std::max(1, d);
+    if (t.base != Base::Struct) return n;
+    int leaves = 0;
+    for (const Member& m : t.st->members) leaves += locationCount(m.type);
+    return n * leaves;
+}
+
+constexpr int kMaxUniformLocations = 1024;
+
 bool usedAnywhere(const Shader&, const Symbol* s) { return s->used; }
+
+// Declared precisions of two uniforms of the same (structurally equal) type must agree, member by member.
+bool samePrecision(const Type& t, uint8_t a, uint8_t b, const Type& u) {
+    if (t.base != Base::Struct) return a == b;
+    for (size_t i = 0; i < t.st->members.size() && i < u.st->members.size(); ++i)
+        if (!samePrecision(t.st->members[i].type, t.st->members[i].prec, u.st->members[i].prec, u.st->members[i].type) )
+            return false;
+    return true;
+}
 
 }  // namespace
 
@@ -72,6 +93,16 @@ LinkResult link(const std::shared_ptr<Shader>& vs, const std::shared_ptr<Shader>
         r.log += "ERROR: " + m + "\n";
         r.ok = false;
         return r;
+    };
+    // A rule of the language that a lenient driver lets through (see strictMode()): true when it is an error.
+    auto strict = [&](const char* rule, const std::string& m) {
+        if (strictMode()) {
+            r.log += "ERROR: " + m + "\n";
+            r.ok = false;
+            return true;
+        }
+        if (std::find(r.lenient.begin(), r.lenient.end(), rule) == r.lenient.end()) r.lenient.push_back(rule);
+        return false;
     };
     if (!vs) return error("no shader attached");
     const bool compute = vs->stage == Stage::Compute;
@@ -105,6 +136,9 @@ LinkResult link(const std::shared_ptr<Shader>& vs, const std::shared_ptr<Shader>
                 if (!sameType(u->sym->type, g.sym->type) ||
                     (g.sym->type.base == Base::AtomicUint && (u->sym->offset != g.sym->offset || u->sym->binding != g.sym->binding)))
                     return error("uniform '" + g.sym->name + "' differs between stages");
+                if (!samePrecision(u->sym->type, u->sym->prec, g.sym->prec, g.sym->type) &&
+                    strict("uniform_precision", "uniform '" + g.sym->name + "' has different precisions in the two stages"))
+                    return r;
                 if (usedAnywhere(*s, g.sym)) u->stages |= stageBit(s->stage);
                 continue;
             }
@@ -112,6 +146,11 @@ LinkResult link(const std::shared_ptr<Shader>& vs, const std::shared_ptr<Shader>
         }
     // Unused uniforms are inactive (GL): dropped from the layout and reflection.
     uint32_t samplerBinding = 1, imageIndex = 0;
+    struct LocGroup {
+        size_t first, last;  // reflection.uniforms[first, last)
+        int declared;        // layout(location = N), -1 = none
+    };
+    std::vector<LocGroup> locGroups;
     std::map<int, uint32_t> atomicSize, atomicStages;  // GL binding point -> bytes / stage bits
     for (auto& [n, u] : uniforms) {
         if (!u.stages) continue;
@@ -127,6 +166,7 @@ LinkResult link(const std::shared_ptr<Shader>& vs, const std::shared_ptr<Shader>
             v.binding = int(binding);
             v.unit = u.sym->binding;
             v.stages = u.stages;
+            locGroups.push_back({r.reflection.uniforms.size(), r.reflection.uniforms.size() + 1, u.sym->location});
             r.reflection.uniforms.push_back(v);
             continue;
         }
@@ -160,6 +200,7 @@ LinkResult link(const std::shared_ptr<Shader>& vs, const std::shared_ptr<Shader>
             v.binding = int(samplerBinding);
             v.unit = u.sym->binding;
             v.stages = u.stages;
+            locGroups.push_back({r.reflection.uniforms.size(), r.reflection.uniforms.size() + 1, u.sym->location});
             r.reflection.uniforms.push_back(v);
             ++samplerBinding;
             continue;
@@ -179,12 +220,68 @@ LinkResult link(const std::shared_ptr<Shader>& vs, const std::shared_ptr<Shader>
             size_t first = r.reflection.uniforms.size();
             flatten(members[i].name, members[i].type, off[i], false, r.reflection.uniforms);
             U* u = findU(members[i].name);
+            locGroups.push_back({first, r.reflection.uniforms.size(), u->sym->location});
             for (size_t k = first; k < r.reflection.uniforms.size(); ++k) r.reflection.uniforms[k].stages = u->stages;
         }
+    }
+    // ---- uniform locations: layout(location = N) (even for inactive uniforms), the rest in the lowest free ones ----
+    {
+        std::vector<char> taken;
+        auto take = [&](int at, int n) {
+            if (size_t(at + n) > taken.size()) taken.resize(size_t(at + n), 0);
+            for (int k = 0; k < n; ++k) taken[size_t(at + k)] = 1;
+        };
+        auto free = [&](int at, int n) {
+            for (int k = 0; k < n && size_t(at + k) < taken.size(); ++k)
+                if (taken[size_t(at + k)]) return false;
+            return true;
+        };
+        std::map<std::string, int> explicitAt;  // uniform name -> its explicit location, when it was honoured
+        for (auto& [n, u] : uniforms) {
+            if (u.sym->location < 0 || u.sym->type.base == Base::AtomicUint) continue;
+            const int count = locationCount(u.sym->type);
+            if (u.sym->location + count > kMaxUniformLocations) {
+                if (strict("uniform_location", "uniform '" + n + "' location is beyond MAX_UNIFORM_LOCATIONS")) return r;
+                continue;
+            }
+            if (!free(u.sym->location, count)) {
+                if (strict("uniform_location", "uniform '" + n + "' location overlaps another uniform")) return r;
+                continue;  // lenient: it gets an implicit one
+            }
+            take(u.sym->location, count);
+            explicitAt[n] = u.sym->location;
+        }
+        for (const LocGroup& g : locGroups) {
+            if (g.first >= g.last) continue;
+            int total = 0;
+            for (size_t k = g.first; k < g.last; ++k) total += std::max(1, r.reflection.uniforms[k].arraySize);
+            int at = -1;
+            if (g.declared >= 0) {
+                // The symbol name is the start of the first leaf ("name.member", "name[0]").
+                std::string base = r.reflection.uniforms[g.first].name;
+                base = base.substr(0, base.find_first_of(".["));
+                auto it = explicitAt.find(base);
+                if (it != explicitAt.end()) at = it->second;
+            }
+            if (at < 0) {
+                at = 0;
+                while (!free(at, total)) ++at;
+                take(at, total);
+            }
+            for (size_t k = g.first; k < g.last; ++k) {
+                Variable& v = r.reflection.uniforms[k];
+                v.uniformLocation = at;
+                at += std::max(1, v.arraySize);
+            }
+        }
+        if (strictMode())
+            for (const Variable& v : r.reflection.uniforms)
+                if (v.uniformLocation >= kMaxUniformLocations) return error("too many uniform locations");
     }
     // ---- uniform and shader storage blocks -------------------------------------------------------
     uint32_t blockIndex = 0, storageIndex = 0;
     std::map<std::string, const UniformBlockDecl*> blocks;  // "U:name" / "S:name"
+    std::map<std::string, std::string> unnamedMembers;      // member of an unnamed block -> its block
     for (Shader* s : stages)
         for (const UniformBlockDecl* b : s->blocks) {
             auto& list = b->buffer ? r.reflection.storageBlocks : r.reflection.blocks;
@@ -196,12 +293,25 @@ LinkResult link(const std::shared_ptr<Shader>& vs, const std::shared_ptr<Shader>
                 for (size_t i = 0; same && i < b->members.size(); ++i)
                     same = o->members[i].name == b->members[i].name && sameType(o->members[i].type, b->members[i].type);
                 if (!same) return error((b->buffer ? "shader storage block '" : "uniform block '") + b->name + "' differs between stages");
+                if (o->instance.empty() != b->instance.empty() && strict("block_instance", "block '" + b->name + "' has an instance name in only one stage"))
+                    return r;
+                bool sameLayout = (o->packing ? o->packing : 1) == (b->packing ? b->packing : 1) && o->rowMajor == b->rowMajor;
+                for (size_t i = 0; sameLayout && i < b->members.size(); ++i)
+                    sameLayout = o->members[i].rowMajor == b->members[i].rowMajor;
+                if (!sameLayout && strict("block_layout", "block '" + b->name + "' has different layout qualifiers in the two stages"))
+                    return r;
                 for (auto& rb : list)
                     if (rb.name == b->name || rb.name.rfind(b->name + "[", 0) == 0)
                         if (b->instanceSym->used) rb.stages |= stageBit(s->stage);
                 continue;
             }
             blocks[key] = b;
+            if (b->instance.empty())  // members of an unnamed block are global names of the whole program
+                for (const Member& m : b->members) {
+                    auto [at, fresh] = unnamedMembers.insert({m.name, b->name});
+                    if (!fresh && at->second != b->name && strict("block_member_clash", "'" + m.name + "' is a member of blocks '" + at->second + "' and '" + b->name + "'"))
+                        return r;
+                }
             if (!b->instanceSym->used) {
                 // Inactive in this stage; may become active in the other one.
                 bool usedElsewhere = false;
@@ -324,6 +434,7 @@ LinkResult link(const std::shared_ptr<Shader>& vs, const std::shared_ptr<Shader>
                 if (in->used) {
                     L.unwrittenInput.insert(in->name);
                     note(in, "!unwritten");
+                    if (strict("varying_unmatched", "fragment input '" + in->name + "' is not an output of the vertex shader")) return r;
                 }
                 continue;
             }

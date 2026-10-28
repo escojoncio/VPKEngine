@@ -38,7 +38,7 @@ env:
   PUBLISH_PREFIX: ci-logs-gles-
   # The driver as games run it on the headset: Quest identity, synchronous pipelines (vpgles has no PSO precache).
   DRIVER_ENV: >-
-    --env VPVK_QUEST_IDENTITY=1 --env VPVK_GLES_SYNC_PIPELINES=1 --env VPVK_PREWARM=0 --env VPGLES_CRASH_TRACE=1
+    --env VPVK_QUEST_IDENTITY=1 --env VPVK_GLES_SYNC_PIPELINES=1 --env VPVK_PREWARM=0 --env VPGLES_CRASH_TRACE=1 --env VPGLES_STRICT_GLSL=1
   GL_ARGS: >-
     --deqp-gl-config-name=rgba8888d24s8 --deqp-surface-type=pbuffer --deqp-surface-width=256 --deqp-surface-height=256
 

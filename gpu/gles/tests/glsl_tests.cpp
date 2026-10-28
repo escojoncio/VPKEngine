@@ -240,7 +240,7 @@ void testErrors() {
     CHECK(compileFails(Stage::Vertex, "void main() { float x = 1; }", "cannot convert"));
     CHECK(compileFails(Stage::Vertex, "void main() { undefinedThing = 1.0; }", "undeclared identifier"));
     CHECK(compileFails(Stage::Vertex, "void foo() {}", "missing main"));
-    CHECK(compileFails(Stage::Fragment, "uniform float u; void main() { u = 1.0; }", "l-value"));
+    CHECK(compileFails(Stage::Fragment, "precision mediump float; uniform float u; void main() { u = 1.0; }", "l-value"));
     CHECK(compileFails(Stage::Vertex, "void main() { vec2 v; v.xz = vec2(1.0); }", "swizzle"));
     CHECK(compileFails(Stage::Vertex, "#version 300 es\nvoid main() { float a[2]; a[2] = 1.0; }", "out of range"));
     CHECK(compileFails(Stage::Vertex, "#version 300 es\nattribute vec4 p; void main() {}", "attribute"));
@@ -262,6 +262,60 @@ void testErrors() {
     CHECK(compileFails(Stage::Vertex, "#define e +1\nvoid main() { int n = 1e; }", "numeric literal"));
     CHECK(compileFails(Stage::Vertex, "#version 300 es\nprecision mediump float;\nvoid main() {}\n#extension all : bogus\n", "behavior"));
     CHECK(compileFails(Stage::Vertex, "#version 300 es\nprecision mediump float;\nin vec4 p;\nlowp centroid out float x; void main() {}", "wrong order"));
+    // Language rules a lenient driver does not enforce.
+    CHECK(compileFails(Stage::Vertex, "float f(float x) { return f(x); } void main() { gl_Position = vec4(f(1.0)); }", "recursion"));
+    CHECK(compileFails(Stage::Vertex, "uniform float u; void main() { const float c = u; gl_Position = vec4(c); }", "constant expression"));
+    CHECK(compileFails(Stage::Vertex, "float f(const float x) { x = 1.0; return x; } void main() { gl_Position = vec4(f(1.0)); }", "const parameter"));
+    CHECK(compileFails(Stage::Vertex, "void f(float x); void f(float x); void main() {}", "declared twice"));
+    CHECK(compileFails(Stage::Vertex, "#version 300 es\nvoid main() { switch (1) { case 1: break; case 1: break; } }", "duplicate case"));
+    CHECK(compileFails(Stage::Vertex, "#version 300 es\nvoid main() { float a[2][2]; }", "arrays of arrays"));
+    CHECK(compileFails(Stage::Vertex, "#version 300 es\nuniform B { layout(foo) float x; }; void main() {}", "layout"));
+    CHECK(compileFails(Stage::Fragment, "#version 300 es\nuniform float u; out mediump vec4 o; void main() { o = vec4(u); }", "no precision"));
+    CHECK(compileFails(Stage::Vertex, "#version 300 es\nvoid f(int x); struct f { int a; }; void main() {}", "name already used"));
+    // Link rules.
+    {
+        auto v = vpglsl::parse(Stage::Vertex, "uniform highp float u; void main() { gl_Position = vec4(u); }");
+        auto f = vpglsl::parse(Stage::Fragment, "precision mediump float; uniform mediump float u; void main() { gl_FragColor = vec4(u); }");
+        CHECK(v.shader && f.shader);
+        auto l = vpglsl::link(v.shader, f.shader, {});
+        CHECK(!l.ok && l.log.find("precisions") != std::string::npos);
+    }
+}
+
+// Lenient mode (the default for games): shaders that break a conformance-only rule compile, and the rule is reported.
+bool compilesLenient(Stage st, const std::string& src, const char* rule) {
+    vpglsl::ParseResult r = vpglsl::parse(st, src);
+    if (!r.shader) std::fprintf(stderr, "  lenient compile failed: %s\n", r.log.c_str());
+    for (const std::string& l : r.lenient)
+        if (l == rule) return r.shader != nullptr;
+    std::fprintf(stderr, "  rule %s not reported (got %zu rules)\n", rule, r.lenient.size());
+    return false;
+}
+
+void testLenient() {
+    CHECK(vpglsl::strictMode() == false);
+    CHECK(compilesLenient(Stage::Vertex, "#version 300 es\nvoid main() { float sample = 1.0; gl_Position = vec4(sample); }", "keyword_as_identifier"));
+    CHECK(compilesLenient(Stage::Vertex, "void main() { float class = 1.0; gl_Position = vec4(class); }", "keyword_as_identifier"));
+    CHECK(compilesLenient(Stage::Vertex, "#define A 1\n#define A 2\nvoid main() { gl_Position = vec4(A); }", "macro_redefinition"));
+    CHECK(compilesLenient(Stage::Vertex, "#if A\n#endif\nvoid main() { gl_Position = vec4(0.0); }", "undefined_identifier"));
+    CHECK(compilesLenient(Stage::Vertex, "#ifdef A B\n#endif\nvoid main() { gl_Position = vec4(0.0); }", "extra_tokens"));
+    CHECK(compilesLenient(Stage::Vertex, "#undef __LINE__\nvoid main() { gl_Position = vec4(0.0); }", "undef"));
+    CHECK(compilesLenient(Stage::Vertex, "void main() { gl_Position = vec4(1e); }", "character"));
+    CHECK(compilesLenient(Stage::Vertex, "#version 300\nvoid main() { gl_Position = vec4(0.0); }", "version_profile"));
+    CHECK(compilesLenient(Stage::Vertex, "#version 300 es\nprecision mediump float;\nin vec4 p;\nlowp centroid out float x; void main() { gl_Position = p; }", "qualifier_order"));
+    CHECK(compilesLenient(Stage::Vertex, "float f(float x) { return x; } float f(float x); void main() { gl_Position = vec4(f(1.0)); }", "function_redeclared"));
+    CHECK(compilesLenient(Stage::Vertex, "uniform float u; void main() { const float c = u; gl_Position = vec4(c); }", "const_initializer"));
+    CHECK(compilesLenient(Stage::Vertex, "#version 300 es\nvoid main() { float a[2][2]; gl_Position = vec4(a[0][0]); }", "arrays_of_arrays"));
+    CHECK(compilesLenient(Stage::Fragment, "#version 300 es\nuniform float u; out mediump vec4 o; void main() { o = vec4(u); }", "unspecified_precision"));
+    // Recursion cannot be compiled in either mode.
+    CHECK(!vpglsl::parse(Stage::Vertex, "float f(float x) { return f(x); } void main() { gl_Position = vec4(f(1.0)); }").shader);
+    // A conforming shader reports nothing, in either mode.
+    vpglsl::ParseResult ok = vpglsl::parse(Stage::Vertex, "attribute vec4 p; void main() { gl_Position = p; }");
+    CHECK(ok.shader && ok.lenient.empty());
+    // Strict mode still rejects.
+    vpglsl::setStrictMode(1);
+    CHECK(compileFails(Stage::Vertex, "#define A 1\n#define A 2\nvoid main() {}", "redefinition"));
+    vpglsl::setStrictMode(0);
 }
 
 void testEs100() {
@@ -1465,9 +1519,14 @@ int main(int argc, char** argv) {
         {"textures", testTextures}, {"external", testExternalSampler}, {"link", testLink},
         {"compute", testCompute}, {"ssbo", testStorageBlocks}, {"images", testImages}, {"atomics", testAtomics},
         {"gather", testGather}, {"fbfetch", testFramebufferFetch}, {"exts", testExtensions}, {"texbuffer", testTextureBuffers}, {"exec", testExecute}, {"packed", testPackedUniforms}, {"shlight", testShLighting},
+        {"lenient", testLenient},
     };
     auto it = tests.find(argv[1]);
     if (it == tests.end()) return 2;
+    {  // the conformance rules are on only where a test checks them (the rest of the tests build shaders with relaxed headers)
+        const std::string g = argv[1];
+        vpglsl::setStrictMode(g == "errors" || g == "pp" || g == "parse" || g == "fbfetch" || g == "exts" ? 1 : 0);
+    }
     it->second();
     std::printf("%s: %s\n", argv[1], failures ? "FAIL" : "ok");
     return failures ? 1 : 0;

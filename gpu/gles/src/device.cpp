@@ -24,6 +24,10 @@ void logf(const char* fmt, ...) {
     std::fprintf(stderr, "%s\n", buf);
 }
 
+void logLenient(const std::vector<std::string>& rules, const char* what, unsigned name) {
+    for (const std::string& r : rules) logf("gles.glsl.lenient rule=%s %s=%u", r.c_str(), what, name);
+}
+
 Device* device() { return gDevice; }
 void setDevice(Device* d) { gDevice = d; }
 Context* current() { return tCurrent; }
