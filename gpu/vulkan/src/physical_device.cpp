@@ -445,6 +445,7 @@ std::vector<VkExtensionProperties> deviceExtensions() {
   v.push_back({VK_KHR_SHADER_NON_SEMANTIC_INFO_EXTENSION_NAME, 1});              // NonSemantic.* ext-insts ignored (spirv)
   v.push_back({VK_KHR_SPIRV_1_4_EXTENSION_NAME, 1});
   v.push_back({VK_KHR_SHADER_FLOAT_CONTROLS_EXTENSION_NAME, 4});                 // properties in entry.cpp
+  v.push_back({VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME, 2});                       // pipelines.cpp vkCmdPushDescriptorSetKHR
   v.push_back({VK_EXT_DEPTH_CLIP_ENABLE_EXTENSION_NAME, 1});                     // pipelines.cpp: static state only
   v.push_back({VK_EXT_VERTEX_ATTRIBUTE_DIVISOR_EXTENSION_NAME, 3});              // lower.cpp dividedInstance (vertex pulling)
   v.push_back({VK_EXT_ASTC_DECODE_MODE_EXTENSION_NAME, 1});                      // VkImageViewASTCDecodeModeEXT accepted, decoded as float

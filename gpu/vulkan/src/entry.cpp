@@ -513,6 +513,9 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkGetPhysicalDeviceProperties2(VkPhysical
             deviceProperties().limits.minTexelBufferOffsetAlignment;
         break;
       }
+      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PUSH_DESCRIPTOR_PROPERTIES_KHR:
+        reinterpret_cast<VkPhysicalDevicePushDescriptorPropertiesKHR*>(s)->maxPushDescriptors = 32;
+        break;
       case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_ATTRIBUTE_DIVISOR_PROPERTIES_EXT:
         reinterpret_cast<VkPhysicalDeviceVertexAttributeDivisorPropertiesEXT*>(s)->maxVertexAttribDivisor = 65535;  // Adreno's value
         break;

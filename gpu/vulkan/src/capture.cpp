@@ -1298,7 +1298,7 @@ void VKAPI_CALL dispatchBaseHook(VkCommandBuffer cb, uint32_t bx, uint32_t by, u
   X(vkDestroyPrivateDataSlot, false) X(vkCreatePipelineCache, false) X(vkDestroyPipelineCache, false)                  \
   X(vkCreateDescriptorUpdateTemplate, false) X(vkDestroyDescriptorUpdateTemplate, false)                               \
   X(vkDestroySamplerYcbcrConversion, false) X(vkCmdSetDeviceMask, false) X(vkCmdSetLogicOpEXT, false)                  \
-  X(vkCmdSetPatchControlPointsEXT, false)
+  X(vkCmdSetPatchControlPointsEXT, false) X(vkCmdPushDescriptorSetKHR, true) X(vkCmdPushDescriptorSetWithTemplateKHR, true)
 struct Unhooked {
   const char* name;
   bool invalid;

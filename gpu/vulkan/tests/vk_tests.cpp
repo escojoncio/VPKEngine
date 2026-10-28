@@ -3703,6 +3703,86 @@ void testInlineUniformBlock() {
   unsetenv("VPVK_EXTRA_EXTENSIONS");
 }
 
+// VK_KHR_push_descriptor: pushes write a set the command buffer owns; each draw sees the descriptors pushed before it, a
+// later push (writes or template) does not reach the draws already recorded.
+void testPushDescriptor() {
+  vpvk_config_set_quest_identity(1);
+  unsetenv("VPVK_EXTRA_EXTENSIONS");
+  Ctx c({VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME});
+  CHECK(c.dev != nullptr);
+  VkPhysicalDevicePushDescriptorPropertiesKHR pp{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PUSH_DESCRIPTOR_PROPERTIES_KHR};
+  VkPhysicalDeviceProperties2 p2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &pp};
+  vkGetPhysicalDeviceProperties2(c.pd, &p2);
+  CHECK(pp.maxPushDescriptors == 32);
+  auto push = reinterpret_cast<PFN_vkCmdPushDescriptorSetKHR>(vkGetDeviceProcAddr(c.dev, "vkCmdPushDescriptorSetKHR"));
+  auto pushTpl = reinterpret_cast<PFN_vkCmdPushDescriptorSetWithTemplateKHR>(
+      vkGetDeviceProcAddr(c.dev, "vkCmdPushDescriptorSetWithTemplateKHR"));
+  CHECK(push && pushTpl);
+  if (!push || !pushTpl) return;
+
+  DrawRig rig(c);
+  VkShaderModule vs = module(c, "pos.vert.spv"), fs = module(c, "inline_ubo.frag.spv");
+  VkDescriptorSetLayoutBinding b{3, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr};
+  VkDescriptorSetLayoutCreateInfo lci{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+  lci.flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR, lci.bindingCount = 1, lci.pBindings = &b;
+  VkDescriptorSetLayout sl;
+  vkCreateDescriptorSetLayout(c.dev, &lci, nullptr, &sl);
+  VkPipelineLayoutCreateInfo plci{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+  plci.setLayoutCount = 1, plci.pSetLayouts = &sl;
+  VkPipelineLayout pl;
+  vkCreatePipelineLayout(c.dev, &plci, nullptr, &pl);
+  VkDescriptorUpdateTemplateEntry te{3, 0, 1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 0, sizeof(VkDescriptorBufferInfo)};
+  VkDescriptorUpdateTemplateCreateInfo tci{VK_STRUCTURE_TYPE_DESCRIPTOR_UPDATE_TEMPLATE_CREATE_INFO};
+  tci.descriptorUpdateEntryCount = 1, tci.pDescriptorUpdateEntries = &te;
+  tci.templateType = VK_DESCRIPTOR_UPDATE_TEMPLATE_TYPE_PUSH_DESCRIPTORS_KHR;
+  tci.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS, tci.pipelineLayout = pl, tci.set = 0;
+  VkDescriptorUpdateTemplate tpl;
+  vkCreateDescriptorUpdateTemplate(c.dev, &tci, nullptr, &tpl);
+
+  PipeOpts o;
+  VkPipeline pipe = makePosPipeline(c, rig, pl, o, vs, fs);
+  CHECK(from<PipelineObj>(pipe) && from<PipelineObj>(pipe)->ok);
+  rig.begin();
+  vkCmdBindPipeline(rig.cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
+  VkDeviceMemory bm = alloc(c, 1 << 20, 0);
+  VkBuffer vb = buffer(c, 4096, bm, 0), ub = buffer(c, 4096, bm, 8192);
+  VkDeviceSize zero = 0;
+  vkCmdBindVertexBuffers(rig.cb, 0, 1, &vb, &zero);
+  VkDescriptorBufferInfo bi{ub, 0, 16};
+  VkWriteDescriptorSet w{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+  w.dstBinding = 3, w.descriptorCount = 1, w.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, w.pBufferInfo = &bi;
+  push(rig.cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pl, 0, 1, &w);
+  vkCmdDraw(rig.cb, 3, 1, 0, 0);
+  bi.offset = 256;
+  push(rig.cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pl, 0, 1, &w);
+  vkCmdDraw(rig.cb, 3, 1, 0, 0);
+  bi.offset = 512;
+  pushTpl(rig.cb, tpl, pl, 0, &bi);
+  vkCmdDraw(rig.cb, 3, 1, 0, 0);
+  vpgpu::Frame frame;
+  TranslateStats ts;
+  const std::vector<vpgpu::Draw> d = rig.finish(frame, ts);
+  CHECK(d.size() == 3 && ts.skippedDraws == 0);
+  uint64_t begin[3] = {};
+  for (size_t i = 0; i < d.size() && i < 3; ++i) {
+    int found = 0;
+    for (const vpgpu::Access& a : d[i].bindings)
+      if (a.kind == vpgpu::BindKind::ConstantBuffer && a.slot == 0) ++found, begin[i] = a.range.begin;
+    CHECK(found == 1);
+  }
+  CHECK(begin[1] == begin[0] + 256 && begin[2] == begin[0] + 512);
+  vkDestroyPipeline(c.dev, pipe, nullptr);
+  vkDestroyDescriptorUpdateTemplate(c.dev, tpl, nullptr);
+  vkDestroyPipelineLayout(c.dev, pl, nullptr);
+  vkDestroyDescriptorSetLayout(c.dev, sl, nullptr);
+  vkDestroyBuffer(c.dev, vb, nullptr);
+  vkDestroyBuffer(c.dev, ub, nullptr);
+  vkFreeMemory(c.dev, bm, nullptr);
+  vkDestroyShaderModule(c.dev, vs, nullptr);
+  vkDestroyShaderModule(c.dev, fs, nullptr);
+  vpvk_config_set_quest_identity(0);
+}
+
 // VK_KHR_buffer_device_address / Vulkan 1.2: addresses of bound buffers (the backend's, here the null
 // backend's distinct fake ones), the aliases, and a compute pipeline that dereferences a pointer.
 void testBufferDeviceAddress() {
@@ -10531,7 +10611,7 @@ int main(int argc, char** argv) {
       {"passes", testPasses},   {"submit", testSubmit}, {"pipeline", testPipeline},
       {"recipes", testRecipes}, {"taa", testTaa}, {"msaa", testMsaa}, {"queries", testQueries},
       {"timeline", testTimeline}, {"pending", testPending}, {"renderpass_ops", testRenderPassOps}, {"linear", testLinear}, {"images", testImages}, {"image_lifetime", testImageLifetime},
-      {"vertex_stores", testVertexStores}, {"profile", testProfile}, {"profile13", testProfile13}, {"quest_extras", testQuestExtras}, {"report_geom", testReportGeomInterpolators}, {"pipeline_policy", testPipelinePolicy}, {"eds", testExtendedDynamicState},
+      {"vertex_stores", testVertexStores}, {"profile", testProfile}, {"profile13", testProfile13}, {"quest_extras", testQuestExtras}, {"push_descriptor", testPushDescriptor}, {"report_geom", testReportGeomInterpolators}, {"pipeline_policy", testPipelinePolicy}, {"eds", testExtendedDynamicState},
       {"native_identity", testNativeIdentity}, {"inline_uniform", testInlineUniformBlock}, {"bda", testBufferDeviceAddress}, {"ycbcr", testYcbcr},
       {"taa_native", testTaaNative}, {"taa_eye_depth", testTaaEyeDepth}, {"taa_uimask", testTaaUiMask}, {"msaa_force", testMsaaForce}, {"aot", testAot}, {"aniso", testAniso}, {"zeroinit", testZeroInit}, {"archive_index", testArchiveIndex}, {"foveation", testFoveation},
       {"stage_keys", testStageKeys}, {"async_pipelines", testAsyncPipelines}, {"sync_pipelines", testSyncPipelines}, {"pso_census", testPsoCensus}, {"pass_drop", testPassDrop}, {"skip_reasons", testSkipReasons}, {"indirect_patch", testIndirectPatch}, {"astc3d", testAstc3d},

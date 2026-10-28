@@ -909,6 +909,7 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkCreateDescriptorSetLayout(VkDevice,
                                                                        const VkAllocationCallbacks*,
                                                                        VkDescriptorSetLayout* out) {
   auto data = std::make_shared<SetLayoutData>();
+  data->push = (ci->flags & VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR) != 0;
   for (uint32_t i = 0; i < ci->bindingCount; ++i) {
     const VkDescriptorSetLayoutBinding& b = ci->pBindings[i];
     SetLayoutBinding x;
@@ -980,30 +981,38 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkDestroyDescriptorPool(VkDevice d, VkDes
   delete from<DescriptorPoolObj>(p);
 }
 
+namespace {
+// An empty set of `layout` (every descriptor unwritten, immutable samplers in place).
+void initDescriptorSet(DescriptorSetObj& s, std::shared_ptr<const SetLayoutData> layout) {
+  s.layout = std::move(layout);
+  s.slots.clear(), s.inlineData.clear();
+  s.slots.resize(s.layout->bindings.size());
+  s.inlineData.resize(s.layout->bindings.size());
+  for (size_t b = 0; b < s.layout->bindings.size(); ++b) {
+    const SetLayoutBinding& lb = s.layout->bindings[b];
+    if (lb.type == VK_DESCRIPTOR_TYPE_INLINE_UNIFORM_BLOCK) {
+      s.slots[b].resize(1);
+      s.slots[b][0].type = lb.type;
+      s.inlineData[b].assign(lb.count, 0);
+      continue;
+    }
+    s.slots[b].resize(lb.count);
+    for (uint32_t k = 0; k < lb.immutable.size() && k < lb.count; ++k) {
+      s.slots[b][k].sampler = lb.immutable[k];
+      s.slots[b][k].type = lb.type;
+      s.slots[b][k].immutable = true;
+    }
+  }
+}
+}  // namespace
+
 VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkAllocateDescriptorSets(VkDevice, const VkDescriptorSetAllocateInfo* ai,
                                                                     VkDescriptorSet* out) {
   auto* pool = from<DescriptorPoolObj>(ai->descriptorPool);
   for (uint32_t i = 0; i < ai->descriptorSetCount; ++i) {
     auto* s = new DescriptorSetObj;
-    s->layout = from<DescriptorSetLayoutObj>(ai->pSetLayouts[i])->data;
+    initDescriptorSet(*s, from<DescriptorSetLayoutObj>(ai->pSetLayouts[i])->data);
     s->pool = pool;
-    s->slots.resize(s->layout->bindings.size());
-    s->inlineData.resize(s->layout->bindings.size());
-    for (size_t b = 0; b < s->layout->bindings.size(); ++b) {
-      const SetLayoutBinding& lb = s->layout->bindings[b];
-      if (lb.type == VK_DESCRIPTOR_TYPE_INLINE_UNIFORM_BLOCK) {
-        s->slots[b].resize(1);
-        s->slots[b][0].type = lb.type;
-        s->inlineData[b].assign(lb.count, 0);
-        continue;
-      }
-      s->slots[b].resize(lb.count);
-      for (uint32_t k = 0; k < lb.immutable.size() && k < lb.count; ++k) {
-        s->slots[b][k].sampler = lb.immutable[k];
-        s->slots[b][k].type = lb.type;
-        s->slots[b][k].immutable = true;
-      }
-    }
     pool->sets.push_back(s);
     out[i] = to<VkDescriptorSet>(s);
   }
@@ -1069,39 +1078,43 @@ void writeInline(DescriptorSetObj* s, uint32_t binding, uint32_t offset, uint32_
 }
 }  // namespace
 
-VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkUpdateDescriptorSets(VkDevice, uint32_t nw, const VkWriteDescriptorSet* w,
-                                                              uint32_t nc, const VkCopyDescriptorSet* c) {
-  for (uint32_t i = 0; i < nw; ++i) {
-    auto* s = from<DescriptorSetObj>(w[i].dstSet);
-    if (w[i].descriptorType == VK_DESCRIPTOR_TYPE_INLINE_UNIFORM_BLOCK) {
-      // dstArrayElement is a byte offset, descriptorCount a byte count; the data is in the pNext chain.
-      for (auto* n = static_cast<const VkBaseInStructure*>(w[i].pNext); n; n = n->pNext)
-        if (n->sType == VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_INLINE_UNIFORM_BLOCK) {
-          auto* iu = reinterpret_cast<const VkWriteDescriptorSetInlineUniformBlock*>(n);
-          writeInline(s, w[i].dstBinding, w[i].dstArrayElement, std::min(w[i].descriptorCount, iu->dataSize), iu->pData);
-        }
-      continue;
-    }
-    for (uint32_t k = 0; k < w[i].descriptorCount; ++k) {
-      Descriptor* d = element(s, w[i].dstBinding, w[i].dstArrayElement + k);
-      if (!d) break;
-      switch (w[i].descriptorType) {
-        case VK_DESCRIPTOR_TYPE_SAMPLER:
-        case VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER:
-        case VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE:
-        case VK_DESCRIPTOR_TYPE_STORAGE_IMAGE:
-        case VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT:
-          writeImage(*d, w[i].descriptorType, w[i].pImageInfo[k]);
-          break;
-        case VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER:
-        case VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER:
-          d->type = w[i].descriptorType;
-          d->texel = w[i].pTexelBufferView[k] ? from<BufferView>(w[i].pTexelBufferView[k]) : nullptr;
-          break;
-        default: writeBuffer(*d, w[i].descriptorType, w[i].pBufferInfo[k]); break;
+namespace {
+// One write into `s` (vkUpdateDescriptorSets and vkCmdPushDescriptorSetKHR share it; the set is w.dstSet or the push set).
+void applyWrite(DescriptorSetObj* s, const VkWriteDescriptorSet& w) {
+  if (w.descriptorType == VK_DESCRIPTOR_TYPE_INLINE_UNIFORM_BLOCK) {
+    // dstArrayElement is a byte offset, descriptorCount a byte count; the data is in the pNext chain.
+    for (auto* n = static_cast<const VkBaseInStructure*>(w.pNext); n; n = n->pNext)
+      if (n->sType == VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_INLINE_UNIFORM_BLOCK) {
+        auto* iu = reinterpret_cast<const VkWriteDescriptorSetInlineUniformBlock*>(n);
+        writeInline(s, w.dstBinding, w.dstArrayElement, std::min(w.descriptorCount, iu->dataSize), iu->pData);
       }
+    return;
+  }
+  for (uint32_t k = 0; k < w.descriptorCount; ++k) {
+    Descriptor* d = element(s, w.dstBinding, w.dstArrayElement + k);
+    if (!d) break;
+    switch (w.descriptorType) {
+      case VK_DESCRIPTOR_TYPE_SAMPLER:
+      case VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER:
+      case VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE:
+      case VK_DESCRIPTOR_TYPE_STORAGE_IMAGE:
+      case VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT:
+        writeImage(*d, w.descriptorType, w.pImageInfo[k]);
+        break;
+      case VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER:
+      case VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER:
+        d->type = w.descriptorType;
+        d->texel = w.pTexelBufferView[k] ? from<BufferView>(w.pTexelBufferView[k]) : nullptr;
+        break;
+      default: writeBuffer(*d, w.descriptorType, w.pBufferInfo[k]); break;
     }
   }
+}
+}  // namespace
+
+VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkUpdateDescriptorSets(VkDevice, uint32_t nw, const VkWriteDescriptorSet* w,
+                                                              uint32_t nc, const VkCopyDescriptorSet* c) {
+  for (uint32_t i = 0; i < nw; ++i) applyWrite(from<DescriptorSetObj>(w[i].dstSet), w[i]);
   for (uint32_t i = 0; i < nc; ++i) {
     auto* src = from<DescriptorSetObj>(c[i].srcSet);
     auto* dst = from<DescriptorSetObj>(c[i].dstSet);
@@ -1123,6 +1136,8 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkCreateDescriptorUpdateTemplate(VkDe
                                                                             VkDescriptorUpdateTemplate* out) {
   auto* t = new DescriptorUpdateTemplateObj;
   t->entries.assign(ci->pDescriptorUpdateEntries, ci->pDescriptorUpdateEntries + ci->descriptorUpdateEntryCount);
+  t->push = ci->templateType == VK_DESCRIPTOR_UPDATE_TEMPLATE_TYPE_PUSH_DESCRIPTORS_KHR;
+  t->bindPoint = ci->pipelineBindPoint, t->set = ci->set;
   *out = to<VkDescriptorUpdateTemplate>(t);
   return VK_SUCCESS;
 }
@@ -1132,9 +1147,8 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkDestroyDescriptorUpdateTemplate(VkDevic
   delete from<DescriptorUpdateTemplateObj>(t);
 }
 
-VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkUpdateDescriptorSetWithTemplate(VkDevice, VkDescriptorSet set,
-                                                                         VkDescriptorUpdateTemplate tpl, const void* data) {
-  auto* s = from<DescriptorSetObj>(set);
+namespace {
+void applyTemplate(DescriptorSetObj* s, VkDescriptorUpdateTemplate tpl, const void* data) {
   const auto* bytes = static_cast<const uint8_t*>(data);
   for (const VkDescriptorUpdateTemplateEntry& e : from<DescriptorUpdateTemplateObj>(tpl)->entries) {
     if (e.descriptorType == VK_DESCRIPTOR_TYPE_INLINE_UNIFORM_BLOCK) {  // bytes at `offset`, count = size
@@ -1172,6 +1186,12 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkUpdateDescriptorSetWithTemplate(VkDevic
       }
     }
   }
+}
+}  // namespace
+
+VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkUpdateDescriptorSetWithTemplate(VkDevice, VkDescriptorSet set,
+                                                                         VkDescriptorUpdateTemplate tpl, const void* data) {
+  applyTemplate(from<DescriptorSetObj>(set), tpl, data);
 }
 
 // =================================================================================================
@@ -2158,6 +2178,42 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdBindDescriptorSets(VkCommandBuffer c
   }
 }
 
+namespace {
+// The push set of (bind point, set number), made (or reused) for the layout's set layout and bound in place of whatever
+// was bound there. Null when the layout has no such set.
+DescriptorSetObj* pushSetFor(VkCommandBuffer cb, VkPipelineBindPoint bp, VkPipelineLayout pl, uint32_t set) {
+  const std::shared_ptr<const PipelineLayoutObj> lay = layoutOf(pl);
+  Recorder& r = rec(cb);
+  if (!lay || set >= lay->sets.size() || !lay->sets[set] || set >= r.pushSets[0].size()) return nullptr;
+  const bool compute = bp == VK_PIPELINE_BIND_POINT_COMPUTE;
+  auto& own = r.pushSets[compute ? 1 : 0][set];
+  if (!own || own->layout != lay->sets[set]) {
+    own = std::make_unique<DescriptorSetObj>();
+    initDescriptorSet(*own, lay->sets[set]);
+  }
+  auto& bound = (compute ? r.bound.computeSets : r.bound.graphicsSets)[set];
+  bound.set = own.get();
+  bound.dynamicOffsets.clear();
+  return own.get();
+}
+}  // namespace
+
+// VK_KHR_push_descriptor: the writes go to a set the command buffer owns; draws copy descriptors when recorded,
+// so rewriting it in place for the next push is safe.
+VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdPushDescriptorSetKHR(VkCommandBuffer cb, VkPipelineBindPoint bp, VkPipelineLayout pl,
+                                                                 uint32_t set, uint32_t n, const VkWriteDescriptorSet* w) {
+  DescriptorSetObj* s = pushSetFor(cb, bp, pl, set);
+  if (!s) return;
+  for (uint32_t i = 0; i < n; ++i) applyWrite(s, w[i]);
+}
+
+VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdPushDescriptorSetWithTemplateKHR(VkCommandBuffer cb, VkDescriptorUpdateTemplate tpl,
+                                                                             VkPipelineLayout pl, uint32_t set, const void* data) {
+  const auto* t = from<DescriptorUpdateTemplateObj>(tpl);
+  DescriptorSetObj* s = pushSetFor(cb, t->bindPoint, pl, set);
+  if (s) applyTemplate(s, tpl, data);
+}
+
 VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdPushConstants(VkCommandBuffer cb, VkPipelineLayout, VkShaderStageFlags,
                                                           uint32_t offset, uint32_t size, const void* data) {
   BoundState& b = rec(cb).bound;
@@ -2464,7 +2520,7 @@ PipelineObj::TexelVariant* texelVariant(Device* dev, const PipelineObj& p, const
   // vertex fetch is in the shader, so the stride is part of the translation.
   std::vector<uint32_t> strides;
   for (const spirv::VertexBufferBinding& vb : p.vertexBuffers) {
-    const int64_t s = p.dynStride ? bound.vertex[vb.binding < 16 ? vb.binding : 0].stride : -1;
+    const int64_t s = p.dynStride ? bound.vertex[vb.binding < bound.vertex.size() ? vb.binding : 0].stride : -1;
     strides.push_back(s >= 0 ? uint32_t(s) : vb.stride);
     differs = differs || strides.back() != vb.stride;
   }
@@ -2669,7 +2725,7 @@ OpDraw makeDraw(Recorder& r, uint32_t first, uint32_t count, uint32_t instances,
             a.range.generation == im->id.generation && std::find(op.images.begin(), op.images.end(), im) == op.images.end())
           op.images.push_back(im);
   for (const spirv::VertexBufferBinding& vb : p->vertexBuffers) {
-    const BoundState::VB& b = r.bound.vertex[vb.binding < 16 ? vb.binding : 0];
+    const BoundState::VB& b = r.bound.vertex[vb.binding < r.bound.vertex.size() ? vb.binding : 0];
     if (!b.buffer || !b.buffer->id) continue;  // unused by the shader or not bound
     VkDeviceSize avail = b.offset < b.buffer->size ? b.buffer->size - b.offset : 0;
     if (b.size != VK_WHOLE_SIZE) avail = std::min(avail, b.size);  // vkCmdBindVertexBuffers2 pSizes
@@ -3759,7 +3815,7 @@ PFN_vkVoidFunction lookupPhase3(const char* name) {
       F(vkUpdateDescriptorSets), F(vkCreateDescriptorUpdateTemplate), F(vkDestroyDescriptorUpdateTemplate),
       F(vkUpdateDescriptorSetWithTemplate), F(vkCreateGraphicsPipelines), F(vkCreateComputePipelines), F(vkDestroyPipeline),
       F(vkCreatePipelineCache), F(vkDestroyPipelineCache), F(vkGetPipelineCacheData), F(vkMergePipelineCaches),
-      F(vkCmdBindPipeline), F(vkCmdBindDescriptorSets), F(vkCmdPushConstants), F(vkCmdBindVertexBuffers),
+      F(vkCmdBindPipeline), F(vkCmdBindDescriptorSets), F(vkCmdPushDescriptorSetKHR), F(vkCmdPushDescriptorSetWithTemplateKHR), F(vkCmdPushConstants), F(vkCmdBindVertexBuffers),
       F(vkCmdBindVertexBuffers2), F(vkCmdBindIndexBuffer), F(vkCmdSetViewport), F(vkCmdSetScissor),
       F(vkCmdSetStencilReference), F(vkCmdSetBlendConstants), F(vkCmdSetLineWidth), F(vkCmdSetDepthBias),
       F(vkCmdSetDepthBounds), F(vkCmdSetViewportWithCount), F(vkCmdSetScissorWithCount), F(vkCmdSetCullMode),

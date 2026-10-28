@@ -388,6 +388,7 @@ struct SetLayoutBinding {
 };
 struct SetLayoutData {
   std::vector<SetLayoutBinding> bindings;  // sorted by binding
+  bool push = false;                       // VK_KHR_push_descriptor layout: never allocated from a pool
   const SetLayoutBinding* find(uint32_t b) const {
     for (const auto& x : bindings)
       if (x.binding == b) return &x;
@@ -440,6 +441,9 @@ struct DescriptorPoolObj {
 
 struct DescriptorUpdateTemplateObj {
   std::vector<VkDescriptorUpdateTemplateEntry> entries;
+  bool push = false;  // VK_DESCRIPTOR_UPDATE_TEMPLATE_TYPE_PUSH_DESCRIPTORS_KHR: bindPoint / set tell where vkCmdPushDescriptorSetWithTemplate goes
+  VkPipelineBindPoint bindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+  uint32_t set = 0;
 };
 
 struct PipelineObj {

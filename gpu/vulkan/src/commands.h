@@ -244,7 +244,7 @@ struct BoundState {
     VkDeviceSize size = VK_WHOLE_SIZE;  // vkCmdBindVertexBuffers2
     int64_t stride = -1;                 // vkCmdBindVertexBuffers2 (dynamic strides); -1 = the pipeline's
   };
-  std::array<VB, 16> vertex{};
+  std::array<VB, 32> vertex{};
   const Buffer* index = nullptr;
   VkDeviceSize indexOffset = 0;
   bool indexWide = false;
@@ -356,8 +356,13 @@ struct Recorder {
   // VK_KHR_imageless_framebuffer: the framebuffer of each pass begun with its views given at
   // vkCmdBeginRenderPass (VkRenderPassAttachmentBeginInfo); ops point at them until reset.
   std::vector<std::unique_ptr<Framebuffer>> imageless;
+  // VK_KHR_push_descriptor: one set per (bind point, set number), rewritten in place by each push. A draw copies its
+  // descriptors when it is recorded, so a later push does not reach it.
+  std::array<std::array<std::unique_ptr<DescriptorSetObj>, 8>, 2> pushSets;
   void reset() {
     imageless.clear();
+    for (auto& bp : pushSets)
+      for (auto& s : bp) s.reset();
     ops.clear();
     barriers = 0;
     inPass = false;
