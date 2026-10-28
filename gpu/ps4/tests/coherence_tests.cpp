@@ -8,6 +8,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <functional>
 #include <map>
 #include <sstream>
 #include <string>
@@ -16,6 +17,7 @@
 #include <vector>
 
 #include "vpgpu/core/device.h"
+#include "vpgpu/core/probe.h"
 #include "vpps4/renderer.h"
 #include "vpps4/tiling.h"
 
@@ -1520,6 +1522,285 @@ void ownedRelease() {
     }
 }
 
+// ---- Aliases of images the GPU wrote ---------------------------------------------------------------------------
+
+// A T# of the same memory a render target / storage image wrote last, with the same layout and texel size but another numeric
+// class (integers over unorm), is read through a view of that image: the target is not written back to memory and the
+// texture filled from it at every use (a retile, a detile and a GPU wait per use). Whatever differs, or anything else writes
+// the range, keeps the way through memory.
+
+constexpr uint64_t kOut = kBase + 0xB0000;  // the target the reading draws write (128x128 RGBA8)
+
+struct ProbeOn {  // the QUAL counters are published only while the probe is on (the registry is not reset: the renderers keep references into it)
+    ProbeOn() { vpgpu::probe::setEnabled(true); }
+    ~ProbeOn() { vpgpu::probe::setEnabled(false); }
+};
+uint64_t qual(Fixture& f, const std::string& name) {
+    f.renderer.publishProbe(1);
+    return vpgpu::probe::counter("QUAL", name).get();
+}
+uint64_t rejected(Fixture& f) {
+    uint64_t n = 0;
+    for (const char* why : {"depth", "address", "shape", "layout", "mips", "samples", "format", "no_view", "range", "feedback"})
+        n += qual(f, std::string("alias_rejected_") + why);
+    return n;
+}
+
+// One frame: a draw into kRt (tile mode `tile`), then a draw that reads memory `at` through a T# of `dfmt`/`nfmt`, `w` x `h`,
+// tiling `ttile` (0xFF: `tile`), word 3 or-ed with `w3`, and writes kOut.
+void writeThenRead(Fixture& f, uint32_t dfmt, uint32_t nfmt, uint8_t tile = 8, uint32_t w = 128, uint32_t h = 128, uint8_t ttile = 0xFF,
+                   uint32_t w3 = 0, uint64_t at = kRt) {
+    vpps4::DrawState a = f.state();
+    a.color[0].tileMode = tile;
+    f.renderer.draw(a);
+    vpps4::DrawState b = f.state();
+    b.color[0].address = kOut;
+    b.color[0].tileMode = tile;
+    f.sample(at, w, h, dfmt, nfmt, ttile == 0xFF ? tile : ttile);
+    f.at(kBase + 0x200)[3] |= w3;
+    f.renderer.draw(b);
+}
+vpps4::ImageDesc sampled(Fixture& f) { return vpps4::decodeImage(std::span<const uint32_t>(f.at(kBase + 0x200), 8)); }
+
+// The views the recorded draws bind.
+std::vector<vpgpu::TextureId> boundViews(Fixture& f) {
+    f.renderer.submit();
+    std::vector<vpgpu::TextureId> out;
+    for (const vpgpu::Command& c : f.backend.commands)
+        if (const auto* p = std::get_if<vpgpu::RenderPass>(&c))
+            for (const vpgpu::Draw& d : p->draws)
+                for (const vpgpu::ViewBinding& v : d.views) out.push_back(v.view);
+    return out;
+}
+
+// A target drawn and then read as integers over several frames: the image is read through a view, with nothing copied
+// after the first frame; the fill of the target never happens (no retile, no detile of it).
+void aliasClassChange(uint8_t tile) {
+    ProbeOn probe;
+    Fixture f;
+    f.withViews = true;
+    writeThenRead(f, 10, 4, tile);  // RGBA8 uint over the RGBA8 unorm target
+    const auto rt = f.renderer.colorTargetAt(kRt);
+    const auto& st = f.renderer.stats();
+    CHECK(bool(rt) && st.drawn == 2);
+    CHECK(st.retiled == 0 && st.refilled == 1);  // (the refill is the first fill of the draw's own texture at kTex)
+    const uint64_t copies = st.copies;
+    for (int i = 0; i < 5; ++i) {
+        writeThenRead(f, 10, 4, tile);
+        CHECK(st.retiled == 0 && st.refilled == 1 && st.copies == copies);
+    }
+    CHECK(st.drawn == 12);
+    CHECK(f.viewRequests.size() == 1 && f.viewRequests[0].base == rt && f.viewRequests[0].format == vpgpu::Format::RGBA8Uint);
+    const vpgpu::TextureId view = f.renderer.textureFor(sampled(f));
+    CHECK(view && view != rt);
+    CHECK(f.renderer.tracker().ownerImage(kRt, 128 * 128 * 4) != 0);  // (memory is still behind the target: nothing wrote it back)
+    CHECK(qual(f, "alias_hits") == 7);
+    CHECK(rejected(f) == 0);
+    const auto views = boundViews(f);
+    CHECK(views.size() == 6);
+    for (const vpgpu::TextureId v : views) CHECK(v == view);
+    CHECK(Fixture::count(f.events(), "copy retile") == 0);
+    if (failures) f.dump();
+}
+void aliasClassChangeLinear() { aliasClassChange(8); }
+void aliasClassChangeTiled() { aliasClassChange(14); }
+
+// The same through a storage image a dispatch wrote (instead of a target).
+void aliasTextureWriter() {
+    ProbeOn probe;
+    Fixture f;
+    f.withViews = true;
+    f.imageWrite();
+    f.sample(kImg, 64, 64, 10, 0, 8);
+    const auto image = f.renderer.textureFor(sampled(f));  // the storage image itself
+    const uint64_t textures = f.renderer.stats().textures;
+    for (int i = 0; i < 4; ++i) {
+        f.imageWrite();
+        vpps4::DrawState d = f.state();
+        f.sample(kImg, 64, 64, 10, 4, 8);  // uint over the unorm storage image
+        f.renderer.draw(d);
+    }
+    CHECK(f.renderer.stats().drawn == 4);
+    CHECK(f.renderer.stats().retiled == 0);
+    CHECK(f.renderer.stats().textures == textures);  // (no texture at kImg but the storage image: the sampling draws read it through a view)
+    CHECK(f.viewRequests.size() == 1 && f.viewRequests[0].base == image && f.viewRequests[0].format == vpgpu::Format::RGBA8Uint);
+    CHECK(qual(f, "alias_hits") == 4 && rejected(f) == 0);
+    if (failures) f.dump();
+}
+
+// A render target read in the pass that writes it is not aliased (it is attached to the pass): the way through memory as
+// before, counted as `feedback`. Once no pass of the draw has it attached, the alias is back with nothing written back.
+void aliasSamePass() {
+    ProbeOn probe;
+    Fixture f;
+    f.withViews = true;
+    f.renderer.draw(f.state());
+    for (int i = 0; i < 3; ++i) {
+        vpps4::DrawState d = f.state();
+        f.sample(kRt, 128, 128, 10, 4, 8);
+        f.renderer.draw(d);  // writes kRt and reads it as integers
+    }
+    const auto& st = f.renderer.stats();
+    CHECK(st.drawn == 4 && st.retiled >= 1);
+    CHECK(qual(f, "alias_hits") == 0 && qual(f, "alias_rejected_feedback") == 3 && rejected(f) == 3);
+    const uint64_t retiles = st.retiled, refills = st.refilled;
+    vpps4::DrawState d = f.state();
+    d.color[0].address = kOut;
+    f.sample(kRt, 128, 128, 10, 4, 8);
+    f.renderer.draw(d);  // reads kRt, writes another target
+    CHECK(qual(f, "alias_hits") == 1 && rejected(f) == 3);
+    CHECK(st.retiled == retiles && st.refilled == refills);
+    if (failures) f.dump();
+}
+
+// A BGRA target read through an RGBA format (or the reverse): not aliased, the channel order is not compensated.
+void aliasChannelOrder() {
+    ProbeOn probe;
+    Fixture f;
+    f.withViews = true;
+    vpps4::DrawState a = f.state();
+    a.color[0].compSwap = 1;  // BGRA
+    f.renderer.draw(a);
+    vpps4::DrawState b = f.state();
+    b.color[0].address = kOut;
+    f.sample(kRt, 128, 128, 10, 4, 8);
+    f.renderer.draw(b);
+    CHECK(qual(f, "alias_hits") == 0 && qual(f, "alias_rejected_format") == 1);
+    CHECK(f.renderer.stats().retiled == 1);
+}
+
+// The CPU writes the target's memory (after the host had it written back), or a DMA does: no alias from then on; the texture is
+// filled from memory, with the new bytes, once, and read from then on; where the target is drawn again the alias is back.
+void aliasWritten(bool dma, uint64_t offset) {
+    ProbeOn probe;
+    Fixture f;
+    f.withViews = true;
+    for (int i = 0; i < 3; ++i) writeThenRead(f, 10, 4, 8);
+    const auto& st = f.renderer.stats();
+    CHECK(st.retiled == 0 && st.refilled == 1);
+    const vpgpu::TextureId aliased = f.renderer.textureFor(sampled(f));
+    if (dma) {
+        CHECK(f.renderer.fill(kRt + offset, 16, 0xCAFEF00Du));
+    } else {
+        CHECK(f.renderer.syncToMemory(kRt, 128 * 128 * 4));
+        f.at(kRt + offset)[0] = 0xCAFEF00Du;
+        f.renderer.invalidate(kRt + offset, 4);
+    }
+    const vpgpu::TextureId after = f.renderer.textureFor(sampled(f));
+    CHECK(after && after != aliased);             // a texture of its own now
+    CHECK(st.refilled == 2 && st.retiled == 1);  // the target written back (once), the texture filled
+    CHECK(offset == 0 ? qual(f, "alias_rejected_range") == 0 : qual(f, "alias_rejected_range") == 1);
+    const auto e = f.events();
+    const long retile = Fixture::indexOf(e, "copy retile " + Fixture::hex(kRt));
+    const long upload = Fixture::indexOf(e, "copy upload " + Fixture::hex(kRt));
+    CHECK(retile >= 0 && upload > retile);
+    const vpgpu::Copy* cp = decodeCopy(f, "upload " + Fixture::hex(kRt));
+    const uint8_t* bytes = cp ? copyBytes(f, *cp) : nullptr;
+    if (!dma) CHECK(bytes && *reinterpret_cast<const uint32_t*>(bytes + offset) == 0xCAFEF00Du);  // (the new bytes are what it reads)
+    CHECK(f.renderer.textureFor(sampled(f)) == after && st.refilled == 2 && st.retiled == 1);  // read again: the texture, nothing more
+    writeThenRead(f, 10, 4, 8);  // the target drawn again (filled from the CPU's bytes first, as any target): the alias is back
+    CHECK(f.renderer.textureFor(sampled(f)) == aliased);
+    const uint64_t refills = st.refilled, retiles = st.retiled;
+    writeThenRead(f, 10, 4, 8);
+    CHECK(st.refilled == refills && st.retiled == retiles);
+    if (failures) f.dump();
+}
+void aliasCpuWriteFirstByte() { aliasWritten(false, 0); }
+void aliasCpuWriteInside() { aliasWritten(false, 0x8000); }
+void aliasDmaWriteFirstByte() { aliasWritten(true, 0); }
+void aliasDmaWriteInside() { aliasWritten(true, 0x8000); }
+
+// What differs keeps the way through memory (the target written back, the texture filled), and says why.
+void aliasRejects() {
+    struct Case {
+        const char* name;
+        const char* why;
+        std::function<void(Fixture&)> run;
+    };
+    const Case cases[] = {
+        {"texel size", "format", [](Fixture& f) { writeThenRead(f, 3, 0); }},                                  // 8_8 over RGBA8
+        {"size", "shape", [](Fixture& f) { writeThenRead(f, 10, 4, 8, 256, 128); }},                           // wider than the target
+        {"tiling", "layout", [](Fixture& f) { writeThenRead(f, 10, 4, 8, 128, 128, 13); }},                    // another tile mode
+        {"levels", "mips", [](Fixture& f) { writeThenRead(f, 10, 4, 8, 128, 128, 0xFF, 3u << 16); }},          // 4 levels of a 1 level image
+        {"address", "address", [](Fixture& f) { writeThenRead(f, 10, 4, 8, 64, 64, 0xFF, 0, kRt + 0x4000); }},  // inside the target
+        {"no views", "no_view", [](Fixture& f) { f.withViews = false, writeThenRead(f, 10, 4); }},
+    };
+    for (const Case& c : cases) {
+        ProbeOn probe;
+        Fixture f;
+        f.withViews = true;
+        c.run(f);
+        const auto& st = f.renderer.stats();
+        if (std::string(c.why) != "address") CHECK(st.retiled == 1);  // (written back, as before the alias)
+        CHECK(qual(f, "alias_hits") == 0);
+        if (qual(f, std::string("alias_rejected_") + c.why) < 1) std::fprintf(stderr, "case %s: no alias_rejected_%s\n", c.name, c.why);
+        CHECK(qual(f, std::string("alias_rejected_") + c.why) >= 1);
+        if (failures) f.dump();
+    }
+    {  // a depth target (sampled larger than itself): depth targets are not aliased from here
+        ProbeOn probe;
+        Fixture f;
+        vpps4::DrawState z = f.depthState(true);
+        z.depth.depthClear = true;
+        f.renderer.draw(z);
+        vpps4::DrawState d = f.state();
+        f.sample(kDepth, 256, 128, 4, 7, 8);
+        f.renderer.draw(d);
+        CHECK(qual(f, "alias_rejected_depth") == 1 && qual(f, "alias_hits") == 0);
+    }
+    {  // a multisampled target (sampled larger than itself)
+        ProbeOn probe;
+        Fixture f;
+        f.withViews = true;
+        f.renderer.setMaxSamples(4);
+        vpps4::DrawState m = f.state();
+        m.color[0].samples = 4;
+        f.renderer.draw(m);
+        vpps4::DrawState d = f.state();
+        d.color[0].address = kOut;
+        f.sample(kRt, 256, 128, 10, 4, 8);
+        f.renderer.draw(d);
+        CHECK(qual(f, "alias_rejected_samples") == 1 && qual(f, "alias_hits") == 0);
+    }
+}
+
+// Turned off, the way through memory as before: the target written back at the first read, the texture filled from it.
+void aliasOff() {
+    ProbeOn probe;
+    Fixture f;
+    f.withViews = true;
+    f.renderer.setImageAlias(false);
+    for (int i = 0; i < 3; ++i) writeThenRead(f, 10, 4, 8);
+    CHECK(f.renderer.stats().retiled == 3 && f.renderer.stats().refilled == 4);
+    CHECK(qual(f, "alias_hits") == 0 && rejected(f) == 0);
+    CHECK(f.viewRequests.empty());
+}
+
+// The target is evicted while its memory is read through the alias: written back first, then the texture comes from memory.
+void aliasEvicted() {
+    ProbeOn probe;
+    Fixture f;
+    f.withViews = true;
+    f.renderer.setResidency(3, 1ull << 40);
+    writeThenRead(f, 10, 4, 8);
+    CHECK(f.renderer.stats().retiled == 0 && qual(f, "alias_hits") == 1);
+    for (int i = 0; i < 24; ++i) f.renderer.submit();
+    CHECK(!bool(f.renderer.colorTargetAt(kRt)));
+    CHECK(f.renderer.stats().retiled >= 1);  // (the target, written back when evicted)
+    const uint64_t textures = f.renderer.stats().textures;
+    vpps4::DrawState d = f.state();
+    f.sample(kRt, 128, 128, 10, 4, 8);
+    f.renderer.draw(d);  // reads the memory of the target that is gone
+    CHECK(f.renderer.stats().textures > textures);
+    CHECK(qual(f, "alias_hits") == 1);
+    const auto e = f.events();
+    const long retile = Fixture::indexOf(e, "copy retile " + Fixture::hex(kRt));
+    const long upload = Fixture::indexOf(e, "copy upload " + Fixture::hex(kRt));
+    CHECK(retile >= 0 && upload > retile);
+    if (failures) f.dump();
+}
+
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -1556,6 +1837,16 @@ int main(int argc, char** argv) {
     else if (t == "eviction_bytes") evictionBytes();
     else if (t == "host_watches") hostWatches();
     else if (t == "owned_release") ownedRelease();
+    else if (t == "alias_class_change") aliasClassChangeLinear();
+    else if (t == "alias_class_change_tiled") aliasClassChangeTiled();
+    else if (t == "alias_texture_writer") aliasTextureWriter();
+    else if (t == "alias_same_pass") aliasSamePass();
+    else if (t == "alias_cpu_write") aliasCpuWriteFirstByte(), aliasCpuWriteInside();
+    else if (t == "alias_dma_write") aliasDmaWriteFirstByte(), aliasDmaWriteInside();
+    else if (t == "alias_rejects") aliasRejects();
+    else if (t == "alias_evicted") aliasEvicted();
+    else if (t == "alias_off") aliasOff();
+    else if (t == "alias_channel_order") aliasChannelOrder();
     else return std::fprintf(stderr, "unknown test\n"), 2;
     return failures ? 1 : 0;
 }

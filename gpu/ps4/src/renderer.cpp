@@ -209,8 +209,12 @@ struct Renderer::Impl {
     Renderer& r;
     vpgpu::Frame frame;
 
+    // Why a T# whose memory an image of the renderer wrote last is not read through that image (see aliasWriter; QUAL alias_rejected_*).
+    enum AliasReject : unsigned { kRejDepth, kRejAddress, kRejShape, kRejLayout, kRejMips, kRejSamples, kRejFormat, kRejNoView, kRejRange, kRejFeedback, kAliasReasons };
+
     // ---- Probe counters (diagnostics; plain integers, the renderer is driven from one thread; published by Renderer::publishProbe)
     struct ProbeStats {
+        uint64_t aliasHits = 0, aliasHitsLegacy = 0, aliasRejected[kAliasReasons] = {};  // T#s read through the image that wrote their memory / those that could not
         uint64_t guestBufAdds = 0, guestBufRemoves = 0, guestBufRefused = 0;
         uint64_t uploadBytes = 0, alignedCopies = 0;
         uint64_t refills[3] = {}, refillBytes[3] = {}, refillFailed = 0;  // first fill, written by others (version), history forgotten
@@ -2028,6 +2032,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
 
     bool gpuTiling = true;
     bool guestReadOnly = false;  // Renderer::setGuestReadOnly
+    bool imageAlias = !std::getenv("VPKENGINE_NO_IMAGE_ALIAS");  // Renderer::setImageAlias (the environment variable turns it off)
     std::unique_ptr<GpuTiler> tilerPtr;
     GpuTiler& tiler() {
         if (!tilerPtr)
@@ -3137,7 +3142,8 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         texWhy = "storage cube without a 2D-array view";
         return {};
     }
-    TexRef sampleThrough(const Surface& s, const ImageDesc& d, vpgpu::Format f, bool storage = false) {
+    // `exact` (optional): cleared when no view could be made and the image itself is returned instead (another format / slices).
+    TexRef sampleThrough(const Surface& s, const ImageDesc& d, vpgpu::Format f, bool storage = false, bool* exact = nullptr) {
         f = inOrderOf(f, s.format);
         if (storage && d.type == 11) return storageCubeAsArray(s, d, f, {s.id, {}});
         ViewRequest want;
@@ -3160,6 +3166,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
                                 want.array == (s.layers > 1 && want.type != vpgpu::TextureType::Cube);
         if (f == s.format && sameLayers) return {s.id, {}};
         if (const TextureId v = viewOf(s, want)) return {s.id, v};
+        if (exact) *exact = false;
         if (f != s.format) note("image sampled with another format (no view available: its own format)");
         if (!sameLayers) note("image sampled as another slice range or dimension (no view available: whole image)");
         return {s.id, {}};
@@ -3521,6 +3528,53 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         if (depth) return {m.id, {}};
         return sampleThrough(m, desc, f, false);
     }
+    // A sampled T# whose memory an image of the renderer wrote last, with exactly the layout of the T# (same address, size,
+    // slices, tiling, pitch, levels and texel size), is read through that image: it holds the newest bytes, and writing it
+    // back to memory only to fill a texture from it is a round trip (a retile, a detile and the GPU waits of raw reads) at
+    // every use. Another numeric class of the same texel size (a float target read as integers) goes through a view. Where
+    // anything differs, or another writer touched the range after the image, or the image is not whole (depth, samples), the
+    // texture is filled from memory as always (`aliasRejected` says why). Nothing is cached: the checks run at every use, so a
+    // write of the CPU / a DMA / another image, or the image's eviction (written back first), ends the alias at its next use.
+    bool aliasWriter(const ImageDesc& desc, const vpgpu::TextureDesc& td, const TexturePlan& plan, const Texture* own, vpgpu::Format f,
+                     TexRef& out) {
+        if (!imageAlias || r.hooks_.seed) return false;  // (a host with seeds holds the texels of its surfaces: refresh() takes them)
+        const uint32_t wid = tracker.writerAt(desc.address);
+        if (!MemoryTracker::isImage(wid) || (own && wid == own->wid)) return false;
+        Surface* w = surfaceOf(wid);
+        // (no image of ours behind the memory, or the texture already holds what it wrote)
+        if (!w || !w->id || w->version <= (own && own->filled ? own->version : 0)) return false;
+        const auto reject = [&](AliasReject why) { return ++pstat.aliasRejected[why], false; };
+        if (w->isDepth) return reject(kRejDepth);
+        if (!w->filled) return false;
+        if (w->address != desc.address) return reject(kRejAddress);
+        if (w->samples > 1 || w->ms || w->memSamples != 1 || desc.type == 14 || desc.type == 15) return reject(kRejSamples);
+        if (w->type != td.type || w->width != td.width || w->height != td.height || w->depth != td.depth || w->layers != td.layers ||
+            desc.baseArray)
+            return reject(kRejShape);
+        if (w->tile != desc.tilingIndex || std::max(w->pitch, w->width) != std::max(desc.pitch, td.width) ||
+            (td.layers > 1 && w->pow2Pad != desc.pow2Pad))
+            return reject(kRejLayout);
+        if (w->mips != td.mips || desc.baseLevel) return reject(kRejMips);
+        const vpgpu::FormatInfo &fw = vpgpu::formatInfo(w->format), &ff = vpgpu::formatInfo(f);
+        if (w->softBc || plan.softBc || plan.widthDivisor > 1 || fw.depth() || ff.depth() || fw.blockSize != 1 || ff.blockSize != 1 ||
+            fw.bytesPerBlock != ff.bytesPerBlock || bgra(f) != bgra(w->format))  // (the channel order of a view is not compensated here, as planFor does for a bound target)
+            return reject(kRejFormat);
+        // (the image is attached to the pass of the draw that reads it: the way through memory, as before)
+        if (std::find(attachedWids.begin(), attachedWids.end(), w->wid) != attachedWids.end()) return reject(kRejFeedback);
+        if (tracker.writtenByOthers(w->address, w->bytes, w->wid, w->version)) return reject(kRejRange);
+        if (!r.hooks_.view && inOrderOf(f, w->format) != w->format) return reject(kRejNoView);
+        flushClear(*w);  // (a clear that waits for the next pass lands first, as for a target a T# names)
+        bool exact = true;
+        const TexRef ref = sampleThrough(*w, desc, f, false, &exact);
+        if (!exact) return reject(kRejNoView);
+        w->lastUse = r.frame_;
+        life.noteRead(w->id, r.frame_);
+        ++pstat.aliasHits;
+        probeSampled(desc, *w, "image written by the GPU (T# of the same memory, aliased)", false);
+        out = ref;
+        return true;
+    }
+    std::vector<uint32_t> attachedWids;  // the images the draw being recorded renders to (colour and depth)
     TexRef textureRef(const ImageDesc& desc, bool storage, bool write, bool integerOnly = false) {
         texWhy.clear();
         bool depthTarget = false;
@@ -3649,6 +3703,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
                     tracker.writerAt(d.address) == other.wid && other.type == td.type && other.width == td.width &&
                     other.height == td.height && other.depth == td.depth && other.layers == td.layers && sameTexel(other.format, f)) {
                     other.lastUse = r.frame_;
+                    ++pstat.aliasHitsLegacy;
                     probeSampled(desc, other, "texture written by the GPU (T# of another format)", storage);
                     if (inOrderOf(f, other.format) == other.format) return {other.id, {}};  // (channel order only)
                     ViewRequest want;
@@ -3660,6 +3715,8 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
                     note("GPU-written image sampled with another format of the same size (its own format)");
                     return {other.id, {}};
                 }
+            TexRef alias;
+            if (aliasWriter(desc, td, plan, own == atAddress.end() ? nullptr : &own->second, f, alias)) return alias;
         }
         auto found = atAddress.find(h.h);
         Texture& tex = atAddress[h.h];
@@ -4343,6 +4400,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         std::vector<Drawn> drawnColors;
         uint32_t depthWid = 0;
         pendingViews.clear();
+        attachedWids.clear();
         if (probeOn) probePs = {};
         uint32_t width = 0, height = 0;
         // One sample count for the whole pass (msaa.h): the smallest of the bound surfaces' counts and the
@@ -4407,6 +4465,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
             const TargetIds t = idsOf(*tg);
             colorIds.push_back({i, t});
             drawnColors.push_back({c.address, t.resolved ? t.resolved : t.render, t.wid});
+            attachedWids.push_back(t.wid);
             desc.colors[i].texture = t.render;
             desc.colors[i].layer = c.sliceStart;
             desc.colors[i].format = viewAs;  // (drawn as another format of the same texel size)
@@ -4457,6 +4516,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
             if (!(z.depthClear || z.stencilClear)) refresh(*dt, nullptr);
             else if (r.hooks_.seed) seedFromHost(*dt, nullptr);
             depthWid = dt->wid;
+            attachedWids.push_back(dt->wid);
             depthIds = idsOf(*dt);
             if (samples > 1) dt->msCov = std::max<uint8_t>(samples, z.samples), dt->msFrag = samples;
             dt->depthMode = depthResolveMode(z.depthCopy, z.copySample, d.depthStencil.depthTest ? d.depthStencil.depthFunc : uint8_t(7));
@@ -5122,6 +5182,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         vpgpu::Dispatch x;
         std::string why;
         pendingViews.clear();
+        attachedWids.clear();
         if (!bind(d.cs, *cs, vpgcn::ShaderStage::Compute, vpgpu::stage::compute, x.bindings, why)) return skip("cs: " + why);
         x.views = std::move(pendingViews);
         pendingViews.clear();
@@ -5797,6 +5858,7 @@ void Renderer::setMaxSamples(uint8_t samples) {
 
 void Renderer::setGpuTiling(bool on) { impl_->gpuTiling = on; }
 void Renderer::setGuestReadOnly(bool on) { impl_->guestReadOnly = on; }
+void Renderer::setImageAlias(bool on) { impl_->imageAlias = on; }
 
 void Renderer::guardRunaway() {
     if (++sinceSubmit_ < kRunawayCommands) return;
@@ -6120,6 +6182,9 @@ void Renderer::publishProbe(uint64_t pictures) {
         for (int k = 0; k < 3; ++k)
             C(f, std::string("refill_") + why[k], ps.refills[k]), C(f, std::string("refill_") + why[k] + "_bytes", ps.refillBytes[k]);
         C(f, "refill_unfilled", ps.refillFailed);
+        static const char* const aliasWhy[Impl::kAliasReasons] = {"depth", "address", "shape", "layout", "mips", "samples", "format", "no_view", "range", "feedback"};
+        C(f, "alias_hits", ps.aliasHits), C(f, "alias_hits_legacy", ps.aliasHitsLegacy);
+        for (unsigned k = 0; k < Impl::kAliasReasons; ++k) C(f, std::string("alias_rejected_") + aliasWhy[k], ps.aliasRejected[k]);
         static const char* const paths[5] = {"none", "gpu_detile", "cpu_detile", "linear_upload", "not_filled"};
         for (int k = 0; k < 5; ++k)
             C(f, std::string("fill_") + paths[k], ps.fillPath[k]), C(f, std::string("fill_") + paths[k] + "_bytes", ps.fillPathBytes[k]);
@@ -6200,6 +6265,7 @@ vpgpu::FrameReport Renderer::submit() {
 
 vpgpu::TextureId Renderer::textureFor(const ImageDesc& d, bool integerOnly) {
     impl_->probePass.clear();
+    impl_->attachedWids.clear();  // (asked outside a draw)
     const auto ref = impl_->textureRef(d, false, false, integerOnly);
     const vpgpu::TextureId t = ref.view ? ref.view : ref.id;
     impl_->life.noteSticky(t, frame_);  // shown by the host: always stored

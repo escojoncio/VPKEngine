@@ -337,6 +337,10 @@ public:
     // cannot stop a shader storing through a raw guest pointer (FLAT address): the host must hand out copies of the
     // memory from Hooks::region for that.
     void setGuestReadOnly(bool on);
+    // On by default (the environment variable VPKENGINE_NO_IMAGE_ALIAS turns it off at start). A sampled T# whose memory
+    // an image of the renderer wrote last, with the same layout, is read through that image instead of through a
+    // round trip to memory (write back + fill); off, it is always filled from memory.
+    void setImageAlias(bool on);
 
     // Foveated rendering of two-layer eye passes (foveation.h), experimental: the pass is drawn through a
     // rate map and expanded back when it ends. Passes it cannot serve are drawn at full rate (the
