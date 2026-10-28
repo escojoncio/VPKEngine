@@ -1036,6 +1036,30 @@ void bitcast16(const std::string& dir) {
     CHECK(int32_t(got[0]) == -2 && int32_t(got[1]) == -32767 && got[2] == in);
 }
 
+// CTS float16 OpCompositeInsert on a struct{v3f16} read-modify-written through a Uniform buffer (vertex stage), evaluated: the
+// output starts as 0xffffffff words and ends as (0, 1, 2) plus the -1.0 pad.
+void f16Insert(const std::string& dir) {
+    spirv::SpirvLowerOptions o;
+    o.entry = "main";
+    o.stage = vpir::Stage::Vertex;
+    o.layout = {bind(0, 0, vpgpu::BindKind::Buffer, 0), bind(0, 1, vpgpu::BindKind::Buffer, 1)};
+    Result r = run(dir + "/f16_insert.vert.spv", o);
+    CHECK(r.ok);
+    if (!r.ok) return;
+    const uint16_t in[4] = {0x0000, 0x3C00, 0x4000, 0xBC00};
+    vpireval::Invocation inv;
+    inv.memory[0].resize(8);
+    std::memcpy(inv.memory[0].data(), in, 8);
+    inv.memory[1].assign(8, 0xFF);
+    std::string err;
+    CHECK(vpireval::run(r.module, inv, err));
+    if (!err.empty()) std::fprintf(stderr, "  eval: %s\n", err.c_str());
+    uint16_t got[4] = {};
+    if (inv.memory[1].size() >= 8) std::memcpy(got, inv.memory[1].data(), 8);
+    CHECK(got[0] == 0x0000 && got[1] == 0x3C00 && got[2] == 0x4000 && got[3] == 0xBC00);
+    if (failures || std::getenv("VP_PRINT")) std::fprintf(stderr, "%04x %04x %04x %04x\n%s\n", got[0], got[1], got[2], got[3], r.msl.source.c_str());
+}
+
 // gl_Subgroup{Eq,Ge,Gt,Le,Lt}Mask are derived from the lane and the subgroup size (submask.comp.spvasm).
 void subgroupMasks(const std::string& dir) {
     spirv::SpirvLowerOptions o;
@@ -1739,6 +1763,7 @@ int main(int argc, char** argv) {
     else if (c == "varptr_call") varPtrCall(dir);
     else if (c == "membar_image") memBarImage(dir);
     else if (c == "bitcast16") bitcast16(dir);
+    else if (c == "f16_insert") f16Insert(dir);
     else if (c == "submask") subgroupMasks(dir);
     else if (c == "sample_mask") sampleMask(dir);
     else if (c == "ycbcr") ycbcr(dir);

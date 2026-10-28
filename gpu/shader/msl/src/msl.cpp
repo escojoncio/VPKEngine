@@ -1301,7 +1301,17 @@ private:
                 if (!uses_.contains(in.result)) return;
                 const std::string m = "vf" + std::to_string(in.result);
                 line("const uint2 ", m, " = as_type<uint2>(simd_vote::vote_t(simd_active_threads_mask()));");
-                return define(in, "simd_shuffle(" + a(0) + ", ushort(" + m + ".x ? ctz(" + m + ".x) : 32u + ctz(" + m + ".y)))");
+                const std::string lane = "ushort(" + m + ".x ? ctz(" + m + ".x) : 32u + ctz(" + m + ".y))";
+                if (in.type.width == 1) return define(in, "simd_shuffle(" + a(0) + ", " + lane + ")");
+                // Vectors go lane by lane: a vector simd_shuffle with a lane computed in divergent code gave wrong
+                // values on device (CTS ballot_broadcast subgroupbroadcastfirst on vec2/ivec4/uvec3/f16vec3/u16vec4/bvec3).
+                const std::string l = "vl" + std::to_string(in.result), v = "vv" + std::to_string(in.result);
+                line("const ushort ", l, " = ", lane, ";");
+                line("const ", typeName(in.type), " ", v, " = ", a(0), ";");
+                std::string e = typeName(in.type) + "(";
+                for (unsigned k = 0; k < in.type.width; ++k)
+                    e += std::string(k ? ", " : "") + "simd_shuffle(" + v + "." + "xyzw"[k] + ", " + l + ")";
+                return define(in, e + ")");
             }
             case Op::SubgroupAny: return define(in, call("simd_any", in));
             case Op::SubgroupAll: return define(in, call("simd_all", in));
