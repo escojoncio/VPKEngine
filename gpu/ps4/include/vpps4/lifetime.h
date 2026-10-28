@@ -24,6 +24,7 @@
 
 #include <cstdint>
 #include <functional>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
@@ -38,6 +39,16 @@ struct LifetimeOptions {
     // frames (a much longer memory than holdFrames: a resolve costs a little bandwidth, a picture that
     // goes black costs the frame).
     uint32_t resolveHoldFrames = 60;
+};
+
+// Rate limit of the diagnostic probes (vpps4.probe lines): the first 40 events, then those of one frame every 600.
+struct ProbeGate {
+    uint64_t calls = 0, frame = 0;
+    bool due(uint64_t now) {
+        if (++calls <= 40) return true;
+        if (now >= frame + 600) frame = now;
+        return now == frame;
+    }
 };
 
 struct LifetimeStats {
@@ -75,6 +86,10 @@ public:
     using ResolveDropSink = std::function<void(vpgpu::TextureId ms, vpgpu::TextureId twin, const char* why)>;
     void setResolveDropSink(ResolveDropSink s) { dropSink_ = std::move(s); }
 
+    // Diagnostics: told one line (rate limited, see ProbeGate) per large attachment (a million pixels and over) with its final actions.
+    using ProbeSink = std::function<void(const std::string&)>;
+    void setProbeSink(ProbeSink s) { probeSink_ = std::move(s); }
+
     // For tests and logs.
     bool sticky(vpgpu::TextureId t) const;
     bool contentsLost(vpgpu::TextureId t) const;
@@ -111,6 +126,8 @@ private:
     std::vector<SubUse> subs_;
     uint64_t planSerial_ = 0;
     ResolveDropSink dropSink_;
+    ProbeSink probeSink_;
+    ProbeGate probeGate_;
 };
 
 }  // namespace vpps4

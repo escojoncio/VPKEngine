@@ -2639,7 +2639,15 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
             return;
         }
         fillFromMemory(s, tex);
+        // P3: a colour target refilled from memory (what a refill that fails or repeats costs).
+        if (!tex && !s.isDepth && s.samples <= 1 && refillProbe.due(r.frame_))
+            log("vpps4.probe P3 refill f=" + std::to_string(r.frame_) + " wid=" + std::to_string(s.wid) + " " + hex(s.address) +
+                " reason=" + (first ? "first" : "written_by_others") + " filled=" + (s.filled ? "1" : "0") + " staging_live=" +
+                std::to_string(stagingLive() >> 20) + "MB/" + std::to_string(stagingLimit >> 20) + "MB stagings=" +
+                std::to_string(stagings.size()));
     }
+    ProbeGate refillProbe, resolveProbe, mirrorProbe;
+    uint64_t memProbeFrame = ~uint64_t(0);
 
     static uint64_t mix(uint64_t h, uint64_t w) {
         h ^= w * 0x9E3779B97F4A7C15ull;
@@ -3346,6 +3354,14 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         TextureId src = c->id;
         if (depth && c->ms) src = depthCompanion(*c);
         if (!src) return {};
+        // A target nothing wrote (no pass drew into it, no resolve, compute or fill wrote it) holds nothing to copy: a
+        // made-up multisampled one is empty. The caller samples the target itself.
+        if (mirrorProbe.due(r.frame_))
+            log("vpps4.probe P5 mirror f=" + std::to_string(r.frame_) + " desc=" + hex(desc.address) + " " + std::to_string(desc.width) + "x" +
+                std::to_string(desc.height) + " target=" + std::to_string(c->width) + "x" + std::to_string(c->height) + " wid=" +
+                std::to_string(c->wid) + " last_draw=" + (c->lastDraw == ~uint64_t(0) ? std::string("never") : std::to_string(c->lastDraw)) +
+                " write_seq=" + std::to_string(c->writeSeq) + " src=" + std::to_string(src.index) + (depth ? " depth" : ""));
+        if (!depth && c->lastDraw == ~uint64_t(0) && !c->writeSeq) return {};
         const uint8_t samples = 1;
         Hash h;
         h.value(uint32_t(0x6d697272));
@@ -3719,6 +3735,11 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         uint64_t size = 0;  // dedicated buffers only (counted against stagingLimit)
     };
     std::vector<Staging> stagings;
+    uint64_t stagingLive() const {
+        uint64_t live = 0;
+        for (const Staging& x : stagings) live += x.size;
+        return live;
+    }
     // Dedicated staging (a copy source larger than half the ring: decoded block-compressed textures, big uploads) is kept
     // until the GPU is done with the frame; past this much alive a request is refused (the image stays unfilled and is
     // tried again at its next use, when earlier frames released theirs). A host without BC decodes every block-compressed
@@ -5022,7 +5043,8 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
                     out += std::string(" ") + kind + "@" + hex(it->first) + "+" + hex(address - std::min(address, it->first)) +
                            (it->first > address ? "(after)" : "") + " " + vpgpu::formatInfo(t.format).name + " " +
                            std::to_string(t.width) + "x" + std::to_string(t.height) + "x" + std::to_string(t.layers) +
-                           " s" + std::to_string(t.samples) + " used" + std::to_string(r.frame_ - t.lastUse);
+                           " s" + std::to_string(t.samples) + " used" + std::to_string(r.frame_ - t.lastUse) + " id=" + std::to_string(t.wid) +
+                           " draw=" + (t.lastDraw == ~uint64_t(0) ? std::string("never") : std::to_string(t.lastDraw));
                 }
         };
         targets(colorTargets, "colour");
@@ -5166,6 +5188,16 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
                 (t.lastUse == from->lastUse && ((t.samples > 1) == wantMs || (from->samples > 1) != wantMs)))
                 from = &t;
         }
+        // No target of exactly that size. A title sets its targets up smaller than the CB's tile-aligned pitch and height (the
+        // extent of SetRenderTarget), so a resolve that names the allocation still means the picture the passes drew: the
+        // most recently drawn target at the address that fits inside it, not a new one that nothing drew into.
+        if (!from)
+            for (Target& t : colorTargets[src.address]) {
+                if (t.format != f || t.width > src.width || t.height > src.height || t.layers < layers || t.lastDraw == ~uint64_t(0)) continue;
+                if (!from || t.lastDraw > from->lastDraw ||
+                    (t.lastDraw == from->lastDraw && ((t.samples > 1) == wantMs && (from->samples > 1) != wantMs)))
+                    from = &t;
+            }
         const bool freshSource = !from;
         if (!from) {
             const std::array<uint8_t, 1> frag{std::max<uint8_t>(src.samples, 1)};
@@ -5174,8 +5206,27 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         }
         if (!from) return skip("resolve: target creation failed");
         const uint32_t fromWid = from->wid;
-        Target* to = target(colorTargets, dst.address, fd, dst.width, dst.height, 1, uint16_t(dst.sliceStart + dst.sliceCount),
-                            false, dst.tileMode, dst.pitch);
+        // The destination is the same picture: as large as the source's (an attachment resolves into a texture of its own
+        // size). A target already at the address of that size is the one, though the request names the allocation.
+        const uint16_t dstLayers = uint16_t(std::max<uint32_t>(dst.sliceStart + dst.sliceCount, 1));
+        const bool fromSmaller = from->width != src.width || from->height != src.height;
+        const uint32_t dw = fromSmaller ? std::min(dst.width, from->width) : dst.width;
+        const uint32_t dh = fromSmaller ? std::min(dst.height, from->height) : dst.height;
+        Target* to = nullptr;
+        {
+            Target* within = nullptr;
+            bool exact = false;
+            for (Target& t : colorTargets[dst.address]) {
+                if (t.format != fd || t.samples != 1 || t.tile != dst.tileMode || t.layers < dstLayers) continue;
+                if (t.width == dw && t.height == dh) exact = true;
+                else if (t.width == from->width && t.height == from->height && t.width <= dw && t.height <= dh &&
+                         (!within || t.lastUse > within->lastUse))
+                    within = &t;
+            }
+            if (!exact && within) within->lastUse = r.frame_, to = within;
+        }
+        if (!to) to = target(colorTargets, dst.address, fd, dw, dh, 1, uint16_t(dst.sliceStart + dst.sliceCount),
+                             false, dst.tileMode, dst.pitch);
         if (!to) return skip("resolve: target creation failed");
         const uint32_t toWid = to->wid;
         // (the second target() may have moved the first when both live at one address)
@@ -5287,8 +5338,8 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
                 c.dstTexture.texture = to->id;
                 c.dstTexture.layer = dst.sliceStart;
                 c.srcTexture.layerCount = c.dstTexture.layerCount = n;
-                c.srcTexture.width = c.dstTexture.width = std::min(src.width, dst.width);
-                c.srcTexture.height = c.dstTexture.height = std::min(src.height, dst.height);
+                c.srcTexture.width = c.dstTexture.width = std::min(from->width, to->width);
+                c.srcTexture.height = c.dstTexture.height = std::min(from->height, to->height);
                 c.label = "resolve " + hex(src.address) + " -> " + hex(dst.address);
                 frame.copy(c);
                 ++r.stats_.copies;
@@ -5298,6 +5349,17 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         latestColor[dst.address] = to->id;
         life.noteRead(from->ms ? from->ms : from->id, r.frame_);  // (the source is read by the resolve)
         markWriteWid(toWid);
+        if (resolveProbe.due(r.frame_)) {  // P2: what the resolve took and what it wrote, and the other targets over the destination
+            std::string others;
+            for (const Target& t : colorTargets[dst.address])
+                if (t.wid != toWid)
+                    others += (others.empty() ? "" : "; ") + describeResolveTarget(t);
+            log("vpps4.probe P2 resolve f=" + std::to_string(r.frame_) + " src_req=" + std::to_string(src.width) + "x" + std::to_string(src.height) +
+                " from id=" + std::to_string(fromWid) + " last_draw=" + (from->lastDraw == ~uint64_t(0) ? std::string("never") : std::to_string(from->lastDraw)) +
+                " " + std::to_string(from->width) + "x" + std::to_string(from->height) + " relaxed=" + (fromSmaller ? "1" : "0") +
+                " | to id=" + std::to_string(toWid) + " " + std::to_string(to->width) + "x" + std::to_string(to->height) +
+                " dst_req=" + std::to_string(dst.width) + "x" + std::to_string(dst.height) + " | others_at_dst=[" + others + "]");
+        }
     }
 
     bool fill(uint64_t address, uint64_t bytes, uint32_t value) {
@@ -5464,6 +5526,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
             if (!dropSinkSet) {
                 dropSinkSet = true;
                 life.setResolveDropSink([this](TextureId ms, TextureId twin, const char* why) { noteResolveDropped(ms, twin, why); });
+                life.setProbeSink([this](const std::string& l) { log(l); });
             }
             const auto tLife = Clock::now();
             const LifetimeStats ls = life.plan(frame, r.device_.resources(), r.frame_);
@@ -5483,6 +5546,19 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         scratchDone[ringIndex] = report.frame + 1;
         frame = vpgpu::Frame{};
         retireOwned();
+        // P3 (memory): once per 600 frames, what the engine holds (the memory growth of a long run).
+        if (memProbeFrame == ~uint64_t(0) || r.frame_ >= memProbeFrame + 600) {
+            memProbeFrame = r.frame_;
+            uint64_t targets = 0, msBytes = 0;
+            for (const auto* cache : {&colorTargets, &depthTargets})
+                for (const auto& [a, list] : *cache)
+                    for (const Target& t : list) {
+                        ++targets;
+                        if (t.samples > 1) msBytes += uint64_t(t.width) * t.height * std::max<uint32_t>(vpgpu::formatInfo(t.format).bytesPerBlock, 1) * t.layers * t.samples;
+                    }
+            log("vpps4.probe P3 mem f=" + std::to_string(r.frame_) + " staging_live=" + std::to_string(stagingLive() >> 20) + "MB stagings=" +
+                std::to_string(stagings.size()) + " targets=" + std::to_string(targets) + " ms_bytes=" + std::to_string(msBytes >> 20) + "MB");
+        }
         if (!busy.empty() || busyAll) {
             inFlight.push_back({report.frame, std::move(busy), busyAll});
             busy.clear();

@@ -1286,6 +1286,79 @@ void rendererResolveSrcLog() {
         for (const std::string& l : f.log) std::fprintf(stderr, "  %s\n", l.c_str());
 }
 
+// The title draws the picture smaller than the CB's tile-aligned allocation (here 100x110 in 128x128) and the resolve names the
+// allocation: the drawn target is the source (no new, empty one), and the destination is made at its size.
+void rendererResolveExtent(uint8_t samples) {
+    Fixture f;
+    f.renderer.setMaxSamples(4);
+    vpps4::DrawState d = f.state();
+    d.color[0].samples = samples;
+    d.color[0].width = 100;
+    d.color[0].height = 110;
+    f.renderer.draw(d);
+    vpps4::ColorTarget src = d.color[0];
+    src.width = src.height = 128;
+    vpps4::ColorTarget dst = f.state().color[0];
+    dst.address = kBase + 0x70000;
+    dst.samples = 1;
+    const uint64_t targets = f.renderer.stats().targets;
+    f.renderer.resolve(src, dst);
+    f.renderer.resolve(src, dst);
+    f.renderer.submit();
+    CHECK(f.renderer.stats().skipped.empty());
+    CHECK(f.renderer.stats().targets == targets + 1);  // the destination only
+    auto entries = [&](uint64_t address) {
+        const std::string s = f.renderer.describeAt(address, 4);
+        size_t n = 0;
+        for (size_t at = s.find("colour@"); at != std::string::npos; at = s.find("colour@", at + 1)) ++n;
+        return std::make_pair(n, s);
+    };
+    const auto [atSrc, srcText] = entries(src.address);
+    const auto [atDst, dstText] = entries(dst.address);
+    CHECK(atSrc == 1 && srcText.find(" 100x110x1 s" + std::to_string(samples)) != std::string::npos && srcText.find("draw=never") == std::string::npos);
+    CHECK(atDst == 1 && dstText.find(" 100x110x1 s1") != std::string::npos);
+    CHECK(f.renderer.stats().notes.count("MSAA resolve done by the pass that drew the samples") +
+              f.renderer.stats().notes.count("MSAA resolve in a pass of its own") + f.renderer.stats().copies >= (samples > 1 ? 1u : 2u));
+    bool tagged = false;
+    for (const std::string& l : f.log) tagged |= l.rfind("vpps4.resolve_src ", 0) == 0 && l.find("new=1") != std::string::npos;
+    CHECK(!tagged);
+    bool p2 = false, p3 = false;
+    for (const std::string& l : f.log) {
+        p2 |= l.rfind("vpps4.probe P2 resolve ", 0) == 0 && l.find("relaxed=1") != std::string::npos;
+        p3 |= l.rfind("vpps4.probe P3 mem ", 0) == 0;
+    }
+    CHECK(p2 && p3);
+    if (failures)
+        for (const std::string& l : f.log) std::fprintf(stderr, "  %s\n", l.c_str());
+}
+
+// A destination already there at the picture's size is the destination though the request names the allocation: no second
+// target at one address.
+void rendererResolveDstReuse() {
+    Fixture f;
+    f.renderer.setMaxSamples(4);
+    vpps4::DrawState d = f.state();
+    d.color[0].samples = 4;
+    d.color[0].width = 100;
+    d.color[0].height = 110;
+    f.renderer.draw(d);
+    vpps4::ColorTarget dst = f.state().color[0];
+    dst.address = kBase + 0x70000;
+    dst.samples = 1;
+    dst.width = 100;
+    dst.height = 110;
+    f.renderer.resolve(d.color[0], dst);
+    const uint64_t targets = f.renderer.stats().targets;
+    dst.width = dst.height = 128;
+    f.renderer.resolve(d.color[0], dst);
+    f.renderer.submit();
+    CHECK(f.renderer.stats().targets == targets);
+    const std::string s = f.renderer.describeAt(dst.address, 4);
+    CHECK(s.find("colour@") != std::string::npos && s.find("colour@", s.find("colour@") + 1) == std::string::npos);
+    if (failures)
+        for (const std::string& l : f.log) std::fprintf(stderr, "  %s\n", l.c_str());
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -1321,6 +1394,9 @@ int main(int argc, char** argv) {
     else if (t == "renderer_resolve_dest_clear_flushed") rendererResolveDestClear(3);
     else if (t == "renderer_resolve_picks_multisampled_source") rendererResolvePicksMultisampledSource();
     else if (t == "renderer_resolve_src_log") rendererResolveSrcLog();
+    else if (t == "renderer_resolve_extent_ms4") rendererResolveExtent(4);
+    else if (t == "renderer_resolve_extent_ms1") rendererResolveExtent(1);
+    else if (t == "renderer_resolve_dst_reuse") rendererResolveDstReuse();
     else {
         std::fprintf(stderr, "unknown test '%s'\n", t.c_str());
         return 2;

@@ -200,6 +200,18 @@ LifetimeStats LifetimeTracker::plan(Frame& frame, const ResourceTable& res, uint
     for (uint32_t i = 0; i < cmds.size(); ++i) {
         auto* rp = std::get_if<RenderPass>(&cmds[i]);
         if (!rp) continue;
+        // P4: the final actions of a large attachment (the eye targets), with what decided them.
+        auto probe = [&](const Attachment& a, bool ms, int64_t nextAttach, bool readLater, bool wanted) {
+            if (!probeSink_) return;
+            const TextureDesc* td = res.get(a.texture);
+            if (!td || uint64_t(td->width) * td->height < 1000000 || !probeGate_.due(frameIndex)) return;
+            probeSink_("vpps4.probe P4 f=" + std::to_string(frameIndex) + " tex=" + std::to_string(a.texture.index) + " " +
+                       std::to_string(td->width) + "x" + std::to_string(td->height) + " s" + std::to_string(td->samples) +
+                       " layer=" + std::to_string(a.layer) + " load=" + std::to_string(int(a.load)) + " store=" + std::to_string(int(a.store)) +
+                       " resolve=" + std::to_string(a.resolve.index) + " keepSamples=" + std::to_string(a.keepSamples ? 1 : 0) +
+                       " nextAttach=" + std::to_string(nextAttach) + " readLater=" + std::to_string(readLater ? 1 : 0) +
+                       " wanted=" + std::to_string(wanted ? 1 : 0) + (ms ? " ms" : ""));
+        };
         auto decide = [&](Attachment& a) {
             if (!a.texture) return;
             const Use& u = *usedNow(keyOf(a.texture));
@@ -262,6 +274,7 @@ LifetimeStats LifetimeTracker::plan(Frame& frame, const ResourceTable& res, uint
                 if (keep && next < 0) ++st.storesKept;
                 a.store = keep ? StoreAction::Store : StoreAction::DontCare;
                 a.resolve = {};
+                probe(a, false, nextAttach, false, false);
                 return;
             }
 
@@ -271,17 +284,17 @@ LifetimeStats LifetimeTracker::plan(Frame& frame, const ResourceTable& res, uint
             bool resolve = false;
             bool resolveDeferred = false;
             const TextureId twin = a.resolve;
+            bool readLater = false, wanted = false;
             if (twin) {
                 Life& rl = lifeOf(twin);
                 const Use* ru = usedNow(keyOf(twin));
-                bool readLater = false;
                 if (ru && !ru->reads.empty()) {
                     // A read of the companion before this subresource's next pass. A read INSIDE that pass
                     // comes before its resolve (the resolve happens when the pass ends), hence `<=`.
                     const int64_t firstRead = after(ru->reads, i);
                     readLater = firstRead >= 0 && (nextAttach < 0 || firstRead <= nextAttach);
                 }
-                const bool wanted = recent(rl.lastRead) || rl.sticky || warm(rl) || readLater ||
+                wanted = recent(rl.lastRead) || rl.sticky || warm(rl) || readLater ||
                                     int64_t(frameIndex) - rl.lastRead <= int64_t(opt_.resolveHoldFrames);
                 const bool lastPass = nextAttach < 0;
                 // A resolve the title requested is never dropped (only the internal sample->twin ones are).
@@ -294,6 +307,7 @@ LifetimeStats LifetimeTracker::plan(Frame& frame, const ResourceTable& res, uint
             else if (keepSamples) a.store = StoreAction::Store;
             else a.store = StoreAction::DontCare;
             if (!resolve) a.resolve = {};
+            probe(a, true, nextAttach, readLater, wanted);
             if (twin && !resolveDeferred) {
                 // The companion is never an attachment, so no end-of-frame bookkeeping sees it: a dropped
                 // resolve leaves it stale (a read before its next resolve is a miss), a done one fresh.

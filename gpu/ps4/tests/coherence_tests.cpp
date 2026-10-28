@@ -344,6 +344,43 @@ void sampleExtent() {
     if (failures) f.dump();
 }
 
+// A target nothing wrote (a multisampled source a resolve had to make up) holds nothing to copy: a T# smaller than it is
+// not given a corner of it (an empty picture), the target itself is sampled. Drawn into, it is copied as usual.
+void mirrorUnwritten() {
+    Fixture f;
+    f.renderer.setMaxSamples(4);
+    const uint64_t a = kBase + 0x70000;
+    vpps4::ColorTarget src = f.state().color[0], dst = src;
+    src.address = a;
+    src.samples = 4;
+    dst.address = kBase + 0xA0000;
+    f.renderer.resolve(src, dst);  // (nothing was drawn at `a`)
+    auto corners = [&] {
+        unsigned n = 0;
+        for (const std::string& e : f.events()) n += e == "copy sampled corner " + Fixture::hex(a);
+        return n;
+    };
+    f.sample(a, 64, 64, 10, 0, 8);
+    const auto t = f.renderer.textureFor(vpps4::decodeImage(std::span<const uint32_t>(f.at(kBase + 0x200), 8)));
+    vpgpu::TextureDesc td;
+    CHECK(t && f.device.textureDesc(t, td) && td.width == 128 && td.height == 128);
+    CHECK(corners() == 0);
+    // The destination of that resolve was written by it: its corner is copied.
+    f.sample(dst.address, 64, 64, 10, 0, 8);
+    const auto m = f.renderer.textureFor(vpps4::decodeImage(std::span<const uint32_t>(f.at(kBase + 0x200), 8)));
+    CHECK(m && f.device.textureDesc(m, td) && td.width == 64 && td.height == 64);
+    // Drawn into, it is copied like any target.
+    vpps4::DrawState d = f.state();
+    d.color[0].address = a;
+    d.color[0].samples = 4;
+    f.renderer.draw(d);
+    f.sample(a, 64, 64, 10, 0, 8);
+    const auto u = f.renderer.textureFor(vpps4::decodeImage(std::span<const uint32_t>(f.at(kBase + 0x200), 8)));
+    CHECK(u && f.device.textureDesc(u, td) && td.samples == 1 && td.width == 64 && td.height == 64);
+    CHECK(corners() == 1);
+    if (failures) f.dump();
+}
+
 // A render target refreshed from memory (the CPU wrote its range, the image is filled again) is written too: the copy of its
 // corner is made again, though no pass drew into it.
 void colorMirrorRefill() {
@@ -1440,6 +1477,7 @@ int main(int argc, char** argv) {
     else if (t == "soft_bc_kernel_wait") softBcKernelWait();
     else if (t == "soft_bc_staging_limit") softBcStagingLimit();
     else if (t == "color_mirror_refill") colorMirrorRefill();
+    else if (t == "mirror_unwritten") mirrorUnwritten();
     else if (t == "sync_refused_fill") syncRefusedFill();
     else if (t == "depth_mirror") depthMirror();
     else if (t == "msaa_mirror") msaaMirror();
