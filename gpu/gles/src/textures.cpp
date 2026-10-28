@@ -456,8 +456,13 @@ void Context::copyImageSubData(GLuint srcName, GLenum srcTarget, GLint srcLevel,
     for (int i = 0; i < 2; ++i) {
         const Side& sd = side[i];
         const FormatInfo& f = *sd.image->format;
-        const uint32_t rw = i == 0 ? uint32_t(w) : (uint32_t(w) + sbw - 1) / sbw * (f.compressed ? f.blockW : 1);
-        const uint32_t rh = i == 0 ? uint32_t(h) : (uint32_t(h) + sbh - 1) / sbh * (f.compressed ? f.blockH : 1);
+        uint32_t rw = i == 0 ? uint32_t(w) : (uint32_t(w) + sbw - 1) / sbw * (f.compressed ? f.blockW : 1);
+        uint32_t rh = i == 0 ? uint32_t(h) : (uint32_t(h) + sbh - 1) / sbh * (f.compressed ? f.blockH : 1);
+        // A compressed region that ends exactly at the level edge may cover a partial block there.
+        if (f.compressed && !mixed && o[i][0] >= 0 && o[i][1] >= 0) {
+            if (uint32_t(o[i][0]) + uint32_t(w) == sd.levelW) rw = uint32_t(w);
+            if (uint32_t(o[i][1]) + uint32_t(h) == sd.levelH) rh = uint32_t(h);
+        }
         if (o[i][0] < 0 || o[i][1] < 0 || o[i][2] < 0 || uint32_t(o[i][0]) + rw > sd.levelW || uint32_t(o[i][1]) + rh > sd.levelH ||
             uint32_t(o[i][2] + d) > sd.levelD)
             return setError(gl::INVALID_VALUE);
