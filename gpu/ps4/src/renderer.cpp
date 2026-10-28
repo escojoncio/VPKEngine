@@ -3354,6 +3354,10 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         TextureId src = c->id;
         if (depth && c->ms) src = depthCompanion(*c);
         if (!src) return {};
+        // (a pending clear, the twin's resolve and a refill from memory write it: before the question whether it holds anything)
+        flushClear(*c);
+        if (!depth) catchUpTwin(*c);
+        refresh(*c, nullptr);
         // A target nothing wrote (no pass drew into it, no resolve, compute or fill wrote it) holds nothing to copy: a
         // made-up multisampled one is empty. The caller samples the target itself.
         if (mirrorProbe.due(r.frame_))
@@ -3395,9 +3399,6 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         }
         Texture& m = atAddress[h.h];
         m.lastUse = c->lastUse = r.frame_;
-        flushClear(*c);
-        if (!depth) catchUpTwin(*c);
-        refresh(*c, nullptr);
         if (m.mirrorSrc != src || m.mirrorVersion != c->writeSeq) {
             closePass();
             vpgpu::Copy cp;
@@ -3405,8 +3406,8 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
             cp.srcTexture.texture = src;
             cp.dstTexture.texture = m.id;
             cp.srcTexture.layerCount = cp.dstTexture.layerCount = c->layers;
-            cp.srcTexture.width = cp.dstTexture.width = desc.width;
-            cp.srcTexture.height = cp.dstTexture.height = desc.height;
+            cp.srcTexture.width = cp.dstTexture.width = std::min(desc.width, c->width);
+            cp.srcTexture.height = cp.dstTexture.height = std::min(desc.height, c->height);
             cp.label = "sampled corner " + hex(desc.address);
             frame.copy(cp);
             ++r.stats_.copies;
@@ -5190,14 +5191,21 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         }
         // No target of exactly that size. A title sets its targets up smaller than the CB's tile-aligned pitch and height (the
         // extent of SetRenderTarget), so a resolve that names the allocation still means the picture the passes drew: the
-        // most recently drawn target at the address that fits inside it, not a new one that nothing drew into.
-        if (!from)
+        // most recently drawn target at the address that fits inside it (the largest of those drawn together), not a new one
+        // that nothing drew into; also when a target of the exact size is there but no pass ever drew into it.
+        if (!from || from->lastDraw == ~uint64_t(0)) {
+            Target* drawn = nullptr;
+            const auto area = [](const Target& t) { return uint64_t(t.width) * t.height; };
             for (Target& t : colorTargets[src.address]) {
                 if (t.format != f || t.width > src.width || t.height > src.height || t.layers < layers || t.lastDraw == ~uint64_t(0)) continue;
-                if (!from || t.lastDraw > from->lastDraw ||
-                    (t.lastDraw == from->lastDraw && ((t.samples > 1) == wantMs && (from->samples > 1) != wantMs)))
-                    from = &t;
+                if (!drawn || t.lastDraw > drawn->lastDraw ||
+                    (t.lastDraw == drawn->lastDraw &&
+                     (area(t) > area(*drawn) ||
+                      (area(t) == area(*drawn) && (t.samples > 1) == wantMs && (drawn->samples > 1) != wantMs))))
+                    drawn = &t;
             }
+            if (drawn) from = drawn;
+        }
         const bool freshSource = !from;
         if (!from) {
             const std::array<uint8_t, 1> frag{std::max<uint8_t>(src.samples, 1)};
@@ -5206,27 +5214,13 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         }
         if (!from) return skip("resolve: target creation failed");
         const uint32_t fromWid = from->wid;
-        // The destination is the same picture: as large as the source's (an attachment resolves into a texture of its own
-        // size). A target already at the address of that size is the one, though the request names the allocation.
-        const uint16_t dstLayers = uint16_t(std::max<uint32_t>(dst.sliceStart + dst.sliceCount, 1));
+        // A source smaller than the request (the picture drawn in the allocation): the destination is the same picture, as
+        // large as the source (an attachment resolves into a texture of its own size). Otherwise the request, as ever.
         const bool fromSmaller = from->width != src.width || from->height != src.height;
         const uint32_t dw = fromSmaller ? std::min(dst.width, from->width) : dst.width;
         const uint32_t dh = fromSmaller ? std::min(dst.height, from->height) : dst.height;
-        Target* to = nullptr;
-        {
-            Target* within = nullptr;
-            bool exact = false;
-            for (Target& t : colorTargets[dst.address]) {
-                if (t.format != fd || t.samples != 1 || t.tile != dst.tileMode || t.layers < dstLayers) continue;
-                if (t.width == dw && t.height == dh) exact = true;
-                else if (t.width == from->width && t.height == from->height && t.width <= dw && t.height <= dh &&
-                         (!within || t.lastUse > within->lastUse))
-                    within = &t;
-            }
-            if (!exact && within) within->lastUse = r.frame_, to = within;
-        }
-        if (!to) to = target(colorTargets, dst.address, fd, dw, dh, 1, uint16_t(dst.sliceStart + dst.sliceCount),
-                             false, dst.tileMode, dst.pitch);
+        Target* to = target(colorTargets, dst.address, fd, dw, dh, 1, uint16_t(dst.sliceStart + dst.sliceCount),
+                            false, dst.tileMode, dst.pitch);
         if (!to) return skip("resolve: target creation failed");
         const uint32_t toWid = to->wid;
         // (the second target() may have moved the first when both live at one address)

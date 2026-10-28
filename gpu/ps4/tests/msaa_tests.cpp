@@ -1349,12 +1349,76 @@ void rendererResolveDstReuse() {
     dst.height = 110;
     f.renderer.resolve(d.color[0], dst);
     const uint64_t targets = f.renderer.stats().targets;
-    dst.width = dst.height = 128;
-    f.renderer.resolve(d.color[0], dst);
+    vpps4::ColorTarget src = d.color[0];
+    src.width = src.height = dst.width = dst.height = 128;
+    f.renderer.resolve(src, dst);
     f.renderer.submit();
     CHECK(f.renderer.stats().targets == targets);
     const std::string s = f.renderer.describeAt(dst.address, 4);
     CHECK(s.find("colour@") != std::string::npos && s.find("colour@", s.find("colour@") + 1) == std::string::npos);
+    if (failures)
+        for (const std::string& l : f.log) std::fprintf(stderr, "  %s\n", l.c_str());
+}
+
+// A source of exactly the requested size keeps the old way: the destination is made at the size requested, though a
+// smaller one is at its address.
+void rendererResolveExactKeepsDst() {
+    Fixture f;
+    f.renderer.setMaxSamples(4);
+    vpps4::DrawState d = f.state();
+    d.color[0].samples = 4;
+    d.color[0].width = 100;
+    d.color[0].height = 110;
+    f.renderer.draw(d);
+    vpps4::ColorTarget dst = f.state().color[0];
+    dst.address = kBase + 0x70000;
+    dst.samples = 1;
+    dst.width = 100;
+    dst.height = 110;
+    f.renderer.resolve(d.color[0], dst);
+    const uint64_t targets = f.renderer.stats().targets;
+    dst.width = dst.height = 128;
+    f.renderer.resolve(d.color[0], dst);
+    f.renderer.submit();
+    CHECK(f.renderer.stats().targets == targets + 1);
+    if (failures)
+        for (const std::string& l : f.log) std::fprintf(stderr, "  %s\n", l.c_str());
+}
+
+// Of the targets drawn at the address, the latest and then the largest is the source; a target of the exact size that no
+// pass drew into does not hide a drawn one.
+void rendererResolveExtentPick(bool undrawnExact) {
+    Fixture f;
+    f.renderer.setMaxSamples(4);
+    vpps4::ColorTarget dst = f.state().color[0];
+    dst.address = kBase + 0x70000;
+    dst.samples = 1;
+    vpps4::ColorTarget src = f.state().color[0];
+    src.samples = 4;
+    if (undrawnExact) f.renderer.resolve(src, dst);  // makes an empty 128x128 multisampled source
+    vpps4::DrawState d = f.state();
+    d.color[0].samples = 4;
+    d.color[0].width = 100;
+    d.color[0].height = 110;
+    if (!undrawnExact) {
+        vpps4::DrawState small = d;
+        small.color[0].width = 90;
+        small.color[0].height = 100;
+        f.renderer.draw(d);
+        f.renderer.draw(small);  // (same frame, made later: first in the list)
+    } else {
+        f.renderer.draw(d);
+    }
+    const uint64_t targets = f.renderer.stats().targets;
+    f.renderer.resolve(src, dst);
+    f.renderer.submit();
+    CHECK(f.renderer.stats().targets == targets + 1);  // the destination only
+    std::string last;
+    for (const std::string& l : f.log)
+        if (l.rfind("vpps4.resolve_src ", 0) == 0) last = l;
+    const size_t from = last.find("| from id="), end = last.find(" ms_tex=");
+    CHECK(from != std::string::npos && end != std::string::npos && last.substr(from, end - from).find(" 100x110x1 ") != std::string::npos &&
+          last.find("new=0", end) != std::string::npos);
     if (failures)
         for (const std::string& l : f.log) std::fprintf(stderr, "  %s\n", l.c_str());
 }
@@ -1397,6 +1461,9 @@ int main(int argc, char** argv) {
     else if (t == "renderer_resolve_extent_ms4") rendererResolveExtent(4);
     else if (t == "renderer_resolve_extent_ms1") rendererResolveExtent(1);
     else if (t == "renderer_resolve_dst_reuse") rendererResolveDstReuse();
+    else if (t == "renderer_resolve_exact_keeps_dst") rendererResolveExactKeepsDst();
+    else if (t == "renderer_resolve_pick_largest") rendererResolveExtentPick(false);
+    else if (t == "renderer_resolve_pick_drawn") rendererResolveExtentPick(true);
     else {
         std::fprintf(stderr, "unknown test '%s'\n", t.c_str());
         return 2;

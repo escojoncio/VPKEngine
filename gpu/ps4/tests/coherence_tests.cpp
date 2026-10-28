@@ -381,6 +381,32 @@ void mirrorUnwritten() {
     if (failures) f.dump();
 }
 
+// A target no pass drew into whose memory the CPU wrote since is filled from it before the question whether it holds
+// anything: its corner is copied for a smaller T#.
+void mirrorRefilled() {
+    Fixture f;
+    const uint64_t a = kBase + 0x70000;
+    vpps4::ColorTarget src = f.state().color[0], dst = src;
+    src.address = a;
+    dst.address = kBase + 0xA0000;
+    f.renderer.resolve(src, dst);  // makes the 1x source target at `a`, never drawn and never written
+    auto corners = [&] {
+        unsigned n = 0;
+        for (const std::string& e : f.events()) n += e == "copy sampled corner " + Fixture::hex(a);
+        return n;
+    };
+    f.sample(a, 64, 64, 10, 0, 8);
+    f.renderer.textureFor(vpps4::decodeImage(std::span<const uint32_t>(f.at(kBase + 0x200), 8)));
+    CHECK(corners() == 0);
+    f.renderer.invalidate(a, 8);  // the CPU wrote the target's memory
+    f.renderer.textureFor(vpps4::decodeImage(std::span<const uint32_t>(f.at(kBase + 0x200), 8)));
+    CHECK(corners() == 1);
+    // The copy never reaches past the source target.
+    const vpgpu::Copy* cp = decodeCopy(f, "sampled corner " + Fixture::hex(a));
+    CHECK(cp && cp->srcTexture.width <= 128 && cp->srcTexture.height <= 128 && cp->srcTexture.width == 64);
+    if (failures) f.dump();
+}
+
 // A render target refreshed from memory (the CPU wrote its range, the image is filled again) is written too: the copy of its
 // corner is made again, though no pass drew into it.
 void colorMirrorRefill() {
@@ -1478,6 +1504,7 @@ int main(int argc, char** argv) {
     else if (t == "soft_bc_staging_limit") softBcStagingLimit();
     else if (t == "color_mirror_refill") colorMirrorRefill();
     else if (t == "mirror_unwritten") mirrorUnwritten();
+    else if (t == "mirror_refilled") mirrorRefilled();
     else if (t == "sync_refused_fill") syncRefusedFill();
     else if (t == "depth_mirror") depthMirror();
     else if (t == "msaa_mirror") msaaMirror();
