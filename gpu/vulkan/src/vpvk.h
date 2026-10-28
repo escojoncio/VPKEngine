@@ -689,6 +689,14 @@ struct MsaaTwins {
   uint32_t gameAuto = 0;  // attachments of the game's own MSAA passes handled as autoMsaa (VPVK_GAME_MSAA_AUTO)
   uint32_t skipUnreadable = 0;  // ... and those left alone because their resolve target is not shader-readable (no sampled usage)
   uint32_t acquires = 0;  // calls of acquire (the sweep of dead guests runs every 256th)
+  // forceMsaa rejections ("vk.msaa force ... rej{...}"): rejN force off (<2 samples), rejEye not an eye scene pass, rejCd no colour 0
+  // / depth, rejSmp the game's own samples, rejRes the game's own resolve, rejDesc a texture description unavailable.
+  uint32_t rejN = 0, rejEye = 0, rejCd = 0, rejSmp = 0, rejRes = 0, rejDesc = 0;
+  // Rejected passes logged ("vk.msaa rej"): up to 12 distinct (size, layers, reason) under 1 Mpx, and 12 at or above it.
+  struct RejSeen { uint32_t w = 0, h = 0; uint16_t layers = 0; const char* why = nullptr; };
+  RejSeen rejSeen[2][12];
+  uint8_t rejLogged[2] = {0, 0};
+  void noteRej(Device* dev, const vpgpu::RenderPassDesc& d, const char* why);  // logs a rejected pass (see above); count it separately
   int64_t nextLogNs = 0;
   // The twin of `guest` (texture description `gd`) for a pass of `layers` layers over mip `mip`, layer `layer`; created on the
   // first use, and entries whose guest image is gone are freed first. {} if it cannot be created.

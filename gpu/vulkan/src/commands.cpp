@@ -1184,40 +1184,48 @@ struct Translator {
     forceN = 0;
     const int n = msaaForce();
     Device* dev = devForce();
-    if (n < 2 || !eyeScene || !dev || !dev->gpu) return;
+    if (!dev || !dev->gpu) return;
     MsaaTwins& mt = dev->msaaTwins;
+    if (n < 2) return void(++mt.rejN);
+    // (Every rejection from here on is counted by reason and logged by MsaaTwins::noteRej: "vk.msaa rej".)
+    auto rej = [&](uint32_t& counter, const char* why) {
+      ++counter;
+      mt.noteRej(dev, d, why);
+    };
+    if (!eyeScene) return rej(mt.rejEye, "eye");
     vpgpu::Attachment& c = d.colors[0];
     vpgpu::Attachment& z = d.depth;
-    if (!c.texture || !z.texture) return;
+    if (!c.texture || !z.texture) return rej(mt.rejCd, "cd");
     vpgpu::TextureDesc gc, gz;
-    if (!dev->gpu->textureDesc(c.texture, gc) || !dev->gpu->textureDesc(z.texture, gz)) return;
-    if (gc.samples != 1 || gz.samples != 1 || c.resolve || z.resolve) return;  // the game's own MSAA: not ours
+    if (!dev->gpu->textureDesc(c.texture, gc) || !dev->gpu->textureDesc(z.texture, gz)) return rej(mt.rejDesc, "desc");
+    if (gc.samples != 1 || gz.samples != 1) return rej(mt.rejSmp, "smp");  // the game's own MSAA: not ours
+    if (c.resolve || z.resolve) return rej(mt.rejRes, "res");
     bool shape = d.rateMap || laterOrMultiSubpass;
     for (int i = 1; i < vpgpu::kMaxColorAttachments; ++i) shape = shape || d.colors[i].texture;
-    if (shape) return void(++mt.skipShape);
-    if (localRead) return void(++mt.skipInput);
+    if (shape) return rej(mt.skipShape, "shape");
+    if (localRead) return rej(mt.skipInput, "input");
     const vpgpu::FormatInfo &fc = vpgpu::formatInfo(gc.format), &fz = vpgpu::formatInfo(gz.format);
     if (fc.integer() || fc.depth() || !fz.depth() || c.format != vpgpu::Format::Undefined || gc.type != vpgpu::TextureType::Tex2D ||
         gz.type != vpgpu::TextureType::Tex2D)
-      return void(++mt.skipFmt);
+      return rej(mt.skipFmt, "fmt");
     // (A stencil aspect that loads makes the attachment's load a Load: attach / the dynamic rendering merge in pipelines.cpp.)
-    if (fz.stencil() && z.load == vpgpu::LoadAction::Load) return void(++mt.skipLoad);
+    if (fz.stencil() && z.load == vpgpu::LoadAction::Load) return rej(mt.skipLoad, "load");
     const uint32_t w = std::max(1u, gc.width >> c.mip), h = std::max(1u, gc.height >> c.mip);
     const uint16_t layers = std::max<uint16_t>(d.layerCount, 1);
     if (std::max(1u, gz.width >> z.mip) != w || std::max(1u, gz.height >> z.mip) != h || gc.layers < c.layer + layers ||
         gz.layers < z.layer + layers)
-      return void(++mt.skipFmt);
-    if (area.offset.x != 0 || area.offset.y != 0 || area.extent.width < w || area.extent.height < h) return void(++mt.skipArea);
+      return rej(mt.skipFmt, "fmt_size");
+    if (area.offset.x != 0 || area.offset.y != 0 || area.extent.width < w || area.extent.height < h) return rej(mt.skipArea, "area");
     int why = 0;
     forceScan(ops, at + 1, why);
     if (why) {
-      ++(why == 1 ? mt.skipInput : why == 2 ? mt.skipDsb : why == 3 ? mt.skipEds : mt.skipShape);
-      return;
+      return rej(why == 1 ? mt.skipInput : why == 2 ? mt.skipDsb : why == 3 ? mt.skipEds : mt.skipShape,
+                 why == 1 ? "scan_input" : why == 2 ? "dsb" : why == 3 ? "eds" : "scan_shape");
     }
     const uint8_t samples = uint8_t(n);
     const vpgpu::TextureId tc = mt.acquire(dev, c.texture, gc, samples, layers, c.mip, c.layer);
     const vpgpu::TextureId tz = tc ? mt.acquire(dev, z.texture, gz, samples, layers, z.mip, z.layer) : vpgpu::TextureId{};
-    if (!tc || !tz) return void(++mt.skipSamples);
+    if (!tc || !tz) return rej(mt.skipSamples, "samples");
     // The depth VPKTAA reads after the frame must reach the game's image even when the game discards it.
     const bool taaDepth = taaPass && !taa->still;
     auto twin = [](vpgpu::Attachment& a, vpgpu::TextureId t, bool resolves) {
@@ -1931,16 +1939,37 @@ void MsaaTwins::release(Device* dev) {
   twins.clear();
 }
 
+// "vk.msaa rej <reason> WxHxL color=<fmt>/<samples>x depth=<fmt>/<samples>x": a pass forceMsaa left at 1x. Distinct (size, layers,
+// reason) only: 12 below 1 Mpx and 12 at or above it, so the frame's small shadow / UI passes do not hide the eye pass.
+void MsaaTwins::noteRej(Device* dev, const vpgpu::RenderPassDesc& d, const char* why) {
+  vpgpu::TextureDesc gc, gz;
+  const bool hc = d.colors[0].texture && dev->gpu->textureDesc(d.colors[0].texture, gc);
+  const bool hz = d.depth.texture && dev->gpu->textureDesc(d.depth.texture, gz);
+  const uint32_t w = hc ? std::max(1u, gc.width >> d.colors[0].mip) : hz ? std::max(1u, gz.width >> d.depth.mip) : 0;
+  const uint32_t h = hc ? std::max(1u, gc.height >> d.colors[0].mip) : hz ? std::max(1u, gz.height >> d.depth.mip) : 0;
+  const uint16_t layers = std::max<uint16_t>(d.layerCount, 1);
+  const int cls = uint64_t(w) * h >= 1'000'000u ? 1 : 0;
+  if (rejLogged[cls] >= 12) return;
+  for (int i = 0; i < rejLogged[cls]; ++i) {
+    const RejSeen& r = rejSeen[cls][i];
+    if (r.w == w && r.h == h && r.layers == layers && !std::strcmp(r.why, why)) return;
+  }
+  rejSeen[cls][rejLogged[cls]++] = {w, h, layers, why};
+  logf("vk.msaa rej %s %ux%ux%u color=%s/%ux depth=%s/%ux", why, w, h, unsigned(layers), hc ? vpgpu::formatInfo(gc.format).name : "none",
+       hc ? unsigned(gc.samples) : 0u, hz ? vpgpu::formatInfo(gz.format).name : "none", hz ? unsigned(gz.samples) : 0u);
+}
+
 // "vk.msaa force=N passes= skip{...}" about once a second while forced MSAA is on; the counts are cumulative since the device was created.
 static void logMsaaForce(MsaaTwins& mt) {
   const int64_t now = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
   if (now < mt.nextLogNs) return;
   mt.nextLogNs = now + 1'000'000'000LL;
   const uint32_t skipped = mt.skipLoad + mt.skipInput + mt.skipDsb + mt.skipEds + mt.skipFmt + mt.skipSamples + mt.skipArea + mt.skipShape;
-  if (!mt.passes && !skipped && !mt.gameAuto && !mt.skipUnreadable) return;
-  logf("vk.msaa force=%d passes=%u skip{load=%u,input=%u,dsb=%u,eds=%u,fmt=%u,samples=%u,area=%u,shape=%u} twins=%zu game_auto=%u skip_unreadable=%u",
+  const uint32_t rejected = mt.rejEye + mt.rejCd + mt.rejSmp + mt.rejRes + mt.rejDesc;  // (rejN counts every pass while forcing is off)
+  if (!mt.passes && !skipped && !rejected && !mt.gameAuto && !mt.skipUnreadable) return;
+  logf("vk.msaa force=%d passes=%u skip{load=%u,input=%u,dsb=%u,eds=%u,fmt=%u,samples=%u,area=%u,shape=%u} twins=%zu game_auto=%u skip_unreadable=%u rej{n=%u,eye=%u,cd=%u,smp=%u,res=%u,desc=%u}",
        msaaForce(), mt.passes, mt.skipLoad, mt.skipInput, mt.skipDsb, mt.skipEds, mt.skipFmt, mt.skipSamples, mt.skipArea,
-       mt.skipShape, mt.twins.size(), mt.gameAuto, mt.skipUnreadable);
+       mt.skipShape, mt.twins.size(), mt.gameAuto, mt.skipUnreadable, mt.rejN, mt.rejEye, mt.rejCd, mt.rejSmp, mt.rejRes, mt.rejDesc);
 }
 
 vpgpu::TextureId UiMaskState::acquire(uint32_t slot, uint32_t w, uint32_t h, uint16_t layers, uint8_t samples) {
