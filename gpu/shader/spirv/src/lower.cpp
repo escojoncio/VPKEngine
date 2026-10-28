@@ -3401,7 +3401,10 @@ private:
                 ValueId r = bin(Op::Rem, a, c, it);
                 ValueId z = splat(it, 0);
                 Type bt(Scalar::Bool, rt.width);
-                ValueId fix = bin(Op::And, bin(Op::Ne, r, z, bt), bin(Op::Ne, bin(Op::Lt, r, z, bt), bin(Op::Lt, c, z, bt), bt), bt);
+                const ValueId nz = bin(Op::Ne, r, z, bt);  // operands in order: the argument order is unspecified (ids = MSL names)
+                const ValueId rneg = bin(Op::Lt, r, z, bt);
+                const ValueId cneg = bin(Op::Lt, c, z, bt);
+                ValueId fix = bin(Op::And, nz, bin(Op::Ne, rneg, cneg, bt), bt);
                 return one(castBits(select(fix, bin(Op::Add, r, c, it), r), rt));
             }
             case OpVectorTimesScalar: {
