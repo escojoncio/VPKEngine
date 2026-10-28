@@ -1,0 +1,733 @@
+=== dEQP-GLES31.functional.debug.negative_coverage.get_error.buffer.blit_framebuffer_multisample
+glGenFramebuffers(2, 0x000000016f0a5670);
+// framebuffers = { 42, 43 }
+glGenRenderbuffers(2, 0x000000016f0a5668);
+// renderbuffers = { 11458, 11459 }
+glBindRenderbuffer(GL_RENDERBUFFER, 11458);
+glBindFramebuffer(GL_READ_FRAMEBUFFER, 42);
+glRenderbufferStorageMultisample(GL_RENDERBUFFER, 4, GL_RGBA8, 32, 32);
+glFramebufferRenderbuffer(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, 11458);
+glCheckFramebufferStatus(GL_READ_FRAMEBUFFER);
+// GL_FRAMEBUFFER_COMPLETE returned
+glBindRenderbuffer(GL_RENDERBUFFER, 11459);
+glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 43);
+glRenderbufferStorageMultisample(GL_RENDERBUFFER, 4, GL_RGBA8, 32, 32);
+glFramebufferRenderbuffer(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, 11459);
+glBlitFramebuffer(0, 0, 16, 16, 0, 0, 16, 16, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+glRenderbufferStorage(GL_RENDERBUFFER, GL_RGBA4, 32, 32);
+glFramebufferRenderbuffer(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, 11459);
+glBlitFramebuffer(0, 0, 16, 16, 0, 0, 16, 16, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+glRenderbufferStorage(GL_RENDERBUFFER, GL_RGBA8, 32, 32);
+glFramebufferRenderbuffer(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, 11459);
+glBlitFramebuffer(0, 0, 16, 16, 2, 2, 18, 18, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+GL_INVALID_OPERATION was expected but got GL_NO_ERROR
+glBindFramebuffer(GL_FRAMEBUFFER, 0);
+glDeleteRenderbuffers(2, { 11458, 11459 });
+glDeleteFramebuffers(2, { 42, 43 });
+<Result StatusCode="Fail">Incorrect error was reported</Result>
+=== dEQP-GLES31.functional.debug.negative_coverage.get_error.buffer.renderbuffer_storage_multisample
+glGetInternalformativ(GL_RENDERBUFFER, GL_RGBA4, GL_SAMPLES, 1, 0x000000016f0a5668);
+// params = { 4 }
+glGetInternalformativ(GL_RENDERBUFFER, GL_RGBA8UI, GL_SAMPLES, 1, 0x000000016f0a5664);
+// params = { 0 }
+glGenRenderbuffers(1, 0x000000016f0a566c);
+// renderbuffers = { 11460 }
+glBindRenderbuffer(GL_RENDERBUFFER, 11460);
+glRenderbufferStorageMultisample(0xffffffffffffffff, 2, GL_RGBA4, 1, 1);
+glRenderbufferStorageMultisample(GL_FRAMEBUFFER, 2, GL_RGBA4, 1, 1);
+glRenderbufferStorageMultisample(GL_RENDERBUFFER, 5, GL_RGBA4, 1, 1);
+glRenderbufferStorageMultisample(GL_RENDERBUFFER, 2, 0xffffffffffffffff, 1, 1);
+glRenderbufferStorageMultisample(GL_RENDERBUFFER, 2, GL_RGBA8_SNORM, 1, 1);
+glRenderbufferStorageMultisample(GL_RENDERBUFFER, 1, GL_RGBA8UI, 1, 1);
+GL_INVALID_OPERATION was expected but got GL_NO_ERROR
+glRenderbufferStorageMultisample(GL_RENDERBUFFER, 2, GL_RGBA4, -1, 1);
+glRenderbufferStorageMultisample(GL_RENDERBUFFER, 2, GL_RGBA4, 1, -1);
+glRenderbufferStorageMultisample(GL_RENDERBUFFER, 2, GL_RGBA4, -1, -1);
+glRenderbufferStorageMultisample(GL_RENDERBUFFER, -1, GL_RGBA4, 1, 1);
+glRenderbufferStorageMultisample(GL_RENDERBUFFER, -1, GL_RGBA4, -1, 1);
+glRenderbufferStorageMultisample(GL_RENDERBUFFER, -1, GL_RGBA4, 1, -1);
+glRenderbufferStorageMultisample(GL_RENDERBUFFER, -1, GL_RGBA4, -1, -1);
+glGetIntegerv(GL_MAX_RENDERBUFFER_SIZE, 0x000000016f0a5660);
+// data = { 16384 }
+glRenderbufferStorageMultisample(GL_RENDERBUFFER, 4, GL_RGBA4, 1, 16385);
+glRenderbufferStorageMultisample(GL_RENDERBUFFER, 4, GL_RGBA4, 16385, 1);
+glRenderbufferStorageMultisample(GL_RENDERBUFFER, 4, GL_RGBA4, 16385, 16385);
+glDeleteRenderbuffers(1, { 11460 });
+<Result StatusCode="Fail">Incorrect error was reported</Result>
+=== dEQP-GLES31.functional.multisample.default_framebuffer.sample_position
+glGetMultisamplefv(GL_SAMPLE_POSITION, 0, 0x000000016f0a5678);
+// val = { 0.5, 0.5 }
+glGetError();
+// GL_NO_ERROR returned
+glGetMultisamplefv(GL_SAMPLE_POSITION, 1, 0x000000016f0a5678);
+// val = { -1, -1 }
+glGetError();
+// GL_INVALID_VALUE returned
+getMultisamplefv: glGetError() returned GL_INVALID_VALUE at es31fMultisampleTests.cpp:145
+<Result StatusCode="Fail">getMultisamplefv: glGetError() returned GL_INVALID_VALUE at es31fMultisampleTests.cpp:145</Result>
+=== dEQP-GLES31.functional.state_query.internal_format.texture_2d_multisample.r16i_samples
+Format must support sample count of GL_MAX_INTEGER_SAMPLES
+GL_MAX_INTEGER_SAMPLES = 4
+GL_NUM_SAMPLE_COUNTS = 0
+ERROR: Format MUST support some multisample configuration, got GL_NUM_SAMPLE_COUNTS = 0
+glGetInternalFormativ() reported 0 supported sample counts at es31fInternalFormatQueryTests.cpp:174
+<Result StatusCode="Fail">glGetInternalFormativ() reported 0 supported sample counts at es31fInternalFormatQueryTests.cpp:174</Result>
+=== dEQP-GLES31.functional.state_query.internal_format.texture_2d_multisample.r16ui_samples
+Format must support sample count of GL_MAX_INTEGER_SAMPLES
+GL_MAX_INTEGER_SAMPLES = 4
+GL_NUM_SAMPLE_COUNTS = 0
+ERROR: Format MUST support some multisample configuration, got GL_NUM_SAMPLE_COUNTS = 0
+glGetInternalFormativ() reported 0 supported sample counts at es31fInternalFormatQueryTests.cpp:174
+<Result StatusCode="Fail">glGetInternalFormativ() reported 0 supported sample counts at es31fInternalFormatQueryTests.cpp:174</Result>
+=== dEQP-GLES31.functional.state_query.internal_format.texture_2d_multisample.r32i_samples
+Format must support sample count of GL_MAX_INTEGER_SAMPLES
+GL_MAX_INTEGER_SAMPLES = 4
+GL_NUM_SAMPLE_COUNTS = 0
+ERROR: Format MUST support some multisample configuration, got GL_NUM_SAMPLE_COUNTS = 0
+glGetInternalFormativ() reported 0 supported sample counts at es31fInternalFormatQueryTests.cpp:174
+<Result StatusCode="Fail">glGetInternalFormativ() reported 0 supported sample counts at es31fInternalFormatQueryTests.cpp:174</Result>
+=== dEQP-GLES31.functional.state_query.internal_format.texture_2d_multisample.r32ui_samples
+Format must support sample count of GL_MAX_INTEGER_SAMPLES
+GL_MAX_INTEGER_SAMPLES = 4
+GL_NUM_SAMPLE_COUNTS = 0
+ERROR: Format MUST support some multisample configuration, got GL_NUM_SAMPLE_COUNTS = 0
+glGetInternalFormativ() reported 0 supported sample counts at es31fInternalFormatQueryTests.cpp:174
+<Result StatusCode="Fail">glGetInternalFormativ() reported 0 supported sample counts at es31fInternalFormatQueryTests.cpp:174</Result>
+=== dEQP-GLES31.functional.state_query.internal_format.texture_2d_multisample.r8i_samples
+Format must support sample count of GL_MAX_INTEGER_SAMPLES
+GL_MAX_INTEGER_SAMPLES = 4
+GL_NUM_SAMPLE_COUNTS = 0
+ERROR: Format MUST support some multisample configuration, got GL_NUM_SAMPLE_COUNTS = 0
+glGetInternalFormativ() reported 0 supported sample counts at es31fInternalFormatQueryTests.cpp:174
+<Result StatusCode="Fail">glGetInternalFormativ() reported 0 supported sample counts at es31fInternalFormatQueryTests.cpp:174</Result>
+=== dEQP-GLES31.functional.state_query.internal_format.texture_2d_multisample.r8ui_samples
+Format must support sample count of GL_MAX_INTEGER_SAMPLES
+GL_MAX_INTEGER_SAMPLES = 4
+GL_NUM_SAMPLE_COUNTS = 0
+ERROR: Format MUST support some multisample configuration, got GL_NUM_SAMPLE_COUNTS = 0
+glGetInternalFormativ() reported 0 supported sample counts at es31fInternalFormatQueryTests.cpp:174
+<Result StatusCode="Fail">glGetInternalFormativ() reported 0 supported sample counts at es31fInternalFormatQueryTests.cpp:174</Result>
+=== dEQP-GLES31.functional.state_query.internal_format.texture_2d_multisample.rg16i_samples
+Format must support sample count of GL_MAX_INTEGER_SAMPLES
+GL_MAX_INTEGER_SAMPLES = 4
+GL_NUM_SAMPLE_COUNTS = 0
+ERROR: Format MUST support some multisample configuration, got GL_NUM_SAMPLE_COUNTS = 0
+glGetInternalFormativ() reported 0 supported sample counts at es31fInternalFormatQueryTests.cpp:174
+<Result StatusCode="Fail">glGetInternalFormativ() reported 0 supported sample counts at es31fInternalFormatQueryTests.cpp:174</Result>
+=== dEQP-GLES31.functional.state_query.internal_format.texture_2d_multisample.rg16ui_samples
+Format must support sample count of GL_MAX_INTEGER_SAMPLES
+GL_MAX_INTEGER_SAMPLES = 4
+GL_NUM_SAMPLE_COUNTS = 0
+ERROR: Format MUST support some multisample configuration, got GL_NUM_SAMPLE_COUNTS = 0
+glGetInternalFormativ() reported 0 supported sample counts at es31fInternalFormatQueryTests.cpp:174
+<Result StatusCode="Fail">glGetInternalFormativ() reported 0 supported sample counts at es31fInternalFormatQueryTests.cpp:174</Result>
+=== dEQP-GLES31.functional.state_query.internal_format.texture_2d_multisample.rg32i_samples
+Format must support sample count of GL_MAX_INTEGER_SAMPLES
+GL_MAX_INTEGER_SAMPLES = 4
+GL_NUM_SAMPLE_COUNTS = 0
+ERROR: Format MUST support some multisample configuration, got GL_NUM_SAMPLE_COUNTS = 0
+glGetInternalFormativ() reported 0 supported sample counts at es31fInternalFormatQueryTests.cpp:174
+<Result StatusCode="Fail">glGetInternalFormativ() reported 0 supported sample counts at es31fInternalFormatQueryTests.cpp:174</Result>
+=== dEQP-GLES31.functional.state_query.internal_format.texture_2d_multisample.rg32ui_samples
+Format must support sample count of GL_MAX_INTEGER_SAMPLES
+GL_MAX_INTEGER_SAMPLES = 4
+GL_NUM_SAMPLE_COUNTS = 0
+ERROR: Format MUST support some multisample configuration, got GL_NUM_SAMPLE_COUNTS = 0
+glGetInternalFormativ() reported 0 supported sample counts at es31fInternalFormatQueryTests.cpp:174
+<Result StatusCode="Fail">glGetInternalFormativ() reported 0 supported sample counts at es31fInternalFormatQueryTests.cpp:174</Result>
+=== dEQP-GLES31.functional.state_query.internal_format.texture_2d_multisample.rg8i_samples
+Format must support sample count of GL_MAX_INTEGER_SAMPLES
+GL_MAX_INTEGER_SAMPLES = 4
+GL_NUM_SAMPLE_COUNTS = 0
+ERROR: Format MUST support some multisample configuration, got GL_NUM_SAMPLE_COUNTS = 0
+glGetInternalFormativ() reported 0 supported sample counts at es31fInternalFormatQueryTests.cpp:174
+<Result StatusCode="Fail">glGetInternalFormativ() reported 0 supported sample counts at es31fInternalFormatQueryTests.cpp:174</Result>
+=== dEQP-GLES31.functional.state_query.internal_format.texture_2d_multisample.rg8ui_samples
+Format must support sample count of GL_MAX_INTEGER_SAMPLES
+GL_MAX_INTEGER_SAMPLES = 4
+GL_NUM_SAMPLE_COUNTS = 0
+ERROR: Format MUST support some multisample configuration, got GL_NUM_SAMPLE_COUNTS = 0
+glGetInternalFormativ() reported 0 supported sample counts at es31fInternalFormatQueryTests.cpp:174
+<Result StatusCode="Fail">glGetInternalFormativ() reported 0 supported sample counts at es31fInternalFormatQueryTests.cpp:174</Result>
+=== dEQP-GLES31.functional.state_query.internal_format.texture_2d_multisample.rgb10_a2ui_samples
+Format must support sample count of GL_MAX_INTEGER_SAMPLES
+GL_MAX_INTEGER_SAMPLES = 4
+GL_NUM_SAMPLE_COUNTS = 0
+ERROR: Format MUST support some multisample configuration, got GL_NUM_SAMPLE_COUNTS = 0
+glGetInternalFormativ() reported 0 supported sample counts at es31fInternalFormatQueryTests.cpp:174
+<Result StatusCode="Fail">glGetInternalFormativ() reported 0 supported sample counts at es31fInternalFormatQueryTests.cpp:174</Result>
+=== dEQP-GLES31.functional.state_query.internal_format.texture_2d_multisample.rgba16i_samples
+Format must support sample count of GL_MAX_INTEGER_SAMPLES
+GL_MAX_INTEGER_SAMPLES = 4
+GL_NUM_SAMPLE_COUNTS = 0
+ERROR: Format MUST support some multisample configuration, got GL_NUM_SAMPLE_COUNTS = 0
+glGetInternalFormativ() reported 0 supported sample counts at es31fInternalFormatQueryTests.cpp:174
+<Result StatusCode="Fail">glGetInternalFormativ() reported 0 supported sample counts at es31fInternalFormatQueryTests.cpp:174</Result>
+=== dEQP-GLES31.functional.state_query.internal_format.texture_2d_multisample.rgba16ui_samples
+Format must support sample count of GL_MAX_INTEGER_SAMPLES
+GL_MAX_INTEGER_SAMPLES = 4
+GL_NUM_SAMPLE_COUNTS = 0
+ERROR: Format MUST support some multisample configuration, got GL_NUM_SAMPLE_COUNTS = 0
+glGetInternalFormativ() reported 0 supported sample counts at es31fInternalFormatQueryTests.cpp:174
+<Result StatusCode="Fail">glGetInternalFormativ() reported 0 supported sample counts at es31fInternalFormatQueryTests.cpp:174</Result>
+=== dEQP-GLES31.functional.state_query.internal_format.texture_2d_multisample.rgba32i_samples
+Format must support sample count of GL_MAX_INTEGER_SAMPLES
+GL_MAX_INTEGER_SAMPLES = 4
+GL_NUM_SAMPLE_COUNTS = 0
+ERROR: Format MUST support some multisample configuration, got GL_NUM_SAMPLE_COUNTS = 0
+glGetInternalFormativ() reported 0 supported sample counts at es31fInternalFormatQueryTests.cpp:174
+<Result StatusCode="Fail">glGetInternalFormativ() reported 0 supported sample counts at es31fInternalFormatQueryTests.cpp:174</Result>
+=== dEQP-GLES31.functional.state_query.internal_format.texture_2d_multisample.rgba32ui_samples
+Format must support sample count of GL_MAX_INTEGER_SAMPLES
+GL_MAX_INTEGER_SAMPLES = 4
+GL_NUM_SAMPLE_COUNTS = 0
+ERROR: Format MUST support some multisample configuration, got GL_NUM_SAMPLE_COUNTS = 0
+glGetInternalFormativ() reported 0 supported sample counts at es31fInternalFormatQueryTests.cpp:174
+<Result StatusCode="Fail">glGetInternalFormativ() reported 0 supported sample counts at es31fInternalFormatQueryTests.cpp:174</Result>
+=== dEQP-GLES31.functional.state_query.internal_format.texture_2d_multisample.rgba8i_samples
+Format must support sample count of GL_MAX_INTEGER_SAMPLES
+GL_MAX_INTEGER_SAMPLES = 4
+GL_NUM_SAMPLE_COUNTS = 0
+ERROR: Format MUST support some multisample configuration, got GL_NUM_SAMPLE_COUNTS = 0
+glGetInternalFormativ() reported 0 supported sample counts at es31fInternalFormatQueryTests.cpp:174
+<Result StatusCode="Fail">glGetInternalFormativ() reported 0 supported sample counts at es31fInternalFormatQueryTests.cpp:174</Result>
+=== dEQP-GLES31.functional.state_query.internal_format.texture_2d_multisample.rgba8ui_samples
+Format must support sample count of GL_MAX_INTEGER_SAMPLES
+GL_MAX_INTEGER_SAMPLES = 4
+GL_NUM_SAMPLE_COUNTS = 0
+ERROR: Format MUST support some multisample configuration, got GL_NUM_SAMPLE_COUNTS = 0
+glGetInternalFormativ() reported 0 supported sample counts at es31fInternalFormatQueryTests.cpp:174
+<Result StatusCode="Fail">glGetInternalFormativ() reported 0 supported sample counts at es31fInternalFormatQueryTests.cpp:174</Result>
+=== dEQP-GLES31.functional.state_query.texture_level.texture_2d_multisample.buffer_data_store_binding_float
+glGenTextures(1, 0x00000009c4e46e20);
+// textures = { 1002 }
+glBindTexture(GL_TEXTURE_2D_MULTISAMPLE, 1002);
+glGetError();
+// GL_NO_ERROR returned
+Verifying GL_TEXTURE_BUFFER_DATA_STORE_BINDING, expecting 0
+glGetTexLevelParameterfv(GL_TEXTURE_2D_MULTISAMPLE, 0, GL_TEXTURE_BUFFER_DATA_STORE_BINDING, 0x000000016f0a5204);
+// params = { -8.02976e+18 }
+glGetError();
+// GL_INVALID_ENUM returned
+// ERROR: glGetTexLevelParameterfv: glGetError() returned GL_INVALID_ENUM
+glDeleteTextures(1, { 1002 });
+Following iteration(s) failed: 1
+<Result StatusCode="Fail">One or more iterations failed</Result>
+=== dEQP-GLES31.functional.state_query.texture_level.texture_2d_multisample.buffer_data_store_binding_integer
+glGenTextures(1, 0x00000009c4ed1320);
+// textures = { 1001 }
+glBindTexture(GL_TEXTURE_2D_MULTISAMPLE, 1001);
+glGetError();
+// GL_NO_ERROR returned
+Verifying GL_TEXTURE_BUFFER_DATA_STORE_BINDING, expecting 0
+glGetTexLevelParameteriv(GL_TEXTURE_2D_MULTISAMPLE, 0, GL_TEXTURE_BUFFER_DATA_STORE_BINDING, 0x000000016f0a5204);
+// params = { -555819298 }
+glGetError();
+// GL_INVALID_ENUM returned
+// ERROR: glGetTexLevelParameteriv: glGetError() returned GL_INVALID_ENUM
+glDeleteTextures(1, { 1001 });
+Following iteration(s) failed: 1
+<Result StatusCode="Fail">One or more iterations failed</Result>
+=== dEQP-GLES31.functional.state_query.texture_level.texture_2d_multisample.buffer_offset_float
+glGenTextures(1, 0x00000009c4d22ca0);
+// textures = { 1004 }
+glBindTexture(GL_TEXTURE_2D_MULTISAMPLE, 1004);
+glGetError();
+// GL_NO_ERROR returned
+Verifying GL_TEXTURE_BUFFER_OFFSET, expecting 0
+glGetTexLevelParameterfv(GL_TEXTURE_2D_MULTISAMPLE, 0, GL_TEXTURE_BUFFER_OFFSET, 0x000000016f0a5204);
+// params = { -8.02976e+18 }
+glGetError();
+// GL_INVALID_ENUM returned
+// ERROR: glGetTexLevelParameterfv: glGetError() returned GL_INVALID_ENUM
+glDeleteTextures(1, { 1004 });
+Following iteration(s) failed: 1
+<Result StatusCode="Fail">One or more iterations failed</Result>
+=== dEQP-GLES31.functional.state_query.texture_level.texture_2d_multisample.buffer_offset_integer
+glGenTextures(1, 0x00000009c4e46ee0);
+// textures = { 1003 }
+glBindTexture(GL_TEXTURE_2D_MULTISAMPLE, 1003);
+glGetError();
+// GL_NO_ERROR returned
+Verifying GL_TEXTURE_BUFFER_OFFSET, expecting 0
+glGetTexLevelParameteriv(GL_TEXTURE_2D_MULTISAMPLE, 0, GL_TEXTURE_BUFFER_OFFSET, 0x000000016f0a5204);
+// params = { -555819298 }
+glGetError();
+// GL_INVALID_ENUM returned
+// ERROR: glGetTexLevelParameteriv: glGetError() returned GL_INVALID_ENUM
+glDeleteTextures(1, { 1003 });
+Following iteration(s) failed: 1
+<Result StatusCode="Fail">One or more iterations failed</Result>
+=== dEQP-GLES31.functional.state_query.texture_level.texture_2d_multisample.buffer_size_float
+glGenTextures(1, 0x00000009c4005aa0);
+// textures = { 1006 }
+glBindTexture(GL_TEXTURE_2D_MULTISAMPLE, 1006);
+glGetError();
+// GL_NO_ERROR returned
+Verifying GL_TEXTURE_BUFFER_SIZE, expecting 0
+glGetTexLevelParameterfv(GL_TEXTURE_2D_MULTISAMPLE, 0, GL_TEXTURE_BUFFER_SIZE, 0x000000016f0a5204);
+// params = { -8.02976e+18 }
+glGetError();
+// GL_INVALID_ENUM returned
+// ERROR: glGetTexLevelParameterfv: glGetError() returned GL_INVALID_ENUM
+glDeleteTextures(1, { 1006 });
+Following iteration(s) failed: 1
+<Result StatusCode="Fail">One or more iterations failed</Result>
+=== dEQP-GLES31.functional.state_query.texture_level.texture_2d_multisample.buffer_size_integer
+glGenTextures(1, 0x00000009c4d22d60);
+// textures = { 1005 }
+glBindTexture(GL_TEXTURE_2D_MULTISAMPLE, 1005);
+glGetError();
+// GL_NO_ERROR returned
+Verifying GL_TEXTURE_BUFFER_SIZE, expecting 0
+glGetTexLevelParameteriv(GL_TEXTURE_2D_MULTISAMPLE, 0, GL_TEXTURE_BUFFER_SIZE, 0x000000016f0a5204);
+// params = { -555819298 }
+glGetError();
+// GL_INVALID_ENUM returned
+// ERROR: glGetTexLevelParameteriv: glGetError() returned GL_INVALID_ENUM
+glDeleteTextures(1, { 1005 });
+Following iteration(s) failed: 1
+<Result StatusCode="Fail">One or more iterations failed</Result>
+=== dEQP-GLES31.functional.texture.multisample.negative.fbo_attach_different_fixed_state_tex_rbo
+glGenFramebuffers(1, 0x000000016f0a56ac);
+// framebuffers = { 36 }
+glBindFramebuffer(GL_FRAMEBUFFER, 36);
+glGetError();
+// GL_NO_ERROR returned
+glGenTextures(1, 0x000000016f0a56a4);
+// textures = { 341 }
+glBindTexture(GL_TEXTURE_2D_MULTISAMPLE, 341);
+glTexStorage2DMultisample(GL_TEXTURE_2D_MULTISAMPLE, 4, GL_RGBA8, 64, 64, GL_FALSE);
+glGetError();
+// GL_NO_ERROR returned
+glGetTexLevelParameteriv(GL_TEXTURE_2D_MULTISAMPLE, 0, GL_TEXTURE_SAMPLES, 0x000000016f0a569c);
+// params = { 4 }
+glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D_MULTISAMPLE, 341, 0);
+glGetError();
+// GL_NO_ERROR returned
+glGenRenderbuffers(1, 0x000000016f0a56a8);
+// renderbuffers = { 342 }
+glBindRenderbuffer(GL_RENDERBUFFER, 342);
+glRenderbufferStorageMultisample(GL_RENDERBUFFER, 4, GL_RGBA8, 64, 64);
+glGetError();
+// GL_NO_ERROR returned
+glGetRenderbufferParameteriv(GL_RENDERBUFFER, GL_RENDERBUFFER_SAMPLES, 0x000000016f0a56c8);
+glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT1, GL_RENDERBUFFER, 342);
+glGetError();
+// GL_NO_ERROR returned
+glCheckFramebufferStatus(GL_FRAMEBUFFER);
+// GL_FRAMEBUFFER_COMPLETE returned
+ERROR! Expected GL_FRAMEBUFFER_INCOMPLETE_MULTISAMPLE, got GL_FRAMEBUFFER_COMPLETE
+glDeleteFramebuffers(1, { 36 });
+glDeleteRenderbuffers(1, { 342 });
+glDeleteTextures(1, { 341 });
+glDeleteTextures(1, { 0 });
+<Result StatusCode="Fail">Got wrong error code</Result>
+=== dEQP-GLES31.functional.texture.multisample.negative.fbo_attach_different_fixed_state_tex_tex
+glGenFramebuffers(1, 0x000000016f0a56ac);
+// framebuffers = { 35 }
+glBindFramebuffer(GL_FRAMEBUFFER, 35);
+glGetError();
+// GL_NO_ERROR returned
+glGenTextures(1, 0x000000016f0a56a4);
+// textures = { 339 }
+glBindTexture(GL_TEXTURE_2D_MULTISAMPLE, 339);
+glTexStorage2DMultisample(GL_TEXTURE_2D_MULTISAMPLE, 4, GL_RGBA8, 64, 64, GL_FALSE);
+glGetError();
+// GL_NO_ERROR returned
+glGetTexLevelParameteriv(GL_TEXTURE_2D_MULTISAMPLE, 0, GL_TEXTURE_SAMPLES, 0x000000016f0a569c);
+// params = { 4 }
+glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D_MULTISAMPLE, 339, 0);
+glGetError();
+// GL_NO_ERROR returned
+glGenTextures(1, 0x000000016f0a56a0);
+// textures = { 340 }
+glBindTexture(GL_TEXTURE_2D_MULTISAMPLE, 340);
+glTexStorage2DMultisample(GL_TEXTURE_2D_MULTISAMPLE, 4, GL_RGBA8, 64, 64, GL_TRUE);
+glGetError();
+// GL_NO_ERROR returned
+glGetTexLevelParameteriv(GL_TEXTURE_2D_MULTISAMPLE, 0, GL_TEXTURE_SAMPLES, 0x000000016f0a56c8);
+// params = { 4 }
+glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT1, GL_TEXTURE_2D_MULTISAMPLE, 340, 0);
+glGetError();
+// GL_NO_ERROR returned
+glCheckFramebufferStatus(GL_FRAMEBUFFER);
+// GL_FRAMEBUFFER_COMPLETE returned
+ERROR! Expected GL_FRAMEBUFFER_INCOMPLETE_MULTISAMPLE, got GL_FRAMEBUFFER_COMPLETE
+glDeleteFramebuffers(1, { 35 });
+glDeleteRenderbuffers(1, { 0 });
+glDeleteTextures(1, { 339 });
+glDeleteTextures(1, { 340 });
+<Result StatusCode="Fail">Got wrong error code</Result>
+=== dEQP-GLES31.functional.texture.multisample.negative.fbo_attach_non_zero_level
+glGenFramebuffers(1, 0x000000016f0a56ac);
+// framebuffers = { 37 }
+glBindFramebuffer(GL_FRAMEBUFFER, 37);
+glGetError();
+// GL_NO_ERROR returned
+glGenTextures(1, 0x000000016f0a56a4);
+// textures = { 343 }
+glBindTexture(GL_TEXTURE_2D_MULTISAMPLE, 343);
+glTexStorage2DMultisample(GL_TEXTURE_2D_MULTISAMPLE, 4, GL_RGBA8, 64, 64, GL_FALSE);
+glGetError();
+// GL_NO_ERROR returned
+glGetTexLevelParameteriv(GL_TEXTURE_2D_MULTISAMPLE, 0, GL_TEXTURE_SAMPLES, 0x000000016f0a569c);
+// params = { 4 }
+glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D_MULTISAMPLE, 343, 5);
+glGetError();
+// GL_NO_ERROR returned
+ERROR! Expected GL_INVALID_VALUE, got GL_NO_ERROR
+glDeleteFramebuffers(1, { 37 });
+glDeleteRenderbuffers(1, { 0 });
+glDeleteTextures(1, { 343 });
+glDeleteTextures(1, { 0 });
+<Result StatusCode="Fail">Got wrong error code</Result>
+=== dEQP-GLES31.functional.texture.multisample.negative.texture_base_level
+glBindTexture(GL_TEXTURE_2D_MULTISAMPLE, 371);
+glTexStorage2DMultisample(GL_TEXTURE_2D_MULTISAMPLE, 1, GL_RGBA8, 16, 16, GL_FALSE);
+glGetError();
+// GL_NO_ERROR returned
+glTexParameteri(GL_TEXTURE_2D_MULTISAMPLE, GL_TEXTURE_BASE_LEVEL, 2);
+glGetError();
+// GL_NO_ERROR returned
+Got unexpected error: GL_NO_ERROR, expected: GL_INVALID_OPERATION
+GL_OES_texture_storage_multisample_2d_array not supported, skipping target
+glBindTexture(GL_TEXTURE_2D_MULTISAMPLE, 372);
+glTexStorage2DMultisample(GL_TEXTURE_2D_MULTISAMPLE, 1, GL_R8I, 16, 16, GL_FALSE);
+glGetError();
+// GL_NO_ERROR returned
+glTexParameteri(GL_TEXTURE_2D_MULTISAMPLE, GL_TEXTURE_BASE_LEVEL, 2);
+glGetError();
+// GL_NO_ERROR returned
+Got unexpected error: GL_NO_ERROR, expected: GL_INVALID_OPERATION
+GL_OES_texture_storage_multisample_2d_array not supported, skipping target
+glBindTexture(GL_TEXTURE_2D_MULTISAMPLE, 373);
+glTexStorage2DMultisample(GL_TEXTURE_2D_MULTISAMPLE, 1, GL_R8UI, 16, 16, GL_FALSE);
+glGetError();
+// GL_NO_ERROR returned
+glTexParameteri(GL_TEXTURE_2D_MULTISAMPLE, GL_TEXTURE_BASE_LEVEL, 2);
+glGetError();
+// GL_NO_ERROR returned
+Got unexpected error: GL_NO_ERROR, expected: GL_INVALID_OPERATION
+GL_OES_texture_storage_multisample_2d_array not supported, skipping target
+<Result StatusCode="Fail">Got wrong error code</Result>
+=== dEQP-GLES31.functional.texture.multisample.negative.texture_compare_func
+glBindTexture(GL_TEXTURE_2D_MULTISAMPLE, 368);
+glTexStorage2DMultisample(GL_TEXTURE_2D_MULTISAMPLE, 1, GL_RGBA8, 16, 16, GL_FALSE);
+glGetError();
+// GL_NO_ERROR returned
+glTexParameteri(GL_TEXTURE_2D_MULTISAMPLE, GL_TEXTURE_COMPARE_FUNC, GL_NOTEQUAL);
+glGetError();
+// GL_NO_ERROR returned
+Got unexpected error: GL_NO_ERROR, expected: GL_INVALID_ENUM
+GL_OES_texture_storage_multisample_2d_array not supported, skipping target
+glBindTexture(GL_TEXTURE_2D_MULTISAMPLE, 369);
+glTexStorage2DMultisample(GL_TEXTURE_2D_MULTISAMPLE, 1, GL_R8I, 16, 16, GL_FALSE);
+glGetError();
+// GL_NO_ERROR returned
+glTexParameteri(GL_TEXTURE_2D_MULTISAMPLE, GL_TEXTURE_COMPARE_FUNC, GL_NOTEQUAL);
+glGetError();
+// GL_NO_ERROR returned
+Got unexpected error: GL_NO_ERROR, expected: GL_INVALID_ENUM
+GL_OES_texture_storage_multisample_2d_array not supported, skipping target
+glBindTexture(GL_TEXTURE_2D_MULTISAMPLE, 370);
+glTexStorage2DMultisample(GL_TEXTURE_2D_MULTISAMPLE, 1, GL_R8UI, 16, 16, GL_FALSE);
+glGetError();
+// GL_NO_ERROR returned
+glTexParameteri(GL_TEXTURE_2D_MULTISAMPLE, GL_TEXTURE_COMPARE_FUNC, GL_NOTEQUAL);
+glGetError();
+// GL_NO_ERROR returned
+Got unexpected error: GL_NO_ERROR, expected: GL_INVALID_ENUM
+GL_OES_texture_storage_multisample_2d_array not supported, skipping target
+<Result StatusCode="Fail">Got wrong error code</Result>
+=== dEQP-GLES31.functional.texture.multisample.negative.texture_compare_mode
+glBindTexture(GL_TEXTURE_2D_MULTISAMPLE, 365);
+glTexStorage2DMultisample(GL_TEXTURE_2D_MULTISAMPLE, 1, GL_RGBA8, 16, 16, GL_FALSE);
+glGetError();
+// GL_NO_ERROR returned
+glTexParameteri(GL_TEXTURE_2D_MULTISAMPLE, GL_TEXTURE_COMPARE_MODE, GL_NONE);
+glGetError();
+// GL_NO_ERROR returned
+Got unexpected error: GL_NO_ERROR, expected: GL_INVALID_ENUM
+GL_OES_texture_storage_multisample_2d_array not supported, skipping target
+glBindTexture(GL_TEXTURE_2D_MULTISAMPLE, 366);
+glTexStorage2DMultisample(GL_TEXTURE_2D_MULTISAMPLE, 1, GL_R8I, 16, 16, GL_FALSE);
+glGetError();
+// GL_NO_ERROR returned
+glTexParameteri(GL_TEXTURE_2D_MULTISAMPLE, GL_TEXTURE_COMPARE_MODE, GL_NONE);
+glGetError();
+// GL_NO_ERROR returned
+Got unexpected error: GL_NO_ERROR, expected: GL_INVALID_ENUM
+GL_OES_texture_storage_multisample_2d_array not supported, skipping target
+glBindTexture(GL_TEXTURE_2D_MULTISAMPLE, 367);
+glTexStorage2DMultisample(GL_TEXTURE_2D_MULTISAMPLE, 1, GL_R8UI, 16, 16, GL_FALSE);
+glGetError();
+// GL_NO_ERROR returned
+glTexParameteri(GL_TEXTURE_2D_MULTISAMPLE, GL_TEXTURE_COMPARE_MODE, GL_NONE);
+glGetError();
+// GL_NO_ERROR returned
+Got unexpected error: GL_NO_ERROR, expected: GL_INVALID_ENUM
+GL_OES_texture_storage_multisample_2d_array not supported, skipping target
+<Result StatusCode="Fail">Got wrong error code</Result>
+=== dEQP-GLES31.functional.texture.multisample.negative.texture_mag_filter
+glBindTexture(GL_TEXTURE_2D_MULTISAMPLE, 347);
+glTexStorage2DMultisample(GL_TEXTURE_2D_MULTISAMPLE, 1, GL_RGBA8, 16, 16, GL_FALSE);
+glGetError();
+// GL_NO_ERROR returned
+glTexParameteri(GL_TEXTURE_2D_MULTISAMPLE, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+glGetError();
+// GL_NO_ERROR returned
+Got unexpected error: GL_NO_ERROR, expected: GL_INVALID_ENUM
+GL_OES_texture_storage_multisample_2d_array not supported, skipping target
+glBindTexture(GL_TEXTURE_2D_MULTISAMPLE, 348);
+glTexStorage2DMultisample(GL_TEXTURE_2D_MULTISAMPLE, 1, GL_R8I, 16, 16, GL_FALSE);
+glGetError();
+// GL_NO_ERROR returned
+glTexParameteri(GL_TEXTURE_2D_MULTISAMPLE, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+glGetError();
+// GL_NO_ERROR returned
+Got unexpected error: GL_NO_ERROR, expected: GL_INVALID_ENUM
+GL_OES_texture_storage_multisample_2d_array not supported, skipping target
+glBindTexture(GL_TEXTURE_2D_MULTISAMPLE, 349);
+glTexStorage2DMultisample(GL_TEXTURE_2D_MULTISAMPLE, 1, GL_R8UI, 16, 16, GL_FALSE);
+glGetError();
+// GL_NO_ERROR returned
+glTexParameteri(GL_TEXTURE_2D_MULTISAMPLE, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+glGetError();
+// GL_NO_ERROR returned
+Got unexpected error: GL_NO_ERROR, expected: GL_INVALID_ENUM
+GL_OES_texture_storage_multisample_2d_array not supported, skipping target
+<Result StatusCode="Fail">Got wrong error code</Result>
+=== dEQP-GLES31.functional.texture.multisample.negative.texture_max_lod
+glBindTexture(GL_TEXTURE_2D_MULTISAMPLE, 362);
+glTexStorage2DMultisample(GL_TEXTURE_2D_MULTISAMPLE, 1, GL_RGBA8, 16, 16, GL_FALSE);
+glGetError();
+// GL_NO_ERROR returned
+glTexParameteri(GL_TEXTURE_2D_MULTISAMPLE, GL_TEXTURE_MAX_LOD, 5);
+glGetError();
+// GL_NO_ERROR returned
+Got unexpected error: GL_NO_ERROR, expected: GL_INVALID_ENUM
+GL_OES_texture_storage_multisample_2d_array not supported, skipping target
+glBindTexture(GL_TEXTURE_2D_MULTISAMPLE, 363);
+glTexStorage2DMultisample(GL_TEXTURE_2D_MULTISAMPLE, 1, GL_R8I, 16, 16, GL_FALSE);
+glGetError();
+// GL_NO_ERROR returned
+glTexParameteri(GL_TEXTURE_2D_MULTISAMPLE, GL_TEXTURE_MAX_LOD, 5);
+glGetError();
+// GL_NO_ERROR returned
+Got unexpected error: GL_NO_ERROR, expected: GL_INVALID_ENUM
+GL_OES_texture_storage_multisample_2d_array not supported, skipping target
+glBindTexture(GL_TEXTURE_2D_MULTISAMPLE, 364);
+glTexStorage2DMultisample(GL_TEXTURE_2D_MULTISAMPLE, 1, GL_R8UI, 16, 16, GL_FALSE);
+glGetError();
+// GL_NO_ERROR returned
+glTexParameteri(GL_TEXTURE_2D_MULTISAMPLE, GL_TEXTURE_MAX_LOD, 5);
+glGetError();
+// GL_NO_ERROR returned
+Got unexpected error: GL_NO_ERROR, expected: GL_INVALID_ENUM
+GL_OES_texture_storage_multisample_2d_array not supported, skipping target
+<Result StatusCode="Fail">Got wrong error code</Result>
+=== dEQP-GLES31.functional.texture.multisample.negative.texture_min_filter
+glBindTexture(GL_TEXTURE_2D_MULTISAMPLE, 344);
+glTexStorage2DMultisample(GL_TEXTURE_2D_MULTISAMPLE, 1, GL_RGBA8, 16, 16, GL_FALSE);
+glGetError();
+// GL_NO_ERROR returned
+glTexParameteri(GL_TEXTURE_2D_MULTISAMPLE, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+glGetError();
+// GL_NO_ERROR returned
+Got unexpected error: GL_NO_ERROR, expected: GL_INVALID_ENUM
+GL_OES_texture_storage_multisample_2d_array not supported, skipping target
+glBindTexture(GL_TEXTURE_2D_MULTISAMPLE, 345);
+glTexStorage2DMultisample(GL_TEXTURE_2D_MULTISAMPLE, 1, GL_R8I, 16, 16, GL_FALSE);
+glGetError();
+// GL_NO_ERROR returned
+glTexParameteri(GL_TEXTURE_2D_MULTISAMPLE, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+glGetError();
+// GL_NO_ERROR returned
+Got unexpected error: GL_NO_ERROR, expected: GL_INVALID_ENUM
+GL_OES_texture_storage_multisample_2d_array not supported, skipping target
+glBindTexture(GL_TEXTURE_2D_MULTISAMPLE, 346);
+glTexStorage2DMultisample(GL_TEXTURE_2D_MULTISAMPLE, 1, GL_R8UI, 16, 16, GL_FALSE);
+glGetError();
+// GL_NO_ERROR returned
+glTexParameteri(GL_TEXTURE_2D_MULTISAMPLE, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+glGetError();
+// GL_NO_ERROR returned
+Got unexpected error: GL_NO_ERROR, expected: GL_INVALID_ENUM
+GL_OES_texture_storage_multisample_2d_array not supported, skipping target
+<Result StatusCode="Fail">Got wrong error code</Result>
+=== dEQP-GLES31.functional.texture.multisample.negative.texture_min_lod
+glBindTexture(GL_TEXTURE_2D_MULTISAMPLE, 359);
+glTexStorage2DMultisample(GL_TEXTURE_2D_MULTISAMPLE, 1, GL_RGBA8, 16, 16, GL_FALSE);
+glGetError();
+// GL_NO_ERROR returned
+glTexParameteri(GL_TEXTURE_2D_MULTISAMPLE, GL_TEXTURE_MIN_LOD, 1);
+glGetError();
+// GL_NO_ERROR returned
+Got unexpected error: GL_NO_ERROR, expected: GL_INVALID_ENUM
+GL_OES_texture_storage_multisample_2d_array not supported, skipping target
+glBindTexture(GL_TEXTURE_2D_MULTISAMPLE, 360);
+glTexStorage2DMultisample(GL_TEXTURE_2D_MULTISAMPLE, 1, GL_R8I, 16, 16, GL_FALSE);
+glGetError();
+// GL_NO_ERROR returned
+glTexParameteri(GL_TEXTURE_2D_MULTISAMPLE, GL_TEXTURE_MIN_LOD, 1);
+glGetError();
+// GL_NO_ERROR returned
+Got unexpected error: GL_NO_ERROR, expected: GL_INVALID_ENUM
+GL_OES_texture_storage_multisample_2d_array not supported, skipping target
+glBindTexture(GL_TEXTURE_2D_MULTISAMPLE, 361);
+glTexStorage2DMultisample(GL_TEXTURE_2D_MULTISAMPLE, 1, GL_R8UI, 16, 16, GL_FALSE);
+glGetError();
+// GL_NO_ERROR returned
+glTexParameteri(GL_TEXTURE_2D_MULTISAMPLE, GL_TEXTURE_MIN_LOD, 1);
+glGetError();
+// GL_NO_ERROR returned
+Got unexpected error: GL_NO_ERROR, expected: GL_INVALID_ENUM
+GL_OES_texture_storage_multisample_2d_array not supported, skipping target
+<Result StatusCode="Fail">Got wrong error code</Result>
+=== dEQP-GLES31.functional.texture.multisample.negative.texture_wrap_r
+glBindTexture(GL_TEXTURE_2D_MULTISAMPLE, 356);
+glTexStorage2DMultisample(GL_TEXTURE_2D_MULTISAMPLE, 1, GL_RGBA8, 16, 16, GL_FALSE);
+glGetError();
+// GL_NO_ERROR returned
+glTexParameteri(GL_TEXTURE_2D_MULTISAMPLE, GL_TEXTURE_WRAP_R, GL_CLAMP_TO_EDGE);
+glGetError();
+// GL_NO_ERROR returned
+Got unexpected error: GL_NO_ERROR, expected: GL_INVALID_ENUM
+GL_OES_texture_storage_multisample_2d_array not supported, skipping target
+glBindTexture(GL_TEXTURE_2D_MULTISAMPLE, 357);
+glTexStorage2DMultisample(GL_TEXTURE_2D_MULTISAMPLE, 1, GL_R8I, 16, 16, GL_FALSE);
+glGetError();
+// GL_NO_ERROR returned
+glTexParameteri(GL_TEXTURE_2D_MULTISAMPLE, GL_TEXTURE_WRAP_R, GL_CLAMP_TO_EDGE);
+glGetError();
+// GL_NO_ERROR returned
+Got unexpected error: GL_NO_ERROR, expected: GL_INVALID_ENUM
+GL_OES_texture_storage_multisample_2d_array not supported, skipping target
+glBindTexture(GL_TEXTURE_2D_MULTISAMPLE, 358);
+glTexStorage2DMultisample(GL_TEXTURE_2D_MULTISAMPLE, 1, GL_R8UI, 16, 16, GL_FALSE);
+glGetError();
+// GL_NO_ERROR returned
+glTexParameteri(GL_TEXTURE_2D_MULTISAMPLE, GL_TEXTURE_WRAP_R, GL_CLAMP_TO_EDGE);
+glGetError();
+// GL_NO_ERROR returned
+Got unexpected error: GL_NO_ERROR, expected: GL_INVALID_ENUM
+GL_OES_texture_storage_multisample_2d_array not supported, skipping target
+<Result StatusCode="Fail">Got wrong error code</Result>
+=== dEQP-GLES31.functional.texture.multisample.negative.texture_wrap_s
+glBindTexture(GL_TEXTURE_2D_MULTISAMPLE, 350);
+glTexStorage2DMultisample(GL_TEXTURE_2D_MULTISAMPLE, 1, GL_RGBA8, 16, 16, GL_FALSE);
+glGetError();
+// GL_NO_ERROR returned
+glTexParameteri(GL_TEXTURE_2D_MULTISAMPLE, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+glGetError();
+// GL_NO_ERROR returned
+Got unexpected error: GL_NO_ERROR, expected: GL_INVALID_ENUM
+GL_OES_texture_storage_multisample_2d_array not supported, skipping target
+glBindTexture(GL_TEXTURE_2D_MULTISAMPLE, 351);
+glTexStorage2DMultisample(GL_TEXTURE_2D_MULTISAMPLE, 1, GL_R8I, 16, 16, GL_FALSE);
+glGetError();
+// GL_NO_ERROR returned
+glTexParameteri(GL_TEXTURE_2D_MULTISAMPLE, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+glGetError();
+// GL_NO_ERROR returned
+Got unexpected error: GL_NO_ERROR, expected: GL_INVALID_ENUM
+GL_OES_texture_storage_multisample_2d_array not supported, skipping target
+glBindTexture(GL_TEXTURE_2D_MULTISAMPLE, 352);
+glTexStorage2DMultisample(GL_TEXTURE_2D_MULTISAMPLE, 1, GL_R8UI, 16, 16, GL_FALSE);
+glGetError();
+// GL_NO_ERROR returned
+glTexParameteri(GL_TEXTURE_2D_MULTISAMPLE, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+glGetError();
+// GL_NO_ERROR returned
+Got unexpected error: GL_NO_ERROR, expected: GL_INVALID_ENUM
+GL_OES_texture_storage_multisample_2d_array not supported, skipping target
+<Result StatusCode="Fail">Got wrong error code</Result>
+=== dEQP-GLES31.functional.texture.multisample.negative.texture_wrap_t
+glBindTexture(GL_TEXTURE_2D_MULTISAMPLE, 353);
+glTexStorage2DMultisample(GL_TEXTURE_2D_MULTISAMPLE, 1, GL_RGBA8, 16, 16, GL_FALSE);
+glGetError();
+// GL_NO_ERROR returned
+glTexParameteri(GL_TEXTURE_2D_MULTISAMPLE, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+glGetError();
+// GL_NO_ERROR returned
+Got unexpected error: GL_NO_ERROR, expected: GL_INVALID_ENUM
+GL_OES_texture_storage_multisample_2d_array not supported, skipping target
+glBindTexture(GL_TEXTURE_2D_MULTISAMPLE, 354);
+glTexStorage2DMultisample(GL_TEXTURE_2D_MULTISAMPLE, 1, GL_R8I, 16, 16, GL_FALSE);
+glGetError();
+// GL_NO_ERROR returned
+glTexParameteri(GL_TEXTURE_2D_MULTISAMPLE, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+glGetError();
+// GL_NO_ERROR returned
+Got unexpected error: GL_NO_ERROR, expected: GL_INVALID_ENUM
+GL_OES_texture_storage_multisample_2d_array not supported, skipping target
+glBindTexture(GL_TEXTURE_2D_MULTISAMPLE, 355);
+glTexStorage2DMultisample(GL_TEXTURE_2D_MULTISAMPLE, 1, GL_R8UI, 16, 16, GL_FALSE);
+glGetError();
+// GL_NO_ERROR returned
+glTexParameteri(GL_TEXTURE_2D_MULTISAMPLE, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+glGetError();
+// GL_NO_ERROR returned
+Got unexpected error: GL_NO_ERROR, expected: GL_INVALID_ENUM
+GL_OES_texture_storage_multisample_2d_array not supported, skipping target
+<Result StatusCode="Fail">Got wrong error code</Result>
+=== dEQP-GLES31.functional.texture.multisample.samples_1.sample_mask_and_sample_coverage
+glGetInternalformativ(GL_SAMPLES) = 4
+Creating multisample texture with sample count 1
+Attaching texture to FBO
+Clearing image
+Setting sample mask to 0b0
+Enabling sample coverage. Varying sample coverage for grid cells.
+Drawing test grid
+Reading from texture with sampler shader, u_sample = -1
+Image verification failed, disabled samples found.
+Clearing image
+Setting sample mask to 0b1
+Enabling sample coverage. Varying sample coverage for grid cells.
+Drawing test grid
+Reading from texture with sampler shader, u_sample = 0
+Image verification ok, no disabled samples found.
+<Result StatusCode="Fail">Sample test failed</Result>
+=== dEQP-GLES31.functional.texture.multisample.samples_1.sample_mask_non_effective_bits
+glGetInternalformativ(GL_SAMPLES) = 4
+Creating multisample texture with sample count 1
+Attaching texture to FBO
+Clearing image
+Setting sample mask to 0b01110000111101001001100111010010
+Drawing test grid
+Reading from texture with sampler shader, u_sample = -1
+Image verification failed, disabled samples found.
+Clearing image
+Setting sample mask to 0b11000000101010010100100101101011
+Drawing test grid
+Reading from texture with sampler shader, u_sample = 0
+Image verification ok, no disabled samples found.
+<Result StatusCode="Fail">Unused mask bits have effect</Result>
+=== dEQP-GLES31.functional.texture.multisample.samples_1.sample_mask_only
+glGetInternalformativ(GL_SAMPLES) = 4
+Creating multisample texture with sample count 1
+Attaching texture to FBO
+Clearing image
+Setting sample mask to 0b0
+Drawing test grid
+Reading from texture with sampler shader, u_sample = -1
+Image verification failed, disabled samples found.
+Clearing image
+Setting sample mask to 0b1
+Drawing test grid
+Reading from texture with sampler shader, u_sample = 0
+Image verification ok, no disabled samples found.
+<Result StatusCode="Fail">Sample test failed</Result>
+=== dEQP-GLES31.functional.texture.multisample.samples_1.sample_position
+GL_MAX_COLOR_TEXTURE_SAMPLES = 4
+GL_SUBPIXEL_BITS = 8
+Creating multisample texture
+Attaching texture to FBO
+Sample locations:
+0: (0.5, 0.5)
+Drawing test pattern to the texture
+Reading from texture with sample index 0
+Verifying rasterization result.
+Invalid pixels found:
+<Result StatusCode="Fail">Pixel comparison failed</Result>

@@ -1,0 +1,1561 @@
+=== dEQP-GLES31.functional.debug.negative_coverage.get_error.buffer.blit_framebuffer_multisample
+<?xml version="1.0" encoding="UTF-8"?>
+<TestCaseResult CasePath="dEQP-GLES31.functional.debug.negative_coverage.get_error.buffer.blit_framebuffer_multisample" Version="0.3.4" CaseType="SelfValidate">
+ <Text>glGenFramebuffers(2, 0x000000016f0a5670);</Text>
+ <Text>// framebuffers = { 42, 43 }</Text>
+ <Text>glGenRenderbuffers(2, 0x000000016f0a5668);</Text>
+ <Text>// renderbuffers = { 11458, 11459 }</Text>
+ <Text>glBindRenderbuffer(GL_RENDERBUFFER, 11458);</Text>
+ <Text>glBindFramebuffer(GL_READ_FRAMEBUFFER, 42);</Text>
+ <Text>glRenderbufferStorageMultisample(GL_RENDERBUFFER, 4, GL_RGBA8, 32, 32);</Text>
+ <Text>glFramebufferRenderbuffer(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, 11458);</Text>
+ <Text>glCheckFramebufferStatus(GL_READ_FRAMEBUFFER);</Text>
+ <Text>// GL_FRAMEBUFFER_COMPLETE returned</Text>
+ <Text>glBindRenderbuffer(GL_RENDERBUFFER, 11459);</Text>
+ <Text>glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 43);</Text>
+ <Section Name="callstream" Description="GL_INVALID_OPERATION is generated if the value of GL_SAMPLE_BUFFERS for the draw buffer is greater than zero.">
+  <Text>glRenderbufferStorageMultisample(GL_RENDERBUFFER, 4, GL_RGBA8, 32, 32);</Text>
+  <Text>glFramebufferRenderbuffer(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, 11459);</Text>
+  <Text>glBlitFramebuffer(0, 0, 16, 16, 0, 0, 16, 16, GL_COLOR_BUFFER_BIT, GL_NEAREST);</Text>
+</Section>
+ <Section Name="callstream" Description="GL_INVALID_OPERATION is generated if GL_SAMPLE_BUFFERS for the read buffer is greater than zero and the formats of draw and read buffers are not identical.">
+  <Text>glRenderbufferStorage(GL_RENDERBUFFER, GL_RGBA4, 32, 32);</Text>
+  <Text>glFramebufferRenderbuffer(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, 11459);</Text>
+  <Text>glBlitFramebuffer(0, 0, 16, 16, 0, 0, 16, 16, GL_COLOR_BUFFER_BIT, GL_NEAREST);</Text>
+</Section>
+ <Section Name="callstream" Description="GL_INVALID_OPERATION is generated if GL_SAMPLE_BUFFERS for the read buffer is greater than zero and the source and destination rectangles are not defined with the same (X0, Y0) and (X1, Y1) bounds.">
+  <Text>glRenderbufferStorage(GL_RENDERBUFFER, GL_RGBA8, 32, 32);</Text>
+  <Text>glFramebufferRenderbuffer(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, 11459);</Text>
+  <Text>glBlitFramebuffer(0, 0, 16, 16, 2, 2, 18, 18, GL_COLOR_BUFFER_BIT, GL_NEAREST);</Text>
+  <Text>GL_INVALID_OPERATION was expected but got GL_NO_ERROR</Text>
+</Section>
+ <Text>glBindFramebuffer(GL_FRAMEBUFFER, 0);</Text>
+ <Text>glDeleteRenderbuffers(2, { 11458, 11459 });</Text>
+ <Text>glDeleteFramebuffers(2, { 42, 43 });</Text>
+ <Number Name="TestDuration" Description="Test case duration in microseconds" Tag="Time" Unit="us">15019</Number>
+ <Result StatusCode="Fail">Incorrect error was reported</Result>
+</TestCaseResult>
+
+
+=== dEQP-GLES31.functional.debug.negative_coverage.get_error.buffer.renderbuffer_storage_multisample
+<?xml version="1.0" encoding="UTF-8"?>
+<TestCaseResult CasePath="dEQP-GLES31.functional.debug.negative_coverage.get_error.buffer.renderbuffer_storage_multisample" Version="0.3.4" CaseType="SelfValidate">
+ <Text>glGetInternalformativ(GL_RENDERBUFFER, GL_RGBA4, GL_SAMPLES, 1, 0x000000016f0a5668);</Text>
+ <Text>// params = { 4 }</Text>
+ <Text>glGetInternalformativ(GL_RENDERBUFFER, GL_RGBA8UI, GL_SAMPLES, 1, 0x000000016f0a5664);</Text>
+ <Text>// params = { 0 }</Text>
+ <Text>glGenRenderbuffers(1, 0x000000016f0a566c);</Text>
+ <Text>// renderbuffers = { 11460 }</Text>
+ <Text>glBindRenderbuffer(GL_RENDERBUFFER, 11460);</Text>
+ <Section Name="callstream" Description="GL_INVALID_ENUM is generated if target is not GL_RENDERBUFFER.">
+  <Text>glRenderbufferStorageMultisample(0xffffffffffffffff, 2, GL_RGBA4, 1, 1);</Text>
+  <Text>glRenderbufferStorageMultisample(GL_FRAMEBUFFER, 2, GL_RGBA4, 1, 1);</Text>
+</Section>
+ <Section Name="callstream" Description="GL_INVALID_OPERATION is generated if samples is greater than the maximum number of samples supported for internalformat.">
+  <Text>glRenderbufferStorageMultisample(GL_RENDERBUFFER, 5, GL_RGBA4, 1, 1);</Text>
+</Section>
+ <Section Name="callstream" Description="GL_INVALID_ENUM is generated if internalformat is not a color-renderable, depth-renderable, or stencil-renderable format.">
+  <Text>glRenderbufferStorageMultisample(GL_RENDERBUFFER, 2, 0xffffffffffffffff, 1, 1);</Text>
+  <Text>glRenderbufferStorageMultisample(GL_RENDERBUFFER, 2, GL_RGBA8_SNORM, 1, 1);</Text>
+</Section>
+ <Section Name="callstream" Description="GL_INVALID_OPERATION is generated if samples is greater than the maximum number of samples supported for internalformat. (Unsigned integer format)">
+  <Text>glRenderbufferStorageMultisample(GL_RENDERBUFFER, 1, GL_RGBA8UI, 1, 1);</Text>
+  <Text>GL_INVALID_OPERATION was expected but got GL_NO_ERROR</Text>
+</Section>
+ <Section Name="callstream" Description="GL_INVALID_VALUE is generated if width or height is less than zero.">
+  <Text>glRenderbufferStorageMultisample(GL_RENDERBUFFER, 2, GL_RGBA4, -1, 1);</Text>
+  <Text>glRenderbufferStorageMultisample(GL_RENDERBUFFER, 2, GL_RGBA4, 1, -1);</Text>
+  <Text>glRenderbufferStorageMultisample(GL_RENDERBUFFER, 2, GL_RGBA4, -1, -1);</Text>
+  <Text>glRenderbufferStorageMultisample(GL_RENDERBUFFER, -1, GL_RGBA4, 1, 1);</Text>
+  <Text>glRenderbufferStorageMultisample(GL_RENDERBUFFER, -1, GL_RGBA4, -1, 1);</Text>
+  <Text>glRenderbufferStorageMultisample(GL_RENDERBUFFER, -1, GL_RGBA4, 1, -1);</Text>
+  <Text>glRenderbufferStorageMultisample(GL_RENDERBUFFER, -1, GL_RGBA4, -1, -1);</Text>
+</Section>
+ <Section Name="callstream" Description="GL_INVALID_VALUE is generated if width or height is greater than GL_MAX_RENDERBUFFER_SIZE.">
+  <Text>glGetIntegerv(GL_MAX_RENDERBUFFER_SIZE, 0x000000016f0a5660);</Text>
+  <Text>// data = { 16384 }</Text>
+  <Text>glRenderbufferStorageMultisample(GL_RENDERBUFFER, 4, GL_RGBA4, 1, 16385);</Text>
+  <Text>glRenderbufferStorageMultisample(GL_RENDERBUFFER, 4, GL_RGBA4, 16385, 1);</Text>
+  <Text>glRenderbufferStorageMultisample(GL_RENDERBUFFER, 4, GL_RGBA4, 16385, 16385);</Text>
+</Section>
+ <Text>glDeleteRenderbuffers(1, { 11460 });</Text>
+ <Number Name="TestDuration" Description="Test case duration in microseconds" Tag="Time" Unit="us">2455</Number>
+ <Result StatusCode="Fail">Incorrect error was reported</Result>
+</TestCaseResult>
+
+
+=== dEQP-GLES31.functional.multisample.default_framebuffer.sample_position
+<?xml version="1.0" encoding="UTF-8"?>
+<TestCaseResult CasePath="dEQP-GLES31.functional.multisample.default_framebuffer.sample_position" Version="0.3.4" CaseType="SelfValidate">
+ <Text>glGetMultisamplefv(GL_SAMPLE_POSITION, 0, 0x000000016f0a5678);</Text>
+ <Text>// val = { 0.5, 0.5 }</Text>
+ <Text>glGetError();</Text>
+ <Text>// GL_NO_ERROR returned</Text>
+ <Text>glGetMultisamplefv(GL_SAMPLE_POSITION, 1, 0x000000016f0a5678);</Text>
+ <Text>// val = { -1, -1 }</Text>
+ <Text>glGetError();</Text>
+ <Text>// GL_INVALID_VALUE returned</Text>
+ <Text>getMultisamplefv: glGetError() returned GL_INVALID_VALUE at es31fMultisampleTests.cpp:145</Text>
+ <Number Name="TestDuration" Description="Test case duration in microseconds" Tag="Time" Unit="us">361</Number>
+ <Result StatusCode="Fail">getMultisamplefv: glGetError() returned GL_INVALID_VALUE at es31fMultisampleTests.cpp:145</Result>
+</TestCaseResult>
+
+
+=== dEQP-GLES31.functional.state_query.internal_format.texture_2d_multisample.r16i_samples
+<?xml version="1.0" encoding="UTF-8"?>
+<TestCaseResult CasePath="dEQP-GLES31.functional.state_query.internal_format.texture_2d_multisample.r16i_samples" Version="0.3.4" CaseType="SelfValidate">
+ <Text>Format must support sample count of GL_MAX_INTEGER_SAMPLES</Text>
+ <Text>GL_MAX_INTEGER_SAMPLES = 4</Text>
+ <Text>GL_NUM_SAMPLE_COUNTS = 0</Text>
+ <Text>ERROR: Format MUST support some multisample configuration, got GL_NUM_SAMPLE_COUNTS = 0</Text>
+ <Text>glGetInternalFormativ() reported 0 supported sample counts at es31fInternalFormatQueryTests.cpp:174</Text>
+ <Number Name="TestDuration" Description="Test case duration in microseconds" Tag="Time" Unit="us">283</Number>
+ <Result StatusCode="Fail">glGetInternalFormativ() reported 0 supported sample counts at es31fInternalFormatQueryTests.cpp:174</Result>
+</TestCaseResult>
+
+
+=== dEQP-GLES31.functional.state_query.internal_format.texture_2d_multisample.r16ui_samples
+<?xml version="1.0" encoding="UTF-8"?>
+<TestCaseResult CasePath="dEQP-GLES31.functional.state_query.internal_format.texture_2d_multisample.r16ui_samples" Version="0.3.4" CaseType="SelfValidate">
+ <Text>Format must support sample count of GL_MAX_INTEGER_SAMPLES</Text>
+ <Text>GL_MAX_INTEGER_SAMPLES = 4</Text>
+ <Text>GL_NUM_SAMPLE_COUNTS = 0</Text>
+ <Text>ERROR: Format MUST support some multisample configuration, got GL_NUM_SAMPLE_COUNTS = 0</Text>
+ <Text>glGetInternalFormativ() reported 0 supported sample counts at es31fInternalFormatQueryTests.cpp:174</Text>
+ <Number Name="TestDuration" Description="Test case duration in microseconds" Tag="Time" Unit="us">280</Number>
+ <Result StatusCode="Fail">glGetInternalFormativ() reported 0 supported sample counts at es31fInternalFormatQueryTests.cpp:174</Result>
+</TestCaseResult>
+
+
+=== dEQP-GLES31.functional.state_query.internal_format.texture_2d_multisample.r32i_samples
+<?xml version="1.0" encoding="UTF-8"?>
+<TestCaseResult CasePath="dEQP-GLES31.functional.state_query.internal_format.texture_2d_multisample.r32i_samples" Version="0.3.4" CaseType="SelfValidate">
+ <Text>Format must support sample count of GL_MAX_INTEGER_SAMPLES</Text>
+ <Text>GL_MAX_INTEGER_SAMPLES = 4</Text>
+ <Text>GL_NUM_SAMPLE_COUNTS = 0</Text>
+ <Text>ERROR: Format MUST support some multisample configuration, got GL_NUM_SAMPLE_COUNTS = 0</Text>
+ <Text>glGetInternalFormativ() reported 0 supported sample counts at es31fInternalFormatQueryTests.cpp:174</Text>
+ <Number Name="TestDuration" Description="Test case duration in microseconds" Tag="Time" Unit="us">280</Number>
+ <Result StatusCode="Fail">glGetInternalFormativ() reported 0 supported sample counts at es31fInternalFormatQueryTests.cpp:174</Result>
+</TestCaseResult>
+
+
+=== dEQP-GLES31.functional.state_query.internal_format.texture_2d_multisample.r32ui_samples
+<?xml version="1.0" encoding="UTF-8"?>
+<TestCaseResult CasePath="dEQP-GLES31.functional.state_query.internal_format.texture_2d_multisample.r32ui_samples" Version="0.3.4" CaseType="SelfValidate">
+ <Text>Format must support sample count of GL_MAX_INTEGER_SAMPLES</Text>
+ <Text>GL_MAX_INTEGER_SAMPLES = 4</Text>
+ <Text>GL_NUM_SAMPLE_COUNTS = 0</Text>
+ <Text>ERROR: Format MUST support some multisample configuration, got GL_NUM_SAMPLE_COUNTS = 0</Text>
+ <Text>glGetInternalFormativ() reported 0 supported sample counts at es31fInternalFormatQueryTests.cpp:174</Text>
+ <Number Name="TestDuration" Description="Test case duration in microseconds" Tag="Time" Unit="us">281</Number>
+ <Result StatusCode="Fail">glGetInternalFormativ() reported 0 supported sample counts at es31fInternalFormatQueryTests.cpp:174</Result>
+</TestCaseResult>
+
+
+=== dEQP-GLES31.functional.state_query.internal_format.texture_2d_multisample.r8i_samples
+<?xml version="1.0" encoding="UTF-8"?>
+<TestCaseResult CasePath="dEQP-GLES31.functional.state_query.internal_format.texture_2d_multisample.r8i_samples" Version="0.3.4" CaseType="SelfValidate">
+ <Text>Format must support sample count of GL_MAX_INTEGER_SAMPLES</Text>
+ <Text>GL_MAX_INTEGER_SAMPLES = 4</Text>
+ <Text>GL_NUM_SAMPLE_COUNTS = 0</Text>
+ <Text>ERROR: Format MUST support some multisample configuration, got GL_NUM_SAMPLE_COUNTS = 0</Text>
+ <Text>glGetInternalFormativ() reported 0 supported sample counts at es31fInternalFormatQueryTests.cpp:174</Text>
+ <Number Name="TestDuration" Description="Test case duration in microseconds" Tag="Time" Unit="us">474</Number>
+ <Result StatusCode="Fail">glGetInternalFormativ() reported 0 supported sample counts at es31fInternalFormatQueryTests.cpp:174</Result>
+</TestCaseResult>
+
+
+=== dEQP-GLES31.functional.state_query.internal_format.texture_2d_multisample.r8ui_samples
+<?xml version="1.0" encoding="UTF-8"?>
+<TestCaseResult CasePath="dEQP-GLES31.functional.state_query.internal_format.texture_2d_multisample.r8ui_samples" Version="0.3.4" CaseType="SelfValidate">
+ <Text>Format must support sample count of GL_MAX_INTEGER_SAMPLES</Text>
+ <Text>GL_MAX_INTEGER_SAMPLES = 4</Text>
+ <Text>GL_NUM_SAMPLE_COUNTS = 0</Text>
+ <Text>ERROR: Format MUST support some multisample configuration, got GL_NUM_SAMPLE_COUNTS = 0</Text>
+ <Text>glGetInternalFormativ() reported 0 supported sample counts at es31fInternalFormatQueryTests.cpp:174</Text>
+ <Number Name="TestDuration" Description="Test case duration in microseconds" Tag="Time" Unit="us">333</Number>
+ <Result StatusCode="Fail">glGetInternalFormativ() reported 0 supported sample counts at es31fInternalFormatQueryTests.cpp:174</Result>
+</TestCaseResult>
+
+
+=== dEQP-GLES31.functional.state_query.internal_format.texture_2d_multisample.rg16i_samples
+<?xml version="1.0" encoding="UTF-8"?>
+<TestCaseResult CasePath="dEQP-GLES31.functional.state_query.internal_format.texture_2d_multisample.rg16i_samples" Version="0.3.4" CaseType="SelfValidate">
+ <Text>Format must support sample count of GL_MAX_INTEGER_SAMPLES</Text>
+ <Text>GL_MAX_INTEGER_SAMPLES = 4</Text>
+ <Text>GL_NUM_SAMPLE_COUNTS = 0</Text>
+ <Text>ERROR: Format MUST support some multisample configuration, got GL_NUM_SAMPLE_COUNTS = 0</Text>
+ <Text>glGetInternalFormativ() reported 0 supported sample counts at es31fInternalFormatQueryTests.cpp:174</Text>
+ <Number Name="TestDuration" Description="Test case duration in microseconds" Tag="Time" Unit="us">287</Number>
+ <Result StatusCode="Fail">glGetInternalFormativ() reported 0 supported sample counts at es31fInternalFormatQueryTests.cpp:174</Result>
+</TestCaseResult>
+
+
+=== dEQP-GLES31.functional.state_query.internal_format.texture_2d_multisample.rg16ui_samples
+<?xml version="1.0" encoding="UTF-8"?>
+<TestCaseResult CasePath="dEQP-GLES31.functional.state_query.internal_format.texture_2d_multisample.rg16ui_samples" Version="0.3.4" CaseType="SelfValidate">
+ <Text>Format must support sample count of GL_MAX_INTEGER_SAMPLES</Text>
+ <Text>GL_MAX_INTEGER_SAMPLES = 4</Text>
+ <Text>GL_NUM_SAMPLE_COUNTS = 0</Text>
+ <Text>ERROR: Format MUST support some multisample configuration, got GL_NUM_SAMPLE_COUNTS = 0</Text>
+ <Text>glGetInternalFormativ() reported 0 supported sample counts at es31fInternalFormatQueryTests.cpp:174</Text>
+ <Number Name="TestDuration" Description="Test case duration in microseconds" Tag="Time" Unit="us">305</Number>
+ <Result StatusCode="Fail">glGetInternalFormativ() reported 0 supported sample counts at es31fInternalFormatQueryTests.cpp:174</Result>
+</TestCaseResult>
+
+
+=== dEQP-GLES31.functional.state_query.internal_format.texture_2d_multisample.rg32i_samples
+<?xml version="1.0" encoding="UTF-8"?>
+<TestCaseResult CasePath="dEQP-GLES31.functional.state_query.internal_format.texture_2d_multisample.rg32i_samples" Version="0.3.4" CaseType="SelfValidate">
+ <Text>Format must support sample count of GL_MAX_INTEGER_SAMPLES</Text>
+ <Text>GL_MAX_INTEGER_SAMPLES = 4</Text>
+ <Text>GL_NUM_SAMPLE_COUNTS = 0</Text>
+ <Text>ERROR: Format MUST support some multisample configuration, got GL_NUM_SAMPLE_COUNTS = 0</Text>
+ <Text>glGetInternalFormativ() reported 0 supported sample counts at es31fInternalFormatQueryTests.cpp:174</Text>
+ <Number Name="TestDuration" Description="Test case duration in microseconds" Tag="Time" Unit="us">290</Number>
+ <Result StatusCode="Fail">glGetInternalFormativ() reported 0 supported sample counts at es31fInternalFormatQueryTests.cpp:174</Result>
+</TestCaseResult>
+
+
+=== dEQP-GLES31.functional.state_query.internal_format.texture_2d_multisample.rg32ui_samples
+<?xml version="1.0" encoding="UTF-8"?>
+<TestCaseResult CasePath="dEQP-GLES31.functional.state_query.internal_format.texture_2d_multisample.rg32ui_samples" Version="0.3.4" CaseType="SelfValidate">
+ <Text>Format must support sample count of GL_MAX_INTEGER_SAMPLES</Text>
+ <Text>GL_MAX_INTEGER_SAMPLES = 4</Text>
+ <Text>GL_NUM_SAMPLE_COUNTS = 0</Text>
+ <Text>ERROR: Format MUST support some multisample configuration, got GL_NUM_SAMPLE_COUNTS = 0</Text>
+ <Text>glGetInternalFormativ() reported 0 supported sample counts at es31fInternalFormatQueryTests.cpp:174</Text>
+ <Number Name="TestDuration" Description="Test case duration in microseconds" Tag="Time" Unit="us">289</Number>
+ <Result StatusCode="Fail">glGetInternalFormativ() reported 0 supported sample counts at es31fInternalFormatQueryTests.cpp:174</Result>
+</TestCaseResult>
+
+
+=== dEQP-GLES31.functional.state_query.internal_format.texture_2d_multisample.rg8i_samples
+<?xml version="1.0" encoding="UTF-8"?>
+<TestCaseResult CasePath="dEQP-GLES31.functional.state_query.internal_format.texture_2d_multisample.rg8i_samples" Version="0.3.4" CaseType="SelfValidate">
+ <Text>Format must support sample count of GL_MAX_INTEGER_SAMPLES</Text>
+ <Text>GL_MAX_INTEGER_SAMPLES = 4</Text>
+ <Text>GL_NUM_SAMPLE_COUNTS = 0</Text>
+ <Text>ERROR: Format MUST support some multisample configuration, got GL_NUM_SAMPLE_COUNTS = 0</Text>
+ <Text>glGetInternalFormativ() reported 0 supported sample counts at es31fInternalFormatQueryTests.cpp:174</Text>
+ <Number Name="TestDuration" Description="Test case duration in microseconds" Tag="Time" Unit="us">295</Number>
+ <Result StatusCode="Fail">glGetInternalFormativ() reported 0 supported sample counts at es31fInternalFormatQueryTests.cpp:174</Result>
+</TestCaseResult>
+
+
+=== dEQP-GLES31.functional.state_query.internal_format.texture_2d_multisample.rg8ui_samples
+<?xml version="1.0" encoding="UTF-8"?>
+<TestCaseResult CasePath="dEQP-GLES31.functional.state_query.internal_format.texture_2d_multisample.rg8ui_samples" Version="0.3.4" CaseType="SelfValidate">
+ <Text>Format must support sample count of GL_MAX_INTEGER_SAMPLES</Text>
+ <Text>GL_MAX_INTEGER_SAMPLES = 4</Text>
+ <Text>GL_NUM_SAMPLE_COUNTS = 0</Text>
+ <Text>ERROR: Format MUST support some multisample configuration, got GL_NUM_SAMPLE_COUNTS = 0</Text>
+ <Text>glGetInternalFormativ() reported 0 supported sample counts at es31fInternalFormatQueryTests.cpp:174</Text>
+ <Number Name="TestDuration" Description="Test case duration in microseconds" Tag="Time" Unit="us">295</Number>
+ <Result StatusCode="Fail">glGetInternalFormativ() reported 0 supported sample counts at es31fInternalFormatQueryTests.cpp:174</Result>
+</TestCaseResult>
+
+
+=== dEQP-GLES31.functional.state_query.internal_format.texture_2d_multisample.rgb10_a2ui_samples
+<?xml version="1.0" encoding="UTF-8"?>
+<TestCaseResult CasePath="dEQP-GLES31.functional.state_query.internal_format.texture_2d_multisample.rgb10_a2ui_samples" Version="0.3.4" CaseType="SelfValidate">
+ <Text>Format must support sample count of GL_MAX_INTEGER_SAMPLES</Text>
+ <Text>GL_MAX_INTEGER_SAMPLES = 4</Text>
+ <Text>GL_NUM_SAMPLE_COUNTS = 0</Text>
+ <Text>ERROR: Format MUST support some multisample configuration, got GL_NUM_SAMPLE_COUNTS = 0</Text>
+ <Text>glGetInternalFormativ() reported 0 supported sample counts at es31fInternalFormatQueryTests.cpp:174</Text>
+ <Number Name="TestDuration" Description="Test case duration in microseconds" Tag="Time" Unit="us">330</Number>
+ <Result StatusCode="Fail">glGetInternalFormativ() reported 0 supported sample counts at es31fInternalFormatQueryTests.cpp:174</Result>
+</TestCaseResult>
+
+
+=== dEQP-GLES31.functional.state_query.internal_format.texture_2d_multisample.rgba16i_samples
+<?xml version="1.0" encoding="UTF-8"?>
+<TestCaseResult CasePath="dEQP-GLES31.functional.state_query.internal_format.texture_2d_multisample.rgba16i_samples" Version="0.3.4" CaseType="SelfValidate">
+ <Text>Format must support sample count of GL_MAX_INTEGER_SAMPLES</Text>
+ <Text>GL_MAX_INTEGER_SAMPLES = 4</Text>
+ <Text>GL_NUM_SAMPLE_COUNTS = 0</Text>
+ <Text>ERROR: Format MUST support some multisample configuration, got GL_NUM_SAMPLE_COUNTS = 0</Text>
+ <Text>glGetInternalFormativ() reported 0 supported sample counts at es31fInternalFormatQueryTests.cpp:174</Text>
+ <Number Name="TestDuration" Description="Test case duration in microseconds" Tag="Time" Unit="us">299</Number>
+ <Result StatusCode="Fail">glGetInternalFormativ() reported 0 supported sample counts at es31fInternalFormatQueryTests.cpp:174</Result>
+</TestCaseResult>
+
+
+=== dEQP-GLES31.functional.state_query.internal_format.texture_2d_multisample.rgba16ui_samples
+<?xml version="1.0" encoding="UTF-8"?>
+<TestCaseResult CasePath="dEQP-GLES31.functional.state_query.internal_format.texture_2d_multisample.rgba16ui_samples" Version="0.3.4" CaseType="SelfValidate">
+ <Text>Format must support sample count of GL_MAX_INTEGER_SAMPLES</Text>
+ <Text>GL_MAX_INTEGER_SAMPLES = 4</Text>
+ <Text>GL_NUM_SAMPLE_COUNTS = 0</Text>
+ <Text>ERROR: Format MUST support some multisample configuration, got GL_NUM_SAMPLE_COUNTS = 0</Text>
+ <Text>glGetInternalFormativ() reported 0 supported sample counts at es31fInternalFormatQueryTests.cpp:174</Text>
+ <Number Name="TestDuration" Description="Test case duration in microseconds" Tag="Time" Unit="us">303</Number>
+ <Result StatusCode="Fail">glGetInternalFormativ() reported 0 supported sample counts at es31fInternalFormatQueryTests.cpp:174</Result>
+</TestCaseResult>
+
+
+=== dEQP-GLES31.functional.state_query.internal_format.texture_2d_multisample.rgba32i_samples
+<?xml version="1.0" encoding="UTF-8"?>
+<TestCaseResult CasePath="dEQP-GLES31.functional.state_query.internal_format.texture_2d_multisample.rgba32i_samples" Version="0.3.4" CaseType="SelfValidate">
+ <Text>Format must support sample count of GL_MAX_INTEGER_SAMPLES</Text>
+ <Text>GL_MAX_INTEGER_SAMPLES = 4</Text>
+ <Text>GL_NUM_SAMPLE_COUNTS = 0</Text>
+ <Text>ERROR: Format MUST support some multisample configuration, got GL_NUM_SAMPLE_COUNTS = 0</Text>
+ <Text>glGetInternalFormativ() reported 0 supported sample counts at es31fInternalFormatQueryTests.cpp:174</Text>
+ <Number Name="TestDuration" Description="Test case duration in microseconds" Tag="Time" Unit="us">1112</Number>
+ <Result StatusCode="Fail">glGetInternalFormativ() reported 0 supported sample counts at es31fInternalFormatQueryTests.cpp:174</Result>
+</TestCaseResult>
+
+
+=== dEQP-GLES31.functional.state_query.internal_format.texture_2d_multisample.rgba32ui_samples
+<?xml version="1.0" encoding="UTF-8"?>
+<TestCaseResult CasePath="dEQP-GLES31.functional.state_query.internal_format.texture_2d_multisample.rgba32ui_samples" Version="0.3.4" CaseType="SelfValidate">
+ <Text>Format must support sample count of GL_MAX_INTEGER_SAMPLES</Text>
+ <Text>GL_MAX_INTEGER_SAMPLES = 4</Text>
+ <Text>GL_NUM_SAMPLE_COUNTS = 0</Text>
+ <Text>ERROR: Format MUST support some multisample configuration, got GL_NUM_SAMPLE_COUNTS = 0</Text>
+ <Text>glGetInternalFormativ() reported 0 supported sample counts at es31fInternalFormatQueryTests.cpp:174</Text>
+ <Number Name="TestDuration" Description="Test case duration in microseconds" Tag="Time" Unit="us">308</Number>
+ <Result StatusCode="Fail">glGetInternalFormativ() reported 0 supported sample counts at es31fInternalFormatQueryTests.cpp:174</Result>
+</TestCaseResult>
+
+
+=== dEQP-GLES31.functional.state_query.internal_format.texture_2d_multisample.rgba8i_samples
+<?xml version="1.0" encoding="UTF-8"?>
+<TestCaseResult CasePath="dEQP-GLES31.functional.state_query.internal_format.texture_2d_multisample.rgba8i_samples" Version="0.3.4" CaseType="SelfValidate">
+ <Text>Format must support sample count of GL_MAX_INTEGER_SAMPLES</Text>
+ <Text>GL_MAX_INTEGER_SAMPLES = 4</Text>
+ <Text>GL_NUM_SAMPLE_COUNTS = 0</Text>
+ <Text>ERROR: Format MUST support some multisample configuration, got GL_NUM_SAMPLE_COUNTS = 0</Text>
+ <Text>glGetInternalFormativ() reported 0 supported sample counts at es31fInternalFormatQueryTests.cpp:174</Text>
+ <Number Name="TestDuration" Description="Test case duration in microseconds" Tag="Time" Unit="us">281</Number>
+ <Result StatusCode="Fail">glGetInternalFormativ() reported 0 supported sample counts at es31fInternalFormatQueryTests.cpp:174</Result>
+</TestCaseResult>
+
+
+=== dEQP-GLES31.functional.state_query.internal_format.texture_2d_multisample.rgba8ui_samples
+<?xml version="1.0" encoding="UTF-8"?>
+<TestCaseResult CasePath="dEQP-GLES31.functional.state_query.internal_format.texture_2d_multisample.rgba8ui_samples" Version="0.3.4" CaseType="SelfValidate">
+ <Text>Format must support sample count of GL_MAX_INTEGER_SAMPLES</Text>
+ <Text>GL_MAX_INTEGER_SAMPLES = 4</Text>
+ <Text>GL_NUM_SAMPLE_COUNTS = 0</Text>
+ <Text>ERROR: Format MUST support some multisample configuration, got GL_NUM_SAMPLE_COUNTS = 0</Text>
+ <Text>glGetInternalFormativ() reported 0 supported sample counts at es31fInternalFormatQueryTests.cpp:174</Text>
+ <Number Name="TestDuration" Description="Test case duration in microseconds" Tag="Time" Unit="us">286</Number>
+ <Result StatusCode="Fail">glGetInternalFormativ() reported 0 supported sample counts at es31fInternalFormatQueryTests.cpp:174</Result>
+</TestCaseResult>
+
+
+=== dEQP-GLES31.functional.state_query.texture_level.texture_2d_multisample.buffer_data_store_binding_float
+<?xml version="1.0" encoding="UTF-8"?>
+<TestCaseResult CasePath="dEQP-GLES31.functional.state_query.texture_level.texture_2d_multisample.buffer_data_store_binding_float" Version="0.3.4" CaseType="SelfValidate">
+ <Section Name="Iteration" Description="Iteration 1/1 - GL_TEXTURE_2D_MULTISAMPLE, initial values">
+  <Text>glGenTextures(1, 0x00000009c4e46e20);</Text>
+  <Text>// textures = { 1002 }</Text>
+  <Text>glBindTexture(GL_TEXTURE_2D_MULTISAMPLE, 1002);</Text>
+  <Text>glGetError();</Text>
+  <Text>// GL_NO_ERROR returned</Text>
+  <Text>Verifying GL_TEXTURE_BUFFER_DATA_STORE_BINDING, expecting 0</Text>
+  <Text>glGetTexLevelParameterfv(GL_TEXTURE_2D_MULTISAMPLE, 0, GL_TEXTURE_BUFFER_DATA_STORE_BINDING, 0x000000016f0a5204);</Text>
+  <Text>// params = { -8.02976e+18 }</Text>
+  <Text>glGetError();</Text>
+  <Text>// GL_INVALID_ENUM returned</Text>
+  <Text> // ERROR: glGetTexLevelParameterfv: glGetError() returned GL_INVALID_ENUM</Text>
+  <Text>glDeleteTextures(1, { 1002 });</Text>
+</Section>
+ <Text>Following iteration(s) failed: 1</Text>
+ <Number Name="TestDuration" Description="Test case duration in microseconds" Tag="Time" Unit="us">2547</Number>
+ <Result StatusCode="Fail">One or more iterations failed</Result>
+</TestCaseResult>
+
+
+=== dEQP-GLES31.functional.state_query.texture_level.texture_2d_multisample.buffer_data_store_binding_integer
+<?xml version="1.0" encoding="UTF-8"?>
+<TestCaseResult CasePath="dEQP-GLES31.functional.state_query.texture_level.texture_2d_multisample.buffer_data_store_binding_integer" Version="0.3.4" CaseType="SelfValidate">
+ <Section Name="Iteration" Description="Iteration 1/1 - GL_TEXTURE_2D_MULTISAMPLE, initial values">
+  <Text>glGenTextures(1, 0x00000009c4ed1320);</Text>
+  <Text>// textures = { 1001 }</Text>
+  <Text>glBindTexture(GL_TEXTURE_2D_MULTISAMPLE, 1001);</Text>
+  <Text>glGetError();</Text>
+  <Text>// GL_NO_ERROR returned</Text>
+  <Text>Verifying GL_TEXTURE_BUFFER_DATA_STORE_BINDING, expecting 0</Text>
+  <Text>glGetTexLevelParameteriv(GL_TEXTURE_2D_MULTISAMPLE, 0, GL_TEXTURE_BUFFER_DATA_STORE_BINDING, 0x000000016f0a5204);</Text>
+  <Text>// params = { -555819298 }</Text>
+  <Text>glGetError();</Text>
+  <Text>// GL_INVALID_ENUM returned</Text>
+  <Text> // ERROR: glGetTexLevelParameteriv: glGetError() returned GL_INVALID_ENUM</Text>
+  <Text>glDeleteTextures(1, { 1001 });</Text>
+</Section>
+ <Text>Following iteration(s) failed: 1</Text>
+ <Number Name="TestDuration" Description="Test case duration in microseconds" Tag="Time" Unit="us">2130</Number>
+ <Result StatusCode="Fail">One or more iterations failed</Result>
+</TestCaseResult>
+
+
+=== dEQP-GLES31.functional.state_query.texture_level.texture_2d_multisample.buffer_offset_float
+<?xml version="1.0" encoding="UTF-8"?>
+<TestCaseResult CasePath="dEQP-GLES31.functional.state_query.texture_level.texture_2d_multisample.buffer_offset_float" Version="0.3.4" CaseType="SelfValidate">
+ <Section Name="Iteration" Description="Iteration 1/1 - GL_TEXTURE_2D_MULTISAMPLE, initial values">
+  <Text>glGenTextures(1, 0x00000009c4d22ca0);</Text>
+  <Text>// textures = { 1004 }</Text>
+  <Text>glBindTexture(GL_TEXTURE_2D_MULTISAMPLE, 1004);</Text>
+  <Text>glGetError();</Text>
+  <Text>// GL_NO_ERROR returned</Text>
+  <Text>Verifying GL_TEXTURE_BUFFER_OFFSET, expecting 0</Text>
+  <Text>glGetTexLevelParameterfv(GL_TEXTURE_2D_MULTISAMPLE, 0, GL_TEXTURE_BUFFER_OFFSET, 0x000000016f0a5204);</Text>
+  <Text>// params = { -8.02976e+18 }</Text>
+  <Text>glGetError();</Text>
+  <Text>// GL_INVALID_ENUM returned</Text>
+  <Text> // ERROR: glGetTexLevelParameterfv: glGetError() returned GL_INVALID_ENUM</Text>
+  <Text>glDeleteTextures(1, { 1004 });</Text>
+</Section>
+ <Text>Following iteration(s) failed: 1</Text>
+ <Number Name="TestDuration" Description="Test case duration in microseconds" Tag="Time" Unit="us">303</Number>
+ <Result StatusCode="Fail">One or more iterations failed</Result>
+</TestCaseResult>
+
+
+=== dEQP-GLES31.functional.state_query.texture_level.texture_2d_multisample.buffer_offset_integer
+<?xml version="1.0" encoding="UTF-8"?>
+<TestCaseResult CasePath="dEQP-GLES31.functional.state_query.texture_level.texture_2d_multisample.buffer_offset_integer" Version="0.3.4" CaseType="SelfValidate">
+ <Section Name="Iteration" Description="Iteration 1/1 - GL_TEXTURE_2D_MULTISAMPLE, initial values">
+  <Text>glGenTextures(1, 0x00000009c4e46ee0);</Text>
+  <Text>// textures = { 1003 }</Text>
+  <Text>glBindTexture(GL_TEXTURE_2D_MULTISAMPLE, 1003);</Text>
+  <Text>glGetError();</Text>
+  <Text>// GL_NO_ERROR returned</Text>
+  <Text>Verifying GL_TEXTURE_BUFFER_OFFSET, expecting 0</Text>
+  <Text>glGetTexLevelParameteriv(GL_TEXTURE_2D_MULTISAMPLE, 0, GL_TEXTURE_BUFFER_OFFSET, 0x000000016f0a5204);</Text>
+  <Text>// params = { -555819298 }</Text>
+  <Text>glGetError();</Text>
+  <Text>// GL_INVALID_ENUM returned</Text>
+  <Text> // ERROR: glGetTexLevelParameteriv: glGetError() returned GL_INVALID_ENUM</Text>
+  <Text>glDeleteTextures(1, { 1003 });</Text>
+</Section>
+ <Text>Following iteration(s) failed: 1</Text>
+ <Number Name="TestDuration" Description="Test case duration in microseconds" Tag="Time" Unit="us">339</Number>
+ <Result StatusCode="Fail">One or more iterations failed</Result>
+</TestCaseResult>
+
+
+=== dEQP-GLES31.functional.state_query.texture_level.texture_2d_multisample.buffer_size_float
+<?xml version="1.0" encoding="UTF-8"?>
+<TestCaseResult CasePath="dEQP-GLES31.functional.state_query.texture_level.texture_2d_multisample.buffer_size_float" Version="0.3.4" CaseType="SelfValidate">
+ <Section Name="Iteration" Description="Iteration 1/1 - GL_TEXTURE_2D_MULTISAMPLE, initial values">
+  <Text>glGenTextures(1, 0x00000009c4005aa0);</Text>
+  <Text>// textures = { 1006 }</Text>
+  <Text>glBindTexture(GL_TEXTURE_2D_MULTISAMPLE, 1006);</Text>
+  <Text>glGetError();</Text>
+  <Text>// GL_NO_ERROR returned</Text>
+  <Text>Verifying GL_TEXTURE_BUFFER_SIZE, expecting 0</Text>
+  <Text>glGetTexLevelParameterfv(GL_TEXTURE_2D_MULTISAMPLE, 0, GL_TEXTURE_BUFFER_SIZE, 0x000000016f0a5204);</Text>
+  <Text>// params = { -8.02976e+18 }</Text>
+  <Text>glGetError();</Text>
+  <Text>// GL_INVALID_ENUM returned</Text>
+  <Text> // ERROR: glGetTexLevelParameterfv: glGetError() returned GL_INVALID_ENUM</Text>
+  <Text>glDeleteTextures(1, { 1006 });</Text>
+</Section>
+ <Text>Following iteration(s) failed: 1</Text>
+ <Number Name="TestDuration" Description="Test case duration in microseconds" Tag="Time" Unit="us">318</Number>
+ <Result StatusCode="Fail">One or more iterations failed</Result>
+</TestCaseResult>
+
+
+=== dEQP-GLES31.functional.state_query.texture_level.texture_2d_multisample.buffer_size_integer
+<?xml version="1.0" encoding="UTF-8"?>
+<TestCaseResult CasePath="dEQP-GLES31.functional.state_query.texture_level.texture_2d_multisample.buffer_size_integer" Version="0.3.4" CaseType="SelfValidate">
+ <Section Name="Iteration" Description="Iteration 1/1 - GL_TEXTURE_2D_MULTISAMPLE, initial values">
+  <Text>glGenTextures(1, 0x00000009c4d22d60);</Text>
+  <Text>// textures = { 1005 }</Text>
+  <Text>glBindTexture(GL_TEXTURE_2D_MULTISAMPLE, 1005);</Text>
+  <Text>glGetError();</Text>
+  <Text>// GL_NO_ERROR returned</Text>
+  <Text>Verifying GL_TEXTURE_BUFFER_SIZE, expecting 0</Text>
+  <Text>glGetTexLevelParameteriv(GL_TEXTURE_2D_MULTISAMPLE, 0, GL_TEXTURE_BUFFER_SIZE, 0x000000016f0a5204);</Text>
+  <Text>// params = { -555819298 }</Text>
+  <Text>glGetError();</Text>
+  <Text>// GL_INVALID_ENUM returned</Text>
+  <Text> // ERROR: glGetTexLevelParameteriv: glGetError() returned GL_INVALID_ENUM</Text>
+  <Text>glDeleteTextures(1, { 1005 });</Text>
+</Section>
+ <Text>Following iteration(s) failed: 1</Text>
+ <Number Name="TestDuration" Description="Test case duration in microseconds" Tag="Time" Unit="us">312</Number>
+ <Result StatusCode="Fail">One or more iterations failed</Result>
+</TestCaseResult>
+
+
+=== dEQP-GLES31.functional.texture.multisample.negative.fbo_attach_different_fixed_state_tex_rbo
+<?xml version="1.0" encoding="UTF-8"?>
+<TestCaseResult CasePath="dEQP-GLES31.functional.texture.multisample.negative.fbo_attach_different_fixed_state_tex_rbo" Version="0.3.4" CaseType="SelfValidate">
+ <Text>glGenFramebuffers(1, 0x000000016f0a56ac);</Text>
+ <Text>// framebuffers = { 36 }</Text>
+ <Text>glBindFramebuffer(GL_FRAMEBUFFER, 36);</Text>
+ <Text>glGetError();</Text>
+ <Text>// GL_NO_ERROR returned</Text>
+ <Text>glGenTextures(1, 0x000000016f0a56a4);</Text>
+ <Text>// textures = { 341 }</Text>
+ <Text>glBindTexture(GL_TEXTURE_2D_MULTISAMPLE, 341);</Text>
+ <Text>glTexStorage2DMultisample(GL_TEXTURE_2D_MULTISAMPLE, 4, GL_RGBA8, 64, 64, GL_FALSE);</Text>
+ <Text>glGetError();</Text>
+ <Text>// GL_NO_ERROR returned</Text>
+ <Text>glGetTexLevelParameteriv(GL_TEXTURE_2D_MULTISAMPLE, 0, GL_TEXTURE_SAMPLES, 0x000000016f0a569c);</Text>
+ <Text>// params = { 4 }</Text>
+ <Text>glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D_MULTISAMPLE, 341, 0);</Text>
+ <Text>glGetError();</Text>
+ <Text>// GL_NO_ERROR returned</Text>
+ <Text>glGenRenderbuffers(1, 0x000000016f0a56a8);</Text>
+ <Text>// renderbuffers = { 342 }</Text>
+ <Text>glBindRenderbuffer(GL_RENDERBUFFER, 342);</Text>
+ <Text>glRenderbufferStorageMultisample(GL_RENDERBUFFER, 4, GL_RGBA8, 64, 64);</Text>
+ <Text>glGetError();</Text>
+ <Text>// GL_NO_ERROR returned</Text>
+ <Text>glGetRenderbufferParameteriv(GL_RENDERBUFFER, GL_RENDERBUFFER_SAMPLES, 0x000000016f0a56c8);</Text>
+ <Text>glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT1, GL_RENDERBUFFER, 342);</Text>
+ <Text>glGetError();</Text>
+ <Text>// GL_NO_ERROR returned</Text>
+ <Text>glCheckFramebufferStatus(GL_FRAMEBUFFER);</Text>
+ <Text>// GL_FRAMEBUFFER_COMPLETE returned</Text>
+ <Text>ERROR! Expected GL_FRAMEBUFFER_INCOMPLETE_MULTISAMPLE, got GL_FRAMEBUFFER_COMPLETE</Text>
+ <Text>glDeleteFramebuffers(1, { 36 });</Text>
+ <Text>glDeleteRenderbuffers(1, { 342 });</Text>
+ <Text>glDeleteTextures(1, { 341 });</Text>
+ <Text>glDeleteTextures(1, { 0 });</Text>
+ <Number Name="TestDuration" Description="Test case duration in microseconds" Tag="Time" Unit="us">387</Number>
+ <Result StatusCode="Fail">Got wrong error code</Result>
+</TestCaseResult>
+
+
+=== dEQP-GLES31.functional.texture.multisample.negative.fbo_attach_different_fixed_state_tex_tex
+<?xml version="1.0" encoding="UTF-8"?>
+<TestCaseResult CasePath="dEQP-GLES31.functional.texture.multisample.negative.fbo_attach_different_fixed_state_tex_tex" Version="0.3.4" CaseType="SelfValidate">
+ <Text>glGenFramebuffers(1, 0x000000016f0a56ac);</Text>
+ <Text>// framebuffers = { 35 }</Text>
+ <Text>glBindFramebuffer(GL_FRAMEBUFFER, 35);</Text>
+ <Text>glGetError();</Text>
+ <Text>// GL_NO_ERROR returned</Text>
+ <Text>glGenTextures(1, 0x000000016f0a56a4);</Text>
+ <Text>// textures = { 339 }</Text>
+ <Text>glBindTexture(GL_TEXTURE_2D_MULTISAMPLE, 339);</Text>
+ <Text>glTexStorage2DMultisample(GL_TEXTURE_2D_MULTISAMPLE, 4, GL_RGBA8, 64, 64, GL_FALSE);</Text>
+ <Text>glGetError();</Text>
+ <Text>// GL_NO_ERROR returned</Text>
+ <Text>glGetTexLevelParameteriv(GL_TEXTURE_2D_MULTISAMPLE, 0, GL_TEXTURE_SAMPLES, 0x000000016f0a569c);</Text>
+ <Text>// params = { 4 }</Text>
+ <Text>glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D_MULTISAMPLE, 339, 0);</Text>
+ <Text>glGetError();</Text>
+ <Text>// GL_NO_ERROR returned</Text>
+ <Text>glGenTextures(1, 0x000000016f0a56a0);</Text>
+ <Text>// textures = { 340 }</Text>
+ <Text>glBindTexture(GL_TEXTURE_2D_MULTISAMPLE, 340);</Text>
+ <Text>glTexStorage2DMultisample(GL_TEXTURE_2D_MULTISAMPLE, 4, GL_RGBA8, 64, 64, GL_TRUE);</Text>
+ <Text>glGetError();</Text>
+ <Text>// GL_NO_ERROR returned</Text>
+ <Text>glGetTexLevelParameteriv(GL_TEXTURE_2D_MULTISAMPLE, 0, GL_TEXTURE_SAMPLES, 0x000000016f0a56c8);</Text>
+ <Text>// params = { 4 }</Text>
+ <Text>glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT1, GL_TEXTURE_2D_MULTISAMPLE, 340, 0);</Text>
+ <Text>glGetError();</Text>
+ <Text>// GL_NO_ERROR returned</Text>
+ <Text>glCheckFramebufferStatus(GL_FRAMEBUFFER);</Text>
+ <Text>// GL_FRAMEBUFFER_COMPLETE returned</Text>
+ <Text>ERROR! Expected GL_FRAMEBUFFER_INCOMPLETE_MULTISAMPLE, got GL_FRAMEBUFFER_COMPLETE</Text>
+ <Text>glDeleteFramebuffers(1, { 35 });</Text>
+ <Text>glDeleteRenderbuffers(1, { 0 });</Text>
+ <Text>glDeleteTextures(1, { 339 });</Text>
+ <Text>glDeleteTextures(1, { 340 });</Text>
+ <Number Name="TestDuration" Description="Test case duration in microseconds" Tag="Time" Unit="us">394</Number>
+ <Result StatusCode="Fail">Got wrong error code</Result>
+</TestCaseResult>
+
+
+=== dEQP-GLES31.functional.texture.multisample.negative.fbo_attach_non_zero_level
+<?xml version="1.0" encoding="UTF-8"?>
+<TestCaseResult CasePath="dEQP-GLES31.functional.texture.multisample.negative.fbo_attach_non_zero_level" Version="0.3.4" CaseType="SelfValidate">
+ <Text>glGenFramebuffers(1, 0x000000016f0a56ac);</Text>
+ <Text>// framebuffers = { 37 }</Text>
+ <Text>glBindFramebuffer(GL_FRAMEBUFFER, 37);</Text>
+ <Text>glGetError();</Text>
+ <Text>// GL_NO_ERROR returned</Text>
+ <Text>glGenTextures(1, 0x000000016f0a56a4);</Text>
+ <Text>// textures = { 343 }</Text>
+ <Text>glBindTexture(GL_TEXTURE_2D_MULTISAMPLE, 343);</Text>
+ <Text>glTexStorage2DMultisample(GL_TEXTURE_2D_MULTISAMPLE, 4, GL_RGBA8, 64, 64, GL_FALSE);</Text>
+ <Text>glGetError();</Text>
+ <Text>// GL_NO_ERROR returned</Text>
+ <Text>glGetTexLevelParameteriv(GL_TEXTURE_2D_MULTISAMPLE, 0, GL_TEXTURE_SAMPLES, 0x000000016f0a569c);</Text>
+ <Text>// params = { 4 }</Text>
+ <Text>glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D_MULTISAMPLE, 343, 5);</Text>
+ <Text>glGetError();</Text>
+ <Text>// GL_NO_ERROR returned</Text>
+ <Text>ERROR! Expected GL_INVALID_VALUE, got GL_NO_ERROR</Text>
+ <Text>glDeleteFramebuffers(1, { 37 });</Text>
+ <Text>glDeleteRenderbuffers(1, { 0 });</Text>
+ <Text>glDeleteTextures(1, { 343 });</Text>
+ <Text>glDeleteTextures(1, { 0 });</Text>
+ <Number Name="TestDuration" Description="Test case duration in microseconds" Tag="Time" Unit="us">328</Number>
+ <Result StatusCode="Fail">Got wrong error code</Result>
+</TestCaseResult>
+
+
+=== dEQP-GLES31.functional.texture.multisample.negative.texture_base_level
+<?xml version="1.0" encoding="UTF-8"?>
+<TestCaseResult CasePath="dEQP-GLES31.functional.texture.multisample.negative.texture_base_level" Version="0.3.4" CaseType="SelfValidate">
+ <Section Name="Iteration" Description="Testing parameter with color texture">
+  <Text>glBindTexture(GL_TEXTURE_2D_MULTISAMPLE, 371);</Text>
+  <Text>glTexStorage2DMultisample(GL_TEXTURE_2D_MULTISAMPLE, 1, GL_RGBA8, 16, 16, GL_FALSE);</Text>
+  <Text>glGetError();</Text>
+  <Text>// GL_NO_ERROR returned</Text>
+  <Text>glTexParameteri(GL_TEXTURE_2D_MULTISAMPLE, GL_TEXTURE_BASE_LEVEL, 2);</Text>
+  <Text>glGetError();</Text>
+  <Text>// GL_NO_ERROR returned</Text>
+  <Text>Got unexpected error: GL_NO_ERROR, expected: GL_INVALID_OPERATION</Text>
+</Section>
+ <Section Name="Iteration" Description="Testing parameter with color array texture">
+  <Text>GL_OES_texture_storage_multisample_2d_array not supported, skipping target</Text>
+</Section>
+ <Section Name="Iteration" Description="Testing parameter with signed integer texture">
+  <Text>glBindTexture(GL_TEXTURE_2D_MULTISAMPLE, 372);</Text>
+  <Text>glTexStorage2DMultisample(GL_TEXTURE_2D_MULTISAMPLE, 1, GL_R8I, 16, 16, GL_FALSE);</Text>
+  <Text>glGetError();</Text>
+  <Text>// GL_NO_ERROR returned</Text>
+  <Text>glTexParameteri(GL_TEXTURE_2D_MULTISAMPLE, GL_TEXTURE_BASE_LEVEL, 2);</Text>
+  <Text>glGetError();</Text>
+  <Text>// GL_NO_ERROR returned</Text>
+  <Text>Got unexpected error: GL_NO_ERROR, expected: GL_INVALID_OPERATION</Text>
+</Section>
+ <Section Name="Iteration" Description="Testing parameter with signed integer array texture">
+  <Text>GL_OES_texture_storage_multisample_2d_array not supported, skipping target</Text>
+</Section>
+ <Section Name="Iteration" Description="Testing parameter with unsigned integer texture">
+  <Text>glBindTexture(GL_TEXTURE_2D_MULTISAMPLE, 373);</Text>
+  <Text>glTexStorage2DMultisample(GL_TEXTURE_2D_MULTISAMPLE, 1, GL_R8UI, 16, 16, GL_FALSE);</Text>
+  <Text>glGetError();</Text>
+  <Text>// GL_NO_ERROR returned</Text>
+  <Text>glTexParameteri(GL_TEXTURE_2D_MULTISAMPLE, GL_TEXTURE_BASE_LEVEL, 2);</Text>
+  <Text>glGetError();</Text>
+  <Text>// GL_NO_ERROR returned</Text>
+  <Text>Got unexpected error: GL_NO_ERROR, expected: GL_INVALID_OPERATION</Text>
+</Section>
+ <Section Name="Iteration" Description="Testing parameter with unsigned integer array texture">
+  <Text>GL_OES_texture_storage_multisample_2d_array not supported, skipping target</Text>
+</Section>
+ <Number Name="TestDuration" Description="Test case duration in microseconds" Tag="Time" Unit="us">421</Number>
+ <Result StatusCode="Fail">Got wrong error code</Result>
+</TestCaseResult>
+
+
+=== dEQP-GLES31.functional.texture.multisample.negative.texture_compare_func
+<?xml version="1.0" encoding="UTF-8"?>
+<TestCaseResult CasePath="dEQP-GLES31.functional.texture.multisample.negative.texture_compare_func" Version="0.3.4" CaseType="SelfValidate">
+ <Section Name="Iteration" Description="Testing parameter with color texture">
+  <Text>glBindTexture(GL_TEXTURE_2D_MULTISAMPLE, 368);</Text>
+  <Text>glTexStorage2DMultisample(GL_TEXTURE_2D_MULTISAMPLE, 1, GL_RGBA8, 16, 16, GL_FALSE);</Text>
+  <Text>glGetError();</Text>
+  <Text>// GL_NO_ERROR returned</Text>
+  <Text>glTexParameteri(GL_TEXTURE_2D_MULTISAMPLE, GL_TEXTURE_COMPARE_FUNC, GL_NOTEQUAL);</Text>
+  <Text>glGetError();</Text>
+  <Text>// GL_NO_ERROR returned</Text>
+  <Text>Got unexpected error: GL_NO_ERROR, expected: GL_INVALID_ENUM</Text>
+</Section>
+ <Section Name="Iteration" Description="Testing parameter with color array texture">
+  <Text>GL_OES_texture_storage_multisample_2d_array not supported, skipping target</Text>
+</Section>
+ <Section Name="Iteration" Description="Testing parameter with signed integer texture">
+  <Text>glBindTexture(GL_TEXTURE_2D_MULTISAMPLE, 369);</Text>
+  <Text>glTexStorage2DMultisample(GL_TEXTURE_2D_MULTISAMPLE, 1, GL_R8I, 16, 16, GL_FALSE);</Text>
+  <Text>glGetError();</Text>
+  <Text>// GL_NO_ERROR returned</Text>
+  <Text>glTexParameteri(GL_TEXTURE_2D_MULTISAMPLE, GL_TEXTURE_COMPARE_FUNC, GL_NOTEQUAL);</Text>
+  <Text>glGetError();</Text>
+  <Text>// GL_NO_ERROR returned</Text>
+  <Text>Got unexpected error: GL_NO_ERROR, expected: GL_INVALID_ENUM</Text>
+</Section>
+ <Section Name="Iteration" Description="Testing parameter with signed integer array texture">
+  <Text>GL_OES_texture_storage_multisample_2d_array not supported, skipping target</Text>
+</Section>
+ <Section Name="Iteration" Description="Testing parameter with unsigned integer texture">
+  <Text>glBindTexture(GL_TEXTURE_2D_MULTISAMPLE, 370);</Text>
+  <Text>glTexStorage2DMultisample(GL_TEXTURE_2D_MULTISAMPLE, 1, GL_R8UI, 16, 16, GL_FALSE);</Text>
+  <Text>glGetError();</Text>
+  <Text>// GL_NO_ERROR returned</Text>
+  <Text>glTexParameteri(GL_TEXTURE_2D_MULTISAMPLE, GL_TEXTURE_COMPARE_FUNC, GL_NOTEQUAL);</Text>
+  <Text>glGetError();</Text>
+  <Text>// GL_NO_ERROR returned</Text>
+  <Text>Got unexpected error: GL_NO_ERROR, expected: GL_INVALID_ENUM</Text>
+</Section>
+ <Section Name="Iteration" Description="Testing parameter with unsigned integer array texture">
+  <Text>GL_OES_texture_storage_multisample_2d_array not supported, skipping target</Text>
+</Section>
+ <Number Name="TestDuration" Description="Test case duration in microseconds" Tag="Time" Unit="us">376</Number>
+ <Result StatusCode="Fail">Got wrong error code</Result>
+</TestCaseResult>
+
+
+=== dEQP-GLES31.functional.texture.multisample.negative.texture_compare_mode
+<?xml version="1.0" encoding="UTF-8"?>
+<TestCaseResult CasePath="dEQP-GLES31.functional.texture.multisample.negative.texture_compare_mode" Version="0.3.4" CaseType="SelfValidate">
+ <Section Name="Iteration" Description="Testing parameter with color texture">
+  <Text>glBindTexture(GL_TEXTURE_2D_MULTISAMPLE, 365);</Text>
+  <Text>glTexStorage2DMultisample(GL_TEXTURE_2D_MULTISAMPLE, 1, GL_RGBA8, 16, 16, GL_FALSE);</Text>
+  <Text>glGetError();</Text>
+  <Text>// GL_NO_ERROR returned</Text>
+  <Text>glTexParameteri(GL_TEXTURE_2D_MULTISAMPLE, GL_TEXTURE_COMPARE_MODE, GL_NONE);</Text>
+  <Text>glGetError();</Text>
+  <Text>// GL_NO_ERROR returned</Text>
+  <Text>Got unexpected error: GL_NO_ERROR, expected: GL_INVALID_ENUM</Text>
+</Section>
+ <Section Name="Iteration" Description="Testing parameter with color array texture">
+  <Text>GL_OES_texture_storage_multisample_2d_array not supported, skipping target</Text>
+</Section>
+ <Section Name="Iteration" Description="Testing parameter with signed integer texture">
+  <Text>glBindTexture(GL_TEXTURE_2D_MULTISAMPLE, 366);</Text>
+  <Text>glTexStorage2DMultisample(GL_TEXTURE_2D_MULTISAMPLE, 1, GL_R8I, 16, 16, GL_FALSE);</Text>
+  <Text>glGetError();</Text>
+  <Text>// GL_NO_ERROR returned</Text>
+  <Text>glTexParameteri(GL_TEXTURE_2D_MULTISAMPLE, GL_TEXTURE_COMPARE_MODE, GL_NONE);</Text>
+  <Text>glGetError();</Text>
+  <Text>// GL_NO_ERROR returned</Text>
+  <Text>Got unexpected error: GL_NO_ERROR, expected: GL_INVALID_ENUM</Text>
+</Section>
+ <Section Name="Iteration" Description="Testing parameter with signed integer array texture">
+  <Text>GL_OES_texture_storage_multisample_2d_array not supported, skipping target</Text>
+</Section>
+ <Section Name="Iteration" Description="Testing parameter with unsigned integer texture">
+  <Text>glBindTexture(GL_TEXTURE_2D_MULTISAMPLE, 367);</Text>
+  <Text>glTexStorage2DMultisample(GL_TEXTURE_2D_MULTISAMPLE, 1, GL_R8UI, 16, 16, GL_FALSE);</Text>
+  <Text>glGetError();</Text>
+  <Text>// GL_NO_ERROR returned</Text>
+  <Text>glTexParameteri(GL_TEXTURE_2D_MULTISAMPLE, GL_TEXTURE_COMPARE_MODE, GL_NONE);</Text>
+  <Text>glGetError();</Text>
+  <Text>// GL_NO_ERROR returned</Text>
+  <Text>Got unexpected error: GL_NO_ERROR, expected: GL_INVALID_ENUM</Text>
+</Section>
+ <Section Name="Iteration" Description="Testing parameter with unsigned integer array texture">
+  <Text>GL_OES_texture_storage_multisample_2d_array not supported, skipping target</Text>
+</Section>
+ <Number Name="TestDuration" Description="Test case duration in microseconds" Tag="Time" Unit="us">390</Number>
+ <Result StatusCode="Fail">Got wrong error code</Result>
+</TestCaseResult>
+
+
+=== dEQP-GLES31.functional.texture.multisample.negative.texture_mag_filter
+<?xml version="1.0" encoding="UTF-8"?>
+<TestCaseResult CasePath="dEQP-GLES31.functional.texture.multisample.negative.texture_mag_filter" Version="0.3.4" CaseType="SelfValidate">
+ <Section Name="Iteration" Description="Testing parameter with color texture">
+  <Text>glBindTexture(GL_TEXTURE_2D_MULTISAMPLE, 347);</Text>
+  <Text>glTexStorage2DMultisample(GL_TEXTURE_2D_MULTISAMPLE, 1, GL_RGBA8, 16, 16, GL_FALSE);</Text>
+  <Text>glGetError();</Text>
+  <Text>// GL_NO_ERROR returned</Text>
+  <Text>glTexParameteri(GL_TEXTURE_2D_MULTISAMPLE, GL_TEXTURE_MAG_FILTER, GL_LINEAR);</Text>
+  <Text>glGetError();</Text>
+  <Text>// GL_NO_ERROR returned</Text>
+  <Text>Got unexpected error: GL_NO_ERROR, expected: GL_INVALID_ENUM</Text>
+</Section>
+ <Section Name="Iteration" Description="Testing parameter with color array texture">
+  <Text>GL_OES_texture_storage_multisample_2d_array not supported, skipping target</Text>
+</Section>
+ <Section Name="Iteration" Description="Testing parameter with signed integer texture">
+  <Text>glBindTexture(GL_TEXTURE_2D_MULTISAMPLE, 348);</Text>
+  <Text>glTexStorage2DMultisample(GL_TEXTURE_2D_MULTISAMPLE, 1, GL_R8I, 16, 16, GL_FALSE);</Text>
+  <Text>glGetError();</Text>
+  <Text>// GL_NO_ERROR returned</Text>
+  <Text>glTexParameteri(GL_TEXTURE_2D_MULTISAMPLE, GL_TEXTURE_MAG_FILTER, GL_LINEAR);</Text>
+  <Text>glGetError();</Text>
+  <Text>// GL_NO_ERROR returned</Text>
+  <Text>Got unexpected error: GL_NO_ERROR, expected: GL_INVALID_ENUM</Text>
+</Section>
+ <Section Name="Iteration" Description="Testing parameter with signed integer array texture">
+  <Text>GL_OES_texture_storage_multisample_2d_array not supported, skipping target</Text>
+</Section>
+ <Section Name="Iteration" Description="Testing parameter with unsigned integer texture">
+  <Text>glBindTexture(GL_TEXTURE_2D_MULTISAMPLE, 349);</Text>
+  <Text>glTexStorage2DMultisample(GL_TEXTURE_2D_MULTISAMPLE, 1, GL_R8UI, 16, 16, GL_FALSE);</Text>
+  <Text>glGetError();</Text>
+  <Text>// GL_NO_ERROR returned</Text>
+  <Text>glTexParameteri(GL_TEXTURE_2D_MULTISAMPLE, GL_TEXTURE_MAG_FILTER, GL_LINEAR);</Text>
+  <Text>glGetError();</Text>
+  <Text>// GL_NO_ERROR returned</Text>
+  <Text>Got unexpected error: GL_NO_ERROR, expected: GL_INVALID_ENUM</Text>
+</Section>
+ <Section Name="Iteration" Description="Testing parameter with unsigned integer array texture">
+  <Text>GL_OES_texture_storage_multisample_2d_array not supported, skipping target</Text>
+</Section>
+ <Number Name="TestDuration" Description="Test case duration in microseconds" Tag="Time" Unit="us">397</Number>
+ <Result StatusCode="Fail">Got wrong error code</Result>
+</TestCaseResult>
+
+
+=== dEQP-GLES31.functional.texture.multisample.negative.texture_max_lod
+<?xml version="1.0" encoding="UTF-8"?>
+<TestCaseResult CasePath="dEQP-GLES31.functional.texture.multisample.negative.texture_max_lod" Version="0.3.4" CaseType="SelfValidate">
+ <Section Name="Iteration" Description="Testing parameter with color texture">
+  <Text>glBindTexture(GL_TEXTURE_2D_MULTISAMPLE, 362);</Text>
+  <Text>glTexStorage2DMultisample(GL_TEXTURE_2D_MULTISAMPLE, 1, GL_RGBA8, 16, 16, GL_FALSE);</Text>
+  <Text>glGetError();</Text>
+  <Text>// GL_NO_ERROR returned</Text>
+  <Text>glTexParameteri(GL_TEXTURE_2D_MULTISAMPLE, GL_TEXTURE_MAX_LOD, 5);</Text>
+  <Text>glGetError();</Text>
+  <Text>// GL_NO_ERROR returned</Text>
+  <Text>Got unexpected error: GL_NO_ERROR, expected: GL_INVALID_ENUM</Text>
+</Section>
+ <Section Name="Iteration" Description="Testing parameter with color array texture">
+  <Text>GL_OES_texture_storage_multisample_2d_array not supported, skipping target</Text>
+</Section>
+ <Section Name="Iteration" Description="Testing parameter with signed integer texture">
+  <Text>glBindTexture(GL_TEXTURE_2D_MULTISAMPLE, 363);</Text>
+  <Text>glTexStorage2DMultisample(GL_TEXTURE_2D_MULTISAMPLE, 1, GL_R8I, 16, 16, GL_FALSE);</Text>
+  <Text>glGetError();</Text>
+  <Text>// GL_NO_ERROR returned</Text>
+  <Text>glTexParameteri(GL_TEXTURE_2D_MULTISAMPLE, GL_TEXTURE_MAX_LOD, 5);</Text>
+  <Text>glGetError();</Text>
+  <Text>// GL_NO_ERROR returned</Text>
+  <Text>Got unexpected error: GL_NO_ERROR, expected: GL_INVALID_ENUM</Text>
+</Section>
+ <Section Name="Iteration" Description="Testing parameter with signed integer array texture">
+  <Text>GL_OES_texture_storage_multisample_2d_array not supported, skipping target</Text>
+</Section>
+ <Section Name="Iteration" Description="Testing parameter with unsigned integer texture">
+  <Text>glBindTexture(GL_TEXTURE_2D_MULTISAMPLE, 364);</Text>
+  <Text>glTexStorage2DMultisample(GL_TEXTURE_2D_MULTISAMPLE, 1, GL_R8UI, 16, 16, GL_FALSE);</Text>
+  <Text>glGetError();</Text>
+  <Text>// GL_NO_ERROR returned</Text>
+  <Text>glTexParameteri(GL_TEXTURE_2D_MULTISAMPLE, GL_TEXTURE_MAX_LOD, 5);</Text>
+  <Text>glGetError();</Text>
+  <Text>// GL_NO_ERROR returned</Text>
+  <Text>Got unexpected error: GL_NO_ERROR, expected: GL_INVALID_ENUM</Text>
+</Section>
+ <Section Name="Iteration" Description="Testing parameter with unsigned integer array texture">
+  <Text>GL_OES_texture_storage_multisample_2d_array not supported, skipping target</Text>
+</Section>
+ <Number Name="TestDuration" Description="Test case duration in microseconds" Tag="Time" Unit="us">418</Number>
+ <Result StatusCode="Fail">Got wrong error code</Result>
+</TestCaseResult>
+
+
+=== dEQP-GLES31.functional.texture.multisample.negative.texture_min_filter
+<?xml version="1.0" encoding="UTF-8"?>
+<TestCaseResult CasePath="dEQP-GLES31.functional.texture.multisample.negative.texture_min_filter" Version="0.3.4" CaseType="SelfValidate">
+ <Section Name="Iteration" Description="Testing parameter with color texture">
+  <Text>glBindTexture(GL_TEXTURE_2D_MULTISAMPLE, 344);</Text>
+  <Text>glTexStorage2DMultisample(GL_TEXTURE_2D_MULTISAMPLE, 1, GL_RGBA8, 16, 16, GL_FALSE);</Text>
+  <Text>glGetError();</Text>
+  <Text>// GL_NO_ERROR returned</Text>
+  <Text>glTexParameteri(GL_TEXTURE_2D_MULTISAMPLE, GL_TEXTURE_MIN_FILTER, GL_LINEAR);</Text>
+  <Text>glGetError();</Text>
+  <Text>// GL_NO_ERROR returned</Text>
+  <Text>Got unexpected error: GL_NO_ERROR, expected: GL_INVALID_ENUM</Text>
+</Section>
+ <Section Name="Iteration" Description="Testing parameter with color array texture">
+  <Text>GL_OES_texture_storage_multisample_2d_array not supported, skipping target</Text>
+</Section>
+ <Section Name="Iteration" Description="Testing parameter with signed integer texture">
+  <Text>glBindTexture(GL_TEXTURE_2D_MULTISAMPLE, 345);</Text>
+  <Text>glTexStorage2DMultisample(GL_TEXTURE_2D_MULTISAMPLE, 1, GL_R8I, 16, 16, GL_FALSE);</Text>
+  <Text>glGetError();</Text>
+  <Text>// GL_NO_ERROR returned</Text>
+  <Text>glTexParameteri(GL_TEXTURE_2D_MULTISAMPLE, GL_TEXTURE_MIN_FILTER, GL_LINEAR);</Text>
+  <Text>glGetError();</Text>
+  <Text>// GL_NO_ERROR returned</Text>
+  <Text>Got unexpected error: GL_NO_ERROR, expected: GL_INVALID_ENUM</Text>
+</Section>
+ <Section Name="Iteration" Description="Testing parameter with signed integer array texture">
+  <Text>GL_OES_texture_storage_multisample_2d_array not supported, skipping target</Text>
+</Section>
+ <Section Name="Iteration" Description="Testing parameter with unsigned integer texture">
+  <Text>glBindTexture(GL_TEXTURE_2D_MULTISAMPLE, 346);</Text>
+  <Text>glTexStorage2DMultisample(GL_TEXTURE_2D_MULTISAMPLE, 1, GL_R8UI, 16, 16, GL_FALSE);</Text>
+  <Text>glGetError();</Text>
+  <Text>// GL_NO_ERROR returned</Text>
+  <Text>glTexParameteri(GL_TEXTURE_2D_MULTISAMPLE, GL_TEXTURE_MIN_FILTER, GL_LINEAR);</Text>
+  <Text>glGetError();</Text>
+  <Text>// GL_NO_ERROR returned</Text>
+  <Text>Got unexpected error: GL_NO_ERROR, expected: GL_INVALID_ENUM</Text>
+</Section>
+ <Section Name="Iteration" Description="Testing parameter with unsigned integer array texture">
+  <Text>GL_OES_texture_storage_multisample_2d_array not supported, skipping target</Text>
+</Section>
+ <Number Name="TestDuration" Description="Test case duration in microseconds" Tag="Time" Unit="us">394</Number>
+ <Result StatusCode="Fail">Got wrong error code</Result>
+</TestCaseResult>
+
+
+=== dEQP-GLES31.functional.texture.multisample.negative.texture_min_lod
+<?xml version="1.0" encoding="UTF-8"?>
+<TestCaseResult CasePath="dEQP-GLES31.functional.texture.multisample.negative.texture_min_lod" Version="0.3.4" CaseType="SelfValidate">
+ <Section Name="Iteration" Description="Testing parameter with color texture">
+  <Text>glBindTexture(GL_TEXTURE_2D_MULTISAMPLE, 359);</Text>
+  <Text>glTexStorage2DMultisample(GL_TEXTURE_2D_MULTISAMPLE, 1, GL_RGBA8, 16, 16, GL_FALSE);</Text>
+  <Text>glGetError();</Text>
+  <Text>// GL_NO_ERROR returned</Text>
+  <Text>glTexParameteri(GL_TEXTURE_2D_MULTISAMPLE, GL_TEXTURE_MIN_LOD, 1);</Text>
+  <Text>glGetError();</Text>
+  <Text>// GL_NO_ERROR returned</Text>
+  <Text>Got unexpected error: GL_NO_ERROR, expected: GL_INVALID_ENUM</Text>
+</Section>
+ <Section Name="Iteration" Description="Testing parameter with color array texture">
+  <Text>GL_OES_texture_storage_multisample_2d_array not supported, skipping target</Text>
+</Section>
+ <Section Name="Iteration" Description="Testing parameter with signed integer texture">
+  <Text>glBindTexture(GL_TEXTURE_2D_MULTISAMPLE, 360);</Text>
+  <Text>glTexStorage2DMultisample(GL_TEXTURE_2D_MULTISAMPLE, 1, GL_R8I, 16, 16, GL_FALSE);</Text>
+  <Text>glGetError();</Text>
+  <Text>// GL_NO_ERROR returned</Text>
+  <Text>glTexParameteri(GL_TEXTURE_2D_MULTISAMPLE, GL_TEXTURE_MIN_LOD, 1);</Text>
+  <Text>glGetError();</Text>
+  <Text>// GL_NO_ERROR returned</Text>
+  <Text>Got unexpected error: GL_NO_ERROR, expected: GL_INVALID_ENUM</Text>
+</Section>
+ <Section Name="Iteration" Description="Testing parameter with signed integer array texture">
+  <Text>GL_OES_texture_storage_multisample_2d_array not supported, skipping target</Text>
+</Section>
+ <Section Name="Iteration" Description="Testing parameter with unsigned integer texture">
+  <Text>glBindTexture(GL_TEXTURE_2D_MULTISAMPLE, 361);</Text>
+  <Text>glTexStorage2DMultisample(GL_TEXTURE_2D_MULTISAMPLE, 1, GL_R8UI, 16, 16, GL_FALSE);</Text>
+  <Text>glGetError();</Text>
+  <Text>// GL_NO_ERROR returned</Text>
+  <Text>glTexParameteri(GL_TEXTURE_2D_MULTISAMPLE, GL_TEXTURE_MIN_LOD, 1);</Text>
+  <Text>glGetError();</Text>
+  <Text>// GL_NO_ERROR returned</Text>
+  <Text>Got unexpected error: GL_NO_ERROR, expected: GL_INVALID_ENUM</Text>
+</Section>
+ <Section Name="Iteration" Description="Testing parameter with unsigned integer array texture">
+  <Text>GL_OES_texture_storage_multisample_2d_array not supported, skipping target</Text>
+</Section>
+ <Number Name="TestDuration" Description="Test case duration in microseconds" Tag="Time" Unit="us">451</Number>
+ <Result StatusCode="Fail">Got wrong error code</Result>
+</TestCaseResult>
+
+
+=== dEQP-GLES31.functional.texture.multisample.negative.texture_wrap_r
+<?xml version="1.0" encoding="UTF-8"?>
+<TestCaseResult CasePath="dEQP-GLES31.functional.texture.multisample.negative.texture_wrap_r" Version="0.3.4" CaseType="SelfValidate">
+ <Section Name="Iteration" Description="Testing parameter with color texture">
+  <Text>glBindTexture(GL_TEXTURE_2D_MULTISAMPLE, 356);</Text>
+  <Text>glTexStorage2DMultisample(GL_TEXTURE_2D_MULTISAMPLE, 1, GL_RGBA8, 16, 16, GL_FALSE);</Text>
+  <Text>glGetError();</Text>
+  <Text>// GL_NO_ERROR returned</Text>
+  <Text>glTexParameteri(GL_TEXTURE_2D_MULTISAMPLE, GL_TEXTURE_WRAP_R, GL_CLAMP_TO_EDGE);</Text>
+  <Text>glGetError();</Text>
+  <Text>// GL_NO_ERROR returned</Text>
+  <Text>Got unexpected error: GL_NO_ERROR, expected: GL_INVALID_ENUM</Text>
+</Section>
+ <Section Name="Iteration" Description="Testing parameter with color array texture">
+  <Text>GL_OES_texture_storage_multisample_2d_array not supported, skipping target</Text>
+</Section>
+ <Section Name="Iteration" Description="Testing parameter with signed integer texture">
+  <Text>glBindTexture(GL_TEXTURE_2D_MULTISAMPLE, 357);</Text>
+  <Text>glTexStorage2DMultisample(GL_TEXTURE_2D_MULTISAMPLE, 1, GL_R8I, 16, 16, GL_FALSE);</Text>
+  <Text>glGetError();</Text>
+  <Text>// GL_NO_ERROR returned</Text>
+  <Text>glTexParameteri(GL_TEXTURE_2D_MULTISAMPLE, GL_TEXTURE_WRAP_R, GL_CLAMP_TO_EDGE);</Text>
+  <Text>glGetError();</Text>
+  <Text>// GL_NO_ERROR returned</Text>
+  <Text>Got unexpected error: GL_NO_ERROR, expected: GL_INVALID_ENUM</Text>
+</Section>
+ <Section Name="Iteration" Description="Testing parameter with signed integer array texture">
+  <Text>GL_OES_texture_storage_multisample_2d_array not supported, skipping target</Text>
+</Section>
+ <Section Name="Iteration" Description="Testing parameter with unsigned integer texture">
+  <Text>glBindTexture(GL_TEXTURE_2D_MULTISAMPLE, 358);</Text>
+  <Text>glTexStorage2DMultisample(GL_TEXTURE_2D_MULTISAMPLE, 1, GL_R8UI, 16, 16, GL_FALSE);</Text>
+  <Text>glGetError();</Text>
+  <Text>// GL_NO_ERROR returned</Text>
+  <Text>glTexParameteri(GL_TEXTURE_2D_MULTISAMPLE, GL_TEXTURE_WRAP_R, GL_CLAMP_TO_EDGE);</Text>
+  <Text>glGetError();</Text>
+  <Text>// GL_NO_ERROR returned</Text>
+  <Text>Got unexpected error: GL_NO_ERROR, expected: GL_INVALID_ENUM</Text>
+</Section>
+ <Section Name="Iteration" Description="Testing parameter with unsigned integer array texture">
+  <Text>GL_OES_texture_storage_multisample_2d_array not supported, skipping target</Text>
+</Section>
+ <Number Name="TestDuration" Description="Test case duration in microseconds" Tag="Time" Unit="us">475</Number>
+ <Result StatusCode="Fail">Got wrong error code</Result>
+</TestCaseResult>
+
+
+=== dEQP-GLES31.functional.texture.multisample.negative.texture_wrap_s
+<?xml version="1.0" encoding="UTF-8"?>
+<TestCaseResult CasePath="dEQP-GLES31.functional.texture.multisample.negative.texture_wrap_s" Version="0.3.4" CaseType="SelfValidate">
+ <Section Name="Iteration" Description="Testing parameter with color texture">
+  <Text>glBindTexture(GL_TEXTURE_2D_MULTISAMPLE, 350);</Text>
+  <Text>glTexStorage2DMultisample(GL_TEXTURE_2D_MULTISAMPLE, 1, GL_RGBA8, 16, 16, GL_FALSE);</Text>
+  <Text>glGetError();</Text>
+  <Text>// GL_NO_ERROR returned</Text>
+  <Text>glTexParameteri(GL_TEXTURE_2D_MULTISAMPLE, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);</Text>
+  <Text>glGetError();</Text>
+  <Text>// GL_NO_ERROR returned</Text>
+  <Text>Got unexpected error: GL_NO_ERROR, expected: GL_INVALID_ENUM</Text>
+</Section>
+ <Section Name="Iteration" Description="Testing parameter with color array texture">
+  <Text>GL_OES_texture_storage_multisample_2d_array not supported, skipping target</Text>
+</Section>
+ <Section Name="Iteration" Description="Testing parameter with signed integer texture">
+  <Text>glBindTexture(GL_TEXTURE_2D_MULTISAMPLE, 351);</Text>
+  <Text>glTexStorage2DMultisample(GL_TEXTURE_2D_MULTISAMPLE, 1, GL_R8I, 16, 16, GL_FALSE);</Text>
+  <Text>glGetError();</Text>
+  <Text>// GL_NO_ERROR returned</Text>
+  <Text>glTexParameteri(GL_TEXTURE_2D_MULTISAMPLE, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);</Text>
+  <Text>glGetError();</Text>
+  <Text>// GL_NO_ERROR returned</Text>
+  <Text>Got unexpected error: GL_NO_ERROR, expected: GL_INVALID_ENUM</Text>
+</Section>
+ <Section Name="Iteration" Description="Testing parameter with signed integer array texture">
+  <Text>GL_OES_texture_storage_multisample_2d_array not supported, skipping target</Text>
+</Section>
+ <Section Name="Iteration" Description="Testing parameter with unsigned integer texture">
+  <Text>glBindTexture(GL_TEXTURE_2D_MULTISAMPLE, 352);</Text>
+  <Text>glTexStorage2DMultisample(GL_TEXTURE_2D_MULTISAMPLE, 1, GL_R8UI, 16, 16, GL_FALSE);</Text>
+  <Text>glGetError();</Text>
+  <Text>// GL_NO_ERROR returned</Text>
+  <Text>glTexParameteri(GL_TEXTURE_2D_MULTISAMPLE, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);</Text>
+  <Text>glGetError();</Text>
+  <Text>// GL_NO_ERROR returned</Text>
+  <Text>Got unexpected error: GL_NO_ERROR, expected: GL_INVALID_ENUM</Text>
+</Section>
+ <Section Name="Iteration" Description="Testing parameter with unsigned integer array texture">
+  <Text>GL_OES_texture_storage_multisample_2d_array not supported, skipping target</Text>
+</Section>
+ <Number Name="TestDuration" Description="Test case duration in microseconds" Tag="Time" Unit="us">441</Number>
+ <Result StatusCode="Fail">Got wrong error code</Result>
+</TestCaseResult>
+
+
+=== dEQP-GLES31.functional.texture.multisample.negative.texture_wrap_t
+<?xml version="1.0" encoding="UTF-8"?>
+<TestCaseResult CasePath="dEQP-GLES31.functional.texture.multisample.negative.texture_wrap_t" Version="0.3.4" CaseType="SelfValidate">
+ <Section Name="Iteration" Description="Testing parameter with color texture">
+  <Text>glBindTexture(GL_TEXTURE_2D_MULTISAMPLE, 353);</Text>
+  <Text>glTexStorage2DMultisample(GL_TEXTURE_2D_MULTISAMPLE, 1, GL_RGBA8, 16, 16, GL_FALSE);</Text>
+  <Text>glGetError();</Text>
+  <Text>// GL_NO_ERROR returned</Text>
+  <Text>glTexParameteri(GL_TEXTURE_2D_MULTISAMPLE, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);</Text>
+  <Text>glGetError();</Text>
+  <Text>// GL_NO_ERROR returned</Text>
+  <Text>Got unexpected error: GL_NO_ERROR, expected: GL_INVALID_ENUM</Text>
+</Section>
+ <Section Name="Iteration" Description="Testing parameter with color array texture">
+  <Text>GL_OES_texture_storage_multisample_2d_array not supported, skipping target</Text>
+</Section>
+ <Section Name="Iteration" Description="Testing parameter with signed integer texture">
+  <Text>glBindTexture(GL_TEXTURE_2D_MULTISAMPLE, 354);</Text>
+  <Text>glTexStorage2DMultisample(GL_TEXTURE_2D_MULTISAMPLE, 1, GL_R8I, 16, 16, GL_FALSE);</Text>
+  <Text>glGetError();</Text>
+  <Text>// GL_NO_ERROR returned</Text>
+  <Text>glTexParameteri(GL_TEXTURE_2D_MULTISAMPLE, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);</Text>
+  <Text>glGetError();</Text>
+  <Text>// GL_NO_ERROR returned</Text>
+  <Text>Got unexpected error: GL_NO_ERROR, expected: GL_INVALID_ENUM</Text>
+</Section>
+ <Section Name="Iteration" Description="Testing parameter with signed integer array texture">
+  <Text>GL_OES_texture_storage_multisample_2d_array not supported, skipping target</Text>
+</Section>
+ <Section Name="Iteration" Description="Testing parameter with unsigned integer texture">
+  <Text>glBindTexture(GL_TEXTURE_2D_MULTISAMPLE, 355);</Text>
+  <Text>glTexStorage2DMultisample(GL_TEXTURE_2D_MULTISAMPLE, 1, GL_R8UI, 16, 16, GL_FALSE);</Text>
+  <Text>glGetError();</Text>
+  <Text>// GL_NO_ERROR returned</Text>
+  <Text>glTexParameteri(GL_TEXTURE_2D_MULTISAMPLE, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);</Text>
+  <Text>glGetError();</Text>
+  <Text>// GL_NO_ERROR returned</Text>
+  <Text>Got unexpected error: GL_NO_ERROR, expected: GL_INVALID_ENUM</Text>
+</Section>
+ <Section Name="Iteration" Description="Testing parameter with unsigned integer array texture">
+  <Text>GL_OES_texture_storage_multisample_2d_array not supported, skipping target</Text>
+</Section>
+ <Number Name="TestDuration" Description="Test case duration in microseconds" Tag="Time" Unit="us">396</Number>
+ <Result StatusCode="Fail">Got wrong error code</Result>
+</TestCaseResult>
+
+
+=== dEQP-GLES31.functional.texture.multisample.samples_1.sample_mask_and_sample_coverage
+<?xml version="1.0" encoding="UTF-8"?>
+<TestCaseResult CasePath="dEQP-GLES31.functional.texture.multisample.samples_1.sample_mask_and_sample_coverage" Version="0.3.4" CaseType="SelfValidate">
+ <Text>glGetInternalformativ(GL_SAMPLES) = 4</Text>
+ <Text>Creating multisample texture with sample count 1</Text>
+ <Text>Attaching texture to FBO</Text>
+ <Section Name="GenerateSamplerShader" Description="Generate sampler shader">
+  <ShaderProgram LinkStatus="OK">
+   <InfoLog></InfoLog>
+   <VertexShader CompileStatus="OK">
+    <ShaderSource>#version 310 es
+in highp vec4 a_position;
+void main (void)
+{
+    gl_Position = a_position;
+}
+</ShaderSource>
+    <InfoLog></InfoLog>
+</VertexShader>
+   <FragmentShader CompileStatus="OK">
+    <ShaderSource>#version 310 es
+layout(location = 0) out highp vec4 fragColor;
+uniform highp sampler2DMS u_sampler;
+uniform highp int u_sample;
+void main (void)
+{
+    highp float correctCoverage = 0.0;
+    highp float incorrectCoverage = 0.0;
+    highp ivec2 texelPos = ivec2(int(floor(gl_FragCoord.x)), int(floor(gl_FragCoord.y)));
+
+    for (int sampleNdx = 0; sampleNdx &lt; 1; ++sampleNdx)
+    {
+        highp float sampleColor = texelFetch(u_sampler, texelPos, sampleNdx).r;
+        if (sampleNdx == u_sample)
+            correctCoverage += sampleColor;
+        else
+            incorrectCoverage += sampleColor;
+    }
+    fragColor = vec4(correctCoverage, incorrectCoverage, 0.0, 1.0);
+}
+</ShaderSource>
+    <InfoLog></InfoLog>
+</FragmentShader>
+</ShaderProgram>
+  <Number Name="VertexCompileTime" Description="Vertex shader compile time" Tag="Time" Unit="ms">0.049000</Number>
+  <Number Name="FragmentCompileTime" Description="Fragment shader compile time" Tag="Time" Unit="ms">0.088000</Number>
+  <Number Name="LinkTime" Description="Link time" Tag="Time" Unit="ms">0.100000</Number>
+</Section>
+ <Section Name="Iteration" Description="Verifying with zero mask">
+  <Text>Clearing image</Text>
+  <Text>Setting sample mask to 0b0</Text>
+  <Text>Enabling sample coverage. Varying sample coverage for grid cells.</Text>
+  <Text>Drawing test grid</Text>
+  <Text>Reading from texture with sampler shader, u_sample = -1</Text>
+  <Text>Image verification failed, disabled samples found.</Text>
+  <ImageSet Name="VerificationResult" Description="Result of rendering">
+   <Image Name="Result" Width="256" Height="256" Format="RGBA8888" CompressionMode="PNG" Description="Result">
+    iVBORw0KGgoAAAANSUhEUgAAAQAAAAEACAYAAABccqhmAAADHUlEQVR4nO3UMQEA
+    IAzAsIF/z0MGRxMFvXpmZwdIur8DgH8MAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIM
+    AMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIM
+    AMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIM
+    AMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIM
+    AMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIM
+    AMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIM
+    AMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIM
+    AMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIM
+    AMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIM
+    AMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIM
+    AMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIM
+    AMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIM
+    AMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIM
+    AMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIM
+    AMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIM
+    AMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIM
+    AMIMAMIMAMIMAMIMAMIMAMIerPcD/iTqJcYAAAAASUVORK5CYII=
+</Image>
+   <Image Name="ErrorMask" Width="256" Height="256" Format="RGBA8888" CompressionMode="PNG" Description="Error Mask">
+    iVBORw0KGgoAAAANSUhEUgAAAQAAAAEACAYAAABccqhmAAADHUlEQVR4nO3UMQEA
+    IAzAsIF/z0MGRxMFvXp2ZgdIur8DgH8MAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIM
+    AMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIM
+    AMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIM
+    AMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIM
+    AMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIM
+    AMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIM
+    AMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIM
+    AMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIM
+    AMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIM
+    AMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIM
+    AMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIM
+    AMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIM
+    AMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIM
+    AMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIM
+    AMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIM
+    AMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIM
+    AMIMAMIMAMIMAMIMAMIMAMIerfYD/tj/d68AAAAASUVORK5CYII=
+</Image>
+</ImageSet>
+</Section>
+ <Section Name="Iteration" Description="Verifying sample 1/1">
+  <Text>Clearing image</Text>
+  <Text>Setting sample mask to 0b1</Text>
+  <Text>Enabling sample coverage. Varying sample coverage for grid cells.</Text>
+  <Text>Drawing test grid</Text>
+  <Text>Reading from texture with sampler shader, u_sample = 0</Text>
+  <Text>Image verification ok, no disabled samples found.</Text>
+</Section>
+ <Number Name="TestDuration" Description="Test case duration in microseconds" Tag="Time" Unit="us">33673</Number>
+ <Result StatusCode="Fail">Sample test failed</Result>
+</TestCaseResult>
+
+
+=== dEQP-GLES31.functional.texture.multisample.samples_1.sample_mask_non_effective_bits
+<?xml version="1.0" encoding="UTF-8"?>
+<TestCaseResult CasePath="dEQP-GLES31.functional.texture.multisample.samples_1.sample_mask_non_effective_bits" Version="0.3.4" CaseType="SelfValidate">
+ <Text>glGetInternalformativ(GL_SAMPLES) = 4</Text>
+ <Text>Creating multisample texture with sample count 1</Text>
+ <Text>Attaching texture to FBO</Text>
+ <Section Name="GenerateSamplerShader" Description="Generate sampler shader">
+  <ShaderProgram LinkStatus="OK">
+   <InfoLog></InfoLog>
+   <VertexShader CompileStatus="OK">
+    <ShaderSource>#version 310 es
+in highp vec4 a_position;
+void main (void)
+{
+    gl_Position = a_position;
+}
+</ShaderSource>
+    <InfoLog></InfoLog>
+</VertexShader>
+   <FragmentShader CompileStatus="OK">
+    <ShaderSource>#version 310 es
+layout(location = 0) out highp vec4 fragColor;
+uniform highp sampler2DMS u_sampler;
+uniform highp int u_sample;
+void main (void)
+{
+    highp float correctCoverage = 0.0;
+    highp float incorrectCoverage = 0.0;
+    highp ivec2 texelPos = ivec2(int(floor(gl_FragCoord.x)), int(floor(gl_FragCoord.y)));
+
+    for (int sampleNdx = 0; sampleNdx &lt; 1; ++sampleNdx)
+    {
+        highp float sampleColor = texelFetch(u_sampler, texelPos, sampleNdx).r;
+        if (sampleNdx == u_sample)
+            correctCoverage += sampleColor;
+        else
+            incorrectCoverage += sampleColor;
+    }
+    fragColor = vec4(correctCoverage, incorrectCoverage, 0.0, 1.0);
+}
+</ShaderSource>
+    <InfoLog></InfoLog>
+</FragmentShader>
+</ShaderProgram>
+  <Number Name="VertexCompileTime" Description="Vertex shader compile time" Tag="Time" Unit="ms">0.045000</Number>
+  <Number Name="FragmentCompileTime" Description="Fragment shader compile time" Tag="Time" Unit="ms">0.079000</Number>
+  <Number Name="LinkTime" Description="Link time" Tag="Time" Unit="ms">0.091000</Number>
+</Section>
+ <Section Name="Iteration" Description="Verifying with zero mask">
+  <Text>Clearing image</Text>
+  <Text>Setting sample mask to 0b01110000111101001001100111010010</Text>
+  <Text>Drawing test grid</Text>
+  <Text>Reading from texture with sampler shader, u_sample = -1</Text>
+  <Text>Image verification failed, disabled samples found.</Text>
+  <ImageSet Name="VerificationResult" Description="Result of rendering">
+   <Image Name="Result" Width="256" Height="256" Format="RGBA8888" CompressionMode="PNG" Description="Result">
+    iVBORw0KGgoAAAANSUhEUgAAAQAAAAEACAYAAABccqhmAAADHUlEQVR4nO3UMQEA
+    IAzAsIF/z0MGRxMFvXpmZwdIur8DgH8MAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIM
+    AMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIM
+    AMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIM
+    AMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIM
+    AMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIM
+    AMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIM
+    AMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIM
+    AMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIM
+    AMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIM
+    AMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIM
+    AMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIM
+    AMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIM
+    AMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIM
+    AMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIM
+    AMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIM
+    AMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIM
+    AMIMAMIMAMIMAMIMAMIMAMIerPcD/iTqJcYAAAAASUVORK5CYII=
+</Image>
+   <Image Name="ErrorMask" Width="256" Height="256" Format="RGBA8888" CompressionMode="PNG" Description="Error Mask">
+    iVBORw0KGgoAAAANSUhEUgAAAQAAAAEACAYAAABccqhmAAADHUlEQVR4nO3UMQEA
+    IAzAsIF/z0MGRxMFvXp2ZgdIur8DgH8MAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIM
+    AMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIM
+    AMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIM
+    AMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIM
+    AMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIM
+    AMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIM
+    AMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIM
+    AMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIM
+    AMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIM
+    AMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIM
+    AMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIM
+    AMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIM
+    AMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIM
+    AMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIM
+    AMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIM
+    AMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIM
+    AMIMAMIMAMIMAMIMAMIMAMIerfYD/tj/d68AAAAASUVORK5CYII=
+</Image>
+</ImageSet>
+</Section>
+ <Section Name="Iteration" Description="Verifying sample 1/1">
+  <Text>Clearing image</Text>
+  <Text>Setting sample mask to 0b11000000101010010100100101101011</Text>
+  <Text>Drawing test grid</Text>
+  <Text>Reading from texture with sampler shader, u_sample = 0</Text>
+  <Text>Image verification ok, no disabled samples found.</Text>
+</Section>
+ <Number Name="TestDuration" Description="Test case duration in microseconds" Tag="Time" Unit="us">27724</Number>
+ <Result StatusCode="Fail">Unused mask bits have effect</Result>
+</TestCaseResult>
+
+
+=== dEQP-GLES31.functional.texture.multisample.samples_1.sample_mask_only
+<?xml version="1.0" encoding="UTF-8"?>
+<TestCaseResult CasePath="dEQP-GLES31.functional.texture.multisample.samples_1.sample_mask_only" Version="0.3.4" CaseType="SelfValidate">
+ <Text>glGetInternalformativ(GL_SAMPLES) = 4</Text>
+ <Text>Creating multisample texture with sample count 1</Text>
+ <Text>Attaching texture to FBO</Text>
+ <Section Name="GenerateSamplerShader" Description="Generate sampler shader">
+  <ShaderProgram LinkStatus="OK">
+   <InfoLog></InfoLog>
+   <VertexShader CompileStatus="OK">
+    <ShaderSource>#version 310 es
+in highp vec4 a_position;
+void main (void)
+{
+    gl_Position = a_position;
+}
+</ShaderSource>
+    <InfoLog></InfoLog>
+</VertexShader>
+   <FragmentShader CompileStatus="OK">
+    <ShaderSource>#version 310 es
+layout(location = 0) out highp vec4 fragColor;
+uniform highp sampler2DMS u_sampler;
+uniform highp int u_sample;
+void main (void)
+{
+    highp float correctCoverage = 0.0;
+    highp float incorrectCoverage = 0.0;
+    highp ivec2 texelPos = ivec2(int(floor(gl_FragCoord.x)), int(floor(gl_FragCoord.y)));
+
+    for (int sampleNdx = 0; sampleNdx &lt; 1; ++sampleNdx)
+    {
+        highp float sampleColor = texelFetch(u_sampler, texelPos, sampleNdx).r;
+        if (sampleNdx == u_sample)
+            correctCoverage += sampleColor;
+        else
+            incorrectCoverage += sampleColor;
+    }
+    fragColor = vec4(correctCoverage, incorrectCoverage, 0.0, 1.0);
+}
+</ShaderSource>
+    <InfoLog></InfoLog>
+</FragmentShader>
+</ShaderProgram>
+  <Number Name="VertexCompileTime" Description="Vertex shader compile time" Tag="Time" Unit="ms">0.113000</Number>
+  <Number Name="FragmentCompileTime" Description="Fragment shader compile time" Tag="Time" Unit="ms">0.112000</Number>
+  <Number Name="LinkTime" Description="Link time" Tag="Time" Unit="ms">0.146000</Number>
+</Section>
+ <Section Name="Iteration" Description="Verifying with zero mask">
+  <Text>Clearing image</Text>
+  <Text>Setting sample mask to 0b0</Text>
+  <Text>Drawing test grid</Text>
+  <Text>Reading from texture with sampler shader, u_sample = -1</Text>
+  <Text>Image verification failed, disabled samples found.</Text>
+  <ImageSet Name="VerificationResult" Description="Result of rendering">
+   <Image Name="Result" Width="256" Height="256" Format="RGBA8888" CompressionMode="PNG" Description="Result">
+    iVBORw0KGgoAAAANSUhEUgAAAQAAAAEACAYAAABccqhmAAADHUlEQVR4nO3UMQEA
+    IAzAsIF/z0MGRxMFvXpmZwdIur8DgH8MAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIM
+    AMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIM
+    AMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIM
+    AMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIM
+    AMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIM
+    AMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIM
+    AMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIM
+    AMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIM
+    AMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIM
+    AMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIM
+    AMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIM
+    AMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIM
+    AMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIM
+    AMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIM
+    AMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIM
+    AMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIM
+    AMIMAMIMAMIMAMIMAMIMAMIerPcD/iTqJcYAAAAASUVORK5CYII=
+</Image>
+   <Image Name="ErrorMask" Width="256" Height="256" Format="RGBA8888" CompressionMode="PNG" Description="Error Mask">
+    iVBORw0KGgoAAAANSUhEUgAAAQAAAAEACAYAAABccqhmAAADHUlEQVR4nO3UMQEA
+    IAzAsIF/z0MGRxMFvXp2ZgdIur8DgH8MAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIM
+    AMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIM
+    AMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIM
+    AMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIM
+    AMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIM
+    AMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIM
+    AMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIM
+    AMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIM
+    AMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIM
+    AMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIM
+    AMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIM
+    AMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIM
+    AMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIM
+    AMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIM
+    AMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIM
+    AMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIMAMIM
+    AMIMAMIMAMIMAMIMAMIMAMIerfYD/tj/d68AAAAASUVORK5CYII=
+</Image>
+</ImageSet>
+</Section>
+ <Section Name="Iteration" Description="Verifying sample 1/1">
+  <Text>Clearing image</Text>
+  <Text>Setting sample mask to 0b1</Text>
+  <Text>Drawing test grid</Text>
+  <Text>Reading from texture with sampler shader, u_sample = 0</Text>
+  <Text>Image verification ok, no disabled samples found.</Text>
+</Section>
+ <Number Name="TestDuration" Description="Test case duration in microseconds" Tag="Time" Unit="us">166000</Number>
+ <Result StatusCode="Fail">Sample test failed</Result>
+</TestCaseResult>
+
+
+=== dEQP-GLES31.functional.texture.multisample.samples_1.sample_position
+<?xml version="1.0" encoding="UTF-8"?>
+<TestCaseResult CasePath="dEQP-GLES31.functional.texture.multisample.samples_1.sample_position" Version="0.3.4" CaseType="SelfValidate">
+ <Text>GL_MAX_COLOR_TEXTURE_SAMPLES = 4</Text>
+ <Text>GL_SUBPIXEL_BITS = 8</Text>
+ <Text>Creating multisample texture</Text>
+ <Text>Attaching texture to FBO</Text>
+ <Text>Sample locations:</Text>
+ <Text>	0: (0.5, 0.5)</Text>
+ <Text>Drawing test pattern to the texture</Text>
+ <Section Name="Generate sampler shader" Description="Generate sampler shader">
+  <ShaderProgram LinkStatus="OK">
+   <InfoLog></InfoLog>
+   <VertexShader CompileStatus="OK">
+    <ShaderSource>#version 310 es
+in highp vec4 a_position;
+void main (void)
+{
+    gl_Position = a_position;
+}
+</ShaderSource>
+    <InfoLog></InfoLog>
+</VertexShader>
+   <FragmentShader CompileStatus="OK">
+    <ShaderSource>#version 310 es
+layout(location = 0) out highp vec4 fragColor;
+uniform highp sampler2DMS u_sampler;
+uniform highp int u_sample;
+void main (void)
+{
+    fragColor = texelFetch(u_sampler, ivec2(int(floor(gl_FragCoord.x)), int(floor(gl_FragCoord.y))), u_sample);
+}
+</ShaderSource>
+    <InfoLog></InfoLog>
+</FragmentShader>
+</ShaderProgram>
+  <Number Name="VertexCompileTime" Description="Vertex shader compile time" Tag="Time" Unit="ms">0.110000</Number>
+  <Number Name="FragmentCompileTime" Description="Fragment shader compile time" Tag="Time" Unit="ms">0.136000</Number>
+  <Number Name="LinkTime" Description="Link time" Tag="Time" Unit="ms">0.169000</Number>
+</Section>
+ <Section Name="Test sample position 1/1" Description="Test sample position 1/1">
+  <Text>Reading from texture with sample index 0</Text>
+</Section>
+ <Text>Verifying rasterization result.</Text>
+ <Text>Invalid pixels found:
+	12812 missing pixels. (Marked with purple)
+	0 incorrectly filled pixels. (Marked with red)
+	Unknown (subpixel on edge) pixels are marked with yellow.</Text>
+ <ImageSet Name="Verification result" Description="Result of rendering">
+  <Image Name="Result" Width="256" Height="256" Format="RGBA8888" CompressionMode="PNG" Description="Result">
+   iVBORw0KGgoAAAANSUhEUgAAAQAAAAEACAYAAABccqhmAAADHUlEQVR4nO3UMQEA
+   IAzAsIF/zyBjRxMFvXpm5g2QdLcDgD0GAGEGAGEGAGEGAGEGAGEGAGEGAGEGAGEG
+   AGEGAGEGAGEGAGEGAGEGAGEGAGEGAGEGAGEGAGEGAGEGAGEGAGEGAGEGAGEGAGEG
+   AGEGAGEGAGEGAGEGAGEGAGEGAGEGAGEGAGEGAGEGAGEGAGEGAGEGAGEGAGEGAGEG
+   AGEGAGEGAGEGAGEGAGEGAGEGAGEGAGEGAGEGAGEGAGEGAGEGAGEGAGEGAGEGAGEG
+   AGEGAGEGAGEGAGEGAGEGAGEGAGEGAGEGAGEGAGEGAGEGAGEGAGEGAGEGAGEGAGEG
+   AGEGAGEGAGEGAGEGAGEGAGEGAGEGAGEGAGEGAGEGAGEGAGEGAGEGAGEGAGEGAGEG
+   AGEGAGEGAGEGAGEGAGEGAGEGAGEGAGEGAGEGAGEGAGEGAGEGAGEGAGEGAGEGAGEG
+   AGEGAGEGAGEGAGEGAGEGAGEGAGEGAGEGAGEGAGEGAGEGAGEGAGEGAGEGAGEGAGEG
+   AGEGAGEGAGEGAGEGAGEGAGEGAGEGAGEGAGEGAGEGAGEGAGEGAGEGAGEGAGEGAGEG
+   AGEGAGEGAGEGAGEGAGEGAGEGAGEGAGEGAGEGAGEGAGEGAGEGAGEGAGEGAGEGAGEG
+   AGEGAGEGAGEGAGEGAGEGAGEGAGEGAGEGAGEGAGEGAGEGAGEGAGEGAGEGAGEGAGEG
+   AGEGAGEGAGEGAGEGAGEGAGEGAGEGAGEGAGEGAGEGAGEGAGEGAGEGAGEGAGEGAGEG
+   AGEGAGEGAGEGAGEGAGEGAGEGAGEGAGEGAGEGAGEGAGEGAGEGAGEGAGEGAGEGAGEG
+   AGEGAGEGAGEGAGEGAGEGAGEGAGEGAGEGAGEGAGEGAGEGAGEGAGEGAGEGAGEGAGEG
+   AGEGAGEGAGEGAGEGAGEGAGEGAGEGAGEGAGEGAGEGAGEGAGEGAGEGAGEGAGEGAGEG
+   AGEGAGEGAGEGAGEGAGEGAGEGAGEGAGEGAGEGAGEGAGEGAGEGAGEGAGEGAGEGAGEG
+   AGEGAGEGAGEGAGEGAGEGAGEfdCIC/5NkVo8AAAAASUVORK5CYII=
+</Image>
+  <Image Name="ErrorMask" Width="256" Height="256" Format="RGBA8888" CompressionMode="PNG" Description="ErrorMask">
+   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
+   XQAAAABJRU5ErkJggg==
+</Image>
+</ImageSet>
+ <Number Name="TestDuration" Description="Test case duration in microseconds" Tag="Time" Unit="us">272892</Number>
+ <Result StatusCode="Fail">Pixel comparison failed</Result>
+</TestCaseResult>
+
+

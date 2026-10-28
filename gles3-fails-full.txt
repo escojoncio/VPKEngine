@@ -1,0 +1,3446 @@
+=== dEQP-GLES3.functional.fbo.api.attach_names
+<?xml version="1.0" encoding="UTF-8"?>
+<TestCaseResult CasePath="dEQP-GLES3.functional.fbo.api.attach_names" Version="0.3.4" CaseType="SelfValidate">
+ <Text>glBindFramebuffer(GL_FRAMEBUFFER, 1);</Text>
+ <Text>glGenTextures(1, 0x000000016fa1d5ac);</Text>
+ <Text>// textures = { 3457 }</Text>
+ <Text>// Attaching allocated texture name to 2D target</Text>
+ <Text>glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, 3457, 0);</Text>
+ <Text>glGetError();</Text>
+ <Text>// GL_NO_ERROR returned</Text>
+ <Text>// Fail, expected GL_INVALID_OPERATION</Text>
+ <Text>// Attaching allocated texture name to cube target</Text>
+ <Text>glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_CUBE_MAP_NEGATIVE_X, 3457, 0);</Text>
+ <Text>glGetError();</Text>
+ <Text>// GL_NO_ERROR returned</Text>
+ <Text>// Fail, expected GL_INVALID_OPERATION</Text>
+ <Text>glGenRenderbuffers(1, 0x000000016fa1d5a8);</Text>
+ <Text>// renderbuffers = { 3458 }</Text>
+ <Text>// Attaching allocated renderbuffer name</Text>
+ <Text>glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, 3458);</Text>
+ <Text>glGetError();</Text>
+ <Text>// GL_NO_ERROR returned</Text>
+ <Text>// Fail, expected GL_INVALID_OPERATION</Text>
+ <Number Name="TestDuration" Description="Test case duration in microseconds" Tag="Time" Unit="us">2132</Number>
+ <Result StatusCode="Fail">Error code mismatch</Result>
+</TestCaseResult>
+
+
+=== dEQP-GLES3.functional.fbo.blit.depth_stencil.depth24_stencil8_stencil_only
+<?xml version="1.0" encoding="UTF-8"?>
+<TestCaseResult CasePath="dEQP-GLES3.functional.fbo.blit.depth_stencil.depth24_stencil8_stencil_only" Version="0.3.4" CaseType="SelfValidate">
+ <Text>glUseProgram(13943);</Text>
+ <Text>glGetUniformLocation(13943, u_gradientMin);</Text>
+ <Text>// 0 returned</Text>
+ <Text>glUniform4fv(0, 1, { 0, 0, 0, 0 });</Text>
+ <Text>glGetUniformLocation(13943, u_gradientMax);</Text>
+ <Text>// 1 returned</Text>
+ <Text>glUniform4fv(1, 1, { 1, 1, 1, 1 });</Text>
+ <Text>glUseProgram(13940);</Text>
+ <Text>glGetUniformLocation(13940, u_sampler0);</Text>
+ <Text>// 0 returned</Text>
+ <Text>glUniform1i(0, 0);</Text>
+ <Text>glGetUniformLocation(13940, u_texScale0);</Text>
+ <Text>// 1 returned</Text>
+ <Text>glUniform4fv(1, 1, { 1, 1, 1, 1 });</Text>
+ <Text>glGetUniformLocation(13940, u_texBias0);</Text>
+ <Text>// 2 returned</Text>
+ <Text>glUniform4fv(2, 1, { 0, 0, 0, 0 });</Text>
+ <Text>glGetUniformLocation(13940, u_outScale0);</Text>
+ <Text>// 3 returned</Text>
+ <Text>glUniform4fv(3, 1, { 1, 1, 1, 1 });</Text>
+ <Text>glGetUniformLocation(13940, u_outBias0);</Text>
+ <Text>// 4 returned</Text>
+ <Text>glUniform4fv(4, 1, { 0, 0, 0, 0 });</Text>
+ <Text>glGenFramebuffers(1, 0x000000016fa15b7c);</Text>
+ <Text>// framebuffers = { 2930 }</Text>
+ <Text>glGenRenderbuffers(1, 0x000000016fa15b74);</Text>
+ <Text>// renderbuffers = { 13946 }</Text>
+ <Text>glBindRenderbuffer(GL_RENDERBUFFER, 13946);</Text>
+ <Text>glRenderbufferStorage(GL_RENDERBUFFER, GL_RGBA8, 128, 128);</Text>
+ <Text>glGenRenderbuffers(1, 0x000000016fa15b6c);</Text>
+ <Text>// renderbuffers = { 13947 }</Text>
+ <Text>glBindRenderbuffer(GL_RENDERBUFFER, 13947);</Text>
+ <Text>glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH24_STENCIL8, 128, 128);</Text>
+ <Text>glBindFramebuffer(GL_FRAMEBUFFER, 2930);</Text>
+ <Text>glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, 13946);</Text>
+ <Text>glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, 13947);</Text>
+ <Text>glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_STENCIL_ATTACHMENT, GL_RENDERBUFFER, 13947);</Text>
+ <Text>glGetError();</Text>
+ <Text>// GL_NO_ERROR returned</Text>
+ <Text>glCheckFramebufferStatus(GL_FRAMEBUFFER);</Text>
+ <Text>// GL_FRAMEBUFFER_COMPLETE returned</Text>
+ <Text>glClearBufferfi(GL_DEPTH_STENCIL, 0, 1, 0);</Text>
+ <Text>glGenFramebuffers(1, 0x000000016fa15b78);</Text>
+ <Text>// framebuffers = { 2931 }</Text>
+ <Text>glGenRenderbuffers(1, 0x000000016fa15b70);</Text>
+ <Text>// renderbuffers = { 13948 }</Text>
+ <Text>glBindRenderbuffer(GL_RENDERBUFFER, 13948);</Text>
+ <Text>glRenderbufferStorage(GL_RENDERBUFFER, GL_RGBA8, 128, 128);</Text>
+ <Text>glGenRenderbuffers(1, 0x000000016fa15b64);</Text>
+ <Text>// renderbuffers = { 13949 }</Text>
+ <Text>glBindRenderbuffer(GL_RENDERBUFFER, 13949);</Text>
+ <Text>glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH24_STENCIL8, 128, 128);</Text>
+ <Text>glBindFramebuffer(GL_FRAMEBUFFER, 2931);</Text>
+ <Text>glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, 13948);</Text>
+ <Text>glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, 13949);</Text>
+ <Text>glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_STENCIL_ATTACHMENT, GL_RENDERBUFFER, 13949);</Text>
+ <Text>glGetError();</Text>
+ <Text>// GL_NO_ERROR returned</Text>
+ <Text>glCheckFramebufferStatus(GL_FRAMEBUFFER);</Text>
+ <Text>// GL_FRAMEBUFFER_COMPLETE returned</Text>
+ <Text>glClearBufferfi(GL_DEPTH_STENCIL, 0, 1, 0);</Text>
+ <Text>glBindFramebuffer(GL_FRAMEBUFFER, 2930);</Text>
+ <Text>glViewport(0, 0, 128, 128);</Text>
+ <Text>glEnable(GL_DEPTH_TEST);</Text>
+ <Text>glEnable(GL_STENCIL_TEST);</Text>
+ <Text>glStencilOp(GL_KEEP, GL_KEEP, GL_REPLACE);</Text>
+ <Text>glStencilFunc(GL_ALWAYS, 7, 255);</Text>
+ <Text>glGetAttribLocation(13943, a_position);</Text>
+ <Text>// 0 returned</Text>
+ <Text>glGetAttribLocation(13943, a_coord);</Text>
+ <Text>// 1 returned</Text>
+ <Text>glUseProgram(13943);</Text>
+ <Text>glEnableVertexAttribArray(0);</Text>
+ <Text>glVertexAttribPointer(0, 4, GL_FLOAT, GL_FALSE, 0, 0x16fa15a38);</Text>
+ <Text>glEnableVertexAttribArray(1);</Text>
+ <Text>glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 0, 0x16fa15a10);</Text>
+ <Text>glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_SHORT, 0x16fa15a00);</Text>
+ <Text>glDisableVertexAttribArray(0);</Text>
+ <Text>glDisableVertexAttribArray(1);</Text>
+ <Text>glGenTextures(1, 0x000000016fa15b5c);</Text>
+ <Text>// textures = { 13950 }</Text>
+ <Text>glBindTexture(GL_TEXTURE_2D, 13950);</Text>
+ <Text>glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);</Text>
+ <Text>glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);</Text>
+ <Text>glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);</Text>
+ <Text>glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);</Text>
+ <Text>glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 128, 128, 0, GL_RGBA, GL_UNSIGNED_BYTE, 0x728ab4010);</Text>
+ <Text>glBindFramebuffer(GL_FRAMEBUFFER, 2931);</Text>
+ <Text>glViewport(0, 0, 128, 128);</Text>
+ <Text>glStencilFunc(GL_ALWAYS, 1, 255);</Text>
+ <Text>glGetAttribLocation(13940, a_position);</Text>
+ <Text>// 0 returned</Text>
+ <Text>glGetAttribLocation(13940, a_coord);</Text>
+ <Text>// 1 returned</Text>
+ <Text>glUseProgram(13940);</Text>
+ <Text>glEnableVertexAttribArray(0);</Text>
+ <Text>glVertexAttribPointer(0, 4, GL_FLOAT, GL_FALSE, 0, 0x16fa15a38);</Text>
+ <Text>glEnableVertexAttribArray(1);</Text>
+ <Text>glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 0, 0x16fa15a10);</Text>
+ <Text>glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_SHORT, 0x16fa15a00);</Text>
+ <Text>glDisableVertexAttribArray(0);</Text>
+ <Text>glDisableVertexAttribArray(1);</Text>
+ <Text>glBindFramebuffer(GL_READ_FRAMEBUFFER, 2930);</Text>
+ <Text>glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 2931);</Text>
+ <Text>glBlitFramebuffer(0, 0, 128, 128, 0, 0, 128, 128, GL_STENCIL_BUFFER_BIT, GL_NEAREST)</Text>
+ <Text>glBindFramebuffer(GL_FRAMEBUFFER, 2931);</Text>
+ <Text>glViewport(0, 0, 128, 128);</Text>
+ <Text>glStencilOp(GL_KEEP, GL_DECR, GL_KEEP);</Text>
+ <Text>glStencilFunc(GL_ALWAYS, 0, 255);</Text>
+ <Text>glGetUniformLocation(13937, u_color);</Text>
+ <Text>// 0 returned</Text>
+ <Text>glUseProgram(13937);</Text>
+ <Text>glUniform4fv(0, 1, { 0, 0, 1, 1 });</Text>
+ <Text>glGetAttribLocation(13937, a_position);</Text>
+ <Text>// 0 returned</Text>
+ <Text>glGetAttribLocation(13937, a_coord);</Text>
+ <Text>// -1 returned</Text>
+ <Text>glUseProgram(13937);</Text>
+ <Text>glEnableVertexAttribArray(0);</Text>
+ <Text>glVertexAttribPointer(0, 4, GL_FLOAT, GL_FALSE, 0, 0x16fa15a38);</Text>
+ <Text>glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_SHORT, 0x16fa15a00);</Text>
+ <Text>glDisableVertexAttribArray(0);</Text>
+ <Text>glDisable(GL_DEPTH_TEST);</Text>
+ <Text>glStencilOp(GL_KEEP, GL_KEEP, GL_KEEP);</Text>
+ <Text>glStencilFunc(GL_EQUAL, 6, 255);</Text>
+ <Text>glGetUniformLocation(13937, u_color);</Text>
+ <Text>// 0 returned</Text>
+ <Text>glUseProgram(13937);</Text>
+ <Text>glUniform4fv(0, 1, { 0, 1, 0, 1 });</Text>
+ <Text>glGetAttribLocation(13937, a_position);</Text>
+ <Text>// 0 returned</Text>
+ <Text>glGetAttribLocation(13937, a_coord);</Text>
+ <Text>// -1 returned</Text>
+ <Text>glUseProgram(13937);</Text>
+ <Text>glEnableVertexAttribArray(0);</Text>
+ <Text>glVertexAttribPointer(0, 4, GL_FLOAT, GL_FALSE, 0, 0x16fa15a38);</Text>
+ <Text>glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_SHORT, 0x16fa15a00);</Text>
+ <Text>glDisableVertexAttribArray(0);</Text>
+ <Text>glReadPixels(0, 0, 128, 128, GL_RGBA, GL_UNSIGNED_BYTE, 0x728ab4000)</Text>
+ <Text>glGetError();</Text>
+ <Text>// GL_NO_ERROR returned</Text>
+ <Text>Image comparison failed: difference = 5565.83, threshold = 0.05</Text>
+ <ImageSet Name="Result" Description="Image comparison result">
+  <Image Name="Result" Width="128" Height="128" Format="RGBA8888" CompressionMode="PNG" Description="Result">
+   iVBORw0KGgoAAAANSUhEUgAAAIAAAACACAYAAADDPmHLAAAC1klEQVR4nO2WWYok
+   WQzAlHP/O1d/FEyR5BoRb/EincAgYfvGDz9IW/7bPYBs5PZjAG25/S5+A+jI7e/q
+   G0A3bvcvnwF04vb47xtAF57IBwPowQv5YAD1eSMfDKA2H+SDAdTlC/lgADX5Uj4Y
+   QD0OyAcDqMVB+WAAdTghHwygBiflgwHk54J8MIDcXJQPBpCXAfLBAHIySD4YQD4G
+   ygcDyMVg+WAAeZggHwwgB5PkgwHEZ6J8MIDYTJYPBhCXBfLBAGKySD4YQDwWygcD
+   iMVi+WAAcdggHwwgBpvkgwHsZ6N8MIC9bJYPBrCPAPLBAPYQRD4YwHoCyQcDWEsw
+   +WAA6wgoHwxgDUHlgwHMJ7B8MIC5BJcPBjCPBPLBAOaQRD4YwHgSyQcDGEsy+WAA
+   40goHwxgDEnlgwFcJ7F8MIBrJJcPBnCeAvLBAM5RRD4YwHEKyQcDOEYx+WAA31NQ
+   PhjAdxSVDwbwmcLywQDeU1w+GMBrGsgHA3hOE/lgAI80kg8GcE8z+WAAfzSUDwbw
+   S1P5YACt5UP3AJrLh84BKB/oGoDy/6dfAMq/o1cAyn+gTwDKf0qPAJT/kvoBKP8t
+   tQNQ/kfqBqD8r6gZgPK/pl4Ayj9ErQCUf5g6ASj/FDUCUP5p8geg/EvkDkD5l8kb
+   gPKHkDMA5Q8jXwDKH0quAJQ/nDwBKH8KOQJQ/jTiB6D8qcQOQPnTiRuA8pcQMwDl
+   LyNeAMpfSqwAlL+cOAEofwsxAlD+NvYHoPyt7A1A+dvZF4DyQ7AnAOWHYX0Ayg/F
+   2gCUH451ASg/JGsCUH5Y5geg/NDMDUD54ZkXgPJTMCcA5adhfADKT8XYAJSfjnEB
+   KD8lYwJQflquB6D81FwLQPnpOR+A8ktwLgDll+F4AMovxbEAlF+O7wNQfkm+C0D5
+   ZfkcgPJL8z4A5ZfndQDKb8HzAJTfhscAlN+K+wCU346/AJTfkt8AlN+Wf1WSgf7t
+   gSitAAAAAElFTkSuQmCC
+</Image>
+  <Image Name="Reference" Width="128" Height="128" Format="RGBA8888" CompressionMode="PNG" Description="Reference">
+   iVBORw0KGgoAAAANSUhEUgAAAIAAAACACAYAAADDPmHLAAABTUlEQVR4nO3SMQEA
+   IAzAsIF/z0MGRxMFPXpmZ4es+zuAvwwQZ4A4A8QZIM4AcQaIM0CcAeIMEGeAOAPE
+   GSDOAHEGiDNAnAHiDBBngDgDxBkgzgBxBogzQJwB4gwQZ4A4A8QZIM4AcQaIM0Cc
+   AeIMEGeAOAPEGSDOAHEGiDNAnAHiDBBngDgDxBkgzgBxBogzQJwB4gwQZ4A4A8QZ
+   IM4AcQaIM0CcAeIMEGeAOAPEGSDOAHEGiDNAnAHiDBBngDgDxBkgzgBxBogzQJwB
+   4gwQZ4A4A8QZIM4AcQaIM0CcAeIMEGeAOAPEGSDOAHEGiDNAnAHiDBBngDgDxBkg
+   zgBxBogzQJwB4gwQZ4A4A8QZIM4AcQaIM0CcAeIMEGeAOAPEGSDOAHEGiDNAnAHi
+   DBBngDgDxBkgzgBxBogzQJwB4gwQZ4A4A8QZIM4AcQaIe18GAv4uC3teAAAAAElF
+   TkSuQmCC
+</Image>
+  <Image Name="ErrorMask" Width="128" Height="128" Format="RGB888" CompressionMode="PNG" Description="Error mask">
+   iVBORw0KGgoAAAANSUhEUgAAAIAAAACACAIAAABMXPacAAACrklEQVR4nO3RwXEb
+   MRBE0S+XY/DN+Sh75qCjk5AvVpkUuSSwmAEwM90RdP33xifawv0E+LP6Rdn94sfq
+   C4V3AQSwahc+3kEAa3bh453fgAAW7Ko+Api92/oIYOru6iOAeXtUHwFM2kF9BDBj
+   x/URgPue1kcAvntVHwE4rqE+AvBaW30E4LLm+gjAfj31EYDxOusjAMv110cAZjtV
+   HwHY7Gx9BGCwgfoIYHRj9RHA0IbrI4Dzs6iPAE7OqD4CODO7+gige6b1EUDfrOsj
+   gI451EcArfOpjwCa5lYfAbyeZ30E8GLO9RHAs/nXRwCHm1IfATzerPoI4MEm1kcA
+   3ze3PgK42fT6COD/VtRHAP+2qD4CgJX1EcDa+lQHWF2f0gAb1KcuwB71KQqwTX0q
+   AuxUn3IAm9WnFsB+9SkEsGV9qgDsWp8SABvXJz/A3vVJDrB9fTIDRKhPWoAg9ckJ
+   EKc+CQFC1ScbQLT6pAIIWJ88ADHrkwQgbH0yAESuT3iA4PWJDRC/PoEBUtQnKkCW
+   +oQESFSfeAC56hMMIF19IgFkrE8YgKT1iQGQtz4BAFLXZ3eA7PXZGqBAffYFqFGf
+   TQHK1GdHgEr12Q6gWH32AqhXn40AStZnF4Cq9dkCoHB91gPUrs9igPL1WQmg+sAy
+   ANX/2goA1b/adADVv91cANW/20QA1X+0WQCqf7ApAKp/PH8A1X86ZwDVfzVPANVv
+   mBuA6rfNB0D1m+cAoPo9swZQ/c6ZAqh+/+wAVP/UjABU/+wsAFR/YMMAqj+2MQDV
+   H94AgOpb7CyA6hvtFIDq260fQPVN1wmg+tbrAVB9hzUDqL7P2gBU320NAKrvuVcA
+   qu+8pwCq779jANWfsgMA1Z+1RwCqP3F3AKo/d7cAqj99VwCqv2JfAKq/aG98rr5Q
+   e38BWGcHaIrL97cAAAAASUVORK5CYII=
+</Image>
+</ImageSet>
+ <Number Name="TestDuration" Description="Test case duration in microseconds" Tag="Time" Unit="us">69592</Number>
+ <Result StatusCode="Fail">Image comparison failed</Result>
+</TestCaseResult>
+
+
+=== dEQP-GLES3.functional.fbo.blit.depth_stencil.depth32f_stencil8_stencil_only
+<?xml version="1.0" encoding="UTF-8"?>
+<TestCaseResult CasePath="dEQP-GLES3.functional.fbo.blit.depth_stencil.depth32f_stencil8_stencil_only" Version="0.3.4" CaseType="SelfValidate">
+ <Text>glUseProgram(13887);</Text>
+ <Text>glGetUniformLocation(13887, u_gradientMin);</Text>
+ <Text>// 0 returned</Text>
+ <Text>glUniform4fv(0, 1, { 0, 0, 0, 0 });</Text>
+ <Text>glGetUniformLocation(13887, u_gradientMax);</Text>
+ <Text>// 1 returned</Text>
+ <Text>glUniform4fv(1, 1, { 1, 1, 1, 1 });</Text>
+ <Text>glUseProgram(13884);</Text>
+ <Text>glGetUniformLocation(13884, u_sampler0);</Text>
+ <Text>// 0 returned</Text>
+ <Text>glUniform1i(0, 0);</Text>
+ <Text>glGetUniformLocation(13884, u_texScale0);</Text>
+ <Text>// 1 returned</Text>
+ <Text>glUniform4fv(1, 1, { 1, 1, 1, 1 });</Text>
+ <Text>glGetUniformLocation(13884, u_texBias0);</Text>
+ <Text>// 2 returned</Text>
+ <Text>glUniform4fv(2, 1, { 0, 0, 0, 0 });</Text>
+ <Text>glGetUniformLocation(13884, u_outScale0);</Text>
+ <Text>// 3 returned</Text>
+ <Text>glUniform4fv(3, 1, { 1, 1, 1, 1 });</Text>
+ <Text>glGetUniformLocation(13884, u_outBias0);</Text>
+ <Text>// 4 returned</Text>
+ <Text>glUniform4fv(4, 1, { 0, 0, 0, 0 });</Text>
+ <Text>glGenFramebuffers(1, 0x000000016fa15b7c);</Text>
+ <Text>// framebuffers = { 2922 }</Text>
+ <Text>glGenRenderbuffers(1, 0x000000016fa15b74);</Text>
+ <Text>// renderbuffers = { 13890 }</Text>
+ <Text>glBindRenderbuffer(GL_RENDERBUFFER, 13890);</Text>
+ <Text>glRenderbufferStorage(GL_RENDERBUFFER, GL_RGBA8, 128, 128);</Text>
+ <Text>glGenRenderbuffers(1, 0x000000016fa15b6c);</Text>
+ <Text>// renderbuffers = { 13891 }</Text>
+ <Text>glBindRenderbuffer(GL_RENDERBUFFER, 13891);</Text>
+ <Text>glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH32F_STENCIL8, 128, 128);</Text>
+ <Text>glBindFramebuffer(GL_FRAMEBUFFER, 2922);</Text>
+ <Text>glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, 13890);</Text>
+ <Text>glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, 13891);</Text>
+ <Text>glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_STENCIL_ATTACHMENT, GL_RENDERBUFFER, 13891);</Text>
+ <Text>glGetError();</Text>
+ <Text>// GL_NO_ERROR returned</Text>
+ <Text>glCheckFramebufferStatus(GL_FRAMEBUFFER);</Text>
+ <Text>// GL_FRAMEBUFFER_COMPLETE returned</Text>
+ <Text>glClearBufferfi(GL_DEPTH_STENCIL, 0, 1, 0);</Text>
+ <Text>glGenFramebuffers(1, 0x000000016fa15b78);</Text>
+ <Text>// framebuffers = { 2923 }</Text>
+ <Text>glGenRenderbuffers(1, 0x000000016fa15b70);</Text>
+ <Text>// renderbuffers = { 13892 }</Text>
+ <Text>glBindRenderbuffer(GL_RENDERBUFFER, 13892);</Text>
+ <Text>glRenderbufferStorage(GL_RENDERBUFFER, GL_RGBA8, 128, 128);</Text>
+ <Text>glGenRenderbuffers(1, 0x000000016fa15b64);</Text>
+ <Text>// renderbuffers = { 13893 }</Text>
+ <Text>glBindRenderbuffer(GL_RENDERBUFFER, 13893);</Text>
+ <Text>glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH32F_STENCIL8, 128, 128);</Text>
+ <Text>glBindFramebuffer(GL_FRAMEBUFFER, 2923);</Text>
+ <Text>glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, 13892);</Text>
+ <Text>glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, 13893);</Text>
+ <Text>glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_STENCIL_ATTACHMENT, GL_RENDERBUFFER, 13893);</Text>
+ <Text>glGetError();</Text>
+ <Text>// GL_NO_ERROR returned</Text>
+ <Text>glCheckFramebufferStatus(GL_FRAMEBUFFER);</Text>
+ <Text>// GL_FRAMEBUFFER_COMPLETE returned</Text>
+ <Text>glClearBufferfi(GL_DEPTH_STENCIL, 0, 1, 0);</Text>
+ <Text>glBindFramebuffer(GL_FRAMEBUFFER, 2922);</Text>
+ <Text>glViewport(0, 0, 128, 128);</Text>
+ <Text>glEnable(GL_DEPTH_TEST);</Text>
+ <Text>glEnable(GL_STENCIL_TEST);</Text>
+ <Text>glStencilOp(GL_KEEP, GL_KEEP, GL_REPLACE);</Text>
+ <Text>glStencilFunc(GL_ALWAYS, 7, 255);</Text>
+ <Text>glGetAttribLocation(13887, a_position);</Text>
+ <Text>// 0 returned</Text>
+ <Text>glGetAttribLocation(13887, a_coord);</Text>
+ <Text>// 1 returned</Text>
+ <Text>glUseProgram(13887);</Text>
+ <Text>glEnableVertexAttribArray(0);</Text>
+ <Text>glVertexAttribPointer(0, 4, GL_FLOAT, GL_FALSE, 0, 0x16fa15a38);</Text>
+ <Text>glEnableVertexAttribArray(1);</Text>
+ <Text>glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 0, 0x16fa15a10);</Text>
+ <Text>glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_SHORT, 0x16fa15a00);</Text>
+ <Text>glDisableVertexAttribArray(0);</Text>
+ <Text>glDisableVertexAttribArray(1);</Text>
+ <Text>glGenTextures(1, 0x000000016fa15b5c);</Text>
+ <Text>// textures = { 13894 }</Text>
+ <Text>glBindTexture(GL_TEXTURE_2D, 13894);</Text>
+ <Text>glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);</Text>
+ <Text>glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);</Text>
+ <Text>glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);</Text>
+ <Text>glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);</Text>
+ <Text>glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 128, 128, 0, GL_RGBA, GL_UNSIGNED_BYTE, 0x728adc010);</Text>
+ <Text>glBindFramebuffer(GL_FRAMEBUFFER, 2923);</Text>
+ <Text>glViewport(0, 0, 128, 128);</Text>
+ <Text>glStencilFunc(GL_ALWAYS, 1, 255);</Text>
+ <Text>glGetAttribLocation(13884, a_position);</Text>
+ <Text>// 0 returned</Text>
+ <Text>glGetAttribLocation(13884, a_coord);</Text>
+ <Text>// 1 returned</Text>
+ <Text>glUseProgram(13884);</Text>
+ <Text>glEnableVertexAttribArray(0);</Text>
+ <Text>glVertexAttribPointer(0, 4, GL_FLOAT, GL_FALSE, 0, 0x16fa15a38);</Text>
+ <Text>glEnableVertexAttribArray(1);</Text>
+ <Text>glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 0, 0x16fa15a10);</Text>
+ <Text>glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_SHORT, 0x16fa15a00);</Text>
+ <Text>glDisableVertexAttribArray(0);</Text>
+ <Text>glDisableVertexAttribArray(1);</Text>
+ <Text>glBindFramebuffer(GL_READ_FRAMEBUFFER, 2922);</Text>
+ <Text>glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 2923);</Text>
+ <Text>glBlitFramebuffer(0, 0, 128, 128, 0, 0, 128, 128, GL_STENCIL_BUFFER_BIT, GL_NEAREST)</Text>
+ <Text>glBindFramebuffer(GL_FRAMEBUFFER, 2923);</Text>
+ <Text>glViewport(0, 0, 128, 128);</Text>
+ <Text>glStencilOp(GL_KEEP, GL_DECR, GL_KEEP);</Text>
+ <Text>glStencilFunc(GL_ALWAYS, 0, 255);</Text>
+ <Text>glGetUniformLocation(13881, u_color);</Text>
+ <Text>// 0 returned</Text>
+ <Text>glUseProgram(13881);</Text>
+ <Text>glUniform4fv(0, 1, { 0, 0, 1, 1 });</Text>
+ <Text>glGetAttribLocation(13881, a_position);</Text>
+ <Text>// 0 returned</Text>
+ <Text>glGetAttribLocation(13881, a_coord);</Text>
+ <Text>// -1 returned</Text>
+ <Text>glUseProgram(13881);</Text>
+ <Text>glEnableVertexAttribArray(0);</Text>
+ <Text>glVertexAttribPointer(0, 4, GL_FLOAT, GL_FALSE, 0, 0x16fa15a38);</Text>
+ <Text>glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_SHORT, 0x16fa15a00);</Text>
+ <Text>glDisableVertexAttribArray(0);</Text>
+ <Text>glDisable(GL_DEPTH_TEST);</Text>
+ <Text>glStencilOp(GL_KEEP, GL_KEEP, GL_KEEP);</Text>
+ <Text>glStencilFunc(GL_EQUAL, 6, 255);</Text>
+ <Text>glGetUniformLocation(13881, u_color);</Text>
+ <Text>// 0 returned</Text>
+ <Text>glUseProgram(13881);</Text>
+ <Text>glUniform4fv(0, 1, { 0, 1, 0, 1 });</Text>
+ <Text>glGetAttribLocation(13881, a_position);</Text>
+ <Text>// 0 returned</Text>
+ <Text>glGetAttribLocation(13881, a_coord);</Text>
+ <Text>// -1 returned</Text>
+ <Text>glUseProgram(13881);</Text>
+ <Text>glEnableVertexAttribArray(0);</Text>
+ <Text>glVertexAttribPointer(0, 4, GL_FLOAT, GL_FALSE, 0, 0x16fa15a38);</Text>
+ <Text>glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_SHORT, 0x16fa15a00);</Text>
+ <Text>glDisableVertexAttribArray(0);</Text>
+ <Text>glReadPixels(0, 0, 128, 128, GL_RGBA, GL_UNSIGNED_BYTE, 0x728adc000)</Text>
+ <Text>glGetError();</Text>
+ <Text>// GL_NO_ERROR returned</Text>
+ <Text>Image comparison failed: difference = 5565.83, threshold = 0.05</Text>
+ <ImageSet Name="Result" Description="Image comparison result">
+  <Image Name="Result" Width="128" Height="128" Format="RGBA8888" CompressionMode="PNG" Description="Result">
+   iVBORw0KGgoAAAANSUhEUgAAAIAAAACACAYAAADDPmHLAAAC1klEQVR4nO2WWYok
+   WQzAlHP/O1d/FEyR5BoRb/EincAgYfvGDz9IW/7bPYBs5PZjAG25/S5+A+jI7e/q
+   G0A3bvcvnwF04vb47xtAF57IBwPowQv5YAD1eSMfDKA2H+SDAdTlC/lgADX5Uj4Y
+   QD0OyAcDqMVB+WAAdTghHwygBiflgwHk54J8MIDcXJQPBpCXAfLBAHIySD4YQD4G
+   ygcDyMVg+WAAeZggHwwgB5PkgwHEZ6J8MIDYTJYPBhCXBfLBAGKySD4YQDwWygcD
+   iMVi+WAAcdggHwwgBpvkgwHsZ6N8MIC9bJYPBrCPAPLBAPYQRD4YwHoCyQcDWEsw
+   +WAA6wgoHwxgDUHlgwHMJ7B8MIC5BJcPBjCPBPLBAOaQRD4YwHgSyQcDGEsy+WAA
+   40goHwxgDEnlgwFcJ7F8MIBrJJcPBnCeAvLBAM5RRD4YwHEKyQcDOEYx+WAA31NQ
+   PhjAdxSVDwbwmcLywQDeU1w+GMBrGsgHA3hOE/lgAI80kg8GcE8z+WAAfzSUDwbw
+   S1P5YACt5UP3AJrLh84BKB/oGoDy/6dfAMq/o1cAyn+gTwDKf0qPAJT/kvoBKP8t
+   tQNQ/kfqBqD8r6gZgPK/pl4Ayj9ErQCUf5g6ASj/FDUCUP5p8geg/EvkDkD5l8kb
+   gPKHkDMA5Q8jXwDKH0quAJQ/nDwBKH8KOQJQ/jTiB6D8qcQOQPnTiRuA8pcQMwDl
+   LyNeAMpfSqwAlL+cOAEofwsxAlD+NvYHoPyt7A1A+dvZF4DyQ7AnAOWHYX0Ayg/F
+   2gCUH451ASg/JGsCUH5Y5geg/NDMDUD54ZkXgPJTMCcA5adhfADKT8XYAJSfjnEB
+   KD8lYwJQflquB6D81FwLQPnpOR+A8ktwLgDll+F4AMovxbEAlF+O7wNQfkm+C0D5
+   ZfkcgPJL8z4A5ZfndQDKb8HzAJTfhscAlN+K+wCU346/AJTfkt8AlN+Wf1WSgf7t
+   gSitAAAAAElFTkSuQmCC
+</Image>
+  <Image Name="Reference" Width="128" Height="128" Format="RGBA8888" CompressionMode="PNG" Description="Reference">
+   iVBORw0KGgoAAAANSUhEUgAAAIAAAACACAYAAADDPmHLAAABTUlEQVR4nO3SMQEA
+   IAzAsIF/z0MGRxMFPXpmZ4es+zuAvwwQZ4A4A8QZIM4AcQaIM0CcAeIMEGeAOAPE
+   GSDOAHEGiDNAnAHiDBBngDgDxBkgzgBxBogzQJwB4gwQZ4A4A8QZIM4AcQaIM0Cc
+   AeIMEGeAOAPEGSDOAHEGiDNAnAHiDBBngDgDxBkgzgBxBogzQJwB4gwQZ4A4A8QZ
+   IM4AcQaIM0CcAeIMEGeAOAPEGSDOAHEGiDNAnAHiDBBngDgDxBkgzgBxBogzQJwB
+   4gwQZ4A4A8QZIM4AcQaIM0CcAeIMEGeAOAPEGSDOAHEGiDNAnAHiDBBngDgDxBkg
+   zgBxBogzQJwB4gwQZ4A4A8QZIM4AcQaIM0CcAeIMEGeAOAPEGSDOAHEGiDNAnAHi
+   DBBngDgDxBkgzgBxBogzQJwB4gwQZ4A4A8QZIM4AcQaIe18GAv4uC3teAAAAAElF
+   TkSuQmCC
+</Image>
+  <Image Name="ErrorMask" Width="128" Height="128" Format="RGB888" CompressionMode="PNG" Description="Error mask">
+   iVBORw0KGgoAAAANSUhEUgAAAIAAAACACAIAAABMXPacAAACrklEQVR4nO3RwXEb
+   MRBE0S+XY/DN+Sh75qCjk5AvVpkUuSSwmAEwM90RdP33xifawv0E+LP6Rdn94sfq
+   C4V3AQSwahc+3kEAa3bh453fgAAW7Ko+Api92/oIYOru6iOAeXtUHwFM2kF9BDBj
+   x/URgPue1kcAvntVHwE4rqE+AvBaW30E4LLm+gjAfj31EYDxOusjAMv110cAZjtV
+   HwHY7Gx9BGCwgfoIYHRj9RHA0IbrI4Dzs6iPAE7OqD4CODO7+gige6b1EUDfrOsj
+   gI451EcArfOpjwCa5lYfAbyeZ30E8GLO9RHAs/nXRwCHm1IfATzerPoI4MEm1kcA
+   3ze3PgK42fT6COD/VtRHAP+2qD4CgJX1EcDa+lQHWF2f0gAb1KcuwB71KQqwTX0q
+   AuxUn3IAm9WnFsB+9SkEsGV9qgDsWp8SABvXJz/A3vVJDrB9fTIDRKhPWoAg9ckJ
+   EKc+CQFC1ScbQLT6pAIIWJ88ADHrkwQgbH0yAESuT3iA4PWJDRC/PoEBUtQnKkCW
+   +oQESFSfeAC56hMMIF19IgFkrE8YgKT1iQGQtz4BAFLXZ3eA7PXZGqBAffYFqFGf
+   TQHK1GdHgEr12Q6gWH32AqhXn40AStZnF4Cq9dkCoHB91gPUrs9igPL1WQmg+sAy
+   ANX/2goA1b/adADVv91cANW/20QA1X+0WQCqf7ApAKp/PH8A1X86ZwDVfzVPANVv
+   mBuA6rfNB0D1m+cAoPo9swZQ/c6ZAqh+/+wAVP/UjABU/+wsAFR/YMMAqj+2MQDV
+   H94AgOpb7CyA6hvtFIDq260fQPVN1wmg+tbrAVB9hzUDqL7P2gBU320NAKrvuVcA
+   qu+8pwCq779jANWfsgMA1Z+1RwCqP3F3AKo/d7cAqj99VwCqv2JfAKq/aG98rr5Q
+   e38BWGcHaIrL97cAAAAASUVORK5CYII=
+</Image>
+</ImageSet>
+ <Number Name="TestDuration" Description="Test case duration in microseconds" Tag="Time" Unit="us">64942</Number>
+ <Result StatusCode="Fail">Image comparison failed</Result>
+</TestCaseResult>
+
+
+=== dEQP-GLES3.functional.fbo.blit.rect.out_of_bounds_linear
+<?xml version="1.0" encoding="UTF-8"?>
+<TestCaseResult CasePath="dEQP-GLES3.functional.fbo.blit.rect.out_of_bounds_linear" Version="0.3.4" CaseType="SelfValidate">
+ <Text>glUseProgram(9862);</Text>
+ <Text>glGetUniformLocation(9862, u_gradientMin);</Text>
+ <Text>// 0 returned</Text>
+ <Text>glUniform4fv(0, 1, { 0, 0, 0, 0 });</Text>
+ <Text>glGetUniformLocation(9862, u_gradientMax);</Text>
+ <Text>// 1 returned</Text>
+ <Text>glUniform4fv(1, 1, { 1, 1, 1, 1 });</Text>
+ <Text>glUseProgram(9865);</Text>
+ <Text>glGetUniformLocation(9865, u_sampler0);</Text>
+ <Text>// 0 returned</Text>
+ <Text>glUniform1i(0, 0);</Text>
+ <Text>glGetUniformLocation(9865, u_texScale0);</Text>
+ <Text>// 1 returned</Text>
+ <Text>glUniform4fv(1, 1, { 1, 1, 1, 1 });</Text>
+ <Text>glGetUniformLocation(9865, u_texBias0);</Text>
+ <Text>// 2 returned</Text>
+ <Text>glUniform4fv(2, 1, { 0, 0, 0, 0 });</Text>
+ <Text>glGetUniformLocation(9865, u_outScale0);</Text>
+ <Text>// 3 returned</Text>
+ <Text>glUniform4fv(3, 1, { 1, 1, 1, 1 });</Text>
+ <Text>glGetUniformLocation(9865, u_outBias0);</Text>
+ <Text>// 4 returned</Text>
+ <Text>glUniform4fv(4, 1, { 0, 0, 0, 0 });</Text>
+ <Text>glGenFramebuffers(1, 0x000000016fa15cac);</Text>
+ <Text>// framebuffers = { 1944 }</Text>
+ <Text>glGenRenderbuffers(1, 0x000000016fa15ca4);</Text>
+ <Text>// renderbuffers = { 9868 }</Text>
+ <Text>glBindRenderbuffer(GL_RENDERBUFFER, 9868);</Text>
+ <Text>glRenderbufferStorage(GL_RENDERBUFFER, GL_RGBA8, 127, 119);</Text>
+ <Text>glBindFramebuffer(GL_FRAMEBUFFER, 1944);</Text>
+ <Text>glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, 9868);</Text>
+ <Text>glGetError();</Text>
+ <Text>// GL_NO_ERROR returned</Text>
+ <Text>glCheckFramebufferStatus(GL_FRAMEBUFFER);</Text>
+ <Text>// GL_FRAMEBUFFER_COMPLETE returned</Text>
+ <Text>glGenFramebuffers(1, 0x000000016fa15ca8);</Text>
+ <Text>// framebuffers = { 1945 }</Text>
+ <Text>glGenRenderbuffers(1, 0x000000016fa15ca0);</Text>
+ <Text>// renderbuffers = { 9869 }</Text>
+ <Text>glBindRenderbuffer(GL_RENDERBUFFER, 9869);</Text>
+ <Text>glRenderbufferStorage(GL_RENDERBUFFER, GL_RGBA8, 132, 128);</Text>
+ <Text>glBindFramebuffer(GL_FRAMEBUFFER, 1945);</Text>
+ <Text>glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, 9869);</Text>
+ <Text>glGetError();</Text>
+ <Text>// GL_NO_ERROR returned</Text>
+ <Text>glCheckFramebufferStatus(GL_FRAMEBUFFER);</Text>
+ <Text>// GL_FRAMEBUFFER_COMPLETE returned</Text>
+ <Text>glBindFramebuffer(GL_FRAMEBUFFER, 1945);</Text>
+ <Text>glViewport(0, 0, 132, 128);</Text>
+ <Text>glGetAttribLocation(9862, a_position);</Text>
+ <Text>// 0 returned</Text>
+ <Text>glGetAttribLocation(9862, a_coord);</Text>
+ <Text>// 1 returned</Text>
+ <Text>glUseProgram(9862);</Text>
+ <Text>glEnableVertexAttribArray(0);</Text>
+ <Text>glVertexAttribPointer(0, 4, GL_FLOAT, GL_FALSE, 0, 0x16fa15b98);</Text>
+ <Text>glEnableVertexAttribArray(1);</Text>
+ <Text>glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 0, 0x16fa15b70);</Text>
+ <Text>glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_SHORT, 0x16fa15b60);</Text>
+ <Text>glDisableVertexAttribArray(0);</Text>
+ <Text>glDisableVertexAttribArray(1);</Text>
+ <Text>glGenTextures(1, 0x000000016fa15c9c);</Text>
+ <Text>// textures = { 9870 }</Text>
+ <Text>glBindTexture(GL_TEXTURE_2D, 9870);</Text>
+ <Text>glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);</Text>
+ <Text>glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);</Text>
+ <Text>glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);</Text>
+ <Text>glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);</Text>
+ <Text>glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 127, 119, 0, GL_RGBA, GL_UNSIGNED_BYTE, 0x728a9c010);</Text>
+ <Text>glBindFramebuffer(GL_FRAMEBUFFER, 1944);</Text>
+ <Text>glViewport(0, 0, 127, 119);</Text>
+ <Text>glGetAttribLocation(9865, a_position);</Text>
+ <Text>// 0 returned</Text>
+ <Text>glGetAttribLocation(9865, a_coord);</Text>
+ <Text>// 1 returned</Text>
+ <Text>glUseProgram(9865);</Text>
+ <Text>glEnableVertexAttribArray(0);</Text>
+ <Text>glVertexAttribPointer(0, 4, GL_FLOAT, GL_FALSE, 0, 0x16fa15b98);</Text>
+ <Text>glEnableVertexAttribArray(1);</Text>
+ <Text>glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 0, 0x16fa15b70);</Text>
+ <Text>glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_SHORT, 0x16fa15b60);</Text>
+ <Text>glDisableVertexAttribArray(0);</Text>
+ <Text>glDisableVertexAttribArray(1);</Text>
+ <Text>glBindFramebuffer(GL_READ_FRAMEBUFFER, 1944);</Text>
+ <Text>glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 1945);</Text>
+ <Text>glBlitFramebuffer(-10, -15, 100, 63, 50, 30, 136, 144, GL_COLOR_BUFFER_BIT, GL_LINEAR)</Text>
+ <Text>glBindFramebuffer(GL_READ_FRAMEBUFFER, 1945);</Text>
+ <Text>glReadPixels(0, 0, 132, 128, GL_RGBA, GL_UNSIGNED_BYTE, 0x728ac0000)</Text>
+ <Text>glGetError();</Text>
+ <Text>// GL_NO_ERROR returned</Text>
+ <Text>Image comparison failed: max difference = (130, 191, 150, 223), threshold = (8, 8, 8, 8)</Text>
+ <ImageSet Name="Result" Description="Image comparison result">
+  <Image Name="Result" Width="132" Height="128" Format="RGBA8888" CompressionMode="PNG" Description="Result">
+   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
+   RU5ErkJggg==
+</Image>
+  <Image Name="Reference" Width="132" Height="128" Format="RGBA8888" CompressionMode="PNG" Description="Result">
+   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
+   YII=
+</Image>
+  <Image Name="ErrorMask" Width="132" Height="128" Format="RGB888" CompressionMode="PNG" Description="Result">
+   iVBORw0KGgoAAAANSUhEUgAAAIQAAACACAIAAABFt1bmAAAB4klEQVR4nO3c0U6D
+   MABAUTD+/y/PBx802YwNg3AL5zwSbcjuqmlTWJfHQsTH2TfADzFCxAgRI0SMEDFC
+   xAgRI0SMEDFCxAgRI0SMEDFCxAgRI0SMEDFCxAgRI0SMEDFCxAgRI0SMEDFCxAgR
+   I0SMkM+zb+C1x3r2HZzBzAgRI0SMEDFCxAgRI0SMEDFCxAgRI0SMEDFCxAgRI0SM
+   EDFCxAgRI0SMEDFCxAiJng75y/rrjYrfJ0ierwz+WHCotfnCyH2P6qyP3Qbccahn
+   c/+ZWp++SS+vjHx8m4ca/MV/ryyzx7gYMULECBEjRIwQMULECBEj5BYr8FmYGSFi
+   hMwdY/Mu0I5D2Zu6JjFCxAgRI0SMEDFCxAgRI8TeVMgFZ8bgkjs41NwxRk7TvLMd
+   MjLUtjM+tkPqxAgRI0SMEDFCxAgRI0SMkDtuhxz6wMs7LjUzBhfb256d2Wx8qDvO
+   jKy5Z4ajOhxFjBAxQsQIESNEjBAxQsQIsQIP8Yqj0FBmRsjc/zPsTXEUMULECBEj
+   RIwQMULECBEjxAp8WTJvIb7gzNhw5Omvj2/HoUbMHaPw7JftkHc1NyJvGqNJjBAx
+   QsQIESNEjBAxQmyHhFxqZuz47NcpLhVj9vk0dwxHdTiKGCFihHwBDMOq8+dpQDUA
+   AAAASUVORK5CYII=
+</Image>
+</ImageSet>
+ <Number Name="TestDuration" Description="Test case duration in microseconds" Tag="Time" Unit="us">41579</Number>
+ <Result StatusCode="Fail">Image comparison failed</Result>
+</TestCaseResult>
+
+
+=== dEQP-GLES3.functional.fbo.blit.rect.out_of_bounds_reverse_dst_x_linear
+<?xml version="1.0" encoding="UTF-8"?>
+<TestCaseResult CasePath="dEQP-GLES3.functional.fbo.blit.rect.out_of_bounds_reverse_dst_x_linear" Version="0.3.4" CaseType="SelfValidate">
+ <Text>glUseProgram(9916);</Text>
+ <Text>glGetUniformLocation(9916, u_gradientMin);</Text>
+ <Text>// 0 returned</Text>
+ <Text>glUniform4fv(0, 1, { 0, 0, 0, 0 });</Text>
+ <Text>glGetUniformLocation(9916, u_gradientMax);</Text>
+ <Text>// 1 returned</Text>
+ <Text>glUniform4fv(1, 1, { 1, 1, 1, 1 });</Text>
+ <Text>glUseProgram(9919);</Text>
+ <Text>glGetUniformLocation(9919, u_sampler0);</Text>
+ <Text>// 0 returned</Text>
+ <Text>glUniform1i(0, 0);</Text>
+ <Text>glGetUniformLocation(9919, u_texScale0);</Text>
+ <Text>// 1 returned</Text>
+ <Text>glUniform4fv(1, 1, { 1, 1, 1, 1 });</Text>
+ <Text>glGetUniformLocation(9919, u_texBias0);</Text>
+ <Text>// 2 returned</Text>
+ <Text>glUniform4fv(2, 1, { 0, 0, 0, 0 });</Text>
+ <Text>glGetUniformLocation(9919, u_outScale0);</Text>
+ <Text>// 3 returned</Text>
+ <Text>glUniform4fv(3, 1, { 1, 1, 1, 1 });</Text>
+ <Text>glGetUniformLocation(9919, u_outBias0);</Text>
+ <Text>// 4 returned</Text>
+ <Text>glUniform4fv(4, 1, { 0, 0, 0, 0 });</Text>
+ <Text>glGenFramebuffers(1, 0x000000016fa15cac);</Text>
+ <Text>// framebuffers = { 1956 }</Text>
+ <Text>glGenRenderbuffers(1, 0x000000016fa15ca4);</Text>
+ <Text>// renderbuffers = { 9922 }</Text>
+ <Text>glBindRenderbuffer(GL_RENDERBUFFER, 9922);</Text>
+ <Text>glRenderbufferStorage(GL_RENDERBUFFER, GL_RGBA8, 127, 119);</Text>
+ <Text>glBindFramebuffer(GL_FRAMEBUFFER, 1956);</Text>
+ <Text>glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, 9922);</Text>
+ <Text>glGetError();</Text>
+ <Text>// GL_NO_ERROR returned</Text>
+ <Text>glCheckFramebufferStatus(GL_FRAMEBUFFER);</Text>
+ <Text>// GL_FRAMEBUFFER_COMPLETE returned</Text>
+ <Text>glGenFramebuffers(1, 0x000000016fa15ca8);</Text>
+ <Text>// framebuffers = { 1957 }</Text>
+ <Text>glGenRenderbuffers(1, 0x000000016fa15ca0);</Text>
+ <Text>// renderbuffers = { 9923 }</Text>
+ <Text>glBindRenderbuffer(GL_RENDERBUFFER, 9923);</Text>
+ <Text>glRenderbufferStorage(GL_RENDERBUFFER, GL_RGBA8, 132, 128);</Text>
+ <Text>glBindFramebuffer(GL_FRAMEBUFFER, 1957);</Text>
+ <Text>glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, 9923);</Text>
+ <Text>glGetError();</Text>
+ <Text>// GL_NO_ERROR returned</Text>
+ <Text>glCheckFramebufferStatus(GL_FRAMEBUFFER);</Text>
+ <Text>// GL_FRAMEBUFFER_COMPLETE returned</Text>
+ <Text>glBindFramebuffer(GL_FRAMEBUFFER, 1957);</Text>
+ <Text>glViewport(0, 0, 132, 128);</Text>
+ <Text>glGetAttribLocation(9916, a_position);</Text>
+ <Text>// 0 returned</Text>
+ <Text>glGetAttribLocation(9916, a_coord);</Text>
+ <Text>// 1 returned</Text>
+ <Text>glUseProgram(9916);</Text>
+ <Text>glEnableVertexAttribArray(0);</Text>
+ <Text>glVertexAttribPointer(0, 4, GL_FLOAT, GL_FALSE, 0, 0x16fa15b98);</Text>
+ <Text>glEnableVertexAttribArray(1);</Text>
+ <Text>glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 0, 0x16fa15b70);</Text>
+ <Text>glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_SHORT, 0x16fa15b60);</Text>
+ <Text>glDisableVertexAttribArray(0);</Text>
+ <Text>glDisableVertexAttribArray(1);</Text>
+ <Text>glGenTextures(1, 0x000000016fa15c9c);</Text>
+ <Text>// textures = { 9924 }</Text>
+ <Text>glBindTexture(GL_TEXTURE_2D, 9924);</Text>
+ <Text>glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);</Text>
+ <Text>glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);</Text>
+ <Text>glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);</Text>
+ <Text>glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);</Text>
+ <Text>glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 127, 119, 0, GL_RGBA, GL_UNSIGNED_BYTE, 0x728a9c010);</Text>
+ <Text>glBindFramebuffer(GL_FRAMEBUFFER, 1956);</Text>
+ <Text>glViewport(0, 0, 127, 119);</Text>
+ <Text>glGetAttribLocation(9919, a_position);</Text>
+ <Text>// 0 returned</Text>
+ <Text>glGetAttribLocation(9919, a_coord);</Text>
+ <Text>// 1 returned</Text>
+ <Text>glUseProgram(9919);</Text>
+ <Text>glEnableVertexAttribArray(0);</Text>
+ <Text>glVertexAttribPointer(0, 4, GL_FLOAT, GL_FALSE, 0, 0x16fa15b98);</Text>
+ <Text>glEnableVertexAttribArray(1);</Text>
+ <Text>glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 0, 0x16fa15b70);</Text>
+ <Text>glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_SHORT, 0x16fa15b60);</Text>
+ <Text>glDisableVertexAttribArray(0);</Text>
+ <Text>glDisableVertexAttribArray(1);</Text>
+ <Text>glBindFramebuffer(GL_READ_FRAMEBUFFER, 1956);</Text>
+ <Text>glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 1957);</Text>
+ <Text>glBlitFramebuffer(-10, -15, 100, 63, 136, 30, 50, 144, GL_COLOR_BUFFER_BIT, GL_LINEAR)</Text>
+ <Text>glBindFramebuffer(GL_READ_FRAMEBUFFER, 1957);</Text>
+ <Text>glReadPixels(0, 0, 132, 128, GL_RGBA, GL_UNSIGNED_BYTE, 0x728ac0000)</Text>
+ <Text>glGetError();</Text>
+ <Text>// GL_NO_ERROR returned</Text>
+ <Text>Image comparison failed: max difference = (203, 191, 149, 224), threshold = (8, 8, 8, 8)</Text>
+ <ImageSet Name="Result" Description="Image comparison result">
+  <Image Name="Result" Width="132" Height="128" Format="RGBA8888" CompressionMode="PNG" Description="Result">
+   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
+   P2IJMfwbd9M3cP4IyxcAAAAASUVORK5CYII=
+</Image>
+  <Image Name="Reference" Width="132" Height="128" Format="RGBA8888" CompressionMode="PNG" Description="Result">
+   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
+</Image>
+  <Image Name="ErrorMask" Width="132" Height="128" Format="RGB888" CompressionMode="PNG" Description="Result">
+   iVBORw0KGgoAAAANSUhEUgAAAIQAAACACAIAAABFt1bmAAAB8UlEQVR4nO3cwU7C
+   QBRA0db4/7+MOwRBJVDomeGeZRMnjdeJ6cu063JYgvjY+wbyrRiQYkCKASkGpBiQ
+   YkCKASkGpBiQYkCKASkGpBiQYkCKASkGpBiQYkCKASkGpBiQYkCKASkGpBiQYkCK
+   ASkG5HPvG7jusO59B3toZ0CKASkGpBiQYkCKASkGpBiQYkCKASkGpBiQYkCKASkG
+   pBiQYkCKASkGpBiQYkDQ0yFH68knFI9HRo4X77vy+FKP38PV4y+r+cHIjupY1sPZ
+   3/LVK8ty/cq/P2gu5cZ4Q8WAFANSDEgxIMWAFANSDMhsT+DrYbOn9w2XutFsO2PD
+   X98fS10+YG9ithiv8aQd48YYZaDUbGpOxYAUA1IMSDEgxYAUA1IMyGyzqaGNtzOe
+   NBcSuDF+mx/82DS7zzAah8ypGJBiQIoBKQakGJBiQIoBGXscYh7MuXupsXfGaw7m
+   HN04ibl7qbF3xmTcnTHKQKnZ1JyKASkGpBiQYkCKASkGpBiQnsAhfeJo56VOtTPO
+   7Du7df9n7DJQujyU9cql3BhvqBiQYkCKASkGpBiQYkCKAekJHNLOgLgxRjlf01Gd
+   ORUDUgxIMSDFgBQDUgxIMSBjj0OEd782hO6MZ7+w9dSlbtFrZDp0ZyzjDJSaTc2p
+   GJBiQL4A8WQNAIQEa/8AAAAASUVORK5CYII=
+</Image>
+</ImageSet>
+ <Number Name="TestDuration" Description="Test case duration in microseconds" Tag="Time" Unit="us">30165</Number>
+ <Result StatusCode="Fail">Image comparison failed</Result>
+</TestCaseResult>
+
+
+=== dEQP-GLES3.functional.fbo.blit.rect.out_of_bounds_reverse_dst_y_linear
+<?xml version="1.0" encoding="UTF-8"?>
+<TestCaseResult CasePath="dEQP-GLES3.functional.fbo.blit.rect.out_of_bounds_reverse_dst_y_linear" Version="0.3.4" CaseType="SelfValidate">
+ <Text>glUseProgram(9934);</Text>
+ <Text>glGetUniformLocation(9934, u_gradientMin);</Text>
+ <Text>// 0 returned</Text>
+ <Text>glUniform4fv(0, 1, { 0, 0, 0, 0 });</Text>
+ <Text>glGetUniformLocation(9934, u_gradientMax);</Text>
+ <Text>// 1 returned</Text>
+ <Text>glUniform4fv(1, 1, { 1, 1, 1, 1 });</Text>
+ <Text>glUseProgram(9937);</Text>
+ <Text>glGetUniformLocation(9937, u_sampler0);</Text>
+ <Text>// 0 returned</Text>
+ <Text>glUniform1i(0, 0);</Text>
+ <Text>glGetUniformLocation(9937, u_texScale0);</Text>
+ <Text>// 1 returned</Text>
+ <Text>glUniform4fv(1, 1, { 1, 1, 1, 1 });</Text>
+ <Text>glGetUniformLocation(9937, u_texBias0);</Text>
+ <Text>// 2 returned</Text>
+ <Text>glUniform4fv(2, 1, { 0, 0, 0, 0 });</Text>
+ <Text>glGetUniformLocation(9937, u_outScale0);</Text>
+ <Text>// 3 returned</Text>
+ <Text>glUniform4fv(3, 1, { 1, 1, 1, 1 });</Text>
+ <Text>glGetUniformLocation(9937, u_outBias0);</Text>
+ <Text>// 4 returned</Text>
+ <Text>glUniform4fv(4, 1, { 0, 0, 0, 0 });</Text>
+ <Text>glGenFramebuffers(1, 0x000000016fa15cac);</Text>
+ <Text>// framebuffers = { 1960 }</Text>
+ <Text>glGenRenderbuffers(1, 0x000000016fa15ca4);</Text>
+ <Text>// renderbuffers = { 9940 }</Text>
+ <Text>glBindRenderbuffer(GL_RENDERBUFFER, 9940);</Text>
+ <Text>glRenderbufferStorage(GL_RENDERBUFFER, GL_RGBA8, 127, 119);</Text>
+ <Text>glBindFramebuffer(GL_FRAMEBUFFER, 1960);</Text>
+ <Text>glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, 9940);</Text>
+ <Text>glGetError();</Text>
+ <Text>// GL_NO_ERROR returned</Text>
+ <Text>glCheckFramebufferStatus(GL_FRAMEBUFFER);</Text>
+ <Text>// GL_FRAMEBUFFER_COMPLETE returned</Text>
+ <Text>glGenFramebuffers(1, 0x000000016fa15ca8);</Text>
+ <Text>// framebuffers = { 1961 }</Text>
+ <Text>glGenRenderbuffers(1, 0x000000016fa15ca0);</Text>
+ <Text>// renderbuffers = { 9941 }</Text>
+ <Text>glBindRenderbuffer(GL_RENDERBUFFER, 9941);</Text>
+ <Text>glRenderbufferStorage(GL_RENDERBUFFER, GL_RGBA8, 132, 128);</Text>
+ <Text>glBindFramebuffer(GL_FRAMEBUFFER, 1961);</Text>
+ <Text>glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, 9941);</Text>
+ <Text>glGetError();</Text>
+ <Text>// GL_NO_ERROR returned</Text>
+ <Text>glCheckFramebufferStatus(GL_FRAMEBUFFER);</Text>
+ <Text>// GL_FRAMEBUFFER_COMPLETE returned</Text>
+ <Text>glBindFramebuffer(GL_FRAMEBUFFER, 1961);</Text>
+ <Text>glViewport(0, 0, 132, 128);</Text>
+ <Text>glGetAttribLocation(9934, a_position);</Text>
+ <Text>// 0 returned</Text>
+ <Text>glGetAttribLocation(9934, a_coord);</Text>
+ <Text>// 1 returned</Text>
+ <Text>glUseProgram(9934);</Text>
+ <Text>glEnableVertexAttribArray(0);</Text>
+ <Text>glVertexAttribPointer(0, 4, GL_FLOAT, GL_FALSE, 0, 0x16fa15b98);</Text>
+ <Text>glEnableVertexAttribArray(1);</Text>
+ <Text>glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 0, 0x16fa15b70);</Text>
+ <Text>glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_SHORT, 0x16fa15b60);</Text>
+ <Text>glDisableVertexAttribArray(0);</Text>
+ <Text>glDisableVertexAttribArray(1);</Text>
+ <Text>glGenTextures(1, 0x000000016fa15c9c);</Text>
+ <Text>// textures = { 9942 }</Text>
+ <Text>glBindTexture(GL_TEXTURE_2D, 9942);</Text>
+ <Text>glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);</Text>
+ <Text>glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);</Text>
+ <Text>glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);</Text>
+ <Text>glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);</Text>
+ <Text>glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 127, 119, 0, GL_RGBA, GL_UNSIGNED_BYTE, 0x728a9c010);</Text>
+ <Text>glBindFramebuffer(GL_FRAMEBUFFER, 1960);</Text>
+ <Text>glViewport(0, 0, 127, 119);</Text>
+ <Text>glGetAttribLocation(9937, a_position);</Text>
+ <Text>// 0 returned</Text>
+ <Text>glGetAttribLocation(9937, a_coord);</Text>
+ <Text>// 1 returned</Text>
+ <Text>glUseProgram(9937);</Text>
+ <Text>glEnableVertexAttribArray(0);</Text>
+ <Text>glVertexAttribPointer(0, 4, GL_FLOAT, GL_FALSE, 0, 0x16fa15b98);</Text>
+ <Text>glEnableVertexAttribArray(1);</Text>
+ <Text>glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 0, 0x16fa15b70);</Text>
+ <Text>glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_SHORT, 0x16fa15b60);</Text>
+ <Text>glDisableVertexAttribArray(0);</Text>
+ <Text>glDisableVertexAttribArray(1);</Text>
+ <Text>glBindFramebuffer(GL_READ_FRAMEBUFFER, 1960);</Text>
+ <Text>glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 1961);</Text>
+ <Text>glBlitFramebuffer(-10, -15, 100, 63, 50, 144, 136, 30, GL_COLOR_BUFFER_BIT, GL_LINEAR)</Text>
+ <Text>glBindFramebuffer(GL_READ_FRAMEBUFFER, 1961);</Text>
+ <Text>glReadPixels(0, 0, 132, 128, GL_RGBA, GL_UNSIGNED_BYTE, 0x728ac0000)</Text>
+ <Text>glGetError();</Text>
+ <Text>// GL_NO_ERROR returned</Text>
+ <Text>Image comparison failed: max difference = (202, 152, 150, 151), threshold = (8, 8, 8, 8)</Text>
+ <ImageSet Name="Result" Description="Image comparison result">
+  <Image Name="Result" Width="132" Height="128" Format="RGBA8888" CompressionMode="PNG" Description="Result">
+   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
+</Image>
+  <Image Name="Reference" Width="132" Height="128" Format="RGBA8888" CompressionMode="PNG" Description="Result">
+   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
+   rkJggg==
+</Image>
+  <Image Name="ErrorMask" Width="132" Height="128" Format="RGB888" CompressionMode="PNG" Description="Result">
+   iVBORw0KGgoAAAANSUhEUgAAAIQAAACACAIAAABFt1bmAAACC0lEQVR4nO3c0W7a
+   MBiA0WTa+78yu5zWUDVibjm2v3OJ6C/Eh4NlhZ7H4wji17tfQP4qBqQYkGJAigEp
+   BqQYkGJAigEpBqQYkGJAigEpBqQYkGJAigEpBqQYkGJAigEpBqQYkGJAigEpBqQY
+   kGJAigH5/e4X8NzjfP74+fj4nOsjN58GjmplQIoBKQbkNH+59Nl3xtrmXhnn5ZN0
+   55Gxo177w6ej5o6xmGJAigEpBqTdFAQ9DvkMeIYxcFSXKUgxIMWAFAPSbgoy98ro
+   bCrfpRiQYkB2/AI/H8Pmjx2148q48/bd/NofO6qzKWjUjiuDVQxIMSAL7qbMzdId
+   c6+Mp8cMH96+/znDGDjqy0eO2WO8zDyI3DSGqRiQYkAW3E3Nq+MQaFSXKUgxIMWA
+   FAPSbgoy98roVp18l2JAigEpBqTdFKSzKWhUlylIMSDFgBQD0m7qba63As29MqY+
+   m7p+4OaOsZhiQIoB2fEL/IdvZ75vqZXx87/9uuP+qM6moFFLrYzZFQNSDMiOuynW
+   pitj4GZpoLljvHygdF153TeVfxQDUgxIuylIxyHQqC5TkGJAigEpBqTdFGTulTH1
+   rTpXc8dYTDEgxYAUA9Ju6jiY/zHZ2RQ0qssUpBiQYkCKAdliN4Vslr4cNffKePkH
+   WwNH9TOyNRUDUgxIMSBb7KZm0cqAFANSDEgxIMWA/AED2Fz+2mZ5agAAAABJRU5E
+   rkJggg==
+</Image>
+</ImageSet>
+ <Number Name="TestDuration" Description="Test case duration in microseconds" Tag="Time" Unit="us">55929</Number>
+ <Result StatusCode="Fail">Image comparison failed</Result>
+</TestCaseResult>
+
+
+=== dEQP-GLES3.functional.fbo.blit.rect.out_of_bounds_reverse_src_dst_x_linear
+<?xml version="1.0" encoding="UTF-8"?>
+<TestCaseResult CasePath="dEQP-GLES3.functional.fbo.blit.rect.out_of_bounds_reverse_src_dst_x_linear" Version="0.3.4" CaseType="SelfValidate">
+ <Text>glUseProgram(9952);</Text>
+ <Text>glGetUniformLocation(9952, u_gradientMin);</Text>
+ <Text>// 0 returned</Text>
+ <Text>glUniform4fv(0, 1, { 0, 0, 0, 0 });</Text>
+ <Text>glGetUniformLocation(9952, u_gradientMax);</Text>
+ <Text>// 1 returned</Text>
+ <Text>glUniform4fv(1, 1, { 1, 1, 1, 1 });</Text>
+ <Text>glUseProgram(9955);</Text>
+ <Text>glGetUniformLocation(9955, u_sampler0);</Text>
+ <Text>// 0 returned</Text>
+ <Text>glUniform1i(0, 0);</Text>
+ <Text>glGetUniformLocation(9955, u_texScale0);</Text>
+ <Text>// 1 returned</Text>
+ <Text>glUniform4fv(1, 1, { 1, 1, 1, 1 });</Text>
+ <Text>glGetUniformLocation(9955, u_texBias0);</Text>
+ <Text>// 2 returned</Text>
+ <Text>glUniform4fv(2, 1, { 0, 0, 0, 0 });</Text>
+ <Text>glGetUniformLocation(9955, u_outScale0);</Text>
+ <Text>// 3 returned</Text>
+ <Text>glUniform4fv(3, 1, { 1, 1, 1, 1 });</Text>
+ <Text>glGetUniformLocation(9955, u_outBias0);</Text>
+ <Text>// 4 returned</Text>
+ <Text>glUniform4fv(4, 1, { 0, 0, 0, 0 });</Text>
+ <Text>glGenFramebuffers(1, 0x000000016fa15cac);</Text>
+ <Text>// framebuffers = { 1964 }</Text>
+ <Text>glGenRenderbuffers(1, 0x000000016fa15ca4);</Text>
+ <Text>// renderbuffers = { 9958 }</Text>
+ <Text>glBindRenderbuffer(GL_RENDERBUFFER, 9958);</Text>
+ <Text>glRenderbufferStorage(GL_RENDERBUFFER, GL_RGBA8, 127, 119);</Text>
+ <Text>glBindFramebuffer(GL_FRAMEBUFFER, 1964);</Text>
+ <Text>glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, 9958);</Text>
+ <Text>glGetError();</Text>
+ <Text>// GL_NO_ERROR returned</Text>
+ <Text>glCheckFramebufferStatus(GL_FRAMEBUFFER);</Text>
+ <Text>// GL_FRAMEBUFFER_COMPLETE returned</Text>
+ <Text>glGenFramebuffers(1, 0x000000016fa15ca8);</Text>
+ <Text>// framebuffers = { 1965 }</Text>
+ <Text>glGenRenderbuffers(1, 0x000000016fa15ca0);</Text>
+ <Text>// renderbuffers = { 9959 }</Text>
+ <Text>glBindRenderbuffer(GL_RENDERBUFFER, 9959);</Text>
+ <Text>glRenderbufferStorage(GL_RENDERBUFFER, GL_RGBA8, 132, 128);</Text>
+ <Text>glBindFramebuffer(GL_FRAMEBUFFER, 1965);</Text>
+ <Text>glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, 9959);</Text>
+ <Text>glGetError();</Text>
+ <Text>// GL_NO_ERROR returned</Text>
+ <Text>glCheckFramebufferStatus(GL_FRAMEBUFFER);</Text>
+ <Text>// GL_FRAMEBUFFER_COMPLETE returned</Text>
+ <Text>glBindFramebuffer(GL_FRAMEBUFFER, 1965);</Text>
+ <Text>glViewport(0, 0, 132, 128);</Text>
+ <Text>glGetAttribLocation(9952, a_position);</Text>
+ <Text>// 0 returned</Text>
+ <Text>glGetAttribLocation(9952, a_coord);</Text>
+ <Text>// 1 returned</Text>
+ <Text>glUseProgram(9952);</Text>
+ <Text>glEnableVertexAttribArray(0);</Text>
+ <Text>glVertexAttribPointer(0, 4, GL_FLOAT, GL_FALSE, 0, 0x16fa15b98);</Text>
+ <Text>glEnableVertexAttribArray(1);</Text>
+ <Text>glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 0, 0x16fa15b70);</Text>
+ <Text>glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_SHORT, 0x16fa15b60);</Text>
+ <Text>glDisableVertexAttribArray(0);</Text>
+ <Text>glDisableVertexAttribArray(1);</Text>
+ <Text>glGenTextures(1, 0x000000016fa15c9c);</Text>
+ <Text>// textures = { 9960 }</Text>
+ <Text>glBindTexture(GL_TEXTURE_2D, 9960);</Text>
+ <Text>glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);</Text>
+ <Text>glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);</Text>
+ <Text>glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);</Text>
+ <Text>glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);</Text>
+ <Text>glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 127, 119, 0, GL_RGBA, GL_UNSIGNED_BYTE, 0x728a9c010);</Text>
+ <Text>glBindFramebuffer(GL_FRAMEBUFFER, 1964);</Text>
+ <Text>glViewport(0, 0, 127, 119);</Text>
+ <Text>glGetAttribLocation(9955, a_position);</Text>
+ <Text>// 0 returned</Text>
+ <Text>glGetAttribLocation(9955, a_coord);</Text>
+ <Text>// 1 returned</Text>
+ <Text>glUseProgram(9955);</Text>
+ <Text>glEnableVertexAttribArray(0);</Text>
+ <Text>glVertexAttribPointer(0, 4, GL_FLOAT, GL_FALSE, 0, 0x16fa15b98);</Text>
+ <Text>glEnableVertexAttribArray(1);</Text>
+ <Text>glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 0, 0x16fa15b70);</Text>
+ <Text>glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_SHORT, 0x16fa15b60);</Text>
+ <Text>glDisableVertexAttribArray(0);</Text>
+ <Text>glDisableVertexAttribArray(1);</Text>
+ <Text>glBindFramebuffer(GL_READ_FRAMEBUFFER, 1964);</Text>
+ <Text>glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 1965);</Text>
+ <Text>glBlitFramebuffer(100, -15, -10, 63, 136, 30, 50, 144, GL_COLOR_BUFFER_BIT, GL_LINEAR)</Text>
+ <Text>glBindFramebuffer(GL_READ_FRAMEBUFFER, 1965);</Text>
+ <Text>glReadPixels(0, 0, 132, 128, GL_RGBA, GL_UNSIGNED_BYTE, 0x728ac0000)</Text>
+ <Text>glGetError();</Text>
+ <Text>// GL_NO_ERROR returned</Text>
+ <Text>Image comparison failed: max difference = (130, 191, 150, 223), threshold = (8, 8, 8, 8)</Text>
+ <ImageSet Name="Result" Description="Image comparison result">
+  <Image Name="Result" Width="132" Height="128" Format="RGBA8888" CompressionMode="PNG" Description="Result">
+   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
+   RU5ErkJggg==
+</Image>
+  <Image Name="Reference" Width="132" Height="128" Format="RGBA8888" CompressionMode="PNG" Description="Result">
+   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
+   YII=
+</Image>
+  <Image Name="ErrorMask" Width="132" Height="128" Format="RGB888" CompressionMode="PNG" Description="Result">
+   iVBORw0KGgoAAAANSUhEUgAAAIQAAACACAIAAABFt1bmAAAB4klEQVR4nO3c0U6D
+   MABAUTD+/y/PBx802YwNg3AL5zwSbcjuqmlTWJfHQsTH2TfADzFCxAgRI0SMEDFC
+   xAgRI0SMEDFCxAgRI0SMEDFCxAgRI0SMEDFCxAgRI0SMEDFCxAgRI0SMEDFCxAgR
+   I0SMkM+zb+C1x3r2HZzBzAgRI0SMEDFCxAgRI0SMEDFCxAgRI0SMEDFCxAgRI0SM
+   EDFCxAgRI0SMEDFCxAiJng75y/rrjYrfJ0ierwz+WHCotfnCyH2P6qyP3Qbccahn
+   c/+ZWp++SS+vjHx8m4ca/MV/ryyzx7gYMULECBEjRIwQMULECBEj5BYr8FmYGSFi
+   hMwdY/Mu0I5D2Zu6JjFCxAgRI0SMEDFCxAgRI8TeVMgFZ8bgkjs41NwxRk7TvLMd
+   MjLUtjM+tkPqxAgRI0SMEDFCxAgRI0SMkDtuhxz6wMs7LjUzBhfb256d2Wx8qDvO
+   jKy5Z4ajOhxFjBAxQsQIESNEjBAxQsQIsQIP8Yqj0FBmRsjc/zPsTXEUMULECBEj
+   RIwQMULECBEjxAp8WTJvIb7gzNhw5Omvj2/HoUbMHaPw7JftkHc1NyJvGqNJjBAx
+   QsQIESNEjBAxQmyHhFxqZuz47NcpLhVj9vk0dwxHdTiKGCFihHwBDMOq8+dpQDUA
+   AAAASUVORK5CYII=
+</Image>
+</ImageSet>
+ <Number Name="TestDuration" Description="Test case duration in microseconds" Tag="Time" Unit="us">31373</Number>
+ <Result StatusCode="Fail">Image comparison failed</Result>
+</TestCaseResult>
+
+
+=== dEQP-GLES3.functional.fbo.blit.rect.out_of_bounds_reverse_src_dst_y_linear
+<?xml version="1.0" encoding="UTF-8"?>
+<TestCaseResult CasePath="dEQP-GLES3.functional.fbo.blit.rect.out_of_bounds_reverse_src_dst_y_linear" Version="0.3.4" CaseType="SelfValidate">
+ <Text>glUseProgram(9970);</Text>
+ <Text>glGetUniformLocation(9970, u_gradientMin);</Text>
+ <Text>// 0 returned</Text>
+ <Text>glUniform4fv(0, 1, { 0, 0, 0, 0 });</Text>
+ <Text>glGetUniformLocation(9970, u_gradientMax);</Text>
+ <Text>// 1 returned</Text>
+ <Text>glUniform4fv(1, 1, { 1, 1, 1, 1 });</Text>
+ <Text>glUseProgram(9973);</Text>
+ <Text>glGetUniformLocation(9973, u_sampler0);</Text>
+ <Text>// 0 returned</Text>
+ <Text>glUniform1i(0, 0);</Text>
+ <Text>glGetUniformLocation(9973, u_texScale0);</Text>
+ <Text>// 1 returned</Text>
+ <Text>glUniform4fv(1, 1, { 1, 1, 1, 1 });</Text>
+ <Text>glGetUniformLocation(9973, u_texBias0);</Text>
+ <Text>// 2 returned</Text>
+ <Text>glUniform4fv(2, 1, { 0, 0, 0, 0 });</Text>
+ <Text>glGetUniformLocation(9973, u_outScale0);</Text>
+ <Text>// 3 returned</Text>
+ <Text>glUniform4fv(3, 1, { 1, 1, 1, 1 });</Text>
+ <Text>glGetUniformLocation(9973, u_outBias0);</Text>
+ <Text>// 4 returned</Text>
+ <Text>glUniform4fv(4, 1, { 0, 0, 0, 0 });</Text>
+ <Text>glGenFramebuffers(1, 0x000000016fa15cac);</Text>
+ <Text>// framebuffers = { 1968 }</Text>
+ <Text>glGenRenderbuffers(1, 0x000000016fa15ca4);</Text>
+ <Text>// renderbuffers = { 9976 }</Text>
+ <Text>glBindRenderbuffer(GL_RENDERBUFFER, 9976);</Text>
+ <Text>glRenderbufferStorage(GL_RENDERBUFFER, GL_RGBA8, 127, 119);</Text>
+ <Text>glBindFramebuffer(GL_FRAMEBUFFER, 1968);</Text>
+ <Text>glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, 9976);</Text>
+ <Text>glGetError();</Text>
+ <Text>// GL_NO_ERROR returned</Text>
+ <Text>glCheckFramebufferStatus(GL_FRAMEBUFFER);</Text>
+ <Text>// GL_FRAMEBUFFER_COMPLETE returned</Text>
+ <Text>glGenFramebuffers(1, 0x000000016fa15ca8);</Text>
+ <Text>// framebuffers = { 1969 }</Text>
+ <Text>glGenRenderbuffers(1, 0x000000016fa15ca0);</Text>
+ <Text>// renderbuffers = { 9977 }</Text>
+ <Text>glBindRenderbuffer(GL_RENDERBUFFER, 9977);</Text>
+ <Text>glRenderbufferStorage(GL_RENDERBUFFER, GL_RGBA8, 132, 128);</Text>
+ <Text>glBindFramebuffer(GL_FRAMEBUFFER, 1969);</Text>
+ <Text>glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, 9977);</Text>
+ <Text>glGetError();</Text>
+ <Text>// GL_NO_ERROR returned</Text>
+ <Text>glCheckFramebufferStatus(GL_FRAMEBUFFER);</Text>
+ <Text>// GL_FRAMEBUFFER_COMPLETE returned</Text>
+ <Text>glBindFramebuffer(GL_FRAMEBUFFER, 1969);</Text>
+ <Text>glViewport(0, 0, 132, 128);</Text>
+ <Text>glGetAttribLocation(9970, a_position);</Text>
+ <Text>// 0 returned</Text>
+ <Text>glGetAttribLocation(9970, a_coord);</Text>
+ <Text>// 1 returned</Text>
+ <Text>glUseProgram(9970);</Text>
+ <Text>glEnableVertexAttribArray(0);</Text>
+ <Text>glVertexAttribPointer(0, 4, GL_FLOAT, GL_FALSE, 0, 0x16fa15b98);</Text>
+ <Text>glEnableVertexAttribArray(1);</Text>
+ <Text>glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 0, 0x16fa15b70);</Text>
+ <Text>glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_SHORT, 0x16fa15b60);</Text>
+ <Text>glDisableVertexAttribArray(0);</Text>
+ <Text>glDisableVertexAttribArray(1);</Text>
+ <Text>glGenTextures(1, 0x000000016fa15c9c);</Text>
+ <Text>// textures = { 9978 }</Text>
+ <Text>glBindTexture(GL_TEXTURE_2D, 9978);</Text>
+ <Text>glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);</Text>
+ <Text>glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);</Text>
+ <Text>glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);</Text>
+ <Text>glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);</Text>
+ <Text>glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 127, 119, 0, GL_RGBA, GL_UNSIGNED_BYTE, 0x728a9c010);</Text>
+ <Text>glBindFramebuffer(GL_FRAMEBUFFER, 1968);</Text>
+ <Text>glViewport(0, 0, 127, 119);</Text>
+ <Text>glGetAttribLocation(9973, a_position);</Text>
+ <Text>// 0 returned</Text>
+ <Text>glGetAttribLocation(9973, a_coord);</Text>
+ <Text>// 1 returned</Text>
+ <Text>glUseProgram(9973);</Text>
+ <Text>glEnableVertexAttribArray(0);</Text>
+ <Text>glVertexAttribPointer(0, 4, GL_FLOAT, GL_FALSE, 0, 0x16fa15b98);</Text>
+ <Text>glEnableVertexAttribArray(1);</Text>
+ <Text>glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 0, 0x16fa15b70);</Text>
+ <Text>glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_SHORT, 0x16fa15b60);</Text>
+ <Text>glDisableVertexAttribArray(0);</Text>
+ <Text>glDisableVertexAttribArray(1);</Text>
+ <Text>glBindFramebuffer(GL_READ_FRAMEBUFFER, 1968);</Text>
+ <Text>glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 1969);</Text>
+ <Text>glBlitFramebuffer(-10, 63, 100, -15, 50, 144, 136, 30, GL_COLOR_BUFFER_BIT, GL_LINEAR)</Text>
+ <Text>glBindFramebuffer(GL_READ_FRAMEBUFFER, 1969);</Text>
+ <Text>glReadPixels(0, 0, 132, 128, GL_RGBA, GL_UNSIGNED_BYTE, 0x728ac0000)</Text>
+ <Text>glGetError();</Text>
+ <Text>// GL_NO_ERROR returned</Text>
+ <Text>Image comparison failed: max difference = (130, 191, 150, 223), threshold = (8, 8, 8, 8)</Text>
+ <ImageSet Name="Result" Description="Image comparison result">
+  <Image Name="Result" Width="132" Height="128" Format="RGBA8888" CompressionMode="PNG" Description="Result">
+   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
+   RU5ErkJggg==
+</Image>
+  <Image Name="Reference" Width="132" Height="128" Format="RGBA8888" CompressionMode="PNG" Description="Result">
+   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
+   YII=
+</Image>
+  <Image Name="ErrorMask" Width="132" Height="128" Format="RGB888" CompressionMode="PNG" Description="Result">
+   iVBORw0KGgoAAAANSUhEUgAAAIQAAACACAIAAABFt1bmAAAB4klEQVR4nO3c0U6D
+   MABAUTD+/y/PBx802YwNg3AL5zwSbcjuqmlTWJfHQsTH2TfADzFCxAgRI0SMEDFC
+   xAgRI0SMEDFCxAgRI0SMEDFCxAgRI0SMEDFCxAgRI0SMEDFCxAgRI0SMEDFCxAgR
+   I0SMkM+zb+C1x3r2HZzBzAgRI0SMEDFCxAgRI0SMEDFCxAgRI0SMEDFCxAgRI0SM
+   EDFCxAgRI0SMEDFCxAiJng75y/rrjYrfJ0ierwz+WHCotfnCyH2P6qyP3Qbccahn
+   c/+ZWp++SS+vjHx8m4ca/MV/ryyzx7gYMULECBEjRIwQMULECBEj5BYr8FmYGSFi
+   hMwdY/Mu0I5D2Zu6JjFCxAgRI0SMEDFCxAgRI8TeVMgFZ8bgkjs41NwxRk7TvLMd
+   MjLUtjM+tkPqxAgRI0SMEDFCxAgRI0SMkDtuhxz6wMs7LjUzBhfb256d2Wx8qDvO
+   jKy5Z4ajOhxFjBAxQsQIESNEjBAxQsQIsQIP8Yqj0FBmRsjc/zPsTXEUMULECBEj
+   RIwQMULECBEjxAp8WTJvIb7gzNhw5Omvj2/HoUbMHaPw7JftkHc1NyJvGqNJjBAx
+   QsQIESNEjBAxQmyHhFxqZuz47NcpLhVj9vk0dwxHdTiKGCFihHwBDMOq8+dpQDUA
+   AAAASUVORK5CYII=
+</Image>
+</ImageSet>
+ <Number Name="TestDuration" Description="Test case duration in microseconds" Tag="Time" Unit="us">41940</Number>
+ <Result StatusCode="Fail">Image comparison failed</Result>
+</TestCaseResult>
+
+
+=== dEQP-GLES3.functional.fbo.blit.rect.out_of_bounds_reverse_src_x_linear
+<?xml version="1.0" encoding="UTF-8"?>
+<TestCaseResult CasePath="dEQP-GLES3.functional.fbo.blit.rect.out_of_bounds_reverse_src_x_linear" Version="0.3.4" CaseType="SelfValidate">
+ <Text>glUseProgram(9880);</Text>
+ <Text>glGetUniformLocation(9880, u_gradientMin);</Text>
+ <Text>// 0 returned</Text>
+ <Text>glUniform4fv(0, 1, { 0, 0, 0, 0 });</Text>
+ <Text>glGetUniformLocation(9880, u_gradientMax);</Text>
+ <Text>// 1 returned</Text>
+ <Text>glUniform4fv(1, 1, { 1, 1, 1, 1 });</Text>
+ <Text>glUseProgram(9883);</Text>
+ <Text>glGetUniformLocation(9883, u_sampler0);</Text>
+ <Text>// 0 returned</Text>
+ <Text>glUniform1i(0, 0);</Text>
+ <Text>glGetUniformLocation(9883, u_texScale0);</Text>
+ <Text>// 1 returned</Text>
+ <Text>glUniform4fv(1, 1, { 1, 1, 1, 1 });</Text>
+ <Text>glGetUniformLocation(9883, u_texBias0);</Text>
+ <Text>// 2 returned</Text>
+ <Text>glUniform4fv(2, 1, { 0, 0, 0, 0 });</Text>
+ <Text>glGetUniformLocation(9883, u_outScale0);</Text>
+ <Text>// 3 returned</Text>
+ <Text>glUniform4fv(3, 1, { 1, 1, 1, 1 });</Text>
+ <Text>glGetUniformLocation(9883, u_outBias0);</Text>
+ <Text>// 4 returned</Text>
+ <Text>glUniform4fv(4, 1, { 0, 0, 0, 0 });</Text>
+ <Text>glGenFramebuffers(1, 0x000000016fa15cac);</Text>
+ <Text>// framebuffers = { 1948 }</Text>
+ <Text>glGenRenderbuffers(1, 0x000000016fa15ca4);</Text>
+ <Text>// renderbuffers = { 9886 }</Text>
+ <Text>glBindRenderbuffer(GL_RENDERBUFFER, 9886);</Text>
+ <Text>glRenderbufferStorage(GL_RENDERBUFFER, GL_RGBA8, 127, 119);</Text>
+ <Text>glBindFramebuffer(GL_FRAMEBUFFER, 1948);</Text>
+ <Text>glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, 9886);</Text>
+ <Text>glGetError();</Text>
+ <Text>// GL_NO_ERROR returned</Text>
+ <Text>glCheckFramebufferStatus(GL_FRAMEBUFFER);</Text>
+ <Text>// GL_FRAMEBUFFER_COMPLETE returned</Text>
+ <Text>glGenFramebuffers(1, 0x000000016fa15ca8);</Text>
+ <Text>// framebuffers = { 1949 }</Text>
+ <Text>glGenRenderbuffers(1, 0x000000016fa15ca0);</Text>
+ <Text>// renderbuffers = { 9887 }</Text>
+ <Text>glBindRenderbuffer(GL_RENDERBUFFER, 9887);</Text>
+ <Text>glRenderbufferStorage(GL_RENDERBUFFER, GL_RGBA8, 132, 128);</Text>
+ <Text>glBindFramebuffer(GL_FRAMEBUFFER, 1949);</Text>
+ <Text>glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, 9887);</Text>
+ <Text>glGetError();</Text>
+ <Text>// GL_NO_ERROR returned</Text>
+ <Text>glCheckFramebufferStatus(GL_FRAMEBUFFER);</Text>
+ <Text>// GL_FRAMEBUFFER_COMPLETE returned</Text>
+ <Text>glBindFramebuffer(GL_FRAMEBUFFER, 1949);</Text>
+ <Text>glViewport(0, 0, 132, 128);</Text>
+ <Text>glGetAttribLocation(9880, a_position);</Text>
+ <Text>// 0 returned</Text>
+ <Text>glGetAttribLocation(9880, a_coord);</Text>
+ <Text>// 1 returned</Text>
+ <Text>glUseProgram(9880);</Text>
+ <Text>glEnableVertexAttribArray(0);</Text>
+ <Text>glVertexAttribPointer(0, 4, GL_FLOAT, GL_FALSE, 0, 0x16fa15b98);</Text>
+ <Text>glEnableVertexAttribArray(1);</Text>
+ <Text>glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 0, 0x16fa15b70);</Text>
+ <Text>glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_SHORT, 0x16fa15b60);</Text>
+ <Text>glDisableVertexAttribArray(0);</Text>
+ <Text>glDisableVertexAttribArray(1);</Text>
+ <Text>glGenTextures(1, 0x000000016fa15c9c);</Text>
+ <Text>// textures = { 9888 }</Text>
+ <Text>glBindTexture(GL_TEXTURE_2D, 9888);</Text>
+ <Text>glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);</Text>
+ <Text>glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);</Text>
+ <Text>glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);</Text>
+ <Text>glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);</Text>
+ <Text>glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 127, 119, 0, GL_RGBA, GL_UNSIGNED_BYTE, 0x728a9c010);</Text>
+ <Text>glBindFramebuffer(GL_FRAMEBUFFER, 1948);</Text>
+ <Text>glViewport(0, 0, 127, 119);</Text>
+ <Text>glGetAttribLocation(9883, a_position);</Text>
+ <Text>// 0 returned</Text>
+ <Text>glGetAttribLocation(9883, a_coord);</Text>
+ <Text>// 1 returned</Text>
+ <Text>glUseProgram(9883);</Text>
+ <Text>glEnableVertexAttribArray(0);</Text>
+ <Text>glVertexAttribPointer(0, 4, GL_FLOAT, GL_FALSE, 0, 0x16fa15b98);</Text>
+ <Text>glEnableVertexAttribArray(1);</Text>
+ <Text>glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 0, 0x16fa15b70);</Text>
+ <Text>glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_SHORT, 0x16fa15b60);</Text>
+ <Text>glDisableVertexAttribArray(0);</Text>
+ <Text>glDisableVertexAttribArray(1);</Text>
+ <Text>glBindFramebuffer(GL_READ_FRAMEBUFFER, 1948);</Text>
+ <Text>glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 1949);</Text>
+ <Text>glBlitFramebuffer(100, -15, -10, 63, 50, 30, 136, 144, GL_COLOR_BUFFER_BIT, GL_LINEAR)</Text>
+ <Text>glBindFramebuffer(GL_READ_FRAMEBUFFER, 1949);</Text>
+ <Text>glReadPixels(0, 0, 132, 128, GL_RGBA, GL_UNSIGNED_BYTE, 0x728ac0000)</Text>
+ <Text>glGetError();</Text>
+ <Text>// GL_NO_ERROR returned</Text>
+ <Text>Image comparison failed: max difference = (203, 191, 149, 224), threshold = (8, 8, 8, 8)</Text>
+ <ImageSet Name="Result" Description="Image comparison result">
+  <Image Name="Result" Width="132" Height="128" Format="RGBA8888" CompressionMode="PNG" Description="Result">
+   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
+   P2IJMfwbd9M3cP4IyxcAAAAASUVORK5CYII=
+</Image>
+  <Image Name="Reference" Width="132" Height="128" Format="RGBA8888" CompressionMode="PNG" Description="Result">
+   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
+</Image>
+  <Image Name="ErrorMask" Width="132" Height="128" Format="RGB888" CompressionMode="PNG" Description="Result">
+   iVBORw0KGgoAAAANSUhEUgAAAIQAAACACAIAAABFt1bmAAAB8UlEQVR4nO3cwU7C
+   QBRA0db4/7+MOwRBJVDomeGeZRMnjdeJ6cu063JYgvjY+wbyrRiQYkCKASkGpBiQ
+   YkCKASkGpBiQYkCKASkGpBiQYkCKASkGpBiQYkCKASkGpBiQYkCKASkGpBiQYkCK
+   ASkG5HPvG7jusO59B3toZ0CKASkGpBiQYkCKASkGpBiQYkCKASkGpBiQYkCKASkG
+   pBiQYkCKASkGpBiQYkDQ0yFH68knFI9HRo4X77vy+FKP38PV4y+r+cHIjupY1sPZ
+   3/LVK8ty/cq/P2gu5cZ4Q8WAFANSDEgxIMWAFANSDMhsT+DrYbOn9w2XutFsO2PD
+   X98fS10+YG9ithiv8aQd48YYZaDUbGpOxYAUA1IMSDEgxYAUA1IMyGyzqaGNtzOe
+   NBcSuDF+mx/82DS7zzAah8ypGJBiQIoBKQakGJBiQIoBGXscYh7MuXupsXfGaw7m
+   HN04ibl7qbF3xmTcnTHKQKnZ1JyKASkGpBiQYkCKASkGpBiQnsAhfeJo56VOtTPO
+   7Du7df9n7DJQujyU9cql3BhvqBiQYkCKASkGpBiQYkCKAekJHNLOgLgxRjlf01Gd
+   ORUDUgxIMSDFgBQDUgxIMSBjj0OEd782hO6MZ7+w9dSlbtFrZDp0ZyzjDJSaTc2p
+   GJBiQL4A8WQNAIQEa/8AAAAASUVORK5CYII=
+</Image>
+</ImageSet>
+ <Number Name="TestDuration" Description="Test case duration in microseconds" Tag="Time" Unit="us">43607</Number>
+ <Result StatusCode="Fail">Image comparison failed</Result>
+</TestCaseResult>
+
+
+=== dEQP-GLES3.functional.fbo.blit.rect.out_of_bounds_reverse_src_y_linear
+<?xml version="1.0" encoding="UTF-8"?>
+<TestCaseResult CasePath="dEQP-GLES3.functional.fbo.blit.rect.out_of_bounds_reverse_src_y_linear" Version="0.3.4" CaseType="SelfValidate">
+ <Text>glUseProgram(9898);</Text>
+ <Text>glGetUniformLocation(9898, u_gradientMin);</Text>
+ <Text>// 0 returned</Text>
+ <Text>glUniform4fv(0, 1, { 0, 0, 0, 0 });</Text>
+ <Text>glGetUniformLocation(9898, u_gradientMax);</Text>
+ <Text>// 1 returned</Text>
+ <Text>glUniform4fv(1, 1, { 1, 1, 1, 1 });</Text>
+ <Text>glUseProgram(9901);</Text>
+ <Text>glGetUniformLocation(9901, u_sampler0);</Text>
+ <Text>// 0 returned</Text>
+ <Text>glUniform1i(0, 0);</Text>
+ <Text>glGetUniformLocation(9901, u_texScale0);</Text>
+ <Text>// 1 returned</Text>
+ <Text>glUniform4fv(1, 1, { 1, 1, 1, 1 });</Text>
+ <Text>glGetUniformLocation(9901, u_texBias0);</Text>
+ <Text>// 2 returned</Text>
+ <Text>glUniform4fv(2, 1, { 0, 0, 0, 0 });</Text>
+ <Text>glGetUniformLocation(9901, u_outScale0);</Text>
+ <Text>// 3 returned</Text>
+ <Text>glUniform4fv(3, 1, { 1, 1, 1, 1 });</Text>
+ <Text>glGetUniformLocation(9901, u_outBias0);</Text>
+ <Text>// 4 returned</Text>
+ <Text>glUniform4fv(4, 1, { 0, 0, 0, 0 });</Text>
+ <Text>glGenFramebuffers(1, 0x000000016fa15cac);</Text>
+ <Text>// framebuffers = { 1952 }</Text>
+ <Text>glGenRenderbuffers(1, 0x000000016fa15ca4);</Text>
+ <Text>// renderbuffers = { 9904 }</Text>
+ <Text>glBindRenderbuffer(GL_RENDERBUFFER, 9904);</Text>
+ <Text>glRenderbufferStorage(GL_RENDERBUFFER, GL_RGBA8, 127, 119);</Text>
+ <Text>glBindFramebuffer(GL_FRAMEBUFFER, 1952);</Text>
+ <Text>glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, 9904);</Text>
+ <Text>glGetError();</Text>
+ <Text>// GL_NO_ERROR returned</Text>
+ <Text>glCheckFramebufferStatus(GL_FRAMEBUFFER);</Text>
+ <Text>// GL_FRAMEBUFFER_COMPLETE returned</Text>
+ <Text>glGenFramebuffers(1, 0x000000016fa15ca8);</Text>
+ <Text>// framebuffers = { 1953 }</Text>
+ <Text>glGenRenderbuffers(1, 0x000000016fa15ca0);</Text>
+ <Text>// renderbuffers = { 9905 }</Text>
+ <Text>glBindRenderbuffer(GL_RENDERBUFFER, 9905);</Text>
+ <Text>glRenderbufferStorage(GL_RENDERBUFFER, GL_RGBA8, 132, 128);</Text>
+ <Text>glBindFramebuffer(GL_FRAMEBUFFER, 1953);</Text>
+ <Text>glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, 9905);</Text>
+ <Text>glGetError();</Text>
+ <Text>// GL_NO_ERROR returned</Text>
+ <Text>glCheckFramebufferStatus(GL_FRAMEBUFFER);</Text>
+ <Text>// GL_FRAMEBUFFER_COMPLETE returned</Text>
+ <Text>glBindFramebuffer(GL_FRAMEBUFFER, 1953);</Text>
+ <Text>glViewport(0, 0, 132, 128);</Text>
+ <Text>glGetAttribLocation(9898, a_position);</Text>
+ <Text>// 0 returned</Text>
+ <Text>glGetAttribLocation(9898, a_coord);</Text>
+ <Text>// 1 returned</Text>
+ <Text>glUseProgram(9898);</Text>
+ <Text>glEnableVertexAttribArray(0);</Text>
+ <Text>glVertexAttribPointer(0, 4, GL_FLOAT, GL_FALSE, 0, 0x16fa15b98);</Text>
+ <Text>glEnableVertexAttribArray(1);</Text>
+ <Text>glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 0, 0x16fa15b70);</Text>
+ <Text>glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_SHORT, 0x16fa15b60);</Text>
+ <Text>glDisableVertexAttribArray(0);</Text>
+ <Text>glDisableVertexAttribArray(1);</Text>
+ <Text>glGenTextures(1, 0x000000016fa15c9c);</Text>
+ <Text>// textures = { 9906 }</Text>
+ <Text>glBindTexture(GL_TEXTURE_2D, 9906);</Text>
+ <Text>glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);</Text>
+ <Text>glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);</Text>
+ <Text>glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);</Text>
+ <Text>glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);</Text>
+ <Text>glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 127, 119, 0, GL_RGBA, GL_UNSIGNED_BYTE, 0x728a9c010);</Text>
+ <Text>glBindFramebuffer(GL_FRAMEBUFFER, 1952);</Text>
+ <Text>glViewport(0, 0, 127, 119);</Text>
+ <Text>glGetAttribLocation(9901, a_position);</Text>
+ <Text>// 0 returned</Text>
+ <Text>glGetAttribLocation(9901, a_coord);</Text>
+ <Text>// 1 returned</Text>
+ <Text>glUseProgram(9901);</Text>
+ <Text>glEnableVertexAttribArray(0);</Text>
+ <Text>glVertexAttribPointer(0, 4, GL_FLOAT, GL_FALSE, 0, 0x16fa15b98);</Text>
+ <Text>glEnableVertexAttribArray(1);</Text>
+ <Text>glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 0, 0x16fa15b70);</Text>
+ <Text>glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_SHORT, 0x16fa15b60);</Text>
+ <Text>glDisableVertexAttribArray(0);</Text>
+ <Text>glDisableVertexAttribArray(1);</Text>
+ <Text>glBindFramebuffer(GL_READ_FRAMEBUFFER, 1952);</Text>
+ <Text>glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 1953);</Text>
+ <Text>glBlitFramebuffer(-10, 63, 100, -15, 50, 30, 136, 144, GL_COLOR_BUFFER_BIT, GL_LINEAR)</Text>
+ <Text>glBindFramebuffer(GL_READ_FRAMEBUFFER, 1953);</Text>
+ <Text>glReadPixels(0, 0, 132, 128, GL_RGBA, GL_UNSIGNED_BYTE, 0x728ac0000)</Text>
+ <Text>glGetError();</Text>
+ <Text>// GL_NO_ERROR returned</Text>
+ <Text>Image comparison failed: max difference = (202, 152, 150, 151), threshold = (8, 8, 8, 8)</Text>
+ <ImageSet Name="Result" Description="Image comparison result">
+  <Image Name="Result" Width="132" Height="128" Format="RGBA8888" CompressionMode="PNG" Description="Result">
+   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
+</Image>
+  <Image Name="Reference" Width="132" Height="128" Format="RGBA8888" CompressionMode="PNG" Description="Result">
+   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
+   rkJggg==
+</Image>
+  <Image Name="ErrorMask" Width="132" Height="128" Format="RGB888" CompressionMode="PNG" Description="Result">
+   iVBORw0KGgoAAAANSUhEUgAAAIQAAACACAIAAABFt1bmAAACC0lEQVR4nO3c0W7a
+   MBiA0WTa+78yu5zWUDVibjm2v3OJ6C/Eh4NlhZ7H4wji17tfQP4qBqQYkGJAigEp
+   BqQYkGJAigEpBqQYkGJAigEpBqQYkGJAigEpBqQYkGJAigEpBqQYkGJAigEpBqQY
+   kGJAigH5/e4X8NzjfP74+fj4nOsjN58GjmplQIoBKQbkNH+59Nl3xtrmXhnn5ZN0
+   55Gxo177w6ej5o6xmGJAigEpBqTdFAQ9DvkMeIYxcFSXKUgxIMWAFAPSbgoy98ro
+   bCrfpRiQYkB2/AI/H8Pmjx2148q48/bd/NofO6qzKWjUjiuDVQxIMSAL7qbMzdId
+   c6+Mp8cMH96+/znDGDjqy0eO2WO8zDyI3DSGqRiQYkAW3E3Nq+MQaFSXKUgxIMWA
+   FAPSbgoy98roVp18l2JAigEpBqTdFKSzKWhUlylIMSDFgBQD0m7qba63As29MqY+
+   m7p+4OaOsZhiQIoB2fEL/IdvZ75vqZXx87/9uuP+qM6moFFLrYzZFQNSDMiOuynW
+   pitj4GZpoLljvHygdF153TeVfxQDUgxIuylIxyHQqC5TkGJAigEpBqTdFGTulTH1
+   rTpXc8dYTDEgxYAUA9Ju6jiY/zHZ2RQ0qssUpBiQYkCKAdliN4Vslr4cNffKePkH
+   WwNH9TOyNRUDUgxIMSBb7KZm0cqAFANSDEgxIMWA/AED2Fz+2mZ5agAAAABJRU5E
+   rkJggg==
+</Image>
+</ImageSet>
+ <Number Name="TestDuration" Description="Test case duration in microseconds" Tag="Time" Unit="us">38448</Number>
+ <Result StatusCode="Fail">Image comparison failed</Result>
+</TestCaseResult>
+
+
+=== dEQP-GLES3.functional.fbo.completeness.renderable.renderbuffer.color0.red_float
+<?xml version="1.0" encoding="UTF-8"?>
+<TestCaseResult CasePath="dEQP-GLES3.functional.fbo.completeness.renderable.renderbuffer.color0.red_float" Version="0.3.4" CaseType="SelfValidate">
+ <Section Name="Framebuffer" Description="Framebuffer configuration">
+  <Section Name="3462" Description="Renderbuffer 3462">
+   <Text>Internal format: GL_RED</Text>
+   <Text>Width: 64</Text>
+   <Text>Height: 64</Text>
+   <Text>Samples: 0</Text>
+</Section>
+  <Section Name="Attachments" Description="Framebuffer attachments">
+   <Section Name="GL_COLOR_ATTACHMENT0" Description="Attachment point GL_COLOR_ATTACHMENT0">
+    <Text>Target: GL_FRAMEBUFFER</Text>
+    <Text>Type: GL_RENDERBUFFER</Text>
+    <Text>Image Name: 3462</Text>
+    <Text>Renderbuffer Target: GL_RENDERBUFFER</Text>
+</Section>
+</Section>
+</Section>
+ <Section Name="Format" Description="Format info">
+  <Section Name="FormatInfo" Description="(format = GL_RED, type = GL_FLOAT)">
+   <Text>* Valid texture format
+	* defined in supported extension(s):
+		- GL_EXT_texture_rg and GL_OES_texture_float
+</Text>
+   <Text>* Unsupported renderbuffer format
+	* no extension can make this format valid</Text>
+   <Text>* Format is allowed to be color-renderable but not required
+	* extensions that would make format color-renderable:
+		- GL_EXT_texture_rg and GL_OES_texture_float
+</Text>
+   <Text>* Format is NOT depth-renderable
+	* no extension can make this format depth-renderable</Text>
+   <Text>* Format is NOT stencil-renderable
+	* no extension can make this format stencil-renderable</Text>
+</Section>
+</Section>
+ <Section Name="Rules" Description="Active rules">
+  <Section Name="GL_INVALID_ENUM" Description="GL_INVALID_ENUM">
+   <Text>Rules:
+	 * Format (format = GL_RED, type = GL_FLOAT) is not a valid format for a renderbuffer
+</Text>
+</Section>
+  <Section Name="GL_FRAMEBUFFER_INCOMPLETE_ATTACHMENT" Description="GL_FRAMEBUFFER_INCOMPLETE_ATTACHMENT">
+   <Text>Rules:
+	 * Attachment format is not required renderable
+</Text>
+</Section>
+</Section>
+ <Text>Expected one of GL_INVALID_ENUM (during FBO initialization) or GL_FRAMEBUFFER_INCOMPLETE_ATTACHMENT.</Text>
+ <Text>Received GL_FRAMEBUFFER_COMPLETE.</Text>
+ <Number Name="TestDuration" Description="Test case duration in microseconds" Tag="Time" Unit="us">2651</Number>
+ <Result StatusCode="Fail">Framebuffer checked as complete, expected incomplete</Result>
+</TestCaseResult>
+
+
+=== dEQP-GLES3.functional.fbo.completeness.renderable.renderbuffer.color0.red_half_float_oes
+<?xml version="1.0" encoding="UTF-8"?>
+<TestCaseResult CasePath="dEQP-GLES3.functional.fbo.completeness.renderable.renderbuffer.color0.red_half_float_oes" Version="0.3.4" CaseType="SelfValidate">
+ <Section Name="Framebuffer" Description="Framebuffer configuration">
+  <Section Name="3463" Description="Renderbuffer 3463">
+   <Text>Internal format: GL_RED</Text>
+   <Text>Width: 64</Text>
+   <Text>Height: 64</Text>
+   <Text>Samples: 0</Text>
+</Section>
+  <Section Name="Attachments" Description="Framebuffer attachments">
+   <Section Name="GL_COLOR_ATTACHMENT0" Description="Attachment point GL_COLOR_ATTACHMENT0">
+    <Text>Target: GL_FRAMEBUFFER</Text>
+    <Text>Type: GL_RENDERBUFFER</Text>
+    <Text>Image Name: 3463</Text>
+    <Text>Renderbuffer Target: GL_RENDERBUFFER</Text>
+</Section>
+</Section>
+</Section>
+ <Section Name="Format" Description="Format info">
+  <Section Name="FormatInfo" Description="(format = GL_RED, type = GL_HALF_FLOAT_OES)">
+   <Text>* Valid texture format
+	* defined in supported extension(s):
+		- GL_EXT_texture_rg and GL_OES_texture_half_float
+</Text>
+   <Text>* Unsupported renderbuffer format
+	* no extension can make this format valid</Text>
+   <Text>* Format is allowed to be color-renderable but not required
+	* extensions that would make format color-renderable:
+		- GL_EXT_texture_rg and GL_OES_texture_half_float
+</Text>
+   <Text>* Format is NOT depth-renderable
+	* no extension can make this format depth-renderable</Text>
+   <Text>* Format is NOT stencil-renderable
+	* no extension can make this format stencil-renderable</Text>
+</Section>
+</Section>
+ <Section Name="Rules" Description="Active rules">
+  <Section Name="GL_INVALID_ENUM" Description="GL_INVALID_ENUM">
+   <Text>Rules:
+	 * Format (format = GL_RED, type = GL_HALF_FLOAT_OES) is not a valid format for a renderbuffer
+</Text>
+</Section>
+  <Section Name="GL_FRAMEBUFFER_INCOMPLETE_ATTACHMENT" Description="GL_FRAMEBUFFER_INCOMPLETE_ATTACHMENT">
+   <Text>Rules:
+	 * Attachment format is not required renderable
+</Text>
+</Section>
+</Section>
+ <Text>Expected one of GL_INVALID_ENUM (during FBO initialization) or GL_FRAMEBUFFER_INCOMPLETE_ATTACHMENT.</Text>
+ <Text>Received GL_FRAMEBUFFER_COMPLETE.</Text>
+ <Number Name="TestDuration" Description="Test case duration in microseconds" Tag="Time" Unit="us">2832</Number>
+ <Result StatusCode="Fail">Framebuffer checked as complete, expected incomplete</Result>
+</TestCaseResult>
+
+
+=== dEQP-GLES3.functional.fbo.completeness.renderable.renderbuffer.color0.red_unsigned_byte
+<?xml version="1.0" encoding="UTF-8"?>
+<TestCaseResult CasePath="dEQP-GLES3.functional.fbo.completeness.renderable.renderbuffer.color0.red_unsigned_byte" Version="0.3.4" CaseType="SelfValidate">
+ <Section Name="Framebuffer" Description="Framebuffer configuration">
+  <Section Name="3461" Description="Renderbuffer 3461">
+   <Text>Internal format: GL_RED</Text>
+   <Text>Width: 64</Text>
+   <Text>Height: 64</Text>
+   <Text>Samples: 0</Text>
+</Section>
+  <Section Name="Attachments" Description="Framebuffer attachments">
+   <Section Name="GL_COLOR_ATTACHMENT0" Description="Attachment point GL_COLOR_ATTACHMENT0">
+    <Text>Target: GL_FRAMEBUFFER</Text>
+    <Text>Type: GL_RENDERBUFFER</Text>
+    <Text>Image Name: 3461</Text>
+    <Text>Renderbuffer Target: GL_RENDERBUFFER</Text>
+</Section>
+</Section>
+</Section>
+ <Section Name="Format" Description="Format info">
+  <Section Name="FormatInfo" Description="(format = GL_RED, type = GL_UNSIGNED_BYTE)">
+   <Text>* Valid texture format
+	* defined in supported extension(s):
+		- GL_EXT_texture_rg
+</Text>
+   <Text>* Unsupported renderbuffer format
+	* no extension can make this format valid</Text>
+   <Text>* Format is allowed to be color-renderable but not required
+	* extensions that would make format color-renderable:
+		- GL_EXT_texture_rg
+</Text>
+   <Text>* Format is NOT depth-renderable
+	* no extension can make this format depth-renderable</Text>
+   <Text>* Format is NOT stencil-renderable
+	* no extension can make this format stencil-renderable</Text>
+</Section>
+</Section>
+ <Section Name="Rules" Description="Active rules">
+  <Section Name="GL_INVALID_ENUM" Description="GL_INVALID_ENUM">
+   <Text>Rules:
+	 * Format (format = GL_RED, type = GL_UNSIGNED_BYTE) is not a valid format for a renderbuffer
+</Text>
+</Section>
+  <Section Name="GL_FRAMEBUFFER_INCOMPLETE_ATTACHMENT" Description="GL_FRAMEBUFFER_INCOMPLETE_ATTACHMENT">
+   <Text>Rules:
+	 * Attachment format is not required renderable
+</Text>
+</Section>
+</Section>
+ <Text>Expected one of GL_INVALID_ENUM (during FBO initialization) or GL_FRAMEBUFFER_INCOMPLETE_ATTACHMENT.</Text>
+ <Text>Received GL_FRAMEBUFFER_COMPLETE.</Text>
+ <Number Name="TestDuration" Description="Test case duration in microseconds" Tag="Time" Unit="us">1452</Number>
+ <Result StatusCode="Fail">Framebuffer checked as complete, expected incomplete</Result>
+</TestCaseResult>
+
+
+=== dEQP-GLES3.functional.fbo.completeness.renderable.renderbuffer.color0.rg_float
+<?xml version="1.0" encoding="UTF-8"?>
+<TestCaseResult CasePath="dEQP-GLES3.functional.fbo.completeness.renderable.renderbuffer.color0.rg_float" Version="0.3.4" CaseType="SelfValidate">
+ <Section Name="Framebuffer" Description="Framebuffer configuration">
+  <Section Name="3483" Description="Renderbuffer 3483">
+   <Text>Internal format: GL_RG</Text>
+   <Text>Width: 64</Text>
+   <Text>Height: 64</Text>
+   <Text>Samples: 0</Text>
+</Section>
+  <Section Name="Attachments" Description="Framebuffer attachments">
+   <Section Name="GL_COLOR_ATTACHMENT0" Description="Attachment point GL_COLOR_ATTACHMENT0">
+    <Text>Target: GL_FRAMEBUFFER</Text>
+    <Text>Type: GL_RENDERBUFFER</Text>
+    <Text>Image Name: 3483</Text>
+    <Text>Renderbuffer Target: GL_RENDERBUFFER</Text>
+</Section>
+</Section>
+</Section>
+ <Section Name="Format" Description="Format info">
+  <Section Name="FormatInfo" Description="(format = GL_RG, type = GL_FLOAT)">
+   <Text>* Valid texture format
+	* defined in supported extension(s):
+		- GL_EXT_texture_rg and GL_OES_texture_float
+</Text>
+   <Text>* Unsupported renderbuffer format
+	* no extension can make this format valid</Text>
+   <Text>* Format is allowed to be color-renderable but not required
+	* extensions that would make format color-renderable:
+		- GL_EXT_texture_rg and GL_OES_texture_float
+</Text>
+   <Text>* Format is NOT depth-renderable
+	* no extension can make this format depth-renderable</Text>
+   <Text>* Format is NOT stencil-renderable
+	* no extension can make this format stencil-renderable</Text>
+</Section>
+</Section>
+ <Section Name="Rules" Description="Active rules">
+  <Section Name="GL_INVALID_ENUM" Description="GL_INVALID_ENUM">
+   <Text>Rules:
+	 * Format (format = GL_RG, type = GL_FLOAT) is not a valid format for a renderbuffer
+</Text>
+</Section>
+  <Section Name="GL_FRAMEBUFFER_INCOMPLETE_ATTACHMENT" Description="GL_FRAMEBUFFER_INCOMPLETE_ATTACHMENT">
+   <Text>Rules:
+	 * Attachment format is not required renderable
+</Text>
+</Section>
+</Section>
+ <Text>Expected one of GL_INVALID_ENUM (during FBO initialization) or GL_FRAMEBUFFER_INCOMPLETE_ATTACHMENT.</Text>
+ <Text>Received GL_FRAMEBUFFER_COMPLETE.</Text>
+ <Number Name="TestDuration" Description="Test case duration in microseconds" Tag="Time" Unit="us">1331</Number>
+ <Result StatusCode="Fail">Framebuffer checked as complete, expected incomplete</Result>
+</TestCaseResult>
+
+
+=== dEQP-GLES3.functional.fbo.completeness.renderable.renderbuffer.color0.rg_half_float_oes
+<?xml version="1.0" encoding="UTF-8"?>
+<TestCaseResult CasePath="dEQP-GLES3.functional.fbo.completeness.renderable.renderbuffer.color0.rg_half_float_oes" Version="0.3.4" CaseType="SelfValidate">
+ <Section Name="Framebuffer" Description="Framebuffer configuration">
+  <Section Name="3484" Description="Renderbuffer 3484">
+   <Text>Internal format: GL_RG</Text>
+   <Text>Width: 64</Text>
+   <Text>Height: 64</Text>
+   <Text>Samples: 0</Text>
+</Section>
+  <Section Name="Attachments" Description="Framebuffer attachments">
+   <Section Name="GL_COLOR_ATTACHMENT0" Description="Attachment point GL_COLOR_ATTACHMENT0">
+    <Text>Target: GL_FRAMEBUFFER</Text>
+    <Text>Type: GL_RENDERBUFFER</Text>
+    <Text>Image Name: 3484</Text>
+    <Text>Renderbuffer Target: GL_RENDERBUFFER</Text>
+</Section>
+</Section>
+</Section>
+ <Section Name="Format" Description="Format info">
+  <Section Name="FormatInfo" Description="(format = GL_RG, type = GL_HALF_FLOAT_OES)">
+   <Text>* Valid texture format
+	* defined in supported extension(s):
+		- GL_EXT_texture_rg and GL_OES_texture_half_float
+</Text>
+   <Text>* Unsupported renderbuffer format
+	* no extension can make this format valid</Text>
+   <Text>* Format is allowed to be color-renderable but not required
+	* extensions that would make format color-renderable:
+		- GL_EXT_texture_rg and GL_OES_texture_half_float
+</Text>
+   <Text>* Format is NOT depth-renderable
+	* no extension can make this format depth-renderable</Text>
+   <Text>* Format is NOT stencil-renderable
+	* no extension can make this format stencil-renderable</Text>
+</Section>
+</Section>
+ <Section Name="Rules" Description="Active rules">
+  <Section Name="GL_INVALID_ENUM" Description="GL_INVALID_ENUM">
+   <Text>Rules:
+	 * Format (format = GL_RG, type = GL_HALF_FLOAT_OES) is not a valid format for a renderbuffer
+</Text>
+</Section>
+  <Section Name="GL_FRAMEBUFFER_INCOMPLETE_ATTACHMENT" Description="GL_FRAMEBUFFER_INCOMPLETE_ATTACHMENT">
+   <Text>Rules:
+	 * Attachment format is not required renderable
+</Text>
+</Section>
+</Section>
+ <Text>Expected one of GL_INVALID_ENUM (during FBO initialization) or GL_FRAMEBUFFER_INCOMPLETE_ATTACHMENT.</Text>
+ <Text>Received GL_FRAMEBUFFER_COMPLETE.</Text>
+ <Number Name="TestDuration" Description="Test case duration in microseconds" Tag="Time" Unit="us">2583</Number>
+ <Result StatusCode="Fail">Framebuffer checked as complete, expected incomplete</Result>
+</TestCaseResult>
+
+
+=== dEQP-GLES3.functional.fbo.completeness.renderable.renderbuffer.color0.rg_unsigned_byte
+<?xml version="1.0" encoding="UTF-8"?>
+<TestCaseResult CasePath="dEQP-GLES3.functional.fbo.completeness.renderable.renderbuffer.color0.rg_unsigned_byte" Version="0.3.4" CaseType="SelfValidate">
+ <Section Name="Framebuffer" Description="Framebuffer configuration">
+  <Section Name="3482" Description="Renderbuffer 3482">
+   <Text>Internal format: GL_RG</Text>
+   <Text>Width: 64</Text>
+   <Text>Height: 64</Text>
+   <Text>Samples: 0</Text>
+</Section>
+  <Section Name="Attachments" Description="Framebuffer attachments">
+   <Section Name="GL_COLOR_ATTACHMENT0" Description="Attachment point GL_COLOR_ATTACHMENT0">
+    <Text>Target: GL_FRAMEBUFFER</Text>
+    <Text>Type: GL_RENDERBUFFER</Text>
+    <Text>Image Name: 3482</Text>
+    <Text>Renderbuffer Target: GL_RENDERBUFFER</Text>
+</Section>
+</Section>
+</Section>
+ <Section Name="Format" Description="Format info">
+  <Section Name="FormatInfo" Description="(format = GL_RG, type = GL_UNSIGNED_BYTE)">
+   <Text>* Valid texture format
+	* defined in supported extension(s):
+		- GL_EXT_texture_rg
+</Text>
+   <Text>* Unsupported renderbuffer format
+	* no extension can make this format valid</Text>
+   <Text>* Format is allowed to be color-renderable but not required
+	* extensions that would make format color-renderable:
+		- GL_EXT_texture_rg
+</Text>
+   <Text>* Format is NOT depth-renderable
+	* no extension can make this format depth-renderable</Text>
+   <Text>* Format is NOT stencil-renderable
+	* no extension can make this format stencil-renderable</Text>
+</Section>
+</Section>
+ <Section Name="Rules" Description="Active rules">
+  <Section Name="GL_INVALID_ENUM" Description="GL_INVALID_ENUM">
+   <Text>Rules:
+	 * Format (format = GL_RG, type = GL_UNSIGNED_BYTE) is not a valid format for a renderbuffer
+</Text>
+</Section>
+  <Section Name="GL_FRAMEBUFFER_INCOMPLETE_ATTACHMENT" Description="GL_FRAMEBUFFER_INCOMPLETE_ATTACHMENT">
+   <Text>Rules:
+	 * Attachment format is not required renderable
+</Text>
+</Section>
+</Section>
+ <Text>Expected one of GL_INVALID_ENUM (during FBO initialization) or GL_FRAMEBUFFER_INCOMPLETE_ATTACHMENT.</Text>
+ <Text>Received GL_FRAMEBUFFER_COMPLETE.</Text>
+ <Number Name="TestDuration" Description="Test case duration in microseconds" Tag="Time" Unit="us">1511</Number>
+ <Result StatusCode="Fail">Framebuffer checked as complete, expected incomplete</Result>
+</TestCaseResult>
+
+
+=== dEQP-GLES3.functional.fbo.completeness.renderable.renderbuffer.color0.srgb_alpha_unsigned_byte
+<?xml version="1.0" encoding="UTF-8"?>
+<TestCaseResult CasePath="dEQP-GLES3.functional.fbo.completeness.renderable.renderbuffer.color0.srgb_alpha_unsigned_byte" Version="0.3.4" CaseType="SelfValidate">
+ <Section Name="Framebuffer" Description="Framebuffer configuration">
+  <Section Name="3512" Description="Renderbuffer 3512">
+   <Text>Internal format: GL_SRGB_ALPHA</Text>
+   <Text>Width: 64</Text>
+   <Text>Height: 64</Text>
+   <Text>Samples: 0</Text>
+</Section>
+  <Section Name="Attachments" Description="Framebuffer attachments">
+   <Section Name="GL_COLOR_ATTACHMENT0" Description="Attachment point GL_COLOR_ATTACHMENT0">
+    <Text>Target: GL_FRAMEBUFFER</Text>
+    <Text>Type: GL_RENDERBUFFER</Text>
+    <Text>Image Name: 3512</Text>
+    <Text>Renderbuffer Target: GL_RENDERBUFFER</Text>
+</Section>
+</Section>
+</Section>
+ <Section Name="Format" Description="Format info">
+  <Section Name="FormatInfo" Description="(format = GL_SRGB_ALPHA, type = GL_UNSIGNED_BYTE)">
+   <Text>* Valid texture format
+	* defined in supported extension(s):
+		- GL_EXT_sRGB
+</Text>
+   <Text>* Unsupported renderbuffer format
+	* no extension can make this format valid</Text>
+   <Text>* Format is allowed to be color-renderable but not required
+	* extensions that would make format color-renderable:
+		- GL_EXT_sRGB
+</Text>
+   <Text>* Format is NOT depth-renderable
+	* no extension can make this format depth-renderable</Text>
+   <Text>* Format is NOT stencil-renderable
+	* no extension can make this format stencil-renderable</Text>
+</Section>
+</Section>
+ <Section Name="Rules" Description="Active rules">
+  <Section Name="GL_INVALID_ENUM" Description="GL_INVALID_ENUM">
+   <Text>Rules:
+	 * Format (format = GL_SRGB_ALPHA, type = GL_UNSIGNED_BYTE) is not a valid format for a renderbuffer
+</Text>
+</Section>
+  <Section Name="GL_FRAMEBUFFER_INCOMPLETE_ATTACHMENT" Description="GL_FRAMEBUFFER_INCOMPLETE_ATTACHMENT">
+   <Text>Rules:
+	 * Attachment format is not required renderable
+</Text>
+</Section>
+</Section>
+ <Text>Expected one of GL_INVALID_ENUM (during FBO initialization) or GL_FRAMEBUFFER_INCOMPLETE_ATTACHMENT.</Text>
+ <Text>Received GL_FRAMEBUFFER_COMPLETE.</Text>
+ <Number Name="TestDuration" Description="Test case duration in microseconds" Tag="Time" Unit="us">3928</Number>
+ <Result StatusCode="Fail">Framebuffer checked as complete, expected incomplete</Result>
+</TestCaseResult>
+
+
+=== dEQP-GLES3.functional.fbo.completeness.renderable.texture.color0.rgb_unsigned_int_10f_11f_11f_rev
+<?xml version="1.0" encoding="UTF-8"?>
+<TestCaseResult CasePath="dEQP-GLES3.functional.fbo.completeness.renderable.texture.color0.rgb_unsigned_int_10f_11f_11f_rev" Version="0.3.4" CaseType="SelfValidate">
+ <Section Name="Framebuffer" Description="Framebuffer configuration">
+  <Section Name="3704" Description="Texture 3704">
+   <Text>Type: GL_TEXTURE_2D</Text>
+   <Text>Internal format: GL_RGB</Text>
+   <Text>Format type: GL_UNSIGNED_INT_10F_11F_11F_REV</Text>
+   <Text>Width: 64</Text>
+   <Text>Height: 64</Text>
+   <Text>Levels: 1</Text>
+</Section>
+  <Section Name="Attachments" Description="Framebuffer attachments">
+   <Section Name="GL_COLOR_ATTACHMENT0" Description="Attachment point GL_COLOR_ATTACHMENT0">
+    <Text>Target: GL_FRAMEBUFFER</Text>
+    <Text>Type: GL_TEXTURE</Text>
+    <Text>Image Name: 3704</Text>
+    <Text>Mipmap Level: 0</Text>
+    <Text>Texture Target: GL_TEXTURE_2D</Text>
+</Section>
+</Section>
+</Section>
+ <Section Name="Format" Description="Format info">
+  <Section Name="FormatInfo" Description="(format = GL_RGB, type = GL_UNSIGNED_INT_10F_11F_11F_REV)">
+   <Text>* Unsupported texture format
+	* requires any of the extensions or combinations:
+		- GL_NV_packed_float
+</Text>
+   <Text>* Unsupported renderbuffer format
+	* no extension can make this format valid</Text>
+   <Text>* Format is NOT color-renderable
+	* extensions that are allowed to make format color-renderable:
+		- GL_NV_packed_float
+</Text>
+   <Text>* Format is NOT depth-renderable
+	* no extension can make this format depth-renderable</Text>
+   <Text>* Format is NOT stencil-renderable
+	* no extension can make this format stencil-renderable</Text>
+</Section>
+</Section>
+ <Section Name="Rules" Description="Active rules">
+  <Section Name="GL_INVALID_ENUM" Description="GL_INVALID_ENUM">
+   <Text>Rules:
+	 * Format (format = GL_RGB, type = GL_UNSIGNED_INT_10F_11F_11F_REV) is not a legal format
+</Text>
+</Section>
+  <Section Name="GL_INVALID_OPERATION" Description="GL_INVALID_OPERATION">
+   <Text>Rules:
+	 * Format (format = GL_RGB, type = GL_UNSIGNED_INT_10F_11F_11F_REV) is not a legal format
+</Text>
+</Section>
+  <Section Name="GL_INVALID_VALUE" Description="GL_INVALID_VALUE">
+   <Text>Rules:
+	 * Format (format = GL_RGB, type = GL_UNSIGNED_INT_10F_11F_11F_REV) is not a legal format
+</Text>
+</Section>
+  <Section Name="GL_FRAMEBUFFER_INCOMPLETE_ATTACHMENT" Description="GL_FRAMEBUFFER_INCOMPLETE_ATTACHMENT">
+   <Text>Rules:
+	 * Attachment format is not legal
+</Text>
+</Section>
+</Section>
+ <Text>Expected one of GL_INVALID_ENUM (during FBO initialization), GL_INVALID_OPERATION (during FBO initialization), GL_INVALID_VALUE (during FBO initialization) or GL_FRAMEBUFFER_INCOMPLETE_ATTACHMENT.</Text>
+ <Text>Received GL_FRAMEBUFFER_COMPLETE.</Text>
+ <Number Name="TestDuration" Description="Test case duration in microseconds" Tag="Time" Unit="us">2486</Number>
+ <Result StatusCode="Fail">Framebuffer checked as complete, expected incomplete</Result>
+</TestCaseResult>
+
+
+=== dEQP-GLES3.functional.fbo.completeness.renderable.texture.color0.rgba_unsigned_int_2_10_10_10_rev
+<?xml version="1.0" encoding="UTF-8"?>
+<TestCaseResult CasePath="dEQP-GLES3.functional.fbo.completeness.renderable.texture.color0.rgba_unsigned_int_2_10_10_10_rev" Version="0.3.4" CaseType="SelfValidate">
+ <Section Name="Framebuffer" Description="Framebuffer configuration">
+  <Section Name="3708" Description="Texture 3708">
+   <Text>Type: GL_TEXTURE_2D</Text>
+   <Text>Internal format: GL_RGBA</Text>
+   <Text>Format type: GL_UNSIGNED_INT_2_10_10_10_REV</Text>
+   <Text>Width: 64</Text>
+   <Text>Height: 64</Text>
+   <Text>Levels: 1</Text>
+</Section>
+  <Section Name="Attachments" Description="Framebuffer attachments">
+   <Section Name="GL_COLOR_ATTACHMENT0" Description="Attachment point GL_COLOR_ATTACHMENT0">
+    <Text>Target: GL_FRAMEBUFFER</Text>
+    <Text>Type: GL_TEXTURE</Text>
+    <Text>Image Name: 3708</Text>
+    <Text>Mipmap Level: 0</Text>
+    <Text>Texture Target: GL_TEXTURE_2D</Text>
+</Section>
+</Section>
+</Section>
+ <Section Name="Format" Description="Format info">
+  <Section Name="FormatInfo" Description="(format = GL_RGBA, type = GL_UNSIGNED_INT_2_10_10_10_REV)">
+   <Text>* Unsupported texture format
+	* requires any of the extensions or combinations:
+		- GL_EXT_texture_type_2_10_10_10_REV
+</Text>
+   <Text>* Unsupported renderbuffer format
+	* no extension can make this format valid</Text>
+   <Text>* Format is NOT color-renderable
+	* no extension can make this format color-renderable</Text>
+   <Text>* Format is NOT depth-renderable
+	* no extension can make this format depth-renderable</Text>
+   <Text>* Format is NOT stencil-renderable
+	* no extension can make this format stencil-renderable</Text>
+</Section>
+</Section>
+ <Section Name="Rules" Description="Active rules">
+  <Section Name="GL_INVALID_ENUM" Description="GL_INVALID_ENUM">
+   <Text>Rules:
+	 * Format (format = GL_RGBA, type = GL_UNSIGNED_INT_2_10_10_10_REV) is not a legal format
+</Text>
+</Section>
+  <Section Name="GL_INVALID_OPERATION" Description="GL_INVALID_OPERATION">
+   <Text>Rules:
+	 * Format (format = GL_RGBA, type = GL_UNSIGNED_INT_2_10_10_10_REV) is not a legal format
+</Text>
+</Section>
+  <Section Name="GL_INVALID_VALUE" Description="GL_INVALID_VALUE">
+   <Text>Rules:
+	 * Format (format = GL_RGBA, type = GL_UNSIGNED_INT_2_10_10_10_REV) is not a legal format
+</Text>
+</Section>
+  <Section Name="GL_FRAMEBUFFER_INCOMPLETE_ATTACHMENT" Description="GL_FRAMEBUFFER_INCOMPLETE_ATTACHMENT">
+   <Text>Rules:
+	 * Attachment format is not legal
+</Text>
+</Section>
+</Section>
+ <Text>Expected one of GL_INVALID_ENUM (during FBO initialization), GL_INVALID_OPERATION (during FBO initialization), GL_INVALID_VALUE (during FBO initialization) or GL_FRAMEBUFFER_INCOMPLETE_ATTACHMENT.</Text>
+ <Text>Received GL_FRAMEBUFFER_COMPLETE.</Text>
+ <Number Name="TestDuration" Description="Test case duration in microseconds" Tag="Time" Unit="us">3974</Number>
+ <Result StatusCode="Fail">Framebuffer checked as complete, expected incomplete</Result>
+</TestCaseResult>
+
+
+=== dEQP-GLES3.functional.fbo.completeness.size.zero
+<?xml version="1.0" encoding="UTF-8"?>
+<TestCaseResult CasePath="dEQP-GLES3.functional.fbo.completeness.size.zero" Version="0.3.4" CaseType="SelfValidate">
+ <Section Name="Framebuffer" Description="Framebuffer configuration">
+  <Section Name="4455" Description="Renderbuffer 4455">
+   <Text>Internal format: GL_RGB8</Text>
+   <Text>Width: 0</Text>
+   <Text>Height: 0</Text>
+   <Text>Samples: 0</Text>
+</Section>
+  <Section Name="Attachments" Description="Framebuffer attachments">
+   <Section Name="GL_COLOR_ATTACHMENT0" Description="Attachment point GL_COLOR_ATTACHMENT0">
+    <Text>Target: GL_FRAMEBUFFER</Text>
+    <Text>Type: GL_RENDERBUFFER</Text>
+    <Text>Image Name: 4455</Text>
+    <Text>Renderbuffer Target: GL_RENDERBUFFER</Text>
+</Section>
+</Section>
+</Section>
+ <Section Name="Format" Description="Format info">
+  <Section Name="FormatInfo" Description="GL_RGB8">
+   <Text>* Valid texture format
+	* core feature</Text>
+   <Text>* Valid renderbuffer format
+	* core feature</Text>
+   <Text>* Format is color-renderable
+	* core feature</Text>
+   <Text>* Format is NOT depth-renderable
+	* no extension can make this format depth-renderable</Text>
+   <Text>* Format is NOT stencil-renderable
+	* no extension can make this format stencil-renderable</Text>
+</Section>
+</Section>
+ <Section Name="Rules" Description="Active rules">
+  <Section Name="GL_FRAMEBUFFER_INCOMPLETE_ATTACHMENT" Description="GL_FRAMEBUFFER_INCOMPLETE_ATTACHMENT">
+   <Text>Rules:
+	 * Width and height of an image are not non-zero
+</Text>
+</Section>
+</Section>
+ <Text>Expected GL_FRAMEBUFFER_INCOMPLETE_ATTACHMENT.</Text>
+ <Text>Received GL_FRAMEBUFFER_COMPLETE.</Text>
+ <Number Name="TestDuration" Description="Test case duration in microseconds" Tag="Time" Unit="us">1972</Number>
+ <Result StatusCode="Fail">Framebuffer checked as complete, expected incomplete</Result>
+</TestCaseResult>
+
+
+=== dEQP-GLES3.functional.fbo.invalidate.sub.unbind_read_depth
+<?xml version="1.0" encoding="UTF-8"?>
+<TestCaseResult CasePath="dEQP-GLES3.functional.fbo.invalidate.sub.unbind_read_depth" Version="0.3.4" CaseType="SelfValidate">
+ <Text>glGenTextures(1, 0x000000016fa15f18);</Text>
+ <Text>// textures = { 14612 }</Text>
+ <Text>glBindTexture(GL_TEXTURE_2D, 14612);</Text>
+ <Text>glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, 128, 128, 0, GL_RGBA, GL_UNSIGNED_BYTE, 0);</Text>
+ <Text>glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);</Text>
+ <Text>glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);</Text>
+ <Text>glGenTextures(1, 0x000000016fa15f14);</Text>
+ <Text>// textures = { 14613 }</Text>
+ <Text>glBindTexture(GL_TEXTURE_2D, 14613);</Text>
+ <Text>glTexImage2D(GL_TEXTURE_2D, 0, GL_DEPTH24_STENCIL8, 128, 128, 0, GL_DEPTH_STENCIL, GL_UNSIGNED_INT_24_8, 0);</Text>
+ <Text>glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);</Text>
+ <Text>glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);</Text>
+ <Text>glGenFramebuffers(1, 0x000000016fa15f1c);</Text>
+ <Text>// framebuffers = { 3059 }</Text>
+ <Text>glBindFramebuffer(GL_FRAMEBUFFER, 3059);</Text>
+ <Text>glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, 14612, 0);</Text>
+ <Text>glFramebufferTexture2D(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_TEXTURE_2D, 14613, 0);</Text>
+ <Text>glFramebufferTexture2D(GL_FRAMEBUFFER, GL_STENCIL_ATTACHMENT, GL_TEXTURE_2D, 14613, 0);</Text>
+ <Text>glCheckFramebufferStatus(GL_FRAMEBUFFER);</Text>
+ <Text>// GL_FRAMEBUFFER_COMPLETE returned</Text>
+ <Text>glClearBufferfv(GL_COLOR, 0, 0x000000016fa15c30);</Text>
+ <Text>glClear(GL_DEPTH_BUFFER_BIT|GL_STENCIL_BUFFER_BIT);</Text>
+ <Text>glEnable(GL_DEPTH_TEST);</Text>
+ <Text>glEnable(GL_STENCIL_TEST);</Text>
+ <Text>glStencilOp(GL_KEEP, GL_KEEP, GL_REPLACE);</Text>
+ <Text>glStencilFunc(GL_ALWAYS, 1, 255);</Text>
+ <Text>glUseProgram(14609);</Text>
+ <Text>glGetUniformLocation(14609, u_gradientMin);</Text>
+ <Text>// 0 returned</Text>
+ <Text>glUniform4fv(0, 1, { 0, 0, 0, 0 });</Text>
+ <Text>glGetUniformLocation(14609, u_gradientMax);</Text>
+ <Text>// 1 returned</Text>
+ <Text>glUniform4fv(1, 1, { 1, 1, 1, 1 });</Text>
+ <Text>glGetAttribLocation(14609, a_position);</Text>
+ <Text>// 0 returned</Text>
+ <Text>glGetAttribLocation(14609, a_coord);</Text>
+ <Text>// 1 returned</Text>
+ <Text>glUseProgram(14609);</Text>
+ <Text>glEnableVertexAttribArray(0);</Text>
+ <Text>glVertexAttribPointer(0, 4, GL_FLOAT, GL_FALSE, 0, 0x16fa15b58);</Text>
+ <Text>glEnableVertexAttribArray(1);</Text>
+ <Text>glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 0, 0x16fa15b30);</Text>
+ <Text>glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_SHORT, 0x16fa15b20);</Text>
+ <Text>glDisableVertexAttribArray(0);</Text>
+ <Text>glDisableVertexAttribArray(1);</Text>
+ <Text>glInvalidateSubFramebuffer(GL_FRAMEBUFFER, 1, { GL_DEPTH_ATTACHMENT }, 0, 0, 64, 128)</Text>
+ <Text>glBindFramebuffer(GL_FRAMEBUFFER, 0);</Text>
+ <Text>glDisable(GL_DEPTH_TEST);</Text>
+ <Text>glDisable(GL_STENCIL_TEST);</Text>
+ <Text>glClearColor(0.25, 0.5, 0.75, 1);</Text>
+ <Text>glClear(GL_DEPTH_BUFFER_BIT|GL_STENCIL_BUFFER_BIT|GL_COLOR_BUFFER_BIT);</Text>
+ <Text>glScissor(64, 0, 64, 128);</Text>
+ <Text>glEnable(GL_SCISSOR_TEST);</Text>
+ <Text>glUseProgram(14614);</Text>
+ <Text>glGetUniformLocation(14614, u_sampler0);</Text>
+ <Text>// 0 returned</Text>
+ <Text>glUniform1i(0, 0);</Text>
+ <Text>glGetUniformLocation(14614, u_texScale0);</Text>
+ <Text>// 1 returned</Text>
+ <Text>glUniform4fv(1, 1, { 1, 1, 1, 1 });</Text>
+ <Text>glGetUniformLocation(14614, u_texBias0);</Text>
+ <Text>// 2 returned</Text>
+ <Text>glUniform4fv(2, 1, { 0, 0, 0, 0 });</Text>
+ <Text>glGetUniformLocation(14614, u_outScale0);</Text>
+ <Text>// 3 returned</Text>
+ <Text>glUniform4fv(3, 1, { 1, 1, 1, 1 });</Text>
+ <Text>glGetUniformLocation(14614, u_outBias0);</Text>
+ <Text>// 4 returned</Text>
+ <Text>glUniform4fv(4, 1, { 0, 0, 0, 0 });</Text>
+ <Text>glBindTexture(GL_TEXTURE_2D, 14613);</Text>
+ <Text>glGetAttribLocation(14614, a_position);</Text>
+ <Text>// 0 returned</Text>
+ <Text>glGetAttribLocation(14614, a_coord);</Text>
+ <Text>// 1 returned</Text>
+ <Text>glUseProgram(14614);</Text>
+ <Text>glEnableVertexAttribArray(0);</Text>
+ <Text>glVertexAttribPointer(0, 4, GL_FLOAT, GL_FALSE, 0, 0x16fa15b58);</Text>
+ <Text>glEnableVertexAttribArray(1);</Text>
+ <Text>glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 0, 0x16fa15b30);</Text>
+ <Text>glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_SHORT, 0x16fa15b20);</Text>
+ <Text>glDisableVertexAttribArray(0);</Text>
+ <Text>glDisableVertexAttribArray(1);</Text>
+ <Text>glReadPixels(0, 0, 128, 128, GL_RGBA, GL_UNSIGNED_BYTE, 0x728b1c010)</Text>
+ <Text>glGetError();</Text>
+ <Text>// GL_NO_ERROR returned</Text>
+ <Text>Image comparison failed, threshold = RGBA(12, 12, 12, 12)</Text>
+ <ImageSet Name="Result" Description="Image comparison result">
+  <Image Name="Result" Width="128" Height="128" Format="RGBA8888" CompressionMode="PNG" Description="Result">
+   iVBORw0KGgoAAAANSUhEUgAAAIAAAACACAYAAADDPmHLAAAC3UlEQVR4nO3UW2rc
+   ABQE0ZZXlqUZb8x4ZclPwAO2x/OQVC3dargQEmdGSh2y/Hl9/5vBWz7esizL2Huh
+   A9CjA5CXRAB0BDK+/wNkJoDL9xZAQRAqvgAyC8B37yuAgjBUfAFkBoBr7ymAgkBU
+   fAHk3ABueT8BFISi4gsg5wRwz3sJoCAYFV8AOReAR95HAAXhqPgCyDkAPPMeAigI
+   SMUXQI4NYI3nF0BBSCq+AHJMAGs+twAKglLxBZBjAdjieQVQEJaKL4AcA8CWzymA
+   gsBUfAGkG8AezyeAgtBUfAGkE8CezyWAguBUfAGkCwDxPAIoCE/FF0A6AJDPIYDB
+   8QUQ9h+f/n4BhAtAfrcALjY5vgCyfwjiOwVwZZPjCyD7BdnzuwRwxybHF0C2D7PH
+   dwjgiU2OL4BsF2jLzxbAipscXwBZP9QWnymADTc5vgCyXrA1P0sAO25yfAHk+XBr
+   fIYAwE2OL4A8HvCZv9t0AhgcXwC5P+Qjf6f5BDA4vgBye9B7fvZIJ4DB8QWQ38Pe
+   8jNHPgEMji+A/Bz42p+d6QQwOL4A8jX0d7935hPA4PgCyGfwy19POgEMji+A/6Mj
+   CAAcHYA+ARREEAA4OgB9AiiIIABwdAD6BFAQQQDg6AD0CaAgggDA0QHoE0BBBAGA
+   owPQJ4CCCAIARwegTwAFEQQAjg5AnwAKIggAHB2APgEURBAAODoAfQIoiCAAcHQA
+   +gRQEEEA4OgA9AmgIIIAwNEB6BNAQQQBgKMD0CeAgggCAEcHoE8ABREEAI4OQJ8A
+   CiIIABwdgD4BFEQQADg6AH0CKIggAHB0APoEUBBBAODoAPQJoCCCAMDRAegTQEEE
+   AYCjA9AngIIIAgBHB6BPAAURBACODkCfAAoiCAAcHYA+ARREEAA4OgB9AiiIIABw
+   dAD6BFAQQQDg6AD0CaAgggDA0QHoE0BBBAGAowPQJ4CCCAIARwegTwAFEQQAjg5A
+   3z+jF2P/QFV1rAAAAABJRU5ErkJggg==
+</Image>
+  <Image Name="Reference" Width="128" Height="128" Format="RGBA8888" CompressionMode="PNG" Description="Result">
+   iVBORw0KGgoAAAANSUhEUgAAAIAAAACACAYAAADDPmHLAAACAUlEQVR4nO3U0QlC
+   QRTE0KyVaWevM0t7/liCMEhyYRrYHPY8r/eN+M714oB2jx+84V/fOsByEIB5hGX8
+   fgD2IZbxA8A+xjJ+ANgHWcYPAPsoy/gBYB9mGT8A7OMs4weAfaBl/ACwj7SMHwD2
+   oZbxA8A+1jJ+ANgHW8YPAPtoy/gBYB9uGT8A7OMt4weAfcBl/ACwj7iMHwD2IZfx
+   A8A+5jJ+ANgHXcYPAPuoy/gBYB92GT8A7OMu4weAfeBl/ACwj7yMHwD2oZfxA8A+
+   9jJ+ANgHX8YPAPvoy/gBYB9+GT8AuOMHAHf8AOCOHwDc8QOAO34AcMcPAO74AcAd
+   PwC44wcAd/wA4I4fANzxA4A7fgBwxw8A7vgBwB0/ALjjBwB3/ADgjh8A3PEDgDt+
+   AHDHDwDu+AHAHT8AuOMHAHf8AOCOHwDc8QOAO34AcMcPAO74AcAdPwDfW0cIwPDW
+   AdYLgHwBkC8A8gVAvgDIFwD5AiBfAOQLgHwBkC8A8gVAvgDIFwD5AiBfAOQLgHwB
+   kC8A8gVAvgDIFwD5AiBfAOQLgHwBkC8A8gVAvgDIFwD5AiBfAOQLgHwBkC8A8gVA
+   vgDIFwD5AiBfAOQLgHwBkC8A8gVAvgDIFwD5AiBfAOQLgHwBkC8A8gVAvgDIFwD5
+   AiBfAOQLgHwBkC8A8gVAvgDIFwD5PvK6I/8pSVsdAAAAAElFTkSuQmCC
+</Image>
+  <Image Name="ErrorMask" Width="128" Height="128" Format="RGB888" CompressionMode="PNG" Description="Result">
+   iVBORw0KGgoAAAANSUhEUgAAAIAAAACACAIAAABMXPacAAABMklEQVR4nO3RQQkA
+   IADAQLV/Zw3h4xB3CQabY4+n7akL7iwd8LsGYA3AGoA1AGsA1gCsAVgDsAZgDcAa
+   gDUAawDWAKwBWAOwBmANwBqANQBrANYArAFYA7AGYA3AGoA1AGsA1gCsAVgDsAZg
+   DcAagDUAawDWAKwBWAOwBmANwBqANQBrANYArAFYA7AGYA3AGoA1AGsA1gCsAVgD
+   sAZgDcAagDUAawDWAKwBWAOwBmANwBqANQBrANYArAFYA7AGYA3AGoA1AGsA1gCs
+   AVgDsAZgDcAagDUAawDWAKwBWAOwBmANwBqANQBrANYArAFYA7AGYA3AGoA1AGsA
+   1gCsAVgDsAZgDcAagDUAawDWAKwBWAOwBmANwBqANQBrANYArAFYA7AGYA3AGoA1
+   AGsA1gDsAJkhAv9fbBLiAAAAAElFTkSuQmCC
+</Image>
+</ImageSet>
+ <Number Name="TestDuration" Description="Test case duration in microseconds" Tag="Time" Unit="us">28126</Number>
+ <Result StatusCode="Fail">Image comparison failed</Result>
+</TestCaseResult>
+
+
+=== dEQP-GLES3.functional.fbo.invalidate.sub.unbind_read_depth_stencil
+<?xml version="1.0" encoding="UTF-8"?>
+<TestCaseResult CasePath="dEQP-GLES3.functional.fbo.invalidate.sub.unbind_read_depth_stencil" Version="0.3.4" CaseType="SelfValidate">
+ <Text>glGenTextures(1, 0x000000016fa15f18);</Text>
+ <Text>// textures = { 14628 }</Text>
+ <Text>glBindTexture(GL_TEXTURE_2D, 14628);</Text>
+ <Text>glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, 128, 128, 0, GL_RGBA, GL_UNSIGNED_BYTE, 0);</Text>
+ <Text>glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);</Text>
+ <Text>glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);</Text>
+ <Text>glGenTextures(1, 0x000000016fa15f14);</Text>
+ <Text>// textures = { 14629 }</Text>
+ <Text>glBindTexture(GL_TEXTURE_2D, 14629);</Text>
+ <Text>glTexImage2D(GL_TEXTURE_2D, 0, GL_DEPTH24_STENCIL8, 128, 128, 0, GL_DEPTH_STENCIL, GL_UNSIGNED_INT_24_8, 0);</Text>
+ <Text>glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);</Text>
+ <Text>glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);</Text>
+ <Text>glGenFramebuffers(1, 0x000000016fa15f1c);</Text>
+ <Text>// framebuffers = { 3061 }</Text>
+ <Text>glBindFramebuffer(GL_FRAMEBUFFER, 3061);</Text>
+ <Text>glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, 14628, 0);</Text>
+ <Text>glFramebufferTexture2D(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_TEXTURE_2D, 14629, 0);</Text>
+ <Text>glFramebufferTexture2D(GL_FRAMEBUFFER, GL_STENCIL_ATTACHMENT, GL_TEXTURE_2D, 14629, 0);</Text>
+ <Text>glCheckFramebufferStatus(GL_FRAMEBUFFER);</Text>
+ <Text>// GL_FRAMEBUFFER_COMPLETE returned</Text>
+ <Text>glClearBufferfv(GL_COLOR, 0, 0x000000016fa15c30);</Text>
+ <Text>glClear(GL_DEPTH_BUFFER_BIT|GL_STENCIL_BUFFER_BIT);</Text>
+ <Text>glEnable(GL_DEPTH_TEST);</Text>
+ <Text>glEnable(GL_STENCIL_TEST);</Text>
+ <Text>glStencilOp(GL_KEEP, GL_KEEP, GL_REPLACE);</Text>
+ <Text>glStencilFunc(GL_ALWAYS, 1, 255);</Text>
+ <Text>glUseProgram(14625);</Text>
+ <Text>glGetUniformLocation(14625, u_gradientMin);</Text>
+ <Text>// 0 returned</Text>
+ <Text>glUniform4fv(0, 1, { 0, 0, 0, 0 });</Text>
+ <Text>glGetUniformLocation(14625, u_gradientMax);</Text>
+ <Text>// 1 returned</Text>
+ <Text>glUniform4fv(1, 1, { 1, 1, 1, 1 });</Text>
+ <Text>glGetAttribLocation(14625, a_position);</Text>
+ <Text>// 0 returned</Text>
+ <Text>glGetAttribLocation(14625, a_coord);</Text>
+ <Text>// 1 returned</Text>
+ <Text>glUseProgram(14625);</Text>
+ <Text>glEnableVertexAttribArray(0);</Text>
+ <Text>glVertexAttribPointer(0, 4, GL_FLOAT, GL_FALSE, 0, 0x16fa15b58);</Text>
+ <Text>glEnableVertexAttribArray(1);</Text>
+ <Text>glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 0, 0x16fa15b30);</Text>
+ <Text>glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_SHORT, 0x16fa15b20);</Text>
+ <Text>glDisableVertexAttribArray(0);</Text>
+ <Text>glDisableVertexAttribArray(1);</Text>
+ <Text>glInvalidateSubFramebuffer(GL_FRAMEBUFFER, 1, { GL_DEPTH_STENCIL_ATTACHMENT }, 0, 0, 64, 128)</Text>
+ <Text>glBindFramebuffer(GL_FRAMEBUFFER, 0);</Text>
+ <Text>glDisable(GL_DEPTH_TEST);</Text>
+ <Text>glDisable(GL_STENCIL_TEST);</Text>
+ <Text>glClearColor(0.25, 0.5, 0.75, 1);</Text>
+ <Text>glClear(GL_DEPTH_BUFFER_BIT|GL_STENCIL_BUFFER_BIT|GL_COLOR_BUFFER_BIT);</Text>
+ <Text>glScissor(64, 0, 64, 128);</Text>
+ <Text>glEnable(GL_SCISSOR_TEST);</Text>
+ <Text>glUseProgram(14630);</Text>
+ <Text>glGetUniformLocation(14630, u_sampler0);</Text>
+ <Text>// 0 returned</Text>
+ <Text>glUniform1i(0, 0);</Text>
+ <Text>glGetUniformLocation(14630, u_texScale0);</Text>
+ <Text>// 1 returned</Text>
+ <Text>glUniform4fv(1, 1, { 1, 1, 1, 1 });</Text>
+ <Text>glGetUniformLocation(14630, u_texBias0);</Text>
+ <Text>// 2 returned</Text>
+ <Text>glUniform4fv(2, 1, { 0, 0, 0, 0 });</Text>
+ <Text>glGetUniformLocation(14630, u_outScale0);</Text>
+ <Text>// 3 returned</Text>
+ <Text>glUniform4fv(3, 1, { 1, 1, 1, 1 });</Text>
+ <Text>glGetUniformLocation(14630, u_outBias0);</Text>
+ <Text>// 4 returned</Text>
+ <Text>glUniform4fv(4, 1, { 0, 0, 0, 0 });</Text>
+ <Text>glBindTexture(GL_TEXTURE_2D, 14629);</Text>
+ <Text>glGetAttribLocation(14630, a_position);</Text>
+ <Text>// 0 returned</Text>
+ <Text>glGetAttribLocation(14630, a_coord);</Text>
+ <Text>// 1 returned</Text>
+ <Text>glUseProgram(14630);</Text>
+ <Text>glEnableVertexAttribArray(0);</Text>
+ <Text>glVertexAttribPointer(0, 4, GL_FLOAT, GL_FALSE, 0, 0x16fa15b58);</Text>
+ <Text>glEnableVertexAttribArray(1);</Text>
+ <Text>glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 0, 0x16fa15b30);</Text>
+ <Text>glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_SHORT, 0x16fa15b20);</Text>
+ <Text>glDisableVertexAttribArray(0);</Text>
+ <Text>glDisableVertexAttribArray(1);</Text>
+ <Text>glReadPixels(0, 0, 128, 128, GL_RGBA, GL_UNSIGNED_BYTE, 0x728b1c010)</Text>
+ <Text>glGetError();</Text>
+ <Text>// GL_NO_ERROR returned</Text>
+ <Text>Image comparison failed, threshold = RGBA(12, 12, 12, 12)</Text>
+ <ImageSet Name="Result" Description="Image comparison result">
+  <Image Name="Result" Width="128" Height="128" Format="RGBA8888" CompressionMode="PNG" Description="Result">
+   iVBORw0KGgoAAAANSUhEUgAAAIAAAACACAYAAADDPmHLAAAC3UlEQVR4nO3UW2rc
+   ABQE0ZZXlqUZb8x4ZclPwAO2x/OQVC3dargQEmdGSh2y/Hl9/5vBWz7esizL2Huh
+   A9CjA5CXRAB0BDK+/wNkJoDL9xZAQRAqvgAyC8B37yuAgjBUfAFkBoBr7ymAgkBU
+   fAHk3ABueT8BFISi4gsg5wRwz3sJoCAYFV8AOReAR95HAAXhqPgCyDkAPPMeAigI
+   SMUXQI4NYI3nF0BBSCq+AHJMAGs+twAKglLxBZBjAdjieQVQEJaKL4AcA8CWzymA
+   gsBUfAGkG8AezyeAgtBUfAGkE8CezyWAguBUfAGkCwDxPAIoCE/FF0A6AJDPIYDB
+   8QUQ9h+f/n4BhAtAfrcALjY5vgCyfwjiOwVwZZPjCyD7BdnzuwRwxybHF0C2D7PH
+   dwjgiU2OL4BsF2jLzxbAipscXwBZP9QWnymADTc5vgCyXrA1P0sAO25yfAHk+XBr
+   fIYAwE2OL4A8HvCZv9t0AhgcXwC5P+Qjf6f5BDA4vgBye9B7fvZIJ4DB8QWQ38Pe
+   8jNHPgEMji+A/Bz42p+d6QQwOL4A8jX0d7935hPA4PgCyGfwy19POgEMji+A/6Mj
+   CAAcHYA+ARREEAA4OgB9AiiIIABwdAD6BFAQQQDg6AD0CaAgggDA0QHoE0BBBAGA
+   owPQJ4CCCAIARwegTwAFEQQAjg5AnwAKIggAHB2APgEURBAAODoAfQIoiCAAcHQA
+   +gRQEEEA4OgA9AmgIIIAwNEB6BNAQQQBgKMD0CeAgggCAEcHoE8ABREEAI4OQJ8A
+   CiIIABwdgD4BFEQQADg6AH0CKIggAHB0APoEUBBBAODoAPQJoCCCAMDRAegTQEEE
+   AYCjA9AngIIIAgBHB6BPAAURBACODkCfAAoiCAAcHYA+ARREEAA4OgB9AiiIIABw
+   dAD6BFAQQQDg6AD0CaAgggDA0QHoE0BBBAGAowPQJ4CCCAIARwegTwAFEQQAjg5A
+   3z+jF2P/QFV1rAAAAABJRU5ErkJggg==
+</Image>
+  <Image Name="Reference" Width="128" Height="128" Format="RGBA8888" CompressionMode="PNG" Description="Result">
+   iVBORw0KGgoAAAANSUhEUgAAAIAAAACACAYAAADDPmHLAAACAUlEQVR4nO3U0QlC
+   QRTE0KyVaWevM0t7/liCMEhyYRrYHPY8r/eN+M714oB2jx+84V/fOsByEIB5hGX8
+   fgD2IZbxA8A+xjJ+ANgHWcYPAPsoy/gBYB9mGT8A7OMs4weAfaBl/ACwj7SMHwD2
+   oZbxA8A+1jJ+ANgHW8YPAPtoy/gBYB9uGT8A7OMt4weAfcBl/ACwj7iMHwD2IZfx
+   A8A+5jJ+ANgHXcYPAPuoy/gBYB92GT8A7OMu4weAfeBl/ACwj7yMHwD2oZfxA8A+
+   9jJ+ANgHX8YPAPvoy/gBYB9+GT8AuOMHAHf8AOCOHwDc8QOAO34AcMcPAO74AcAd
+   PwC44wcAd/wA4I4fANzxA4A7fgBwxw8A7vgBwB0/ALjjBwB3/ADgjh8A3PEDgDt+
+   AHDHDwDu+AHAHT8AuOMHAHf8AOCOHwDc8QOAO34AcMcPAO74AcAdPwDfW0cIwPDW
+   AdYLgHwBkC8A8gVAvgDIFwD5AiBfAOQLgHwBkC8A8gVAvgDIFwD5AiBfAOQLgHwB
+   kC8A8gVAvgDIFwD5AiBfAOQLgHwBkC8A8gVAvgDIFwD5AiBfAOQLgHwBkC8A8gVA
+   vgDIFwD5AiBfAOQLgHwBkC8A8gVAvgDIFwD5AiBfAOQLgHwBkC8A8gVAvgDIFwD5
+   AiBfAOQLgHwBkC8A8gVAvgDIFwD5PvK6I/8pSVsdAAAAAElFTkSuQmCC
+</Image>
+  <Image Name="ErrorMask" Width="128" Height="128" Format="RGB888" CompressionMode="PNG" Description="Result">
+   iVBORw0KGgoAAAANSUhEUgAAAIAAAACACAIAAABMXPacAAABMklEQVR4nO3RQQkA
+   IADAQLV/Zw3h4xB3CQabY4+n7akL7iwd8LsGYA3AGoA1AGsA1gCsAVgDsAZgDcAa
+   gDUAawDWAKwBWAOwBmANwBqANQBrANYArAFYA7AGYA3AGoA1AGsA1gCsAVgDsAZg
+   DcAagDUAawDWAKwBWAOwBmANwBqANQBrANYArAFYA7AGYA3AGoA1AGsA1gCsAVgD
+   sAZgDcAagDUAawDWAKwBWAOwBmANwBqANQBrANYArAFYA7AGYA3AGoA1AGsA1gCs
+   AVgDsAZgDcAagDUAawDWAKwBWAOwBmANwBqANQBrANYArAFYA7AGYA3AGoA1AGsA
+   1gCsAVgDsAZgDcAagDUAawDWAKwBWAOwBmANwBqANQBrANYArAFYA7AGYA3AGoA1
+   AGsA1gDsAJkhAv9fbBLiAAAAAElFTkSuQmCC
+</Image>
+</ImageSet>
+ <Number Name="TestDuration" Description="Test case duration in microseconds" Tag="Time" Unit="us">49960</Number>
+ <Result StatusCode="Fail">Image comparison failed</Result>
+</TestCaseResult>
+
+
+=== dEQP-GLES3.functional.fbo.invalidate.sub.unbind_read_stencil
+<?xml version="1.0" encoding="UTF-8"?>
+<TestCaseResult CasePath="dEQP-GLES3.functional.fbo.invalidate.sub.unbind_read_stencil" Version="0.3.4" CaseType="SelfValidate">
+ <Text>glGenTextures(1, 0x000000016fa15f18);</Text>
+ <Text>// textures = { 14620 }</Text>
+ <Text>glBindTexture(GL_TEXTURE_2D, 14620);</Text>
+ <Text>glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, 128, 128, 0, GL_RGBA, GL_UNSIGNED_BYTE, 0);</Text>
+ <Text>glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);</Text>
+ <Text>glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);</Text>
+ <Text>glGenTextures(1, 0x000000016fa15f14);</Text>
+ <Text>// textures = { 14621 }</Text>
+ <Text>glBindTexture(GL_TEXTURE_2D, 14621);</Text>
+ <Text>glTexImage2D(GL_TEXTURE_2D, 0, GL_DEPTH24_STENCIL8, 128, 128, 0, GL_DEPTH_STENCIL, GL_UNSIGNED_INT_24_8, 0);</Text>
+ <Text>glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);</Text>
+ <Text>glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);</Text>
+ <Text>glGenFramebuffers(1, 0x000000016fa15f1c);</Text>
+ <Text>// framebuffers = { 3060 }</Text>
+ <Text>glBindFramebuffer(GL_FRAMEBUFFER, 3060);</Text>
+ <Text>glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, 14620, 0);</Text>
+ <Text>glFramebufferTexture2D(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_TEXTURE_2D, 14621, 0);</Text>
+ <Text>glFramebufferTexture2D(GL_FRAMEBUFFER, GL_STENCIL_ATTACHMENT, GL_TEXTURE_2D, 14621, 0);</Text>
+ <Text>glCheckFramebufferStatus(GL_FRAMEBUFFER);</Text>
+ <Text>// GL_FRAMEBUFFER_COMPLETE returned</Text>
+ <Text>glClearBufferfv(GL_COLOR, 0, 0x000000016fa15c30);</Text>
+ <Text>glClear(GL_DEPTH_BUFFER_BIT|GL_STENCIL_BUFFER_BIT);</Text>
+ <Text>glEnable(GL_DEPTH_TEST);</Text>
+ <Text>glEnable(GL_STENCIL_TEST);</Text>
+ <Text>glStencilOp(GL_KEEP, GL_KEEP, GL_REPLACE);</Text>
+ <Text>glStencilFunc(GL_ALWAYS, 1, 255);</Text>
+ <Text>glUseProgram(14617);</Text>
+ <Text>glGetUniformLocation(14617, u_gradientMin);</Text>
+ <Text>// 0 returned</Text>
+ <Text>glUniform4fv(0, 1, { 0, 0, 0, 0 });</Text>
+ <Text>glGetUniformLocation(14617, u_gradientMax);</Text>
+ <Text>// 1 returned</Text>
+ <Text>glUniform4fv(1, 1, { 1, 1, 1, 1 });</Text>
+ <Text>glGetAttribLocation(14617, a_position);</Text>
+ <Text>// 0 returned</Text>
+ <Text>glGetAttribLocation(14617, a_coord);</Text>
+ <Text>// 1 returned</Text>
+ <Text>glUseProgram(14617);</Text>
+ <Text>glEnableVertexAttribArray(0);</Text>
+ <Text>glVertexAttribPointer(0, 4, GL_FLOAT, GL_FALSE, 0, 0x16fa15b58);</Text>
+ <Text>glEnableVertexAttribArray(1);</Text>
+ <Text>glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 0, 0x16fa15b30);</Text>
+ <Text>glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_SHORT, 0x16fa15b20);</Text>
+ <Text>glDisableVertexAttribArray(0);</Text>
+ <Text>glDisableVertexAttribArray(1);</Text>
+ <Text>glInvalidateSubFramebuffer(GL_FRAMEBUFFER, 1, { GL_STENCIL_ATTACHMENT }, 0, 0, 64, 128)</Text>
+ <Text>glBindFramebuffer(GL_FRAMEBUFFER, 0);</Text>
+ <Text>glDisable(GL_DEPTH_TEST);</Text>
+ <Text>glDisable(GL_STENCIL_TEST);</Text>
+ <Text>glClearColor(0.25, 0.5, 0.75, 1);</Text>
+ <Text>glClear(GL_DEPTH_BUFFER_BIT|GL_STENCIL_BUFFER_BIT|GL_COLOR_BUFFER_BIT);</Text>
+ <Text>glScissor(64, 0, 64, 128);</Text>
+ <Text>glEnable(GL_SCISSOR_TEST);</Text>
+ <Text>glUseProgram(14622);</Text>
+ <Text>glGetUniformLocation(14622, u_sampler0);</Text>
+ <Text>// 0 returned</Text>
+ <Text>glUniform1i(0, 0);</Text>
+ <Text>glGetUniformLocation(14622, u_texScale0);</Text>
+ <Text>// 1 returned</Text>
+ <Text>glUniform4fv(1, 1, { 1, 1, 1, 1 });</Text>
+ <Text>glGetUniformLocation(14622, u_texBias0);</Text>
+ <Text>// 2 returned</Text>
+ <Text>glUniform4fv(2, 1, { 0, 0, 0, 0 });</Text>
+ <Text>glGetUniformLocation(14622, u_outScale0);</Text>
+ <Text>// 3 returned</Text>
+ <Text>glUniform4fv(3, 1, { 1, 1, 1, 1 });</Text>
+ <Text>glGetUniformLocation(14622, u_outBias0);</Text>
+ <Text>// 4 returned</Text>
+ <Text>glUniform4fv(4, 1, { 0, 0, 0, 0 });</Text>
+ <Text>glBindTexture(GL_TEXTURE_2D, 14621);</Text>
+ <Text>glGetAttribLocation(14622, a_position);</Text>
+ <Text>// 0 returned</Text>
+ <Text>glGetAttribLocation(14622, a_coord);</Text>
+ <Text>// 1 returned</Text>
+ <Text>glUseProgram(14622);</Text>
+ <Text>glEnableVertexAttribArray(0);</Text>
+ <Text>glVertexAttribPointer(0, 4, GL_FLOAT, GL_FALSE, 0, 0x16fa15b58);</Text>
+ <Text>glEnableVertexAttribArray(1);</Text>
+ <Text>glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 0, 0x16fa15b30);</Text>
+ <Text>glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_SHORT, 0x16fa15b20);</Text>
+ <Text>glDisableVertexAttribArray(0);</Text>
+ <Text>glDisableVertexAttribArray(1);</Text>
+ <Text>glReadPixels(0, 0, 128, 128, GL_RGBA, GL_UNSIGNED_BYTE, 0x728b1c010)</Text>
+ <Text>glGetError();</Text>
+ <Text>// GL_NO_ERROR returned</Text>
+ <Text>Image comparison failed, threshold = RGBA(12, 12, 12, 12)</Text>
+ <ImageSet Name="Result" Description="Image comparison result">
+  <Image Name="Result" Width="128" Height="128" Format="RGBA8888" CompressionMode="PNG" Description="Result">
+   iVBORw0KGgoAAAANSUhEUgAAAIAAAACACAYAAADDPmHLAAAC3UlEQVR4nO3UW2rc
+   ABQE0ZZXlqUZb8x4ZclPwAO2x/OQVC3dargQEmdGSh2y/Hl9/5vBWz7esizL2Huh
+   A9CjA5CXRAB0BDK+/wNkJoDL9xZAQRAqvgAyC8B37yuAgjBUfAFkBoBr7ymAgkBU
+   fAHk3ABueT8BFISi4gsg5wRwz3sJoCAYFV8AOReAR95HAAXhqPgCyDkAPPMeAigI
+   SMUXQI4NYI3nF0BBSCq+AHJMAGs+twAKglLxBZBjAdjieQVQEJaKL4AcA8CWzymA
+   gsBUfAGkG8AezyeAgtBUfAGkE8CezyWAguBUfAGkCwDxPAIoCE/FF0A6AJDPIYDB
+   8QUQ9h+f/n4BhAtAfrcALjY5vgCyfwjiOwVwZZPjCyD7BdnzuwRwxybHF0C2D7PH
+   dwjgiU2OL4BsF2jLzxbAipscXwBZP9QWnymADTc5vgCyXrA1P0sAO25yfAHk+XBr
+   fIYAwE2OL4A8HvCZv9t0AhgcXwC5P+Qjf6f5BDA4vgBye9B7fvZIJ4DB8QWQ38Pe
+   8jNHPgEMji+A/Bz42p+d6QQwOL4A8jX0d7935hPA4PgCyGfwy19POgEMji+A/6Mj
+   CAAcHYA+ARREEAA4OgB9AiiIIABwdAD6BFAQQQDg6AD0CaAgggDA0QHoE0BBBAGA
+   owPQJ4CCCAIARwegTwAFEQQAjg5AnwAKIggAHB2APgEURBAAODoAfQIoiCAAcHQA
+   +gRQEEEA4OgA9AmgIIIAwNEB6BNAQQQBgKMD0CeAgggCAEcHoE8ABREEAI4OQJ8A
+   CiIIABwdgD4BFEQQADg6AH0CKIggAHB0APoEUBBBAODoAPQJoCCCAMDRAegTQEEE
+   AYCjA9AngIIIAgBHB6BPAAURBACODkCfAAoiCAAcHYA+ARREEAA4OgB9AiiIIABw
+   dAD6BFAQQQDg6AD0CaAgggDA0QHoE0BBBAGAowPQJ4CCCAIARwegTwAFEQQAjg5A
+   3z+jF2P/QFV1rAAAAABJRU5ErkJggg==
+</Image>
+  <Image Name="Reference" Width="128" Height="128" Format="RGBA8888" CompressionMode="PNG" Description="Result">
+   iVBORw0KGgoAAAANSUhEUgAAAIAAAACACAYAAADDPmHLAAACAUlEQVR4nO3U0QlC
+   QRTE0KyVaWevM0t7/liCMEhyYRrYHPY8r/eN+M714oB2jx+84V/fOsByEIB5hGX8
+   fgD2IZbxA8A+xjJ+ANgHWcYPAPsoy/gBYB9mGT8A7OMs4weAfaBl/ACwj7SMHwD2
+   oZbxA8A+1jJ+ANgHW8YPAPtoy/gBYB9uGT8A7OMt4weAfcBl/ACwj7iMHwD2IZfx
+   A8A+5jJ+ANgHXcYPAPuoy/gBYB92GT8A7OMu4weAfeBl/ACwj7yMHwD2oZfxA8A+
+   9jJ+ANgHX8YPAPvoy/gBYB9+GT8AuOMHAHf8AOCOHwDc8QOAO34AcMcPAO74AcAd
+   PwC44wcAd/wA4I4fANzxA4A7fgBwxw8A7vgBwB0/ALjjBwB3/ADgjh8A3PEDgDt+
+   AHDHDwDu+AHAHT8AuOMHAHf8AOCOHwDc8QOAO34AcMcPAO74AcAdPwDfW0cIwPDW
+   AdYLgHwBkC8A8gVAvgDIFwD5AiBfAOQLgHwBkC8A8gVAvgDIFwD5AiBfAOQLgHwB
+   kC8A8gVAvgDIFwD5AiBfAOQLgHwBkC8A8gVAvgDIFwD5AiBfAOQLgHwBkC8A8gVA
+   vgDIFwD5AiBfAOQLgHwBkC8A8gVAvgDIFwD5AiBfAOQLgHwBkC8A8gVAvgDIFwD5
+   AiBfAOQLgHwBkC8A8gVAvgDIFwD5PvK6I/8pSVsdAAAAAElFTkSuQmCC
+</Image>
+  <Image Name="ErrorMask" Width="128" Height="128" Format="RGB888" CompressionMode="PNG" Description="Result">
+   iVBORw0KGgoAAAANSUhEUgAAAIAAAACACAIAAABMXPacAAABMklEQVR4nO3RQQkA
+   IADAQLV/Zw3h4xB3CQabY4+n7akL7iwd8LsGYA3AGoA1AGsA1gCsAVgDsAZgDcAa
+   gDUAawDWAKwBWAOwBmANwBqANQBrANYArAFYA7AGYA3AGoA1AGsA1gCsAVgDsAZg
+   DcAagDUAawDWAKwBWAOwBmANwBqANQBrANYArAFYA7AGYA3AGoA1AGsA1gCsAVgD
+   sAZgDcAagDUAawDWAKwBWAOwBmANwBqANQBrANYArAFYA7AGYA3AGoA1AGsA1gCs
+   AVgDsAZgDcAagDUAawDWAKwBWAOwBmANwBqANQBrANYArAFYA7AGYA3AGoA1AGsA
+   1gCsAVgDsAZgDcAagDUAawDWAKwBWAOwBmANwBqANQBrANYArAFYA7AGYA3AGoA1
+   AGsA1gDsAJkhAv9fbBLiAAAAAElFTkSuQmCC
+</Image>
+</ImageSet>
+ <Number Name="TestDuration" Description="Test case duration in microseconds" Tag="Time" Unit="us">49150</Number>
+ <Result StatusCode="Fail">Image comparison failed</Result>
+</TestCaseResult>
+
+
+=== dEQP-GLES3.functional.fbo.invalidate.whole.unbind_read_color
+<?xml version="1.0" encoding="UTF-8"?>
+<TestCaseResult CasePath="dEQP-GLES3.functional.fbo.invalidate.whole.unbind_read_color" Version="0.3.4" CaseType="SelfValidate">
+ <Text>glGenTextures(1, 0x000000016fa15f20);</Text>
+ <Text>// textures = { 14534 }</Text>
+ <Text>glBindTexture(GL_TEXTURE_2D, 14534);</Text>
+ <Text>glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, 128, 128, 0, GL_RGBA, GL_UNSIGNED_BYTE, 0);</Text>
+ <Text>glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);</Text>
+ <Text>glGenTextures(1, 0x000000016fa15f1c);</Text>
+ <Text>// textures = { 14535 }</Text>
+ <Text>glBindTexture(GL_TEXTURE_2D, 14535);</Text>
+ <Text>glTexImage2D(GL_TEXTURE_2D, 0, GL_DEPTH24_STENCIL8, 128, 128, 0, GL_DEPTH_STENCIL, GL_UNSIGNED_INT_24_8, 0);</Text>
+ <Text>glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);</Text>
+ <Text>glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);</Text>
+ <Text>glGenFramebuffers(1, 0x000000016fa15f24);</Text>
+ <Text>// framebuffers = { 3047 }</Text>
+ <Text>glBindFramebuffer(GL_FRAMEBUFFER, 3047);</Text>
+ <Text>glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, 14534, 0);</Text>
+ <Text>glFramebufferTexture2D(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_TEXTURE_2D, 14535, 0);</Text>
+ <Text>glFramebufferTexture2D(GL_FRAMEBUFFER, GL_STENCIL_ATTACHMENT, GL_TEXTURE_2D, 14535, 0);</Text>
+ <Text>glCheckFramebufferStatus(GL_FRAMEBUFFER);</Text>
+ <Text>// GL_FRAMEBUFFER_COMPLETE returned</Text>
+ <Text>glClearColor(0, 0, 0, 1);</Text>
+ <Text>glClear(GL_DEPTH_BUFFER_BIT|GL_STENCIL_BUFFER_BIT|GL_COLOR_BUFFER_BIT);</Text>
+ <Text>glEnable(GL_DEPTH_TEST);</Text>
+ <Text>glEnable(GL_STENCIL_TEST);</Text>
+ <Text>glStencilOp(GL_KEEP, GL_KEEP, GL_REPLACE);</Text>
+ <Text>glStencilFunc(GL_ALWAYS, 1, 255);</Text>
+ <Text>glUseProgram(14531);</Text>
+ <Text>glGetUniformLocation(14531, u_gradientMin);</Text>
+ <Text>// 0 returned</Text>
+ <Text>glUniform4fv(0, 1, { 0, 0, 0, 0 });</Text>
+ <Text>glGetUniformLocation(14531, u_gradientMax);</Text>
+ <Text>// 1 returned</Text>
+ <Text>glUniform4fv(1, 1, { 1, 1, 1, 1 });</Text>
+ <Text>glGetAttribLocation(14531, a_position);</Text>
+ <Text>// 0 returned</Text>
+ <Text>glGetAttribLocation(14531, a_coord);</Text>
+ <Text>// 1 returned</Text>
+ <Text>glUseProgram(14531);</Text>
+ <Text>glEnableVertexAttribArray(0);</Text>
+ <Text>glVertexAttribPointer(0, 4, GL_FLOAT, GL_FALSE, 0, 0x16fa15b78);</Text>
+ <Text>glEnableVertexAttribArray(1);</Text>
+ <Text>glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 0, 0x16fa15b50);</Text>
+ <Text>glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_SHORT, 0x16fa15b40);</Text>
+ <Text>glDisableVertexAttribArray(0);</Text>
+ <Text>glDisableVertexAttribArray(1);</Text>
+ <Text>glInvalidateFramebuffer(GL_FRAMEBUFFER, 1, { GL_COLOR_ATTACHMENT0 });</Text>
+ <Text>glBindFramebuffer(GL_FRAMEBUFFER, 0);</Text>
+ <Text>glDisable(GL_DEPTH_TEST);</Text>
+ <Text>glDisable(GL_STENCIL_TEST);</Text>
+ <Text>glUseProgram(14536);</Text>
+ <Text>glGetUniformLocation(14536, u_sampler0);</Text>
+ <Text>// 0 returned</Text>
+ <Text>glUniform1i(0, 0);</Text>
+ <Text>glGetUniformLocation(14536, u_texScale0);</Text>
+ <Text>// 1 returned</Text>
+ <Text>glUniform4fv(1, 1, { 1, 1, 1, 1 });</Text>
+ <Text>glGetUniformLocation(14536, u_texBias0);</Text>
+ <Text>// 2 returned</Text>
+ <Text>glUniform4fv(2, 1, { 0, 0, 0, 0 });</Text>
+ <Text>glGetUniformLocation(14536, u_outScale0);</Text>
+ <Text>// 3 returned</Text>
+ <Text>glUniform4fv(3, 1, { 1, 1, 1, 1 });</Text>
+ <Text>glGetUniformLocation(14536, u_outBias0);</Text>
+ <Text>// 4 returned</Text>
+ <Text>glUniform4fv(4, 1, { 0, 0, 0, 0 });</Text>
+ <Text>glBindTexture(GL_TEXTURE_2D, 14535);</Text>
+ <Text>glGetAttribLocation(14536, a_position);</Text>
+ <Text>// 0 returned</Text>
+ <Text>glGetAttribLocation(14536, a_coord);</Text>
+ <Text>// 1 returned</Text>
+ <Text>glUseProgram(14536);</Text>
+ <Text>glEnableVertexAttribArray(0);</Text>
+ <Text>glVertexAttribPointer(0, 4, GL_FLOAT, GL_FALSE, 0, 0x16fa15b78);</Text>
+ <Text>glEnableVertexAttribArray(1);</Text>
+ <Text>glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 0, 0x16fa15b50);</Text>
+ <Text>glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_SHORT, 0x16fa15b40);</Text>
+ <Text>glDisableVertexAttribArray(0);</Text>
+ <Text>glDisableVertexAttribArray(1);</Text>
+ <Text>glReadPixels(0, 0, 128, 128, GL_RGBA, GL_UNSIGNED_BYTE, 0x728b1c010)</Text>
+ <Text>glGetError();</Text>
+ <Text>// GL_NO_ERROR returned</Text>
+ <Text>Image comparison failed: difference = 4487.81, threshold = 0.05</Text>
+ <ImageSet Name="Result" Description="Image comparison result">
+  <Image Name="Result" Width="128" Height="128" Format="RGBA8888" CompressionMode="PNG" Description="Result">
+   iVBORw0KGgoAAAANSUhEUgAAAIAAAACACAYAAADDPmHLAAACRklEQVR4nO3USW4E
+   MQzFULvvf+dklSBDD1XVHiSRi78X8Aj13vtH77055m67D3D71lozAOpaa613PwBy
+   X/gGANxPfAOA7S++AYB2D98AIHuEbwCAPcM3gOJ7hW8AhXcE3wCK7ii+ARTcGXwD
+   KLaz+AZQaFfwDaDIruIbQIG9g28AyfcuvgEk3gh8A0i6UfgGkHAj8Q0g2UbjG0Ci
+   zcA3gCSbhW8ACTYT3wCCbza+AQTeCnwDCLpV+AYQcCvxDSDYVuMbQKDtwDeAINuF
+   bwABthPfAOD4BgDHNwA4vgHA8Q0Ajm8AcHwDgOMbABzfAOD4BgDHNwA4vgHA8Q0A
+   jm8AcHwDgOMbABzfAOD4BgDHNwA4vgHA8Q0Ajm8AcHwDgOMbABzfAOD4BgDHNwA4
+   vgHA8Q0Ajm8AcHwDgOMbABwfHwAdHx2A+OAAxAcHID44APHBAYgPDkB8cADigwMQ
+   HxyA+OAAxAcHID44APHBAYgPDkB8cADigwMQHxyA+OAAxAcHID44APHBAYgPDkB8
+   cADigwMQHxyA+OAAxAcHID44APHBAYgPDkB8cADigwMQf/+2BSB+jG0JQPw4Wx6A
+   +LG2NADx421ZAOLH3JIAxI+76QGIH3tTAxA//qYFIH6OTQlA/DwbHoD4uTY0APHz
+   bVgA4ufckADEz7u3AxA/994KQPz8uxyA+DV2KQDx6+x0AOLX2qkAxK+3wwGIX3OH
+   AhC/7l4GIH7tPQ1A/Pp7GID4jN0NQHzO/gUgPmu/AhCft+8AxGfuJj57n2tVwIKG
+   HqjfAAAAAElFTkSuQmCC
+</Image>
+  <Image Name="Reference" Width="128" Height="128" Format="RGBA8888" CompressionMode="PNG" Description="Reference">
+   iVBORw0KGgoAAAANSUhEUgAAAIAAAACACAYAAADDPmHLAAAC1ElEQVR4nO3SSW5b
+   URAEwZTvf2d744VheNBAsrK7axGQRP2hHpFvb/D9DaibvqUHVA40gLP4+bMBHMQv
+   vzeAY/jt7wZwCH/4rAEcwV8+bwAH8I//NYDl+M//G8BivOOaBrAU77yuASzEB65t
+   AMvwwesbwCJ84p4GsASfvK8BLMAX7m0Aw/HF+xvAYDzgGQ1gKB70nAYwEA98VgMY
+   hgc/rwEMwhOe2QCG4EnPbQAD8MRnNwA5nvz8BiDGC97RAKR40XsagBAvfFcDkOHF
+   72sAIgTe2QAkCL23AQgQfHcDCCP8/gYQhGBDAwhBsKEBhCDY0ABCEGxoACEINjSA
+   EAQbGkAIgg0NIATBhgYQgmBDAwhBsKEBhCDY0ABCEGxoACEINjSAEAQbGkAIgg0N
+   IATBhgYQgmBDAwhBsKEBhCDY0ABCEGxoACEINjSAEAQbGkAIgg0NIATBhgYQgmBD
+   AwhBsKEBhCDY0ABCEGxoACEINjSAEAQbGkAIgg0NIATBhgYQgmBD2tkAEGwwOBkA
+   gg0W5wJAsMHkVAAINticCQDBBqMTASDYYLU+AAQbzFYHgGCD3doAEGyYYGUACDZM
+   sS4ABBsmWRUAgg3TrAkAwYaJVgSAYMNU4wNAsGGy0QEg2DDd2AAQbNhgZAAINmwx
+   LgAEGzYZFQCCDduMCQDBho1GBIBgw1b6ABBs2EwdAIIN22kDQLDhAmUACDZcoQsA
+   wYZLVAEg2HCNJgAEGy5SBIBgw1XxABB8CZdFA0DwBVwXCwDB4SsUAIKDVygABIeu
+   UAAIDlyhABActkIBIDhohQJAcMgKBYDggBUKAMHhKhQAgoNVKAAEh6pQAAgOVKEA
+   EBymQgEgOEiFAkBwiAoFgOAAFQoAwfgKBYBgeIUCQDC6QgEgGFyhABCMrVAACIZW
+   KAAEIysUAIKBFQoAwbgKBYBgWIUCQDCqQgEgGFShABCMqVAACIZUxg/voEGA+hUI
+   bgAAAABJRU5ErkJggg==
+</Image>
+  <Image Name="ErrorMask" Width="128" Height="128" Format="RGB888" CompressionMode="PNG" Description="Error mask">
+   iVBORw0KGgoAAAANSUhEUgAAAIAAAACACAIAAABMXPacAAACAElEQVR4nO3czWoT
+   YRxH4TP/xtYviqig938NXlehSKRa23FhQowUXDlH8DzMIl+L5HfgnV0WViLaAXyC
+   5fjC8subyxMPl5/XerhmZR6ZRy4euHhg98DuO8/uubzn8htXX3l+x4s7Xn7h1Z7X
+   e64/c33Lm1ve3vDuhvd7PsBHuNrgt/57lpWB1jfN6WHrG44BWl9yfgTR+lubs2et
+   v7mn7wGtv5kn7gGtv6Xf7wGtv7Gze0Drb+8UoPUVhwCtbxlaX3V2BLX+9k5HUOsr
+   DkdQ61uOAVpfMrS+6hSg9RWHAK1vGWh900Drmw4BWt8y0PqmQ4DWtwy0vmmg9U0D
+   rW8aaH3TQOubBlrfNND6poHWNw20vmmg9U0DrW8aaH3TQOubBlrfNND6poHWNw20
+   vmmg9U0LK3dL6zuWlYWVdfnzR/M3HP8rIp4CyAogK4CsALICyAogK4CsALICyAog
+   K4CsALICyAogK4CsALICyAogK4CsALICyAogK4CsALICyAogK4CsALICyAogK4Cs
+   ALICyAogK4CsALICyAogK4CsALICyAogK4CsALICyAogK4CsALICyAogK4CsALIC
+   yAogK4CsALICyAogK4CsALICyAogK4CsALICyAogK4CsALICyAogK4CsALICyAog
+   K4CsALICyAogK4CsALKF1f4K/7cfr+8Ehuq21AQAAAAASUVORK5CYII=
+</Image>
+</ImageSet>
+ <Number Name="TestDuration" Description="Test case duration in microseconds" Tag="Time" Unit="us">87212</Number>
+ <Result StatusCode="Fail">Image comparison failed</Result>
+</TestCaseResult>
+
+
+=== dEQP-GLES3.functional.fbo.invalidate.whole.unbind_read_color_stencil
+<?xml version="1.0" encoding="UTF-8"?>
+<TestCaseResult CasePath="dEQP-GLES3.functional.fbo.invalidate.whole.unbind_read_color_stencil" Version="0.3.4" CaseType="SelfValidate">
+ <Text>glGenTextures(1, 0x000000016fa15f20);</Text>
+ <Text>// textures = { 14566 }</Text>
+ <Text>glBindTexture(GL_TEXTURE_2D, 14566);</Text>
+ <Text>glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, 128, 128, 0, GL_RGBA, GL_UNSIGNED_BYTE, 0);</Text>
+ <Text>glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);</Text>
+ <Text>glGenTextures(1, 0x000000016fa15f1c);</Text>
+ <Text>// textures = { 14567 }</Text>
+ <Text>glBindTexture(GL_TEXTURE_2D, 14567);</Text>
+ <Text>glTexImage2D(GL_TEXTURE_2D, 0, GL_DEPTH24_STENCIL8, 128, 128, 0, GL_DEPTH_STENCIL, GL_UNSIGNED_INT_24_8, 0);</Text>
+ <Text>glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);</Text>
+ <Text>glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);</Text>
+ <Text>glGenFramebuffers(1, 0x000000016fa15f24);</Text>
+ <Text>// framebuffers = { 3051 }</Text>
+ <Text>glBindFramebuffer(GL_FRAMEBUFFER, 3051);</Text>
+ <Text>glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, 14566, 0);</Text>
+ <Text>glFramebufferTexture2D(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_TEXTURE_2D, 14567, 0);</Text>
+ <Text>glFramebufferTexture2D(GL_FRAMEBUFFER, GL_STENCIL_ATTACHMENT, GL_TEXTURE_2D, 14567, 0);</Text>
+ <Text>glCheckFramebufferStatus(GL_FRAMEBUFFER);</Text>
+ <Text>// GL_FRAMEBUFFER_COMPLETE returned</Text>
+ <Text>glClearColor(0, 0, 0, 1);</Text>
+ <Text>glClear(GL_DEPTH_BUFFER_BIT|GL_STENCIL_BUFFER_BIT|GL_COLOR_BUFFER_BIT);</Text>
+ <Text>glEnable(GL_DEPTH_TEST);</Text>
+ <Text>glEnable(GL_STENCIL_TEST);</Text>
+ <Text>glStencilOp(GL_KEEP, GL_KEEP, GL_REPLACE);</Text>
+ <Text>glStencilFunc(GL_ALWAYS, 1, 255);</Text>
+ <Text>glUseProgram(14563);</Text>
+ <Text>glGetUniformLocation(14563, u_gradientMin);</Text>
+ <Text>// 0 returned</Text>
+ <Text>glUniform4fv(0, 1, { 0, 0, 0, 0 });</Text>
+ <Text>glGetUniformLocation(14563, u_gradientMax);</Text>
+ <Text>// 1 returned</Text>
+ <Text>glUniform4fv(1, 1, { 1, 1, 1, 1 });</Text>
+ <Text>glGetAttribLocation(14563, a_position);</Text>
+ <Text>// 0 returned</Text>
+ <Text>glGetAttribLocation(14563, a_coord);</Text>
+ <Text>// 1 returned</Text>
+ <Text>glUseProgram(14563);</Text>
+ <Text>glEnableVertexAttribArray(0);</Text>
+ <Text>glVertexAttribPointer(0, 4, GL_FLOAT, GL_FALSE, 0, 0x16fa15b78);</Text>
+ <Text>glEnableVertexAttribArray(1);</Text>
+ <Text>glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 0, 0x16fa15b50);</Text>
+ <Text>glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_SHORT, 0x16fa15b40);</Text>
+ <Text>glDisableVertexAttribArray(0);</Text>
+ <Text>glDisableVertexAttribArray(1);</Text>
+ <Text>glInvalidateFramebuffer(GL_FRAMEBUFFER, 2, { GL_COLOR_ATTACHMENT0, GL_STENCIL_ATTACHMENT });</Text>
+ <Text>glBindFramebuffer(GL_FRAMEBUFFER, 0);</Text>
+ <Text>glDisable(GL_DEPTH_TEST);</Text>
+ <Text>glDisable(GL_STENCIL_TEST);</Text>
+ <Text>glUseProgram(14568);</Text>
+ <Text>glGetUniformLocation(14568, u_sampler0);</Text>
+ <Text>// 0 returned</Text>
+ <Text>glUniform1i(0, 0);</Text>
+ <Text>glGetUniformLocation(14568, u_texScale0);</Text>
+ <Text>// 1 returned</Text>
+ <Text>glUniform4fv(1, 1, { 1, 1, 1, 1 });</Text>
+ <Text>glGetUniformLocation(14568, u_texBias0);</Text>
+ <Text>// 2 returned</Text>
+ <Text>glUniform4fv(2, 1, { 0, 0, 0, 0 });</Text>
+ <Text>glGetUniformLocation(14568, u_outScale0);</Text>
+ <Text>// 3 returned</Text>
+ <Text>glUniform4fv(3, 1, { 1, 1, 1, 1 });</Text>
+ <Text>glGetUniformLocation(14568, u_outBias0);</Text>
+ <Text>// 4 returned</Text>
+ <Text>glUniform4fv(4, 1, { 0, 0, 0, 0 });</Text>
+ <Text>glBindTexture(GL_TEXTURE_2D, 14567);</Text>
+ <Text>glGetAttribLocation(14568, a_position);</Text>
+ <Text>// 0 returned</Text>
+ <Text>glGetAttribLocation(14568, a_coord);</Text>
+ <Text>// 1 returned</Text>
+ <Text>glUseProgram(14568);</Text>
+ <Text>glEnableVertexAttribArray(0);</Text>
+ <Text>glVertexAttribPointer(0, 4, GL_FLOAT, GL_FALSE, 0, 0x16fa15b78);</Text>
+ <Text>glEnableVertexAttribArray(1);</Text>
+ <Text>glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 0, 0x16fa15b50);</Text>
+ <Text>glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_SHORT, 0x16fa15b40);</Text>
+ <Text>glDisableVertexAttribArray(0);</Text>
+ <Text>glDisableVertexAttribArray(1);</Text>
+ <Text>glReadPixels(0, 0, 128, 128, GL_RGBA, GL_UNSIGNED_BYTE, 0x728b1c010)</Text>
+ <Text>glGetError();</Text>
+ <Text>// GL_NO_ERROR returned</Text>
+ <Text>Image comparison failed: difference = 4487.81, threshold = 0.05</Text>
+ <ImageSet Name="Result" Description="Image comparison result">
+  <Image Name="Result" Width="128" Height="128" Format="RGBA8888" CompressionMode="PNG" Description="Result">
+   iVBORw0KGgoAAAANSUhEUgAAAIAAAACACAYAAADDPmHLAAACRklEQVR4nO3USW4E
+   MQzFULvvf+dklSBDD1XVHiSRi78X8Aj13vtH77055m67D3D71lozAOpaa613PwBy
+   X/gGANxPfAOA7S++AYB2D98AIHuEbwCAPcM3gOJ7hW8AhXcE3wCK7ii+ARTcGXwD
+   KLaz+AZQaFfwDaDIruIbQIG9g28AyfcuvgEk3gh8A0i6UfgGkHAj8Q0g2UbjG0Ci
+   zcA3gCSbhW8ACTYT3wCCbza+AQTeCnwDCLpV+AYQcCvxDSDYVuMbQKDtwDeAINuF
+   bwABthPfAOD4BgDHNwA4vgHA8Q0Ajm8AcHwDgOMbABzfAOD4BgDHNwA4vgHA8Q0A
+   jm8AcHwDgOMbABzfAOD4BgDHNwA4vgHA8Q0Ajm8AcHwDgOMbABzfAOD4BgDHNwA4
+   vgHA8Q0Ajm8AcHwDgOMbABwfHwAdHx2A+OAAxAcHID44APHBAYgPDkB8cADigwMQ
+   HxyA+OAAxAcHID44APHBAYgPDkB8cADigwMQHxyA+OAAxAcHID44APHBAYgPDkB8
+   cADigwMQHxyA+OAAxAcHID44APHBAYgPDkB8cADigwMQf/+2BSB+jG0JQPw4Wx6A
+   +LG2NADx421ZAOLH3JIAxI+76QGIH3tTAxA//qYFIH6OTQlA/DwbHoD4uTY0APHz
+   bVgA4ufckADEz7u3AxA/994KQPz8uxyA+DV2KQDx6+x0AOLX2qkAxK+3wwGIX3OH
+   AhC/7l4GIH7tPQ1A/Pp7GID4jN0NQHzO/gUgPmu/AhCft+8AxGfuJj57n2tVwIKG
+   HqjfAAAAAElFTkSuQmCC
+</Image>
+  <Image Name="Reference" Width="128" Height="128" Format="RGBA8888" CompressionMode="PNG" Description="Reference">
+   iVBORw0KGgoAAAANSUhEUgAAAIAAAACACAYAAADDPmHLAAAC1ElEQVR4nO3SSW5b
+   URAEwZTvf2d744VheNBAsrK7axGQRP2hHpFvb/D9DaibvqUHVA40gLP4+bMBHMQv
+   vzeAY/jt7wZwCH/4rAEcwV8+bwAH8I//NYDl+M//G8BivOOaBrAU77yuASzEB65t
+   AMvwwesbwCJ84p4GsASfvK8BLMAX7m0Aw/HF+xvAYDzgGQ1gKB70nAYwEA98VgMY
+   hgc/rwEMwhOe2QCG4EnPbQAD8MRnNwA5nvz8BiDGC97RAKR40XsagBAvfFcDkOHF
+   72sAIgTe2QAkCL23AQgQfHcDCCP8/gYQhGBDAwhBsKEBhCDY0ABCEGxoACEINjSA
+   EAQbGkAIgg0NIATBhgYQgmBDAwhBsKEBhCDY0ABCEGxoACEINjSAEAQbGkAIgg0N
+   IATBhgYQgmBDAwhBsKEBhCDY0ABCEGxoACEINjSAEAQbGkAIgg0NIATBhgYQgmBD
+   AwhBsKEBhCDY0ABCEGxoACEINjSAEAQbGkAIgg0NIATBhgYQgmBD2tkAEGwwOBkA
+   gg0W5wJAsMHkVAAINticCQDBBqMTASDYYLU+AAQbzFYHgGCD3doAEGyYYGUACDZM
+   sS4ABBsmWRUAgg3TrAkAwYaJVgSAYMNU4wNAsGGy0QEg2DDd2AAQbNhgZAAINmwx
+   LgAEGzYZFQCCDduMCQDBho1GBIBgw1b6ABBs2EwdAIIN22kDQLDhAmUACDZcoQsA
+   wYZLVAEg2HCNJgAEGy5SBIBgw1XxABB8CZdFA0DwBVwXCwDB4SsUAIKDVygABIeu
+   UAAIDlyhABActkIBIDhohQJAcMgKBYDggBUKAMHhKhQAgoNVKAAEh6pQAAgOVKEA
+   EBymQgEgOEiFAkBwiAoFgOAAFQoAwfgKBYBgeIUCQDC6QgEgGFyhABCMrVAACIZW
+   KAAEIysUAIKBFQoAwbgKBYBgWIUCQDCqQgEgGFShABCMqVAACIZUxg/voEGA+hUI
+   bgAAAABJRU5ErkJggg==
+</Image>
+  <Image Name="ErrorMask" Width="128" Height="128" Format="RGB888" CompressionMode="PNG" Description="Error mask">
+   iVBORw0KGgoAAAANSUhEUgAAAIAAAACACAIAAABMXPacAAACAElEQVR4nO3czWoT
+   YRxH4TP/xtYviqig938NXlehSKRa23FhQowUXDlH8DzMIl+L5HfgnV0WViLaAXyC
+   5fjC8subyxMPl5/XerhmZR6ZRy4euHhg98DuO8/uubzn8htXX3l+x4s7Xn7h1Z7X
+   e64/c33Lm1ve3vDuhvd7PsBHuNrgt/57lpWB1jfN6WHrG44BWl9yfgTR+lubs2et
+   v7mn7wGtv5kn7gGtv6Xf7wGtv7Gze0Drb+8UoPUVhwCtbxlaX3V2BLX+9k5HUOsr
+   DkdQ61uOAVpfMrS+6hSg9RWHAK1vGWh900Drmw4BWt8y0PqmQ4DWtwy0vmmg9U0D
+   rW8aaH3TQOubBlrfNND6poHWNw20vmmg9U0DrW8aaH3TQOubBlrfNND6poHWNw20
+   vmmg9U0LK3dL6zuWlYWVdfnzR/M3HP8rIp4CyAogK4CsALICyAogK4CsALICyAog
+   K4CsALICyAogK4CsALICyAogK4CsALICyAogK4CsALICyAogK4CsALICyAogK4Cs
+   ALICyAogK4CsALICyAogK4CsALICyAogK4CsALICyAogK4CsALICyAogK4CsALIC
+   yAogK4CsALICyAogK4CsALICyAogK4CsALICyAogK4CsALICyAogK4CsALICyAog
+   K4CsALICyAogK4CsALKF1f4K/7cfr+8Ehuq21AQAAAAASUVORK5CYII=
+</Image>
+</ImageSet>
+ <Number Name="TestDuration" Description="Test case duration in microseconds" Tag="Time" Unit="us">65189</Number>
+ <Result StatusCode="Fail">Image comparison failed</Result>
+</TestCaseResult>
+
+
+=== dEQP-GLES3.functional.fbo.invalidate.whole.unbind_read_stencil
+<?xml version="1.0" encoding="UTF-8"?>
+<TestCaseResult CasePath="dEQP-GLES3.functional.fbo.invalidate.whole.unbind_read_stencil" Version="0.3.4" CaseType="SelfValidate">
+ <Text>glGenTextures(1, 0x000000016fa15f20);</Text>
+ <Text>// textures = { 14550 }</Text>
+ <Text>glBindTexture(GL_TEXTURE_2D, 14550);</Text>
+ <Text>glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, 128, 128, 0, GL_RGBA, GL_UNSIGNED_BYTE, 0);</Text>
+ <Text>glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);</Text>
+ <Text>glGenTextures(1, 0x000000016fa15f1c);</Text>
+ <Text>// textures = { 14551 }</Text>
+ <Text>glBindTexture(GL_TEXTURE_2D, 14551);</Text>
+ <Text>glTexImage2D(GL_TEXTURE_2D, 0, GL_DEPTH24_STENCIL8, 128, 128, 0, GL_DEPTH_STENCIL, GL_UNSIGNED_INT_24_8, 0);</Text>
+ <Text>glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);</Text>
+ <Text>glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);</Text>
+ <Text>glGenFramebuffers(1, 0x000000016fa15f24);</Text>
+ <Text>// framebuffers = { 3049 }</Text>
+ <Text>glBindFramebuffer(GL_FRAMEBUFFER, 3049);</Text>
+ <Text>glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, 14550, 0);</Text>
+ <Text>glFramebufferTexture2D(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_TEXTURE_2D, 14551, 0);</Text>
+ <Text>glFramebufferTexture2D(GL_FRAMEBUFFER, GL_STENCIL_ATTACHMENT, GL_TEXTURE_2D, 14551, 0);</Text>
+ <Text>glCheckFramebufferStatus(GL_FRAMEBUFFER);</Text>
+ <Text>// GL_FRAMEBUFFER_COMPLETE returned</Text>
+ <Text>glClearColor(0, 0, 0, 1);</Text>
+ <Text>glClear(GL_DEPTH_BUFFER_BIT|GL_STENCIL_BUFFER_BIT|GL_COLOR_BUFFER_BIT);</Text>
+ <Text>glEnable(GL_DEPTH_TEST);</Text>
+ <Text>glEnable(GL_STENCIL_TEST);</Text>
+ <Text>glStencilOp(GL_KEEP, GL_KEEP, GL_REPLACE);</Text>
+ <Text>glStencilFunc(GL_ALWAYS, 1, 255);</Text>
+ <Text>glUseProgram(14547);</Text>
+ <Text>glGetUniformLocation(14547, u_gradientMin);</Text>
+ <Text>// 0 returned</Text>
+ <Text>glUniform4fv(0, 1, { 0, 0, 0, 0 });</Text>
+ <Text>glGetUniformLocation(14547, u_gradientMax);</Text>
+ <Text>// 1 returned</Text>
+ <Text>glUniform4fv(1, 1, { 1, 1, 1, 1 });</Text>
+ <Text>glGetAttribLocation(14547, a_position);</Text>
+ <Text>// 0 returned</Text>
+ <Text>glGetAttribLocation(14547, a_coord);</Text>
+ <Text>// 1 returned</Text>
+ <Text>glUseProgram(14547);</Text>
+ <Text>glEnableVertexAttribArray(0);</Text>
+ <Text>glVertexAttribPointer(0, 4, GL_FLOAT, GL_FALSE, 0, 0x16fa15b78);</Text>
+ <Text>glEnableVertexAttribArray(1);</Text>
+ <Text>glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 0, 0x16fa15b50);</Text>
+ <Text>glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_SHORT, 0x16fa15b40);</Text>
+ <Text>glDisableVertexAttribArray(0);</Text>
+ <Text>glDisableVertexAttribArray(1);</Text>
+ <Text>glInvalidateFramebuffer(GL_FRAMEBUFFER, 1, { GL_STENCIL_ATTACHMENT });</Text>
+ <Text>glBindFramebuffer(GL_FRAMEBUFFER, 0);</Text>
+ <Text>glDisable(GL_DEPTH_TEST);</Text>
+ <Text>glDisable(GL_STENCIL_TEST);</Text>
+ <Text>glUseProgram(14552);</Text>
+ <Text>glGetUniformLocation(14552, u_sampler0);</Text>
+ <Text>// 0 returned</Text>
+ <Text>glUniform1i(0, 0);</Text>
+ <Text>glGetUniformLocation(14552, u_texScale0);</Text>
+ <Text>// 1 returned</Text>
+ <Text>glUniform4fv(1, 1, { 1, 1, 1, 1 });</Text>
+ <Text>glGetUniformLocation(14552, u_texBias0);</Text>
+ <Text>// 2 returned</Text>
+ <Text>glUniform4fv(2, 1, { 0, 0, 0, 0 });</Text>
+ <Text>glGetUniformLocation(14552, u_outScale0);</Text>
+ <Text>// 3 returned</Text>
+ <Text>glUniform4fv(3, 1, { 1, 1, 1, 1 });</Text>
+ <Text>glGetUniformLocation(14552, u_outBias0);</Text>
+ <Text>// 4 returned</Text>
+ <Text>glUniform4fv(4, 1, { 0, 0, 0, 0 });</Text>
+ <Text>glBindTexture(GL_TEXTURE_2D, 14551);</Text>
+ <Text>glGetAttribLocation(14552, a_position);</Text>
+ <Text>// 0 returned</Text>
+ <Text>glGetAttribLocation(14552, a_coord);</Text>
+ <Text>// 1 returned</Text>
+ <Text>glUseProgram(14552);</Text>
+ <Text>glEnableVertexAttribArray(0);</Text>
+ <Text>glVertexAttribPointer(0, 4, GL_FLOAT, GL_FALSE, 0, 0x16fa15b78);</Text>
+ <Text>glEnableVertexAttribArray(1);</Text>
+ <Text>glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 0, 0x16fa15b50);</Text>
+ <Text>glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_SHORT, 0x16fa15b40);</Text>
+ <Text>glDisableVertexAttribArray(0);</Text>
+ <Text>glDisableVertexAttribArray(1);</Text>
+ <Text>glReadPixels(0, 0, 128, 128, GL_RGBA, GL_UNSIGNED_BYTE, 0x728b1c010)</Text>
+ <Text>glGetError();</Text>
+ <Text>// GL_NO_ERROR returned</Text>
+ <Text>Image comparison failed: difference = 4487.81, threshold = 0.05</Text>
+ <ImageSet Name="Result" Description="Image comparison result">
+  <Image Name="Result" Width="128" Height="128" Format="RGBA8888" CompressionMode="PNG" Description="Result">
+   iVBORw0KGgoAAAANSUhEUgAAAIAAAACACAYAAADDPmHLAAACRklEQVR4nO3USW4E
+   MQzFULvvf+dklSBDD1XVHiSRi78X8Aj13vtH77055m67D3D71lozAOpaa613PwBy
+   X/gGANxPfAOA7S++AYB2D98AIHuEbwCAPcM3gOJ7hW8AhXcE3wCK7ii+ARTcGXwD
+   KLaz+AZQaFfwDaDIruIbQIG9g28AyfcuvgEk3gh8A0i6UfgGkHAj8Q0g2UbjG0Ci
+   zcA3gCSbhW8ACTYT3wCCbza+AQTeCnwDCLpV+AYQcCvxDSDYVuMbQKDtwDeAINuF
+   bwABthPfAOD4BgDHNwA4vgHA8Q0Ajm8AcHwDgOMbABzfAOD4BgDHNwA4vgHA8Q0A
+   jm8AcHwDgOMbABzfAOD4BgDHNwA4vgHA8Q0Ajm8AcHwDgOMbABzfAOD4BgDHNwA4
+   vgHA8Q0Ajm8AcHwDgOMbABwfHwAdHx2A+OAAxAcHID44APHBAYgPDkB8cADigwMQ
+   HxyA+OAAxAcHID44APHBAYgPDkB8cADigwMQHxyA+OAAxAcHID44APHBAYgPDkB8
+   cADigwMQHxyA+OAAxAcHID44APHBAYgPDkB8cADigwMQf/+2BSB+jG0JQPw4Wx6A
+   +LG2NADx421ZAOLH3JIAxI+76QGIH3tTAxA//qYFIH6OTQlA/DwbHoD4uTY0APHz
+   bVgA4ufckADEz7u3AxA/994KQPz8uxyA+DV2KQDx6+x0AOLX2qkAxK+3wwGIX3OH
+   AhC/7l4GIH7tPQ1A/Pp7GID4jN0NQHzO/gUgPmu/AhCft+8AxGfuJj57n2tVwIKG
+   HqjfAAAAAElFTkSuQmCC
+</Image>
+  <Image Name="Reference" Width="128" Height="128" Format="RGBA8888" CompressionMode="PNG" Description="Reference">
+   iVBORw0KGgoAAAANSUhEUgAAAIAAAACACAYAAADDPmHLAAAC1ElEQVR4nO3SSW5b
+   URAEwZTvf2d744VheNBAsrK7axGQRP2hHpFvb/D9DaibvqUHVA40gLP4+bMBHMQv
+   vzeAY/jt7wZwCH/4rAEcwV8+bwAH8I//NYDl+M//G8BivOOaBrAU77yuASzEB65t
+   AMvwwesbwCJ84p4GsASfvK8BLMAX7m0Aw/HF+xvAYDzgGQ1gKB70nAYwEA98VgMY
+   hgc/rwEMwhOe2QCG4EnPbQAD8MRnNwA5nvz8BiDGC97RAKR40XsagBAvfFcDkOHF
+   72sAIgTe2QAkCL23AQgQfHcDCCP8/gYQhGBDAwhBsKEBhCDY0ABCEGxoACEINjSA
+   EAQbGkAIgg0NIATBhgYQgmBDAwhBsKEBhCDY0ABCEGxoACEINjSAEAQbGkAIgg0N
+   IATBhgYQgmBDAwhBsKEBhCDY0ABCEGxoACEINjSAEAQbGkAIgg0NIATBhgYQgmBD
+   AwhBsKEBhCDY0ABCEGxoACEINjSAEAQbGkAIgg0NIATBhgYQgmBD2tkAEGwwOBkA
+   gg0W5wJAsMHkVAAINticCQDBBqMTASDYYLU+AAQbzFYHgGCD3doAEGyYYGUACDZM
+   sS4ABBsmWRUAgg3TrAkAwYaJVgSAYMNU4wNAsGGy0QEg2DDd2AAQbNhgZAAINmwx
+   LgAEGzYZFQCCDduMCQDBho1GBIBgw1b6ABBs2EwdAIIN22kDQLDhAmUACDZcoQsA
+   wYZLVAEg2HCNJgAEGy5SBIBgw1XxABB8CZdFA0DwBVwXCwDB4SsUAIKDVygABIeu
+   UAAIDlyhABActkIBIDhohQJAcMgKBYDggBUKAMHhKhQAgoNVKAAEh6pQAAgOVKEA
+   EBymQgEgOEiFAkBwiAoFgOAAFQoAwfgKBYBgeIUCQDC6QgEgGFyhABCMrVAACIZW
+   KAAEIysUAIKBFQoAwbgKBYBgWIUCQDCqQgEgGFShABCMqVAACIZUxg/voEGA+hUI
+   bgAAAABJRU5ErkJggg==
+</Image>
+  <Image Name="ErrorMask" Width="128" Height="128" Format="RGB888" CompressionMode="PNG" Description="Error mask">
+   iVBORw0KGgoAAAANSUhEUgAAAIAAAACACAIAAABMXPacAAACAElEQVR4nO3czWoT
+   YRxH4TP/xtYviqig938NXlehSKRa23FhQowUXDlH8DzMIl+L5HfgnV0WViLaAXyC
+   5fjC8subyxMPl5/XerhmZR6ZRy4euHhg98DuO8/uubzn8htXX3l+x4s7Xn7h1Z7X
+   e64/c33Lm1ve3vDuhvd7PsBHuNrgt/57lpWB1jfN6WHrG44BWl9yfgTR+lubs2et
+   v7mn7wGtv5kn7gGtv6Xf7wGtv7Gze0Drb+8UoPUVhwCtbxlaX3V2BLX+9k5HUOsr
+   DkdQ61uOAVpfMrS+6hSg9RWHAK1vGWh900Drmw4BWt8y0PqmQ4DWtwy0vmmg9U0D
+   rW8aaH3TQOubBlrfNND6poHWNw20vmmg9U0DrW8aaH3TQOubBlrfNND6poHWNw20
+   vmmg9U0LK3dL6zuWlYWVdfnzR/M3HP8rIp4CyAogK4CsALICyAogK4CsALICyAog
+   K4CsALICyAogK4CsALICyAogK4CsALICyAogK4CsALICyAogK4CsALICyAogK4Cs
+   ALICyAogK4CsALICyAogK4CsALICyAogK4CsALICyAogK4CsALICyAogK4CsALIC
+   yAogK4CsALICyAogK4CsALICyAogK4CsALICyAogK4CsALICyAogK4CsALICyAog
+   K4CsALICyAogK4CsALKF1f4K/7cfr+8Ehuq21AQAAAAASUVORK5CYII=
+</Image>
+</ImageSet>
+ <Number Name="TestDuration" Description="Test case duration in microseconds" Tag="Time" Unit="us">53769</Number>
+ <Result StatusCode="Fail">Image comparison failed</Result>
+</TestCaseResult>
+
+
+=== dEQP-GLES3.functional.negative_api.buffer.blit_framebuffer_multisample
+<?xml version="1.0" encoding="UTF-8"?>
+<TestCaseResult CasePath="dEQP-GLES3.functional.negative_api.buffer.blit_framebuffer_multisample" Version="0.3.4" CaseType="SelfValidate">
+ <Text>glGenFramebuffers(2, 0x000000016fa1d6b0);</Text>
+ <Text>// framebuffers = { 3189, 3190 }</Text>
+ <Text>glGenRenderbuffers(2, 0x000000016fa1d6a8);</Text>
+ <Text>// renderbuffers = { 15169, 15170 }</Text>
+ <Text>glBindRenderbuffer(GL_RENDERBUFFER, 15169);</Text>
+ <Text>glBindFramebuffer(GL_READ_FRAMEBUFFER, 3189);</Text>
+ <Text>glRenderbufferStorageMultisample(GL_RENDERBUFFER, 4, GL_RGBA8, 32, 32);</Text>
+ <Text>glFramebufferRenderbuffer(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, 15169);</Text>
+ <Text>glCheckFramebufferStatus(GL_READ_FRAMEBUFFER);</Text>
+ <Text>// GL_FRAMEBUFFER_COMPLETE returned</Text>
+ <Text>glBindRenderbuffer(GL_RENDERBUFFER, 15170);</Text>
+ <Text>glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 3190);</Text>
+ <Text>glGetError();</Text>
+ <Text>// GL_NO_ERROR returned</Text>
+ <Section Name="" Description="GL_INVALID_OPERATION is generated if the value of GL_SAMPLE_BUFFERS for the draw buffer is greater than zero.">
+  <Text>glRenderbufferStorageMultisample(GL_RENDERBUFFER, 4, GL_RGBA8, 32, 32);</Text>
+  <Text>glFramebufferRenderbuffer(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, 15170);</Text>
+  <Text>glBlitFramebuffer(0, 0, 16, 16, 0, 0, 16, 16, GL_COLOR_BUFFER_BIT, GL_NEAREST);</Text>
+  <Text>glGetError();</Text>
+  <Text>// GL_INVALID_OPERATION returned</Text>
+</Section>
+ <Section Name="" Description="GL_INVALID_OPERATION is generated if GL_SAMPLE_BUFFERS for the read buffer is greater than zero and the formats of draw and read buffers are not identical.">
+  <Text>glRenderbufferStorage(GL_RENDERBUFFER, GL_RGBA4, 32, 32);</Text>
+  <Text>glFramebufferRenderbuffer(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, 15170);</Text>
+  <Text>glBlitFramebuffer(0, 0, 16, 16, 0, 0, 16, 16, GL_COLOR_BUFFER_BIT, GL_NEAREST);</Text>
+  <Text>glGetError();</Text>
+  <Text>// GL_INVALID_OPERATION returned</Text>
+</Section>
+ <Section Name="" Description="GL_INVALID_OPERATION is generated if GL_SAMPLE_BUFFERS for the read buffer is greater than zero and the source and destination rectangles are not defined with the same (X0, Y0) and (X1, Y1) bounds.">
+  <Text>glRenderbufferStorage(GL_RENDERBUFFER, GL_RGBA8, 32, 32);</Text>
+  <Text>glFramebufferRenderbuffer(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, 15170);</Text>
+  <Text>glBlitFramebuffer(0, 0, 16, 16, 2, 2, 18, 18, GL_COLOR_BUFFER_BIT, GL_NEAREST);</Text>
+  <Text>glGetError();</Text>
+  <Text>// GL_NO_ERROR returned</Text>
+  <Text>// ERROR: expected GL_INVALID_OPERATION</Text>
+</Section>
+ <Text>glBindFramebuffer(GL_FRAMEBUFFER, 0);</Text>
+ <Text>glDeleteRenderbuffers(2, { 15169, 15170 });</Text>
+ <Text>glDeleteFramebuffers(2, { 3189, 3190 });</Text>
+ <Number Name="TestDuration" Description="Test case duration in microseconds" Tag="Time" Unit="us">25290</Number>
+ <Result StatusCode="Fail">Got invalid error</Result>
+</TestCaseResult>
+
+

@@ -1,0 +1,1239 @@
+=== dEQP-GLES3.functional.fbo.api.attach_names
+glBindFramebuffer(GL_FRAMEBUFFER, 1);
+glGenTextures(1, 0x000000016fa1d5ac);
+// textures = { 3457 }
+// Attaching allocated texture name to 2D target
+glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, 3457, 0);
+glGetError();
+// GL_NO_ERROR returned
+// Fail, expected GL_INVALID_OPERATION
+// Attaching allocated texture name to cube target
+glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_CUBE_MAP_NEGATIVE_X, 3457, 0);
+glGetError();
+// GL_NO_ERROR returned
+// Fail, expected GL_INVALID_OPERATION
+glGenRenderbuffers(1, 0x000000016fa1d5a8);
+// renderbuffers = { 3458 }
+// Attaching allocated renderbuffer name
+glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, 3458);
+glGetError();
+// GL_NO_ERROR returned
+// Fail, expected GL_INVALID_OPERATION
+<Result StatusCode="Fail">Error code mismatch</Result>
+=== dEQP-GLES3.functional.fbo.blit.depth_stencil.depth24_stencil8_stencil_only
+glUseProgram(13943);
+glGetUniformLocation(13943, u_gradientMin);
+// 0 returned
+glUniform4fv(0, 1, { 0, 0, 0, 0 });
+glGetUniformLocation(13943, u_gradientMax);
+// 1 returned
+glUniform4fv(1, 1, { 1, 1, 1, 1 });
+glUseProgram(13940);
+glGetUniformLocation(13940, u_sampler0);
+// 0 returned
+glUniform1i(0, 0);
+glGetUniformLocation(13940, u_texScale0);
+// 1 returned
+glUniform4fv(1, 1, { 1, 1, 1, 1 });
+glGetUniformLocation(13940, u_texBias0);
+// 2 returned
+glUniform4fv(2, 1, { 0, 0, 0, 0 });
+glGetUniformLocation(13940, u_outScale0);
+// 3 returned
+glUniform4fv(3, 1, { 1, 1, 1, 1 });
+glGetUniformLocation(13940, u_outBias0);
+// 4 returned
+glUniform4fv(4, 1, { 0, 0, 0, 0 });
+glGenFramebuffers(1, 0x000000016fa15b7c);
+// framebuffers = { 2930 }
+glGenRenderbuffers(1, 0x000000016fa15b74);
+// renderbuffers = { 13946 }
+glBindRenderbuffer(GL_RENDERBUFFER, 13946);
+glRenderbufferStorage(GL_RENDERBUFFER, GL_RGBA8, 128, 128);
+glGenRenderbuffers(1, 0x000000016fa15b6c);
+// renderbuffers = { 13947 }
+glBindRenderbuffer(GL_RENDERBUFFER, 13947);
+glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH24_STENCIL8, 128, 128);
+glBindFramebuffer(GL_FRAMEBUFFER, 2930);
+glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, 13946);
+glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, 13947);
+glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_STENCIL_ATTACHMENT, GL_RENDERBUFFER, 13947);
+glGetError();
+// GL_NO_ERROR returned
+glCheckFramebufferStatus(GL_FRAMEBUFFER);
+// GL_FRAMEBUFFER_COMPLETE returned
+glClearBufferfi(GL_DEPTH_STENCIL, 0, 1, 0);
+glGenFramebuffers(1, 0x000000016fa15b78);
+// framebuffers = { 2931 }
+glGenRenderbuffers(1, 0x000000016fa15b70);
+// renderbuffers = { 13948 }
+glBindRenderbuffer(GL_RENDERBUFFER, 13948);
+glRenderbufferStorage(GL_RENDERBUFFER, GL_RGBA8, 128, 128);
+glGenRenderbuffers(1, 0x000000016fa15b64);
+// renderbuffers = { 13949 }
+glBindRenderbuffer(GL_RENDERBUFFER, 13949);
+glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH24_STENCIL8, 128, 128);
+glBindFramebuffer(GL_FRAMEBUFFER, 2931);
+glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, 13948);
+glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, 13949);
+glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_STENCIL_ATTACHMENT, GL_RENDERBUFFER, 13949);
+glGetError();
+// GL_NO_ERROR returned
+glCheckFramebufferStatus(GL_FRAMEBUFFER);
+// GL_FRAMEBUFFER_COMPLETE returned
+glClearBufferfi(GL_DEPTH_STENCIL, 0, 1, 0);
+glBindFramebuffer(GL_FRAMEBUFF
+=== dEQP-GLES3.functional.fbo.blit.depth_stencil.depth32f_stencil8_stencil_only
+glUseProgram(13887);
+glGetUniformLocation(13887, u_gradientMin);
+// 0 returned
+glUniform4fv(0, 1, { 0, 0, 0, 0 });
+glGetUniformLocation(13887, u_gradientMax);
+// 1 returned
+glUniform4fv(1, 1, { 1, 1, 1, 1 });
+glUseProgram(13884);
+glGetUniformLocation(13884, u_sampler0);
+// 0 returned
+glUniform1i(0, 0);
+glGetUniformLocation(13884, u_texScale0);
+// 1 returned
+glUniform4fv(1, 1, { 1, 1, 1, 1 });
+glGetUniformLocation(13884, u_texBias0);
+// 2 returned
+glUniform4fv(2, 1, { 0, 0, 0, 0 });
+glGetUniformLocation(13884, u_outScale0);
+// 3 returned
+glUniform4fv(3, 1, { 1, 1, 1, 1 });
+glGetUniformLocation(13884, u_outBias0);
+// 4 returned
+glUniform4fv(4, 1, { 0, 0, 0, 0 });
+glGenFramebuffers(1, 0x000000016fa15b7c);
+// framebuffers = { 2922 }
+glGenRenderbuffers(1, 0x000000016fa15b74);
+// renderbuffers = { 13890 }
+glBindRenderbuffer(GL_RENDERBUFFER, 13890);
+glRenderbufferStorage(GL_RENDERBUFFER, GL_RGBA8, 128, 128);
+glGenRenderbuffers(1, 0x000000016fa15b6c);
+// renderbuffers = { 13891 }
+glBindRenderbuffer(GL_RENDERBUFFER, 13891);
+glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH32F_STENCIL8, 128, 128);
+glBindFramebuffer(GL_FRAMEBUFFER, 2922);
+glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, 13890);
+glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, 13891);
+glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_STENCIL_ATTACHMENT, GL_RENDERBUFFER, 13891);
+glGetError();
+// GL_NO_ERROR returned
+glCheckFramebufferStatus(GL_FRAMEBUFFER);
+// GL_FRAMEBUFFER_COMPLETE returned
+glClearBufferfi(GL_DEPTH_STENCIL, 0, 1, 0);
+glGenFramebuffers(1, 0x000000016fa15b78);
+// framebuffers = { 2923 }
+glGenRenderbuffers(1, 0x000000016fa15b70);
+// renderbuffers = { 13892 }
+glBindRenderbuffer(GL_RENDERBUFFER, 13892);
+glRenderbufferStorage(GL_RENDERBUFFER, GL_RGBA8, 128, 128);
+glGenRenderbuffers(1, 0x000000016fa15b64);
+// renderbuffers = { 13893 }
+glBindRenderbuffer(GL_RENDERBUFFER, 13893);
+glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH32F_STENCIL8, 128, 128);
+glBindFramebuffer(GL_FRAMEBUFFER, 2923);
+glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, 13892);
+glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, 13893);
+glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_STENCIL_ATTACHMENT, GL_RENDERBUFFER, 13893);
+glGetError();
+// GL_NO_ERROR returned
+glCheckFramebufferStatus(GL_FRAMEBUFFER);
+// GL_FRAMEBUFFER_COMPLETE returned
+glClearBufferfi(GL_DEPTH_STENCIL, 0, 1, 0);
+glBindFramebuffer(GL_FRAMEBU
+=== dEQP-GLES3.functional.fbo.blit.rect.out_of_bounds_linear
+glUseProgram(9862);
+glGetUniformLocation(9862, u_gradientMin);
+// 0 returned
+glUniform4fv(0, 1, { 0, 0, 0, 0 });
+glGetUniformLocation(9862, u_gradientMax);
+// 1 returned
+glUniform4fv(1, 1, { 1, 1, 1, 1 });
+glUseProgram(9865);
+glGetUniformLocation(9865, u_sampler0);
+// 0 returned
+glUniform1i(0, 0);
+glGetUniformLocation(9865, u_texScale0);
+// 1 returned
+glUniform4fv(1, 1, { 1, 1, 1, 1 });
+glGetUniformLocation(9865, u_texBias0);
+// 2 returned
+glUniform4fv(2, 1, { 0, 0, 0, 0 });
+glGetUniformLocation(9865, u_outScale0);
+// 3 returned
+glUniform4fv(3, 1, { 1, 1, 1, 1 });
+glGetUniformLocation(9865, u_outBias0);
+// 4 returned
+glUniform4fv(4, 1, { 0, 0, 0, 0 });
+glGenFramebuffers(1, 0x000000016fa15cac);
+// framebuffers = { 1944 }
+glGenRenderbuffers(1, 0x000000016fa15ca4);
+// renderbuffers = { 9868 }
+glBindRenderbuffer(GL_RENDERBUFFER, 9868);
+glRenderbufferStorage(GL_RENDERBUFFER, GL_RGBA8, 127, 119);
+glBindFramebuffer(GL_FRAMEBUFFER, 1944);
+glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, 9868);
+glGetError();
+// GL_NO_ERROR returned
+glCheckFramebufferStatus(GL_FRAMEBUFFER);
+// GL_FRAMEBUFFER_COMPLETE returned
+glGenFramebuffers(1, 0x000000016fa15ca8);
+// framebuffers = { 1945 }
+glGenRenderbuffers(1, 0x000000016fa15ca0);
+// renderbuffers = { 9869 }
+glBindRenderbuffer(GL_RENDERBUFFER, 9869);
+glRenderbufferStorage(GL_RENDERBUFFER, GL_RGBA8, 132, 128);
+glBindFramebuffer(GL_FRAMEBUFFER, 1945);
+glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, 9869);
+glGetError();
+// GL_NO_ERROR returned
+glCheckFramebufferStatus(GL_FRAMEBUFFER);
+// GL_FRAMEBUFFER_COMPLETE returned
+glBindFramebuffer(GL_FRAMEBUFFER, 1945);
+glViewport(0, 0, 132, 128);
+glGetAttribLocation(9862, a_position);
+// 0 returned
+glGetAttribLocation(9862, a_coord);
+// 1 returned
+glUseProgram(9862);
+glEnableVertexAttribArray(0);
+glVertexAttribPointer(0, 4, GL_FLOAT, GL_FALSE, 0, 0x16fa15b98);
+glEnableVertexAttribArray(1);
+glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 0, 0x16fa15b70);
+glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_SHORT, 0x16fa15b60);
+glDisableVertexAttribArray(0);
+glDisableVertexAttribArray(1);
+glGenTextures(1, 0x000000016fa15c9c);
+// textures = { 9870 }
+glBindTexture(GL_TEXTURE_2D, 9870);
+glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER
+=== dEQP-GLES3.functional.fbo.blit.rect.out_of_bounds_reverse_dst_x_linear
+glUseProgram(9916);
+glGetUniformLocation(9916, u_gradientMin);
+// 0 returned
+glUniform4fv(0, 1, { 0, 0, 0, 0 });
+glGetUniformLocation(9916, u_gradientMax);
+// 1 returned
+glUniform4fv(1, 1, { 1, 1, 1, 1 });
+glUseProgram(9919);
+glGetUniformLocation(9919, u_sampler0);
+// 0 returned
+glUniform1i(0, 0);
+glGetUniformLocation(9919, u_texScale0);
+// 1 returned
+glUniform4fv(1, 1, { 1, 1, 1, 1 });
+glGetUniformLocation(9919, u_texBias0);
+// 2 returned
+glUniform4fv(2, 1, { 0, 0, 0, 0 });
+glGetUniformLocation(9919, u_outScale0);
+// 3 returned
+glUniform4fv(3, 1, { 1, 1, 1, 1 });
+glGetUniformLocation(9919, u_outBias0);
+// 4 returned
+glUniform4fv(4, 1, { 0, 0, 0, 0 });
+glGenFramebuffers(1, 0x000000016fa15cac);
+// framebuffers = { 1956 }
+glGenRenderbuffers(1, 0x000000016fa15ca4);
+// renderbuffers = { 9922 }
+glBindRenderbuffer(GL_RENDERBUFFER, 9922);
+glRenderbufferStorage(GL_RENDERBUFFER, GL_RGBA8, 127, 119);
+glBindFramebuffer(GL_FRAMEBUFFER, 1956);
+glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, 9922);
+glGetError();
+// GL_NO_ERROR returned
+glCheckFramebufferStatus(GL_FRAMEBUFFER);
+// GL_FRAMEBUFFER_COMPLETE returned
+glGenFramebuffers(1, 0x000000016fa15ca8);
+// framebuffers = { 1957 }
+glGenRenderbuffers(1, 0x000000016fa15ca0);
+// renderbuffers = { 9923 }
+glBindRenderbuffer(GL_RENDERBUFFER, 9923);
+glRenderbufferStorage(GL_RENDERBUFFER, GL_RGBA8, 132, 128);
+glBindFramebuffer(GL_FRAMEBUFFER, 1957);
+glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, 9923);
+glGetError();
+// GL_NO_ERROR returned
+glCheckFramebufferStatus(GL_FRAMEBUFFER);
+// GL_FRAMEBUFFER_COMPLETE returned
+glBindFramebuffer(GL_FRAMEBUFFER, 1957);
+glViewport(0, 0, 132, 128);
+glGetAttribLocation(9916, a_position);
+// 0 returned
+glGetAttribLocation(9916, a_coord);
+// 1 returned
+glUseProgram(9916);
+glEnableVertexAttribArray(0);
+glVertexAttribPointer(0, 4, GL_FLOAT, GL_FALSE, 0, 0x16fa15b98);
+glEnableVertexAttribArray(1);
+glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 0, 0x16fa15b70);
+glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_SHORT, 0x16fa15b60);
+glDisableVertexAttribArray(0);
+glDisableVertexAttribArray(1);
+glGenTextures(1, 0x000000016fa15c9c);
+// textures = { 9924 }
+glBindTexture(GL_TEXTURE_2D, 9924);
+glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER
+=== dEQP-GLES3.functional.fbo.blit.rect.out_of_bounds_reverse_dst_y_linear
+glUseProgram(9934);
+glGetUniformLocation(9934, u_gradientMin);
+// 0 returned
+glUniform4fv(0, 1, { 0, 0, 0, 0 });
+glGetUniformLocation(9934, u_gradientMax);
+// 1 returned
+glUniform4fv(1, 1, { 1, 1, 1, 1 });
+glUseProgram(9937);
+glGetUniformLocation(9937, u_sampler0);
+// 0 returned
+glUniform1i(0, 0);
+glGetUniformLocation(9937, u_texScale0);
+// 1 returned
+glUniform4fv(1, 1, { 1, 1, 1, 1 });
+glGetUniformLocation(9937, u_texBias0);
+// 2 returned
+glUniform4fv(2, 1, { 0, 0, 0, 0 });
+glGetUniformLocation(9937, u_outScale0);
+// 3 returned
+glUniform4fv(3, 1, { 1, 1, 1, 1 });
+glGetUniformLocation(9937, u_outBias0);
+// 4 returned
+glUniform4fv(4, 1, { 0, 0, 0, 0 });
+glGenFramebuffers(1, 0x000000016fa15cac);
+// framebuffers = { 1960 }
+glGenRenderbuffers(1, 0x000000016fa15ca4);
+// renderbuffers = { 9940 }
+glBindRenderbuffer(GL_RENDERBUFFER, 9940);
+glRenderbufferStorage(GL_RENDERBUFFER, GL_RGBA8, 127, 119);
+glBindFramebuffer(GL_FRAMEBUFFER, 1960);
+glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, 9940);
+glGetError();
+// GL_NO_ERROR returned
+glCheckFramebufferStatus(GL_FRAMEBUFFER);
+// GL_FRAMEBUFFER_COMPLETE returned
+glGenFramebuffers(1, 0x000000016fa15ca8);
+// framebuffers = { 1961 }
+glGenRenderbuffers(1, 0x000000016fa15ca0);
+// renderbuffers = { 9941 }
+glBindRenderbuffer(GL_RENDERBUFFER, 9941);
+glRenderbufferStorage(GL_RENDERBUFFER, GL_RGBA8, 132, 128);
+glBindFramebuffer(GL_FRAMEBUFFER, 1961);
+glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, 9941);
+glGetError();
+// GL_NO_ERROR returned
+glCheckFramebufferStatus(GL_FRAMEBUFFER);
+// GL_FRAMEBUFFER_COMPLETE returned
+glBindFramebuffer(GL_FRAMEBUFFER, 1961);
+glViewport(0, 0, 132, 128);
+glGetAttribLocation(9934, a_position);
+// 0 returned
+glGetAttribLocation(9934, a_coord);
+// 1 returned
+glUseProgram(9934);
+glEnableVertexAttribArray(0);
+glVertexAttribPointer(0, 4, GL_FLOAT, GL_FALSE, 0, 0x16fa15b98);
+glEnableVertexAttribArray(1);
+glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 0, 0x16fa15b70);
+glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_SHORT, 0x16fa15b60);
+glDisableVertexAttribArray(0);
+glDisableVertexAttribArray(1);
+glGenTextures(1, 0x000000016fa15c9c);
+// textures = { 9942 }
+glBindTexture(GL_TEXTURE_2D, 9942);
+glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER
+=== dEQP-GLES3.functional.fbo.blit.rect.out_of_bounds_reverse_src_dst_x_linear
+glUseProgram(9952);
+glGetUniformLocation(9952, u_gradientMin);
+// 0 returned
+glUniform4fv(0, 1, { 0, 0, 0, 0 });
+glGetUniformLocation(9952, u_gradientMax);
+// 1 returned
+glUniform4fv(1, 1, { 1, 1, 1, 1 });
+glUseProgram(9955);
+glGetUniformLocation(9955, u_sampler0);
+// 0 returned
+glUniform1i(0, 0);
+glGetUniformLocation(9955, u_texScale0);
+// 1 returned
+glUniform4fv(1, 1, { 1, 1, 1, 1 });
+glGetUniformLocation(9955, u_texBias0);
+// 2 returned
+glUniform4fv(2, 1, { 0, 0, 0, 0 });
+glGetUniformLocation(9955, u_outScale0);
+// 3 returned
+glUniform4fv(3, 1, { 1, 1, 1, 1 });
+glGetUniformLocation(9955, u_outBias0);
+// 4 returned
+glUniform4fv(4, 1, { 0, 0, 0, 0 });
+glGenFramebuffers(1, 0x000000016fa15cac);
+// framebuffers = { 1964 }
+glGenRenderbuffers(1, 0x000000016fa15ca4);
+// renderbuffers = { 9958 }
+glBindRenderbuffer(GL_RENDERBUFFER, 9958);
+glRenderbufferStorage(GL_RENDERBUFFER, GL_RGBA8, 127, 119);
+glBindFramebuffer(GL_FRAMEBUFFER, 1964);
+glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, 9958);
+glGetError();
+// GL_NO_ERROR returned
+glCheckFramebufferStatus(GL_FRAMEBUFFER);
+// GL_FRAMEBUFFER_COMPLETE returned
+glGenFramebuffers(1, 0x000000016fa15ca8);
+// framebuffers = { 1965 }
+glGenRenderbuffers(1, 0x000000016fa15ca0);
+// renderbuffers = { 9959 }
+glBindRenderbuffer(GL_RENDERBUFFER, 9959);
+glRenderbufferStorage(GL_RENDERBUFFER, GL_RGBA8, 132, 128);
+glBindFramebuffer(GL_FRAMEBUFFER, 1965);
+glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, 9959);
+glGetError();
+// GL_NO_ERROR returned
+glCheckFramebufferStatus(GL_FRAMEBUFFER);
+// GL_FRAMEBUFFER_COMPLETE returned
+glBindFramebuffer(GL_FRAMEBUFFER, 1965);
+glViewport(0, 0, 132, 128);
+glGetAttribLocation(9952, a_position);
+// 0 returned
+glGetAttribLocation(9952, a_coord);
+// 1 returned
+glUseProgram(9952);
+glEnableVertexAttribArray(0);
+glVertexAttribPointer(0, 4, GL_FLOAT, GL_FALSE, 0, 0x16fa15b98);
+glEnableVertexAttribArray(1);
+glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 0, 0x16fa15b70);
+glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_SHORT, 0x16fa15b60);
+glDisableVertexAttribArray(0);
+glDisableVertexAttribArray(1);
+glGenTextures(1, 0x000000016fa15c9c);
+// textures = { 9960 }
+glBindTexture(GL_TEXTURE_2D, 9960);
+glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER
+=== dEQP-GLES3.functional.fbo.blit.rect.out_of_bounds_reverse_src_dst_y_linear
+glUseProgram(9970);
+glGetUniformLocation(9970, u_gradientMin);
+// 0 returned
+glUniform4fv(0, 1, { 0, 0, 0, 0 });
+glGetUniformLocation(9970, u_gradientMax);
+// 1 returned
+glUniform4fv(1, 1, { 1, 1, 1, 1 });
+glUseProgram(9973);
+glGetUniformLocation(9973, u_sampler0);
+// 0 returned
+glUniform1i(0, 0);
+glGetUniformLocation(9973, u_texScale0);
+// 1 returned
+glUniform4fv(1, 1, { 1, 1, 1, 1 });
+glGetUniformLocation(9973, u_texBias0);
+// 2 returned
+glUniform4fv(2, 1, { 0, 0, 0, 0 });
+glGetUniformLocation(9973, u_outScale0);
+// 3 returned
+glUniform4fv(3, 1, { 1, 1, 1, 1 });
+glGetUniformLocation(9973, u_outBias0);
+// 4 returned
+glUniform4fv(4, 1, { 0, 0, 0, 0 });
+glGenFramebuffers(1, 0x000000016fa15cac);
+// framebuffers = { 1968 }
+glGenRenderbuffers(1, 0x000000016fa15ca4);
+// renderbuffers = { 9976 }
+glBindRenderbuffer(GL_RENDERBUFFER, 9976);
+glRenderbufferStorage(GL_RENDERBUFFER, GL_RGBA8, 127, 119);
+glBindFramebuffer(GL_FRAMEBUFFER, 1968);
+glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, 9976);
+glGetError();
+// GL_NO_ERROR returned
+glCheckFramebufferStatus(GL_FRAMEBUFFER);
+// GL_FRAMEBUFFER_COMPLETE returned
+glGenFramebuffers(1, 0x000000016fa15ca8);
+// framebuffers = { 1969 }
+glGenRenderbuffers(1, 0x000000016fa15ca0);
+// renderbuffers = { 9977 }
+glBindRenderbuffer(GL_RENDERBUFFER, 9977);
+glRenderbufferStorage(GL_RENDERBUFFER, GL_RGBA8, 132, 128);
+glBindFramebuffer(GL_FRAMEBUFFER, 1969);
+glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, 9977);
+glGetError();
+// GL_NO_ERROR returned
+glCheckFramebufferStatus(GL_FRAMEBUFFER);
+// GL_FRAMEBUFFER_COMPLETE returned
+glBindFramebuffer(GL_FRAMEBUFFER, 1969);
+glViewport(0, 0, 132, 128);
+glGetAttribLocation(9970, a_position);
+// 0 returned
+glGetAttribLocation(9970, a_coord);
+// 1 returned
+glUseProgram(9970);
+glEnableVertexAttribArray(0);
+glVertexAttribPointer(0, 4, GL_FLOAT, GL_FALSE, 0, 0x16fa15b98);
+glEnableVertexAttribArray(1);
+glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 0, 0x16fa15b70);
+glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_SHORT, 0x16fa15b60);
+glDisableVertexAttribArray(0);
+glDisableVertexAttribArray(1);
+glGenTextures(1, 0x000000016fa15c9c);
+// textures = { 9978 }
+glBindTexture(GL_TEXTURE_2D, 9978);
+glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER
+=== dEQP-GLES3.functional.fbo.blit.rect.out_of_bounds_reverse_src_x_linear
+glUseProgram(9880);
+glGetUniformLocation(9880, u_gradientMin);
+// 0 returned
+glUniform4fv(0, 1, { 0, 0, 0, 0 });
+glGetUniformLocation(9880, u_gradientMax);
+// 1 returned
+glUniform4fv(1, 1, { 1, 1, 1, 1 });
+glUseProgram(9883);
+glGetUniformLocation(9883, u_sampler0);
+// 0 returned
+glUniform1i(0, 0);
+glGetUniformLocation(9883, u_texScale0);
+// 1 returned
+glUniform4fv(1, 1, { 1, 1, 1, 1 });
+glGetUniformLocation(9883, u_texBias0);
+// 2 returned
+glUniform4fv(2, 1, { 0, 0, 0, 0 });
+glGetUniformLocation(9883, u_outScale0);
+// 3 returned
+glUniform4fv(3, 1, { 1, 1, 1, 1 });
+glGetUniformLocation(9883, u_outBias0);
+// 4 returned
+glUniform4fv(4, 1, { 0, 0, 0, 0 });
+glGenFramebuffers(1, 0x000000016fa15cac);
+// framebuffers = { 1948 }
+glGenRenderbuffers(1, 0x000000016fa15ca4);
+// renderbuffers = { 9886 }
+glBindRenderbuffer(GL_RENDERBUFFER, 9886);
+glRenderbufferStorage(GL_RENDERBUFFER, GL_RGBA8, 127, 119);
+glBindFramebuffer(GL_FRAMEBUFFER, 1948);
+glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, 9886);
+glGetError();
+// GL_NO_ERROR returned
+glCheckFramebufferStatus(GL_FRAMEBUFFER);
+// GL_FRAMEBUFFER_COMPLETE returned
+glGenFramebuffers(1, 0x000000016fa15ca8);
+// framebuffers = { 1949 }
+glGenRenderbuffers(1, 0x000000016fa15ca0);
+// renderbuffers = { 9887 }
+glBindRenderbuffer(GL_RENDERBUFFER, 9887);
+glRenderbufferStorage(GL_RENDERBUFFER, GL_RGBA8, 132, 128);
+glBindFramebuffer(GL_FRAMEBUFFER, 1949);
+glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, 9887);
+glGetError();
+// GL_NO_ERROR returned
+glCheckFramebufferStatus(GL_FRAMEBUFFER);
+// GL_FRAMEBUFFER_COMPLETE returned
+glBindFramebuffer(GL_FRAMEBUFFER, 1949);
+glViewport(0, 0, 132, 128);
+glGetAttribLocation(9880, a_position);
+// 0 returned
+glGetAttribLocation(9880, a_coord);
+// 1 returned
+glUseProgram(9880);
+glEnableVertexAttribArray(0);
+glVertexAttribPointer(0, 4, GL_FLOAT, GL_FALSE, 0, 0x16fa15b98);
+glEnableVertexAttribArray(1);
+glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 0, 0x16fa15b70);
+glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_SHORT, 0x16fa15b60);
+glDisableVertexAttribArray(0);
+glDisableVertexAttribArray(1);
+glGenTextures(1, 0x000000016fa15c9c);
+// textures = { 9888 }
+glBindTexture(GL_TEXTURE_2D, 9888);
+glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER
+=== dEQP-GLES3.functional.fbo.blit.rect.out_of_bounds_reverse_src_y_linear
+glUseProgram(9898);
+glGetUniformLocation(9898, u_gradientMin);
+// 0 returned
+glUniform4fv(0, 1, { 0, 0, 0, 0 });
+glGetUniformLocation(9898, u_gradientMax);
+// 1 returned
+glUniform4fv(1, 1, { 1, 1, 1, 1 });
+glUseProgram(9901);
+glGetUniformLocation(9901, u_sampler0);
+// 0 returned
+glUniform1i(0, 0);
+glGetUniformLocation(9901, u_texScale0);
+// 1 returned
+glUniform4fv(1, 1, { 1, 1, 1, 1 });
+glGetUniformLocation(9901, u_texBias0);
+// 2 returned
+glUniform4fv(2, 1, { 0, 0, 0, 0 });
+glGetUniformLocation(9901, u_outScale0);
+// 3 returned
+glUniform4fv(3, 1, { 1, 1, 1, 1 });
+glGetUniformLocation(9901, u_outBias0);
+// 4 returned
+glUniform4fv(4, 1, { 0, 0, 0, 0 });
+glGenFramebuffers(1, 0x000000016fa15cac);
+// framebuffers = { 1952 }
+glGenRenderbuffers(1, 0x000000016fa15ca4);
+// renderbuffers = { 9904 }
+glBindRenderbuffer(GL_RENDERBUFFER, 9904);
+glRenderbufferStorage(GL_RENDERBUFFER, GL_RGBA8, 127, 119);
+glBindFramebuffer(GL_FRAMEBUFFER, 1952);
+glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, 9904);
+glGetError();
+// GL_NO_ERROR returned
+glCheckFramebufferStatus(GL_FRAMEBUFFER);
+// GL_FRAMEBUFFER_COMPLETE returned
+glGenFramebuffers(1, 0x000000016fa15ca8);
+// framebuffers = { 1953 }
+glGenRenderbuffers(1, 0x000000016fa15ca0);
+// renderbuffers = { 9905 }
+glBindRenderbuffer(GL_RENDERBUFFER, 9905);
+glRenderbufferStorage(GL_RENDERBUFFER, GL_RGBA8, 132, 128);
+glBindFramebuffer(GL_FRAMEBUFFER, 1953);
+glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, 9905);
+glGetError();
+// GL_NO_ERROR returned
+glCheckFramebufferStatus(GL_FRAMEBUFFER);
+// GL_FRAMEBUFFER_COMPLETE returned
+glBindFramebuffer(GL_FRAMEBUFFER, 1953);
+glViewport(0, 0, 132, 128);
+glGetAttribLocation(9898, a_position);
+// 0 returned
+glGetAttribLocation(9898, a_coord);
+// 1 returned
+glUseProgram(9898);
+glEnableVertexAttribArray(0);
+glVertexAttribPointer(0, 4, GL_FLOAT, GL_FALSE, 0, 0x16fa15b98);
+glEnableVertexAttribArray(1);
+glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 0, 0x16fa15b70);
+glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_SHORT, 0x16fa15b60);
+glDisableVertexAttribArray(0);
+glDisableVertexAttribArray(1);
+glGenTextures(1, 0x000000016fa15c9c);
+// textures = { 9906 }
+glBindTexture(GL_TEXTURE_2D, 9906);
+glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER
+=== dEQP-GLES3.functional.fbo.completeness.renderable.renderbuffer.color0.red_float
+Internal format: GL_RED
+Width: 64
+Height: 64
+Samples: 0
+Target: GL_FRAMEBUFFER
+Type: GL_RENDERBUFFER
+Image Name: 3462
+Renderbuffer Target: GL_RENDERBUFFER
+* Valid texture format
+* Unsupported renderbuffer format
+* Format is allowed to be color-renderable but not required
+* Format is NOT depth-renderable
+* Format is NOT stencil-renderable
+Rules:
+Rules:
+Expected one of GL_INVALID_ENUM (during FBO initialization) or GL_FRAMEBUFFER_INCOMPLETE_ATTACHMENT.
+Received GL_FRAMEBUFFER_COMPLETE.
+<Result StatusCode="Fail">Framebuffer checked as complete, expected incomplete</Result>
+=== dEQP-GLES3.functional.fbo.completeness.renderable.renderbuffer.color0.red_half_float_oes
+Internal format: GL_RED
+Width: 64
+Height: 64
+Samples: 0
+Target: GL_FRAMEBUFFER
+Type: GL_RENDERBUFFER
+Image Name: 3463
+Renderbuffer Target: GL_RENDERBUFFER
+* Valid texture format
+* Unsupported renderbuffer format
+* Format is allowed to be color-renderable but not required
+* Format is NOT depth-renderable
+* Format is NOT stencil-renderable
+Rules:
+Rules:
+Expected one of GL_INVALID_ENUM (during FBO initialization) or GL_FRAMEBUFFER_INCOMPLETE_ATTACHMENT.
+Received GL_FRAMEBUFFER_COMPLETE.
+<Result StatusCode="Fail">Framebuffer checked as complete, expected incomplete</Result>
+=== dEQP-GLES3.functional.fbo.completeness.renderable.renderbuffer.color0.red_unsigned_byte
+Internal format: GL_RED
+Width: 64
+Height: 64
+Samples: 0
+Target: GL_FRAMEBUFFER
+Type: GL_RENDERBUFFER
+Image Name: 3461
+Renderbuffer Target: GL_RENDERBUFFER
+* Valid texture format
+* Unsupported renderbuffer format
+* Format is allowed to be color-renderable but not required
+* Format is NOT depth-renderable
+* Format is NOT stencil-renderable
+Rules:
+Rules:
+Expected one of GL_INVALID_ENUM (during FBO initialization) or GL_FRAMEBUFFER_INCOMPLETE_ATTACHMENT.
+Received GL_FRAMEBUFFER_COMPLETE.
+<Result StatusCode="Fail">Framebuffer checked as complete, expected incomplete</Result>
+=== dEQP-GLES3.functional.fbo.completeness.renderable.renderbuffer.color0.rg_float
+Internal format: GL_RG
+Width: 64
+Height: 64
+Samples: 0
+Target: GL_FRAMEBUFFER
+Type: GL_RENDERBUFFER
+Image Name: 3483
+Renderbuffer Target: GL_RENDERBUFFER
+* Valid texture format
+* Unsupported renderbuffer format
+* Format is allowed to be color-renderable but not required
+* Format is NOT depth-renderable
+* Format is NOT stencil-renderable
+Rules:
+Rules:
+Expected one of GL_INVALID_ENUM (during FBO initialization) or GL_FRAMEBUFFER_INCOMPLETE_ATTACHMENT.
+Received GL_FRAMEBUFFER_COMPLETE.
+<Result StatusCode="Fail">Framebuffer checked as complete, expected incomplete</Result>
+=== dEQP-GLES3.functional.fbo.completeness.renderable.renderbuffer.color0.rg_half_float_oes
+Internal format: GL_RG
+Width: 64
+Height: 64
+Samples: 0
+Target: GL_FRAMEBUFFER
+Type: GL_RENDERBUFFER
+Image Name: 3484
+Renderbuffer Target: GL_RENDERBUFFER
+* Valid texture format
+* Unsupported renderbuffer format
+* Format is allowed to be color-renderable but not required
+* Format is NOT depth-renderable
+* Format is NOT stencil-renderable
+Rules:
+Rules:
+Expected one of GL_INVALID_ENUM (during FBO initialization) or GL_FRAMEBUFFER_INCOMPLETE_ATTACHMENT.
+Received GL_FRAMEBUFFER_COMPLETE.
+<Result StatusCode="Fail">Framebuffer checked as complete, expected incomplete</Result>
+=== dEQP-GLES3.functional.fbo.completeness.renderable.renderbuffer.color0.rg_unsigned_byte
+Internal format: GL_RG
+Width: 64
+Height: 64
+Samples: 0
+Target: GL_FRAMEBUFFER
+Type: GL_RENDERBUFFER
+Image Name: 3482
+Renderbuffer Target: GL_RENDERBUFFER
+* Valid texture format
+* Unsupported renderbuffer format
+* Format is allowed to be color-renderable but not required
+* Format is NOT depth-renderable
+* Format is NOT stencil-renderable
+Rules:
+Rules:
+Expected one of GL_INVALID_ENUM (during FBO initialization) or GL_FRAMEBUFFER_INCOMPLETE_ATTACHMENT.
+Received GL_FRAMEBUFFER_COMPLETE.
+<Result StatusCode="Fail">Framebuffer checked as complete, expected incomplete</Result>
+=== dEQP-GLES3.functional.fbo.completeness.renderable.renderbuffer.color0.srgb_alpha_unsigned_byte
+Internal format: GL_SRGB_ALPHA
+Width: 64
+Height: 64
+Samples: 0
+Target: GL_FRAMEBUFFER
+Type: GL_RENDERBUFFER
+Image Name: 3512
+Renderbuffer Target: GL_RENDERBUFFER
+* Valid texture format
+* Unsupported renderbuffer format
+* Format is allowed to be color-renderable but not required
+* Format is NOT depth-renderable
+* Format is NOT stencil-renderable
+Rules:
+Rules:
+Expected one of GL_INVALID_ENUM (during FBO initialization) or GL_FRAMEBUFFER_INCOMPLETE_ATTACHMENT.
+Received GL_FRAMEBUFFER_COMPLETE.
+<Result StatusCode="Fail">Framebuffer checked as complete, expected incomplete</Result>
+=== dEQP-GLES3.functional.fbo.completeness.renderable.texture.color0.rgb_unsigned_int_10f_11f_11f_rev
+Type: GL_TEXTURE_2D
+Internal format: GL_RGB
+Format type: GL_UNSIGNED_INT_10F_11F_11F_REV
+Width: 64
+Height: 64
+Levels: 1
+Target: GL_FRAMEBUFFER
+Type: GL_TEXTURE
+Image Name: 3704
+Mipmap Level: 0
+Texture Target: GL_TEXTURE_2D
+* Unsupported texture format
+* Unsupported renderbuffer format
+* Format is NOT color-renderable
+* Format is NOT depth-renderable
+* Format is NOT stencil-renderable
+Rules:
+Rules:
+Rules:
+Rules:
+Expected one of GL_INVALID_ENUM (during FBO initialization), GL_INVALID_OPERATION (during FBO initialization), GL_INVALID_VALUE (during FBO initialization) or GL_FRAMEBUFFER_INCOMPLETE_ATTACHMENT.
+Received GL_FRAMEBUFFER_COMPLETE.
+<Result StatusCode="Fail">Framebuffer checked as complete, expected incomplete</Result>
+=== dEQP-GLES3.functional.fbo.completeness.renderable.texture.color0.rgba_unsigned_int_2_10_10_10_rev
+Type: GL_TEXTURE_2D
+Internal format: GL_RGBA
+Format type: GL_UNSIGNED_INT_2_10_10_10_REV
+Width: 64
+Height: 64
+Levels: 1
+Target: GL_FRAMEBUFFER
+Type: GL_TEXTURE
+Image Name: 3708
+Mipmap Level: 0
+Texture Target: GL_TEXTURE_2D
+* Unsupported texture format
+* Unsupported renderbuffer format
+* Format is NOT color-renderable
+* Format is NOT depth-renderable
+* Format is NOT stencil-renderable
+Rules:
+Rules:
+Rules:
+Rules:
+Expected one of GL_INVALID_ENUM (during FBO initialization), GL_INVALID_OPERATION (during FBO initialization), GL_INVALID_VALUE (during FBO initialization) or GL_FRAMEBUFFER_INCOMPLETE_ATTACHMENT.
+Received GL_FRAMEBUFFER_COMPLETE.
+<Result StatusCode="Fail">Framebuffer checked as complete, expected incomplete</Result>
+=== dEQP-GLES3.functional.fbo.completeness.size.zero
+Internal format: GL_RGB8
+Width: 0
+Height: 0
+Samples: 0
+Target: GL_FRAMEBUFFER
+Type: GL_RENDERBUFFER
+Image Name: 4455
+Renderbuffer Target: GL_RENDERBUFFER
+* Valid texture format
+* Valid renderbuffer format
+* Format is color-renderable
+* Format is NOT depth-renderable
+* Format is NOT stencil-renderable
+Rules:
+Expected GL_FRAMEBUFFER_INCOMPLETE_ATTACHMENT.
+Received GL_FRAMEBUFFER_COMPLETE.
+<Result StatusCode="Fail">Framebuffer checked as complete, expected incomplete</Result>
+=== dEQP-GLES3.functional.fbo.invalidate.sub.unbind_read_depth
+glGenTextures(1, 0x000000016fa15f18);
+// textures = { 14612 }
+glBindTexture(GL_TEXTURE_2D, 14612);
+glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, 128, 128, 0, GL_RGBA, GL_UNSIGNED_BYTE, 0);
+glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+glGenTextures(1, 0x000000016fa15f14);
+// textures = { 14613 }
+glBindTexture(GL_TEXTURE_2D, 14613);
+glTexImage2D(GL_TEXTURE_2D, 0, GL_DEPTH24_STENCIL8, 128, 128, 0, GL_DEPTH_STENCIL, GL_UNSIGNED_INT_24_8, 0);
+glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+glGenFramebuffers(1, 0x000000016fa15f1c);
+// framebuffers = { 3059 }
+glBindFramebuffer(GL_FRAMEBUFFER, 3059);
+glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, 14612, 0);
+glFramebufferTexture2D(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_TEXTURE_2D, 14613, 0);
+glFramebufferTexture2D(GL_FRAMEBUFFER, GL_STENCIL_ATTACHMENT, GL_TEXTURE_2D, 14613, 0);
+glCheckFramebufferStatus(GL_FRAMEBUFFER);
+// GL_FRAMEBUFFER_COMPLETE returned
+glClearBufferfv(GL_COLOR, 0, 0x000000016fa15c30);
+glClear(GL_DEPTH_BUFFER_BIT|GL_STENCIL_BUFFER_BIT);
+glEnable(GL_DEPTH_TEST);
+glEnable(GL_STENCIL_TEST);
+glStencilOp(GL_KEEP, GL_KEEP, GL_REPLACE);
+glStencilFunc(GL_ALWAYS, 1, 255);
+glUseProgram(14609);
+glGetUniformLocation(14609, u_gradientMin);
+// 0 returned
+glUniform4fv(0, 1, { 0, 0, 0, 0 });
+glGetUniformLocation(14609, u_gradientMax);
+// 1 returned
+glUniform4fv(1, 1, { 1, 1, 1, 1 });
+glGetAttribLocation(14609, a_position);
+// 0 returned
+glGetAttribLocation(14609, a_coord);
+// 1 returned
+glUseProgram(14609);
+glEnableVertexAttribArray(0);
+glVertexAttribPointer(0, 4, GL_FLOAT, GL_FALSE, 0, 0x16fa15b58);
+glEnableVertexAttribArray(1);
+glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 0, 0x16fa15b30);
+glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_SHORT, 0x16fa15b20);
+glDisableVertexAttribArray(0);
+glDisableVertexAttribArray(1);
+glInvalidateSubFramebuffer(GL_FRAMEBUFFER, 1, { GL_DEPTH_ATTACHMENT }, 0, 0, 64, 128)
+glBindFramebuffer(GL_FRAMEBUFFER, 0);
+glDisable(GL_DEPTH_TEST);
+glDisable(GL_STENCIL_TEST);
+glClearColor(0.25, 0.5, 0.75, 1);
+glClear(GL_DEPTH_BUFFER_BIT|GL_STENCIL_BUFFER_BIT|GL_COLOR_BUFFER_BIT);
+glScissor(64, 0, 64, 128);
+glEnable(GL_SCISSOR_TEST);
+glUseProgram(14614);
+glGetUniformLocation(14614, u_sampler0);
+// 0 returned
+glUniform1i(0, 0);
+glGetUniformLocation(14614, u_texScale0);
+// 1 returned
+glUniform4fv(1, 1, 
+=== dEQP-GLES3.functional.fbo.invalidate.sub.unbind_read_depth_stencil
+glGenTextures(1, 0x000000016fa15f18);
+// textures = { 14628 }
+glBindTexture(GL_TEXTURE_2D, 14628);
+glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, 128, 128, 0, GL_RGBA, GL_UNSIGNED_BYTE, 0);
+glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+glGenTextures(1, 0x000000016fa15f14);
+// textures = { 14629 }
+glBindTexture(GL_TEXTURE_2D, 14629);
+glTexImage2D(GL_TEXTURE_2D, 0, GL_DEPTH24_STENCIL8, 128, 128, 0, GL_DEPTH_STENCIL, GL_UNSIGNED_INT_24_8, 0);
+glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+glGenFramebuffers(1, 0x000000016fa15f1c);
+// framebuffers = { 3061 }
+glBindFramebuffer(GL_FRAMEBUFFER, 3061);
+glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, 14628, 0);
+glFramebufferTexture2D(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_TEXTURE_2D, 14629, 0);
+glFramebufferTexture2D(GL_FRAMEBUFFER, GL_STENCIL_ATTACHMENT, GL_TEXTURE_2D, 14629, 0);
+glCheckFramebufferStatus(GL_FRAMEBUFFER);
+// GL_FRAMEBUFFER_COMPLETE returned
+glClearBufferfv(GL_COLOR, 0, 0x000000016fa15c30);
+glClear(GL_DEPTH_BUFFER_BIT|GL_STENCIL_BUFFER_BIT);
+glEnable(GL_DEPTH_TEST);
+glEnable(GL_STENCIL_TEST);
+glStencilOp(GL_KEEP, GL_KEEP, GL_REPLACE);
+glStencilFunc(GL_ALWAYS, 1, 255);
+glUseProgram(14625);
+glGetUniformLocation(14625, u_gradientMin);
+// 0 returned
+glUniform4fv(0, 1, { 0, 0, 0, 0 });
+glGetUniformLocation(14625, u_gradientMax);
+// 1 returned
+glUniform4fv(1, 1, { 1, 1, 1, 1 });
+glGetAttribLocation(14625, a_position);
+// 0 returned
+glGetAttribLocation(14625, a_coord);
+// 1 returned
+glUseProgram(14625);
+glEnableVertexAttribArray(0);
+glVertexAttribPointer(0, 4, GL_FLOAT, GL_FALSE, 0, 0x16fa15b58);
+glEnableVertexAttribArray(1);
+glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 0, 0x16fa15b30);
+glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_SHORT, 0x16fa15b20);
+glDisableVertexAttribArray(0);
+glDisableVertexAttribArray(1);
+glInvalidateSubFramebuffer(GL_FRAMEBUFFER, 1, { GL_DEPTH_STENCIL_ATTACHMENT }, 0, 0, 64, 128)
+glBindFramebuffer(GL_FRAMEBUFFER, 0);
+glDisable(GL_DEPTH_TEST);
+glDisable(GL_STENCIL_TEST);
+glClearColor(0.25, 0.5, 0.75, 1);
+glClear(GL_DEPTH_BUFFER_BIT|GL_STENCIL_BUFFER_BIT|GL_COLOR_BUFFER_BIT);
+glScissor(64, 0, 64, 128);
+glEnable(GL_SCISSOR_TEST);
+glUseProgram(14630);
+glGetUniformLocation(14630, u_sampler0);
+// 0 returned
+glUniform1i(0, 0);
+glGetUniformLocation(14630, u_texScale0);
+// 1 returned
+glUniform4f
+=== dEQP-GLES3.functional.fbo.invalidate.sub.unbind_read_stencil
+glGenTextures(1, 0x000000016fa15f18);
+// textures = { 14620 }
+glBindTexture(GL_TEXTURE_2D, 14620);
+glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, 128, 128, 0, GL_RGBA, GL_UNSIGNED_BYTE, 0);
+glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+glGenTextures(1, 0x000000016fa15f14);
+// textures = { 14621 }
+glBindTexture(GL_TEXTURE_2D, 14621);
+glTexImage2D(GL_TEXTURE_2D, 0, GL_DEPTH24_STENCIL8, 128, 128, 0, GL_DEPTH_STENCIL, GL_UNSIGNED_INT_24_8, 0);
+glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+glGenFramebuffers(1, 0x000000016fa15f1c);
+// framebuffers = { 3060 }
+glBindFramebuffer(GL_FRAMEBUFFER, 3060);
+glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, 14620, 0);
+glFramebufferTexture2D(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_TEXTURE_2D, 14621, 0);
+glFramebufferTexture2D(GL_FRAMEBUFFER, GL_STENCIL_ATTACHMENT, GL_TEXTURE_2D, 14621, 0);
+glCheckFramebufferStatus(GL_FRAMEBUFFER);
+// GL_FRAMEBUFFER_COMPLETE returned
+glClearBufferfv(GL_COLOR, 0, 0x000000016fa15c30);
+glClear(GL_DEPTH_BUFFER_BIT|GL_STENCIL_BUFFER_BIT);
+glEnable(GL_DEPTH_TEST);
+glEnable(GL_STENCIL_TEST);
+glStencilOp(GL_KEEP, GL_KEEP, GL_REPLACE);
+glStencilFunc(GL_ALWAYS, 1, 255);
+glUseProgram(14617);
+glGetUniformLocation(14617, u_gradientMin);
+// 0 returned
+glUniform4fv(0, 1, { 0, 0, 0, 0 });
+glGetUniformLocation(14617, u_gradientMax);
+// 1 returned
+glUniform4fv(1, 1, { 1, 1, 1, 1 });
+glGetAttribLocation(14617, a_position);
+// 0 returned
+glGetAttribLocation(14617, a_coord);
+// 1 returned
+glUseProgram(14617);
+glEnableVertexAttribArray(0);
+glVertexAttribPointer(0, 4, GL_FLOAT, GL_FALSE, 0, 0x16fa15b58);
+glEnableVertexAttribArray(1);
+glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 0, 0x16fa15b30);
+glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_SHORT, 0x16fa15b20);
+glDisableVertexAttribArray(0);
+glDisableVertexAttribArray(1);
+glInvalidateSubFramebuffer(GL_FRAMEBUFFER, 1, { GL_STENCIL_ATTACHMENT }, 0, 0, 64, 128)
+glBindFramebuffer(GL_FRAMEBUFFER, 0);
+glDisable(GL_DEPTH_TEST);
+glDisable(GL_STENCIL_TEST);
+glClearColor(0.25, 0.5, 0.75, 1);
+glClear(GL_DEPTH_BUFFER_BIT|GL_STENCIL_BUFFER_BIT|GL_COLOR_BUFFER_BIT);
+glScissor(64, 0, 64, 128);
+glEnable(GL_SCISSOR_TEST);
+glUseProgram(14622);
+glGetUniformLocation(14622, u_sampler0);
+// 0 returned
+glUniform1i(0, 0);
+glGetUniformLocation(14622, u_texScale0);
+// 1 returned
+glUniform4fv(1, 1
+=== dEQP-GLES3.functional.fbo.invalidate.whole.unbind_read_color
+glGenTextures(1, 0x000000016fa15f20);
+// textures = { 14534 }
+glBindTexture(GL_TEXTURE_2D, 14534);
+glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, 128, 128, 0, GL_RGBA, GL_UNSIGNED_BYTE, 0);
+glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+glGenTextures(1, 0x000000016fa15f1c);
+// textures = { 14535 }
+glBindTexture(GL_TEXTURE_2D, 14535);
+glTexImage2D(GL_TEXTURE_2D, 0, GL_DEPTH24_STENCIL8, 128, 128, 0, GL_DEPTH_STENCIL, GL_UNSIGNED_INT_24_8, 0);
+glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+glGenFramebuffers(1, 0x000000016fa15f24);
+// framebuffers = { 3047 }
+glBindFramebuffer(GL_FRAMEBUFFER, 3047);
+glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, 14534, 0);
+glFramebufferTexture2D(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_TEXTURE_2D, 14535, 0);
+glFramebufferTexture2D(GL_FRAMEBUFFER, GL_STENCIL_ATTACHMENT, GL_TEXTURE_2D, 14535, 0);
+glCheckFramebufferStatus(GL_FRAMEBUFFER);
+// GL_FRAMEBUFFER_COMPLETE returned
+glClearColor(0, 0, 0, 1);
+glClear(GL_DEPTH_BUFFER_BIT|GL_STENCIL_BUFFER_BIT|GL_COLOR_BUFFER_BIT);
+glEnable(GL_DEPTH_TEST);
+glEnable(GL_STENCIL_TEST);
+glStencilOp(GL_KEEP, GL_KEEP, GL_REPLACE);
+glStencilFunc(GL_ALWAYS, 1, 255);
+glUseProgram(14531);
+glGetUniformLocation(14531, u_gradientMin);
+// 0 returned
+glUniform4fv(0, 1, { 0, 0, 0, 0 });
+glGetUniformLocation(14531, u_gradientMax);
+// 1 returned
+glUniform4fv(1, 1, { 1, 1, 1, 1 });
+glGetAttribLocation(14531, a_position);
+// 0 returned
+glGetAttribLocation(14531, a_coord);
+// 1 returned
+glUseProgram(14531);
+glEnableVertexAttribArray(0);
+glVertexAttribPointer(0, 4, GL_FLOAT, GL_FALSE, 0, 0x16fa15b78);
+glEnableVertexAttribArray(1);
+glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 0, 0x16fa15b50);
+glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_SHORT, 0x16fa15b40);
+glDisableVertexAttribArray(0);
+glDisableVertexAttribArray(1);
+glInvalidateFramebuffer(GL_FRAMEBUFFER, 1, { GL_COLOR_ATTACHMENT0 });
+glBindFramebuffer(GL_FRAMEBUFFER, 0);
+glDisable(GL_DEPTH_TEST);
+glDisable(GL_STENCIL_TEST);
+glUseProgram(14536);
+glGetUniformLocation(14536, u_sampler0);
+// 0 returned
+glUniform1i(0, 0);
+glGetUniformLocation(14536, u_texScale0);
+// 1 returned
+glUniform4fv(1, 1, { 1, 1, 1, 1 });
+glGetUniformLocation(14536, u_texBias0);
+// 2 returned
+glUniform4fv(2, 1, { 0, 0, 0, 0 });
+glGetUniformLocation(14536, u_outScale0);
+// 3 returned
+glUniform4fv(3, 1, { 1, 1, 1, 1 });
+glGetUniformLocation(14536, u_outBias0);
+// 4 re
+=== dEQP-GLES3.functional.fbo.invalidate.whole.unbind_read_color_stencil
+glGenTextures(1, 0x000000016fa15f20);
+// textures = { 14566 }
+glBindTexture(GL_TEXTURE_2D, 14566);
+glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, 128, 128, 0, GL_RGBA, GL_UNSIGNED_BYTE, 0);
+glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+glGenTextures(1, 0x000000016fa15f1c);
+// textures = { 14567 }
+glBindTexture(GL_TEXTURE_2D, 14567);
+glTexImage2D(GL_TEXTURE_2D, 0, GL_DEPTH24_STENCIL8, 128, 128, 0, GL_DEPTH_STENCIL, GL_UNSIGNED_INT_24_8, 0);
+glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+glGenFramebuffers(1, 0x000000016fa15f24);
+// framebuffers = { 3051 }
+glBindFramebuffer(GL_FRAMEBUFFER, 3051);
+glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, 14566, 0);
+glFramebufferTexture2D(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_TEXTURE_2D, 14567, 0);
+glFramebufferTexture2D(GL_FRAMEBUFFER, GL_STENCIL_ATTACHMENT, GL_TEXTURE_2D, 14567, 0);
+glCheckFramebufferStatus(GL_FRAMEBUFFER);
+// GL_FRAMEBUFFER_COMPLETE returned
+glClearColor(0, 0, 0, 1);
+glClear(GL_DEPTH_BUFFER_BIT|GL_STENCIL_BUFFER_BIT|GL_COLOR_BUFFER_BIT);
+glEnable(GL_DEPTH_TEST);
+glEnable(GL_STENCIL_TEST);
+glStencilOp(GL_KEEP, GL_KEEP, GL_REPLACE);
+glStencilFunc(GL_ALWAYS, 1, 255);
+glUseProgram(14563);
+glGetUniformLocation(14563, u_gradientMin);
+// 0 returned
+glUniform4fv(0, 1, { 0, 0, 0, 0 });
+glGetUniformLocation(14563, u_gradientMax);
+// 1 returned
+glUniform4fv(1, 1, { 1, 1, 1, 1 });
+glGetAttribLocation(14563, a_position);
+// 0 returned
+glGetAttribLocation(14563, a_coord);
+// 1 returned
+glUseProgram(14563);
+glEnableVertexAttribArray(0);
+glVertexAttribPointer(0, 4, GL_FLOAT, GL_FALSE, 0, 0x16fa15b78);
+glEnableVertexAttribArray(1);
+glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 0, 0x16fa15b50);
+glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_SHORT, 0x16fa15b40);
+glDisableVertexAttribArray(0);
+glDisableVertexAttribArray(1);
+glInvalidateFramebuffer(GL_FRAMEBUFFER, 2, { GL_COLOR_ATTACHMENT0, GL_STENCIL_ATTACHMENT });
+glBindFramebuffer(GL_FRAMEBUFFER, 0);
+glDisable(GL_DEPTH_TEST);
+glDisable(GL_STENCIL_TEST);
+glUseProgram(14568);
+glGetUniformLocation(14568, u_sampler0);
+// 0 returned
+glUniform1i(0, 0);
+glGetUniformLocation(14568, u_texScale0);
+// 1 returned
+glUniform4fv(1, 1, { 1, 1, 1, 1 });
+glGetUniformLocation(14568, u_texBias0);
+// 2 returned
+glUniform4fv(2, 1, { 0, 0, 0, 0 });
+glGetUniformLocation(14568, u_outScale0);
+// 3 returned
+glUniform4fv(3, 1, { 1, 1, 1, 1 });
+glGetUniformLocation(1456
+=== dEQP-GLES3.functional.fbo.invalidate.whole.unbind_read_stencil
+glGenTextures(1, 0x000000016fa15f20);
+// textures = { 14550 }
+glBindTexture(GL_TEXTURE_2D, 14550);
+glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, 128, 128, 0, GL_RGBA, GL_UNSIGNED_BYTE, 0);
+glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+glGenTextures(1, 0x000000016fa15f1c);
+// textures = { 14551 }
+glBindTexture(GL_TEXTURE_2D, 14551);
+glTexImage2D(GL_TEXTURE_2D, 0, GL_DEPTH24_STENCIL8, 128, 128, 0, GL_DEPTH_STENCIL, GL_UNSIGNED_INT_24_8, 0);
+glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+glGenFramebuffers(1, 0x000000016fa15f24);
+// framebuffers = { 3049 }
+glBindFramebuffer(GL_FRAMEBUFFER, 3049);
+glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, 14550, 0);
+glFramebufferTexture2D(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_TEXTURE_2D, 14551, 0);
+glFramebufferTexture2D(GL_FRAMEBUFFER, GL_STENCIL_ATTACHMENT, GL_TEXTURE_2D, 14551, 0);
+glCheckFramebufferStatus(GL_FRAMEBUFFER);
+// GL_FRAMEBUFFER_COMPLETE returned
+glClearColor(0, 0, 0, 1);
+glClear(GL_DEPTH_BUFFER_BIT|GL_STENCIL_BUFFER_BIT|GL_COLOR_BUFFER_BIT);
+glEnable(GL_DEPTH_TEST);
+glEnable(GL_STENCIL_TEST);
+glStencilOp(GL_KEEP, GL_KEEP, GL_REPLACE);
+glStencilFunc(GL_ALWAYS, 1, 255);
+glUseProgram(14547);
+glGetUniformLocation(14547, u_gradientMin);
+// 0 returned
+glUniform4fv(0, 1, { 0, 0, 0, 0 });
+glGetUniformLocation(14547, u_gradientMax);
+// 1 returned
+glUniform4fv(1, 1, { 1, 1, 1, 1 });
+glGetAttribLocation(14547, a_position);
+// 0 returned
+glGetAttribLocation(14547, a_coord);
+// 1 returned
+glUseProgram(14547);
+glEnableVertexAttribArray(0);
+glVertexAttribPointer(0, 4, GL_FLOAT, GL_FALSE, 0, 0x16fa15b78);
+glEnableVertexAttribArray(1);
+glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 0, 0x16fa15b50);
+glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_SHORT, 0x16fa15b40);
+glDisableVertexAttribArray(0);
+glDisableVertexAttribArray(1);
+glInvalidateFramebuffer(GL_FRAMEBUFFER, 1, { GL_STENCIL_ATTACHMENT });
+glBindFramebuffer(GL_FRAMEBUFFER, 0);
+glDisable(GL_DEPTH_TEST);
+glDisable(GL_STENCIL_TEST);
+glUseProgram(14552);
+glGetUniformLocation(14552, u_sampler0);
+// 0 returned
+glUniform1i(0, 0);
+glGetUniformLocation(14552, u_texScale0);
+// 1 returned
+glUniform4fv(1, 1, { 1, 1, 1, 1 });
+glGetUniformLocation(14552, u_texBias0);
+// 2 returned
+glUniform4fv(2, 1, { 0, 0, 0, 0 });
+glGetUniformLocation(14552, u_outScale0);
+// 3 returned
+glUniform4fv(3, 1, { 1, 1, 1, 1 });
+glGetUniformLocation(14552, u_outBias0);
+// 4 r
+=== dEQP-GLES3.functional.negative_api.buffer.blit_framebuffer_multisample
+glGenFramebuffers(2, 0x000000016fa1d6b0);
+// framebuffers = { 3189, 3190 }
+glGenRenderbuffers(2, 0x000000016fa1d6a8);
+// renderbuffers = { 15169, 15170 }
+glBindRenderbuffer(GL_RENDERBUFFER, 15169);
+glBindFramebuffer(GL_READ_FRAMEBUFFER, 3189);
+glRenderbufferStorageMultisample(GL_RENDERBUFFER, 4, GL_RGBA8, 32, 32);
+glFramebufferRenderbuffer(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, 15169);
+glCheckFramebufferStatus(GL_READ_FRAMEBUFFER);
+// GL_FRAMEBUFFER_COMPLETE returned
+glBindRenderbuffer(GL_RENDERBUFFER, 15170);
+glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 3190);
+glGetError();
+// GL_NO_ERROR returned
+glRenderbufferStorageMultisample(GL_RENDERBUFFER, 4, GL_RGBA8, 32, 32);
+glFramebufferRenderbuffer(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, 15170);
+glBlitFramebuffer(0, 0, 16, 16, 0, 0, 16, 16, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+glGetError();
+// GL_INVALID_OPERATION returned
+glRenderbufferStorage(GL_RENDERBUFFER, GL_RGBA4, 32, 32);
+glFramebufferRenderbuffer(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, 15170);
+glBlitFramebuffer(0, 0, 16, 16, 0, 0, 16, 16, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+glGetError();
+// GL_INVALID_OPERATION returned
+glRenderbufferStorage(GL_RENDERBUFFER, GL_RGBA8, 32, 32);
+glFramebufferRenderbuffer(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, 15170);
+glBlitFramebuffer(0, 0, 16, 16, 2, 2, 18, 18, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+glGetError();
+// GL_NO_ERROR returned
+// ERROR: expected GL_INVALID_OPERATION
+glBindFramebuffer(GL_FRAMEBUFFER, 0);
+glDeleteRenderbuffers(2, { 15169, 15170 });
+glDeleteFramebuffers(2, { 3189, 3190 });
+<Result StatusCode="Fail">Got invalid error</Result>

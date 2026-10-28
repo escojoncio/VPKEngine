@@ -1,0 +1,2 @@
+attempt 1: exit=1 why=exit done=3321 open=None remaining=0
+{"Fail": 27, "NotSupported": 176, "Pass": 3117, "QualityWarning": 1}
