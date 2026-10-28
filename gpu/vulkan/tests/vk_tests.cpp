@@ -619,7 +619,7 @@ void testPasses() {
 
   CHECK(toStore(VK_ATTACHMENT_STORE_OP_NONE, false) == vpgpu::StoreAction::Store);  // NONE keeps contents
   CHECK(toStore(VK_ATTACHMENT_STORE_OP_DONT_CARE, true) == vpgpu::StoreAction::Resolve);
-  CHECK(toLoad(VK_ATTACHMENT_LOAD_OP_NONE_KHR) == vpgpu::LoadAction::DontCare);
+  CHECK(toLoad(VK_ATTACHMENT_LOAD_OP_NONE_KHR) == vpgpu::LoadAction::Load);  // NONE keeps the contents
 }
 
 // Upload + clear + copies through vkQueueSubmit, fences, and the deferred list reaching the core.

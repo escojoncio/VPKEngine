@@ -4631,6 +4631,8 @@ private:
 
     // ---- GLSL.std.450 ---------------------------------------------------------------------------
     void extInst(const Instr& in) {
+        // NonSemantic.* sets (debug info, printf, reflection) have no effect on the shader: no value is defined.
+        if (std::find(m_.nonSemanticExt.begin(), m_.nonSemanticExt.end(), w(in, 3)) != m_.nonSemanticExt.end()) return;
         if (w(in, 3) != m_.glslExt) fail("unsupported extended instruction set");
         uint32_t e = w(in, 4);
         uint32_t rtId = w(in, 1), id = w(in, 2);

@@ -2307,9 +2307,9 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkCreateRenderPass(VkDevice, const Vk
     b.flags = a.flags;
     b.format = a.format;
     b.samples = a.samples;
-    b.loadOp = a.loadOp;
+    b.loadOp = a.loadOp == VK_ATTACHMENT_LOAD_OP_NONE_KHR ? VK_ATTACHMENT_LOAD_OP_LOAD : a.loadOp;  // NONE keeps the contents
     b.storeOp = a.storeOp;
-    b.stencilLoadOp = a.stencilLoadOp;
+    b.stencilLoadOp = a.stencilLoadOp == VK_ATTACHMENT_LOAD_OP_NONE_KHR ? VK_ATTACHMENT_LOAD_OP_LOAD : a.stencilLoadOp;
     b.stencilStoreOp = a.stencilStoreOp;
     b.initialLayout = a.initialLayout;
     b.finalLayout = a.finalLayout;
@@ -2344,6 +2344,10 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkCreateRenderPass2(VkDevice, const V
                                                                VkRenderPass* out) {
   auto* rp = new RenderPassObj;
   rp->attachments.assign(ci->pAttachments, ci->pAttachments + ci->attachmentCount);
+  for (VkAttachmentDescription2& a : rp->attachments) {  // LOAD_OP_NONE (VK_EXT_load_store_op_none) keeps the contents: Load
+    if (a.loadOp == VK_ATTACHMENT_LOAD_OP_NONE_KHR) a.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+    if (a.stencilLoadOp == VK_ATTACHMENT_LOAD_OP_NONE_KHR) a.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+  }
   for (auto& a : rp->attachments) a.pNext = nullptr;
   for (uint32_t s = 0; s < ci->subpassCount; ++s) {
     const VkSubpassDescription2& sd = ci->pSubpasses[s];

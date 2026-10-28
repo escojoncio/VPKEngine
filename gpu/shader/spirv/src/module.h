@@ -93,6 +93,7 @@ struct SpirvModule {
     std::vector<uint32_t> words;
     uint32_t bound = 0;
     uint32_t glslExt = 0;  // the GLSL.std.450 import id, 0 if absent
+    std::vector<uint32_t> nonSemanticExt;  // NonSemantic.* import ids (VK_KHR_shader_non_semantic_info): debug info, ignored
     std::vector<EntryPoint> entries;
     std::unordered_map<uint32_t, TypeInfo> types;
     std::unordered_map<uint32_t, ConstantDef> constants;

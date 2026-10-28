@@ -1900,6 +1900,25 @@ bool vpvk::translateRecipeStage(const spirv::SpirvModule& m, const spirv::SpirvL
   return true;
 }
 
+namespace {
+// VK_EXT_pipeline_creation_feedback (core 1.3): the call's own duration for the pipeline (what a caller measures around
+// vkCreate*Pipelines); stages carry no figure of their own (VALID with a zero duration). A pipeline that was not created
+// (COMPILE_REQUIRED) reports nothing.
+void fillCreationFeedback(const void* pNext, uint32_t stageCount, uint64_t ns, bool created) {
+  for (auto* n = static_cast<const VkBaseInStructure*>(pNext); n; n = n->pNext) {
+    if (n->sType != VK_STRUCTURE_TYPE_PIPELINE_CREATION_FEEDBACK_CREATE_INFO) continue;
+    auto* fb = reinterpret_cast<const VkPipelineCreationFeedbackCreateInfo*>(n);
+    const VkPipelineCreationFeedbackFlags f = created ? VK_PIPELINE_CREATION_FEEDBACK_VALID_BIT : 0;
+    if (fb->pPipelineCreationFeedback) *fb->pPipelineCreationFeedback = {f, created ? ns : 0};
+    for (uint32_t k = 0; k < fb->pipelineStageCreationFeedbackCount && fb->pPipelineStageCreationFeedbacks; ++k)
+      fb->pPipelineStageCreationFeedbacks[k] = {k < stageCount ? f : 0, 0};
+  }
+}
+uint64_t nsSince(std::chrono::steady_clock::time_point t) {
+  return uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t).count());
+}
+}  // namespace
+
 VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkCreateGraphicsPipelines(VkDevice dv, VkPipelineCache, uint32_t n,
                                                                      const VkGraphicsPipelineCreateInfo* ci,
                                                                      const VkAllocationCallbacks*, VkPipeline* out) {
@@ -1908,7 +1927,9 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkCreateGraphicsPipelines(VkDevice dv
   std::vector<vpgpu::PipelineKey> keys;
   VkResult result = VK_SUCCESS;
   for (uint32_t i = 0; i < n; ++i) {
+    const auto t0 = std::chrono::steady_clock::now();
     PipelineObj* p = createGraphics(d, ci[i]);
+    fillCreationFeedback(ci[i].pNext, ci[i].stageCount, nsSince(t0), !p->compileRequired);
     if (p->compileRequired) {  // FAIL_ON_PIPELINE_COMPILE_REQUIRED: not requested; the others of the batch still are
       delete p;
       out[i] = VK_NULL_HANDLE;
@@ -1936,7 +1957,9 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkCreateComputePipelines(VkDevice dv,
   std::vector<vpgpu::PipelineKey> keys;
   VkResult result = VK_SUCCESS;
   for (uint32_t i = 0; i < n; ++i) {
+    const auto t0 = std::chrono::steady_clock::now();
     PipelineObj* p = createCompute(d, ci[i]);
+    fillCreationFeedback(ci[i].pNext, 1, nsSince(t0), !p->compileRequired);
     if (p->compileRequired) {
       delete p;
       out[i] = VK_NULL_HANDLE;
@@ -3223,8 +3246,9 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdBeginRendering(VkCommandBuffer cb, c
     const bool clearD = !resuming && da && fi.depth() && da->loadOp == VK_ATTACHMENT_LOAD_OP_CLEAR;
     const bool clearS = !resuming && sa && fi.stencil() && sa->loadOp == VK_ATTACHMENT_LOAD_OP_CLEAR;
     // An aspect of the image that is not attached keeps its contents (it is loaded, and stored below).
-    const bool loadD = fi.depth() && (da ? da->loadOp == VK_ATTACHMENT_LOAD_OP_LOAD : true);
-    const bool loadS = fi.stencil() && (sa ? sa->loadOp == VK_ATTACHMENT_LOAD_OP_LOAD : true);
+    auto loads = [](VkAttachmentLoadOp op) { return op == VK_ATTACHMENT_LOAD_OP_LOAD || op == VK_ATTACHMENT_LOAD_OP_NONE_KHR; };
+    const bool loadD = fi.depth() && (da ? loads(da->loadOp) : true);
+    const bool loadS = fi.stencil() && (sa ? loads(sa->loadOp) : true);
     if (da) d.depth.clear.depth = da->clearValue.depthStencil.depth;
     if (sa) d.depth.clear.stencil = uint8_t(sa->clearValue.depthStencil.stencil);
     const bool keepOthers = partialArea(ri->renderArea, v) || irregular;

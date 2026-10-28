@@ -14,7 +14,8 @@ namespace vpvk {
 
 vpgpu::LoadAction toLoad(VkAttachmentLoadOp op) {
   switch (op) {
-    case VK_ATTACHMENT_LOAD_OP_LOAD: return vpgpu::LoadAction::Load;
+    case VK_ATTACHMENT_LOAD_OP_LOAD:
+    case VK_ATTACHMENT_LOAD_OP_NONE_KHR: return vpgpu::LoadAction::Load;  // NONE (VK_EXT_load_store_op_none): contents kept, not read
     case VK_ATTACHMENT_LOAD_OP_CLEAR: return vpgpu::LoadAction::Clear;
     default: return vpgpu::LoadAction::DontCare;
   }

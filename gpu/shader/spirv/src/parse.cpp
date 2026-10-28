@@ -184,7 +184,8 @@ struct Parser {
                 return true;
             case OpExtInstImport:
                 if (!need(in, 3)) return false;
-                if (literalString(m, in, 2) == "GLSL.std.450") m.glslExt = w(in, 1);
+                if (const std::string name = literalString(m, in, 2); name == "GLSL.std.450") m.glslExt = w(in, 1);
+                else if (name.rfind("NonSemantic.", 0) == 0) m.nonSemanticExt.push_back(w(in, 1));
                 return true;
             case OpEntryPoint: {
                 if (!need(in, 4)) return false;
