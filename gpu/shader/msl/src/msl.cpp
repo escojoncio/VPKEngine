@@ -1338,10 +1338,12 @@ private:
         const std::string id = std::to_string(in.result), x = "sx" + id;
         static const char* const reduceFn[] = {"simd_sum", "simd_product", "simd_min", "simd_max", "simd_and", "simd_or", "simd_xor"};
         line("const ", typeName(t), " ", x, " = ", ex(in.args[0]), ";");
-        const bool builtin = mode == 0 || ((mode == 1 || mode == 2) && kind <= 1);
+        static const int expFlags = std::getenv("VPVK_SGA") ? std::atoi(std::getenv("VPVK_SGA")) : 0;  // EXPERIMENT
+        const bool builtin = (expFlags & 1) ? false : (mode == 0 || ((mode == 1 || mode == 2) && kind <= 1));
         const std::string mask = "sm" + id, lane = "sl" + id;
-        if (!builtin) {
-            line("const uint ", mask, " = as_type<uint2>(simd_vote::vote_t(simd_active_threads_mask())).x;");
+        if (!builtin || (expFlags & 2)) {
+            if (expFlags & 4) line("const uint ", mask, " = as_type<uint2>(simd_vote::vote_t(simd_ballot(true))).x;");
+            else line("const uint ", mask, " = as_type<uint2>(simd_vote::vote_t(simd_active_threads_mask())).x;");
             line("const uint ", lane, " = ", ex(in.args[1]), ";");
         }
         // Identity element: integers carry their bits; floats 0, 1, +inf, -inf.
@@ -1353,8 +1355,9 @@ private:
         }
         std::string results;
         for (unsigned k = 0; k < t.width; ++k) {
-            const std::string c = t.width > 1 ? x + "." + "xyzw"[k] : x;
+            std::string c = t.width > 1 ? x + "." + "xyzw"[k] : x;
             std::string r;
+            if (builtin && (expFlags & 2)) c = "(((" + mask + " >> " + lane + ") & 1u) != 0u ? " + c + " : " + literal(et.scalar, idBits) + ")";
             if (builtin) {
                 r = mode == 0 ? std::string(reduceFn[kind]) + "(" + c + ")"
                               : std::string(mode == 1 ? "simd_prefix_inclusive_" : "simd_prefix_exclusive_") + (kind == 0 ? "sum" : "product") + "(" + c + ")";
@@ -1370,7 +1373,7 @@ private:
                 for (size_t at; (at = body.find("sacc")) != std::string::npos;) body.replace(at, 4, r);
                 line(typeName(et), " ", r, " = ", literal(et.scalar, idBits), ";");
                 line("for (uint sk = 0u; sk < 32u; ++sk) {");
-                line("    const ", typeName(et), " sv = simd_shuffle(", c, ", ushort(sk));");
+                line("    const ", typeName(et), " sv = ", (expFlags & 8) ? "simd_broadcast(" : "simd_shuffle(", c, ", ushort(sk));");
                 line("    if (((", mask, " >> sk) & 1u) != 0u && ", cond, ") ", r, " = ", body, ";");
                 line("}");
             }
