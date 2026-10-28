@@ -102,20 +102,21 @@ std::mutex gEglLock;
 
 bool createSurfaceImages(Device* dev, Surface& s) {
     const uint32_t n = s.config->samples > 1 ? renderSamples(uint32_t(s.config->samples)) : 1;
-    auto make = [&](VkFormat f, bool depth, uint32_t samples) -> ImageP {
-        // Multisample images are attachments only: their samples are never read, so the backend can keep them on the tile.
-        const VkImageUsageFlags usage =
-            samples > 1 ? VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT
-                        : (depth ? VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT : VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT) |
-                              VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
-        return createImage2D(dev, formatByVk(f), s.width, s.height, 1, samples, usage);
+    auto make = [&](VkFormat f, bool depth) -> ImageP {
+        const FormatInfo* fi = formatByVk(f);
+        // The depth/stencil of a multisample config is the resolve target of its twin: the seed reads its stencil plane through a stencil view.
+        return createImage2D(dev, fi, s.width, s.height, 1, 1,
+                             (depth ? VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT : VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT) |
+                                 VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                             depth && fi->stencil && n > 1 ? VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT : 0);
     };
-    s.color = make(s.config->color, false, 1);
+    s.color = make(s.config->color, false);
     if (!s.color) return false;
-    // The multisample colour is not an image of the surface: the passes render it in a transient twin (Context::msTwin, an
-    // implicit-multisample attachment) that resolves into `color` and is seeded from it when a pass continues the picture.
+    // The multisample colour and depth/stencil are not images of the surface: the passes render them in transient twins
+    // (Context::msTwin, implicit-multisample attachments) that resolve into `color` / `depthStencil` and are seeded from them when
+    // a pass continues the picture. The samples never reach memory.
     s.msSamples = n;
-    if (s.config->ds != VK_FORMAT_UNDEFINED) s.depthStencil = make(s.config->ds, true, n);
+    if (s.config->ds != VK_FORMAT_UNDEFINED) s.depthStencil = make(s.config->ds, true);
     return true;
 }
 
@@ -321,7 +322,7 @@ static EGLSurface CreateSurface(EGLConfig c, Surface::Kind kind, void* window, c
     zeroSurfaceImage(tmp, *s->color);
     if (s->depthStencil) {
         tmp.imageInit(*s->depthStencil);
-        if (s->depthStencil->samples == VK_SAMPLE_COUNT_1_BIT) zeroSurfaceImage(tmp, *s->depthStencil);
+        zeroSurfaceImage(tmp, *s->depthStencil);
     }
     tmp.flush(true);
     return s;

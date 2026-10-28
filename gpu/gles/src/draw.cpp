@@ -139,6 +139,10 @@ Context::FbInfo Context::resolveFramebuffer(GLuint name, bool forDraw) {
         if (s->depthStencil) {
             fb.depth.image = s->depthStencil.get();
             if (s->depthStencil->format->stencil) fb.stencil.image = s->depthStencil.get();
+            if (s->msSamples > 1) {  // same twin scheme; the backend seeds a continuing pass from the resolved image
+                fb.depth.implicit = true, fb.depth.seedImage = s->depthStencil;
+                if (fb.stencil.image) fb.stencil.implicit = true, fb.stencil.seedImage = s->depthStencil;
+            }
         }
         return fb;
     }
@@ -318,17 +322,19 @@ bool Context::beginPass(const FbInfo& fb, std::vector<VkClearAttachment>* firstC
     // `resolve`: the single-sample view a multisample attachment is resolved into at the end of the pass (a multisample default
     // framebuffer stores its samples too: the next pass loads them).
     // An implicit-multisample attachment (`implicit`) is not stored (its twin stays on the tile) and starts from what the seed
-    // draw copies into it: its LOAD becomes DONT_CARE (depth / stencil have no seed: they start undefined).
+    // draw copies into it: its LOAD becomes DONT_CARE (depth / stencil of a texture have no seed: they start undefined). The
+    // depth / stencil of the default framebuffer (`seeded`) keep their LOAD: the twin is an autoMsaa slot of the backend, which
+    // seeds it from the resolved image.
     uint32_t seedMask = 0;
     auto fill = [&](VkRenderingAttachmentInfo& a, VkImageView v, size_t idx, VkImageView resolve = VK_NULL_HANDLE, bool integer = false,
-                    bool implicit = false) {
+                    bool implicit = false, bool seeded = false) {
         a.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
         a.imageView = v;
         a.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
         a.loadOp = load[idx];
         a.storeOp = implicit ? VK_ATTACHMENT_STORE_OP_DONT_CARE : VK_ATTACHMENT_STORE_OP_STORE;
         a.clearValue = clearValue[idx];
-        if (implicit && a.loadOp == VK_ATTACHMENT_LOAD_OP_LOAD) {
+        if (implicit && !seeded && a.loadOp == VK_ATTACHMENT_LOAD_OP_LOAD) {
             a.loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
             if (idx < size_t(kMaxDrawBuffers)) seedMask |= 1u << idx;
         }
@@ -346,8 +352,8 @@ bool Context::beginPass(const FbInfo& fb, std::vector<VkClearAttachment>* firstC
         if (colors[i].imageView) colorCount = uint32_t(i + 1);
     }
     VkRenderingAttachmentInfo depth{}, stencil{};
-    fill(depth, key.depth, kMaxDrawBuffers, key.depthResolve, true, fb.depth.implicit);
-    fill(stencil, key.stencil, kMaxDrawBuffers + 1, key.stencilResolve, true, fb.stencil.implicit);
+    fill(depth, key.depth, kMaxDrawBuffers, key.depthResolve, true, fb.depth.implicit, bool(fb.depth.seedImage));
+    fill(stencil, key.stencil, kMaxDrawBuffers + 1, key.stencilResolve, true, fb.stencil.implicit, bool(fb.stencil.seedImage));
     VkRenderingInfo ri{VK_STRUCTURE_TYPE_RENDERING_INFO};
     ri.renderArea = {{0, 0}, {fb.width, fb.height}};
     ri.layerCount = key.viewMask ? 1 : 1;
@@ -2674,13 +2680,15 @@ void Context::blitFramebuffer(GLint sx0, GLint sy0, GLint sx1, GLint sy1, GLint 
     FbTarget& rc = rf.color[size_t(std::clamp(ri, 0, kMaxDrawBuffers - 1))];
     const auto& bufs = drawFbo ? fbo(drawFbo)->drawBuffers : fbos[0]->drawBuffers;
     auto multisampled = [](const FbTarget& t) { return t.image && t.image->samples > 1; };
-    bool dstMS = ((mask & gl::DEPTH_BUFFER_BIT) && multisampled(df.depth)) || ((mask & gl::STENCIL_BUFFER_BIT) && multisampled(df.stencil));
+    // (The depth / stencil of a multisample default framebuffer is a single-sample image its twin resolves into.)
+    auto multisampledDs = [&](const FbTarget& t) { return multisampled(t) || (t.implicit && t.seedImage); };
+    bool dstMS = ((mask & gl::DEPTH_BUFFER_BIT) && multisampledDs(df.depth)) || ((mask & gl::STENCIL_BUFFER_BIT) && multisampledDs(df.stencil));
     if (mask & gl::COLOR_BUFFER_BIT)
         for (int i = 0; i < kMaxDrawBuffers; ++i) dstMS = dstMS || (bufs[size_t(i)] != gl::NONE && multisampled(df.color[size_t(i)]));
     if (dstMS) return setError(gl::INVALID_OPERATION);
     const bool msColor = (mask & gl::COLOR_BUFFER_BIT) && multisampled(rc);
-    const bool msDepth = (mask & gl::DEPTH_BUFFER_BIT) && multisampled(rf.depth);
-    const bool msStencil = (mask & gl::STENCIL_BUFFER_BIT) && multisampled(rf.stencil);
+    const bool msDepth = (mask & gl::DEPTH_BUFFER_BIT) && multisampledDs(rf.depth);
+    const bool msStencil = (mask & gl::STENCIL_BUFFER_BIT) && multisampledDs(rf.stencil);
     if (msColor || msDepth || msStencil) {
         if (sx1 - sx0 != dx1 - dx0 || sy1 - sy0 != dy1 - dy0) return setError(gl::INVALID_OPERATION);
         if (msColor)
