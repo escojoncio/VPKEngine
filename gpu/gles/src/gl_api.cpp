@@ -707,41 +707,62 @@ void SampleCoverage(GLfloat v, GLboolean inv) {
     CTX()
     c->sampleCoverageValue = std::clamp(v, 0.0f, 1.0f), c->sampleCoverageInvert = inv;
 }
+// Enum validation of the state setters (INVALID_ENUM before any state changes).
+bool validBlendFactor(GLenum f, bool src) {
+    return f == 0 || f == 1 || (f >= 0x300 && f <= 0x307) || (src && f == 0x308) || (f >= 0x8001 && f <= 0x8004);
+}
+bool validBlendEq(GLenum e) { return e == 0x8006 || e == 0x8007 || e == 0x8008 || e == 0x800A || e == 0x800B; }
+bool validStencilOp(GLenum o) { return o == 0 || (o >= 0x1E00 && o <= 0x1E03) || o == 0x150A || o == 0x8507 || o == 0x8508; }
+bool validCompare(GLenum f) { return f >= 0x200 && f <= 0x207; }
+bool validFace(GLenum f) { return f == 0x404 || f == 0x405 || f == 0x408; }
+bool validUsage(GLenum u) { return u >= 0x88E0 && u <= 0x88EA && u != 0x88E3 && u != 0x88E7; }
 void Hint(GLenum t, GLenum m) {
     CTX()
+    if ((t != gl::GENERATE_MIPMAP_HINT && t != gl::FRAGMENT_SHADER_DERIVATIVE_HINT) || m < 0x1100 || m > 0x1102)
+        return c->setError(gl::INVALID_ENUM, t);
     if (t == gl::GENERATE_MIPMAP_HINT) c->hints[0] = m;
     else if (t == gl::FRAGMENT_SHADER_DERIVATIVE_HINT) c->hints[1] = m;
 }
 void BlendFunc(GLenum s, GLenum d) {
     CTX()
+    if (!validBlendFactor(s, true) || !validBlendFactor(d, false)) return c->setError(gl::INVALID_ENUM, s);
     for (auto& b : c->blend) b.srcRGB = b.srcA = s, b.dstRGB = b.dstA = d;
 }
 void BlendFuncSeparate(GLenum sr, GLenum dr, GLenum sa, GLenum da) {
     CTX()
+    if (!validBlendFactor(sr, true) || !validBlendFactor(dr, false) || !validBlendFactor(sa, true) || !validBlendFactor(da, false))
+        return c->setError(gl::INVALID_ENUM, sr);
     for (auto& b : c->blend) b.srcRGB = sr, b.dstRGB = dr, b.srcA = sa, b.dstA = da;
 }
 void BlendFunci(GLuint i, GLenum s, GLenum d) {
     CTX()
+    if (!validBlendFactor(s, true) || !validBlendFactor(d, false)) return c->setError(gl::INVALID_ENUM, s);
     if (i < kMaxDrawBuffers) c->blend[i].srcRGB = c->blend[i].srcA = s, c->blend[i].dstRGB = c->blend[i].dstA = d;
 }
 void BlendFuncSeparatei(GLuint i, GLenum sr, GLenum dr, GLenum sa, GLenum da) {
     CTX()
+    if (!validBlendFactor(sr, true) || !validBlendFactor(dr, false) || !validBlendFactor(sa, true) || !validBlendFactor(da, false))
+        return c->setError(gl::INVALID_ENUM, sr);
     if (i < kMaxDrawBuffers) c->blend[i].srcRGB = sr, c->blend[i].dstRGB = dr, c->blend[i].srcA = sa, c->blend[i].dstA = da;
 }
 void BlendEquation(GLenum e) {
     CTX()
+    if (!validBlendEq(e)) return c->setError(gl::INVALID_ENUM, e);
     for (auto& b : c->blend) b.eqRGB = b.eqA = e;
 }
 void BlendEquationSeparate(GLenum r, GLenum a) {
     CTX()
+    if (!validBlendEq(r) || !validBlendEq(a)) return c->setError(gl::INVALID_ENUM, r);
     for (auto& b : c->blend) b.eqRGB = r, b.eqA = a;
 }
 void BlendEquationi(GLuint i, GLenum e) {
     CTX()
+    if (!validBlendEq(e)) return c->setError(gl::INVALID_ENUM, e);
     if (i < kMaxDrawBuffers) c->blend[i].eqRGB = c->blend[i].eqA = e;
 }
 void BlendEquationSeparatei(GLuint i, GLenum r, GLenum a) {
     CTX()
+    if (!validBlendEq(r) || !validBlendEq(a)) return c->setError(gl::INVALID_ENUM, r);
     if (i < kMaxDrawBuffers) c->blend[i].eqRGB = r, c->blend[i].eqA = a;
 }
 void BlendColor(GLfloat r, GLfloat g, GLfloat b, GLfloat a) {
@@ -750,18 +771,21 @@ void BlendColor(GLfloat r, GLfloat g, GLfloat b, GLfloat a) {
 }
 void StencilFuncSeparate(GLenum face, GLenum f, GLint ref, GLuint mask) {
     CTX()
+    if (!validFace(face) || !validCompare(f)) return c->setError(gl::INVALID_ENUM, face);
     for (int i = 0; i < 2; ++i)
         if (face == gl::FRONT_AND_BACK || (face == gl::FRONT) == (i == 0)) c->stencil[i].func = f, c->stencil[i].ref = ref, c->stencil[i].mask = mask;
 }
 void StencilFunc(GLenum f, GLint ref, GLuint mask) { StencilFuncSeparate(gl::FRONT_AND_BACK, f, ref, mask); }
 void StencilMaskSeparate(GLenum face, GLuint m) {
     CTX()
+    if (!validFace(face)) return c->setError(gl::INVALID_ENUM, face);
     for (int i = 0; i < 2; ++i)
         if (face == gl::FRONT_AND_BACK || (face == gl::FRONT) == (i == 0)) c->stencil[i].writeMask = m;
 }
 void StencilMask(GLuint m) { StencilMaskSeparate(gl::FRONT_AND_BACK, m); }
 void StencilOpSeparate(GLenum face, GLenum sf, GLenum zf, GLenum zp) {
     CTX()
+    if (!validFace(face) || !validStencilOp(sf) || !validStencilOp(zf) || !validStencilOp(zp)) return c->setError(gl::INVALID_ENUM, face);
     for (int i = 0; i < 2; ++i)
         if (face == gl::FRONT_AND_BACK || (face == gl::FRONT) == (i == 0)) c->stencil[i].fail = sf, c->stencil[i].zfail = zf, c->stencil[i].zpass = zp;
 }
@@ -917,6 +941,7 @@ constexpr VkBufferUsageFlags kAllUsage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_
                                          VK_BUFFER_USAGE_TRANSFER_DST_BIT;
 void BufferData(GLenum target, GLsizeiptr size, const void* data, GLenum usage) {
     CTX()
+    if (!validUsage(usage)) return c->setError(gl::INVALID_ENUM, target);
     if (size < 0) return c->setError(gl::INVALID_VALUE, target);
     Buffer* b = targetBuffer(c, target);
     if (!b) return;
