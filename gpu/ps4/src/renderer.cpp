@@ -3909,7 +3909,8 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
                     }
                     uint64_t address = 0, size = 0;
                     uint32_t stride = 0;
-                    if (b.dwords == 0 || b.source.kind == vpgcn::DescriptorSource::Code) {
+                    const bool pointer = b.dwords == 0 || b.source.kind == vpgcn::DescriptorSource::Code;
+                    if (pointer) {
                         // (Code: the base is an address in the program image; its size/format words are
                         // set by the program, so there is no descriptor to read.)
                         if (!memoryAddress(s, b.source, address)) return why = "buffer address unreadable", false;
@@ -3935,13 +3936,13 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
                         if (address) noteUnmappedBuffer(address, size, res.kind == vpir::ResourceKind::ConstantBuffer);
                         std::memset(dummy.memory, 0, kDummyBytes);
                         a.range = ResourceRange::bytes(dummy.id, 0, kDummyBytes);
-                        if (resolved_ && address) resolved_->buffers.push_back({uint8_t(stage), address, 0, stride, a.write});
+                        if (resolved_ && address) resolved_->buffers.push_back({uint8_t(stage), address, 0, stride, a.write, pointer});
                         break;
                     }
                     // (a buffer of unknown extent, e.g. a bare address: only a window of it is tracked)
                     rawAccess(address, size && size <= available ? size : std::min<uint64_t>(available, kUnknownExtent), a.write);
                     if (!size || size > available) size = available;
-                    if (resolved_) resolved_->buffers.push_back({uint8_t(stage), address, size, stride, a.write});
+                    if (resolved_) resolved_->buffers.push_back({uint8_t(stage), address, size, stride, a.write, pointer});
                     if (res.kind == vpir::ResourceKind::Buffer && address % 4) return why = "buffer not 4-byte aligned", false;
                     if (res.kind == vpir::ResourceKind::ConstantBuffer && address % 16) {
                         // Constant buffers are read with aligned vector loads: an unaligned one is copied.

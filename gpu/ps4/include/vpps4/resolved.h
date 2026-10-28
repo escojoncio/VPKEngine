@@ -41,6 +41,7 @@ struct ResolvedBuffer {
     uint64_t size = 0;      // bytes bound; 0: not bound for real (zeros)
     uint32_t stride = 0;
     bool write = false;
+    bool pointer = false;   // reached by an address (s_load through a pointer, a program image), not through a V#
 };
 
 struct ResolvedTexture {
