@@ -1,0 +1,18 @@
+=== dEQP-VK.subgroups.arithmetic.compute.subgroupadd_uint
+1 / 7 values passed
+<Result StatusCode="Fail">Failed!</Result>
+=== dEQP-VK.subgroups.arithmetic.compute.subgroupexclusiveor_int
+1 / 7 values passed
+<Result StatusCode="Fail">Failed!</Result>
+=== dEQP-VK.subgroups.arithmetic.compute.subgroupinclusiveadd_int
+1 / 7 values passed
+<Result StatusCode="Fail">Failed!</Result>
+=== dEQP-VK.subgroups.arithmetic.compute.subgroupmin_float
+1 / 7 values passed
+<Result StatusCode="Fail">Failed!</Result>
+=== dEQP-VK.subgroups.arithmetic.graphics.subgroupadd_ivec4
+1 / 27 values passed
+<Result StatusCode="Fail">Failed!</Result>
+=== dEQP-VK.subgroups.arithmetic.graphics.subgroupinclusivemin_vec2
+4 / 27 values passed
+<Result StatusCode="Fail">Failed!</Result>
