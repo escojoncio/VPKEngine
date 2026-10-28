@@ -1366,7 +1366,7 @@ struct Translator {
       // Strictly increasing and never 0, even for two writes within one clock tick.
       uint64_t prev = last.load();
       while (!last.compare_exchange_weak(prev, std::max(now, prev + 1))) {}
-      now = std::max(now, prev + 1);
+      now = std::max(now, prev + 1) & ((uint64_t{1} << kTimestampValidBits) - 1);
       for (uint32_t i = 0; i < n; ++i)
         std::memcpy(p->device->visibility.host + size_t(p->base + q.query + i) * 8, &now, 8);
     }

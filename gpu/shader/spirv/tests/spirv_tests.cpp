@@ -703,6 +703,31 @@ void subgroupShuffle(const std::string& dir) {
     if (failures || std::getenv("VP_PRINT")) std::fprintf(stderr, "%s\n", src.c_str());
 }
 
+// Arithmetic and clustered subgroup operations (vpir subgroup_arith): reductions and the sum / product scans are Metal's
+// simd_* functions, the other scans and the clustered reductions a loop over the lanes of the SIMD group; a boolean
+// LogicalAnd travels as an integer. Hand-assembled: gen_subgroup_arith.py.
+void subgroupArith(const std::string& dir) {
+    spirv::SpirvLowerOptions o;
+    o.entry = "main";
+    o.stage = vpir::Stage::Compute;
+    o.layout = {bind(0, 0, vpgpu::BindKind::Buffer, 0)};
+    Result r = run(dir + "/subgroup_arith.comp.spv", o);
+    CHECK(r.ok);
+    if (!r.ok) return;
+    const std::string& src = r.msl.source;
+    CHECK(src.find("simd_sum(") != std::string::npos);                    // IAdd reduce
+    CHECK(src.find("simd_prefix_inclusive_sum(") != std::string::npos);   // FAdd inclusive scan
+    CHECK(src.find("simd_xor(") != std::string::npos);                    // BitwiseXor reduce
+    CHECK(src.find("simd_and(") != std::string::npos);                    // LogicalAnd reduce (0/1 integers)
+    CHECK(src.find("simd_prefix_exclusive_") == std::string::npos);       // SMin exclusive: the loop, not a builtin
+    CHECK(src.find("simd_active_threads_mask()") != std::string::npos && src.find("for (uint sk = 0u; sk < 32u; ++sk)") != std::string::npos);
+    CHECK(src.find("min(") != std::string::npos && src.find("max(") != std::string::npos);
+    CHECK(src.find("(sk >> 2u) == (") != std::string::npos);              // clustered by 4
+    CHECK(src.find("sk < ") != std::string::npos);                        // exclusive: lanes below
+    CHECK(src.find("2147483647") != std::string::npos);                   // SMin identity
+    if (failures || std::getenv("VP_PRINT")) std::fprintf(stderr, "%s\n", src.c_str());
+}
+
 // robustBufferAccess (EmitOptions::robustBuffers): every storage-buffer store / atomic is guarded by
 // the BufferSize of its slot (added as an argument when the shader had none), so an out-of-range
 // or unbound (size 0) buffer is never touched. Without the option the MSL has no guard.
@@ -1772,6 +1797,7 @@ int main(int argc, char** argv) {
     else if (c == "dyn_buffer") dynBuffer(dir);
     else if (c == "subgroup_cube") subgroupCube(dir);
     else if (c == "subgroup_shuffle") subgroupShuffle(dir);
+    else if (c == "subgroup_arith") subgroupArith(dir);
     else if (c == "texel_fetch") texelFetch(dir);
     else if (c == "int16") int16(dir);
     else if (c == "storage16") storage16(dir);

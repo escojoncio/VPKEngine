@@ -171,6 +171,12 @@ struct Instance : Dispatchable {
   std::string appName, engineName;
 };
 
+// The single queue family exposes kQueueCount VkQueues (Quest: queueCount 4). Each has its own submission order; they all
+// execute on the one Metal command queue, in the order their batches become ready (entry.cpp drainDeferred).
+inline constexpr uint32_t kQueueCount = 4;
+// Timestamps are host ticks of limits.timestampPeriod; the bits above this many are 0 (commands.cpp queryEnd). Quest: 48.
+inline constexpr uint32_t kTimestampValidBits = 48;
+
 struct Queue : Dispatchable {
   Device* device = nullptr;
   uint32_t family = 0, index = 0;
@@ -606,6 +612,7 @@ struct DeferredBatch {
   std::vector<const CommandBuffer*> cbs;
   std::vector<std::pair<Semaphore*, uint64_t>> waits, signals;  // timeline semaphores only
   Fence* fence = nullptr;                                     // last batch of its vkQueueSubmit
+  uint32_t queue = 0;                                         // index of the VkQueue it was submitted to
 };
 
 struct CommandPool {
@@ -704,7 +711,7 @@ struct Device : Dispatchable {
   // prewarm off), recipes the prewarm left ready, and the game's creates no recipe covered (counted with nothing stored too).
   uint32_t recipesLoaded = 0;
   std::atomic<uint32_t> recipesPrewarmed{0}, recipesFresh{0};
-  Queue queue;
+  Queue queues[kQueueCount];
   bool multiview = false, densityMap = false, metalObjects = false;
   std::mutex submitMutex;
   std::mutex resourceMutex;  // gpu->create*/destroy from recording threads (upload arenas)
@@ -717,7 +724,7 @@ struct Device : Dispatchable {
   std::atomic<int64_t> indirectPatchBackoffNs{0};
   uint32_t indirectPatchWaitMs = 2000, indirectPatchBackoffMs = 3000;
   uint64_t submits = 0;
-  std::vector<DeferredBatch> deferred;  // submitMutex; queue order (front = next to run)
+  std::vector<DeferredBatch> deferred;  // submitMutex; submission order (batches of one queue keep their order, queues are independent)
   // vpvk_dump_pending: when each vpgpu frame was handed to the backend (by frame index % 64), and how many are noted.
   std::atomic<int64_t> frameNs[64]{};
   std::atomic<uint64_t> frameNsNoted{0};

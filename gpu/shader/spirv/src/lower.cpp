@@ -3765,9 +3765,72 @@ private:
                 }
                 return one(un(Op::SubgroupAll, eq, vpir::kBool));
             }
+            case OpGroupNonUniformIAdd: case OpGroupNonUniformFAdd: case OpGroupNonUniformIMul: case OpGroupNonUniformFMul:
+            case OpGroupNonUniformSMin: case OpGroupNonUniformUMin: case OpGroupNonUniformFMin:
+            case OpGroupNonUniformSMax: case OpGroupNonUniformUMax: case OpGroupNonUniformFMax:
+            case OpGroupNonUniformBitwiseAnd: case OpGroupNonUniformBitwiseOr: case OpGroupNonUniformBitwiseXor:
+            case OpGroupNonUniformLogicalAnd: case OpGroupNonUniformLogicalOr: case OpGroupNonUniformLogicalXor:
+                return one(subgroupArith(in));
             default: break;
         }
         fail("unsupported SPIR-V instruction " + std::to_string(op));
+    }
+    // OpGroupNonUniform{IAdd..LogicalXor}: reductions and scans over the active lanes (vpir subgroup_arith). 8/16-bit
+    // integers are computed in 32 bits (min / max on the operand re-extended as the opcode reads it) and the result is
+    // re-extended; booleans travel as 0/1 integers.
+    ValueId subgroupArith(const Instr& in) {
+        const uint16_t op = in.op;
+        const uint32_t rtId = w(in, 1), group = w(in, 4), valId = w(in, 5);
+        uint32_t kind = 0;
+        bool sgn = false;
+        switch (op) {
+            case OpGroupNonUniformIAdd: case OpGroupNonUniformFAdd: kind = 0; break;
+            case OpGroupNonUniformIMul: case OpGroupNonUniformFMul: kind = 1; break;
+            case OpGroupNonUniformSMin: sgn = true; [[fallthrough]];
+            case OpGroupNonUniformUMin: case OpGroupNonUniformFMin: kind = 2; break;
+            case OpGroupNonUniformSMax: sgn = true; [[fallthrough]];
+            case OpGroupNonUniformUMax: case OpGroupNonUniformFMax: kind = 3; break;
+            case OpGroupNonUniformBitwiseAnd: case OpGroupNonUniformLogicalAnd: kind = 4; break;
+            case OpGroupNonUniformBitwiseOr: case OpGroupNonUniformLogicalOr: kind = 5; break;
+            default: kind = 6; break;
+        }
+        uint32_t mode = group, cluster = 0;
+        if (group > 3) fail("unsupported subgroup group operation " + std::to_string(group));
+        if (group == 3) {
+            if (in.count < 7 || !isConstant(w(in, 6))) fail("subgroup clustered operation needs a constant cluster size");
+            cluster = uint32_t(constScalar(w(in, 6)));
+            if (cluster == 0 || (cluster & (cluster - 1))) fail("subgroup cluster size must be a power of two");
+            if (cluster >= 32) mode = 0;  // as large as the subgroup: a plain reduction
+        }
+        const Type rt = vt(rtId);
+        const bool boolean = rt.isBool(), narrow = isNarrowInt(rtId);
+        const uint32_t bits = narrow ? intBits(rtId) : 32;
+        // The operand in the register type the operation runs in, and the identity element's bits for integers.
+        Type et = boolean ? Type(Scalar::U32, rt.width) : rt;
+        ValueId v;
+        if (boolean) v = select(get1(valId), splat(et, 1), splat(et, 0));
+        else if (rt.isFloat()) v = get1(valId);
+        else if (kind == 2 || kind == 3) {
+            et = Type(sgn ? Scalar::I32 : Scalar::U32, rt.width);
+            v = narrow ? intOperand(valId, et.scalar) : castBits(get1(valId), et);
+        } else {
+            v = get1(valId);
+            et = typeOfValue(v);
+        }
+        uint32_t identity = 0;
+        switch (kind) {
+            case 1: identity = 1; break;
+            case 2: identity = sgn ? (1u << (bits - 1)) - 1 : 0xFFFFFFFFu; break;
+            case 3: identity = sgn ? 0u - (1u << (bits - 1)) : 0u; break;
+            case 4: identity = boolean ? 1u : 0xFFFFFFFFu; break;
+            default: break;
+        }
+        Inst si;
+        si.op = Op::SubgroupArith, si.type = et, si.args = {v, laneId()}, si.lits = {kind, mode, cluster, identity};
+        ValueId r = b_->emit(si);
+        if (boolean) return bin(Op::Ne, r, splat(et, 0), rt);
+        if (narrow) return narrowInt(r, rtId);
+        return castBits(r, rt);
     }
     // A per-lane subgroup op (read first, broadcast, shuffle, quad shuffle) on any value type: MSL's
     // simd_* functions take no bool, so booleans travel as 0/1 integers. `lane` = kNoValue: unary.

@@ -17,7 +17,8 @@ where they loaded MoltenVK today. Written from the Vulkan specification; uses on
 
 ## Model
 - **One physical device**, reported as Adreno 740 (vendor 0x5143) with Quest-3-like limits so engines
-  pick their mobile Vulkan path. One queue family (graphics+compute+transfer), one queue.
+  pick their mobile Vulkan path. One queue family (graphics+compute+transfer) with 4 VkQueues (Quest: queueCount 4, timestampValidBits 48): each
+  keeps its own submission order and all run on the one Metal command queue in the order their batches become ready.
 - **Memory**: one DEVICE_LOCAL heap; types 0 device, 1 host-visible coherent, 2 +cached, 3 lazily
   allocated (transient attachments only). Every `VkDeviceMemory` is page-aligned (16 KiB) host memory;
   a bound `VkBuffer` is a core buffer aliasing `memory + offset` (`BufferDesc::guestMemory`, Metal

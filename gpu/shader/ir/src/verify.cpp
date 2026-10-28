@@ -685,6 +685,20 @@ private:
                 break;
             case Op::SubgroupAny:
             case Op::SubgroupAll: unaryOrBinary(t == kBool, "needs bool"); break;
+            case Op::SubgroupArith: {
+                expectResult(in, true);
+                require(a[0] == t && t.isNumeric() && a[1] == kU32, "needs a numeric value and a u32 lane, the result has the value's type");
+                if (in.lits.size() != 4) {
+                    error("needs kind, mode, cluster and identity literals");
+                    break;
+                }
+                const uint32_t kind = in.lits[0], mode = in.lits[1], cluster = in.lits[2];
+                require(kind <= 6, "bad kind");
+                require(kind < 4 || t.isInt(), "and / or / xor need an integer");
+                require(mode <= 3, "bad mode");
+                require(mode != 3 || (cluster >= 1 && cluster <= 16 && (cluster & (cluster - 1)) == 0), "cluster must be a power of two from 1 to 16");
+                break;
+            }
             case Op::UnpackUnorm4x8:
             case Op::UnpackSnorm4x8:
             case Op::UnpackUnorm2x16:
@@ -730,7 +744,7 @@ private:
                 require(sameAll(kU32), "operands must be u32");
                 break;
         }
-        if (in.op >= Op::SubgroupBallot && in.op <= Op::SubgroupAll)
+        if (in.op >= Op::SubgroupBallot && in.op <= Op::SubgroupArith)
             require(stageIs(kSubgroupStages), "subgroup ops need a fragment, compute, object or mesh stage");
     }
 

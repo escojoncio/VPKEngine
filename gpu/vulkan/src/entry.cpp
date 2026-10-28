@@ -313,8 +313,8 @@ constexpr uint32_t kSubgroupSize = 32;  // Apple SIMD-group width (the Adreno's 
 constexpr VkShaderStageFlags kSubgroupStages = VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_COMPUTE_BIT;
 constexpr VkSubgroupFeatureFlags kSubgroupOps =
     VK_SUBGROUP_FEATURE_BASIC_BIT | VK_SUBGROUP_FEATURE_VOTE_BIT | VK_SUBGROUP_FEATURE_BALLOT_BIT |
-    VK_SUBGROUP_FEATURE_SHUFFLE_BIT | VK_SUBGROUP_FEATURE_SHUFFLE_RELATIVE_BIT | VK_SUBGROUP_FEATURE_QUAD_BIT;
-// Arithmetic and clustered reductions are not translated (no VPIR op for simd_sum / prefix scans): they stay off.
+    VK_SUBGROUP_FEATURE_SHUFFLE_BIT | VK_SUBGROUP_FEATURE_SHUFFLE_RELATIVE_BIT | VK_SUBGROUP_FEATURE_QUAD_BIT |
+    VK_SUBGROUP_FEATURE_ARITHMETIC_BIT | VK_SUBGROUP_FEATURE_CLUSTERED_BIT;  // arithmetic / clustered: vpir subgroup_arith
 constexpr uint32_t kMaxInlineUniformBlockSize = 256, kMaxInlineUniformBlocks = 4;  // the minimums
 // What the Adreno driver reports with the Quest identity (VK_KHR_driver_properties): engines key Qualcomm
 // workarounds off driverID, never off the name.
@@ -924,8 +924,8 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkGetPhysicalDeviceQueueFamilyProperties(
     VkPhysicalDevice, uint32_t* count, VkQueueFamilyProperties* out) {
   VkQueueFamilyProperties q{};
   q.queueFlags = VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT | VK_QUEUE_TRANSFER_BIT;
-  q.queueCount = 1;
-  q.timestampValidBits = 64;
+  q.queueCount = kQueueCount;
+  q.timestampValidBits = kTimestampValidBits;
   q.minImageTransferGranularity = {1, 1, 1};
   fillArray(std::vector<VkQueueFamilyProperties>{q}, count, out);
 }
@@ -1322,7 +1322,7 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkCreateDevice(VkPhysicalDevice pd,
   // render/main threads two cores.
   const unsigned workers = std::clamp(std::thread::hardware_concurrency(), 4u, 8u) - 2u;
   d->gpu = std::make_unique<vpgpu::Device>(d->platform->backend(), workers, [](const std::string& s) { log(s); });
-  d->queue.device = d;
+  for (uint32_t i = 0; i < kQueueCount; ++i) d->queues[i].device = d, d->queues[i].index = i;
   requestIndirectPatch(d);  // engine-internal kernel of GPU indirect draws: compiling (Urgent) before the game's first frame
   // Pipeline recipes of earlier runs: compiled now, before the game's first frame, so its
   // vkCreate*Pipelines calls are cache hits. With vpvk_prewarm() run by the app beforehand this is
@@ -1409,9 +1409,8 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkDestroyDevice(VkDevice dv, const VkAllo
 VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkGetDeviceQueue(VkDevice dv, uint32_t family, uint32_t index,
                                                         VkQueue* out) {
   Device* d = from<Device>(dv);
-  d->queue.family = family;
-  d->queue.index = index;
-  *out = to<VkQueue>(&d->queue);
+  d->queues[std::min(index, kQueueCount - 1)].family = family;
+  *out = to<VkQueue>(&d->queues[std::min(index, kQueueCount - 1)]);
 }
 
 VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkGetDeviceQueue2(VkDevice dv, const VkDeviceQueueInfo2* i,
@@ -1428,7 +1427,8 @@ static VkResult waitResult(Platform::WaitResult r) {
 
 // Batches held back on a timeline wait (Device::deferred) are queue work too: idle means they ran.
 // Another thread's vkSignalSemaphore releases them; polled in 1 ms steps.
-static VkResult waitDeviceIdle(Device* d) {
+// `queueMask`: bit i = VkQueue i (vkQueueWaitIdle waits for its own queue's held batches, vkDeviceWaitIdle for all).
+static VkResult waitDeviceIdle(Device* d, uint32_t queueMask = ~0u) {
   PerfWait perfWait(perf().idleWaits, perf().idleUs, perf().idleUsMax);  // vk.perf idle_wait
   // Batches parked on a timeline value nobody will signal would hang this forever
   // (an application bug, but a hang is worse than a log line): bounded at 2 s.
@@ -1436,7 +1436,9 @@ static VkResult waitDeviceIdle(Device* d) {
   for (;;) {
     {
       std::lock_guard<std::mutex> lock(d->submitMutex);
-      if (d->deferred.empty()) break;
+      bool held = false;
+      for (const DeferredBatch& b : d->deferred) held = held || (queueMask >> b.queue & 1);
+      if (!held) break;
     }
     if (d->platform->lost()) return VK_ERROR_DEVICE_LOST;
     if (std::chrono::steady_clock::now() > until) {
@@ -1451,7 +1453,9 @@ static VkResult waitDeviceIdle(Device* d) {
 
 VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkDeviceWaitIdle(VkDevice dv) { return waitDeviceIdle(from<Device>(dv)); }
 
-VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkQueueWaitIdle(VkQueue q) { return waitDeviceIdle(from<Queue>(q)->device); }
+VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkQueueWaitIdle(VkQueue q) {
+  return waitDeviceIdle(from<Queue>(q)->device, 1u << from<Queue>(q)->index);
+}
 
 // ---------------------------------------------------------------------------------------------
 // Memory
@@ -3158,20 +3162,39 @@ void runBatches(Device* d, std::vector<DeferredBatch>& list, size_t count) {
   list.erase(list.begin(), list.begin() + std::ptrdiff_t(count));
 }
 
-// Runs the longest ready prefix of d->deferred (submitMutex held); stops at the first batch with a
-// wait nothing can meet yet.
+// Runs the ready batches of d->deferred (submitMutex held). A batch is ready when its waits can be met and every batch
+// submitted before it to the same VkQueue is ready too: each queue keeps its own order, and a queue held back on a wait
+// nothing can meet yet does not hold back the others. The ready batches keep their submission order among themselves
+// (they go to the one Metal queue in that order, which is what makes cross-queue timeline waits satisfiable).
 void drainDeferred(Device* d) {
   while (!d->deferred.empty()) {
     std::vector<std::pair<Semaphore*, uint64_t>> ahead;
+    uint32_t blocked = 0;  // queues with a batch that is not ready
+    std::vector<bool> run(d->deferred.size(), false);
     size_t ready = 0;
-    for (; ready < d->deferred.size(); ++ready) {
-      const DeferredBatch& b = d->deferred[ready];
+    for (size_t i = 0; i < d->deferred.size(); ++i) {
+      const DeferredBatch& b = d->deferred[i];
+      if (blocked >> b.queue & 1) continue;
       bool met = true;
       for (const auto& [s, v] : b.waits) met = met && waitMet(s, v, ahead);
-      if (!met) break;
+      if (!met) {
+        blocked |= 1u << b.queue;
+        continue;
+      }
       ahead.insert(ahead.end(), b.signals.begin(), b.signals.end());
+      run[i] = true;
+      ++ready;
     }
     if (!ready) return;
+    if (ready != d->deferred.size()) {  // ready batches first, both groups in submission order
+      std::vector<DeferredBatch> ordered;
+      ordered.reserve(d->deferred.size());
+      for (size_t i = 0; i < d->deferred.size(); ++i)
+        if (run[i]) ordered.push_back(std::move(d->deferred[i]));
+      for (size_t i = 0; i < d->deferred.size(); ++i)
+        if (!run[i]) ordered.push_back(std::move(d->deferred[i]));
+      d->deferred = std::move(ordered);
+    }
     runBatches(d, d->deferred, ready);
   }
 }
@@ -3287,6 +3310,7 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkQueueSubmit(VkQueue q, uint32_t n, 
   const size_t first = d->deferred.size();
   for (uint32_t i = 0; i < n; ++i) {
     DeferredBatch b;
+    b.queue = from<Queue>(q)->index;
     for (uint32_t j = 0; j < si[i].commandBufferCount; ++j) b.cbs.push_back(from<CommandBuffer>(si[i].pCommandBuffers[j]));
     const auto* t = static_cast<const VkTimelineSemaphoreSubmitInfo*>(
         findNext(si[i].pNext, VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO));
@@ -3301,7 +3325,7 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkQueueSubmit(VkQueue q, uint32_t n, 
     d->deferred.push_back(std::move(b));
   }
   if (fence) {
-    if (d->deferred.size() == first) d->deferred.emplace_back();  // n == 0: the fence alone
+    if (d->deferred.size() == first) d->deferred.emplace_back().queue = from<Queue>(q)->index;  // n == 0: the fence alone
     Fence* fe = from<Fence>(fence);
     fe->deferred = true;  // until its batch runs (cleared by runBatches)
     fe->submitNs = pendingNowNs();

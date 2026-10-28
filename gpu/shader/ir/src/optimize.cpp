@@ -34,7 +34,7 @@ bool pure(const Module& m, const Inst& in) {
         case Op::ImageSamples: return in.sym < m.resources.size() && m.resources[in.sym].kind == ResourceKind::Texture;
         case Op::QuadShuffle:
         case Op::QuadAny: return false;  // (depend on the active lanes, like subgroup ops)
-        default: return !(in.op >= Op::SubgroupBallot && in.op <= Op::SubgroupAll);
+        default: return !(in.op >= Op::SubgroupBallot && in.op <= Op::SubgroupArith);
     }
 }
 

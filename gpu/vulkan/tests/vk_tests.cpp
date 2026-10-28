@@ -1589,13 +1589,14 @@ void testQuestExtras() {
   vkGetPhysicalDeviceProperties2(c.pd, &p2);
   CHECK(vap.maxVertexAttribDivisor == 65535);
   {
-    // Subgroup operations the translator implements; arithmetic / clustered have no VPIR op and stay off.
+    // Subgroup operations the translator implements (arithmetic / clustered: vpir subgroup_arith).
     VkPhysicalDeviceSubgroupProperties sgp{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES};
     VkPhysicalDeviceProperties2 sp2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &sgp};
     vkGetPhysicalDeviceProperties2(c.pd, &sp2);
     const VkSubgroupFeatureFlags want = VK_SUBGROUP_FEATURE_BASIC_BIT | VK_SUBGROUP_FEATURE_VOTE_BIT |
                                         VK_SUBGROUP_FEATURE_BALLOT_BIT | VK_SUBGROUP_FEATURE_SHUFFLE_BIT |
-                                        VK_SUBGROUP_FEATURE_SHUFFLE_RELATIVE_BIT | VK_SUBGROUP_FEATURE_QUAD_BIT;
+                                        VK_SUBGROUP_FEATURE_SHUFFLE_RELATIVE_BIT | VK_SUBGROUP_FEATURE_QUAD_BIT |
+                                        VK_SUBGROUP_FEATURE_ARITHMETIC_BIT | VK_SUBGROUP_FEATURE_CLUSTERED_BIT;
     CHECK(sgp.supportedOperations == want && sgp.subgroupSize == 32);
     // Timestamps are host nanoseconds divided by the period: Adreno's 19.2 MHz tick under the Quest identity.
     CHECK(std::fabs(p2.properties.limits.timestampPeriod - 52.083336f) < 1e-3f);
@@ -2579,6 +2580,7 @@ void testQueries() {
                                 VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT | VK_QUERY_RESULT_WAIT_BIT) ==
           VK_SUCCESS);
     CHECK(t[0] > 0 && t[2] > t[0] && t[1] == 1 && t[3] == 1);
+    CHECK((t[0] >> kTimestampValidBits) == 0 && (t[2] >> kTimestampValidBits) == 0);  // only the valid bits are set
     vkDestroyQueryPool(c.dev, tp, nullptr);
   }
   vkDestroyQueryPool(c.dev, qp, nullptr);
@@ -2700,6 +2702,92 @@ void testTimeline() {
   vkFreeMemory(c.dev, im, nullptr);
 
   vkDestroyFence(c.dev, fence, nullptr);
+  vkDestroySemaphore(c.dev, sem, nullptr);
+  vkDestroyCommandPool(c.dev, pool, nullptr);
+  vkDestroyBuffer(c.dev, b, nullptr);
+  vkFreeMemory(c.dev, m, nullptr);
+}
+
+// Several VkQueues of the one family (Quest: queueCount 4, timestampValidBits 48): each keeps its own submission order,
+// a queue held back on a timeline wait does not hold back the others, and a wait on a value another queue signals later
+// is met once that queue's batch has run.
+void testQueues() {
+  Ctx c;
+  uint32_t nf = 0;
+  vkGetPhysicalDeviceQueueFamilyProperties(c.pd, &nf, nullptr);
+  VkQueueFamilyProperties qf{};
+  nf = 1;
+  vkGetPhysicalDeviceQueueFamilyProperties(c.pd, &nf, &qf);
+  CHECK(qf.queueCount == 4 && qf.timestampValidBits == 48);
+  VkQueue q[4];
+  for (uint32_t i = 0; i < 4; ++i) vkGetDeviceQueue(c.dev, 0, i, &q[i]);
+  CHECK(q[0] == c.queue && q[1] != q[0] && q[2] != q[1] && q[3] != q[2]);
+  VkQueue again;
+  vkGetDeviceQueue(c.dev, 0, 2, &again);
+  CHECK(again == q[2]);
+
+  VkCommandPoolCreateInfo pi{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+  VkCommandPool pool;
+  vkCreateCommandPool(c.dev, &pi, nullptr, &pool);
+  VkCommandBufferAllocateInfo ai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+  ai.commandPool = pool;
+  ai.commandBufferCount = 1;
+  VkDeviceMemory m = alloc(c, 1 << 16, 1);
+  VkBuffer b = buffer(c, 4096, m, 0);
+  VkCommandBuffer cb[4];
+  for (VkCommandBuffer& x : cb) {
+    vkAllocateCommandBuffers(c.dev, &ai, &x);
+    VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    vkBeginCommandBuffer(x, &bi);
+    vkCmdFillBuffer(x, b, 0, 256, 7);
+    vkEndCommandBuffer(x);
+  }
+  VkSemaphoreTypeCreateInfo ti{VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO};
+  ti.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
+  VkSemaphoreCreateInfo sci{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
+  sci.pNext = &ti;
+  VkSemaphore sem;
+  vkCreateSemaphore(c.dev, &sci, nullptr, &sem);
+  VkFenceCreateInfo fci{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+  VkFence f1, f2;
+  vkCreateFence(c.dev, &fci, nullptr, &f1);
+  vkCreateFence(c.dev, &fci, nullptr, &f2);
+  Device* dev = from<Device>(c.dev);
+  const VkPipelineStageFlags stage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+  // `wait`/`signal` of 0 mean none.
+  auto submit = [&](VkQueue queue, VkCommandBuffer cmd, uint64_t wait, uint64_t signal, VkFence fence) {
+    VkTimelineSemaphoreSubmitInfo t{VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO};
+    t.waitSemaphoreValueCount = wait ? 1 : 0, t.pWaitSemaphoreValues = &wait;
+    t.signalSemaphoreValueCount = signal ? 1 : 0, t.pSignalSemaphoreValues = &signal;
+    VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+    si.pNext = &t, si.waitSemaphoreCount = wait ? 1 : 0, si.pWaitSemaphores = &sem, si.pWaitDstStageMask = &stage;
+    si.commandBufferCount = 1, si.pCommandBuffers = &cmd, si.signalSemaphoreCount = signal ? 1 : 0, si.pSignalSemaphores = &sem;
+    return vkQueueSubmit(queue, 1, &si, fence);
+  };
+  const uint64_t frames0 = c.gpu().submittedFrames();
+  // q0: waits on 5 (the host), signals 6. q0 again, behind it, with no wait: stays held (its queue's order).
+  CHECK(submit(q[0], cb[0], 5, 6, VK_NULL_HANDLE) == VK_SUCCESS);
+  CHECK(submit(q[0], cb[1], 0, 0, f1) == VK_SUCCESS);
+  CHECK(dev->deferred.size() == 2 && c.gpu().submittedFrames() == frames0);
+  CHECK(vkGetFenceStatus(c.dev, f1) == VK_NOT_READY);
+  // q1 has no wait: it runs at once, past the held q0 batches.
+  CHECK(submit(q[1], cb[2], 0, 0, f2) == VK_SUCCESS);
+  CHECK(dev->deferred.size() == 2 && c.gpu().submittedFrames() == frames0 + 1);
+  CHECK(vkWaitForFences(c.dev, 1, &f2, VK_TRUE, UINT64_MAX) == VK_SUCCESS);
+  CHECK(vkGetFenceStatus(c.dev, f1) == VK_NOT_READY);
+  // q2 waits on 6, which q0's held batch signals: held too. vkQueueWaitIdle(q1) does not wait for the held ones.
+  CHECK(submit(q[2], cb[3], 6, 0, VK_NULL_HANDLE) == VK_SUCCESS);
+  CHECK(dev->deferred.size() == 3);
+  CHECK(vkQueueWaitIdle(q[1]) == VK_SUCCESS && dev->deferred.size() == 3);
+  VkSemaphoreSignalInfo sig{VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO};
+  sig.semaphore = sem, sig.value = 5;
+  CHECK(vkSignalSemaphore(c.dev, &sig) == VK_SUCCESS);
+  CHECK(dev->deferred.empty());  // q0's two batches, then q2's (its wait is met by the first)
+  CHECK(vkWaitForFences(c.dev, 1, &f1, VK_TRUE, UINT64_MAX) == VK_SUCCESS);
+  CHECK(vkDeviceWaitIdle(c.dev) == VK_SUCCESS);
+
+  vkDestroyFence(c.dev, f1, nullptr);
+  vkDestroyFence(c.dev, f2, nullptr);
   vkDestroySemaphore(c.dev, sem, nullptr);
   vkDestroyCommandPool(c.dev, pool, nullptr);
   vkDestroyBuffer(c.dev, b, nullptr);
@@ -5422,7 +5510,7 @@ void testFoveation() {
 // CMake source fingerprint: a refactor that leaves the output alone keeps the digest (and every cache), a change of
 // output moves it. When this test fails the translator's OUTPUT changed: bump kLowerVersion (SPIR-V -> VPIR) or
 // kEmitVersion (VPIR -> MSL) in recipes.h, then update kCorpusDigest to the printed value in the same change.
-constexpr uint64_t kCorpusDigest = 0x19739bc97a1403c8ull;  // the "corpus digest" line the test prints
+constexpr uint64_t kCorpusDigest = 0xe66673416a935ab0ull;  // the "corpus digest" line the test prints
 
 uint64_t corpusDigest(unsigned& modules, unsigned& failed) {
   std::vector<std::string> names;
@@ -10656,7 +10744,7 @@ int main(int argc, char** argv) {
       {"exports", testExports}, {"physical", testPhysical}, {"memory", testMemory}, {"msaa_tile_off", testMsaaTileOff},
       {"passes", testPasses},   {"submit", testSubmit}, {"pipeline", testPipeline},
       {"recipes", testRecipes}, {"taa", testTaa}, {"msaa", testMsaa}, {"queries", testQueries},
-      {"timeline", testTimeline}, {"pending", testPending}, {"renderpass_ops", testRenderPassOps}, {"linear", testLinear}, {"images", testImages}, {"image_lifetime", testImageLifetime},
+      {"timeline", testTimeline}, {"queues", testQueues}, {"pending", testPending}, {"renderpass_ops", testRenderPassOps}, {"linear", testLinear}, {"images", testImages}, {"image_lifetime", testImageLifetime},
       {"vertex_stores", testVertexStores}, {"profile", testProfile}, {"profile13", testProfile13}, {"quest_extras", testQuestExtras}, {"push_descriptor", testPushDescriptor}, {"report_geom", testReportGeomInterpolators}, {"pipeline_policy", testPipelinePolicy}, {"eds", testExtendedDynamicState},
       {"native_identity", testNativeIdentity}, {"inline_uniform", testInlineUniformBlock}, {"bda", testBufferDeviceAddress}, {"ycbcr", testYcbcr},
       {"taa_native", testTaaNative}, {"taa_eye_depth", testTaaEyeDepth}, {"taa_uimask", testTaaUiMask}, {"msaa_force", testMsaaForce}, {"aot", testAot}, {"aniso", testAniso}, {"zeroinit", testZeroInit}, {"archive_index", testArchiveIndex}, {"foveation", testFoveation},

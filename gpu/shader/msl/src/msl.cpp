@@ -1315,6 +1315,7 @@ private:
             }
             case Op::SubgroupAny: return define(in, call("simd_any", in));
             case Op::SubgroupAll: return define(in, call("simd_all", in));
+            case Op::SubgroupArith: return subgroupArith(in);
             case Op::QuadShuffle: return define(in, "quad_shuffle(" + a(0) + ", ushort(" + a(1) + "))");
             case Op::QuadAny: return define(in, call("quad_any", in));
             case Op::MeshDispatch: return line("vp_grid.set_threadgroups_per_grid(uint3(", args(in), "));");
@@ -1324,6 +1325,58 @@ private:
             case Op::MeshIndex: return line("vp_mesh.set_index(", a(0), ", uchar(", a(1), "));");
             case Op::MeshPrimitiveCount: return line("vp_mesh.set_primitive_count(", a(0), ");");
         }
+    }
+
+    // subgroup_arith (ir.h): Metal's own simd_* reductions, simd_prefix_{inclusive,exclusive}_{sum,product} for the two scans
+    // it has, and for every other scan / clustered reduction a loop over the 32 lanes combining the values of the ACTIVE
+    // lanes in range (every active lane runs all 32 shuffles, so each shuffle reads a lane that is running). Vectors go
+    // component by component.
+    void subgroupArith(const Inst& in) {
+        if (!uses_.contains(in.result)) return;
+        const uint32_t kind = in.lits[0], mode = in.lits[1], cluster = in.lits[2], identityBits = in.lits[3];
+        const Type t = in.type, et = t.element();
+        const std::string id = std::to_string(in.result), x = "sx" + id;
+        static const char* const reduceFn[] = {"simd_sum", "simd_product", "simd_min", "simd_max", "simd_and", "simd_or", "simd_xor"};
+        line("const ", typeName(t), " ", x, " = ", ex(in.args[0]), ";");
+        const bool builtin = mode == 0 || ((mode == 1 || mode == 2) && kind <= 1);
+        const std::string mask = "sm" + id, lane = "sl" + id;
+        if (!builtin) {
+            line("const uint ", mask, " = as_type<uint2>(simd_vote::vote_t(simd_active_threads_mask())).x;");
+            line("const uint ", lane, " = ", ex(in.args[1]), ";");
+        }
+        // Identity element: integers carry their bits; floats 0, 1, +inf, -inf.
+        const bool half = et.scalar == Scalar::F16;
+        uint32_t idBits = identityBits;
+        if (et.isFloat()) {
+            static const uint32_t f32[] = {0u, 0x3F800000u, 0x7F800000u, 0xFF800000u}, f16[] = {0u, 0x3C00u, 0x7C00u, 0xFC00u};
+            idBits = kind < 4 ? (half ? f16 : f32)[kind] : 0u;
+        }
+        std::string results;
+        for (unsigned k = 0; k < t.width; ++k) {
+            const std::string c = t.width > 1 ? x + "." + "xyzw"[k] : x;
+            std::string r;
+            if (builtin) {
+                r = mode == 0 ? std::string(reduceFn[kind]) + "(" + c + ")"
+                              : std::string(mode == 1 ? "simd_prefix_inclusive_" : "simd_prefix_exclusive_") + (kind == 0 ? "sum" : "product") + "(" + c + ")";
+            } else {
+                r = "sa" + id + "_" + std::to_string(k);
+                std::string cond = mode == 1 ? "sk <= " + lane : mode == 2 ? "sk < " + lane : "";
+                if (mode == 3) {
+                    const std::string lg = std::to_string(std::countr_zero(cluster));
+                    cond = "(sk >> " + lg + "u) == (" + lane + " >> " + lg + "u)";
+                }
+                static const char* const combine[] = {"sacc + sv", "sacc * sv", "min(sacc, sv)", "max(sacc, sv)", "sacc & sv", "sacc | sv", "sacc ^ sv"};
+                std::string body = combine[kind];
+                for (size_t at; (at = body.find("sacc")) != std::string::npos;) body.replace(at, 4, r);
+                line(typeName(et), " ", r, " = ", literal(et.scalar, idBits), ";");
+                line("for (uint sk = 0u; sk < 32u; ++sk) {");
+                line("    const ", typeName(et), " sv = simd_shuffle(", c, ", ushort(sk));");
+                line("    if (((", mask, " >> sk) & 1u) != 0u && ", cond, ") ", r, " = ", body, ";");
+                line("}");
+            }
+            results += (k ? ", " : "") + r;
+        }
+        define(in, t.width > 1 ? typeName(t) + "(" + results + ")" : results);
     }
 
     // Bounds condition of a storage-buffer access of `bytes` at `addr` (robust mode), "" when the
@@ -1382,7 +1435,7 @@ private:
 
 bool usesSubgroups(const Block& b) {
     return std::any_of(b.begin(), b.end(), [](const Node& n) {
-        bool op = n.kind == NodeKind::Inst && n.inst.op >= Op::SubgroupBallot && n.inst.op <= Op::SubgroupAll;
+        bool op = n.kind == NodeKind::Inst && n.inst.op >= Op::SubgroupBallot && n.inst.op <= Op::SubgroupArith;
         return op || usesSubgroups(n.body) || usesSubgroups(n.elseBody);
     });
 }
