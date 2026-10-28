@@ -1,0 +1,8 @@
+run 1: 0
+0 fails
+run 2: 1 fails
+run 3: 0
+0 fails
+run 4: 2 fails
+run 5: 2 fails
+run 6: 1 fails

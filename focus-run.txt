@@ -1,0 +1,12 @@
+attempt 1: exit=0 why=exit done=2 open=None remaining=0
+{"Pass": 2}
+attempt 1: exit=1 why=exit done=2 open=None remaining=0
+{"Fail": 1, "Pass": 1}
+attempt 1: exit=0 why=exit done=2 open=None remaining=0
+{"Pass": 2}
+attempt 1: exit=1 why=exit done=2 open=None remaining=0
+{"Fail": 2}
+attempt 1: exit=1 why=exit done=2 open=None remaining=0
+{"Fail": 2}
+attempt 1: exit=1 why=exit done=2 open=None remaining=0
+{"Fail": 1, "Pass": 1}

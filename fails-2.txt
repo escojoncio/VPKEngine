@@ -1,0 +1,7 @@
+=== dEQP-VK.pipeline.monolithic.multisample.misc.clear_attachments.r8g8b8a8_unorm_r16g16b16a16_sfloat_r32g32b32a32_uint_d32_sfloat_s8_uint.2x.ds_resolve_sample_zero.sub_framebuffer
+Verification passed for color attachment 1
+Verification passed for color attachment 2
+Verification passed for color attachment 3
+Verification failed for depth attachment for 391 pixel(s)
+Verification failed for stencil attachment for 643 pixel(s)
+<Result StatusCode="Fail">Incorrect multisampled rendering for depth attachment, stencil attachment</Result>
