@@ -238,7 +238,7 @@ private:
     uint32_t killVar_ = UINT32_MAX;
     bool killPending_ = false;
     int ifDepth_ = 0;
-    int positionInput_ = -1, layerInput_ = -1, instanceInput_ = -1, vertexInput_ = -1;
+    int positionInput_ = -1, layerInput_ = -1, instanceInput_ = -1, vertexInput_ = -1, baseInstanceInput_ = -1;
     int layerOutput_ = -1;
     int viewportOutput_ = -1;  // multiview + o_.viewportIndex: [[viewport_array_index]] = the view
     bool writesLayer_ = false;
@@ -1605,6 +1605,20 @@ private:
         if (o_.viewCount > 1 && !amp_) i = bin(Op::Div, i, u32(o_.viewCount), vpir::kU32);
         return i;
     }
+    // Per-instance attribute index with a divisor: firstInstance + (instance - firstInstance) / divisor. Divisor 0: always firstInstance.
+    ValueId dividedInstance(uint32_t divisor) {
+        if (divisor == 1) return instanceIndex();
+        if (baseInstanceInput_ < 0) {
+            vpir::IoVar v;
+            v.builtin = vpir::Builtin::BaseInstance, v.name = "base_instance", v.type = vpir::kU32;
+            baseInstanceInput_ = addInput(v);
+        }
+        ValueId base = b_->loadInput(uint32_t(baseInstanceInput_), vpir::kU32);
+        if (o_.viewCount > 1 && !amp_) base = bin(Op::Div, base, u32(o_.viewCount), vpir::kU32);
+        if (divisor == 0) return base;
+        ValueId rel = bin(Op::Sub, instanceIndex(), base, vpir::kU32);
+        return bin(Op::Add, base, bin(Op::Div, rel, u32(divisor), vpir::kU32), vpir::kU32);
+    }
     // gl_SubgroupEq/Ge/Gt/Le/LtMask (kind 0..4): bit i of the 64-bit mask (uvec4 .xy) for lane i, only below the subgroup size.
     ValueId subgroupMask(uint32_t kind) {
         auto builtin = [&](vpir::Builtin bi) {
@@ -2100,7 +2114,7 @@ private:
             if (x.binding == a->binding) vb = &x;
         if (!vb) fail("vertex attribute " + std::to_string(location) + " has no vertex buffer");
         int res = resource(vpir::ResourceKind::Buffer, vb->slot, [](vpir::Resource& r) { r.access = vpir::Access::Read; });
-        ValueId index = vb->perInstance ? instanceIndex() : b_->loadInput(uint32_t(vertexInput_), vpir::kU32);
+        ValueId index = vb->perInstance ? dividedInstance(vb->divisor) : b_->loadInput(uint32_t(vertexInput_), vpir::kU32);
         ValueId base = bin(Op::Mul, index, u32(vb->stride), vpir::kU32);
         RPtr p;
         p.target = uint32_t(res);

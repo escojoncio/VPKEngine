@@ -77,6 +77,7 @@ struct VertexBufferBinding {
   uint32_t binding = 0, stride = 0;
   bool perInstance = false;
   uint16_t slot = 0;  // Buffer slot assigned by the driver
+  uint32_t divisor = 1;  // VK_EXT_vertex_attribute_divisor: instances per element (0: always the first instance's element)
 };
 
 struct SpirvLowerOptions {

@@ -1742,6 +1742,12 @@ PipelineObj* createGraphics(Device* d, const VkGraphicsPipelineCreateInfo& ci) {
       const auto& b = vi->pVertexBindingDescriptions[i];
       spirv::VertexBufferBinding vb;
       vb.binding = b.binding, vb.stride = b.stride, vb.perInstance = b.inputRate == VK_VERTEX_INPUT_RATE_INSTANCE;
+      for (auto* e = static_cast<const VkBaseInStructure*>(vi->pNext); e; e = e->pNext)  // VK_EXT_vertex_attribute_divisor
+        if (e->sType == VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_DIVISOR_STATE_CREATE_INFO_EXT) {
+          const auto* dv = reinterpret_cast<const VkPipelineVertexInputDivisorStateCreateInfoEXT*>(e);
+          for (uint32_t k = 0; k < dv->vertexBindingDivisorCount; ++k)
+            if (dv->pVertexBindingDivisors[k].binding == b.binding) vb.divisor = dv->pVertexBindingDivisors[k].divisor;
+        }
       vb.slot = uint16_t(p->layout->nextBuffer + b.binding);
       p->vertexBuffers.push_back(vb);
     }
@@ -1769,7 +1775,10 @@ PipelineObj* createGraphics(Device* d, const VkGraphicsPipelineCreateInfo& ci) {
     if (p->pointMode) st.primitive = primitiveOf(*p, p->topology, st.primitive);
     p->frontFace = rs->frontFace;
     p->depthBiasEnable = rs->depthBiasEnable;
-    p->depthClamp = rs->depthClampEnable;
+    p->depthClamp = rs->depthClampEnable;  // Metal's clamp mode = no clipping
+    for (auto* e = static_cast<const VkBaseInStructure*>(rs->pNext); e; e = e->pNext)  // VK_EXT_depth_clip_enable: clipping is its own switch
+      if (e->sType == VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_DEPTH_CLIP_STATE_CREATE_INFO_EXT)
+        p->depthClamp = !reinterpret_cast<const VkPipelineRasterizationDepthClipStateCreateInfoEXT*>(e)->depthClipEnable;
     p->depthBias[0] = rs->depthBiasConstantFactor, p->depthBias[1] = rs->depthBiasClamp, p->depthBias[2] = rs->depthBiasSlopeFactor;
   }
   if (const auto* ms = ci.pMultisampleState) {

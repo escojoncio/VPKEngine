@@ -127,8 +127,12 @@ void encodeInput(Writer& w, const StageInput& in) {
     w.pod(uint32_t(a.location)), w.pod(uint32_t(a.binding)), w.pod(uint32_t(a.offset)), w.pod(uint32_t(a.format)),
         w.pod(uint8_t(a.components));
   w.pod(uint32_t(o.vertexBuffers.size()));
-  for (const spirv::VertexBufferBinding& v : o.vertexBuffers)
-    w.pod(uint32_t(v.binding)), w.pod(uint32_t(v.stride)), w.pod(uint8_t(v.perInstance)), w.pod(uint16_t(v.slot));
+  for (const spirv::VertexBufferBinding& v : o.vertexBuffers) {
+    const bool divided = v.perInstance && v.divisor != 1;  // bit 0 per instance, bit 1 a divisor (uint32) follows the slot
+    w.pod(uint32_t(v.binding)), w.pod(uint32_t(v.stride)), w.pod(uint8_t((v.perInstance ? 1 : 0) | (divided ? 2 : 0))),
+        w.pod(uint16_t(v.slot));
+    if (divided) w.pod(uint32_t(v.divisor));
+  }
   // Trailing and only when set: inputs recorded before these fields keep their bytes (and hashes).
   // Flags byte: bit 0 multisampleAsSingle, bit 1 a viewMask (uint32) follows, bit 2 colorIntKinds
   // (uint16) follows, bit 3 the Y'CbCr conversions follow (count, then per binding its layout
@@ -189,8 +193,10 @@ bool decodeInput(Reader& r, StageInput& in) {
   for (uint32_t i = 0, n = r.count(4096); r.ok && i < n; ++i) {
     spirv::VertexBufferBinding v;
     v.binding = r.pod<uint32_t>(), v.stride = r.pod<uint32_t>();
-    v.perInstance = r.pod<uint8_t>() != 0;
+    const uint8_t rate = r.pod<uint8_t>();  // bit 0 per instance, bit 1 a divisor (uint32) follows the slot
+    v.perInstance = (rate & 1) != 0;
     v.slot = r.pod<uint16_t>();
+    if (rate & 2) v.divisor = r.pod<uint32_t>();
     o.vertexBuffers.push_back(v);
   }
   if (r.ok && r.p < r.end) {

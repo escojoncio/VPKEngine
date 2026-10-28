@@ -142,6 +142,16 @@ void meshMultiview(const std::string& dir, const std::string& v) {
     o.viewCount = 1, o.viewMask = 0b100;
     Result one = run(dir + "/mesh_multiview.vert" + (v.empty() ? "" : ".opt") + ".spv", o);
     CHECK(one.ok && one.msl.source.find("render_target_array_index") != std::string::npos);
+    // VK_EXT_vertex_attribute_divisor: a divided instance binding reads base_instance; divisor 1 does not.
+    o.viewCount = 1, o.viewMask = 0;
+    Result plain = run(dir + "/mesh_multiview.vert" + (v.empty() ? "" : ".opt") + ".spv", o);
+    CHECK(plain.ok && plain.msl.source.find("base_instance") == std::string::npos);
+    for (uint32_t divisor : {4u, 0u}) {
+        o.vertexBuffers[1].divisor = divisor;
+        Result dv = run(dir + "/mesh_multiview.vert" + (v.empty() ? "" : ".opt") + ".spv", o);
+        CHECK(dv.ok && dv.msl.source.find("base_instance") != std::string::npos && dv.msl.source != plain.msl.source);
+    }
+    o.vertexBuffers[1].divisor = 1;
 }
 
 // Fragment shader writing gl_ViewIndex to a uint colour (tests/asm style, assembled with spvasm.py):

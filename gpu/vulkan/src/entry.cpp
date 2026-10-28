@@ -513,6 +513,9 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkGetPhysicalDeviceProperties2(VkPhysical
             deviceProperties().limits.minTexelBufferOffsetAlignment;
         break;
       }
+      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_ATTRIBUTE_DIVISOR_PROPERTIES_EXT:
+        reinterpret_cast<VkPhysicalDeviceVertexAttributeDivisorPropertiesEXT*>(s)->maxVertexAttribDivisor = 65535;  // Adreno's value
+        break;
       case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_4_PROPERTIES:
         reinterpret_cast<VkPhysicalDeviceMaintenance4Properties*>(s)->maxBufferSize = 1ull << 32;
         break;
@@ -793,6 +796,20 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkGetPhysicalDeviceFeatures2(VkPhysicalDe
       }
       case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_SUBGROUP_EXTENDED_TYPES_FEATURES:
         reinterpret_cast<VkPhysicalDeviceShaderSubgroupExtendedTypesFeatures*>(s)->shaderSubgroupExtendedTypes = gate;  // laneOp on any scalar/vector type (lower.cpp)
+        break;
+      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_CLIP_ENABLE_FEATURES_EXT:
+        reinterpret_cast<VkPhysicalDeviceDepthClipEnableFeaturesEXT*>(s)->depthClipEnable = gate;  // pipelines.cpp: Metal clip mode
+        break;
+      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_ATTRIBUTE_DIVISOR_FEATURES_EXT: {
+        auto* x = reinterpret_cast<VkPhysicalDeviceVertexAttributeDivisorFeaturesEXT*>(s);  // lower.cpp dividedInstance
+        x->vertexAttributeInstanceRateDivisor = x->vertexAttributeInstanceRateZeroDivisor = gate;
+        break;
+      }
+      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ASTC_DECODE_FEATURES_EXT:
+        reinterpret_cast<VkPhysicalDeviceASTCDecodeFeaturesEXT*>(s)->decodeModeSharedExponent = VK_FALSE;  // the mode itself is accepted and ignored
+        break;
+      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TEXEL_BUFFER_ALIGNMENT_FEATURES_EXT:
+        reinterpret_cast<VkPhysicalDeviceTexelBufferAlignmentFeaturesEXT*>(s)->texelBufferAlignment = gate;
         break;
       case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_TERMINATE_INVOCATION_FEATURES:
         // OpTerminateInvocation -> discard_fragment (same answer as Vulkan13Features).

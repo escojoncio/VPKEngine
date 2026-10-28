@@ -1549,6 +1549,61 @@ void testPipelinePolicy() {
 // Host-side Vulkan 1.3 pieces behind the CTS gate: private data, maintenance4 requirements,
 // imageless framebuffers (views from VkRenderPassAttachmentBeginInfo), subgroup size control and
 // B4G4R4A4 (ABGR4 with R/B swapped; only its mandatory features). Hidden from games.
+// Quest identity = one profile: the extensions and feature structs that were added for Quest 3 parity are all there,
+// with no environment switch. Each entry is a feature the driver implements (see the comments in physical_device.cpp).
+void testQuestExtras() {
+  vpvk_config_set_quest_identity(1);
+  unsetenv("VPVK_EXTRA_EXTENSIONS");
+  Ctx c;
+  uint32_t n = 0;
+  vkEnumerateDeviceExtensionProperties(c.pd, nullptr, &n, nullptr);
+  std::vector<VkExtensionProperties> e(n);
+  vkEnumerateDeviceExtensionProperties(c.pd, nullptr, &n, e.data());
+  auto has = [&](const char* name) {
+    for (const auto& x : e)
+      if (std::strcmp(x.extensionName, name) == 0) return true;
+    return false;
+  };
+  for (const char* name :
+       {VK_KHR_SHADER_TERMINATE_INVOCATION_EXTENSION_NAME, VK_KHR_FORMAT_FEATURE_FLAGS_2_EXTENSION_NAME,
+        VK_KHR_RELAXED_BLOCK_LAYOUT_EXTENSION_NAME, VK_EXT_PIPELINE_CREATION_FEEDBACK_EXTENSION_NAME,
+        VK_EXT_TOOLING_INFO_EXTENSION_NAME, VK_EXT_LOAD_STORE_OP_NONE_EXTENSION_NAME,
+        VK_KHR_SHADER_NON_SEMANTIC_INFO_EXTENSION_NAME, VK_KHR_SPIRV_1_4_EXTENSION_NAME,
+        VK_KHR_SHADER_FLOAT_CONTROLS_EXTENSION_NAME, VK_EXT_TEXEL_BUFFER_ALIGNMENT_EXTENSION_NAME,
+        VK_EXT_DEPTH_CLIP_ENABLE_EXTENSION_NAME, VK_EXT_VERTEX_ATTRIBUTE_DIVISOR_EXTENSION_NAME,
+        VK_EXT_ASTC_DECODE_MODE_EXTENSION_NAME})
+    CHECK(has(name));
+  CHECK(!has(VK_EXT_FRAGMENT_DENSITY_MAP_EXTENSION_NAME) && !has(VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME));
+
+  VkPhysicalDeviceTexelBufferAlignmentFeaturesEXT tba{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TEXEL_BUFFER_ALIGNMENT_FEATURES_EXT};
+  VkPhysicalDeviceDepthClipEnableFeaturesEXT dce{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_CLIP_ENABLE_FEATURES_EXT, &tba};
+  VkPhysicalDeviceVertexAttributeDivisorFeaturesEXT vad{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_ATTRIBUTE_DIVISOR_FEATURES_EXT, &dce};
+  VkPhysicalDeviceASTCDecodeFeaturesEXT astc{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ASTC_DECODE_FEATURES_EXT, &vad};
+  VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &astc};
+  vkGetPhysicalDeviceFeatures2(c.pd, &f2);
+  CHECK(tba.texelBufferAlignment && dce.depthClipEnable);
+  CHECK(vad.vertexAttributeInstanceRateDivisor && vad.vertexAttributeInstanceRateZeroDivisor);
+  CHECK(!astc.decodeModeSharedExponent);
+  VkPhysicalDeviceVertexAttributeDivisorPropertiesEXT vap{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_ATTRIBUTE_DIVISOR_PROPERTIES_EXT};
+  VkPhysicalDeviceProperties2 p2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &vap};
+  vkGetPhysicalDeviceProperties2(c.pd, &p2);
+  CHECK(vap.maxVertexAttribDivisor == 65535);
+  {
+    // The divisor is part of the stage key (a different divisor is a different translation); divisor 1 keeps the old bytes.
+    StageInput a;
+    a.spirv = 1, a.opt.vertexBuffers = {{0, 16, true, 3}};
+    const uint64_t h1 = a.hash();
+    StageInput b = a;
+    b.opt.vertexBuffers[0].divisor = 4;
+    StageInput z = a;
+    z.opt.vertexBuffers[0].divisor = 0;
+    CHECK(h1 != b.hash() && h1 != z.hash() && b.hash() != z.hash());
+    b.opt.vertexBuffers[0].divisor = 1;
+    CHECK(h1 == b.hash());
+  }
+  vpvk_config_set_quest_identity(0);
+}
+
 void testProfile13() {
   vpvk_config_set_quest_identity(1);  // asserts the Quest 3 / Adreno 740 profile: opt-in
   unsetenv("VPVK_EXTRA_EXTENSIONS");
@@ -10476,7 +10531,7 @@ int main(int argc, char** argv) {
       {"passes", testPasses},   {"submit", testSubmit}, {"pipeline", testPipeline},
       {"recipes", testRecipes}, {"taa", testTaa}, {"msaa", testMsaa}, {"queries", testQueries},
       {"timeline", testTimeline}, {"pending", testPending}, {"renderpass_ops", testRenderPassOps}, {"linear", testLinear}, {"images", testImages}, {"image_lifetime", testImageLifetime},
-      {"vertex_stores", testVertexStores}, {"profile", testProfile}, {"profile13", testProfile13}, {"report_geom", testReportGeomInterpolators}, {"pipeline_policy", testPipelinePolicy}, {"eds", testExtendedDynamicState},
+      {"vertex_stores", testVertexStores}, {"profile", testProfile}, {"profile13", testProfile13}, {"quest_extras", testQuestExtras}, {"report_geom", testReportGeomInterpolators}, {"pipeline_policy", testPipelinePolicy}, {"eds", testExtendedDynamicState},
       {"native_identity", testNativeIdentity}, {"inline_uniform", testInlineUniformBlock}, {"bda", testBufferDeviceAddress}, {"ycbcr", testYcbcr},
       {"taa_native", testTaaNative}, {"taa_eye_depth", testTaaEyeDepth}, {"taa_uimask", testTaaUiMask}, {"msaa_force", testMsaaForce}, {"aot", testAot}, {"aniso", testAniso}, {"zeroinit", testZeroInit}, {"archive_index", testArchiveIndex}, {"foveation", testFoveation},
       {"stage_keys", testStageKeys}, {"async_pipelines", testAsyncPipelines}, {"sync_pipelines", testSyncPipelines}, {"pso_census", testPsoCensus}, {"pass_drop", testPassDrop}, {"skip_reasons", testSkipReasons}, {"indirect_patch", testIndirectPatch}, {"astc3d", testAstc3d},

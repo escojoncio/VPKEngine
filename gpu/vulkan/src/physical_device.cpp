@@ -435,6 +435,20 @@ std::vector<VkExtensionProperties> deviceExtensions() {
   v.push_back({VK_EXT_PIPELINE_CREATION_CACHE_CONTROL_EXTENSION_NAME, 3});      // pipelines.cpp
   v.push_back({VK_KHR_ZERO_INITIALIZE_WORKGROUP_MEMORY_EXTENSION_NAME, 1});     // lower.cpp zeroWorkgroup
   v.push_back({VK_KHR_SHADER_INTEGER_DOT_PRODUCT_EXTENSION_NAME, 1});           // lower.cpp dotProduct
+  // Core 1.1-1.3 features that were already implemented and only lacked their extension name (Quest lists them).
+  v.push_back({VK_KHR_SHADER_TERMINATE_INVOCATION_EXTENSION_NAME, 1});           // OpTerminateInvocation -> discard_fragment
+  v.push_back({VK_KHR_FORMAT_FEATURE_FLAGS_2_EXTENSION_NAME, 2});                // VkFormatProperties3 (entry.cpp)
+  v.push_back({VK_KHR_RELAXED_BLOCK_LAYOUT_EXTENSION_NAME, 1});                  // spirv layout is not validated
+  v.push_back({VK_EXT_PIPELINE_CREATION_FEEDBACK_EXTENSION_NAME, 1});            // pipelines.cpp fillCreationFeedback
+  v.push_back({VK_EXT_TOOLING_INFO_EXTENSION_NAME, 1});                          // ext.cpp (empty list)
+  v.push_back({VK_EXT_LOAD_STORE_OP_NONE_EXTENSION_NAME, 1});                    // LOAD_OP_NONE -> Load, STORE_OP_NONE -> Store
+  v.push_back({VK_KHR_SHADER_NON_SEMANTIC_INFO_EXTENSION_NAME, 1});              // NonSemantic.* ext-insts ignored (spirv)
+  v.push_back({VK_KHR_SPIRV_1_4_EXTENSION_NAME, 1});
+  v.push_back({VK_KHR_SHADER_FLOAT_CONTROLS_EXTENSION_NAME, 4});                 // properties in entry.cpp
+  v.push_back({VK_EXT_DEPTH_CLIP_ENABLE_EXTENSION_NAME, 1});                     // pipelines.cpp: static state only
+  v.push_back({VK_EXT_VERTEX_ATTRIBUTE_DIVISOR_EXTENSION_NAME, 3});              // lower.cpp dividedInstance (vertex pulling)
+  v.push_back({VK_EXT_ASTC_DECODE_MODE_EXTENSION_NAME, 1});                      // VkImageViewASTCDecodeModeEXT accepted, decoded as float
+  v.push_back({VK_EXT_TEXEL_BUFFER_ALIGNMENT_EXTENSION_NAME, 1});                // properties + features in entry.cpp
   // What Half-Life: Alyx (Source 2) asks of a Vulkan 1.3 device and an Adreno does not list: native identity only,
   // never with the Quest identity (not even with VPVK_EXTRA_EXTENSIONS=1).
   if (nativeExtras()) {
