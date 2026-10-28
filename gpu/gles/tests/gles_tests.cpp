@@ -1755,6 +1755,8 @@ void testMultiview() {
     CHECK(tex != 0);
     // A wrapped RGBA image keeps its alpha (passthrough eye): not the RGB8/SRGB8 row that shares its Vulkan format.
     CHECK(formatByVk(VK_FORMAT_R8G8B8A8_SRGB)->alphaBits == 8 && formatByVk(VK_FORMAT_R8G8B8A8_UNORM)->alphaBits == 8);
+    // The window's D24S8 keeps its stencil (a DEPTH_COMPONENT24 row for the same VkFormat has none).
+    CHECK(formatByVk(VK_FORMAT_D24_UNORM_S8_UINT)->stencil && formatByVk(VK_FORMAT_D24_UNORM_S8_UINT)->stencilBits == 8);
     GLuint fb;
     glGenFramebuffers(1, &fb);
     glBindFramebuffer(gl::DRAW_FRAMEBUFFER, fb);

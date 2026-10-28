@@ -214,7 +214,7 @@ const FormatInfo* formatByVk(VkFormat f) {
     const FormatInfo* first = nullptr;
     for (const FormatInfo& x : table()) {
         if (x.vk != f || x.compressed) continue;
-        if (x.alphaBits) return &x;
+        if (x.alphaBits || x.stencil) return &x;  // D24S8 is DEPTH24_STENCIL8 (not DEPTH_COMPONENT24: the window's stencil would vanish)
         if (!first) first = &x;
     }
     return first;
