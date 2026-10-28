@@ -1,0 +1,95 @@
+-- The CXX compiler identification is AppleClang 21.0.0.21000101
+-- Detecting CXX compiler ABI info
+-- Detecting CXX compiler ABI info - done
+-- Check for working CXX compiler: /usr/bin/c++ - skipped
+-- Detecting CXX compile features
+-- Detecting CXX compile features - done
+-- vpmsl translator fingerprint e47772701ba9b3b6
+-- Performing Test CMAKE_HAVE_LIBC_PTHREAD
+-- Performing Test CMAKE_HAVE_LIBC_PTHREAD - Success
+-- Found Threads: TRUE
+-- The OBJCXX compiler identification is AppleClang 21.0.0.21000101
+-- Detecting OBJCXX compiler ABI info
+-- Detecting OBJCXX compiler ABI info - done
+-- Check for working OBJCXX compiler: /usr/bin/clang++ - skipped
+-- Configuring done (17.5s)
+-- Generating done (0.1s)
+-- Build files have been written to: /Users/runner/work/VPKEngine/VPKEngine/build/gpu-mac
+ninja: Entering directory `build/gpu-mac'
+[0/2] Re-checking globbed directories...
+[1/59] Building CXX object shader/ir/CMakeFiles/vpir.dir/src/ir.cpp.o
+[2/59] Building CXX object shader/ir/CMakeFiles/vpir.dir/src/print.cpp.o
+[3/59] Building CXX object shader/ir/CMakeFiles/vpir.dir/src/builder.cpp.o
+[4/59] Building CXX object shader/ir/CMakeFiles/vpir.dir/src/parse.cpp.o
+[5/59] Building CXX object core/CMakeFiles/vpgpu_core.dir/src/resources.cpp.o
+[6/59] Building CXX object shader/ir/CMakeFiles/vpir.dir/src/verify.cpp.o
+[7/59] Building CXX object shader/ir/CMakeFiles/vpir.dir/src/fbfetch.cpp.o
+[8/59] Building CXX object shader/ir/CMakeFiles/vpir.dir/src/optimize.cpp.o
+[9/59] Building CXX object core/CMakeFiles/vpgpu_core.dir/src/commands.cpp.o
+[10/59] Building CXX object core/CMakeFiles/vpgpu_core.dir/src/pipeline_cache.cpp.o
+[11/59] Building CXX object core/CMakeFiles/vpgpu_core.dir/src/diagnostics.cpp.o
+[12/59] Building CXX object core/CMakeFiles/vpgpu_core.dir/src/null_backend.cpp.o
+[13/59] Building CXX object core/CMakeFiles/vpgpu_core.dir/src/device.cpp.o
+[14/59] Building CXX object core/CMakeFiles/vpgpu_core.dir/src/background.cpp.o
+[15/59] Building CXX object gles/CMakeFiles/vpglsl.dir/glsl/types.cpp.o
+[16/59] Building CXX object core/CMakeFiles/vpgpu_core.dir/src/frame_compiler.cpp.o
+[17/59] Building CXX object gles/CMakeFiles/vpglsl.dir/glsl/pp.cpp.o
+/Users/runner/work/VPKEngine/VPKEngine/gpu/gles/glsl/pp.cpp:764:11: warning: private field 'stage_' is not used [-Wunused-private-field]
+  764 |     Stage stage_;
+      |           ^
+/Users/runner/work/VPKEngine/VPKEngine/gpu/gles/glsl/pp.cpp:774:9: warning: private field 'physLine_' is not used [-Wunused-private-field]
+  774 |     int physLine_ = 0;
+      |         ^
+2 warnings generated.
+[18/59] Building CXX object gles/CMakeFiles/vpglsl.dir/glsl/builtins.cpp.o
+[19/59] Linking CXX static library shader/ir/libvpir.a
+[20/59] Building CXX object gles/CMakeFiles/vpglsl.dir/glsl/link.cpp.o
+[21/59] Building CXX object gles/CMakeFiles/vpglsl.dir/glsl/emit.cpp.o
+/Users/runner/work/VPKEngine/VPKEngine/gpu/gles/glsl/emit.cpp:258:14: warning: private field 'fragDataVar_' is not used [-Wunused-private-field]
+  258 |     uint32_t fragDataVar_ = 0;
+      |              ^
+1 warning generated.
+[22/59] Linking CXX static library core/libvpgpu_core.a
+[23/59] Building CXX object gles/CMakeFiles/vpglsl.dir/glsl/parser.cpp.o
+[24/59] Linking CXX static library gles/libvpglsl.a
+[25/59] Building CXX object shader/spirv/CMakeFiles/vpspirv.dir/src/parse.cpp.o
+[26/59] Building CXX object gles/CMakeFiles/vpgles.dir/src/vk.cpp.o
+[27/59] Building CXX object gles/CMakeFiles/vpgles.dir/src/formats.cpp.o
+[28/59] Building CXX object shader/msl/CMakeFiles/vpmsl.dir/src/msl.cpp.o
+[29/59] Building CXX object gles/CMakeFiles/vpgles.dir/src/device.cpp.o
+[30/59] Building CXX object gles/CMakeFiles/vpgles.dir/src/textures.cpp.o
+[31/59] Building CXX object gles/CMakeFiles/vpgles.dir/src/xfb.cpp.o
+[32/59] Building CXX object gles/CMakeFiles/vpgles.dir/src/egl.cpp.o
+[33/59] Linking CXX static library shader/msl/libvpmsl.a
+[34/59] Building CXX object shader/spirv/CMakeFiles/vpspirv.dir/src/lower.cpp.o
+[35/59] Linking CXX static library shader/spirv/libvpspirv.a
+[36/59] Building CXX object gles/CMakeFiles/vpgles.dir/src/draw.cpp.o
+[37/59] Building CXX object gles/CMakeFiles/vpgles.dir/src/gl_api.cpp.o
+[38/59] Linking CXX static library gles/libvpgles.a
+[39/59] Building OBJCXX object metal2/CMakeFiles/vpgpu_metal2.dir/src/metal_backend.mm.o
+/Users/runner/work/VPKEngine/VPKEngine/gpu/metal2/src/metal_backend.mm:7347:34: warning: missing field 'fsr' initializer [-Wmissing-field-initializers]
+ 7347 |     Res r{c, 0, 0, 0, 0, 0, false};
+      |                                  ^
+1 warning generated.
+[40/59] Linking CXX static library metal2/libvpgpu_metal2.a
+[41/59] Generating gen/vpktaa_native_msl.h
+[42/59] Building CXX object vulkan/CMakeFiles/VPVulkan.dir/src/config.cpp.o
+[43/59] Building CXX object vulkan/CMakeFiles/VPVulkan.dir/src/physical_device.cpp.o
+[44/59] Building CXX object vulkan/CMakeFiles/VPVulkan.dir/src/commands.cpp.o
+[45/59] Building CXX object vulkan/CMakeFiles/VPVulkan.dir/src/precompile.cpp.o
+[46/59] Building CXX object vulkan/CMakeFiles/VPVulkan.dir/src/taa_native.cpp.o
+[47/59] Building CXX object vulkan/CMakeFiles/VPVulkan.dir/src/entry.cpp.o
+[48/59] Building CXX object vulkan/CMakeFiles/VPVulkan.dir/src/recipes.cpp.o
+[49/59] Building CXX object vulkan/CMakeFiles/VPVulkan.dir/src/foveation.cpp.o
+[50/59] Building CXX object vulkan/CMakeFiles/VPVulkan.dir/src/vpcap.cpp.o
+[51/59] Building CXX object vulkan/CMakeFiles/VPVulkan.dir/src/ext.cpp.o
+[52/59] Building CXX object vulkan/CMakeFiles/VPVulkan.dir/src/pipelines.cpp.o
+[53/59] Building CXX object vulkan/CMakeFiles/VPVulkan.dir/src/texdecode.cpp.o
+[54/59] Building CXX object vulkan/CMakeFiles/VPVulkan.dir/src/pending.cpp.o
+[55/59] Building OBJCXX object vulkan/CMakeFiles/VPVulkan.dir/src/taa_native_metal.mm.o
+[56/59] Building OBJCXX object vulkan/CMakeFiles/VPVulkan.dir/src/platform_metal.mm.o
+[57/59] Building CXX object vulkan/CMakeFiles/VPVulkan.dir/src/capture.cpp.o
+[58/59] Linking CXX shared library vulkan/libVPVulkan.dylib
+0000000000018eec T _vkGetInstanceProcAddr
+0000000000238aa0 T _vpgles_init
+0000000000238c7c T _vpgles_proc
