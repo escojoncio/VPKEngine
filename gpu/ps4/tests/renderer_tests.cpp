@@ -2596,7 +2596,6 @@ void seedThenClear() {
 void seedDepthStencil() {
     Fixture f;
     std::vector<uint8_t> z, st;
-    vpps4::SeedImage got;
     f.seed = [&](const vpps4::SeedRequest& q, vpps4::SeedImage& img) {
         if (q.kind != vpps4::SeedRequest::Kind::Depth) return false;
         CHECK(q.format == vpgpu::Format::D32FloatS8);
