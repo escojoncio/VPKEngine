@@ -557,6 +557,14 @@ bool convertReadbackGeneric(const FormatInfo& src, GLenum format, GLenum type, c
     const uint32_t outBytes = clientPixelBytes(format, type);
     const bool packed = type == UNSIGNED_SHORT_5_6_5 || type == UNSIGNED_SHORT_4_4_4_4 || type == UNSIGNED_SHORT_5_5_5_1 ||
                         type == UNSIGNED_INT_2_10_10_10_REV || type == UNSIGNED_INT_10F_11F_11F_REV;
+    // glReadPixels formats (no luminance/alpha) and the packed types that go with each.
+    switch (format) {
+        case RED: case RG: case RGB: case RGBA: case BGRA_EXT: case RED_INTEGER: case RG_INTEGER: case RGB_INTEGER: case RGBA_INTEGER: break;
+        default: return false;
+    }
+    if ((type == UNSIGNED_SHORT_5_6_5 || type == UNSIGNED_INT_10F_11F_11F_REV) && format != RGB) return false;
+    if ((type == UNSIGNED_SHORT_4_4_4_4 || type == UNSIGNED_SHORT_5_5_5_1) && format != RGBA) return false;
+    if (type == UNSIGNED_INT_2_10_10_10_REV && format != RGBA && format != RGBA_INTEGER) return false;
     const uint32_t comps = packed ? 0 : outBytes ? components(format) : 0;
     if (!packed && (!comps || format == DEPTH_COMPONENT || format == DEPTH_STENCIL || format == STENCIL_INDEX)) return false;
     const bool bgra = format == BGRA_EXT;
