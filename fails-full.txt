@@ -1,0 +1,3927 @@
+=== dEQP-VK.subgroups.arithmetic.compute.subgroupadd_uint
+<?xml version="1.0" encoding="UTF-8"?>
+<TestCaseResult CasePath="dEQP-VK.subgroups.arithmetic.compute.subgroupadd_uint" Version="0.3.4" CaseType="SelfValidate">
+ <Section Name="comp" Description="Program: comp">
+  <ShaderProgram LinkStatus="OK">
+   <InfoLog></InfoLog>
+   <ComputeShader CompileStatus="OK">
+    <ShaderSource>#version 450
+#extension GL_KHR_shader_subgroup_arithmetic: enable
+#extension GL_KHR_shader_subgroup_ballot: enable
+layout (local_size_x_id = 0, local_size_y_id = 1, local_size_z_id = 2) in;
+layout(set = 0, binding = 0, std430) buffer Buffer1
+{
+  uint result[];
+};
+layout(set = 0, binding = 1, std430) buffer Buffer2
+{
+  uint data[];
+};
+
+void main (void)
+{
+  uvec3 globalSize = gl_NumWorkGroups * gl_WorkGroupSize;
+  highp uint offset = globalSize.x * ((globalSize.y * gl_GlobalInvocationID.z) + gl_GlobalInvocationID.y) + gl_GlobalInvocationID.x;
+  uint tempRes;
+  uvec4 mask = subgroupBallot(true);
+  uint start = 0, end = gl_SubgroupSize;
+  uint ref = uint(0);
+  tempRes = 0;
+  uint identityOnly = 0x3;
+  for (uint index = start; index &lt; end; index++)
+  {
+    if (subgroupBallotBitExtract(mask, index))
+    {
+      ref = ref + data[index];
+      identityOnly &amp;= ~0x1;
+    }
+  }
+  tempRes = (ref == subgroupAdd(data[gl_SubgroupInvocationID])) ? 0x1 : 0;
+  if (1 == (gl_SubgroupInvocationID % 2))
+  {
+    mask = subgroupBallot(true);
+    ref = uint(0);
+    for (uint index = start; index &lt; end; index++)
+    {
+      if (subgroupBallotBitExtract(mask, index))
+      {
+        ref = ref + data[index];
+        identityOnly &amp;= ~0x2;
+      }
+    }
+    tempRes |= (ref == subgroupAdd(data[gl_SubgroupInvocationID])) ? 0x2 : 0;
+  }
+  else
+  {
+    tempRes |= 0x2;
+  }
+  result[offset] = tempRes;
+}
+</ShaderSource>
+    <InfoLog></InfoLog>
+</ComputeShader>
+</ShaderProgram>
+  <Number Name="ComputeCompileTime" Description="Compute shader compile time" Tag="Time" Unit="ms">0.665000</Number>
+  <Number Name="LinkTime" Description="Link time" Tag="Time" Unit="ms">0.011000</Number>
+</Section>
+ <ShaderProgram LinkStatus="OK">
+  <InfoLog></InfoLog>
+  <SpirVAssemblySource>; SPIR-V
+; Version: 1.3
+; Generator: Khronos Glslang Reference Front End; 11
+; Bound: 147
+; Schema: 0
+OpCapability Shader
+OpCapability GroupNonUniform
+OpCapability GroupNonUniformArithmetic
+OpCapability GroupNonUniformBallot
+%1 = OpExtInstImport &quot;GLSL.std.450&quot;
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %4 &quot;main&quot; %11 %26 %48 %87
+OpExecutionMode %4 LocalSize 1 1 1
+OpDecorate %11 BuiltIn NumWorkgroups
+OpDecorate %13 SpecId 0
+OpDecorate %14 SpecId 1
+OpDecorate %15 SpecId 2
+OpDecorate %16 BuiltIn WorkgroupSize
+OpDecorate %26 BuiltIn GlobalInvocationId
+OpDecorate %48 RelaxedPrecision
+OpDecorate %48 BuiltIn SubgroupSize
+OpDecorate %49 RelaxedPrecision
+OpDecorate %69 ArrayStride 4
+OpDecorate %70 Block
+OpMemberDecorate %70 0 Offset 0
+OpDecorate %72 Binding 1
+OpDecorate %72 DescriptorSet 0
+OpDecorate %87 RelaxedPrecision
+OpDecorate %87 BuiltIn SubgroupLocalInvocationId
+OpDecorate %88 RelaxedPrecision
+OpDecorate %95 RelaxedPrecision
+OpDecorate %96 RelaxedPrecision
+OpDecorate %127 RelaxedPrecision
+OpDecorate %140 ArrayStride 4
+OpDecorate %141 Block
+OpMemberDecorate %141 0 Offset 0
+OpDecorate %143 Binding 0
+OpDecorate %143 DescriptorSet 0
+%2 = OpTypeVoid
+%3 = OpTypeFunction %2
+%6 = OpTypeInt 32 0
+%7 = OpTypeVector %6 3
+%8 = OpTypePointer Function %7
+%10 = OpTypePointer Input %7
+%11 = OpVariable %10 Input
+%13 = OpSpecConstant %6 1
+%14 = OpSpecConstant %6 1
+%15 = OpSpecConstant %6 1
+%16 = OpSpecConstantComposite %7 %13 %14 %15
+%18 = OpTypePointer Function %6
+%20 = OpConstant %6 0
+%23 = OpConstant %6 1
+%26 = OpVariable %10 Input
+%27 = OpConstant %6 2
+%28 = OpTypePointer Input %6
+%39 = OpTypeVector %6 4
+%40 = OpTypePointer Function %39
+%42 = OpTypeBool
+%43 = OpConstantTrue %42
+%44 = OpConstant %6 3
+%48 = OpVariable %28 Input
+%69 = OpTypeRuntimeArray %6
+%70 = OpTypeStruct %69
+%71 = OpTypePointer StorageBuffer %70
+%72 = OpVariable %71 StorageBuffer
+%73 = OpTypeInt 32 1
+%74 = OpConstant %73 0
+%76 = OpTypePointer StorageBuffer %6
+%80 = OpConstant %6 4294967294
+%84 = OpConstant %73 1
+%87 = OpVariable %28 Input
+%121 = OpConstant %6 4294967293
+%132 = OpConstant %73 2
+%140 = OpTypeRuntimeArray %6
+%141 = OpTypeStruct %140
+%142 = OpTypePointer StorageBuffer %141
+%143 = OpVariable %142 StorageBuffer
+%4 = OpFunction %2 None %3
+%5 = OpLabel
+%9 = OpVariable %8 Function
+%19 = OpVariable %18 Function
+%41 = OpVariable %40 Function
+%46 = OpVariable %18 Function
+%47 = OpVariable %18 Function
+%50 = OpVariable %18 Function
+%51 = OpVariable %18 Function
+%52 = OpVariable %18 Function
+%53 = OpVariable %18 Function
+%101 = OpVariable %18 Function
+%12 = OpLoad %7 %11
+%17 = OpIMul %7 %12 %16
+OpStore %9 %17
+%21 = OpAccessChain %18 %9 %20
+%22 = OpLoad %6 %21
+%24 = OpAccessChain %18 %9 %23
+%25 = OpLoad %6 %24
+%29 = OpAccessChain %28 %26 %27
+%30 = OpLoad %6 %29
+%31 = OpIMul %6 %25 %30
+%32 = OpAccessChain %28 %26 %23
+%33 = OpLoad %6 %32
+%34 = OpIAdd %6 %31 %33
+%35 = OpIMul %6 %22 %34
+%36 = OpAccessChain %28 %26 %20
+%37 = OpLoad %6 %36
+%38 = OpIAdd %6 %35 %37
+OpStore %19 %38
+%45 = OpGroupNonUniformBallot %39 %44 %43
+OpStore %41 %45
+OpStore %46 %20
+%49 = OpLoad %6 %48
+OpStore %47 %49
+OpStore %50 %20
+OpStore %51 %20
+OpStore %52 %44
+%54 = OpLoad %6 %46
+OpStore %53 %54
+OpBranch %55
+%55 = OpLabel
+OpLoopMerge %57 %58 None
+OpBranch %59
+%59 = OpLabel
+%60 = OpLoad %6 %53
+%61 = OpLoad %6 %47
+%62 = OpULessThan %42 %60 %61
+OpBranchConditional %62 %56 %57
+%56 = OpLabel
+%63 = OpLoad %39 %41
+%64 = OpLoad %6 %53
+%65 = OpGroupNonUniformBallotBitExtract %42 %44 %63 %64
+OpSelectionMerge %67 None
+OpBranchConditional %65 %66 %67
+%66 = OpLabel
+%68 = OpLoad %6 %50
+%75 = OpLoad %6 %53
+%77 = OpAccessChain %76 %72 %74 %75
+%78 = OpLoad %6 %77
+%79 = OpIAdd %6 %68 %78
+OpStore %50 %79
+%81 = OpLoad %6 %52
+%82 = OpBitwiseAnd %6 %81 %80
+OpStore %52 %82
+OpBranch %67
+%67 = OpLabel
+OpBranch %58
+%58 = OpLabel
+%83 = OpLoad %6 %53
+%85 = OpIAdd %6 %83 %84
+OpStore %53 %85
+OpBranch %55
+%57 = OpLabel
+%86 = OpLoad %6 %50
+%88 = OpLoad %6 %87
+%89 = OpAccessChain %76 %72 %74 %88
+%90 = OpLoad %6 %89
+%91 = OpGroupNonUniformIAdd %6 %44 Reduce %90
+%92 = OpIEqual %42 %86 %91
+%93 = OpSelect %73 %92 %84 %74
+%94 = OpBitcast %6 %93
+OpStore %51 %94
+%95 = OpLoad %6 %87
+%96 = OpUMod %6 %95 %27
+%97 = OpIEqual %42 %23 %96
+OpSelectionMerge %99 None
+OpBranchConditional %97 %98 %137
+%98 = OpLabel
+%100 = OpGroupNonUniformBallot %39 %44 %43
+OpStore %41 %100
+OpStore %50 %20
+%102 = OpLoad %6 %46
+OpStore %101 %102
+OpBranch %103
+%103 = OpLabel
+OpLoopMerge %105 %106 None
+OpBranch %107
+%107 = OpLabel
+%108 = OpLoad %6 %101
+%109 = OpLoad %6 %47
+%110 = OpULessThan %42 %108 %109
+OpBranchConditional %110 %104 %105
+%104 = OpLabel
+%111 = OpLoad %39 %41
+%112 = OpLoad %6 %101
+%113 = OpGroupNonUniformBallotBitExtract %42 %44 %111 %112
+OpSelectionMerge %115 None
+OpBranchConditional %113 %114 %115
+%114 = OpLabel
+%116 = OpLoad %6 %50
+%117 = OpLoad %6 %101
+%118 = OpAccessChain %76 %72 %74 %117
+%119 = OpLoad %6 %118
+%120 = OpIAdd %6 %116 %119
+OpStore %50 %120
+%122 = OpLoad %6 %52
+%123 = OpBitwiseAnd %6 %122 %121
+OpStore %52 %123
+OpBranch %115
+%115 = OpLabel
+OpBranch %106
+%106 = OpLabel
+%124 = OpLoad %6 %101
+%125 = OpIAdd %6 %124 %84
+OpStore %101 %125
+OpBranch %103
+%105 = OpLabel
+%126 = OpLoad %6 %50
+%127 = OpLoad %6 %87
+%128 = OpAccessChain %76 %72 %74 %127
+%129 = OpLoad %6 %128
+%130 = OpGroupNonUniformIAdd %6 %44 Reduce %129
+%131 = OpIEqual %42 %126 %130
+%133 = OpSelect %73 %131 %132 %74
+%134 = OpBitcast %6 %133
+%135 = OpLoad %6 %51
+%136 = OpBitwiseOr %6 %135 %134
+OpStore %51 %136
+OpBranch %99
+%137 = OpLabel
+%138 = OpLoad %6 %51
+%139 = OpBitwiseOr %6 %138 %27
+OpStore %51 %139
+OpBranch %99
+%99 = OpLabel
+%144 = OpLoad %6 %19
+%145 = OpLoad %6 %51
+%146 = OpAccessChain %76 %143 %74 %144
+OpStore %146 %145
+OpReturn
+OpFunctionEnd
+</SpirVAssemblySource>
+</ShaderProgram>
+ <Text>1 / 7 values passed</Text>
+ <Number Name="TestDuration" Description="Test case duration in microseconds" Tag="Time" Unit="us">119415</Number>
+ <Result StatusCode="Fail">Failed!</Result>
+</TestCaseResult>
+
+
+=== dEQP-VK.subgroups.arithmetic.compute.subgroupexclusiveor_int
+<?xml version="1.0" encoding="UTF-8"?>
+<TestCaseResult CasePath="dEQP-VK.subgroups.arithmetic.compute.subgroupexclusiveor_int" Version="0.3.4" CaseType="SelfValidate">
+ <Section Name="comp" Description="Program: comp">
+  <ShaderProgram LinkStatus="OK">
+   <InfoLog></InfoLog>
+   <ComputeShader CompileStatus="OK">
+    <ShaderSource>#version 450
+#extension GL_KHR_shader_subgroup_arithmetic: enable
+#extension GL_KHR_shader_subgroup_ballot: enable
+layout (local_size_x_id = 0, local_size_y_id = 1, local_size_z_id = 2) in;
+layout(set = 0, binding = 0, std430) buffer Buffer1
+{
+  uint result[];
+};
+layout(set = 0, binding = 1, std430) buffer Buffer2
+{
+  int data[];
+};
+
+void main (void)
+{
+  uvec3 globalSize = gl_NumWorkGroups * gl_WorkGroupSize;
+  highp uint offset = globalSize.x * ((globalSize.y * gl_GlobalInvocationID.z) + gl_GlobalInvocationID.y) + gl_GlobalInvocationID.x;
+  uint tempRes;
+  uvec4 mask = subgroupBallot(true);
+  uint start = 0, end = gl_SubgroupInvocationID;
+  int ref = int(0);
+  tempRes = 0;
+  uint identityOnly = 0x3;
+  for (uint index = start; index &lt; end; index++)
+  {
+    if (subgroupBallotBitExtract(mask, index))
+    {
+      ref = ref | data[index];
+      identityOnly &amp;= ~0x1;
+    }
+  }
+  tempRes = (ref == subgroupExclusiveOr(data[gl_SubgroupInvocationID])) ? 0x1 : 0;
+  if (1 == (gl_SubgroupInvocationID % 2))
+  {
+    mask = subgroupBallot(true);
+    ref = int(0);
+    for (uint index = start; index &lt; end; index++)
+    {
+      if (subgroupBallotBitExtract(mask, index))
+      {
+        ref = ref | data[index];
+        identityOnly &amp;= ~0x2;
+      }
+    }
+    tempRes |= (ref == subgroupExclusiveOr(data[gl_SubgroupInvocationID])) ? 0x2 : 0;
+  }
+  else
+  {
+    tempRes |= 0x2;
+  }
+  result[offset] = tempRes;
+}
+</ShaderSource>
+    <InfoLog></InfoLog>
+</ComputeShader>
+</ShaderProgram>
+  <Number Name="ComputeCompileTime" Description="Compute shader compile time" Tag="Time" Unit="ms">0.678000</Number>
+  <Number Name="LinkTime" Description="Link time" Tag="Time" Unit="ms">0.006000</Number>
+</Section>
+ <ShaderProgram LinkStatus="OK">
+  <InfoLog></InfoLog>
+  <SpirVAssemblySource>; SPIR-V
+; Version: 1.3
+; Generator: Khronos Glslang Reference Front End; 11
+; Bound: 148
+; Schema: 0
+OpCapability Shader
+OpCapability GroupNonUniform
+OpCapability GroupNonUniformArithmetic
+OpCapability GroupNonUniformBallot
+%1 = OpExtInstImport &quot;GLSL.std.450&quot;
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %4 &quot;main&quot; %11 %26 %48
+OpExecutionMode %4 LocalSize 1 1 1
+OpDecorate %11 BuiltIn NumWorkgroups
+OpDecorate %13 SpecId 0
+OpDecorate %14 SpecId 1
+OpDecorate %15 SpecId 2
+OpDecorate %16 BuiltIn WorkgroupSize
+OpDecorate %26 BuiltIn GlobalInvocationId
+OpDecorate %48 RelaxedPrecision
+OpDecorate %48 BuiltIn SubgroupLocalInvocationId
+OpDecorate %49 RelaxedPrecision
+OpDecorate %72 ArrayStride 4
+OpDecorate %73 Block
+OpMemberDecorate %73 0 Offset 0
+OpDecorate %75 Binding 1
+OpDecorate %75 DescriptorSet 0
+OpDecorate %88 RelaxedPrecision
+OpDecorate %95 RelaxedPrecision
+OpDecorate %96 RelaxedPrecision
+OpDecorate %127 RelaxedPrecision
+OpDecorate %140 ArrayStride 4
+OpDecorate %141 Block
+OpMemberDecorate %141 0 Offset 0
+OpDecorate %143 Binding 0
+OpDecorate %143 DescriptorSet 0
+%2 = OpTypeVoid
+%3 = OpTypeFunction %2
+%6 = OpTypeInt 32 0
+%7 = OpTypeVector %6 3
+%8 = OpTypePointer Function %7
+%10 = OpTypePointer Input %7
+%11 = OpVariable %10 Input
+%13 = OpSpecConstant %6 1
+%14 = OpSpecConstant %6 1
+%15 = OpSpecConstant %6 1
+%16 = OpSpecConstantComposite %7 %13 %14 %15
+%18 = OpTypePointer Function %6
+%20 = OpConstant %6 0
+%23 = OpConstant %6 1
+%26 = OpVariable %10 Input
+%27 = OpConstant %6 2
+%28 = OpTypePointer Input %6
+%39 = OpTypeVector %6 4
+%40 = OpTypePointer Function %39
+%42 = OpTypeBool
+%43 = OpConstantTrue %42
+%44 = OpConstant %6 3
+%48 = OpVariable %28 Input
+%50 = OpTypeInt 32 1
+%51 = OpTypePointer Function %50
+%53 = OpConstant %50 0
+%72 = OpTypeRuntimeArray %50
+%73 = OpTypeStruct %72
+%74 = OpTypePointer StorageBuffer %73
+%75 = OpVariable %74 StorageBuffer
+%77 = OpTypePointer StorageBuffer %50
+%81 = OpConstant %6 4294967294
+%85 = OpConstant %50 1
+%121 = OpConstant %6 4294967293
+%132 = OpConstant %50 2
+%140 = OpTypeRuntimeArray %6
+%141 = OpTypeStruct %140
+%142 = OpTypePointer StorageBuffer %141
+%143 = OpVariable %142 StorageBuffer
+%146 = OpTypePointer StorageBuffer %6
+%4 = OpFunction %2 None %3
+%5 = OpLabel
+%9 = OpVariable %8 Function
+%19 = OpVariable %18 Function
+%41 = OpVariable %40 Function
+%46 = OpVariable %18 Function
+%47 = OpVariable %18 Function
+%52 = OpVariable %51 Function
+%54 = OpVariable %18 Function
+%55 = OpVariable %18 Function
+%56 = OpVariable %18 Function
+%101 = OpVariable %18 Function
+%12 = OpLoad %7 %11
+%17 = OpIMul %7 %12 %16
+OpStore %9 %17
+%21 = OpAccessChain %18 %9 %20
+%22 = OpLoad %6 %21
+%24 = OpAccessChain %18 %9 %23
+%25 = OpLoad %6 %24
+%29 = OpAccessChain %28 %26 %27
+%30 = OpLoad %6 %29
+%31 = OpIMul %6 %25 %30
+%32 = OpAccessChain %28 %26 %23
+%33 = OpLoad %6 %32
+%34 = OpIAdd %6 %31 %33
+%35 = OpIMul %6 %22 %34
+%36 = OpAccessChain %28 %26 %20
+%37 = OpLoad %6 %36
+%38 = OpIAdd %6 %35 %37
+OpStore %19 %38
+%45 = OpGroupNonUniformBallot %39 %44 %43
+OpStore %41 %45
+OpStore %46 %20
+%49 = OpLoad %6 %48
+OpStore %47 %49
+OpStore %52 %53
+OpStore %54 %20
+OpStore %55 %44
+%57 = OpLoad %6 %46
+OpStore %56 %57
+OpBranch %58
+%58 = OpLabel
+OpLoopMerge %60 %61 None
+OpBranch %62
+%62 = OpLabel
+%63 = OpLoad %6 %56
+%64 = OpLoad %6 %47
+%65 = OpULessThan %42 %63 %64
+OpBranchConditional %65 %59 %60
+%59 = OpLabel
+%66 = OpLoad %39 %41
+%67 = OpLoad %6 %56
+%68 = OpGroupNonUniformBallotBitExtract %42 %44 %66 %67
+OpSelectionMerge %70 None
+OpBranchConditional %68 %69 %70
+%69 = OpLabel
+%71 = OpLoad %50 %52
+%76 = OpLoad %6 %56
+%78 = OpAccessChain %77 %75 %53 %76
+%79 = OpLoad %50 %78
+%80 = OpBitwiseOr %50 %71 %79
+OpStore %52 %80
+%82 = OpLoad %6 %55
+%83 = OpBitwiseAnd %6 %82 %81
+OpStore %55 %83
+OpBranch %70
+%70 = OpLabel
+OpBranch %61
+%61 = OpLabel
+%84 = OpLoad %6 %56
+%86 = OpIAdd %6 %84 %85
+OpStore %56 %86
+OpBranch %58
+%60 = OpLabel
+%87 = OpLoad %50 %52
+%88 = OpLoad %6 %48
+%89 = OpAccessChain %77 %75 %53 %88
+%90 = OpLoad %50 %89
+%91 = OpGroupNonUniformBitwiseOr %50 %44 ExclusiveScan %90
+%92 = OpIEqual %42 %87 %91
+%93 = OpSelect %50 %92 %85 %53
+%94 = OpBitcast %6 %93
+OpStore %54 %94
+%95 = OpLoad %6 %48
+%96 = OpUMod %6 %95 %27
+%97 = OpIEqual %42 %23 %96
+OpSelectionMerge %99 None
+OpBranchConditional %97 %98 %137
+%98 = OpLabel
+%100 = OpGroupNonUniformBallot %39 %44 %43
+OpStore %41 %100
+OpStore %52 %53
+%102 = OpLoad %6 %46
+OpStore %101 %102
+OpBranch %103
+%103 = OpLabel
+OpLoopMerge %105 %106 None
+OpBranch %107
+%107 = OpLabel
+%108 = OpLoad %6 %101
+%109 = OpLoad %6 %47
+%110 = OpULessThan %42 %108 %109
+OpBranchConditional %110 %104 %105
+%104 = OpLabel
+%111 = OpLoad %39 %41
+%112 = OpLoad %6 %101
+%113 = OpGroupNonUniformBallotBitExtract %42 %44 %111 %112
+OpSelectionMerge %115 None
+OpBranchConditional %113 %114 %115
+%114 = OpLabel
+%116 = OpLoad %50 %52
+%117 = OpLoad %6 %101
+%118 = OpAccessChain %77 %75 %53 %117
+%119 = OpLoad %50 %118
+%120 = OpBitwiseOr %50 %116 %119
+OpStore %52 %120
+%122 = OpLoad %6 %55
+%123 = OpBitwiseAnd %6 %122 %121
+OpStore %55 %123
+OpBranch %115
+%115 = OpLabel
+OpBranch %106
+%106 = OpLabel
+%124 = OpLoad %6 %101
+%125 = OpIAdd %6 %124 %85
+OpStore %101 %125
+OpBranch %103
+%105 = OpLabel
+%126 = OpLoad %50 %52
+%127 = OpLoad %6 %48
+%128 = OpAccessChain %77 %75 %53 %127
+%129 = OpLoad %50 %128
+%130 = OpGroupNonUniformBitwiseOr %50 %44 ExclusiveScan %129
+%131 = OpIEqual %42 %126 %130
+%133 = OpSelect %50 %131 %132 %53
+%134 = OpBitcast %6 %133
+%135 = OpLoad %6 %54
+%136 = OpBitwiseOr %6 %135 %134
+OpStore %54 %136
+OpBranch %99
+%137 = OpLabel
+%138 = OpLoad %6 %54
+%139 = OpBitwiseOr %6 %138 %27
+OpStore %54 %139
+OpBranch %99
+%99 = OpLabel
+%144 = OpLoad %6 %19
+%145 = OpLoad %6 %54
+%147 = OpAccessChain %146 %143 %53 %144
+OpStore %147 %145
+OpReturn
+OpFunctionEnd
+</SpirVAssemblySource>
+</ShaderProgram>
+ <Text>1 / 7 values passed</Text>
+ <Number Name="TestDuration" Description="Test case duration in microseconds" Tag="Time" Unit="us">231892</Number>
+ <Result StatusCode="Fail">Failed!</Result>
+</TestCaseResult>
+
+
+=== dEQP-VK.subgroups.arithmetic.compute.subgroupinclusiveadd_int
+<?xml version="1.0" encoding="UTF-8"?>
+<TestCaseResult CasePath="dEQP-VK.subgroups.arithmetic.compute.subgroupinclusiveadd_int" Version="0.3.4" CaseType="SelfValidate">
+ <Section Name="comp" Description="Program: comp">
+  <ShaderProgram LinkStatus="OK">
+   <InfoLog></InfoLog>
+   <ComputeShader CompileStatus="OK">
+    <ShaderSource>#version 450
+#extension GL_KHR_shader_subgroup_arithmetic: enable
+#extension GL_KHR_shader_subgroup_ballot: enable
+layout (local_size_x_id = 0, local_size_y_id = 1, local_size_z_id = 2) in;
+layout(set = 0, binding = 0, std430) buffer Buffer1
+{
+  uint result[];
+};
+layout(set = 0, binding = 1, std430) buffer Buffer2
+{
+  int data[];
+};
+
+void main (void)
+{
+  uvec3 globalSize = gl_NumWorkGroups * gl_WorkGroupSize;
+  highp uint offset = globalSize.x * ((globalSize.y * gl_GlobalInvocationID.z) + gl_GlobalInvocationID.y) + gl_GlobalInvocationID.x;
+  uint tempRes;
+  uvec4 mask = subgroupBallot(true);
+  uint start = 0, end = gl_SubgroupInvocationID + 1;
+  int ref = int(0);
+  tempRes = 0;
+  uint identityOnly = 0x3;
+  for (uint index = start; index &lt; end; index++)
+  {
+    if (subgroupBallotBitExtract(mask, index))
+    {
+      ref = ref + data[index];
+      identityOnly &amp;= ~0x1;
+    }
+  }
+  tempRes = (ref == subgroupInclusiveAdd(data[gl_SubgroupInvocationID])) ? 0x1 : 0;
+  if (1 == (gl_SubgroupInvocationID % 2))
+  {
+    mask = subgroupBallot(true);
+    ref = int(0);
+    for (uint index = start; index &lt; end; index++)
+    {
+      if (subgroupBallotBitExtract(mask, index))
+      {
+        ref = ref + data[index];
+        identityOnly &amp;= ~0x2;
+      }
+    }
+    tempRes |= (ref == subgroupInclusiveAdd(data[gl_SubgroupInvocationID])) ? 0x2 : 0;
+  }
+  else
+  {
+    tempRes |= 0x2;
+  }
+  result[offset] = tempRes;
+}
+</ShaderSource>
+    <InfoLog></InfoLog>
+</ComputeShader>
+</ShaderProgram>
+  <Number Name="ComputeCompileTime" Description="Compute shader compile time" Tag="Time" Unit="ms">0.717000</Number>
+  <Number Name="LinkTime" Description="Link time" Tag="Time" Unit="ms">0.006000</Number>
+</Section>
+ <ShaderProgram LinkStatus="OK">
+  <InfoLog></InfoLog>
+  <SpirVAssemblySource>; SPIR-V
+; Version: 1.3
+; Generator: Khronos Glslang Reference Front End; 11
+; Bound: 149
+; Schema: 0
+OpCapability Shader
+OpCapability GroupNonUniform
+OpCapability GroupNonUniformArithmetic
+OpCapability GroupNonUniformBallot
+%1 = OpExtInstImport &quot;GLSL.std.450&quot;
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %4 &quot;main&quot; %11 %26 %48
+OpExecutionMode %4 LocalSize 1 1 1
+OpDecorate %11 BuiltIn NumWorkgroups
+OpDecorate %13 SpecId 0
+OpDecorate %14 SpecId 1
+OpDecorate %15 SpecId 2
+OpDecorate %16 BuiltIn WorkgroupSize
+OpDecorate %26 BuiltIn GlobalInvocationId
+OpDecorate %48 RelaxedPrecision
+OpDecorate %48 BuiltIn SubgroupLocalInvocationId
+OpDecorate %49 RelaxedPrecision
+OpDecorate %50 RelaxedPrecision
+OpDecorate %73 ArrayStride 4
+OpDecorate %74 Block
+OpMemberDecorate %74 0 Offset 0
+OpDecorate %76 Binding 1
+OpDecorate %76 DescriptorSet 0
+OpDecorate %89 RelaxedPrecision
+OpDecorate %96 RelaxedPrecision
+OpDecorate %97 RelaxedPrecision
+OpDecorate %128 RelaxedPrecision
+OpDecorate %141 ArrayStride 4
+OpDecorate %142 Block
+OpMemberDecorate %142 0 Offset 0
+OpDecorate %144 Binding 0
+OpDecorate %144 DescriptorSet 0
+%2 = OpTypeVoid
+%3 = OpTypeFunction %2
+%6 = OpTypeInt 32 0
+%7 = OpTypeVector %6 3
+%8 = OpTypePointer Function %7
+%10 = OpTypePointer Input %7
+%11 = OpVariable %10 Input
+%13 = OpSpecConstant %6 1
+%14 = OpSpecConstant %6 1
+%15 = OpSpecConstant %6 1
+%16 = OpSpecConstantComposite %7 %13 %14 %15
+%18 = OpTypePointer Function %6
+%20 = OpConstant %6 0
+%23 = OpConstant %6 1
+%26 = OpVariable %10 Input
+%27 = OpConstant %6 2
+%28 = OpTypePointer Input %6
+%39 = OpTypeVector %6 4
+%40 = OpTypePointer Function %39
+%42 = OpTypeBool
+%43 = OpConstantTrue %42
+%44 = OpConstant %6 3
+%48 = OpVariable %28 Input
+%51 = OpTypeInt 32 1
+%52 = OpTypePointer Function %51
+%54 = OpConstant %51 0
+%73 = OpTypeRuntimeArray %51
+%74 = OpTypeStruct %73
+%75 = OpTypePointer StorageBuffer %74
+%76 = OpVariable %75 StorageBuffer
+%78 = OpTypePointer StorageBuffer %51
+%82 = OpConstant %6 4294967294
+%86 = OpConstant %51 1
+%122 = OpConstant %6 4294967293
+%133 = OpConstant %51 2
+%141 = OpTypeRuntimeArray %6
+%142 = OpTypeStruct %141
+%143 = OpTypePointer StorageBuffer %142
+%144 = OpVariable %143 StorageBuffer
+%147 = OpTypePointer StorageBuffer %6
+%4 = OpFunction %2 None %3
+%5 = OpLabel
+%9 = OpVariable %8 Function
+%19 = OpVariable %18 Function
+%41 = OpVariable %40 Function
+%46 = OpVariable %18 Function
+%47 = OpVariable %18 Function
+%53 = OpVariable %52 Function
+%55 = OpVariable %18 Function
+%56 = OpVariable %18 Function
+%57 = OpVariable %18 Function
+%102 = OpVariable %18 Function
+%12 = OpLoad %7 %11
+%17 = OpIMul %7 %12 %16
+OpStore %9 %17
+%21 = OpAccessChain %18 %9 %20
+%22 = OpLoad %6 %21
+%24 = OpAccessChain %18 %9 %23
+%25 = OpLoad %6 %24
+%29 = OpAccessChain %28 %26 %27
+%30 = OpLoad %6 %29
+%31 = OpIMul %6 %25 %30
+%32 = OpAccessChain %28 %26 %23
+%33 = OpLoad %6 %32
+%34 = OpIAdd %6 %31 %33
+%35 = OpIMul %6 %22 %34
+%36 = OpAccessChain %28 %26 %20
+%37 = OpLoad %6 %36
+%38 = OpIAdd %6 %35 %37
+OpStore %19 %38
+%45 = OpGroupNonUniformBallot %39 %44 %43
+OpStore %41 %45
+OpStore %46 %20
+%49 = OpLoad %6 %48
+%50 = OpIAdd %6 %49 %23
+OpStore %47 %50
+OpStore %53 %54
+OpStore %55 %20
+OpStore %56 %44
+%58 = OpLoad %6 %46
+OpStore %57 %58
+OpBranch %59
+%59 = OpLabel
+OpLoopMerge %61 %62 None
+OpBranch %63
+%63 = OpLabel
+%64 = OpLoad %6 %57
+%65 = OpLoad %6 %47
+%66 = OpULessThan %42 %64 %65
+OpBranchConditional %66 %60 %61
+%60 = OpLabel
+%67 = OpLoad %39 %41
+%68 = OpLoad %6 %57
+%69 = OpGroupNonUniformBallotBitExtract %42 %44 %67 %68
+OpSelectionMerge %71 None
+OpBranchConditional %69 %70 %71
+%70 = OpLabel
+%72 = OpLoad %51 %53
+%77 = OpLoad %6 %57
+%79 = OpAccessChain %78 %76 %54 %77
+%80 = OpLoad %51 %79
+%81 = OpIAdd %51 %72 %80
+OpStore %53 %81
+%83 = OpLoad %6 %56
+%84 = OpBitwiseAnd %6 %83 %82
+OpStore %56 %84
+OpBranch %71
+%71 = OpLabel
+OpBranch %62
+%62 = OpLabel
+%85 = OpLoad %6 %57
+%87 = OpIAdd %6 %85 %86
+OpStore %57 %87
+OpBranch %59
+%61 = OpLabel
+%88 = OpLoad %51 %53
+%89 = OpLoad %6 %48
+%90 = OpAccessChain %78 %76 %54 %89
+%91 = OpLoad %51 %90
+%92 = OpGroupNonUniformIAdd %51 %44 InclusiveScan %91
+%93 = OpIEqual %42 %88 %92
+%94 = OpSelect %51 %93 %86 %54
+%95 = OpBitcast %6 %94
+OpStore %55 %95
+%96 = OpLoad %6 %48
+%97 = OpUMod %6 %96 %27
+%98 = OpIEqual %42 %23 %97
+OpSelectionMerge %100 None
+OpBranchConditional %98 %99 %138
+%99 = OpLabel
+%101 = OpGroupNonUniformBallot %39 %44 %43
+OpStore %41 %101
+OpStore %53 %54
+%103 = OpLoad %6 %46
+OpStore %102 %103
+OpBranch %104
+%104 = OpLabel
+OpLoopMerge %106 %107 None
+OpBranch %108
+%108 = OpLabel
+%109 = OpLoad %6 %102
+%110 = OpLoad %6 %47
+%111 = OpULessThan %42 %109 %110
+OpBranchConditional %111 %105 %106
+%105 = OpLabel
+%112 = OpLoad %39 %41
+%113 = OpLoad %6 %102
+%114 = OpGroupNonUniformBallotBitExtract %42 %44 %112 %113
+OpSelectionMerge %116 None
+OpBranchConditional %114 %115 %116
+%115 = OpLabel
+%117 = OpLoad %51 %53
+%118 = OpLoad %6 %102
+%119 = OpAccessChain %78 %76 %54 %118
+%120 = OpLoad %51 %119
+%121 = OpIAdd %51 %117 %120
+OpStore %53 %121
+%123 = OpLoad %6 %56
+%124 = OpBitwiseAnd %6 %123 %122
+OpStore %56 %124
+OpBranch %116
+%116 = OpLabel
+OpBranch %107
+%107 = OpLabel
+%125 = OpLoad %6 %102
+%126 = OpIAdd %6 %125 %86
+OpStore %102 %126
+OpBranch %104
+%106 = OpLabel
+%127 = OpLoad %51 %53
+%128 = OpLoad %6 %48
+%129 = OpAccessChain %78 %76 %54 %128
+%130 = OpLoad %51 %129
+%131 = OpGroupNonUniformIAdd %51 %44 InclusiveScan %130
+%132 = OpIEqual %42 %127 %131
+%134 = OpSelect %51 %132 %133 %54
+%135 = OpBitcast %6 %134
+%136 = OpLoad %6 %55
+%137 = OpBitwiseOr %6 %136 %135
+OpStore %55 %137
+OpBranch %100
+%138 = OpLabel
+%139 = OpLoad %6 %55
+%140 = OpBitwiseOr %6 %139 %27
+OpStore %55 %140
+OpBranch %100
+%100 = OpLabel
+%145 = OpLoad %6 %19
+%146 = OpLoad %6 %55
+%148 = OpAccessChain %147 %144 %54 %145
+OpStore %148 %146
+OpReturn
+OpFunctionEnd
+</SpirVAssemblySource>
+</ShaderProgram>
+ <Text>1 / 7 values passed</Text>
+ <Number Name="TestDuration" Description="Test case duration in microseconds" Tag="Time" Unit="us">161054</Number>
+ <Result StatusCode="Fail">Failed!</Result>
+</TestCaseResult>
+
+
+=== dEQP-VK.subgroups.arithmetic.compute.subgroupmin_float
+<?xml version="1.0" encoding="UTF-8"?>
+<TestCaseResult CasePath="dEQP-VK.subgroups.arithmetic.compute.subgroupmin_float" Version="0.3.4" CaseType="SelfValidate">
+ <Section Name="comp" Description="Program: comp">
+  <ShaderProgram LinkStatus="OK">
+   <InfoLog></InfoLog>
+   <ComputeShader CompileStatus="OK">
+    <ShaderSource>#version 450
+#extension GL_KHR_shader_subgroup_arithmetic: enable
+#extension GL_KHR_shader_subgroup_ballot: enable
+layout (local_size_x_id = 0, local_size_y_id = 1, local_size_z_id = 2) in;
+layout(set = 0, binding = 0, std430) buffer Buffer1
+{
+  uint result[];
+};
+layout(set = 0, binding = 1, std430) buffer Buffer2
+{
+  float data[];
+};
+
+void main (void)
+{
+  uvec3 globalSize = gl_NumWorkGroups * gl_WorkGroupSize;
+  highp uint offset = globalSize.x * ((globalSize.y * gl_GlobalInvocationID.z) + gl_GlobalInvocationID.y) + gl_GlobalInvocationID.x;
+  uint tempRes;
+  uvec4 mask = subgroupBallot(true);
+  uint start = 0, end = gl_SubgroupSize;
+  float ref = float(intBitsToFloat(0x7f800000));
+  tempRes = 0;
+  uint identityOnly = 0x3;
+  for (uint index = start; index &lt; end; index++)
+  {
+    if (subgroupBallotBitExtract(mask, index))
+    {
+      ref = (isnan(ref) ? data[index] : (isnan(data[index]) ? ref : min(ref, data[index])));
+      identityOnly &amp;= ~0x1;
+    }
+  }
+  tempRes = (ref == subgroupMin(data[gl_SubgroupInvocationID])) ? 0x1 : 0;
+  if (1 == (gl_SubgroupInvocationID % 2))
+  {
+    mask = subgroupBallot(true);
+    ref = float(intBitsToFloat(0x7f800000));
+    for (uint index = start; index &lt; end; index++)
+    {
+      if (subgroupBallotBitExtract(mask, index))
+      {
+        ref = (isnan(ref) ? data[index] : (isnan(data[index]) ? ref : min(ref, data[index])));
+        identityOnly &amp;= ~0x2;
+      }
+    }
+    tempRes |= (ref == subgroupMin(data[gl_SubgroupInvocationID])) ? 0x2 : 0;
+  }
+  else
+  {
+    tempRes |= 0x2;
+  }
+  tempRes |= identityOnly;
+  result[offset] = tempRes;
+}
+</ShaderSource>
+    <InfoLog></InfoLog>
+</ComputeShader>
+</ShaderProgram>
+  <Number Name="ComputeCompileTime" Description="Compute shader compile time" Tag="Time" Unit="ms">0.770000</Number>
+  <Number Name="LinkTime" Description="Link time" Tag="Time" Unit="ms">0.008000</Number>
+</Section>
+ <ShaderProgram LinkStatus="OK">
+  <InfoLog></InfoLog>
+  <SpirVAssemblySource>; SPIR-V
+; Version: 1.3
+; Generator: Khronos Glslang Reference Front End; 11
+; Bound: 196
+; Schema: 0
+OpCapability Shader
+OpCapability GroupNonUniform
+OpCapability GroupNonUniformArithmetic
+OpCapability GroupNonUniformBallot
+%1 = OpExtInstImport &quot;GLSL.std.450&quot;
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %4 &quot;main&quot; %11 %26 %48 %111
+OpExecutionMode %4 LocalSize 1 1 1
+OpDecorate %11 BuiltIn NumWorkgroups
+OpDecorate %13 SpecId 0
+OpDecorate %14 SpecId 1
+OpDecorate %15 SpecId 2
+OpDecorate %16 BuiltIn WorkgroupSize
+OpDecorate %26 BuiltIn GlobalInvocationId
+OpDecorate %48 RelaxedPrecision
+OpDecorate %48 BuiltIn SubgroupSize
+OpDecorate %49 RelaxedPrecision
+OpDecorate %78 ArrayStride 4
+OpDecorate %79 Block
+OpMemberDecorate %79 0 Offset 0
+OpDecorate %81 Binding 1
+OpDecorate %81 DescriptorSet 0
+OpDecorate %111 RelaxedPrecision
+OpDecorate %111 BuiltIn SubgroupLocalInvocationId
+OpDecorate %112 RelaxedPrecision
+OpDecorate %119 RelaxedPrecision
+OpDecorate %120 RelaxedPrecision
+OpDecorate %172 RelaxedPrecision
+OpDecorate %188 ArrayStride 4
+OpDecorate %189 Block
+OpMemberDecorate %189 0 Offset 0
+OpDecorate %191 Binding 0
+OpDecorate %191 DescriptorSet 0
+%2 = OpTypeVoid
+%3 = OpTypeFunction %2
+%6 = OpTypeInt 32 0
+%7 = OpTypeVector %6 3
+%8 = OpTypePointer Function %7
+%10 = OpTypePointer Input %7
+%11 = OpVariable %10 Input
+%13 = OpSpecConstant %6 1
+%14 = OpSpecConstant %6 1
+%15 = OpSpecConstant %6 1
+%16 = OpSpecConstantComposite %7 %13 %14 %15
+%18 = OpTypePointer Function %6
+%20 = OpConstant %6 0
+%23 = OpConstant %6 1
+%26 = OpVariable %10 Input
+%27 = OpConstant %6 2
+%28 = OpTypePointer Input %6
+%39 = OpTypeVector %6 4
+%40 = OpTypePointer Function %39
+%42 = OpTypeBool
+%43 = OpConstantTrue %42
+%44 = OpConstant %6 3
+%48 = OpVariable %28 Input
+%50 = OpTypeFloat 32
+%51 = OpTypePointer Function %50
+%53 = OpTypeInt 32 1
+%54 = OpConstant %53 2139095040
+%78 = OpTypeRuntimeArray %50
+%79 = OpTypeStruct %78
+%80 = OpTypePointer StorageBuffer %79
+%81 = OpVariable %80 StorageBuffer
+%82 = OpConstant %53 0
+%84 = OpTypePointer StorageBuffer %50
+%104 = OpConstant %6 4294967294
+%108 = OpConstant %53 1
+%111 = OpVariable %28 Input
+%166 = OpConstant %6 4294967293
+%177 = OpConstant %53 2
+%188 = OpTypeRuntimeArray %6
+%189 = OpTypeStruct %188
+%190 = OpTypePointer StorageBuffer %189
+%191 = OpVariable %190 StorageBuffer
+%194 = OpTypePointer StorageBuffer %6
+%4 = OpFunction %2 None %3
+%5 = OpLabel
+%9 = OpVariable %8 Function
+%19 = OpVariable %18 Function
+%41 = OpVariable %40 Function
+%46 = OpVariable %18 Function
+%47 = OpVariable %18 Function
+%52 = OpVariable %51 Function
+%56 = OpVariable %18 Function
+%57 = OpVariable %18 Function
+%58 = OpVariable %18 Function
+%75 = OpVariable %51 Function
+%92 = OpVariable %51 Function
+%126 = OpVariable %18 Function
+%143 = OpVariable %51 Function
+%154 = OpVariable %51 Function
+%12 = OpLoad %7 %11
+%17 = OpIMul %7 %12 %16
+OpStore %9 %17
+%21 = OpAccessChain %18 %9 %20
+%22 = OpLoad %6 %21
+%24 = OpAccessChain %18 %9 %23
+%25 = OpLoad %6 %24
+%29 = OpAccessChain %28 %26 %27
+%30 = OpLoad %6 %29
+%31 = OpIMul %6 %25 %30
+%32 = OpAccessChain %28 %26 %23
+%33 = OpLoad %6 %32
+%34 = OpIAdd %6 %31 %33
+%35 = OpIMul %6 %22 %34
+%36 = OpAccessChain %28 %26 %20
+%37 = OpLoad %6 %36
+%38 = OpIAdd %6 %35 %37
+OpStore %19 %38
+%45 = OpGroupNonUniformBallot %39 %44 %43
+OpStore %41 %45
+OpStore %46 %20
+%49 = OpLoad %6 %48
+OpStore %47 %49
+%55 = OpBitcast %50 %54
+OpStore %52 %55
+OpStore %56 %20
+OpStore %57 %44
+%59 = OpLoad %6 %46
+OpStore %58 %59
+OpBranch %60
+%60 = OpLabel
+OpLoopMerge %62 %63 None
+OpBranch %64
+%64 = OpLabel
+%65 = OpLoad %6 %58
+%66 = OpLoad %6 %47
+%67 = OpULessThan %42 %65 %66
+OpBranchConditional %67 %61 %62
+%61 = OpLabel
+%68 = OpLoad %39 %41
+%69 = OpLoad %6 %58
+%70 = OpGroupNonUniformBallotBitExtract %42 %44 %68 %69
+OpSelectionMerge %72 None
+OpBranchConditional %70 %71 %72
+%71 = OpLabel
+%73 = OpLoad %50 %52
+%74 = OpIsNan %42 %73
+OpSelectionMerge %77 None
+OpBranchConditional %74 %76 %87
+%76 = OpLabel
+%83 = OpLoad %6 %58
+%85 = OpAccessChain %84 %81 %82 %83
+%86 = OpLoad %50 %85
+OpStore %75 %86
+OpBranch %77
+%87 = OpLabel
+%88 = OpLoad %6 %58
+%89 = OpAccessChain %84 %81 %82 %88
+%90 = OpLoad %50 %89
+%91 = OpIsNan %42 %90
+OpSelectionMerge %94 None
+OpBranchConditional %91 %93 %96
+%93 = OpLabel
+%95 = OpLoad %50 %52
+OpStore %92 %95
+OpBranch %94
+%96 = OpLabel
+%97 = OpLoad %50 %52
+%98 = OpLoad %6 %58
+%99 = OpAccessChain %84 %81 %82 %98
+%100 = OpLoad %50 %99
+%101 = OpExtInst %50 %1 FMin %97 %100
+OpStore %92 %101
+OpBranch %94
+%94 = OpLabel
+%102 = OpLoad %50 %92
+OpStore %75 %102
+OpBranch %77
+%77 = OpLabel
+%103 = OpLoad %50 %75
+OpStore %52 %103
+%105 = OpLoad %6 %57
+%106 = OpBitwiseAnd %6 %105 %104
+OpStore %57 %106
+OpBranch %72
+%72 = OpLabel
+OpBranch %63
+%63 = OpLabel
+%107 = OpLoad %6 %58
+%109 = OpIAdd %6 %107 %108
+OpStore %58 %109
+OpBranch %60
+%62 = OpLabel
+%110 = OpLoad %50 %52
+%112 = OpLoad %6 %111
+%113 = OpAccessChain %84 %81 %82 %112
+%114 = OpLoad %50 %113
+%115 = OpGroupNonUniformFMin %50 %44 Reduce %114
+%116 = OpFOrdEqual %42 %110 %115
+%117 = OpSelect %53 %116 %108 %82
+%118 = OpBitcast %6 %117
+OpStore %56 %118
+%119 = OpLoad %6 %111
+%120 = OpUMod %6 %119 %27
+%121 = OpIEqual %42 %23 %120
+OpSelectionMerge %123 None
+OpBranchConditional %121 %122 %182
+%122 = OpLabel
+%124 = OpGroupNonUniformBallot %39 %44 %43
+OpStore %41 %124
+%125 = OpBitcast %50 %54
+OpStore %52 %125
+%127 = OpLoad %6 %46
+OpStore %126 %127
+OpBranch %128
+%128 = OpLabel
+OpLoopMerge %130 %131 None
+OpBranch %132
+%132 = OpLabel
+%133 = OpLoad %6 %126
+%134 = OpLoad %6 %47
+%135 = OpULessThan %42 %133 %134
+OpBranchConditional %135 %129 %130
+%129 = OpLabel
+%136 = OpLoad %39 %41
+%137 = OpLoad %6 %126
+%138 = OpGroupNonUniformBallotBitExtract %42 %44 %136 %137
+OpSelectionMerge %140 None
+OpBranchConditional %138 %139 %140
+%139 = OpLabel
+%141 = OpLoad %50 %52
+%142 = OpIsNan %42 %141
+OpSelectionMerge %145 None
+OpBranchConditional %142 %144 %149
+%144 = OpLabel
+%146 = OpLoad %6 %126
+%147 = OpAccessChain %84 %81 %82 %146
+%148 = OpLoad %50 %147
+OpStore %143 %148
+OpBranch %145
+%149 = OpLabel
+%150 = OpLoad %6 %126
+%151 = OpAccessChain %84 %81 %82 %150
+%152 = OpLoad %50 %151
+%153 = OpIsNan %42 %152
+OpSelectionMerge %156 None
+OpBranchConditional %153 %155 %158
+%155 = OpLabel
+%157 = OpLoad %50 %52
+OpStore %154 %157
+OpBranch %156
+%158 = OpLabel
+%159 = OpLoad %50 %52
+%160 = OpLoad %6 %126
+%161 = OpAccessChain %84 %81 %82 %160
+%162 = OpLoad %50 %161
+%163 = OpExtInst %50 %1 FMin %159 %162
+OpStore %154 %163
+OpBranch %156
+%156 = OpLabel
+%164 = OpLoad %50 %154
+OpStore %143 %164
+OpBranch %145
+%145 = OpLabel
+%165 = OpLoad %50 %143
+OpStore %52 %165
+%167 = OpLoad %6 %57
+%168 = OpBitwiseAnd %6 %167 %166
+OpStore %57 %168
+OpBranch %140
+%140 = OpLabel
+OpBranch %131
+%131 = OpLabel
+%169 = OpLoad %6 %126
+%170 = OpIAdd %6 %169 %108
+OpStore %126 %170
+OpBranch %128
+%130 = OpLabel
+%171 = OpLoad %50 %52
+%172 = OpLoad %6 %111
+%173 = OpAccessChain %84 %81 %82 %172
+%174 = OpLoad %50 %173
+%175 = OpGroupNonUniformFMin %50 %44 Reduce %174
+%176 = OpFOrdEqual %42 %171 %175
+%178 = OpSelect %53 %176 %177 %82
+%179 = OpBitcast %6 %178
+%180 = OpLoad %6 %56
+%181 = OpBitwiseOr %6 %180 %179
+OpStore %56 %181
+OpBranch %123
+%182 = OpLabel
+%183 = OpLoad %6 %56
+%184 = OpBitwiseOr %6 %183 %27
+OpStore %56 %184
+OpBranch %123
+%123 = OpLabel
+%185 = OpLoad %6 %57
+%186 = OpLoad %6 %56
+%187 = OpBitwiseOr %6 %186 %185
+OpStore %56 %187
+%192 = OpLoad %6 %19
+%193 = OpLoad %6 %56
+%195 = OpAccessChain %194 %191 %82 %192
+OpStore %195 %193
+OpReturn
+OpFunctionEnd
+</SpirVAssemblySource>
+</ShaderProgram>
+ <Text>1 / 7 values passed</Text>
+ <Number Name="TestDuration" Description="Test case duration in microseconds" Tag="Time" Unit="us">164261</Number>
+ <Result StatusCode="Fail">Failed!</Result>
+</TestCaseResult>
+
+
+=== dEQP-VK.subgroups.arithmetic.graphics.subgroupadd_ivec4
+<?xml version="1.0" encoding="UTF-8"?>
+<TestCaseResult CasePath="dEQP-VK.subgroups.arithmetic.graphics.subgroupadd_ivec4" Version="0.3.4" CaseType="SelfValidate">
+ <Section Name="fragment" Description="Program: fragment">
+  <ShaderProgram LinkStatus="OK">
+   <InfoLog></InfoLog>
+   <FragmentShader CompileStatus="OK">
+    <ShaderSource>#version 450
+#extension GL_KHR_shader_subgroup_arithmetic: enable
+#extension GL_KHR_shader_subgroup_ballot: enable
+layout(location = 0) out uint result;
+layout(set = 0, binding = 4, std430) readonly buffer Buffer1
+{
+  ivec4 data[];
+};
+void main (void)
+{
+  uint tempRes;
+  uvec4 mask = subgroupBallot(true);
+  uint start = 0, end = gl_SubgroupSize;
+  ivec4 ref = ivec4(0);
+  tempRes = 0;
+  uint identityOnly = 0x3;
+  for (uint index = start; index &lt; end; index++)
+  {
+    if (subgroupBallotBitExtract(mask, index))
+    {
+      ref = ref + data[index];
+      identityOnly &amp;= ~0x1;
+    }
+  }
+  tempRes = all(equal(ref, subgroupAdd(data[gl_SubgroupInvocationID]))) ? 0x1 : 0;
+  if (1 == (gl_SubgroupInvocationID % 2))
+  {
+    mask = subgroupBallot(true);
+    ref = ivec4(0);
+    for (uint index = start; index &lt; end; index++)
+    {
+      if (subgroupBallotBitExtract(mask, index))
+      {
+        ref = ref + data[index];
+        identityOnly &amp;= ~0x2;
+      }
+    }
+    tempRes |= all(equal(ref, subgroupAdd(data[gl_SubgroupInvocationID]))) ? 0x2 : 0;
+  }
+  else
+  {
+    tempRes |= 0x2;
+  }
+  result = tempRes;
+}
+</ShaderSource>
+    <InfoLog></InfoLog>
+</FragmentShader>
+</ShaderProgram>
+  <Number Name="FragmentCompileTime" Description="Fragment shader compile time" Tag="Time" Unit="ms">1.223000</Number>
+  <Number Name="LinkTime" Description="Link time" Tag="Time" Unit="ms">0.011000</Number>
+</Section>
+ <ShaderProgram LinkStatus="OK">
+  <InfoLog></InfoLog>
+  <SpirVAssemblySource>; SPIR-V
+; Version: 1.3
+; Generator: Khronos Glslang Reference Front End; 11
+; Bound: 122
+; Schema: 0
+OpCapability Shader
+OpCapability GroupNonUniform
+OpCapability GroupNonUniformArithmetic
+OpCapability GroupNonUniformBallot
+%1 = OpExtInstImport &quot;GLSL.std.450&quot;
+OpMemoryModel Logical GLSL450
+OpEntryPoint Fragment %4 &quot;main&quot; %19 %61 %120
+OpExecutionMode %4 OriginUpperLeft
+OpDecorate %19 RelaxedPrecision
+OpDecorate %19 BuiltIn SubgroupSize
+OpDecorate %19 Flat
+OpDecorate %20 RelaxedPrecision
+OpDecorate %45 ArrayStride 16
+OpDecorate %46 Block
+OpMemberDecorate %46 0 NonWritable
+OpMemberDecorate %46 0 Offset 0
+OpDecorate %48 NonWritable
+OpDecorate %48 Binding 4
+OpDecorate %48 DescriptorSet 0
+OpDecorate %61 RelaxedPrecision
+OpDecorate %61 BuiltIn SubgroupLocalInvocationId
+OpDecorate %61 Flat
+OpDecorate %62 RelaxedPrecision
+OpDecorate %72 RelaxedPrecision
+OpDecorate %74 RelaxedPrecision
+OpDecorate %105 RelaxedPrecision
+OpDecorate %120 Location 0
+%2 = OpTypeVoid
+%3 = OpTypeFunction %2
+%6 = OpTypeInt 32 0
+%7 = OpTypeVector %6 4
+%8 = OpTypePointer Function %7
+%10 = OpTypeBool
+%11 = OpConstantTrue %10
+%12 = OpConstant %6 3
+%14 = OpTypePointer Function %6
+%16 = OpConstant %6 0
+%18 = OpTypePointer Input %6
+%19 = OpVariable %18 Input
+%21 = OpTypeInt 32 1
+%22 = OpTypeVector %21 4
+%23 = OpTypePointer Function %22
+%25 = OpConstant %21 0
+%26 = OpConstantComposite %22 %25 %25 %25 %25
+%45 = OpTypeRuntimeArray %22
+%46 = OpTypeStruct %45
+%47 = OpTypePointer StorageBuffer %46
+%48 = OpVariable %47 StorageBuffer
+%50 = OpTypePointer StorageBuffer %22
+%54 = OpConstant %6 4294967294
+%58 = OpConstant %21 1
+%61 = OpVariable %18 Input
+%66 = OpTypeVector %10 4
+%71 = OpConstant %6 1
+%73 = OpConstant %6 2
+%99 = OpConstant %6 4294967293
+%111 = OpConstant %21 2
+%119 = OpTypePointer Output %6
+%120 = OpVariable %119 Output
+%4 = OpFunction %2 None %3
+%5 = OpLabel
+%9 = OpVariable %8 Function
+%15 = OpVariable %14 Function
+%17 = OpVariable %14 Function
+%24 = OpVariable %23 Function
+%27 = OpVariable %14 Function
+%28 = OpVariable %14 Function
+%29 = OpVariable %14 Function
+%79 = OpVariable %14 Function
+%13 = OpGroupNonUniformBallot %7 %12 %11
+OpStore %9 %13
+OpStore %15 %16
+%20 = OpLoad %6 %19
+OpStore %17 %20
+OpStore %24 %26
+OpStore %27 %16
+OpStore %28 %12
+%30 = OpLoad %6 %15
+OpStore %29 %30
+OpBranch %31
+%31 = OpLabel
+OpLoopMerge %33 %34 None
+OpBranch %35
+%35 = OpLabel
+%36 = OpLoad %6 %29
+%37 = OpLoad %6 %17
+%38 = OpULessThan %10 %36 %37
+OpBranchConditional %38 %32 %33
+%32 = OpLabel
+%39 = OpLoad %7 %9
+%40 = OpLoad %6 %29
+%41 = OpGroupNonUniformBallotBitExtract %10 %12 %39 %40
+OpSelectionMerge %43 None
+OpBranchConditional %41 %42 %43
+%42 = OpLabel
+%44 = OpLoad %22 %24
+%49 = OpLoad %6 %29
+%51 = OpAccessChain %50 %48 %25 %49
+%52 = OpLoad %22 %51
+%53 = OpIAdd %22 %44 %52
+OpStore %24 %53
+%55 = OpLoad %6 %28
+%56 = OpBitwiseAnd %6 %55 %54
+OpStore %28 %56
+OpBranch %43
+%43 = OpLabel
+OpBranch %34
+%34 = OpLabel
+%57 = OpLoad %6 %29
+%59 = OpIAdd %6 %57 %58
+OpStore %29 %59
+OpBranch %31
+%33 = OpLabel
+%60 = OpLoad %22 %24
+%62 = OpLoad %6 %61
+%63 = OpAccessChain %50 %48 %25 %62
+%64 = OpLoad %22 %63
+%65 = OpGroupNonUniformIAdd %22 %12 Reduce %64
+%67 = OpIEqual %66 %60 %65
+%68 = OpAll %10 %67
+%69 = OpSelect %21 %68 %58 %25
+%70 = OpBitcast %6 %69
+OpStore %27 %70
+%72 = OpLoad %6 %61
+%74 = OpUMod %6 %72 %73
+%75 = OpIEqual %10 %71 %74
+OpSelectionMerge %77 None
+OpBranchConditional %75 %76 %116
+%76 = OpLabel
+%78 = OpGroupNonUniformBallot %7 %12 %11
+OpStore %9 %78
+OpStore %24 %26
+%80 = OpLoad %6 %15
+OpStore %79 %80
+OpBranch %81
+%81 = OpLabel
+OpLoopMerge %83 %84 None
+OpBranch %85
+%85 = OpLabel
+%86 = OpLoad %6 %79
+%87 = OpLoad %6 %17
+%88 = OpULessThan %10 %86 %87
+OpBranchConditional %88 %82 %83
+%82 = OpLabel
+%89 = OpLoad %7 %9
+%90 = OpLoad %6 %79
+%91 = OpGroupNonUniformBallotBitExtract %10 %12 %89 %90
+OpSelectionMerge %93 None
+OpBranchConditional %91 %92 %93
+%92 = OpLabel
+%94 = OpLoad %22 %24
+%95 = OpLoad %6 %79
+%96 = OpAccessChain %50 %48 %25 %95
+%97 = OpLoad %22 %96
+%98 = OpIAdd %22 %94 %97
+OpStore %24 %98
+%100 = OpLoad %6 %28
+%101 = OpBitwiseAnd %6 %100 %99
+OpStore %28 %101
+OpBranch %93
+%93 = OpLabel
+OpBranch %84
+%84 = OpLabel
+%102 = OpLoad %6 %79
+%103 = OpIAdd %6 %102 %58
+OpStore %79 %103
+OpBranch %81
+%83 = OpLabel
+%104 = OpLoad %22 %24
+%105 = OpLoad %6 %61
+%106 = OpAccessChain %50 %48 %25 %105
+%107 = OpLoad %22 %106
+%108 = OpGroupNonUniformIAdd %22 %12 Reduce %107
+%109 = OpIEqual %66 %104 %108
+%110 = OpAll %10 %109
+%112 = OpSelect %21 %110 %111 %25
+%113 = OpBitcast %6 %112
+%114 = OpLoad %6 %27
+%115 = OpBitwiseOr %6 %114 %113
+OpStore %27 %115
+OpBranch %77
+%116 = OpLabel
+%117 = OpLoad %6 %27
+%118 = OpBitwiseOr %6 %117 %73
+OpStore %27 %118
+OpBranch %77
+%77 = OpLabel
+%121 = OpLoad %6 %27
+OpStore %120 %121
+OpReturn
+OpFunctionEnd
+</SpirVAssemblySource>
+</ShaderProgram>
+ <Section Name="geometry_lines" Description="Program: geometry_lines">
+  <ShaderProgram LinkStatus="OK">
+   <InfoLog></InfoLog>
+   <GeometryShader CompileStatus="OK">
+    <ShaderSource>#version 450
+#extension GL_KHR_shader_subgroup_arithmetic: enable
+#extension GL_KHR_shader_subgroup_ballot: enable
+layout(lines) in;
+layout(points, max_vertices = 1) out;
+layout(set =
+[...]
+ex++)
+  {
+    if (subgroupBallotBitExtract(mask, index))
+    {
+      ref = ref + data[index];
+      identityOnly &amp;= ~0x1;
+    }
+  }
+  tempRes = all(equal(ref, subgroupAdd(data[gl_SubgroupInvocationID]))) ? 0x1 : 0;
+  if (1 == (gl_SubgroupInvocationID % 2))
+  {
+    mask = subgroupBallot(true);
+    ref = ivec4(0);
+    for (uint index = start; index &lt; end; index++)
+    {
+      if (subgroupBallotBitExtract(mask, index))
+      {
+        ref = ref + data[index];
+        identityOnly &amp;= ~0x2;
+      }
+    }
+    tempRes |= all(equal(ref, subgroupAdd(data[gl_SubgroupInvocationID]))) ? 0x2 : 0;
+  }
+  else
+  {
+    tempRes |= 0x2;
+  }
+  result[gl_VertexIndex] = tempRes;
+  float pixelSize = 2.0f/1024.0f;
+  float pixelPosition = pixelSize/2.0f - 1.0f;
+  gl_Position = vec4(float(gl_VertexIndex) * pixelSize + pixelPosition, 0.0f, 0.0f, 1.0f);
+  gl_PointSize = 1.0f;
+}
+</ShaderSource>
+    <InfoLog></InfoLog>
+</VertexShader>
+</ShaderProgram>
+  <Number Name="VertexCompileTime" Description="Vertex shader compile time" Tag="Time" Unit="ms">0.865000</Number>
+  <Number Name="LinkTime" Description="Link time" Tag="Time" Unit="ms">0.004000</Number>
+</Section>
+ <ShaderProgram LinkStatus="OK">
+  <InfoLog></InfoLog>
+  <SpirVAssemblySource>; SPIR-V
+; Version: 1.3
+; Generator: Khronos Glslang Reference Front End; 11
+; Bound: 156
+; Schema: 0
+OpCapability Shader
+OpCapability GroupNonUniform
+OpCapability GroupNonUniformArithmetic
+OpCapability GroupNonUniformBallot
+%1 = OpExtInstImport &quot;GLSL.std.450&quot;
+OpMemoryModel Logical GLSL450
+OpEntryPoint Vertex %4 &quot;main&quot; %19 %61 %124 %143
+OpDecorate %19 RelaxedPrecision
+OpDecorate %19 BuiltIn SubgroupSize
+OpDecorate %20 RelaxedPrecision
+OpDecorate %45 ArrayStride 16
+OpDecorate %46 Block
+OpMemberDecorate %46 0 NonWritable
+OpMemberDecorate %46 0 Offset 0
+OpDecorate %48 NonWritable
+OpDecorate %48 Binding 4
+OpDecorate %48 DescriptorSet 0
+OpDecorate %61 RelaxedPrecision
+OpDecorate %61 BuiltIn SubgroupLocalInvocationId
+OpDecorate %62 RelaxedPrecision
+OpDecorate %72 RelaxedPrecision
+OpDecorate %74 RelaxedPrecision
+OpDecorate %105 RelaxedPrecision
+OpDecorate %119 ArrayStride 4
+OpDecorate %120 Block
+OpMemberDecorate %120 0 Offset 0
+OpDecorate %122 Binding 0
+OpDecorate %122 DescriptorSet 0
+OpDecorate %124 BuiltIn VertexIndex
+OpDecorate %141 Block
+OpMemberDecorate %141 0 BuiltIn Position
+OpMemberDecorate %141 1 BuiltIn PointSize
+OpMemberDecorate %141 2 BuiltIn ClipDistance
+OpMemberDecorate %141 3 BuiltIn CullDistance
+%2 = OpTypeVoid
+%3 = OpTypeFunction %2
+%6 = OpTypeInt 32 0
+%7 = OpTypeVector %6 4
+%8 = OpTypePointer Function %7
+%10 = OpTypeBool
+%11 = OpConstantTrue %10
+%12 = OpConstant %6 3
+%14 = OpTypePointer Function %6
+%16 = OpConstant %6 0
+%18 = OpTypePointer Input %6
+%19 = OpVariable %18 Input
+%21 = OpTypeInt 32 1
+%22 = OpTypeVector %21 4
+%23 = OpTypePointer Function %22
+%25 = OpConstant %21 0
+%26 = OpConstantComposite %22 %25 %25 %25 %25
+%45 = OpTypeRuntimeArray %22
+%46 = OpTypeStruct %45
+%47 = OpTypePointer StorageBuffer %46
+%48 = OpVariable %47 StorageBuffer
+%50 = OpTypePointer StorageBuffer %22
+%54 = OpConstant %6 4294967294
+%58 = OpConstant %21 1
+%61 = OpVariable %18 Input
+%66 = OpTypeVector %10 4
+%71 = OpConstant %6 1
+%73 = OpConstant %6 2
+%99 = OpConstant %6 4294967293
+%111 = OpConstant %21 2
+%119 = OpTypeRuntimeArray %6
+%120 = OpTypeStruct %119
+%121 = OpTypePointer StorageBuffer %120
+%122 = OpVariable %121 StorageBuffer
+%123 = OpTypePointer Input %21
+%124 = OpVariable %123 Input
+%127 = OpTypePointer StorageBuffer %6
+%129 = OpTypeFloat 32
+%130 = OpTypePointer Function %129
+%132 = OpConstant %129 0.001953125
+%135 = OpConstant %129 2
+%137 = OpConstant %129 1
+%139 = OpTypeVector %129 4
+%140 = OpTypeArray %129 %71
+%141 = OpTypeStruct %139 %129 %140 %140
+%142 = OpTypePointer Output %141
+%143 = OpVariable %142 Output
+%150 = OpConstant %129 0
+%152 = OpTypePointer Output %139
+%154 = OpTypePointer Output %129
+%4 = OpFunction %2 None %3
+%5 = OpLabel
+%9 = OpVariable %8 Function
+%15 = OpVariable %14 Function
+%17 = OpVariable %14 Function
+%24 = OpVariable %23 Function
+%27 = OpVariable %14 Function
+%28 = OpVariable %14 Function
+%29 = OpVariable %14 Function
+%79 = OpVariable %14 Function
+%131 = OpVariable %130 Function
+%133 = OpVariable %130 Function
+%13 = OpGroupNonUniformBallot %7 %12 %11
+OpStore %9 %13
+OpStore %15 %16
+%20 = OpLoad %6 %19
+OpStore %17 %20
+OpStore %24 %26
+OpStore %27 %16
+OpStore %28 %12
+%30 = OpLoad %6 %15
+OpStore %29 %30
+OpBranch %31
+%31 = OpLabel
+OpLoopMerge %33 %34 None
+OpBranch %35
+%35 = OpLabel
+%36 = OpLoad %6 %29
+%37 = OpLoad %6 %17
+%38 = OpULessThan %10 %36 %37
+OpBranchConditional %38 %32 %33
+%32 = OpLabel
+%39 = OpLoad %7 %9
+%40 = OpLoad %6 %29
+%41 = OpGroupNonUniformBallotBitExtract %10 %12 %39 %40
+OpSelectionMerge %43 None
+OpBranchConditional %41 %42 %43
+%42 = OpLabel
+%44 = OpLoad %22 %24
+%49 = OpLoad %6 %29
+%51 = OpAccessChain %50 %48 %25 %49
+%52 = OpLoad %22 %51
+%53 = OpIAdd %22 %44 %52
+OpStore %24 %53
+%55 = OpLoad %6 %28
+%56 = OpBitwiseAnd %6 %55 %54
+OpStore %28 %56
+OpBranch %43
+%43 = OpLabel
+OpBranch %34
+%34 = OpLabel
+%57 = OpLoad %6 %29
+%59 = OpIAdd %6 %57 %58
+OpStore %29 %59
+OpBranch %31
+%33 = OpLabel
+%60 = OpLoad %22 %24
+%62 = OpLoad %6 %61
+%63 = OpAccessChain %50 %48 %25 %62
+%64 = OpLoad %22 %63
+%65 = OpGroupNonUniformIAdd %22 %12 Reduce %64
+%67 = OpIEqual %66 %60 %65
+%68 = OpAll %10 %67
+%69 = OpSelect %21 %68 %58 %25
+%70 = OpBitcast %6 %69
+OpStore %27 %70
+%72 = OpLoad %6 %61
+%74 = OpUMod %6 %72 %73
+%75 = OpIEqual %10 %71 %74
+OpSelectionMerge %77 None
+OpBranchConditional %75 %76 %116
+%76 = OpLabel
+%78 = OpGroupNonUniformBallot %7 %12 %11
+OpStore %9 %78
+OpStore %24 %26
+%80 = OpLoad %6 %15
+OpStore %79 %80
+OpBranch %81
+%81 = OpLabel
+OpLoopMerge %83 %84 None
+OpBranch %85
+%85 = OpLabel
+%86 = OpLoad %6 %79
+%87 = OpLoad %6 %17
+%88 = OpULessThan %10 %86 %87
+OpBranchConditional %88 %82 %83
+%82 = OpLabel
+%89 = OpLoad %7 %9
+%90 = OpLoad %6 %79
+%91 = OpGroupNonUniformBallotBitExtract %10 %12 %89 %90
+OpSelectionMerge %93 None
+OpBranchConditional %91 %92 %93
+%92 = OpLabel
+%94 = OpLoad %22 %24
+%95 = OpLoad %6 %79
+%96 = OpAccessChain %50 %48 %25 %95
+%97 = OpLoad %22 %96
+%98 = OpIAdd %22 %94 %97
+OpStore %24 %98
+%100 = OpLoad %6 %28
+%101 = OpBitwiseAnd %6 %100 %99
+OpStore %28 %101
+OpBranch %93
+%93 = OpLabel
+OpBranch %84
+%84 = OpLabel
+%102 = OpLoad %6 %79
+%103 = OpIAdd %6 %102 %58
+OpStore %79 %103
+OpBranch %81
+%83 = OpLabel
+%104 = OpLoad %22 %24
+%105 = OpLoad %6 %61
+%106 = OpAccessChain %50 %48 %25 %105
+%107 = OpLoad %22 %106
+%108 = OpGroupNonUniformIAdd %22 %12 Reduce %107
+%109 = OpIEqual %66 %104 %108
+%110 = OpAll %10 %109
+%112 = OpSelect %21 %110 %111 %25
+%113 = OpBitcast %6 %112
+%114 = OpLoad %6 %27
+%115 = OpBitwiseOr %6 %114 %113
+OpStore %27 %115
+OpBranch %77
+%116 = OpLabel
+%117 = OpLoad %6 %27
+%118 = OpBitwiseOr %6 %117 %73
+OpStore %27 %118
+OpBranch %77
+%77 = OpLabel
+%125 = OpLoad %21 %124
+%126 = OpLoad %6 %27
+%128 = OpAccessChain %127 %122 %25 %125
+OpStore %128 %126
+OpStore %131 %132
+%134 = OpLoad %129 %131
+%136 = OpFDiv %129 %134 %135
+%138 = OpFSub %129 %136 %137
+OpStore %133 %138
+%144 = OpLoad %21 %124
+%145 = OpConvertSToF %129 %144
+%146 = OpLoad %129 %131
+%147 = OpFMul %129 %145 %146
+%148 = OpLoad %129 %133
+%149 = OpFAdd %129 %147 %148
+%151 = OpCompositeConstruct %139 %149 %150 %150 %137
+%153 = OpAccessChain %152 %143 %25
+OpStore %153 %151
+%155 = OpAccessChain %154 %143 %58
+OpStore %155 %137
+OpReturn
+OpFunctionEnd
+</SpirVAssemblySource>
+</ShaderProgram>
+ <Section Name="tesc_noSubgroup" Description="Program: tesc_noSubgroup">
+  <ShaderProgram LinkStatus="OK">
+   <InfoLog></InfoLog>
+   <SpirVAssemblySource>; SPIR-V
+; Version: 1.3
+; Generator: Khronos Glslang Reference Front End; 1
+; Bound: 45
+; Schema: 0
+OpCapability Tessellation
+%1 = OpExtInstImport &quot;GLSL.std.450&quot;
+OpMemoryModel Logical GLSL450
+OpEntryPoint TessellationControl %4 &quot;main&quot; %8 %20 %32 %38
+OpExecutionMode %4 OutputVertices 1
+OpDecorate %8 BuiltIn InvocationId
+OpDecorate %20 Patch
+OpDecorate %20 BuiltIn TessLevelOuter
+OpMemberDecorate %29 0 BuiltIn Position
+OpMemberDecorate %29 1 BuiltIn PointSize
+OpMemberDecorate %29 2 BuiltIn ClipDistance
+OpMemberDecorate %29 3 BuiltIn CullDistance
+OpDecorate %29 Block
+OpMemberDecorate %34 0 BuiltIn Position
+OpMemberDecorate %34 1 BuiltIn PointSize
+OpMemberDecorate %34 2 BuiltIn ClipDistance
+OpMemberDecorate %34 3 BuiltIn CullDistance
+OpDecorate %34 Block
+%2 = OpTypeVoid
+%3 = OpTypeFunction %2
+%6 = OpTypeInt 32 1
+%7 = OpTypePointer Input %6
+%8 = OpVariable %7 Input
+%10 = OpConstant %6 0
+%11 = OpTypeBool
+%15 = OpTypeFloat 32
+%16 = OpTypeInt 32 0
+%17 = OpConstant %16 4
+%18 = OpTypeArray %15 %17
+%19 = OpTypePointer Output %18
+%20 = OpVariable %19 Output
+%21 = OpConstant %15 1
+%22 = OpTypePointer Output %15
+%24 = OpConstant %6 1
+%26 = OpTypeVector %15 4
+%27 = OpConstant %16 1
+%28 = OpTypeArray %15 %27
+%29 = OpTypeStruct %26 %15 %28 %28
+%30 = OpTypeArray %29 %27
+%31 = OpTypePointer Output %30
+%32 = OpVariable %31 Output
+%34 = OpTypeStruct %26 %15 %28 %28
+%35 = OpConstant %16 32
+%36 = OpTypeArray %34 %35
+%37 = OpTypePointer Input %36
+%38 = OpVariable %37 Input
+%40 = OpTypePointer Input %26
+%43 = OpTypePointer Output %26
+%4 = OpFunction %2 None %3
+%5 = OpLabel
+%9 = OpLoad %6 %8
+%12 = OpIEqual %11 %9 %10
+OpSelectionMerge %14 None
+OpBranchConditional %12 %13 %14
+%13 = OpLabel
+%23 = OpAccessChain %22 %20 %10
+OpStore %23 %21
+%25 = OpAccessChain %22 %20 %24
+OpStore %25 %21
+OpBranch %14
+%14 = OpLabel
+%33 = OpLoad %6 %8
+%39 = OpLoad %6 %8
+%41 = OpAccessChain %40 %38 %39 %10
+%42 = OpLoad %26 %41
+%44 = OpAccessChain %43 %32 %33 %10
+OpStore %44 %42
+OpReturn
+OpFunctionEnd
+</SpirVAssemblySource>
+</ShaderProgram>
+  <Number Name="SpirVAssemblyTime" Description="SpirV assembly time" Tag="Time" Unit="ms">0.211000</Number>
+</Section>
+ <Section Name="tese_noSubgroup" Description="Program: tese_noSubgroup">
+  <ShaderProgram LinkStatus="OK">
+   <InfoLog></InfoLog>
+   <SpirVAssemblySource>; SPIR-V
+; Version: 1.3
+; Generator: Khronos Glslang Reference Front End; 2
+; Bound: 42
+; Schema: 0
+OpCapability Tessellation
+%1 = OpExtInstImport &quot;GLSL.std.450&quot;
+OpMemoryModel Logical GLSL450
+OpEntryPoint TessellationEvaluation %4 &quot;main&quot; %16 %23 %29
+OpExecutionMode %4 Isolines
+OpExecutionMode %4 SpacingEqual
+OpExecutionMode %4 VertexOrderCcw
+OpMemberDecorate %14 0 BuiltIn Position
+OpMemberDecorate %14 1 BuiltIn PointSize
+OpMemberDecorate %14 2 BuiltIn ClipDistance
+OpMemberDecorate %14 3 BuiltIn CullDistance
+OpDecorate %14 Block
+OpMemberDecorate %19 0 BuiltIn Position
+OpMemberDecorate %19 1 BuiltIn PointSize
+OpMemberDecorate %19 2 BuiltIn ClipDistance
+OpMemberDecorate %19 3 BuiltIn CullDistance
+OpDecorate %19 Block
+OpDecorate %29 BuiltIn TessCoord
+%2 = OpTypeVoid
+%3 = OpTypeFunction %2
+%6 = OpTypeFloat 32
+%7 = OpTypePointer Function %6
+%9 = OpConstant %6 0.00195313
+%10 = OpTypeVector %6 4
+%11 = OpTypeInt 32 0
+%12 = OpConstant %11 1
+%13 = OpTypeArray %6 %12
+%14 = OpTypeStruct %10 %6 %13 %13
+%15 = OpTypePointer Output %14
+%16 = OpVariable %15 Output
+%17 = OpTypeInt 32 1
+%18 = OpConstant %17 0
+%19 = OpTypeStruct %10 %6 %13 %13
+%20 = OpConstant %11 32
+%21 = OpTypeArray %19 %20
+%22 = OpTypePointer Input %21
+%23 = OpVariable %22 Input
+%24 = OpTypePointer Input %10
+%27 = OpTypeVector %6 3
+%28 = OpTypePointer Input %27
+%29 = OpVariable %28 Input
+%30 = OpConstant %11 0
+%31 = OpTypePointer Input %6
+%36 = OpConstant %6 2
+%40 = OpTypePointer Output %10
+%4 = OpFunction %2 None %3
+%5 = OpLabel
+%8 = OpVariable %7 Function
+OpStore %8 %9
+%25 = OpAccessChain %24 %23 %18 %18
+%26 = OpLoad %10 %25
+%32 = OpAccessChain %31 %29 %30
+%33 = OpLoad %6 %32
+%34 = OpLoad %6 %8
+%35 = OpFMul %6 %33 %34
+%37 = OpFDiv %6 %35 %36
+%38 = OpCompositeConstruct %10 %37 %37 %37 %37
+%39 = OpFAdd %10 %26 %38
+%41 = OpAccessChain %40 %16 %18
+OpStore %41 %39
+OpReturn
+OpFunctionEnd
+</SpirVAssemblySource>
+</ShaderProgram>
+  <Number Name="SpirVAssemblyTime" Description="SpirV assembly time" Tag="Time" Unit="ms">0.122000</Number>
+</Section>
+ <Section Name="vert_noSubgroup" Description="Program: vert_noSubgroup">
+  <ShaderProgram LinkStatus="OK">
+   <InfoLog></InfoLog>
+   <SpirVAssemblySource>; SPIR-V
+; Version: 1.3
+; Generator: Khronos Glslang Reference Front End; 1
+; Bound: 37
+; Schema: 0
+OpCapability Shader
+%1 = OpExtInstImport &quot;GLSL.std.450&quot;
+OpMemoryModel Logical GLSL450
+OpEntryPoint Vertex %4 &quot;main&quot; %22 %26
+OpMemberDecorate %20 0 BuiltIn Position
+OpMemberDecorate %20 1 BuiltIn PointSize
+OpMemberDecorate %20 2 BuiltIn ClipDistance
+OpMemberDecorate %20 3 BuiltIn CullDistance
+OpDecorate %20 Block
+OpDecorate %26 BuiltIn VertexIndex
+%2 = OpTypeVoid
+%3 = OpTypeFunction %2
+%6 = OpTypeFloat 32
+%7 = OpTypePointer Function %6
+%9 = OpConstant %6 0.00195313
+%12 = OpConstant %6 2
+%14 = OpConstant %6 1
+%16 = OpTypeVector %6 4
+%17 = OpTypeInt 32 0
+%18 = OpConstant %17 1
+%19 = OpTypeArray %6 %18
+%20 = OpTypeStruct %16 %6 %19 %19
+%21 = OpTypePointer Output %20
+%22 = OpVariable %21 Output
+%23 = OpTypeInt 32 1
+%24 = OpConstant %23 0
+%25 = OpTypePointer Input %23
+%26 = OpVariable %25 Input
+%33 = OpConstant %6 0
+%35 = OpTypePointer Output %16
+%37 = OpConstant %23 1
+%38 = OpTypePointer Output %6
+%4 = OpFunction %2 None %3
+%5 = OpLabel
+%8 = OpVariable %7 Function
+%10 = OpVariable %7 Function
+OpStore %8 %9
+%11 = OpLoad %6 %8
+%13 = OpFDiv %6 %11 %12
+%15 = OpFSub %6 %13 %14
+OpStore %10 %15
+%27 = OpLoad %23 %26
+%28 = OpConvertSToF %6 %27
+%29 = OpLoad %6 %8
+%30 = OpFMul %6 %28 %29
+%31 = OpLoad %6 %10
+%32 = OpFAdd %6 %30 %31
+%34 = OpCompositeConstruct %16 %32 %33 %33 %14
+%36 = OpAccessChain %35 %22 %24
+OpStore %36 %34
+%39 = OpAccessChain %38 %22 %37
+OpStore %39 %14
+OpReturn
+OpFunctionEnd
+</SpirVAssemblySource>
+</ShaderProgram>
+  <Number Name="SpirVAssemblyTime" Description="SpirV assembly time" Tag="Time" Unit="ms">0.093000</Number>
+</Section>
+ <Text>1 / 27 values passed</Text>
+ <Number Name="TestDuration" Description="Test case duration in microseconds" Tag="Time" Unit="us">111103</Number>
+ <Result StatusCode="Fail">Failed!</Result>
+</TestCaseResult>
+
+
+=== dEQP-VK.subgroups.arithmetic.graphics.subgroupinclusivemin_vec2
+<?xml version="1.0" encoding="UTF-8"?>
+<TestCaseResult CasePath="dEQP-VK.subgroups.arithmetic.graphics.subgroupinclusivemin_vec2" Version="0.3.4" CaseType="SelfValidate">
+ <Section Name="fragment" Description="Program: fragment">
+  <ShaderProgram LinkStatus="OK">
+   <InfoLog></InfoLog>
+   <FragmentShader CompileStatus="OK">
+    <ShaderSource>#version 450
+#extension GL_KHR_shader_subgroup_arithmetic: enable
+#extension GL_KHR_shader_subgroup_ballot: enable
+layout(location = 0) out uint result;
+layout(set = 0, binding = 4, std430) readonly buffer Buffer1
+{
+  vec2 data[];
+};
+void main (void)
+{
+  uint tempRes;
+  uvec4 mask = subgroupBallot(true);
+  uint start = 0, end = gl_SubgroupInvocationID + 1;
+  vec2 ref = vec2(intBitsToFloat(0x7f800000));
+  tempRes = 0;
+  uint identityOnly = 0x3;
+  for (uint index = start; index &lt; end; index++)
+  {
+    if (subgroupBallotBitExtract(mask, index))
+    {
+      ref = mix(mix(min(ref, data[index]), ref, isnan(data[index])), data[index], isnan(ref));
+      identityOnly &amp;= ~0x1;
+    }
+  }
+  tempRes = all(equal(ref, subgroupInclusiveMin(data[gl_SubgroupInvocationID]))) ? 0x1 : 0;
+  if (1 == (gl_SubgroupInvocationID % 2))
+  {
+    mask = subgroupBallot(true);
+    ref = vec2(intBitsToFloat(0x7f800000));
+    for (uint index = start; index &lt; end; index++)
+    {
+      if (subgroupBallotBitExtract(mask, index))
+      {
+        ref = mix(mix(min(ref, data[index]), ref, isnan(data[index])), data[index], isnan(ref));
+        identityOnly &amp;= ~0x2;
+      }
+    }
+    tempRes |= all(equal(ref, subgroupInclusiveMin(data[gl_SubgroupInvocationID]))) ? 0x2 : 0;
+  }
+  else
+  {
+    tempRes |= 0x2;
+  }
+  tempRes |= identityOnly;
+  result = tempRes;
+}
+</ShaderSource>
+    <InfoLog></InfoLog>
+</FragmentShader>
+</ShaderProgram>
+  <Number Name="FragmentCompileTime" Description="Fragment shader compile time" Tag="Time" Unit="ms">0.778000</Number>
+  <Number Name="LinkTime" Description="Link time" Tag="Time" Unit="ms">0.006000</Number>
+</Section>
+ <ShaderProgram LinkStatus="OK">
+  <InfoLog></InfoLog>
+  <SpirVAssemblySource>; SPIR-V
+; Version: 1.3
+; Generator: Khronos Glslang Reference Front End; 11
+; Bound: 154
+; Schema: 0
+OpCapability Shader
+OpCapability GroupNonUniform
+OpCapability GroupNonUniformArithmetic
+OpCapability GroupNonUniformBallot
+%1 = OpExtInstImport &quot;GLSL.std.450&quot;
+OpMemoryModel Logical GLSL450
+OpEntryPoint Fragment %4 &quot;main&quot; %19 %152
+OpExecutionMode %4 OriginUpperLeft
+OpDecorate %19 RelaxedPrecision
+OpDecorate %19 BuiltIn SubgroupLocalInvocationId
+OpDecorate %19 Flat
+OpDecorate %20 RelaxedPrecision
+OpDecorate %22 RelaxedPrecision
+OpDecorate %49 ArrayStride 8
+OpDecorate %50 Block
+OpMemberDecorate %50 0 NonWritable
+OpMemberDecorate %50 0 Offset 0
+OpDecorate %52 NonWritable
+OpDecorate %52 Binding 4
+OpDecorate %52 DescriptorSet 0
+OpDecorate %79 RelaxedPrecision
+OpDecorate %87 RelaxedPrecision
+OpDecorate %89 RelaxedPrecision
+OpDecorate %134 RelaxedPrecision
+OpDecorate %152 Location 0
+%2 = OpTypeVoid
+%3 = OpTypeFunction %2
+%6 = OpTypeInt 32 0
+%7 = OpTypeVector %6 4
+%8 = OpTypePointer Function %7
+%10 = OpTypeBool
+%11 = OpConstantTrue %10
+%12 = OpConstant %6 3
+%14 = OpTypePointer Function %6
+%16 = OpConstant %6 0
+%18 = OpTypePointer Input %6
+%19 = OpVariable %18 Input
+%21 = OpConstant %6 1
+%23 = OpTypeFloat 32
+%24 = OpTypeVector %23 2
+%25 = OpTypePointer Function %24
+%27 = OpTypeInt 32 1
+%28 = OpConstant %27 2139095040
+%49 = OpTypeRuntimeArray %24
+%50 = OpTypeStruct %49
+%51 = OpTypePointer StorageBuffer %50
+%52 = OpVariable %51 StorageBuffer
+%53 = OpConstant %27 0
+%55 = OpTypePointer StorageBuffer %24
+%63 = OpTypeVector %10 2
+%72 = OpConstant %6 4294967294
+%76 = OpConstant %27 1
+%88 = OpConstant %6 2
+%128 = OpConstant %6 4294967293
+%140 = OpConstant %27 2
+%151 = OpTypePointer Output %6
+%152 = OpVariable %151 Output
+%4 = OpFunction %2 None %3
+%5 = OpLabel
+%9 = OpVariable %8 Function
+%15 = OpVariable %14 Function
+%17 = OpVariable %14 Function
+%26 = OpVariable %25 Function
+%31 = OpVariable %14 Function
+%32 = OpVariable %14 Function
+%33 = OpVariable %14 Function
+%96 = OpVariable %14 Function
+%13 = OpGroupNonUniformBallot %7 %12 %11
+OpStore %9 %13
+OpStore %15 %16
+%20 = OpLoad %6 %19
+%22 = OpIAdd %6 %20 %21
+OpStore %17 %22
+%29 = OpBitcast %23 %28
+%30 = OpCompositeConstruct %24 %29 %29
+OpStore %26 %30
+OpStore %31 %16
+OpStore %32 %12
+%34 = OpLoad %6 %15
+OpStore %33 %34
+OpBranch %35
+%35 = OpLabel
+OpLoopMerge %37 %38 None
+OpBranch %39
+%39 = OpLabel
+%40 = OpLoad %6 %33
+%41 = OpLoad %6 %17
+%42 = OpULessThan %10 %40 %41
+OpBranchConditional %42 %36 %37
+%36 = OpLabel
+%43 = OpLoad %7 %9
+%44 = OpLoad %6 %33
+%45 = OpGroupNonUniformBallotBitExtract %10 %12 %43 %44
+OpSelectionMerge %47 None
+OpBranchConditional %45 %46 %47
+%46 = OpLabel
+%48 = OpLoad %24 %26
+%54 = OpLoad %6 %33
+%56 = OpAccessChain %55 %52 %53 %54
+%57 = OpLoad %24 %56
+%58 = OpExtInst %24 %1 FMin %48 %57
+%59 = OpLoad %24 %26
+%60 = OpLoad %6 %33
+%61 = OpAccessChain %55 %52 %53 %60
+%62 = OpLoad %24 %61
+%64 = OpIsNan %63 %62
+%65 = OpSelect %24 %64 %59 %58
+%66 = OpLoad %6 %33
+%67 = OpAccessChain %55 %52 %53 %66
+%68 = OpLoad %24 %67
+%69 = OpLoad %24 %26
+%70 = OpIsNan %63 %69
+%71 = OpSelect %24 %70 %68 %65
+OpStore %26 %71
+%73 = OpLoad %6 %32
+%74 = OpBitwiseAnd %6 %73 %72
+OpStore %32 %74
+OpBranch %47
+%47 = OpLabel
+OpBranch %38
+%38 = OpLabel
+%75 = OpLoad %6 %33
+%77 = OpIAdd %6 %75 %76
+OpStore %33 %77
+OpBranch %35
+%37 = OpLabel
+%78 = OpLoad %24 %26
+%79 = OpLoad %6 %19
+%80 = OpAccessChain %55 %52 %53 %79
+%81 = OpLoad %24 %80
+%82 = OpGroupNonUniformFMin %24 %12 InclusiveScan %81
+%83 = OpFOrdEqual %63 %78 %82
+%84 = OpAll %10 %83
+%85 = OpSelect %27 %84 %76 %53
+%86 = OpBitcast %6 %85
+OpStore %31 %86
+%87 = OpLoad %6 %19
+%89 = OpUMod %6 %87 %88
+%90 = OpIEqual %10 %21 %89
+OpSelectionMerge %92 None
+OpBranchConditional %90 %91 %145
+%91 = OpLabel
+%93 = OpGroupNonUniformBallot %7 %12 %11
+OpStore %9 %93
+%94 = OpBitcast %23 %28
+%95 = OpCompositeConstruct %24 %94 %94
+OpStore %26 %95
+%97 = OpLoad %6 %15
+OpStore %96 %97
+OpBranch %98
+%98 = OpLabel
+OpLoopMerge %100 %101 None
+OpBranch %102
+%102 = OpLabel
+%103 = OpLoad %6 %96
+%104 = OpLoad %6 %17
+%105 = OpULessThan %10 %103 %104
+OpBranchConditional %105 %99 %100
+%99 = OpLabel
+%106 = OpLoad %7 %9
+%107 = OpLoad %6 %96
+%108 = OpGroupNonUniformBallotBitExtract %10 %12 %106 %107
+OpSelectionMerge %110 None
+OpBranchConditional %108 %109 %110
+%109 = OpLabel
+%111 = OpLoad %24 %26
+%112 = OpLoad %6 %96
+%113 = OpAccessChain %55 %52 %53 %112
+%114 = OpLoad %24 %113
+%115 = OpExtInst %24 %1 FMin %111 %114
+%116 = OpLoad %24 %26
+%117 = OpLoad %6 %96
+%118 = OpAccessChain %55 %52 %53 %117
+%119 = OpLoad %24 %118
+%120 = OpIsNan %63 %119
+%121 = OpSelect %24 %120 %116 %115
+%122 = OpLoad %6 %96
+%123 = OpAccessChain %55 %52 %53 %122
+%124 = OpLoad %24 %123
+%125 = OpLoad %24 %26
+%126 = OpIsNan %63 %125
+%127 = OpSelect %24 %126 %124 %121
+OpStore %26 %127
+%129 = OpLoad %6 %32
+%130 = OpBitwiseAnd %6 %129 %128
+OpStore %32 %130
+OpBranch %110
+%110 = OpLabel
+OpBranch %101
+%101 = OpLabel
+%131 = OpLoad 
+[...]
+  gl_PointSize = 1.0f;
+}
+</ShaderSource>
+    <InfoLog></InfoLog>
+</VertexShader>
+</ShaderProgram>
+  <Number Name="VertexCompileTime" Description="Vertex shader compile time" Tag="Time" Unit="ms">0.737000</Number>
+  <Number Name="LinkTime" Description="Link time" Tag="Time" Unit="ms">0.005000</Number>
+</Section>
+ <ShaderProgram LinkStatus="OK">
+  <InfoLog></InfoLog>
+  <SpirVAssemblySource>; SPIR-V
+; Version: 1.3
+; Generator: Khronos Glslang Reference Front End; 11
+; Bound: 187
+; Schema: 0
+OpCapability Shader
+OpCapability GroupNonUniform
+OpCapability GroupNonUniformArithmetic
+OpCapability GroupNonUniformBallot
+%1 = OpExtInstImport &quot;GLSL.std.450&quot;
+OpMemoryModel Logical GLSL450
+OpEntryPoint Vertex %4 &quot;main&quot; %19 %156 %174
+OpDecorate %19 RelaxedPrecision
+OpDecorate %19 BuiltIn SubgroupLocalInvocationId
+OpDecorate %20 RelaxedPrecision
+OpDecorate %22 RelaxedPrecision
+OpDecorate %49 ArrayStride 8
+OpDecorate %50 Block
+OpMemberDecorate %50 0 NonWritable
+OpMemberDecorate %50 0 Offset 0
+OpDecorate %52 NonWritable
+OpDecorate %52 Binding 4
+OpDecorate %52 DescriptorSet 0
+OpDecorate %79 RelaxedPrecision
+OpDecorate %87 RelaxedPrecision
+OpDecorate %89 RelaxedPrecision
+OpDecorate %134 RelaxedPrecision
+OpDecorate %151 ArrayStride 4
+OpDecorate %152 Block
+OpMemberDecorate %152 0 Offset 0
+OpDecorate %154 Binding 0
+OpDecorate %154 DescriptorSet 0
+OpDecorate %156 BuiltIn VertexIndex
+OpDecorate %172 Block
+OpMemberDecorate %172 0 BuiltIn Position
+OpMemberDecorate %172 1 BuiltIn PointSize
+OpMemberDecorate %172 2 BuiltIn ClipDistance
+OpMemberDecorate %172 3 BuiltIn CullDistance
+%2 = OpTypeVoid
+%3 = OpTypeFunction %2
+%6 = OpTypeInt 32 0
+%7 = OpTypeVector %6 4
+%8 = OpTypePointer Function %7
+%10 = OpTypeBool
+%11 = OpConstantTrue %10
+%12 = OpConstant %6 3
+%14 = OpTypePointer Function %6
+%16 = OpConstant %6 0
+%18 = OpTypePointer Input %6
+%19 = OpVariable %18 Input
+%21 = OpConstant %6 1
+%23 = OpTypeFloat 32
+%24 = OpTypeVector %23 2
+%25 = OpTypePointer Function %24
+%27 = OpTypeInt 32 1
+%28 = OpConstant %27 2139095040
+%49 = OpTypeRuntimeArray %24
+%50 = OpTypeStruct %49
+%51 = OpTypePointer StorageBuffer %50
+%52 = OpVariable %51 StorageBuffer
+%53 = OpConstant %27 0
+%55 = OpTypePointer StorageBuffer %24
+%63 = OpTypeVector %10 2
+%72 = OpConstant %6 4294967294
+%76 = OpConstant %27 1
+%88 = OpConstant %6 2
+%128 = OpConstant %6 4294967293
+%140 = OpConstant %27 2
+%151 = OpTypeRuntimeArray %6
+%152 = OpTypeStruct %151
+%153 = OpTypePointer StorageBuffer %152
+%154 = OpVariable %153 StorageBuffer
+%155 = OpTypePointer Input %27
+%156 = OpVariable %155 Input
+%159 = OpTypePointer StorageBuffer %6
+%161 = OpTypePointer Function %23
+%163 = OpConstant %23 0.001953125
+%166 = OpConstant %23 2
+%168 = OpConstant %23 1
+%170 = OpTypeVector %23 4
+%171 = OpTypeArray %23 %21
+%172 = OpTypeStruct %170 %23 %171 %171
+%173 = OpTypePointer Output %172
+%174 = OpVariable %173 Output
+%181 = OpConstant %23 0
+%183 = OpTypePointer Output %170
+%185 = OpTypePointer Output %23
+%4 = OpFunction %2 None %3
+%5 = OpLabel
+%9 = OpVariable %8 Function
+%15 = OpVariable %14 Function
+%17 = OpVariable %14 Function
+%26 = OpVariable %25 Function
+%31 = OpVariable %14 Function
+%32 = OpVariable %14 Function
+%33 = OpVariable %14 Function
+%96 = OpVariable %14 Function
+%162 = OpVariable %161 Function
+%164 = OpVariable %161 Function
+%13 = OpGroupNonUniformBallot %7 %12 %11
+OpStore %9 %13
+OpStore %15 %16
+%20 = OpLoad %6 %19
+%22 = OpIAdd %6 %20 %21
+OpStore %17 %22
+%29 = OpBitcast %23 %28
+%30 = OpCompositeConstruct %24 %29 %29
+OpStore %26 %30
+OpStore %31 %16
+OpStore %32 %12
+%34 = OpLoad %6 %15
+OpStore %33 %34
+OpBranch %35
+%35 = OpLabel
+OpLoopMerge %37 %38 None
+OpBranch %39
+%39 = OpLabel
+%40 = OpLoad %6 %33
+%41 = OpLoad %6 %17
+%42 = OpULessThan %10 %40 %41
+OpBranchConditional %42 %36 %37
+%36 = OpLabel
+%43 = OpLoad %7 %9
+%44 = OpLoad %6 %33
+%45 = OpGroupNonUniformBallotBitExtract %10 %12 %43 %44
+OpSelectionMerge %47 None
+OpBranchConditional %45 %46 %47
+%46 = OpLabel
+%48 = OpLoad %24 %26
+%54 = OpLoad %6 %33
+%56 = OpAccessChain %55 %52 %53 %54
+%57 = OpLoad %24 %56
+%58 = OpExtInst %24 %1 FMin %48 %57
+%59 = OpLoad %24 %26
+%60 = OpLoad %6 %33
+%61 = OpAccessChain %55 %52 %53 %60
+%62 = OpLoad %24 %61
+%64 = OpIsNan %63 %62
+%65 = OpSelect %24 %64 %59 %58
+%66 = OpLoad %6 %33
+%67 = OpAccessChain %55 %52 %53 %66
+%68 = OpLoad %24 %67
+%69 = OpLoad %24 %26
+%70 = OpIsNan %63 %69
+%71 = OpSelect %24 %70 %68 %65
+OpStore %26 %71
+%73 = OpLoad %6 %32
+%74 = OpBitwiseAnd %6 %73 %72
+OpStore %32 %74
+OpBranch %47
+%47 = OpLabel
+OpBranch %38
+%38 = OpLabel
+%75 = OpLoad %6 %33
+%77 = OpIAdd %6 %75 %76
+OpStore %33 %77
+OpBranch %35
+%37 = OpLabel
+%78 = OpLoad %24 %26
+%79 = OpLoad %6 %19
+%80 = OpAccessChain %55 %52 %53 %79
+%81 = OpLoad %24 %80
+%82 = OpGroupNonUniformFMin %24 %12 InclusiveScan %81
+%83 = OpFOrdEqual %63 %78 %82
+%84 = OpAll %10 %83
+%85 = OpSelect %27 %84 %76 %53
+%86 = OpBitcast %6 %85
+OpStore %31 %86
+%87 = OpLoad %6 %19
+%89 = OpUMod %6 %87 %88
+%90 = OpIEqual %10 %21 %89
+OpSelectionMerge %92 None
+OpBranchConditional %90 %91 %145
+%91 = OpLabel
+%93 = OpGroupNonUniformBallot %7 %12 %11
+OpStore %9 %93
+%94 = OpBitcast %23 %28
+%95 = OpCompositeConstruct %24 %94 %94
+OpStore %26 %95
+%97 = OpLoad %6 %15
+OpStore %96 %97
+OpBranch %98
+%98 = OpLabel
+OpLoopMerge %100 %101 None
+OpBranch %102
+%102 = OpLabel
+%103 = OpLoad %6 %96
+%104 = OpLoad %6 %17
+%105 = OpULessThan %10 %103 %104
+OpBranchConditional %105 %99 %100
+%99 = OpLabel
+%106 = OpLoad %7 %9
+%107 = OpLoad %6 %96
+%108 = OpGroupNonUniformBallotBitExtract %10 %12 %106 %107
+OpSelectionMerge %110 None
+OpBranchConditional %108 %109 %110
+%109 = OpLabel
+%111 = OpLoad %24 %26
+%112 = OpLoad %6 %96
+%113 = OpAccessChain %55 %52 %53 %112
+%114 = OpLoad %24 %113
+%115 = OpExtInst %24 %1 FMin %111 %114
+%116 = OpLoad %24 %26
+%117 = OpLoad %6 %96
+%118 = OpAccessChain %55 %52 %53 %117
+%119 = OpLoad %24 %118
+%120 = OpIsNan %63 %119
+%121 = OpSelect %24 %120 %116 %115
+%122 = OpLoad %6 %96
+%123 = OpAccessChain %55 %52 %53 %122
+%124 = OpLoad %24 %123
+%125 = OpLoad %24 %26
+%126 = OpIsNan %63 %125
+%127 = OpSelect %24 %126 %124 %121
+OpStore %26 %127
+%129 = OpLoad %6 %32
+%130 = OpBitwiseAnd %6 %129 %128
+OpStore %32 %130
+OpBranch %110
+%110 = OpLabel
+OpBranch %101
+%101 = OpLabel
+%131 = OpLoad %6 %96
+%132 = OpIAdd %6 %131 %76
+OpStore %96 %132
+OpBranch %98
+%100 = OpLabel
+%133 = OpLoad %24 %26
+%134 = OpLoad %6 %19
+%135 = OpAccessChain %55 %52 %53 %134
+%136 = OpLoad %24 %135
+%137 = OpGroupNonUniformFMin %24 %12 InclusiveScan %136
+%138 = OpFOrdEqual %63 %133 %137
+%139 = OpAll %10 %138
+%141 = OpSelect %27 %139 %140 %53
+%142 = OpBitcast %6 %141
+%143 = OpLoad %6 %31
+%144 = OpBitwiseOr %6 %143 %142
+OpStore %31 %144
+OpBranch %92
+%145 = OpLabel
+%146 = OpLoad %6 %31
+%147 = OpBitwiseOr %6 %146 %88
+OpStore %31 %147
+OpBranch %92
+%92 = OpLabel
+%148 = OpLoad %6 %32
+%149 = OpLoad %6 %31
+%150 = OpBitwiseOr %6 %149 %148
+OpStore %31 %150
+%157 = OpLoad %27 %156
+%158 = OpLoad %6 %31
+%160 = OpAccessChain %159 %154 %53 %157
+OpStore %160 %158
+OpStore %162 %163
+%165 = OpLoad %23 %162
+%167 = OpFDiv %23 %165 %166
+%169 = OpFSub %23 %167 %168
+OpStore %164 %169
+%175 = OpLoad %27 %156
+%176 = OpConvertSToF %23 %175
+%177 = OpLoad %23 %162
+%178 = OpFMul %23 %176 %177
+%179 = OpLoad %23 %164
+%180 = OpFAdd %23 %178 %179
+%182 = OpCompositeConstruct %170 %180 %181 %181 %168
+%184 = OpAccessChain %183 %174 %53
+OpStore %184 %182
+%186 = OpAccessChain %185 %174 %76
+OpStore %186 %168
+OpReturn
+OpFunctionEnd
+</SpirVAssemblySource>
+</ShaderProgram>
+ <Section Name="tesc_noSubgroup" Description="Program: tesc_noSubgroup">
+  <ShaderProgram LinkStatus="OK">
+   <InfoLog></InfoLog>
+   <SpirVAssemblySource>; SPIR-V
+; Version: 1.3
+; Generator: Khronos Glslang Reference Front End; 1
+; Bound: 45
+; Schema: 0
+OpCapability Tessellation
+%1 = OpExtInstImport &quot;GLSL.std.450&quot;
+OpMemoryModel Logical GLSL450
+OpEntryPoint TessellationControl %4 &quot;main&quot; %8 %20 %32 %38
+OpExecutionMode %4 OutputVertices 1
+OpDecorate %8 BuiltIn InvocationId
+OpDecorate %20 Patch
+OpDecorate %20 BuiltIn TessLevelOuter
+OpMemberDecorate %29 0 BuiltIn Position
+OpMemberDecorate %29 1 BuiltIn PointSize
+OpMemberDecorate %29 2 BuiltIn ClipDistance
+OpMemberDecorate %29 3 BuiltIn CullDistance
+OpDecorate %29 Block
+OpMemberDecorate %34 0 BuiltIn Position
+OpMemberDecorate %34 1 BuiltIn PointSize
+OpMemberDecorate %34 2 BuiltIn ClipDistance
+OpMemberDecorate %34 3 BuiltIn CullDistance
+OpDecorate %34 Block
+%2 = OpTypeVoid
+%3 = OpTypeFunction %2
+%6 = OpTypeInt 32 1
+%7 = OpTypePointer Input %6
+%8 = OpVariable %7 Input
+%10 = OpConstant %6 0
+%11 = OpTypeBool
+%15 = OpTypeFloat 32
+%16 = OpTypeInt 32 0
+%17 = OpConstant %16 4
+%18 = OpTypeArray %15 %17
+%19 = OpTypePointer Output %18
+%20 = OpVariable %19 Output
+%21 = OpConstant %15 1
+%22 = OpTypePointer Output %15
+%24 = OpConstant %6 1
+%26 = OpTypeVector %15 4
+%27 = OpConstant %16 1
+%28 = OpTypeArray %15 %27
+%29 = OpTypeStruct %26 %15 %28 %28
+%30 = OpTypeArray %29 %27
+%31 = OpTypePointer Output %30
+%32 = OpVariable %31 Output
+%34 = OpTypeStruct %26 %15 %28 %28
+%35 = OpConstant %16 32
+%36 = OpTypeArray %34 %35
+%37 = OpTypePointer Input %36
+%38 = OpVariable %37 Input
+%40 = OpTypePointer Input %26
+%43 = OpTypePointer Output %26
+%4 = OpFunction %2 None %3
+%5 = OpLabel
+%9 = OpLoad %6 %8
+%12 = OpIEqual %11 %9 %10
+OpSelectionMerge %14 None
+OpBranchConditional %12 %13 %14
+%13 = OpLabel
+%23 = OpAccessChain %22 %20 %10
+OpStore %23 %21
+%25 = OpAccessChain %22 %20 %24
+OpStore %25 %21
+OpBranch %14
+%14 = OpLabel
+%33 = OpLoad %6 %8
+%39 = OpLoad %6 %8
+%41 = OpAccessChain %40 %38 %39 %10
+%42 = OpLoad %26 %41
+%44 = OpAccessChain %43 %32 %33 %10
+OpStore %44 %42
+OpReturn
+OpFunctionEnd
+</SpirVAssemblySource>
+</ShaderProgram>
+  <Number Name="SpirVAssemblyTime" Description="SpirV assembly time" Tag="Time" Unit="ms">0.155000</Number>
+</Section>
+ <Section Name="tese_noSubgroup" Description="Program: tese_noSubgroup">
+  <ShaderProgram LinkStatus="OK">
+   <InfoLog></InfoLog>
+   <SpirVAssemblySource>; SPIR-V
+; Version: 1.3
+; Generator: Khronos Glslang Reference Front End; 2
+; Bound: 42
+; Schema: 0
+OpCapability Tessellation
+%1 = OpExtInstImport &quot;GLSL.std.450&quot;
+OpMemoryModel Logical GLSL450
+OpEntryPoint TessellationEvaluation %4 &quot;main&quot; %16 %23 %29
+OpExecutionMode %4 Isolines
+OpExecutionMode %4 SpacingEqual
+OpExecutionMode %4 VertexOrderCcw
+OpMemberDecorate %14 0 BuiltIn Position
+OpMemberDecorate %14 1 BuiltIn PointSize
+OpMemberDecorate %14 2 BuiltIn ClipDistance
+OpMemberDecorate %14 3 BuiltIn CullDistance
+OpDecorate %14 Block
+OpMemberDecorate %19 0 BuiltIn Position
+OpMemberDecorate %19 1 BuiltIn PointSize
+OpMemberDecorate %19 2 BuiltIn ClipDistance
+OpMemberDecorate %19 3 BuiltIn CullDistance
+OpDecorate %19 Block
+OpDecorate %29 BuiltIn TessCoord
+%2 = OpTypeVoid
+%3 = OpTypeFunction %2
+%6 = OpTypeFloat 32
+%7 = OpTypePointer Function %6
+%9 = OpConstant %6 0.00195313
+%10 = OpTypeVector %6 4
+%11 = OpTypeInt 32 0
+%12 = OpConstant %11 1
+%13 = OpTypeArray %6 %12
+%14 = OpTypeStruct %10 %6 %13 %13
+%15 = OpTypePointer Output %14
+%16 = OpVariable %15 Output
+%17 = OpTypeInt 32 1
+%18 = OpConstant %17 0
+%19 = OpTypeStruct %10 %6 %13 %13
+%20 = OpConstant %11 32
+%21 = OpTypeArray %19 %20
+%22 = OpTypePointer Input %21
+%23 = OpVariable %22 Input
+%24 = OpTypePointer Input %10
+%27 = OpTypeVector %6 3
+%28 = OpTypePointer Input %27
+%29 = OpVariable %28 Input
+%30 = OpConstant %11 0
+%31 = OpTypePointer Input %6
+%36 = OpConstant %6 2
+%40 = OpTypePointer Output %10
+%4 = OpFunction %2 None %3
+%5 = OpLabel
+%8 = OpVariable %7 Function
+OpStore %8 %9
+%25 = OpAccessChain %24 %23 %18 %18
+%26 = OpLoad %10 %25
+%32 = OpAccessChain %31 %29 %30
+%33 = OpLoad %6 %32
+%34 = OpLoad %6 %8
+%35 = OpFMul %6 %33 %34
+%37 = OpFDiv %6 %35 %36
+%38 = OpCompositeConstruct %10 %37 %37 %37 %37
+%39 = OpFAdd %10 %26 %38
+%41 = OpAccessChain %40 %16 %18
+OpStore %41 %39
+OpReturn
+OpFunctionEnd
+</SpirVAssemblySource>
+</ShaderProgram>
+  <Number Name="SpirVAssemblyTime" Description="SpirV assembly time" Tag="Time" Unit="ms">0.101000</Number>
+</Section>
+ <Section Name="vert_noSubgroup" Description="Program: vert_noSubgroup">
+  <ShaderProgram LinkStatus="OK">
+   <InfoLog></InfoLog>
+   <SpirVAssemblySource>; SPIR-V
+; Version: 1.3
+; Generator: Khronos Glslang Reference Front End; 1
+; Bound: 37
+; Schema: 0
+OpCapability Shader
+%1 = OpExtInstImport &quot;GLSL.std.450&quot;
+OpMemoryModel Logical GLSL450
+OpEntryPoint Vertex %4 &quot;main&quot; %22 %26
+OpMemberDecorate %20 0 BuiltIn Position
+OpMemberDecorate %20 1 BuiltIn PointSize
+OpMemberDecorate %20 2 BuiltIn ClipDistance
+OpMemberDecorate %20 3 BuiltIn CullDistance
+OpDecorate %20 Block
+OpDecorate %26 BuiltIn VertexIndex
+%2 = OpTypeVoid
+%3 = OpTypeFunction %2
+%6 = OpTypeFloat 32
+%7 = OpTypePointer Function %6
+%9 = OpConstant %6 0.00195313
+%12 = OpConstant %6 2
+%14 = OpConstant %6 1
+%16 = OpTypeVector %6 4
+%17 = OpTypeInt 32 0
+%18 = OpConstant %17 1
+%19 = OpTypeArray %6 %18
+%20 = OpTypeStruct %16 %6 %19 %19
+%21 = OpTypePointer Output %20
+%22 = OpVariable %21 Output
+%23 = OpTypeInt 32 1
+%24 = OpConstant %23 0
+%25 = OpTypePointer Input %23
+%26 = OpVariable %25 Input
+%33 = OpConstant %6 0
+%35 = OpTypePointer Output %16
+%37 = OpConstant %23 1
+%38 = OpTypePointer Output %6
+%4 = OpFunction %2 None %3
+%5 = OpLabel
+%8 = OpVariable %7 Function
+%10 = OpVariable %7 Function
+OpStore %8 %9
+%11 = OpLoad %6 %8
+%13 = OpFDiv %6 %11 %12
+%15 = OpFSub %6 %13 %14
+OpStore %10 %15
+%27 = OpLoad %23 %26
+%28 = OpConvertSToF %6 %27
+%29 = OpLoad %6 %8
+%30 = OpFMul %6 %28 %29
+%31 = OpLoad %6 %10
+%32 = OpFAdd %6 %30 %31
+%34 = OpCompositeConstruct %16 %32 %33 %33 %14
+%36 = OpAccessChain %35 %22 %24
+OpStore %36 %34
+%39 = OpAccessChain %38 %22 %37
+OpStore %39 %14
+OpReturn
+OpFunctionEnd
+</SpirVAssemblySource>
+</ShaderProgram>
+  <Number Name="SpirVAssemblyTime" Description="SpirV assembly time" Tag="Time" Unit="ms">0.094000</Number>
+</Section>
+ <Text>4 / 27 values passed</Text>
+ <Number Name="TestDuration" Description="Test case duration in microseconds" Tag="Time" Unit="us">131032</Number>
+ <Result StatusCode="Fail">Failed!</Result>
+</TestCaseResult>
+
+
+=== dEQP-VK.subgroups.ballot_broadcast.compute.subgroupbroadcastfirst_ivec4
+<?xml version="1.0" encoding="UTF-8"?>
+<TestCaseResult CasePath="dEQP-VK.subgroups.ballot_broadcast.compute.subgroupbroadcastfirst_ivec4" Version="0.3.4" CaseType="SelfValidate">
+ <Section Name="comp" Description="Program: comp">
+  <ShaderProgram LinkStatus="OK">
+   <InfoLog></InfoLog>
+   <ComputeShader CompileStatus="OK">
+    <ShaderSource>#version 450
+#extension GL_KHR_shader_subgroup_ballot: enable
+layout (local_size_x_id = 0, local_size_y_id = 1, local_size_z_id = 2) in;
+layout(set = 0, binding = 0, std430) buffer Buffer1
+{
+  uint result[];
+};
+layout(set = 0, binding = 1, std430) buffer Buffer2
+{
+  ivec4 data[];
+};
+
+void main (void)
+{
+  uvec3 globalSize = gl_NumWorkGroups * gl_WorkGroupSize;
+  highp uint offset = globalSize.x * ((globalSize.y * gl_GlobalInvocationID.z) + gl_GlobalInvocationID.y) + gl_GlobalInvocationID.x;
+  uint tempRes;
+  uvec4 mask = subgroupBallot(true);
+  uint sgSize = gl_SubgroupSize;
+  uint sgInvocation = gl_SubgroupInvocationID;
+  tempRes = 0;
+  uint firstActive = 0;
+  for (uint i = 0; i &lt; sgSize; i++)
+  {
+    if (subgroupBallotBitExtract(mask, i))
+    {
+      firstActive = i;
+      break;
+    }
+  }
+  tempRes |= (subgroupBroadcastFirst(data[sgInvocation]) == data[firstActive]) ? 0x1 : 0;
+  // make the firstActive invocation inactive now
+  if (firstActive != sgInvocation)
+  {
+mask = subgroupBallot(true);
+    for (uint i = 0; i &lt; sgSize; i++)
+    {
+      if (subgroupBallotBitExtract(mask, i))
+      {
+        firstActive = i;
+        break;
+      }
+    }
+    tempRes |= (subgroupBroadcastFirst(data[sgInvocation]) == data[firstActive]) ? 0x2 : 0;
+  }
+  else
+  {
+    // the firstActive invocation didn&apos;t partake in the second result so set it to true
+    tempRes |= 0x2;
+  }
+  result[offset] = tempRes;
+}
+</ShaderSource>
+    <InfoLog></InfoLog>
+</ComputeShader>
+</ShaderProgram>
+  <Number Name="ComputeCompileTime" Description="Compute shader compile time" Tag="Time" Unit="ms">10.345000</Number>
+  <Number Name="LinkTime" Description="Link time" Tag="Time" Unit="ms">0.008000</Number>
+</Section>
+ <ShaderProgram LinkStatus="OK">
+  <InfoLog></InfoLog>
+  <SpirVAssemblySource>; SPIR-V
+; Version: 1.3
+; Generator: Khronos Glslang Reference Front End; 11
+; Bound: 144
+; Schema: 0
+OpCapability Shader
+OpCapability GroupNonUniform
+OpCapability GroupNonUniformBallot
+%1 = OpExtInstImport &quot;GLSL.std.450&quot;
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %4 &quot;main&quot; %11 %26 %47 %50
+OpExecutionMode %4 LocalSize 1 1 1
+OpDecorate %11 BuiltIn NumWorkgroups
+OpDecorate %13 SpecId 0
+OpDecorate %14 SpecId 1
+OpDecorate %15 SpecId 2
+OpDecorate %16 BuiltIn WorkgroupSize
+OpDecorate %26 BuiltIn GlobalInvocationId
+OpDecorate %47 RelaxedPrecision
+OpDecorate %47 BuiltIn SubgroupSize
+OpDecorate %48 RelaxedPrecision
+OpDecorate %50 RelaxedPrecision
+OpDecorate %50 BuiltIn SubgroupLocalInvocationId
+OpDecorate %51 RelaxedPrecision
+OpDecorate %75 ArrayStride 16
+OpDecorate %76 Block
+OpMemberDecorate %76 0 Offset 0
+OpDecorate %78 Binding 1
+OpDecorate %78 DescriptorSet 0
+OpDecorate %136 ArrayStride 4
+OpDecorate %137 Block
+OpMemberDecorate %137 0 Offset 0
+OpDecorate %139 Binding 0
+OpDecorate %139 DescriptorSet 0
+%2 = OpTypeVoid
+%3 = OpTypeFunction %2
+%6 = OpTypeInt 32 0
+%7 = OpTypeVector %6 3
+%8 = OpTypePointer Function %7
+%10 = OpTypePointer Input %7
+%11 = OpVariable %10 Input
+%13 = OpSpecConstant %6 1
+%14 = OpSpecConstant %6 1
+%15 = OpSpecConstant %6 1
+%16 = OpSpecConstantComposite %7 %13 %14 %15
+%18 = OpTypePointer Function %6
+%20 = OpConstant %6 0
+%23 = OpConstant %6 1
+%26 = OpVariable %10 Input
+%27 = OpConstant %6 2
+%28 = OpTypePointer Input %6
+%39 = OpTypeVector %6 4
+%40 = OpTypePointer Function %39
+%42 = OpTypeBool
+%43 = OpConstantTrue %42
+%44 = OpConstant %6 3
+%47 = OpVariable %28 Input
+%50 = OpVariable %28 Input
+%71 = OpTypeInt 32 1
+%72 = OpConstant %71 1
+%74 = OpTypeVector %71 4
+%75 = OpTypeRuntimeArray %74
+%76 = OpTypeStruct %75
+%77 = OpTypePointer StorageBuffer %76
+%78 = OpVariable %77 StorageBuffer
+%79 = OpConstant %71 0
+%81 = OpTypePointer StorageBuffer %74
+%88 = OpTypeVector %42 4
+%128 = OpConstant %71 2
+%136 = OpTypeRuntimeArray %6
+%137 = OpTypeStruct %136
+%138 = OpTypePointer StorageBuffer %137
+%139 = OpVariable %138 StorageBuffer
+%142 = OpTypePointer StorageBuffer %6
+%4 = OpFunction %2 None %3
+%5 = OpLabel
+%9 = OpVariable %8 Function
+%19 = OpVariable %18 Function
+%41 = OpVariable %40 Function
+%46 = OpVariable %18 Function
+%49 = OpVariable %18 Function
+%52 = OpVariable %18 Function
+%53 = OpVariable %18 Function
+%54 = OpVariable %18 Function
+%101 = OpVariable %18 Function
+%12 = OpLoad %7 %11
+%17 = OpIMul %7 %12 %16
+OpStore %9 %17
+%21 = OpAccessChain %18 %9 %20
+%22 = OpLoad %6 %21
+%24 = OpAccessChain %18 %9 %23
+%25 = OpLoad %6 %24
+%29 = OpAccessChain %28 %26 %27
+%30 = OpLoad %6 %29
+%31 = OpIMul %6 %25 %30
+%32 = OpAccessChain %28 %26 %23
+%33 = OpLoad %6 %32
+%34 = OpIAdd %6 %31 %33
+%35 = OpIMul %6 %22 %34
+%36 = OpAccessChain %28 %26 %20
+%37 = OpLoad %6 %36
+%38 = OpIAdd %6 %35 %37
+OpStore %19 %38
+%45 = OpGroupNonUniformBallot %39 %44 %43
+OpStore %41 %45
+%48 = OpLoad %6 %47
+OpStore %46 %48
+%51 = OpLoad %6 %50
+OpStore %49 %51
+OpStore %52 %20
+OpStore %53 %20
+OpStore %54 %20
+OpBranch %55
+%55 = OpLabel
+OpLoopMerge %57 %58 None
+OpBranch %59
+%59 = OpLabel
+%60 = OpLoad %6 %54
+%61 = OpLoad %6 %46
+%62 = OpULessThan %42 %60 %61
+OpBranchConditional %62 %56 %57
+%56 = OpLabel
+%63 = OpLoad %39 %41
+%64 = OpLoad %6 %54
+%65 = OpGroupNonUniformBallotBitExtract %42 %44 %63 %64
+OpSelectionMerge %67 None
+OpBranchConditional %65 %66 %67
+%66 = OpLabel
+%68 = OpLoad %6 %54
+OpStore %53 %68
+OpBranch %57
+%67 = OpLabel
+OpBranch %58
+%58 = OpLabel
+%70 = OpLoad %6 %54
+%73 = OpIAdd %6 %70 %72
+OpStore %54 %73
+OpBranch %55
+%57 = OpLabel
+%80 = OpLoad %6 %49
+%82 = OpAccessChain %81 %78 %79 %80
+%83 = OpLoad %74 %82
+%84 = OpGroupNonUniformBroadcastFirst %74 %44 %83
+%85 = OpLoad %6 %53
+%86 = OpAccessChain %81 %78 %79 %85
+%87 = OpLoad %74 %86
+%89 = OpIEqual %88 %84 %87
+%90 = OpAll %42 %89
+%91 = OpSelect %71 %90 %72 %79
+%92 = OpBitcast %6 %91
+%93 = OpLoad %6 %52
+%94 = OpBitwiseOr %6 %93 %92
+OpStore %52 %94
+%95 = OpLoad %6 %53
+%96 = OpLoad %6 %49
+%97 = OpINotEqual %42 %95 %96
+OpSelectionMerge %99 None
+OpBranchConditional %97 %98 %133
+%98 = OpLabel
+%100 = OpGroupNonUniformBallot %39 %44 %43
+OpStore %41 %100
+OpStore %101 %20
+OpBranch %102
+%102 = OpLabel
+OpLoopMerge %104 %105 None
+OpBranch %106
+%106 = OpLabel
+%107 = OpLoad %6 %101
+%108 = OpLoad %6 %46
+%109 = OpULessThan %42 %107 %108
+OpBranchConditional %109 %103 %104
+%103 = OpLabel
+%110 = OpLoad %39 %41
+%111 = OpLoad %6 %101
+%112 = OpGroupNonUniformBallotBitExtract %42 %44 %110 %111
+OpSelectionMerge %114 None
+OpBranchConditional %112 %113 %114
+%113 = OpLabel
+%115 = OpLoad %6 %101
+OpStore %53 %115
+OpBranch %104
+%114 = OpLabel
+OpBranch %105
+%105 = OpLabel
+%117 = OpLoad %6 %101
+%118 = OpIAdd %6 %117 %72
+OpStore %101 %118
+OpBranch %102
+%104 = OpLabel
+%119 = OpLoad %6 %49
+%120 = OpAccessChain %81 %78 %79 %119
+%121 = OpLoad %74 %120
+%122 = OpGroupNonUniformBroadcastFirst %74 %44 %121
+%123 = OpLoad %6 %53
+%124 = OpAccessChain %81 %78 %79 %123
+%125 = OpLoad %74 %124
+%126 = OpIEqual %88 %122 %125
+%127 = OpAll %42 %126
+%129 = OpSelect %71 %127 %128 %79
+%130 = OpBitcast %6 %129
+%131 = OpLoad %6 %52
+%132 = OpBitwiseOr %6 %131 %130
+OpStore %52 %132
+OpBranch %99
+%133 = OpLabel
+%134 = OpLoad %6 %52
+%135 = OpBitwiseOr %6 %134 %27
+OpStore %52 %135
+OpBranch %99
+%99 = OpLabel
+%140 = OpLoad %6 %19
+%141 = OpLoad %6 %52
+%143 = OpAccessChain %142 %139 %79 %140
+OpStore %143 %141
+OpReturn
+OpFunctionEnd
+</SpirVAssemblySource>
+</ShaderProgram>
+ <Text>1 / 7 values passed</Text>
+ <Number Name="TestDuration" Description="Test case duration in microseconds" Tag="Time" Unit="us">249122</Number>
+ <Result StatusCode="Fail">Failed!</Result>
+</TestCaseResult>
+
+
+=== dEQP-VK.subgroups.ballot_broadcast.graphics.subgroupbroadcastfirst_bvec3
+<?xml version="1.0" encoding="UTF-8"?>
+<TestCaseResult CasePath="dEQP-VK.subgroups.ballot_broadcast.graphics.subgroupbroadcastfirst_bvec3" Version="0.3.4" CaseType="SelfValidate">
+ <Section Name="fragment" Description="Program: fragment">
+  <ShaderProgram LinkStatus="OK">
+   <InfoLog></InfoLog>
+   <FragmentShader CompileStatus="OK">
+    <ShaderSource>#version 450
+#extension GL_KHR_shader_subgroup_ballot: enable
+layout(location = 0) out uint result;
+layout(set = 0, binding = 4, std430) readonly buffer Buffer1
+{
+  bvec3 data[];
+};
+void main (void)
+{
+  uint tempRes;
+  uvec4 mask = subgroupBallot(true);
+  uint sgSize = gl_SubgroupSize;
+  uint sgInvocation = gl_SubgroupInvocationID;
+  tempRes = 0;
+  uint firstActive = 0;
+  for (uint i = 0; i &lt; sgSize; i++)
+  {
+    if (subgroupBallotBitExtract(mask, i))
+    {
+      firstActive = i;
+      break;
+    }
+  }
+  tempRes |= (subgroupBroadcastFirst(data[sgInvocation]) == data[firstActive]) ? 0x1 : 0;
+  // make the firstActive invocation inactive now
+  if (firstActive != sgInvocation)
+  {
+mask = subgroupBallot(true);
+    for (uint i = 0; i &lt; sgSize; i++)
+    {
+      if (subgroupBallotBitExtract(mask, i))
+      {
+        firstActive = i;
+        break;
+      }
+    }
+    tempRes |= (subgroupBroadcastFirst(data[sgInvocation]) == data[firstActive]) ? 0x2 : 0;
+  }
+  else
+  {
+    // the firstActive invocation didn&apos;t partake in the second result so set it to true
+    tempRes |= 0x2;
+  }
+  result = tempRes;
+}
+</ShaderSource>
+    <InfoLog></InfoLog>
+</FragmentShader>
+</ShaderProgram>
+  <Number Name="FragmentCompileTime" Description="Fragment shader compile time" Tag="Time" Unit="ms">139.257004</Number>
+  <Number Name="LinkTime" Description="Link time" Tag="Time" Unit="ms">0.008000</Number>
+</Section>
+ <ShaderProgram LinkStatus="OK">
+  <InfoLog></InfoLog>
+  <SpirVAssemblySource>; SPIR-V
+; Version: 1.3
+; Generator: Khronos Glslang Reference Front End; 11
+; Bound: 116
+; Schema: 0
+OpCapability Shader
+OpCapability GroupNonUniform
+OpCapability GroupNonUniformBallot
+%1 = OpExtInstImport &quot;GLSL.std.450&quot;
+OpMemoryModel Logical GLSL450
+OpEntryPoint Fragment %4 &quot;main&quot; %17 %20 %114
+OpExecutionMode %4 OriginUpperLeft
+OpDecorate %17 RelaxedPrecision
+OpDecorate %17 BuiltIn SubgroupSize
+OpDecorate %17 Flat
+OpDecorate %18 RelaxedPrecision
+OpDecorate %20 RelaxedPrecision
+OpDecorate %20 BuiltIn SubgroupLocalInvocationId
+OpDecorate %20 Flat
+OpDecorate %21 RelaxedPrecision
+OpDecorate %46 ArrayStride 16
+OpDecorate %47 Block
+OpMemberDecorate %47 0 NonWritable
+OpMemberDecorate %47 0 Offset 0
+OpDecorate %49 NonWritable
+OpDecorate %49 Binding 4
+OpDecorate %49 DescriptorSet 0
+OpDecorate %114 Location 0
+%2 = OpTypeVoid
+%3 = OpTypeFunction %2
+%6 = OpTypeInt 32 0
+%7 = OpTypeVector %6 4
+%8 = OpTypePointer Function %7
+%10 = OpTypeBool
+%11 = OpConstantTrue %10
+%12 = OpConstant %6 3
+%14 = OpTypePointer Function %6
+%16 = OpTypePointer Input %6
+%17 = OpVariable %16 Input
+%20 = OpVariable %16 Input
+%23 = OpConstant %6 0
+%42 = OpTypeInt 32 1
+%43 = OpConstant %42 1
+%45 = OpTypeVector %6 3
+%46 = OpTypeRuntimeArray %45
+%47 = OpTypeStruct %46
+%48 = OpTypePointer StorageBuffer %47
+%49 = OpVariable %48 StorageBuffer
+%50 = OpConstant %42 0
+%52 = OpTypePointer StorageBuffer %45
+%55 = OpTypeVector %10 3
+%56 = OpConstantComposite %45 %23 %23 %23
+%104 = OpConstant %42 2
+%110 = OpConstant %6 2
+%113 = OpTypePointer Output %6
+%114 = OpVariable %113 Output
+%4 = OpFunction %2 None %3
+%5 = OpLabel
+%9 = OpVariable %8 Function
+%15 = OpVariable %14 Function
+%19 = OpVariable %14 Function
+%22 = OpVariable %14 Function
+%24 = OpVariable %14 Function
+%25 = OpVariable %14 Function
+%75 = OpVariable %14 Function
+%13 = OpGroupNonUniformBallot %7 %12 %11
+OpStore %9 %13
+%18 = OpLoad %6 %17
+OpStore %15 %18
+%21 = OpLoad %6 %20
+OpStore %19 %21
+OpStore %22 %23
+OpStore %24 %23
+OpStore %25 %23
+OpBranch %26
+%26 = OpLabel
+OpLoopMerge %28 %29 None
+OpBranch %30
+%30 = OpLabel
+%31 = OpLoad %6 %25
+%32 = OpLoad %6 %15
+%33 = OpULessThan %10 %31 %32
+OpBranchConditional %33 %27 %28
+%27 = OpLabel
+%34 = OpLoad %7 %9
+%35 = OpLoad %6 %25
+%36 = OpGroupNonUniformBallotBitExtract %10 %12 %34 %35
+OpSelectionMerge %38 None
+OpBranchConditional %36 %37 %38
+%37 = OpLabel
+%39 = OpLoad %6 %25
+OpStore %24 %39
+OpBranch %28
+%38 = OpLabel
+OpBranch %29
+%29 = OpLabel
+%41 = OpLoad %6 %25
+%44 = OpIAdd %6 %41 %43
+OpStore %25 %44
+OpBranch %26
+%28 = OpLabel
+%51 = OpLoad %6 %19
+%53 = OpAccessChain %52 %49 %50 %51
+%54 = OpLoad %45 %53
+%57 = OpINotEqual %55 %54 %56
+%58 = OpGroupNonUniformBroadcastFirst %55 %12 %57
+%59 = OpLoad %6 %24
+%60 = OpAccessChain %52 %49 %50 %59
+%61 = OpLoad %45 %60
+%62 = OpINotEqual %55 %61 %56
+%63 = OpLogicalEqual %55 %58 %62
+%64 = OpAll %10 %63
+%65 = OpSelect %42 %64 %43 %50
+%66 = OpBitcast %6 %65
+%67 = OpLoad %6 %22
+%68 = OpBitwiseOr %6 %67 %66
+OpStore %22 %68
+%69 = OpLoad %6 %24
+%70 = OpLoad %6 %19
+%71 = OpINotEqual %10 %69 %70
+OpSelectionMerge %73 None
+OpBranchConditional %71 %72 %109
+%72 = OpLabel
+%74 = OpGroupNonUniformBallot %7 %12 %11
+OpStore %9 %74
+OpStore %75 %23
+OpBranch %76
+%76 = OpLabel
+OpLoopMerge %78 %79 None
+OpBranch %80
+%80 = OpLabel
+%81 = OpLoad %6 %75
+%82 = OpLoad %6 %15
+%83 = OpULessThan %10 %81 %82
+OpBranchConditional %83 %77 %78
+%77 = OpLabel
+%84 = OpLoad %7 %9
+%85 = OpLoad %6 %75
+%86 = OpGroupNonUniformBallotBitExtract %10 %12 %84 %85
+OpSelectionMerge %88 None
+OpBranchConditional %86 %87 %88
+%87 = OpLabel
+%89 = OpLoad %6 %75
+OpStore %24 %89
+OpBranch %78
+%88 = OpLabel
+OpBranch %79
+%79 = OpLabel
+%91 = OpLoad %6 %75
+%92 = OpIAdd %6 %91 %43
+OpStore %75 %92
+OpBranch %76
+%78 = OpLabel
+%93 = OpLoad %6 %19
+%94 = OpAccessChain %52 %49 %50 %93
+%95 = OpLoad %45 %94
+%96 = OpINotEqual %55 %95 %56
+%97 = OpGroupNonUniformBroadcastFirst %55 %12 %96
+%98 = OpLoad %6 %24
+%99 = OpAccessChain %52 %49 %50 %98
+%100 = OpLoad %45 %99
+%101 = OpINotEqual %55 %100 %56
+%102 = OpLogicalEqual %55 %97 %101
+%103 = OpAll %10 %102
+%105 = OpSelect %42 %103 %104 %50
+%106 = OpBitcast %6 %105
+%107 = OpLoad %6 %22
+%108 = OpBitwiseOr %6 %107 %106
+OpStore %22 %108
+OpBranch %73
+%109 = OpLabel
+%111 = OpLoad %6 %22
+%112 = OpBitwiseOr %6 %111 %110
+OpStore %22 %112
+OpBranch %73
+%73 = OpLabel
+%115 = OpLoad %6 %22
+OpStore %114 %115
+OpReturn
+OpFunctionEnd
+</SpirVAssemblySource>
+</ShaderProgram>
+ <Section Name="geometry_lines" Description="Program: geometry_lines">
+  <ShaderProgram LinkStatus="OK">
+   <InfoLog></InfoLog>
+   <GeometryShader CompileStatus="OK">
+    <ShaderSource>#version 450
+#extension GL_KHR_shader_subgroup_ballot: enable
+layout(lines) in;
+layout(points, max_vertices = 1) out;
+layout(set = 0, binding = 3, std430) buffer Buffer1
+{
+  uint result[];
+};
+layout(set = 0, binding = 4, std430) readonly buffer Buffer2
+{
+  bvec3 data[];
+};
+
+void main (void)
+{
+  uint tempRes;
+  uvec4 mask = subgroupBallot(true);
+  uint sgSize = gl_SubgroupSize;
+  uint sgInvocation = gl_SubgroupInvocationID;
+  tempRes = 0;
+  uint firstActive = 0;
+  for (uint i = 0; i &lt; sgSize; i++)
+  {
+    if (subgroupBallotBitExtract(mask, i))
+    {
+  
+[...]
+sult[];
+};
+layout(set = 0, binding = 4, std430) readonly buffer Buffer2
+{
+  bvec3 data[];
+};
+
+void main (void)
+{
+  uint tempRes;
+  uvec4 mask = subgroupBallot(true);
+  uint sgSize = gl_SubgroupSize;
+  uint sgInvocation = gl_SubgroupInvocationID;
+  tempRes = 0;
+  uint firstActive = 0;
+  for (uint i = 0; i &lt; sgSize; i++)
+  {
+    if (subgroupBallotBitExtract(mask, i))
+    {
+      firstActive = i;
+      break;
+    }
+  }
+  tempRes |= (subgroupBroadcastFirst(data[sgInvocation]) == data[firstActive]) ? 0x1 : 0;
+  // make the firstActive invocation inactive now
+  if (firstActive != sgInvocation)
+  {
+mask = subgroupBallot(true);
+    for (uint i = 0; i &lt; sgSize; i++)
+    {
+      if (subgroupBallotBitExtract(mask, i))
+      {
+        firstActive = i;
+        break;
+      }
+    }
+    tempRes |= (subgroupBroadcastFirst(data[sgInvocation]) == data[firstActive]) ? 0x2 : 0;
+  }
+  else
+  {
+    // the firstActive invocation didn&apos;t partake in the second result so set it to true
+    tempRes |= 0x2;
+  }
+  result[gl_VertexIndex] = tempRes;
+  float pixelSize = 2.0f/1024.0f;
+  float pixelPosition = pixelSize/2.0f - 1.0f;
+  gl_Position = vec4(float(gl_VertexIndex) * pixelSize + pixelPosition, 0.0f, 0.0f, 1.0f);
+  gl_PointSize = 1.0f;
+}
+</ShaderSource>
+    <InfoLog></InfoLog>
+</VertexShader>
+</ShaderProgram>
+  <Number Name="VertexCompileTime" Description="Vertex shader compile time" Tag="Time" Unit="ms">1.544000</Number>
+  <Number Name="LinkTime" Description="Link time" Tag="Time" Unit="ms">0.014000</Number>
+</Section>
+ <ShaderProgram LinkStatus="OK">
+  <InfoLog></InfoLog>
+  <SpirVAssemblySource>; SPIR-V
+; Version: 1.3
+; Generator: Khronos Glslang Reference Front End; 11
+; Bound: 151
+; Schema: 0
+OpCapability Shader
+OpCapability GroupNonUniform
+OpCapability GroupNonUniformBallot
+%1 = OpExtInstImport &quot;GLSL.std.450&quot;
+OpMemoryModel Logical GLSL450
+OpEntryPoint Vertex %4 &quot;main&quot; %17 %20 %118 %138
+OpDecorate %17 RelaxedPrecision
+OpDecorate %17 BuiltIn SubgroupSize
+OpDecorate %18 RelaxedPrecision
+OpDecorate %20 RelaxedPrecision
+OpDecorate %20 BuiltIn SubgroupLocalInvocationId
+OpDecorate %21 RelaxedPrecision
+OpDecorate %46 ArrayStride 16
+OpDecorate %47 Block
+OpMemberDecorate %47 0 NonWritable
+OpMemberDecorate %47 0 Offset 0
+OpDecorate %49 NonWritable
+OpDecorate %49 Binding 4
+OpDecorate %49 DescriptorSet 0
+OpDecorate %113 ArrayStride 4
+OpDecorate %114 Block
+OpMemberDecorate %114 0 Offset 0
+OpDecorate %116 Binding 0
+OpDecorate %116 DescriptorSet 0
+OpDecorate %118 BuiltIn VertexIndex
+OpDecorate %136 Block
+OpMemberDecorate %136 0 BuiltIn Position
+OpMemberDecorate %136 1 BuiltIn PointSize
+OpMemberDecorate %136 2 BuiltIn ClipDistance
+OpMemberDecorate %136 3 BuiltIn CullDistance
+%2 = OpTypeVoid
+%3 = OpTypeFunction %2
+%6 = OpTypeInt 32 0
+%7 = OpTypeVector %6 4
+%8 = OpTypePointer Function %7
+%10 = OpTypeBool
+%11 = OpConstantTrue %10
+%12 = OpConstant %6 3
+%14 = OpTypePointer Function %6
+%16 = OpTypePointer Input %6
+%17 = OpVariable %16 Input
+%20 = OpVariable %16 Input
+%23 = OpConstant %6 0
+%42 = OpTypeInt 32 1
+%43 = OpConstant %42 1
+%45 = OpTypeVector %6 3
+%46 = OpTypeRuntimeArray %45
+%47 = OpTypeStruct %46
+%48 = OpTypePointer StorageBuffer %47
+%49 = OpVariable %48 StorageBuffer
+%50 = OpConstant %42 0
+%52 = OpTypePointer StorageBuffer %45
+%55 = OpTypeVector %10 3
+%56 = OpConstantComposite %45 %23 %23 %23
+%104 = OpConstant %42 2
+%110 = OpConstant %6 2
+%113 = OpTypeRuntimeArray %6
+%114 = OpTypeStruct %113
+%115 = OpTypePointer StorageBuffer %114
+%116 = OpVariable %115 StorageBuffer
+%117 = OpTypePointer Input %42
+%118 = OpVariable %117 Input
+%121 = OpTypePointer StorageBuffer %6
+%123 = OpTypeFloat 32
+%124 = OpTypePointer Function %123
+%126 = OpConstant %123 0.001953125
+%129 = OpConstant %123 2
+%131 = OpConstant %123 1
+%133 = OpTypeVector %123 4
+%134 = OpConstant %6 1
+%135 = OpTypeArray %123 %134
+%136 = OpTypeStruct %133 %123 %135 %135
+%137 = OpTypePointer Output %136
+%138 = OpVariable %137 Output
+%145 = OpConstant %123 0
+%147 = OpTypePointer Output %133
+%149 = OpTypePointer Output %123
+%4 = OpFunction %2 None %3
+%5 = OpLabel
+%9 = OpVariable %8 Function
+%15 = OpVariable %14 Function
+%19 = OpVariable %14 Function
+%22 = OpVariable %14 Function
+%24 = OpVariable %14 Function
+%25 = OpVariable %14 Function
+%75 = OpVariable %14 Function
+%125 = OpVariable %124 Function
+%127 = OpVariable %124 Function
+%13 = OpGroupNonUniformBallot %7 %12 %11
+OpStore %9 %13
+%18 = OpLoad %6 %17
+OpStore %15 %18
+%21 = OpLoad %6 %20
+OpStore %19 %21
+OpStore %22 %23
+OpStore %24 %23
+OpStore %25 %23
+OpBranch %26
+%26 = OpLabel
+OpLoopMerge %28 %29 None
+OpBranch %30
+%30 = OpLabel
+%31 = OpLoad %6 %25
+%32 = OpLoad %6 %15
+%33 = OpULessThan %10 %31 %32
+OpBranchConditional %33 %27 %28
+%27 = OpLabel
+%34 = OpLoad %7 %9
+%35 = OpLoad %6 %25
+%36 = OpGroupNonUniformBallotBitExtract %10 %12 %34 %35
+OpSelectionMerge %38 None
+OpBranchConditional %36 %37 %38
+%37 = OpLabel
+%39 = OpLoad %6 %25
+OpStore %24 %39
+OpBranch %28
+%38 = OpLabel
+OpBranch %29
+%29 = OpLabel
+%41 = OpLoad %6 %25
+%44 = OpIAdd %6 %41 %43
+OpStore %25 %44
+OpBranch %26
+%28 = OpLabel
+%51 = OpLoad %6 %19
+%53 = OpAccessChain %52 %49 %50 %51
+%54 = OpLoad %45 %53
+%57 = OpINotEqual %55 %54 %56
+%58 = OpGroupNonUniformBroadcastFirst %55 %12 %57
+%59 = OpLoad %6 %24
+%60 = OpAccessChain %52 %49 %50 %59
+%61 = OpLoad %45 %60
+%62 = OpINotEqual %55 %61 %56
+%63 = OpLogicalEqual %55 %58 %62
+%64 = OpAll %10 %63
+%65 = OpSelect %42 %64 %43 %50
+%66 = OpBitcast %6 %65
+%67 = OpLoad %6 %22
+%68 = OpBitwiseOr %6 %67 %66
+OpStore %22 %68
+%69 = OpLoad %6 %24
+%70 = OpLoad %6 %19
+%71 = OpINotEqual %10 %69 %70
+OpSelectionMerge %73 None
+OpBranchConditional %71 %72 %109
+%72 = OpLabel
+%74 = OpGroupNonUniformBallot %7 %12 %11
+OpStore %9 %74
+OpStore %75 %23
+OpBranch %76
+%76 = OpLabel
+OpLoopMerge %78 %79 None
+OpBranch %80
+%80 = OpLabel
+%81 = OpLoad %6 %75
+%82 = OpLoad %6 %15
+%83 = OpULessThan %10 %81 %82
+OpBranchConditional %83 %77 %78
+%77 = OpLabel
+%84 = OpLoad %7 %9
+%85 = OpLoad %6 %75
+%86 = OpGroupNonUniformBallotBitExtract %10 %12 %84 %85
+OpSelectionMerge %88 None
+OpBranchConditional %86 %87 %88
+%87 = OpLabel
+%89 = OpLoad %6 %75
+OpStore %24 %89
+OpBranch %78
+%88 = OpLabel
+OpBranch %79
+%79 = OpLabel
+%91 = OpLoad %6 %75
+%92 = OpIAdd %6 %91 %43
+OpStore %75 %92
+OpBranch %76
+%78 = OpLabel
+%93 = OpLoad %6 %19
+%94 = OpAccessChain %52 %49 %50 %93
+%95 = OpLoad %45 %94
+%96 = OpINotEqual %55 %95 %56
+%97 = OpGroupNonUniformBroadcastFirst %55 %12 %96
+%98 = OpLoad %6 %24
+%99 = OpAccessChain %52 %49 %50 %98
+%100 = OpLoad %45 %99
+%101 = OpINotEqual %55 %100 %56
+%102 = OpLogicalEqual %55 %97 %101
+%103 = OpAll %10 %102
+%105 = OpSelect %42 %103 %104 %50
+%106 = OpBitcast %6 %105
+%107 = OpLoad %6 %22
+%108 = OpBitwiseOr %6 %107 %106
+OpStore %22 %108
+OpBranch %73
+%109 = OpLabel
+%111 = OpLoad %6 %22
+%112 = OpBitwiseOr %6 %111 %110
+OpStore %22 %112
+OpBranch %73
+%73 = OpLabel
+%119 = OpLoad %42 %118
+%120 = OpLoad %6 %22
+%122 = OpAccessChain %121 %116 %50 %119
+OpStore %122 %120
+OpStore %125 %126
+%128 = OpLoad %123 %125
+%130 = OpFDiv %123 %128 %129
+%132 = OpFSub %123 %130 %131
+OpStore %127 %132
+%139 = OpLoad %42 %118
+%140 = OpConvertSToF %123 %139
+%141 = OpLoad %123 %125
+%142 = OpFMul %123 %140 %141
+%143 = OpLoad %123 %127
+%144 = OpFAdd %123 %142 %143
+%146 = OpCompositeConstruct %133 %144 %145 %145 %131
+%148 = OpAccessChain %147 %138 %50
+OpStore %148 %146
+%150 = OpAccessChain %149 %138 %43
+OpStore %150 %131
+OpReturn
+OpFunctionEnd
+</SpirVAssemblySource>
+</ShaderProgram>
+ <Section Name="tesc_noSubgroup" Description="Program: tesc_noSubgroup">
+  <ShaderProgram LinkStatus="OK">
+   <InfoLog></InfoLog>
+   <SpirVAssemblySource>; SPIR-V
+; Version: 1.3
+; Generator: Khronos Glslang Reference Front End; 1
+; Bound: 45
+; Schema: 0
+OpCapability Tessellation
+%1 = OpExtInstImport &quot;GLSL.std.450&quot;
+OpMemoryModel Logical GLSL450
+OpEntryPoint TessellationControl %4 &quot;main&quot; %8 %20 %32 %38
+OpExecutionMode %4 OutputVertices 1
+OpDecorate %8 BuiltIn InvocationId
+OpDecorate %20 Patch
+OpDecorate %20 BuiltIn TessLevelOuter
+OpMemberDecorate %29 0 BuiltIn Position
+OpMemberDecorate %29 1 BuiltIn PointSize
+OpMemberDecorate %29 2 BuiltIn ClipDistance
+OpMemberDecorate %29 3 BuiltIn CullDistance
+OpDecorate %29 Block
+OpMemberDecorate %34 0 BuiltIn Position
+OpMemberDecorate %34 1 BuiltIn PointSize
+OpMemberDecorate %34 2 BuiltIn ClipDistance
+OpMemberDecorate %34 3 BuiltIn CullDistance
+OpDecorate %34 Block
+%2 = OpTypeVoid
+%3 = OpTypeFunction %2
+%6 = OpTypeInt 32 1
+%7 = OpTypePointer Input %6
+%8 = OpVariable %7 Input
+%10 = OpConstant %6 0
+%11 = OpTypeBool
+%15 = OpTypeFloat 32
+%16 = OpTypeInt 32 0
+%17 = OpConstant %16 4
+%18 = OpTypeArray %15 %17
+%19 = OpTypePointer Output %18
+%20 = OpVariable %19 Output
+%21 = OpConstant %15 1
+%22 = OpTypePointer Output %15
+%24 = OpConstant %6 1
+%26 = OpTypeVector %15 4
+%27 = OpConstant %16 1
+%28 = OpTypeArray %15 %27
+%29 = OpTypeStruct %26 %15 %28 %28
+%30 = OpTypeArray %29 %27
+%31 = OpTypePointer Output %30
+%32 = OpVariable %31 Output
+%34 = OpTypeStruct %26 %15 %28 %28
+%35 = OpConstant %16 32
+%36 = OpTypeArray %34 %35
+%37 = OpTypePointer Input %36
+%38 = OpVariable %37 Input
+%40 = OpTypePointer Input %26
+%43 = OpTypePointer Output %26
+%4 = OpFunction %2 None %3
+%5 = OpLabel
+%9 = OpLoad %6 %8
+%12 = OpIEqual %11 %9 %10
+OpSelectionMerge %14 None
+OpBranchConditional %12 %13 %14
+%13 = OpLabel
+%23 = OpAccessChain %22 %20 %10
+OpStore %23 %21
+%25 = OpAccessChain %22 %20 %24
+OpStore %25 %21
+OpBranch %14
+%14 = OpLabel
+%33 = OpLoad %6 %8
+%39 = OpLoad %6 %8
+%41 = OpAccessChain %40 %38 %39 %10
+%42 = OpLoad %26 %41
+%44 = OpAccessChain %43 %32 %33 %10
+OpStore %44 %42
+OpReturn
+OpFunctionEnd
+</SpirVAssemblySource>
+</ShaderProgram>
+  <Number Name="SpirVAssemblyTime" Description="SpirV assembly time" Tag="Time" Unit="ms">0.186000</Number>
+</Section>
+ <Section Name="tese_noSubgroup" Description="Program: tese_noSubgroup">
+  <ShaderProgram LinkStatus="OK">
+   <InfoLog></InfoLog>
+   <SpirVAssemblySource>; SPIR-V
+; Version: 1.3
+; Generator: Khronos Glslang Reference Front End; 2
+; Bound: 42
+; Schema: 0
+OpCapability Tessellation
+%1 = OpExtInstImport &quot;GLSL.std.450&quot;
+OpMemoryModel Logical GLSL450
+OpEntryPoint TessellationEvaluation %4 &quot;main&quot; %16 %23 %29
+OpExecutionMode %4 Isolines
+OpExecutionMode %4 SpacingEqual
+OpExecutionMode %4 VertexOrderCcw
+OpMemberDecorate %14 0 BuiltIn Position
+OpMemberDecorate %14 1 BuiltIn PointSize
+OpMemberDecorate %14 2 BuiltIn ClipDistance
+OpMemberDecorate %14 3 BuiltIn CullDistance
+OpDecorate %14 Block
+OpMemberDecorate %19 0 BuiltIn Position
+OpMemberDecorate %19 1 BuiltIn PointSize
+OpMemberDecorate %19 2 BuiltIn ClipDistance
+OpMemberDecorate %19 3 BuiltIn CullDistance
+OpDecorate %19 Block
+OpDecorate %29 BuiltIn TessCoord
+%2 = OpTypeVoid
+%3 = OpTypeFunction %2
+%6 = OpTypeFloat 32
+%7 = OpTypePointer Function %6
+%9 = OpConstant %6 0.00195313
+%10 = OpTypeVector %6 4
+%11 = OpTypeInt 32 0
+%12 = OpConstant %11 1
+%13 = OpTypeArray %6 %12
+%14 = OpTypeStruct %10 %6 %13 %13
+%15 = OpTypePointer Output %14
+%16 = OpVariable %15 Output
+%17 = OpTypeInt 32 1
+%18 = OpConstant %17 0
+%19 = OpTypeStruct %10 %6 %13 %13
+%20 = OpConstant %11 32
+%21 = OpTypeArray %19 %20
+%22 = OpTypePointer Input %21
+%23 = OpVariable %22 Input
+%24 = OpTypePointer Input %10
+%27 = OpTypeVector %6 3
+%28 = OpTypePointer Input %27
+%29 = OpVariable %28 Input
+%30 = OpConstant %11 0
+%31 = OpTypePointer Input %6
+%36 = OpConstant %6 2
+%40 = OpTypePointer Output %10
+%4 = OpFunction %2 None %3
+%5 = OpLabel
+%8 = OpVariable %7 Function
+OpStore %8 %9
+%25 = OpAccessChain %24 %23 %18 %18
+%26 = OpLoad %10 %25
+%32 = OpAccessChain %31 %29 %30
+%33 = OpLoad %6 %32
+%34 = OpLoad %6 %8
+%35 = OpFMul %6 %33 %34
+%37 = OpFDiv %6 %35 %36
+%38 = OpCompositeConstruct %10 %37 %37 %37 %37
+%39 = OpFAdd %10 %26 %38
+%41 = OpAccessChain %40 %16 %18
+OpStore %41 %39
+OpReturn
+OpFunctionEnd
+</SpirVAssemblySource>
+</ShaderProgram>
+  <Number Name="SpirVAssemblyTime" Description="SpirV assembly time" Tag="Time" Unit="ms">0.122000</Number>
+</Section>
+ <Section Name="vert_noSubgroup" Description="Program: vert_noSubgroup">
+  <ShaderProgram LinkStatus="OK">
+   <InfoLog></InfoLog>
+   <SpirVAssemblySource>; SPIR-V
+; Version: 1.3
+; Generator: Khronos Glslang Reference Front End; 1
+; Bound: 37
+; Schema: 0
+OpCapability Shader
+%1 = OpExtInstImport &quot;GLSL.std.450&quot;
+OpMemoryModel Logical GLSL450
+OpEntryPoint Vertex %4 &quot;main&quot; %22 %26
+OpMemberDecorate %20 0 BuiltIn Position
+OpMemberDecorate %20 1 BuiltIn PointSize
+OpMemberDecorate %20 2 BuiltIn ClipDistance
+OpMemberDecorate %20 3 BuiltIn CullDistance
+OpDecorate %20 Block
+OpDecorate %26 BuiltIn VertexIndex
+%2 = OpTypeVoid
+%3 = OpTypeFunction %2
+%6 = OpTypeFloat 32
+%7 = OpTypePointer Function %6
+%9 = OpConstant %6 0.00195313
+%12 = OpConstant %6 2
+%14 = OpConstant %6 1
+%16 = OpTypeVector %6 4
+%17 = OpTypeInt 32 0
+%18 = OpConstant %17 1
+%19 = OpTypeArray %6 %18
+%20 = OpTypeStruct %16 %6 %19 %19
+%21 = OpTypePointer Output %20
+%22 = OpVariable %21 Output
+%23 = OpTypeInt 32 1
+%24 = OpConstant %23 0
+%25 = OpTypePointer Input %23
+%26 = OpVariable %25 Input
+%33 = OpConstant %6 0
+%35 = OpTypePointer Output %16
+%37 = OpConstant %23 1
+%38 = OpTypePointer Output %6
+%4 = OpFunction %2 None %3
+%5 = OpLabel
+%8 = OpVariable %7 Function
+%10 = OpVariable %7 Function
+OpStore %8 %9
+%11 = OpLoad %6 %8
+%13 = OpFDiv %6 %11 %12
+%15 = OpFSub %6 %13 %14
+OpStore %10 %15
+%27 = OpLoad %23 %26
+%28 = OpConvertSToF %6 %27
+%29 = OpLoad %6 %8
+%30 = OpFMul %6 %28 %29
+%31 = OpLoad %6 %10
+%32 = OpFAdd %6 %30 %31
+%34 = OpCompositeConstruct %16 %32 %33 %33 %14
+%36 = OpAccessChain %35 %22 %24
+OpStore %36 %34
+%39 = OpAccessChain %38 %22 %37
+OpStore %39 %14
+OpReturn
+OpFunctionEnd
+</SpirVAssemblySource>
+</ShaderProgram>
+  <Number Name="SpirVAssemblyTime" Description="SpirV assembly time" Tag="Time" Unit="ms">0.093000</Number>
+</Section>
+ <Text>1 / 27 values passed</Text>
+ <Number Name="TestDuration" Description="Test case duration in microseconds" Tag="Time" Unit="us">456102</Number>
+ <Result StatusCode="Fail">Failed!</Result>
+</TestCaseResult>
+
+
