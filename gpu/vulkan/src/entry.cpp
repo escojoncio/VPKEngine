@@ -312,7 +312,9 @@ namespace {
 constexpr uint32_t kSubgroupSize = 32;  // Apple SIMD-group width (the Adreno's 64 cannot be honoured)
 constexpr VkShaderStageFlags kSubgroupStages = VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_COMPUTE_BIT;
 constexpr VkSubgroupFeatureFlags kSubgroupOps =
-    VK_SUBGROUP_FEATURE_BASIC_BIT | VK_SUBGROUP_FEATURE_VOTE_BIT | VK_SUBGROUP_FEATURE_BALLOT_BIT;
+    VK_SUBGROUP_FEATURE_BASIC_BIT | VK_SUBGROUP_FEATURE_VOTE_BIT | VK_SUBGROUP_FEATURE_BALLOT_BIT |
+    VK_SUBGROUP_FEATURE_SHUFFLE_BIT | VK_SUBGROUP_FEATURE_SHUFFLE_RELATIVE_BIT | VK_SUBGROUP_FEATURE_QUAD_BIT;
+// Arithmetic and clustered reductions are not translated (no VPIR op for simd_sum / prefix scans): they stay off.
 constexpr uint32_t kMaxInlineUniformBlockSize = 256, kMaxInlineUniformBlocks = 4;  // the minimums
 // What the Adreno driver reports with the Quest identity (VK_KHR_driver_properties): engines key Qualcomm
 // workarounds off driverID, never off the name.

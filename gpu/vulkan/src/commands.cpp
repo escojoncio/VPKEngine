@@ -1351,7 +1351,7 @@ struct Translator {
 
   // A query ends: in a multiview pass it is viewCount consecutive queries (Vulkan), the first
   // holding the count of every view and the rest 0 (they were reset). Timestamps: the host time
-  // at submission (monotonic, nanoseconds = timestampPeriod 1), written now into the counter.
+  // at submission (monotonic, in timestampPeriod ticks), written now into the counter.
   void queryEnd(const OpQueryEnd& q) {
     QueryPoolObj* p = q.pool;
     if (!p || q.query >= p->count) return;
@@ -1359,8 +1359,10 @@ struct Translator {
     if (passOpen && viewMask) n = std::min<uint32_t>(uint32_t(std::popcount(viewMask)), p->count - q.query);
     if (q.timestamp && p->base != UINT32_MAX && p->device && p->device->visibility.host) {
       static std::atomic<uint64_t> last{0};
-      uint64_t now = uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                  std::chrono::steady_clock::now().time_since_epoch()).count());
+      // In ticks of limits.timestampPeriod (nanoseconds / period): the Quest identity advertises Adreno's 52.08 ns tick.
+      uint64_t now = uint64_t(double(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                         std::chrono::steady_clock::now().time_since_epoch()).count()) /
+                              double(deviceProperties().limits.timestampPeriod));
       // Strictly increasing and never 0, even for two writes within one clock tick.
       uint64_t prev = last.load();
       while (!last.compare_exchange_weak(prev, std::max(now, prev + 1))) {}

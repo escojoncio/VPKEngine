@@ -39,7 +39,7 @@ VkPhysicalDeviceProperties makeProps(bool quest, bool geom) {
   l.maxImageArrayLayers = 2048;
   l.maxTexelBufferElements = 1u << 26;
   l.maxUniformBufferRange = 65536;
-  l.maxStorageBufferRange = 1u << 30;
+  l.maxStorageBufferRange = quest ? 134217728u : 1u << 30;  // Quest's 128 MiB
   l.maxPushConstantsSize = 256;  // BoundState::push is 256 bytes; the block reaches the shader as one constant buffer
   l.maxMemoryAllocationCount = 4096;
   l.maxSamplerAllocationCount = 4000;
@@ -134,7 +134,7 @@ VkPhysicalDeviceProperties makeProps(bool quest, bool geom) {
   l.storageImageSampleCounts = VK_SAMPLE_COUNT_1_BIT;
   l.maxSampleMaskWords = 1;
   l.timestampComputeAndGraphics = VK_TRUE;
-  l.timestampPeriod = 1.0f;  // nanoseconds
+  l.timestampPeriod = quest ? 52.083336f : 1.0f;  // queries hold host nanoseconds / period (commands.cpp queryEnd); Quest: Adreno's 19.2 MHz tick
   l.maxClipDistances = 8;
   l.maxCullDistances = 0;
   l.maxCombinedClipAndCullDistances = 8;

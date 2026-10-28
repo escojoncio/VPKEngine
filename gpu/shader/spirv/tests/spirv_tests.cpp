@@ -684,6 +684,25 @@ void subgroupCube(const std::string& dir) {
     if (failures || std::getenv("VP_PRINT")) std::fprintf(stderr, "%s\n", src.c_str());
 }
 
+// Relative shuffles (Xor / Up / Down) are a simd_shuffle of the computed lane, the quad broadcast a quad_shuffle.
+// Hand-assembled: gen_subgroup_shuffle.py.
+void subgroupShuffle(const std::string& dir) {
+    spirv::SpirvLowerOptions o;
+    o.entry = "main";
+    o.stage = vpir::Stage::Compute;
+    o.layout = {bind(0, 0, vpgpu::BindKind::Buffer, 0)};
+    Result r = run(dir + "/subgroup_shuffle.comp.spv", o);
+    CHECK(r.ok);
+    if (!r.ok) return;
+    const std::string& src = r.msl.source;
+    size_t shuffles = 0;
+    for (size_t at = src.find("simd_shuffle("); at != std::string::npos; at = src.find("simd_shuffle(", at + 1)) ++shuffles;
+    CHECK(shuffles == 3);
+    CHECK(src.find("quad_shuffle(") != std::string::npos);
+    CHECK(src.find(" ^ ") != std::string::npos);
+    if (failures || std::getenv("VP_PRINT")) std::fprintf(stderr, "%s\n", src.c_str());
+}
+
 // robustBufferAccess (EmitOptions::robustBuffers): every storage-buffer store / atomic is guarded by
 // the BufferSize of its slot (added as an argument when the shader had none), so an out-of-range
 // or unbound (size 0) buffer is never touched. Without the option the MSL has no guard.
@@ -1752,6 +1771,7 @@ int main(int argc, char** argv) {
     else if (c == "bool_iface") boolIface(dir);
     else if (c == "dyn_buffer") dynBuffer(dir);
     else if (c == "subgroup_cube") subgroupCube(dir);
+    else if (c == "subgroup_shuffle") subgroupShuffle(dir);
     else if (c == "texel_fetch") texelFetch(dir);
     else if (c == "int16") int16(dir);
     else if (c == "storage16") storage16(dir);

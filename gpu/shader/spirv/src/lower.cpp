@@ -3736,6 +3736,13 @@ private:
                 return one(laneOp(Op::SubgroupBroadcast, get1(w(in, 4)), cast(get1(w(in, 5)), vpir::kU32)));
             case OpGroupNonUniformShuffle:
                 return one(laneOp(Op::SubgroupShuffle, get1(w(in, 4)), cast(get1(w(in, 5)), vpir::kU32)));
+            // Relative shuffles are a shuffle of the computed lane (outside [0, size) the result is undefined in Vulkan).
+            case OpGroupNonUniformShuffleXor:
+                return one(laneOp(Op::SubgroupShuffle, get1(w(in, 4)), bin(Op::Xor, laneId(), cast(get1(w(in, 5)), vpir::kU32), vpir::kU32)));
+            case OpGroupNonUniformShuffleUp:
+                return one(laneOp(Op::SubgroupShuffle, get1(w(in, 4)), bin(Op::Sub, laneId(), cast(get1(w(in, 5)), vpir::kU32), vpir::kU32)));
+            case OpGroupNonUniformShuffleDown:
+                return one(laneOp(Op::SubgroupShuffle, get1(w(in, 4)), bin(Op::Add, laneId(), cast(get1(w(in, 5)), vpir::kU32), vpir::kU32)));
             case OpGroupNonUniformQuadBroadcast:
                 return one(laneOp(Op::QuadShuffle, get1(w(in, 4)), cast(get1(w(in, 5)), vpir::kU32)));
             case OpGroupNonUniformQuadSwap: {

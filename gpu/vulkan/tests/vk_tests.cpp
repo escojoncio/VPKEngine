@@ -1589,6 +1589,19 @@ void testQuestExtras() {
   vkGetPhysicalDeviceProperties2(c.pd, &p2);
   CHECK(vap.maxVertexAttribDivisor == 65535);
   {
+    // Subgroup operations the translator implements; arithmetic / clustered have no VPIR op and stay off.
+    VkPhysicalDeviceSubgroupProperties sgp{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES};
+    VkPhysicalDeviceProperties2 sp2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &sgp};
+    vkGetPhysicalDeviceProperties2(c.pd, &sp2);
+    const VkSubgroupFeatureFlags want = VK_SUBGROUP_FEATURE_BASIC_BIT | VK_SUBGROUP_FEATURE_VOTE_BIT |
+                                        VK_SUBGROUP_FEATURE_BALLOT_BIT | VK_SUBGROUP_FEATURE_SHUFFLE_BIT |
+                                        VK_SUBGROUP_FEATURE_SHUFFLE_RELATIVE_BIT | VK_SUBGROUP_FEATURE_QUAD_BIT;
+    CHECK(sgp.supportedOperations == want && sgp.subgroupSize == 32);
+    // Timestamps are host nanoseconds divided by the period: Adreno's 19.2 MHz tick under the Quest identity.
+    CHECK(std::fabs(p2.properties.limits.timestampPeriod - 52.083336f) < 1e-3f);
+    CHECK(p2.properties.limits.maxStorageBufferRange == 134217728u);
+  }
+  {
     // The divisor is part of the stage key (a different divisor is a different translation); divisor 1 keeps the old bytes.
     StageInput a;
     a.spirv = 1, a.opt.vertexBuffers = {{0, 16, true, 3}};
@@ -5377,7 +5390,7 @@ void testFoveation() {
 // CMake source fingerprint: a refactor that leaves the output alone keeps the digest (and every cache), a change of
 // output moves it. When this test fails the translator's OUTPUT changed: bump kLowerVersion (SPIR-V -> VPIR) or
 // kEmitVersion (VPIR -> MSL) in recipes.h, then update kCorpusDigest to the printed value in the same change.
-constexpr uint64_t kCorpusDigest = 0x7fa9ffd477d66b55ull;  // the "corpus digest" line the test prints
+constexpr uint64_t kCorpusDigest = 0x19739bc97a1403c8ull;  // the "corpus digest" line the test prints
 
 uint64_t corpusDigest(unsigned& modules, unsigned& failed) {
   std::vector<std::string> names;
