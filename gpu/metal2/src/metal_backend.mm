@@ -1502,6 +1502,31 @@ kernel void k_bf(device uint* out [[buffer(0)]], const device uint* d [[buffer(1
     out[base + 4] = 0xEEEEu;
   }
 }
+#define CTSK(NAME, M1, M2) \
+kernel void NAME(device uint* out [[buffer(0)]], const device uint* d [[buffer(1)]], \
+                 uint tid [[thread_position_in_grid]], uint lane [[thread_index_in_simdgroup]]) { \
+  uint base = tid * 8u; \
+  uint mask = M1; \
+  uint ref = 0u; \
+  for (uint i = 0u; i < 32u; ++i) if (((mask >> i) & 1u) != 0u) ref += d[i]; \
+  uint s1 = simd_sum(d[lane]); \
+  out[base + 0] = ref; out[base + 1] = s1; out[base + 2] = mask; \
+  if ((lane & 1u) == 1u) { \
+    uint mask2 = M2; \
+    uint ref2 = 0u; \
+    for (uint i = 0u; i < 32u; ++i) if (((mask2 >> i) & 1u) != 0u) ref2 += d[i]; \
+    uint s2 = simd_sum(d[lane]); \
+    out[base + 3] = ref2; out[base + 4] = s2; out[base + 5] = mask2; \
+  } else { out[base + 3] = 0xEEEEu; } \
+}
+CTSK(v_a, ball(), ball())
+CTSK(v_b, actv(), actv())
+CTSK(v_c, (ball() & actv()), (ball() & actv()))
+CTSK(v_d, ball(), as_type<uint2>(simd_vote::vote_t(simd_ballot(lane < 32u))).x)
+CTSK(v_e, ball(), as_type<uint2>(simd_vote::vote_t(simd_ballot(d[100] != 0u))).x)
+CTSK(v_f, ball(), as_type<uint2>(simd_vote::vote_t(simd_ballot((lane & 1u) == 1u))).x)
+CTSK(v_g, actv(), as_type<uint2>(simd_vote::vote_t(simd_ballot(d[100] != 0u))).x)
+CTSK(v_h, as_type<uint2>(simd_vote::vote_t(simd_ballot(d[100] != 0u))).x, as_type<uint2>(simd_vote::vote_t(simd_ballot(d[100] != 0u))).x)
 )MSL";
     NSError* e = nil;
     id<MTLLibrary> lib = [dev newLibraryWithSource:@(kSrc) options:nil error:&e];
@@ -1509,8 +1534,8 @@ kernel void k_bf(device uint* out [[buffer(0)]], const device uint* d [[buffer(1
     uint32_t data[128];
     for (uint32_t i = 0; i < 128; ++i) data[i] = (i + 1) * (i + 1) + 3;
     struct Shape { uint32_t x, y, z; };
-    const Shape shapes[] = {{32, 1, 1}, {1, 4, 32}, {8, 1, 1}};
-    for (const char* kn : {"k_cts", "k_bf"}) {
+    const Shape shapes[] = {{32, 1, 1}, {8, 1, 1}};
+    for (const char* kn : {"k_cts", "k_bf", "v_a", "v_b", "v_c", "v_d", "v_e", "v_f", "v_g", "v_h"}) {
       id<MTLFunction> fn = [lib newFunctionWithName:@(kn)];
       id<MTLComputePipelineState> ps = fn ? [dev newComputePipelineStateWithFunction:fn error:&e] : nil;
       if (!ps) { say(std::string("SGTEST pipeline_failed ") + kn); continue; }
