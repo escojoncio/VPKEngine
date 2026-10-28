@@ -2753,7 +2753,7 @@ GLint GetUniformLocation(GLuint pn, const GLchar* name) {
         return -1;
     }
     const GLint ret = uniformLocation(*p, name);
-    // Diagnostics: the packed-uniform names ([vp]c<N>_[hiu]) the translated shaders use, once per name (64 per process).
+    // Diagnostics: the packed-uniform names ([vp]c<N>_[hiu]) the translated shaders use, once per (program, name) (1024 per process).
     if (name && (name[0] == 'v' || name[0] == 'p') && name[1] == 'c' && name[2] >= '0' && name[2] <= '9') {
         const char* q = name + 2;
         while (*q >= '0' && *q <= '9') ++q;
@@ -2761,7 +2761,7 @@ GLint GetUniformLocation(GLuint pn, const GLchar* name) {
             static std::mutex mu;
             static std::set<std::string> seen;
             std::lock_guard<std::mutex> g(mu);
-            if (seen.size() < 64 && seen.insert(std::to_string(pn) + ":" + name).second)
+            if (seen.size() < 1024 && seen.insert(std::to_string(pn) + ":" + name).second)
                 logf("gles.uloc prog=%u name=%s ret=%d", unsigned(pn), name, int(ret));
         }
     }
