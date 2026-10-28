@@ -1706,7 +1706,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         uint8_t memSamples = 1;  // samples per texel as laid out in memory (MSAA textures)
         uint64_t address = 0, bytes = 0;  // guest range it is a copy of (mip 0, all slices)
         uint64_t version = 0;             // tracker version of the memory contents it holds
-        uint64_t writeSeq = 0;            // counts the writes recorded into the image (any plane: copies of it compare this)
+        uint64_t writeSeq = 0;            // counts the writes and fills recorded into the image (any plane: copies of it compare this)
         uint64_t lastUse = 0;
         bool filled = false;         // filled from memory at least once (targets: always)
         // How the last fill from memory went (diagnostics, see probeSampled): 0 none, 1 GPU detile, 2 CPU detile,
@@ -2510,6 +2510,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         s.version = tracker.current();
         s.filled = true;  // (a layout that cannot be filled is noted once, not retried every use)
         if (!ok) return;
+        //MUT
         if (s.isDepth) {  // (the fill moves Z only: it makes that plane the image's own, and a failed one leaves it behind memory)
             if (s.format != vpgpu::Format::S8Uint) s.zAuthoritative = true;
             else s.stencilAuthoritative = true;
@@ -2578,6 +2579,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
             ++r.stats_.copies;
         }
         ++r.stats_.seeded;
+        ++s.writeSeq;
         s.version = tracker.current();
         s.filled = true;
         if (s.isDepth) {

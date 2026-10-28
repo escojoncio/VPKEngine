@@ -337,6 +337,33 @@ void sampleExtent() {
     if (failures) f.dump();
 }
 
+// A render target refreshed from memory (the CPU wrote its range, the image is filled again) is written too: the copy of its
+// corner is made again, though no pass drew into it.
+void colorMirrorRefill() {
+    Fixture f;
+    f.renderer.draw(f.state());
+    auto corners = [&] {
+        unsigned n = 0;
+        for (const std::string& e : f.events()) n += e == "copy sampled corner " + Fixture::hex(kRt);
+        return n;
+    };
+    auto uploads = [&] { return Fixture::count(f.events(), "copy upload " + Fixture::hex(kRt)); };
+    auto sampled = [&] {
+        f.sample(kRt, 64, 64, 10, 0, 8);
+        return f.renderer.textureFor(vpps4::decodeImage(std::span<const uint32_t>(f.at(kBase + 0x200), 8)));
+    };
+    const auto mirror = sampled();
+    CHECK(mirror && mirror != f.renderer.colorTargetAt(kRt));
+    CHECK(corners() == 1 && uploads() == 0);
+    CHECK(sampled() == mirror && corners() == 1);
+    f.renderer.invalidate(kRt, 8);  // the CPU wrote the target's memory
+    CHECK(sampled() == mirror);
+    CHECK(uploads() == 1);
+    CHECK(corners() == 2);
+    CHECK(sampled() == mirror && corners() == 2);
+    if (failures) f.dump();
+}
+
 // A depth target sampled through a smaller T#: the copy of its corner is made again after every write of the target, a draw
 // or a clear.
 void depthMirror() {
@@ -362,6 +389,8 @@ void depthMirror() {
     CHECK(sampled() == mirror && corners() == 2);
     f.renderer.draw(cleared);
     CHECK(sampled() == mirror && corners() == 3);
+    f.renderer.invalidate(kDepth, 8);  // the CPU wrote the target's memory: the target is filled again, no pass drew into it
+    CHECK(sampled() == mirror && corners() == 4);
     if (failures) f.dump();
 }
 
@@ -1272,6 +1301,7 @@ int main(int argc, char** argv) {
     else if (t == "soft_bc_upload") softBcUpload();
     else if (t == "soft_bc_tiled") softBcTiled();
     else if (t == "soft_bc_gpu") softBcGpu();
+    else if (t == "color_mirror_refill") colorMirrorRefill();
     else if (t == "depth_mirror") depthMirror();
     else if (t == "msaa_mirror") msaaMirror();
     else if (t == "channel_order") channelOrder();
