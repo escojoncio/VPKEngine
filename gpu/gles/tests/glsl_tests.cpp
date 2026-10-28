@@ -685,6 +685,14 @@ void testCompute() {
         "layout(binding = 1) buffer B { uint v[]; } b;\n"
         "void main() { b.v[gl_GlobalInvocationID.x] = gl_WorkGroupSize.x; }\n");
     CHECK(q.ok);
+    // gl_WorkGroupSize.x is a constant expression (array sizes).
+    ComputeProgram wgs = buildCompute(
+        "#version 310 es\n"
+        "layout(local_size_x = 4, local_size_y = 2) in;\n"
+        "const uint kSize = gl_WorkGroupSize.x * gl_WorkGroupSize.y;\n"
+        "layout(binding = 0) buffer R { bool ok[kSize]; } r;\n"
+        "void main() { r.ok[gl_LocalInvocationIndex] = true; }\n");
+    CHECK(wgs.ok);
     // Errors.
     CHECK(compileFails(Stage::Compute, "#version 310 es\nvoid main() {}\n", "local_size"));
     CHECK(compileFails(Stage::Compute, "#version 310 es\nlayout(local_size_x = 2000) in;\nvoid main() {}\n", "work group size"));

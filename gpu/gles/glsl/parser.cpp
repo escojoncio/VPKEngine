@@ -1340,6 +1340,9 @@ private:
                     }
                     x->nswz = uint8_t(f.size());
                     if (e->hasConst && f.size() == 1) x->hasConst = true, x->constF = e->constF, x->constI = e->constI;
+                    // gl_WorkGroupSize.x is a constant expression once layout(local_size_*) is declared (ES 3.10).
+                    if (e->k == EK::Var && e->sym->builtin == BuiltinVar::WorkGroupSize && f.size() == 1 && sh_->hasLocalSize)
+                        x->hasConst = true, x->constI = sh_->localSize[x->swz[0]], x->constF = double(x->constI);
                     x->a.push_back(std::move(e));
                     e = std::move(x);
                     continue;
