@@ -159,9 +159,16 @@ struct Image {  // a VkImage with its memory
     // A 2D (array) view of one level and `layerCount` layers from `layer`, for attachments.
     VkImageView attachmentView(uint32_t level, uint32_t layer, uint32_t layerCount);
     // A view for a storage image descriptor: `type` 2D / 2D_ARRAY / 3D over one level and `layerCount` layers.
-    VkImageView storageView(uint32_t level, uint32_t layer, uint32_t layerCount, VkImageViewType type);
+    // `format` (when not UNDEFINED and not the image's own): the texel format the view reinterprets the image with
+    // (glBindImageTexture with an image format other than the texture's, of the same size).
+    VkImageView storageView(uint32_t level, uint32_t layer, uint32_t layerCount, VkImageViewType type,
+                            VkFormat format = VK_FORMAT_UNDEFINED);
 };
 using ImageP = std::shared_ptr<Image>;
+// A 2D (array) image of `samples` samples with its device-local memory bound; null when Vulkan refuses it. The caller
+// records Context::imageInit.
+ImageP createImage2D(Device* dev, const FormatInfo* f, uint32_t w, uint32_t h, uint32_t layers, uint32_t samples,
+                     VkImageUsageFlags usage, VkImageCreateFlags flags = 0);
 
 struct TexelBufferView;
 
@@ -560,6 +567,16 @@ public:
     uint64_t flush(bool wait);         // submits; returns the submission serial (0 if nothing)
     void keep(std::shared_ptr<void> p) { keep_.push_back(std::move(p)); }
     void useStorage(const StorageP& s);  // marks it used by the open command buffer
+    // image2D bound to one slice of a 3D texture: Metal cannot view a 3D texture as 2D, so the dispatch works on a 2D
+    // copy of the slice (copied in before, back after: syncSlicesBack).
+    struct SliceSync {
+        ImageP proxy, source;
+        uint32_t level = 0, slice = 0;
+        bool writeBack = false;
+    };
+    std::vector<SliceSync> sliceBack_;
+    std::map<std::pair<const Image*, uint64_t>, ImageP> sliceProxies_;
+    void syncSlicesBack();
     // Transient upload memory for this submission (vertex/index streaming, uniforms, staging).
     struct Alloc {
         VkBuffer buffer;
@@ -688,6 +705,9 @@ private:
                            const std::vector<VkVertexInputAttributeDescription>& attrs);
     bool bindResources(Program& p);
     bool beginDispatch(Program*& p);
+    bool dispatching_ = false;  // bindResources runs for a dispatch (copies may be recorded)
+    // The 2D storage view for image2D bound to slice `layer` of a 3D texture (see SliceSync); null when it cannot be had.
+    VkImageView sliceView(Texture& t, uint32_t level, GLint layer, GLenum access, VkFormat format);
     bool attribsDirect(Program& p, VertexArray* va);
     // glClear / glClearBuffer with a colour or stencil write mask: vkCmdClearAttachments cannot mask channels or bits, so
     // those are a full-target triangle drawn with the mask as the pipeline's write mask (what ANGLE does). `forcedProgram_`

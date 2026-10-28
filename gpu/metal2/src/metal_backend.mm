@@ -1685,6 +1685,14 @@ id<MTLTexture> MetalBackend::Impl::view(TextureId t) {
     // passes that sample the stencil of their own depth buffer).
     pf = MTLPixelFormatX32_Stencil8;
   }
+  // A 3D texture cannot be seen as 2D (Vulkan EXT_image_2d_view_of_3d): Metal aborts inside newTextureView
+  // ("source texture MTLTextureType3D not compatible with texture view MTLTextureType2D").
+  if (base.textureType == MTLTextureType3D && type != MTLTextureType3D) {
+    v.failed = true;
+    static std::atomic<int> said{0};
+    if (said.fetch_add(1) < 8) err("what=texture_view_unsupported reason=3d_as_2d base=%u", v.base.index);
+    return nil;
+  }
   // Views Metal cannot make abort the process inside newTextureViewWithPixelFormat (MTLReportFailure,
   // not nil): a compressed texture seen as an uncompressed format of the same block size (Vulkan
   // BLOCK_TEXEL_VIEW_COMPATIBLE), compressed families other than an sRGB twin, depth seen as colour,

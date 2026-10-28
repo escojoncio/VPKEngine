@@ -1839,6 +1839,38 @@ private:
                                 : xy;
                     w[1] = coord;
                     ++i;
+                } else if ((st.dim == SDim::D2 || st.dim == SDim::D2Array) && !constantExpr(o)) {
+                    // A dynamic offset: Metal's hardware offset is 4 bits wide (-8..7), the advertised range is
+                    // -32..31. Offsets outside -8..7 move the coordinate by whole texels and the operand becomes
+                    // zero; the others keep the hardware offset (exact, no float rounding).
+                    caps_.insert(50);  // ImageQuery
+                    const bool arr = st.dim == SDim::D2Array;
+                    const Type f2 = Type::make(Base::Float, 2), i2 = Type::make(Base::Int, 2), b2 = Type::make(Base::Bool, 2);
+                    const Type bs = Type::make(Base::Bool);
+                    uint32_t ov = value(o);
+                    uint32_t lo = constI(-8), hi = constI(7);
+                    uint32_t outside = op(OpLogicalOr, typeId(b2),
+                                          {op(OpSLessThan, typeId(b2), {ov, opV(OpCompositeConstruct, typeId(i2), {lo, lo})}),
+                                           op(OpSGreaterThan, typeId(b2), {ov, opV(OpCompositeConstruct, typeId(i2), {hi, hi})})});
+                    uint32_t anyOut = op(OpAny, typeId(bs), {outside});
+                    uint32_t img = op(OpImage, imageOf(st), {si});
+                    uint32_t size = op(OpImageQuerySizeLod, typeId(Type::make(Base::Int, arr ? 3 : 2)), {img, constI(0)});
+                    if (arr) size = opV(OpVectorShuffle, typeId(i2), {size, size, 0, 1});
+                    uint32_t sizeF = op(OpConvertSToF, typeId(f2), {size});
+                    uint32_t offF = op(OpConvertSToF, typeId(f2), {ov});
+                    uint32_t scale = op(OpSelect, typeId(f), {anyOut, constF(1.0f), constF(0.0f)});
+                    uint32_t shift = op(OpVectorTimesScalar, typeId(f2), {op(OpFDiv, typeId(f2), {offF, sizeF}), scale});
+                    uint32_t xy = arr ? opV(OpVectorShuffle, typeId(f2), {coord, coord, 0, 1}) : coord;
+                    xy = op(OpFAdd, typeId(f2), {xy, shift});
+                    coord = arr ? opV(OpCompositeConstruct, typeId(Type::make(Base::Float, 3)),
+                                      {xy, op(OpCompositeExtract, typeId(f), {coord, 2})})
+                                : xy;
+                    w[1] = coord;
+                    uint32_t zero = opV(OpCompositeConstruct, typeId(i2), {constI(0), constI(0)});
+                    uint32_t any2 = opV(OpCompositeConstruct, typeId(b2), {anyOut, anyOut});
+                    ops.push_back(op(OpSelect, typeId(i2), {any2, zero, ov}));
+                    mask |= ImgOp::Offset;
+                    ++i;
                 } else {
                     ops.push_back(value(o));
                     mask |= constantExpr(o) ? ImgOp::ConstOffset : ImgOp::Offset;

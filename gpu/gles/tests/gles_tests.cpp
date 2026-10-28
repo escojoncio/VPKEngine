@@ -59,6 +59,12 @@ struct Counts {
         blits = 0, copiesToBuffer = 0, drawsIndirect = 0, drawsIndexedIndirect = 0, dispatchesIndirect = 0, copiesImage = 0,
         imagesWithStorage = 0, imagesCreated = 0, clearColorImages = 0, clearDepthImages = 0;
     uint32_t lastCopyRegions = 0;
+    // Last image view created (format, type) and last image created (flags, samples).
+    VkFormat lastViewFormat = VK_FORMAT_UNDEFINED;
+    VkImageViewType lastViewType = VK_IMAGE_VIEW_TYPE_MAX_ENUM;
+    VkImageCreateFlags lastImageFlags = 0;
+    VkSampleCountFlagBits lastImageSamples = VK_SAMPLE_COUNT_1_BIT, lastRasterSamples = VK_SAMPLE_COUNT_1_BIT;
+    int imagesMultisample = 0, viewsOf3DAs2D = 0;
     // Last graphics pipeline: colour write mask of attachment 0 (0xFFFFFFFF = none yet), stencil test, depth test.
     uint32_t lastWriteMask = 0xFFFFFFFFu;
     int lastStencilTest = -1, lastDepthTest = -1;
@@ -86,9 +92,11 @@ PFN_vkCmdDrawIndexedIndirect realDrawIndexedIndirect;
 PFN_vkCmdDispatchIndirect realDispatchIndirect;
 PFN_vkCmdCopyImage realCopyImage;
 PFN_vkCreateImage realCreateImage;
+PFN_vkCreateImageView realCreateImageView;
 PFN_vkCmdClearColorImage realClearColorImage;
 PFN_vkCmdClearDepthStencilImage realClearDepthImage;
 PFN_vkUpdateDescriptorSets realUpdateSets;
+std::map<VkImage, VkImageType> imageTypes;  // images the layer created: their type (views of a 3D image as 2D are Metal aborts)
 
 VKAPI_ATTR void VKAPI_CALL myDraw(VkCommandBuffer c, uint32_t v, uint32_t i, uint32_t fv, uint32_t fi) {
     ++counts.draws;
@@ -115,6 +123,7 @@ VKAPI_ATTR VkResult VKAPI_CALL myCreatePipelines(VkDevice d, VkPipelineCache pc,
     for (uint32_t i = 0; i < ci->pVertexInputState->vertexAttributeDescriptionCount; ++i)
         counts.lastAttrFormats.push_back(ci->pVertexInputState->pVertexAttributeDescriptions[i].format);
     counts.lastFrontFace = ci->pRasterizationState->frontFace;
+    counts.lastRasterSamples = ci->pMultisampleState ? ci->pMultisampleState->rasterizationSamples : VK_SAMPLE_COUNT_1_BIT;
     counts.lastWriteMask = ci->pColorBlendState && ci->pColorBlendState->attachmentCount
                                ? ci->pColorBlendState->pAttachments[0].colorWriteMask : 0xFFFFFFFFu;
     counts.lastStencilTest = ci->pDepthStencilState ? int(ci->pDepthStencilState->stencilTestEnable) : -1;
@@ -171,7 +180,21 @@ VKAPI_ATTR void VKAPI_CALL myCopyImage(VkCommandBuffer c, VkImage si, VkImageLay
 VKAPI_ATTR VkResult VKAPI_CALL myCreateImage(VkDevice d, const VkImageCreateInfo* ci, const VkAllocationCallbacks* a, VkImage* out) {
     ++counts.imagesCreated;
     if (ci->usage & VK_IMAGE_USAGE_STORAGE_BIT) ++counts.imagesWithStorage;
-    return realCreateImage(d, ci, a, out);
+    counts.lastImageFlags = ci->flags;
+    counts.lastImageSamples = ci->samples;
+    if (ci->samples != VK_SAMPLE_COUNT_1_BIT) ++counts.imagesMultisample;
+    VkResult r = realCreateImage(d, ci, a, out);
+    if (r == VK_SUCCESS) imageTypes[*out] = ci->imageType;
+    return r;
+}
+VKAPI_ATTR VkResult VKAPI_CALL myCreateImageView(VkDevice d, const VkImageViewCreateInfo* ci, const VkAllocationCallbacks* a, VkImageView* out) {
+    counts.lastViewFormat = ci->format;
+    counts.lastViewType = ci->viewType;
+    auto it = imageTypes.find(ci->image);
+    if (it != imageTypes.end() && it->second == VK_IMAGE_TYPE_3D && ci->viewType != VK_IMAGE_VIEW_TYPE_3D &&
+        ci->viewType != VK_IMAGE_VIEW_TYPE_2D_ARRAY)
+        ++counts.viewsOf3DAs2D;
+    return realCreateImageView(d, ci, a, out);
 }
 
 VKAPI_ATTR void VKAPI_CALL myClearColorImage(VkCommandBuffer c, VkImage i, VkImageLayout l, const VkClearColorValue* v, uint32_t n,
@@ -211,6 +234,7 @@ PFN_vkVoidFunction intercept(const char* name, PFN_vkVoidFunction real) {
     I("vkCmdDispatchIndirect", myDispatchIndirect, realDispatchIndirect)
     I("vkCmdCopyImage", myCopyImage, realCopyImage)
     I("vkCreateImage", myCreateImage, realCreateImage)
+    I("vkCreateImageView", myCreateImageView, realCreateImageView)
     I("vkCmdClearColorImage", myClearColorImage, realClearColorImage)
     I("vkCmdClearDepthStencilImage", myClearDepthImage, realClearDepthImage)
     I("vkUpdateDescriptorSets", myUpdateSets, realUpdateSets)
@@ -1340,6 +1364,20 @@ void testDraw() {
         CHECK(sampledView() == black);  // the sampler's mipmapped filter needs levels the texture lacks
         glBindSampler(0, 0);
         CHECK(sampledView() == own && err() == gl::NO_ERROR);
+        // ES 2.0: the chain runs down to 1x1 (a 128x64 texture has 8 levels): without its last level a mipmapped texture is incomplete.
+        {
+            GLuint tn;
+            glGenTextures(1, &tn);
+            glBindTexture(gl::TEXTURE_2D, tn);
+            glTexParameteri(gl::TEXTURE_2D, gl::TEXTURE_MIN_FILTER, gl::NEAREST_MIPMAP_NEAREST);
+            const std::vector<uint8_t> big(128 * 64 * 4, 255);
+            for (int l = 0; l < 7; ++l)
+                glTexImage2D(gl::TEXTURE_2D, l, gl::RGBA, std::max(1, 128 >> l), std::max(1, 64 >> l), 0, gl::RGBA, gl::UNSIGNED_BYTE, big.data());
+            const VkImageView missing = sampledView();
+            glTexImage2D(gl::TEXTURE_2D, 7, gl::RGBA, 1, 1, 0, gl::RGBA, gl::UNSIGNED_BYTE, big.data());
+            const VkImageView full = sampledView();
+            CHECK(missing == black && full != black && err() == gl::NO_ERROR);
+        }
     }
     // Client-side arrays + client indices, triangle fans, line loops, unsigned byte indices.
     glBindBuffer(gl::ARRAY_BUFFER, 0);
@@ -2428,6 +2466,93 @@ void testEs31() {
             CHECK(err() == gl::INVALID_VALUE);
             glUseProgram(p);
         }
+    }
+
+    // ---- image units: a slice of a 3D texture as image2D (Metal cannot view 3D as 2D: a 2D copy of the slice is
+    // bound, copied in before the dispatch and back after it) and a format other than the texture's
+    {
+        G(glCreateShader, GLuint (*)(GLenum));
+        G(glShaderSource, void (*)(GLuint, GLsizei, const char* const*, const GLint*));
+        G(glCompileShader, void (*)(GLuint));
+        G(glGetShaderiv, void (*)(GLuint, GLenum, GLint*));
+        G(glCreateProgram, GLuint (*)());
+        G(glAttachShader, void (*)(GLuint, GLuint));
+        G(glLinkProgram, void (*)(GLuint));
+        G(glGetProgramiv, void (*)(GLuint, GLenum, GLint*));
+        G(glBindImageTexture, void (*)(GLuint, GLuint, GLint, GLboolean, GLint, GLenum, GLenum));
+        G(glTexStorage3D, void (*)(GLenum, GLsizei, GLenum, GLsizei, GLsizei, GLsizei));
+        G(glTexStorage2D, void (*)(GLenum, GLsizei, GLenum, GLsizei, GLsizei));
+        auto compute = [&](const char* src) {
+            GLuint sh = glCreateShader(gl::COMPUTE_SHADER);
+            glShaderSource(sh, 1, &src, nullptr);
+            glCompileShader(sh);
+            GLuint cp = glCreateProgram();
+            glAttachShader(cp, sh);
+            glLinkProgram(cp);
+            GLint linked = 0;
+            glGetProgramiv(cp, gl::LINK_STATUS, &linked);
+            return linked ? cp : 0u;
+        };
+        const GLuint slice = compute(
+            "#version 310 es\nlayout(local_size_x = 4) in;\n"
+            "layout(r32ui, binding = 0) readonly uniform highp uimage2D src;\n"
+            "layout(r32ui, binding = 1) writeonly uniform highp uimage2D dst;\n"
+            "void main() { ivec2 p = ivec2(int(gl_GlobalInvocationID.x), 0); imageStore(dst, p, imageLoad(src, p)); }\n");
+        CHECK(slice != 0);
+        GLuint t3, t2;
+        glGenTextures(1, &t3);
+        glGenTextures(1, &t2);
+        glBindTexture(gl::TEXTURE_3D, t3);
+        glTexStorage3D(gl::TEXTURE_3D, 1, 0x8236 /*R32UI*/, 4, 4, 4);
+        glBindTexture(gl::TEXTURE_2D, t2);
+        glTexStorage2D(gl::TEXTURE_2D, 1, 0x8236, 4, 4);
+        CHECK(err() == gl::NO_ERROR);
+        if (slice) {
+            glUseProgram(slice);
+            glBindImageTexture(0, t3, 0, 0, 2, gl::READ_ONLY, 0x8236);
+            glBindImageTexture(1, t2, 0, 0, 0, gl::WRITE_ONLY, 0x8236);
+            CHECK(err() == gl::NO_ERROR);
+            counts = {};  // (the binds made the textures storage-capable: images re-created, contents carried over)
+            glDispatchCompute(1, 1, 1);
+            CHECK(err() == gl::NO_ERROR && counts.dispatches == 1);
+            CHECK(counts.copiesImage == 1);  // the slice in; read-only: nothing comes back
+            CHECK(counts.viewsOf3DAs2D == 0);
+            // Written: copied back after the dispatch.
+            glBindImageTexture(0, t2, 0, 0, 0, gl::READ_ONLY, 0x8236);
+            glBindImageTexture(1, t3, 0, 0, 3, gl::WRITE_ONLY, 0x8236);
+            counts.copiesImage = 0;
+            glDispatchCompute(1, 1, 1);
+            CHECK(err() == gl::NO_ERROR && counts.copiesImage == 2 && counts.viewsOf3DAs2D == 0);
+            // A layer past the depth: reads zero, no error, no 2D view of the 3D image.
+            glBindImageTexture(1, t3, 0, 0, 9, gl::WRITE_ONLY, 0x8236);
+            glDispatchCompute(1, 1, 1);
+            CHECK(err() == gl::NO_ERROR && counts.viewsOf3DAs2D == 0);
+        }
+        // Format reinterpretation: an RGBA8 texture read as R32UI gets a view of that format.
+        const GLuint reint = compute(
+            "#version 310 es\nlayout(local_size_x = 4) in;\n"
+            "layout(r32ui, binding = 0) readonly uniform highp uimage2D src;\n"
+            "layout(r32ui, binding = 1) writeonly uniform highp uimage2D dst;\n"
+            "void main() { ivec2 p = ivec2(int(gl_GlobalInvocationID.x), 0); imageStore(dst, p, imageLoad(src, p)); }\n");
+        CHECK(reint != 0);
+        GLuint ta, tb;
+        glGenTextures(1, &ta);
+        glGenTextures(1, &tb);
+        glBindTexture(gl::TEXTURE_2D, ta);
+        glTexStorage2D(gl::TEXTURE_2D, 1, gl::RGBA8, 4, 4);
+        glBindTexture(gl::TEXTURE_2D, tb);
+        glTexStorage2D(gl::TEXTURE_2D, 1, 0x8236, 4, 4);
+        if (reint) {
+            glUseProgram(reint);
+            counts = {};
+            glBindImageTexture(0, ta, 0, 0, 0, gl::READ_ONLY, 0x8236);
+            CHECK(counts.lastImageFlags & VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT);
+            glBindImageTexture(1, tb, 0, 0, 0, gl::WRITE_ONLY, 0x8236);
+            glDispatchCompute(1, 1, 1);
+            CHECK(err() == gl::NO_ERROR && counts.dispatches == 1);
+            CHECK(counts.lastViewFormat == VK_FORMAT_R32_UINT);
+        }
+        glUseProgram(p);
     }
 
     // ---- texture buffers

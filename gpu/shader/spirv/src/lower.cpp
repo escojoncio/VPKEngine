@@ -483,7 +483,28 @@ private:
     }
     ValueId vecOf(const std::vector<ValueId>& parts, Type t) {
         if (t.width == 1) return parts.at(0);
-        return b_->construct(parts, t);
+        unsigned n = 0;
+        bool ok = true;
+        for (ValueId p : parts) {
+            const Type pt = typeOfValue(p);
+            n += pt.width, ok = ok && pt.scalar == t.scalar;
+        }
+        if (ok && n == t.width) return b_->construct(parts, t);
+        // A vector whose parts do not match its type (mixed scalar types or a wrong count): rebuilt component by
+        // component (converted to the element type, padded with zeros / truncated) so the module still verifies.
+        std::vector<ValueId> comps;
+        for (ValueId p : parts) {
+            const unsigned pw = typeOfValue(p).width;
+            for (unsigned i = 0; i < pw; ++i) {
+                ValueId c = pw == 1 ? p : ext(p, i);
+                const Type ct = typeOfValue(c);
+                if (ct.scalar != t.scalar) c = ct.isInt() && t.isInt() ? castBits(c, t.element()) : cast(c, t.element());
+                comps.push_back(c);
+            }
+        }
+        while (comps.size() < t.width) comps.push_back(zeroOf(t.element()));
+        comps.resize(t.width);
+        return b_->construct(comps, t);
     }
     ValueId splatValue(ValueId s, uint8_t width) {
         if (width == 1) return s;
@@ -3917,7 +3938,7 @@ private:
             std::vector<ValueId> parts;
             for (uint32_t i = 3; i < in.count; ++i) parts.push_back(get1(w(in, i)));
             if (parts.size() == 1 && typeOfValue(parts[0]).width == rt.count) return Val{{parts[0]}};
-            return Val{{b_->construct(parts, vt(rtId))}};
+            return Val{{vecOf(parts, vt(rtId))}};
         }
         Val r;
         for (uint32_t i = 3; i < in.count; ++i) {

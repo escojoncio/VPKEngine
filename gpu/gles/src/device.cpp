@@ -242,14 +242,41 @@ VkImageView Image::attachmentView(uint32_t level, uint32_t layer, uint32_t layer
     return v;
 }
 
-VkImageView Image::storageView(uint32_t level, uint32_t layer, uint32_t layerCount, VkImageViewType type) {
-    const uint64_t key = 1ull << 62 | uint64_t(type) << 56 | uint64_t(level) << 40 | uint64_t(layer) << 20 | layerCount;
+ImageP createImage2D(Device* dev, const FormatInfo* f, uint32_t w, uint32_t h, uint32_t layers, uint32_t samples,
+                     VkImageUsageFlags usage, VkImageCreateFlags flags) {
+    auto img = std::make_shared<Image>();
+    img->dev = dev;
+    img->format = f;
+    img->width = std::max(w, 1u), img->height = std::max(h, 1u), img->layers = std::max(layers, 1u);
+    img->samples = VkSampleCountFlagBits(std::max(samples, 1u));
+    VkImageCreateInfo ci{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+    ci.imageType = VK_IMAGE_TYPE_2D, ci.format = f->vk, ci.extent = {img->width, img->height, 1};
+    ci.mipLevels = 1, ci.arrayLayers = img->layers, ci.samples = img->samples;
+    ci.tiling = VK_IMAGE_TILING_OPTIMAL;
+    ci.usage = usage;
+    ci.flags = flags;
+    ci.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    if (dev->vk.vkCreateImage(dev->device, &ci, nullptr, &img->image) != VK_SUCCESS) return nullptr;
+    VkMemoryRequirements req;
+    dev->vk.vkGetImageMemoryRequirements(dev->device, img->image, &req);
+    VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    mai.allocationSize = req.size;
+    mai.memoryTypeIndex = uint32_t(dev->memoryType(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT));
+    dev->vk.vkAllocateMemory(dev->device, &mai, nullptr, &img->memory);
+    dev->vk.vkBindImageMemory(dev->device, img->image, img->memory, 0);
+    return img;
+}
+
+VkImageView Image::storageView(uint32_t level, uint32_t layer, uint32_t layerCount, VkImageViewType type, VkFormat fmt) {
+    if (fmt == format->vk) fmt = VK_FORMAT_UNDEFINED;
+    const uint64_t key = 1ull << 62 | uint64_t(fmt != VK_FORMAT_UNDEFINED) << 61 | uint64_t(fmt & 0xFFF) << 49 |
+                         uint64_t(type) << 44 | uint64_t(level) << 32 | uint64_t(layer) << 16 | layerCount;
     auto it = views.find(key);
     if (it != views.end()) return it->second;
     VkImageViewCreateInfo ci{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
     ci.image = image;
     ci.viewType = type;
-    ci.format = format->vk;
+    ci.format = fmt != VK_FORMAT_UNDEFINED ? fmt : format->vk;
     ci.subresourceRange = {aspect(), level, 1, layer, layerCount};
     VkImageView v = VK_NULL_HANDLE;
     dev->vk.vkCreateImageView(dev->device, &ci, nullptr, &v);

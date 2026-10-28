@@ -374,6 +374,99 @@ static int imageDim(uint32_t t) {
     return int(t - base);
 }
 
+// The 13 formats of glBindImageTexture (ES 3.1 table 8.27) as the Vulkan format a view reads them with; UNDEFINED otherwise.
+static VkFormat imageViewFormat(GLenum f) {
+    switch (f) {
+        case 0x8814: return VK_FORMAT_R32G32B32A32_SFLOAT;  // RGBA32F
+        case 0x881A: return VK_FORMAT_R16G16B16A16_SFLOAT;  // RGBA16F
+        case 0x822E: return VK_FORMAT_R32_SFLOAT;           // R32F
+        case 0x8058: return VK_FORMAT_R8G8B8A8_UNORM;       // RGBA8
+        case 0x8F97: return VK_FORMAT_R8G8B8A8_SNORM;       // RGBA8_SNORM
+        case 0x8D82: return VK_FORMAT_R32G32B32A32_SINT;    // RGBA32I
+        case 0x8D88: return VK_FORMAT_R16G16B16A16_SINT;    // RGBA16I
+        case 0x8D8E: return VK_FORMAT_R8G8B8A8_SINT;        // RGBA8I
+        case 0x8235: return VK_FORMAT_R32_SINT;             // R32I
+        case 0x8D70: return VK_FORMAT_R32G32B32A32_UINT;    // RGBA32UI
+        case 0x8D76: return VK_FORMAT_R16G16B16A16_UINT;    // RGBA16UI
+        case 0x8D7C: return VK_FORMAT_R8G8B8A8_UINT;        // RGBA8UI
+        case 0x8236: return VK_FORMAT_R32_UINT;             // R32UI
+        default: return VK_FORMAT_UNDEFINED;
+    }
+}
+// Texel size of those formats (a view may only reinterpret between equal sizes).
+static uint32_t imageFormatBytes(VkFormat f) {
+    switch (f) {
+        case VK_FORMAT_R32G32B32A32_SFLOAT: case VK_FORMAT_R32G32B32A32_SINT: case VK_FORMAT_R32G32B32A32_UINT: return 16;
+        case VK_FORMAT_R16G16B16A16_SFLOAT: case VK_FORMAT_R16G16B16A16_SINT: case VK_FORMAT_R16G16B16A16_UINT: return 8;
+        default: return 4;
+    }
+}
+
+VkImageView Context::sliceView(Texture& t, uint32_t level, GLint layer, GLenum access, VkFormat format) {
+    Image& im = *t.image;
+    const uint32_t w = std::max(1u, im.width >> level), h = std::max(1u, im.height >> level), depth = std::max(1u, im.depth >> level);
+    if (!dispatching_ || layer < 0 || uint32_t(layer) >= depth) {
+        static std::atomic<int> said{0};
+        if (said.fetch_add(1) < 8)
+            logf("gles.warn what=image2d_of_3d_unsupported texture=%u level=%u layer=%d dispatch=%d (the image reads as zero)", t.name, level, int(layer), int(dispatching_));
+        return VK_NULL_HANDLE;
+    }
+    // One 2D proxy per (3D image, level): the slice is copied into it before the dispatch and back after it.
+    auto& proxy = sliceProxies_[{&im, level}];
+    if (proxy && (proxy->format != im.format || proxy->width != w || proxy->height != h)) {
+        keep(proxy);
+        proxy.reset();
+    }
+    if (!proxy) {
+        if (sliceProxies_.size() > 16) {
+            for (auto it = sliceProxies_.begin(); it != sliceProxies_.end();) {
+                if (&it->second == &proxy) { ++it; continue; }
+                keep(it->second);
+                it = sliceProxies_.erase(it);
+            }
+        }
+        proxy = createImage2D(dev, im.format, w, h, 1, 1,
+                              VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                              VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT);
+        if (!proxy) return VK_NULL_HANDLE;
+        proxy->storage = true;
+        imageInit(*proxy);
+    }
+    VkImageCopy r{};
+    r.srcSubresource = {im.aspect(), level, 0, 1};
+    r.srcOffset = {0, 0, layer};
+    r.dstSubresource = {im.aspect(), 0, 0, 1};
+    r.extent = {w, h, 1};
+    dev->vk.vkCmdCopyImage(cmd(), im.image, VK_IMAGE_LAYOUT_GENERAL, proxy->image, VK_IMAGE_LAYOUT_GENERAL, 1, &r);
+    barrier();
+    SliceSync s;
+    s.proxy = proxy;
+    s.source = t.image;
+    s.level = level, s.slice = uint32_t(layer);
+    s.writeBack = access != gl::READ_ONLY;
+    if (s.writeBack) sliceBack_.push_back(s);
+    keep(proxy);
+    return proxy->storageView(0, 0, 1, VK_IMAGE_VIEW_TYPE_2D, format);
+}
+
+// After a dispatch that used slice proxies: the written ones go back into their 3D texture.
+void Context::syncSlicesBack() {
+    if (sliceBack_.empty()) return;
+    barrier();
+    for (const SliceSync& s : sliceBack_) {
+        const Image& im = *s.source;
+        VkImageCopy r{};
+        r.srcSubresource = {im.aspect(), 0, 0, 1};
+        r.dstSubresource = {im.aspect(), s.level, 0, 1};
+        r.dstOffset = {0, 0, int32_t(s.slice)};
+        r.extent = {s.proxy->width, s.proxy->height, 1};
+        dev->vk.vkCmdCopyImage(cmd(), s.proxy->image, VK_IMAGE_LAYOUT_GENERAL, im.image, VK_IMAGE_LAYOUT_GENERAL, 1, &r);
+        keep(s.source);
+    }
+    sliceBack_.clear();
+    barrier();
+}
+
 // ---- program binary ---------------------------------------------------------------------------------
 // Blob (little endian): magic, version, payload size, FNV-1a 64 of the payload; payload = u32 separable flag,
 // u32 stage count, per stage {u32 GL shader type, u32 length, source as compiled}, u32 binding count, per binding
@@ -1064,10 +1157,16 @@ bool Context::bindResources(Program& p) {
                 if (t && t->image && t->image->storage && dim != 5 && uint32_t(iu.level) < t->image->levels) {
                     Image& im = *t->image;
                     im.invalid.clear();
+                    // The texel format the shader reads / writes with (glBindImageTexture's format) when it differs from the
+                    // texture's: a view of the same texel size.
+                    const VkFormat vf = imageViewFormat(iu.format);
+                    const VkFormat fmt = vf != VK_FORMAT_UNDEFINED && imageFormatBytes(vf) == imageFormatBytes(im.format->vk) ? vf : VK_FORMAT_UNDEFINED;
                     // image3D: the whole 3D level; layered image2DArray / imageCube: all layers; image2D: one layer.
-                    if (dim == 2) ii.imageView = im.storageView(uint32_t(iu.level), 0, 1, VK_IMAGE_VIEW_TYPE_3D);
-                    else if (dim == 7 || dim == 4 || dim == 8) ii.imageView = im.storageView(uint32_t(iu.level), 0, im.layers, VK_IMAGE_VIEW_TYPE_2D_ARRAY);
-                    else ii.imageView = im.storageView(uint32_t(iu.level), im.layers > 1 && !iu.layered ? uint32_t(iu.layer) : 0, 1, VK_IMAGE_VIEW_TYPE_2D);
+                    if (dim == 2) ii.imageView = im.storageView(uint32_t(iu.level), 0, 1, VK_IMAGE_VIEW_TYPE_3D, fmt);
+                    else if (dim == 7 || dim == 4 || dim == 8) ii.imageView = im.storageView(uint32_t(iu.level), 0, im.layers, VK_IMAGE_VIEW_TYPE_2D_ARRAY, fmt);
+                    else if (im.type == VK_IMAGE_TYPE_3D) ii.imageView = sliceView(*t, iu.level, iu.layered ? 0 : iu.layer, iu.access, fmt);
+                    else ii.imageView = im.storageView(uint32_t(iu.level), im.layers > 1 && !iu.layered ? uint32_t(iu.layer) : 0, 1, VK_IMAGE_VIEW_TYPE_2D, fmt);
+                    if (!ii.imageView) ii.imageView = blackTexture().image->storageView(0, 0, 1, VK_IMAGE_VIEW_TYPE_2D);
                     keep(t->image);
                 } else {
                     ii.imageView = blackTexture().image->storageView(0, 0, 1, VK_IMAGE_VIEW_TYPE_2D);  // unbound unit: reads 0 (undefined in GL)
@@ -1691,7 +1790,13 @@ bool Context::beginDispatch(Program*& pp) {
         return false;
     }
     dev->vk.vkCmdBindPipeline(cmd(), VK_PIPELINE_BIND_POINT_COMPUTE, pl);
-    if (!bindResources(*p)) return false;
+    dispatching_ = true;
+    const bool bound = bindResources(*p);
+    dispatching_ = false;
+    if (!bound) {
+        sliceBack_.clear();
+        return false;
+    }
     pp = p;
     return true;
 }
@@ -1703,6 +1808,7 @@ void Context::dispatch(GLuint x, GLuint y, GLuint z) {
     if (!beginDispatch(p)) return;
     dev->vk.vkCmdDispatch(cmd(), x, y, z);
     barrier();
+    syncSlicesBack();
 }
 
 void Context::dispatchIndirect(GLintptr offset) {
@@ -1715,6 +1821,7 @@ void Context::dispatchIndirect(GLintptr offset) {
     useStorage(ib->storage);
     dev->vk.vkCmdDispatchIndirect(cmd(), ib->storage->buffer, VkDeviceSize(offset));
     barrier();
+    syncSlicesBack();
 }
 
 // ---- indirect draws -----------------------------------------------------------------------------------

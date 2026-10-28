@@ -1084,6 +1084,17 @@ void testGather() {
         CHECK(far.fs.msl.find("int2(20, -31)") == std::string::npos && far.fs.msl.find("int2(-32, 3)") == std::string::npos);
         CHECK(far.fs.msl.find("get_width") != std::string::npos);
     }
+    // A dynamic offset (ES 3.2 / gpu_shader5): Metal's hardware offset is 4 bits wide, so offsets outside -8..7 move the
+    // coordinate (the size query is in the shader) and the operand is selected to zero for those.
+    Program dyn = build(kTrivialVs,
+        "#version 320 es\nprecision mediump float;\nuniform sampler2D t; uniform sampler2DArray ta; uniform sampler2DShadow ts; in vec2 uv; out vec4 o;\n"
+        "void main() { ivec2 d = ivec2(int(uv.x * 64.0) - 32, int(uv.y * 64.0) - 32);\n"
+        "    o = textureGatherOffset(t, uv, d, 1) + textureGatherOffset(ta, vec3(uv, 1.0), d) + textureGatherOffset(ts, uv, 0.5, d); }\n");
+    CHECK(dyn.ok);
+    if (dyn.ok) {
+        CHECK(dyn.fs.msl.find("get_width") != std::string::npos);
+        CHECK(dyn.fs.msl.find("gather") != std::string::npos);
+    }
     // ES 3.10: cube map arrays need the extension (and the layer's say-so); textureGather exists.
     const std::string fs310 = "#version 310 es\nprecision mediump float;\nuniform samplerCubeArray t; in vec2 uv; out vec4 o;\nvoid main() { o = texture(t, vec4(uv, 0.0, 0.0)); }\n";
     CHECK(compileFails(Stage::Fragment, fs310, "unknown type"));

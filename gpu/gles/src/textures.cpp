@@ -105,7 +105,10 @@ bool Context::realizeTexture(Texture& t) {
     if (!l0.format->compressed && (!is3D || (ci.flags & VK_IMAGE_CREATE_2D_ARRAY_COMPATIBLE_BIT)))
         ci.usage |= l0.format->depth || l0.format->stencil ? VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT
                                                            : VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
-    if (storage) ci.usage |= VK_IMAGE_USAGE_STORAGE_BIT;  // lazy: ShaderWrite turns off lossless compression on Apple GPUs
+    if (storage) {
+        ci.usage |= VK_IMAGE_USAGE_STORAGE_BIT;  // lazy: ShaderWrite turns off lossless compression on Apple GPUs
+        ci.flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;  // glBindImageTexture may read the texels with another format of the same size
+    }
     ci.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
     if (dev->vk.vkCreateImage(dev->device, &ci, nullptr, &img->image) != VK_SUCCESS) {
         setError(gl::OUT_OF_MEMORY);
