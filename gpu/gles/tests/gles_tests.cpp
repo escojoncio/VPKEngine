@@ -3173,6 +3173,10 @@ void testErrors() {
     CHECK(err() == gl::INVALID_ENUM);
     glTexParameteri(gl::TEXTURE_2D, gl::TEXTURE_MAG_FILTER, 0);
     CHECK(err() == gl::INVALID_ENUM);
+    glTexParameteri(gl::TEXTURE_2D, gl::TEXTURE_MIN_LOD, -1000);  // not an enumerated parameter: any value (gluStateReset sets it)
+    CHECK(err() == gl::NO_ERROR);
+    glTexImage2D(gl::TEXTURE_2D, 0, gl::SRGB8, 1, 1, 0, 0x8C40 /* GL_SRGB_EXT */, gl::UNSIGNED_BYTE, nullptr);
+    CHECK(err() == gl::NO_ERROR);
     e.down();
     // No current context: calls are ignored, not crashes.
     G(glClear, void (*)(GLbitfield));

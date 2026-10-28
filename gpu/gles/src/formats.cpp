@@ -232,6 +232,8 @@ static uint32_t components(GLenum format) {
 }
 
 GLenum transferError(const FormatInfo& f, GLenum format, GLenum type, bool sub) {
+    if (format == 0x8C40) format = RGB;        // GL_SRGB_EXT / GL_SRGB_ALPHA_EXT (EXT_sRGB): the same data layout
+    else if (format == 0x8C42) format = RGBA;
     switch (format) {
         case RED: case RG: case RGB: case RGBA: case RED_INTEGER: case RG_INTEGER: case RGB_INTEGER: case RGBA_INTEGER:
         case DEPTH_COMPONENT: case DEPTH_STENCIL: case LUMINANCE: case LUMINANCE_ALPHA: case ALPHA: case BGRA_EXT: break;

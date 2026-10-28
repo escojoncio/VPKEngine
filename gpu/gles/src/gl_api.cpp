@@ -1483,8 +1483,13 @@ void GenerateMipmap(GLenum target) {
 }
 // The enumerated texture / sampler parameters take only their own values (INVALID_ENUM otherwise).
 bool validTexParamEnum(GLenum p, double v) {
+    switch (p) {
+        case gl::TEXTURE_MIN_FILTER: case gl::TEXTURE_MAG_FILTER: case gl::TEXTURE_WRAP_S: case gl::TEXTURE_WRAP_T:
+        case gl::TEXTURE_WRAP_R: case gl::TEXTURE_COMPARE_MODE: case gl::TEXTURE_COMPARE_FUNC: break;
+        default: return true;  // not an enumerated parameter (LOD, levels, swizzle...)
+    }
+    if (v < 0 || v > 4294967295.0 || v != double(GLenum(v))) return false;
     const GLenum e = GLenum(v);
-    if (v != double(e)) return false;
     switch (p) {
         case gl::TEXTURE_MIN_FILTER:
             return e == gl::NEAREST || e == gl::LINEAR || e == gl::NEAREST_MIPMAP_NEAREST || e == gl::LINEAR_MIPMAP_NEAREST ||
