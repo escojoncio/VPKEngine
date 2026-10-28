@@ -1,0 +1,6 @@
+Apple metal version 32023.883 (metalfe-32023.883)
+1000 programs: 1000 match, 0 mismatch, 0 lift errors, 0 eval errors, 0 not run (reference)
+programs: 1000 programs, 0 Metal errors
+400 programs: 400 match, 0 mismatch, 0 lift errors, 0 eval errors, 0 not run (reference)
+programs_cf: 400 programs, 0 Metal errors
+compile_msl: 1400 programs, 0 failed
