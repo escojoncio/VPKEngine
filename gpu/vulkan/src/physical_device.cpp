@@ -217,6 +217,11 @@ constexpr FormatRow kFormats[] = {
     // B4G4R4A4 (mandatory: sample, filter, blit source) = the same texture with R and B swapped:
     // image views swizzle them back, clears and blit sources swap them (isSwappedRB).
     {VK_FORMAT_B4G4R4A4_UNORM_PACK16, vpgpu::Format::ABGR4Unorm},
+    // A2R10G10B10 = A2B10G10R10 with R and B swapped (isSwappedRB): the same texture, views swizzle them back.
+    {VK_FORMAT_A2R10G10B10_UNORM_PACK32, vpgpu::Format::RGB10A2Unorm},
+    {VK_FORMAT_A2R10G10B10_UINT_PACK32, vpgpu::Format::RGB10A2Uint},
+    // Single and dual channel sRGB (Metal: R8Unorm_sRGB / RG8Unorm_sRGB).
+    {VK_FORMAT_R8_SRGB, vpgpu::Format::R8Srgb}, {VK_FORMAT_R8G8_SRGB, vpgpu::Format::RG8Srgb},
     {VK_FORMAT_D16_UNORM, vpgpu::Format::D16Unorm}, {VK_FORMAT_D32_SFLOAT, vpgpu::Format::D32Float},
     {VK_FORMAT_D24_UNORM_S8_UINT, vpgpu::Format::D24UnormS8},
     // Depth-only D24 (common on Android GPUs): the same texture as D24S8 (Apple: Depth32Float_Stencil8,
@@ -286,7 +291,9 @@ const MultiPlane& multiPlane(VkFormat f) {
   }
 }
 
-bool isSwappedRB(VkFormat f) { return f == VK_FORMAT_B4G4R4A4_UNORM_PACK16; }
+bool isSwappedRB(VkFormat f) {
+  return f == VK_FORMAT_B4G4R4A4_UNORM_PACK16 || f == VK_FORMAT_A2R10G10B10_UNORM_PACK32 || f == VK_FORMAT_A2R10G10B10_UINT_PACK32;
+}
 
 vpgpu::Format toCoreFormat(VkFormat f) {
   for (const FormatRow& r : kFormats)
@@ -323,7 +330,8 @@ VkFormatFeatureFlags formatFeatures(VkFormat f, bool buffer) {
   if (isSwappedRB(f))
     return buffer || !extraExtensions()
                ? 0
-               : VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT | VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT |
+               : VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT |
+                     (vpgpu::formatInfo(core).integer() ? 0 : VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT) |
                      VK_FORMAT_FEATURE_BLIT_SRC_BIT | VK_FORMAT_FEATURE_TRANSFER_SRC_BIT |
                      VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
   const vpgpu::FormatInfo& info = vpgpu::formatInfo(core);

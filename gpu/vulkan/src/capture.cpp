@@ -796,7 +796,7 @@ void prepareImage(Device* dev, uint64_t id, std::vector<ImageJob>& jobs) {
           s.width = std::max(1u, d.width >> mip), s.height = std::max(1u, d.height >> mip);
           s.depth = d.type == vpgpu::TextureType::Tex3D ? std::max(1u, d.depth >> mip) : 1;
           sb.aspect = a.vk;
-          sb.store = isSwappedRB(im->info.format) ? kStoreSwappedRB4 : kStoreVulkan;
+          sb.store = im->info.format == VK_FORMAT_B4G4R4A4_UNORM_PACK16 ? kStoreSwappedRB4 : kStoreVulkan;
           j.subs.push_back(std::move(sb));
         }
   }

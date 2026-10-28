@@ -66,7 +66,8 @@ inline constexpr StageMask vertex = 1, fragment = 2, compute = 4, transfer = 8;
   X(Astc10x5, 16, 10, 5, 0) X(Astc10x5Srgb, 16, 10, 5, S) \
   X(Astc10x6, 16, 10, 6, 0) X(Astc10x6Srgb, 16, 10, 6, S) \
   X(Astc10x8, 16, 10, 8, 0) X(Astc10x8Srgb, 16, 10, 8, S) \
-  X(Astc12x10, 16, 12, 10, 0) X(Astc12x10Srgb, 16, 12, 10, S)
+  X(Astc12x10, 16, 12, 10, 0) X(Astc12x10Srgb, 16, 12, 10, S) \
+  X(R8Srgb, 1, 1, 1, S) X(RG8Srgb, 2, 1, 1, S)
 
 enum class Format : uint8_t {
 #define VPGPU_X(name, bytes, bw, bh, flags) name,

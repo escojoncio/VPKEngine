@@ -1614,6 +1614,36 @@ void testQuestExtras() {
     b.opt.vertexBuffers[0].divisor = 1;
     CHECK(h1 == b.hash());
   }
+  {
+    // Formats added for Quest parity.
+    const VkFormatFeatureFlags colour = VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT | VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT |
+                                        VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT | VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT |
+                                        VK_FORMAT_FEATURE_BLIT_SRC_BIT | VK_FORMAT_FEATURE_BLIT_DST_BIT;
+    VkFormatProperties fp;
+    for (VkFormat f : {VK_FORMAT_R8_SRGB, VK_FORMAT_R8G8_SRGB}) {
+      vkGetPhysicalDeviceFormatProperties(c.pd, f, &fp);
+      CHECK((fp.optimalTilingFeatures & colour) == colour && !(fp.optimalTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT));
+      VkImageFormatProperties ip;
+      CHECK(vkGetPhysicalDeviceImageFormatProperties(c.pd, f, VK_IMAGE_TYPE_2D, VK_IMAGE_TILING_OPTIMAL,
+                                                     VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, 0, &ip) == VK_SUCCESS);
+    }
+    // A2R10G10B10 is the R/B-swapped twin of A2B10G10R10: sampled and transferred (the unorm one also filtered), not rendered.
+    vkGetPhysicalDeviceFormatProperties(c.pd, VK_FORMAT_A2R10G10B10_UNORM_PACK32, &fp);
+    CHECK((fp.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT) &&
+          (fp.optimalTilingFeatures & VK_FORMAT_FEATURE_BLIT_SRC_BIT) && !(fp.optimalTilingFeatures & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT));
+    vkGetPhysicalDeviceFormatProperties(c.pd, VK_FORMAT_A2R10G10B10_UINT_PACK32, &fp);
+    CHECK((fp.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT) &&
+          !(fp.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT));
+    // Linear tiling is the same texture: filtered sampling and blit sources, like Quest; depth stays out.
+    vkGetPhysicalDeviceFormatProperties(c.pd, VK_FORMAT_R8G8B8A8_UNORM, &fp);
+    CHECK((fp.linearTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT) &&
+          (fp.linearTilingFeatures & VK_FORMAT_FEATURE_BLIT_SRC_BIT) && !(fp.linearTilingFeatures & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT));
+    vkGetPhysicalDeviceFormatProperties(c.pd, VK_FORMAT_D32_SFLOAT, &fp);
+    CHECK(!(fp.linearTilingFeatures & VK_FORMAT_FEATURE_BLIT_SRC_BIT));
+    // BCn is offered (the Quest report lists BC1-7 as sampled).
+    vkGetPhysicalDeviceFormatProperties(c.pd, VK_FORMAT_BC7_UNORM_BLOCK, &fp);
+    CHECK(fp.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT);
+  }
   vpvk_config_set_quest_identity(0);
 }
 

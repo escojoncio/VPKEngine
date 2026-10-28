@@ -970,10 +970,15 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkGetPhysicalDeviceFormatProperties(VkPhy
   p->optimalTilingFeatures = formatFeatures(f, false);
   // Linear images are only offered for transfers (staging): Metal linear textures are restrictive.
   // Multi-planar linear images: transfers only (each plane is a linear image of its own, see vkCreateImage).
+  // A linear colour image is the same texture as an optimal one (the host memory is its staging), so what a sampler or a blit
+  // source does with it holds for both: Quest reports linear = optimal for these.
+  const vpgpu::FormatInfo& lin = vpgpu::formatInfo(toCoreFormat(f));
+  const VkFormatFeatureFlags linearReads = lin.depth() || lin.stencil() ? 0
+                                           : VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT | VK_FORMAT_FEATURE_BLIT_SRC_BIT;
   p->linearTilingFeatures = p->optimalTilingFeatures &
                             (multiPlane(f).planes ? (VK_FORMAT_FEATURE_TRANSFER_SRC_BIT | VK_FORMAT_FEATURE_TRANSFER_DST_BIT)
                                                   : (VK_FORMAT_FEATURE_TRANSFER_SRC_BIT | VK_FORMAT_FEATURE_TRANSFER_DST_BIT |
-                                                     VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT));
+                                                     VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT | linearReads));
   p->bufferFeatures = formatFeatures(f, true);
   // A format the game asks about and gets nothing for: the first 64 are named (an engine that refuses to start over a
   // missing format then says which one in the log).

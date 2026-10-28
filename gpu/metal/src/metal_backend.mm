@@ -58,6 +58,8 @@ MTLPixelFormat pixelFormat(Format f) {
     case Format::RG8Snorm: return MTLPixelFormatRG8Snorm;
     case Format::RG8Uint: return MTLPixelFormatRG8Uint;
     case Format::RG8Sint: return MTLPixelFormatRG8Sint;
+    case Format::R8Srgb: return MTLPixelFormatR8Unorm_sRGB;
+    case Format::RG8Srgb: return MTLPixelFormatRG8Unorm_sRGB;
     case Format::RGBA8Unorm: return MTLPixelFormatRGBA8Unorm;
     case Format::RGBA8Srgb: return MTLPixelFormatRGBA8Unorm_sRGB;
     case Format::RGBA8Snorm: return MTLPixelFormatRGBA8Snorm;
