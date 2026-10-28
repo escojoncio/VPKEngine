@@ -1112,17 +1112,27 @@ struct Translator {
   // The game's own MSAA (VPVK_GAME_MSAA_AUTO, default on; =0 off): a colour 0 / depth attachment of a multisampled image the
   // game can never read the samples of (TextureDesc::samplesReadable) and that the pass resolves is handled like a forced-MSAA
   // twin: Attachment::autoMsaa, so its samples stay on tile whatever the geometry, the store is only the Resolve, and a later
-  // Load of it (another encoder or submit) is seeded from the resolve target. Left alone: any other usage, no resolve target,
-  // a partial render area, input attachments / later subpasses, stencil that must be loaded (the seed cannot restore it), and
-  // the depth VPKTAA reads after the frame (it keeps its samples). Called with forceMsaa, before uiPass.
+  // Load of it (another encoder or submit) is seeded from the resolve target. Left alone: any other usage, no resolve target
+  // (except a depth the game discards, below), a partial render area, input attachments / later subpasses, any Load (an attachment
+  // whose load is a Load continues samples an earlier pass stored: that includes a stencil aspect that loads, which makes the whole
+  // attachment's load a Load), and the depth VPKTAA reads after the frame (it keeps its samples). The seed restores depth and
+  // stencil, so a depth/stencil attachment is served only when its stencil survives a cut: it resolves stencil (stencilResolve
+  // not None) into a target created with format views (the stencil plane is read through a stencil view).
+  // A depth the game never resolves and discards (store DontCare, the usual MSAA depth) gets a 1x partner of ours
+  // (MsaaTwins::acquire, samples 1) as its resolve target: nothing resolves into it unless the frame compiler cuts a heavy
+  // encoder (splitHeavyAuto: every chunk resolves, the next seeds from it), so the colour of a heavy pass stays memoryless
+  // without the depth samples ever being stored. Called with forceMsaa, before uiPass.
   void gameAuto(vpgpu::RenderPassDesc& d, const VkRect2D& area, bool localRead, bool laterOrMultiSubpass) {
     Device* dev = devForce();
     if (!gameMsaaAuto() || !dev || !dev->gpu || localRead || laterOrMultiSubpass || d.rateMap) return;
+    bool alone = false;  // set once colour 0 is autoMsaa and no other colour is attached
     auto eligible = [&](vpgpu::Attachment& a, bool depth) {
-      // A Load continues samples an earlier pass stored (or, with autoMsaa, never stored): not ours. A stencil aspect that loads
-      // makes the whole attachment's load a Load (attach / the dynamic rendering merge), so it is covered too.
-      if (!a.texture || a.autoMsaa || !a.resolve || a.load == vpgpu::LoadAction::Load) return;
-      if (a.store != vpgpu::StoreAction::Resolve && a.store != vpgpu::StoreAction::StoreAndResolve) return;
+      if (!a.texture || a.autoMsaa || a.load == vpgpu::LoadAction::Load) return;
+      // No resolve target: colour is left alone; a depth the game discards gets the 1x partner below.
+      // (Only beside an autoMsaa colour 0 and no other colour: a memoryless depth next to samples that need memory would meet the
+      // tiler's flush on a heavy pass, where a depth with memory used to survive it.)
+      const bool ours = depth && !a.resolve && a.store == vpgpu::StoreAction::DontCare && alone;
+      if (!ours && (!a.resolve || (a.store != vpgpu::StoreAction::Resolve && a.store != vpgpu::StoreAction::StoreAndResolve))) return;
       vpgpu::TextureDesc td;
       if (!dev->gpu->textureDesc(a.texture, td) || td.samples < 2 || td.samplesReadable || td.type != vpgpu::TextureType::Tex2D) return;
       const uint32_t w = std::max(1u, td.width >> a.mip), h = std::max(1u, td.height >> a.mip);
@@ -1130,17 +1140,30 @@ struct Translator {
       if (depth) {
         if (taaPass && !taa->still) return;
       }
-      // The seed of a later Load reads the resolve target in a shader: it must be readable (entry.cpp adds no usage for this).
-      vpgpu::TextureDesc rd;
-      if (!dev->gpu->textureDesc(a.resolve, rd) || !(rd.usage & vpgpu::usage::sampled)) {
-        ++dev->msaaTwins.skipUnreadable;
-        return;
+      const bool stencil = depth && vpgpu::formatInfo(td.format).stencil();
+      if (!ours) {
+        // The seed of a later Load reads the resolve target in a shader: it must be readable (entry.cpp adds no usage for this).
+        vpgpu::TextureDesc rd;
+        if (!dev->gpu->textureDesc(a.resolve, rd) || !(rd.usage & vpgpu::usage::sampled)) {
+          ++dev->msaaTwins.skipUnreadable;
+          return;
+        }
+        // ... and its stencil plane, when there is one, through a stencil view (format views) of a resolved stencil.
+        if (stencil && (a.stencilResolve == vpgpu::ResolveMode::None || !(rd.usage & vpgpu::usage::formatView))) return;
+      } else {
+        const vpgpu::TextureId partner = dev->msaaTwins.acquire(dev, a.texture, td, 1, std::max<uint16_t>(d.layerCount, 1), a.mip, a.layer);
+        if (!partner) return;
+        a.resolve = partner, a.resolveMip = 0, a.resolveLayer = 0;
+        a.depthResolve = vpgpu::ResolveMode::Sample0;
+        a.stencilResolve = stencil ? vpgpu::ResolveMode::Sample0 : vpgpu::ResolveMode::None;
       }
       a.autoMsaa = true, a.needsSeed = false, a.keepSamples = false;
-      a.store = vpgpu::StoreAction::Resolve;
+      a.store = ours ? vpgpu::StoreAction::DontCare : vpgpu::StoreAction::Resolve;
       ++dev->msaaTwins.gameAuto;
     };
     eligible(d.colors[0], false);
+    alone = d.colors[0].autoMsaa;
+    for (int i = 1; i < vpgpu::kMaxColorAttachments; ++i) alone = alone && !d.colors[i].texture;
     eligible(d.depth, true);
   }
 
@@ -1880,14 +1903,21 @@ vpgpu::TextureId MsaaTwins::acquire(Device* dev, vpgpu::TextureId guest, const v
   td.usage = vpgpu::formatInfo(gd.format).depth() ? vpgpu::usage::depthTarget : vpgpu::usage::colorTarget;
   td.transient = true;  // never read after its pass: resolved into the guest image, samples on tile only
   td.label = "vk.msaa_force";
+  if (samples == 1) {
+    // The 1x partner of a depth the game never resolves (gameAuto): only a cut of a heavy encoder resolves into it, and the next
+    // chunk seeds its samples from it (depth plane, and the stencil plane through a stencil view: formatView). Memory only then.
+    td.usage |= vpgpu::usage::sampled;
+    if (vpgpu::formatInfo(gd.format).stencil()) td.usage |= vpgpu::usage::formatView;
+    td.label = "vk.msaa_seed";
+  }
   const vpgpu::TextureId id = dev->gpu->createTexture(td);
   if (!id) {
     logf("vk.err what=msaa_force_twin size=%ux%ux%u samples=%u", td.width, td.height, unsigned(layers), unsigned(samples));
     return {};
   }
   twins.push_back({guest, id, samples, layers, mip, layer});
-  logf("vk.msaa force twin %ux%ux%u samples=%u fmt=%s (tile memory, resolved into the game's image)", td.width, td.height,
-       unsigned(layers), unsigned(samples), vpgpu::formatInfo(gd.format).name);
+  logf("vk.msaa force twin %ux%ux%u samples=%u fmt=%s (%s)", td.width, td.height, unsigned(layers), unsigned(samples),
+       vpgpu::formatInfo(gd.format).name, samples == 1 ? "1x seed partner of a depth the game does not resolve" : "tile memory, resolved into the game's image");
   return id;
 }
 

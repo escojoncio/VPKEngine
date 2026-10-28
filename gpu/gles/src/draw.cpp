@@ -131,10 +131,10 @@ Context::FbInfo Context::resolveFramebuffer(GLuint name, bool forDraw) {
         }
         fb.width = s->width, fb.height = s->height;
         fb.color[0].image = s->color.get();
-        if (s->msColor) {  // rendered multisampled, resolved into the presented image when the pass ends
-            fb.color[0].image = s->msColor.get();
-            fb.color[0].resolve = s->color.get();
-            fb.samples = uint32_t(s->msColor->samples);
+        if (s->msSamples > 1) {  // rendered multisampled in a transient twin, resolved into the presented image when the pass ends
+            fb.color[0].implicit = true;
+            fb.color[0].seedImage = s->color;
+            fb.samples = s->msSamples;
         }
         if (s->depthStencil) {
             fb.depth.image = s->depthStencil.get();
@@ -240,7 +240,6 @@ Context::PassKey Context::passKeyFor(const FbInfo& fb) {
         if (bufs[size_t(i)] == gl::NONE) continue;
         const FbTarget& t = fb.color[size_t(i)];
         if (t.image) key.color[size_t(i)] = view(t, key.colorResolve[size_t(i)]);
-        if (t.image && t.resolve) key.colorResolve[size_t(i)] = t.resolve->attachmentView(0, 0, layerCount);
     }
     if (fb.depth.image) key.depth = view(fb.depth, key.depthResolve);
     if (fb.stencil.image) key.stencil = view(fb.stencil, key.stencilResolve);
@@ -1930,7 +1929,8 @@ Context::TransformFeedback& Context::curTf() {
 
 // The capture pass of a draw while transform feedback is active: the vertex shader variant runs once per vertex of the draw
 // as a point list (rasterizer off) and writes each vertex's record into a scratch buffer; the records are then put in primitive
-// order into the bound buffers on the CPU (buffers are host-visible). The draw waits for the GPU (flush(true)).
+// order into the bound buffers on the CPU (buffers are host-visible), which makes the draw wait for the GPU (flush(true)). Lists of
+// points / lines / triangles that are not indexed need no reordering: the GPU copies their records, no wait (see below).
 bool Context::captureTransformFeedback(GLenum mode, uint32_t count, uint32_t first, uint32_t instances, bool indexed,
                                        const std::vector<uint32_t>& indices, int32_t baseVertex) {
     Program* p = graphicsProgram();
@@ -1957,7 +1957,7 @@ bool Context::captureTransformFeedback(GLenum mode, uint32_t count, uint32_t fir
     if (baseV < 0) return true;
     const uint32_t W = p->refl.xfbRecordWords;
     const VkDeviceSize bytes = (vpglsl::kXfbHeaderWords + VkDeviceSize(n) * instances * W) * 4;
-    StorageP scratch = dev->newStorage(bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    StorageP scratch = dev->newStorage(bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
     if (!scratch) return setError(gl::OUT_OF_MEMORY), false;
     auto* head = reinterpret_cast<uint32_t*>(scratch->host);
     head[0] = n, head[1] = uint32_t(baseV);
@@ -1971,23 +1971,17 @@ bool Context::captureTransformFeedback(GLenum mode, uint32_t count, uint32_t fir
     if (!ok) return false;
     useStorage(scratch);
     dev->vk.vkCmdDraw(cmd(), n, instances, uint32_t(baseV), 0);
-    flush(true);
-    // Primitive order: assembled per instance, instance after instance.
-    std::vector<uint32_t> prims;
-    xfbAssemble(mode, seq.data(), seq.size(), indexed && primitiveRestart, 0xFFFFFFFFu, prims);
     const uint32_t perPrim = tf.mode == gl::POINTS ? 1 : tf.mode == gl::LINES ? 2 : 3;
-    std::vector<uint32_t> order;
-    order.reserve(prims.size() * instances);
-    for (uint32_t i = 0; i < instances; ++i)
-        for (uint32_t v : prims) order.push_back(i * n + v);
     // The bound buffers: interleaved takes every varying in binding 0, separate one per binding.
     const bool separate = p->xfbLinkedMode == 0x8C8D;
     const size_t nb = separate ? p->refl.xfb.size() : 1;
     std::vector<XfbOut> outs(nb);
+    std::vector<Buffer*> bufs(nb, nullptr);
     for (size_t b = 0; b < nb; ++b) {
         const auto& ib = tf.buffers[b];
         Buffer* buf = ib.buffer ? buffer(ib.buffer) : nullptr;
         if (!buf || !buf->storage) return true;
+        bufs[b] = buf;
         const uint64_t avail = ib.size ? uint64_t(ib.size) : uint64_t(buf->size) - uint64_t(ib.offset);
         XfbOut& o = outs[b];
         o.dst = buf->storage->host + ib.offset;
@@ -2000,6 +1994,39 @@ bool Context::captureTransformFeedback(GLenum mode, uint32_t count, uint32_t fir
             o.stride += xv.words * uint32_t(xv.arraySize) * 4;
         }
     }
+    // The records are already in the order GL writes them when the draw is a list of points / lines / triangles, not indexed, whole
+    // primitives per instance, and the one output takes the record as is (interleaved, or a single varying): the GPU copies them
+    // into the buffer, with no wait (Unity's GPU skinning does this every frame). Anything else is put in order on the CPU.
+    bool direct = !indexed && nb == 1 && (mode == gl::POINTS || mode == gl::LINES || mode == gl::TRIANGLES) && count % perPrim == 0 &&
+                  outs[0].stride == W * 4;
+    uint32_t at = 0;
+    for (const auto& [offset, words] : outs[0].parts) direct = direct && offset == at, at += words;
+    direct = direct && at == W;
+    if (direct) {
+        XfbOut& o = outs[0];
+        const uint64_t prims = uint64_t(count / perPrim) * instances;
+        const uint64_t fit = std::min<uint64_t>(prims, (o.room - std::min(o.room, o.used)) / (uint64_t(perPrim) * o.stride));
+        if (fit) {
+            const uint64_t bytes = fit * perPrim * o.stride;
+            Buffer* buf = bufs[0];
+            useStorage(buf->storage);
+            barrier();  // the capture draw's records are visible to the copy
+            const VkBufferCopy bc{vpglsl::kXfbHeaderWords * 4, VkDeviceSize(tf.buffers[0].offset) + o.used, bytes};
+            dev->vk.vkCmdCopyBuffer(cmd(), scratch->buffer, buf->storage->buffer, 1, &bc);
+            barrier();  // ... and its output to whatever reads the buffer next
+            tf.used[0] += bytes;
+            xfbPrimitivesWritten += fit;
+        }
+        return true;
+    }
+    flush(true);
+    // Primitive order: assembled per instance, instance after instance.
+    std::vector<uint32_t> prims;
+    xfbAssemble(mode, seq.data(), seq.size(), indexed && primitiveRestart, 0xFFFFFFFFu, prims);
+    std::vector<uint32_t> order;
+    order.reserve(prims.size() * instances);
+    for (uint32_t i = 0; i < instances; ++i)
+        for (uint32_t v : prims) order.push_back(i * n + v);
     const uint64_t done = xfbWrite(order, perPrim, reinterpret_cast<const uint32_t*>(scratch->host) + vpglsl::kXfbHeaderWords, W, outs);
     for (size_t b = 0; b < nb; ++b) tf.used[b] = outs[b].used;
     xfbPrimitivesWritten += done;
@@ -2360,15 +2387,19 @@ bool Context::clearByDraw(const FbInfo& fb, const VkRect2D& rect, const ClearDra
             continue;
         }
         const FbTarget& t = fb.color[size_t(i)];
-        const Texture* src = t.implicit ? texture(t.tex) : nullptr;
-        if (!src || !src->image || src->target != gl::TEXTURE_2D || t.layer != 0) {  // no seed for these: they start undefined
+        // The source: the attached texture's image, or (default framebuffer) the surface's presented image.
+        const Texture* src = t.implicit && t.tex ? texture(t.tex) : nullptr;
+        ImageP srcImage = src ? src->image : t.implicit ? t.seedImage : nullptr;
+        if (!srcImage || (src && src->target != gl::TEXTURE_2D) || t.layer != 0) {  // no seed for these: they start undefined
             logf("gles.warn msrtt seed skipped for colour %d (not a 2D texture)", i);
             continue;
         }
         auto tmp = std::make_unique<Texture>();
         const GLuint tname = 0xFFFE0000u + GLuint(i);
-        tmp->name = tname, tmp->target = gl::TEXTURE_2D, tmp->image = src->image, tmp->levels = src->levels;
-        tmp->immutable = true, tmp->immutableLevels = GLint(src->image->levels);
+        tmp->name = tname, tmp->target = gl::TEXTURE_2D, tmp->image = srcImage;
+        if (src) tmp->levels = src->levels;
+        else tmp->levels = {Texture::Level{srcImage->width, srcImage->height, 1, srcImage->format}};
+        tmp->immutable = true, tmp->immutableLevels = GLint(srcImage->levels);
         tmp->baseLevel = tmp->maxLevel = GLint(t.level);
         tmp->sampler.minFilter = tmp->sampler.magFilter = gl::NEAREST;
         share->textures[tname] = std::move(tmp);
@@ -2566,8 +2597,7 @@ void Context::readPixels(GLint x, GLint y, GLsizei w, GLsizei h, GLenum format, 
         idx = int(f->readBuffer - gl::COLOR_ATTACHMENT0);
     }
     FbTarget src = fb.color[size_t(idx)];
-    if (src.resolve) src.image = src.resolve;  // multisample default framebuffer: its resolved image
-    else if (src.image && src.image->samples > 1) return setError(gl::INVALID_OPERATION, format);
+    if (src.image && src.image->samples > 1) return setError(gl::INVALID_OPERATION, format);
     if (!src.image) return setError(gl::INVALID_OPERATION, format);
     const uint32_t outPx = clientPixelBytes(format, type);
     if (!outPx) return setError(gl::INVALID_ENUM, format);
@@ -2642,7 +2672,6 @@ void Context::blitFramebuffer(GLint sx0, GLint sy0, GLint sx1, GLint sy1, GLint 
     int ri = 0;
     if (readFbo) ri = int(fbo(readFbo)->readBuffer - gl::COLOR_ATTACHMENT0);
     FbTarget& rc = rf.color[size_t(std::clamp(ri, 0, kMaxDrawBuffers - 1))];
-    if (rc.resolve) rc.image = rc.resolve;
     const auto& bufs = drawFbo ? fbo(drawFbo)->drawBuffers : fbos[0]->drawBuffers;
     auto multisampled = [](const FbTarget& t) { return t.image && t.image->samples > 1; };
     bool dstMS = ((mask & gl::DEPTH_BUFFER_BIT) && multisampled(df.depth)) || ((mask & gl::STENCIL_BUFFER_BIT) && multisampled(df.stencil));

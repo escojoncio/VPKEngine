@@ -3060,7 +3060,7 @@ void testAutoMsaa() {
     CHECK_EQ(compileFrame(h, &r.s.res, o).encoders.size(), 1u);
     CHECK_EQ(cf.stats.tileSplitSkipped, 0u);
   }
-  {  // a heavy encoder whose depth has a stencil aspect is not cut (the seed restores depth only): whole, counted
+  {  // a heavy encoder whose depth has a stencil aspect is cut when its 1x partner can be read for the stencil (formatView); else whole, counted
     Rig r;
     TextureDesc d;
     d.format = Format::D32FloatS8;
@@ -3087,6 +3087,26 @@ void testAutoMsaa() {
     // the same encoder under the limits is not heavy: nothing to skip, nothing counted
     o.tileMaxDraws = 100;
     CHECK_EQ(compileFrame(f, &r.s.res, o).stats.tileSplitSkipped, 0u);
+    {  // a 1x partner created with format views: cut like any other, both aspects resolve at every cut
+      TextureDesc fd;
+      fd.format = Format::D32FloatS8;
+      fd.width = fd.height = 256;
+      fd.usage = usage::sampled | usage::depthTarget | usage::formatView;
+      RenderPassDesc ps = p;
+      ps.depth.resolve = r.s.res.createTexture(fd);
+      ps.depth.stencilResolve = ResolveMode::None;
+      Frame fs;
+      fs.beginRenderPass(ps);
+      for (int i = 0; i < 5; ++i) fs.draw(Scene::draw());
+      fs.endRenderPass();
+      o.tileMaxDraws = 2;
+      CompiledFrame cs = compileFrame(fs, &r.s.res, o);
+      CHECK_EQ(cs.encoders.size(), 3u);
+      CHECK_EQ(cs.stats.tileSplitSkipped, 0u);
+      CHECK(cs.encoders[0].pass.depth.stencilResolve == ResolveMode::Sample0 && cs.encoders[1].pass.depth.depthResolve == ResolveMode::Sample0);
+      CHECK(cs.encoders[2].pass.depth.stencilResolve == ResolveMode::None);  // the final chunk keeps the client's mode
+      CHECK(cs.encoders[1].pass.depth.needsSeed && cs.encoders[2].pass.depth.needsSeed);
+    }
     // without the stencil aspect it is cut (the test above)
     RenderPassDesc q = r.pass(LoadAction::Clear);
     Frame g;
@@ -3109,12 +3129,17 @@ void testAutoMsaa() {
     CHECK_EQ(ch.encoders.size(), 1u);
     CHECK_EQ(ch.stats.tileSplitSkipSingle, 1u);
     CHECK_EQ(ch.stats.tileSplitSkipped, 1u);
-    // more than 32 chunks: whole, counted as cap
+    // more than 32 chunks are still cut (the sanity cap is 1024): beyond it whole, counted as cap
+    Frame w40;
+    w40.beginRenderPass(q);
+    for (int i = 0; i < 40; ++i) w40.draw(Scene::draw());
+    w40.endRenderPass();
+    o.tileMaxDraws = 1;
+    CHECK_EQ(compileFrame(w40, &r.s.res, o).encoders.size(), 40u);
     Frame w;
     w.beginRenderPass(q);
-    for (int i = 0; i < 40; ++i) w.draw(Scene::draw());
+    for (int i = 0; i < 1100; ++i) w.draw(Scene::draw());
     w.endRenderPass();
-    o.tileMaxDraws = 1;
     CompiledFrame cw = compileFrame(w, &r.s.res, o);
     CHECK_EQ(cw.encoders.size(), 1u);
     CHECK_EQ(cw.stats.tileSplitSkipCap, 1u);

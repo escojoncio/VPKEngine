@@ -1262,6 +1262,7 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkCreateDevice(VkPhysicalDevice pd,
   const auto have = deviceExtensions();
   auto* d = new Device;
   d->physical = from<PhysicalDevice>(pd);
+  bool wantIndexU8 = false;
   for (uint32_t i = 0; i < ci->enabledExtensionCount; ++i) {
     const char* e = ci->ppEnabledExtensionNames[i];
     // A game that enables the density map without checking (it is not advertised) is let through
@@ -1277,6 +1278,7 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkCreateDevice(VkPhysicalDevice pd,
       return VK_ERROR_EXTENSION_NOT_PRESENT;
     }
     if (!std::strcmp(e, VK_KHR_MULTIVIEW_EXTENSION_NAME)) d->multiview = true;
+    if (!std::strcmp(e, VK_EXT_INDEX_TYPE_UINT8_EXTENSION_NAME)) wantIndexU8 = true;
     if (!std::strcmp(e, VK_EXT_METAL_OBJECTS_EXTENSION_NAME)) d->metalObjects = true;
   }
   if (extraExtensions()) {
@@ -1329,6 +1331,7 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkCreateDevice(VkPhysicalDevice pd,
   d->gpu = std::make_unique<vpgpu::Device>(d->platform->backend(), workers, [](const std::string& s) { log(s); });
   for (uint32_t i = 0; i < kQueueCount; ++i) d->queues[i].device = d, d->queues[i].index = i;
   requestIndirectPatch(d);  // engine-internal kernel of GPU indirect draws: compiling (Urgent) before the game's first frame
+  if (wantIndexU8) requestIndexU8(d);  // the 8-bit index widening kernel too: no draw waits for its first compile
   // Pipeline recipes of earlier runs: compiled now, before the game's first frame, so its
   // vkCreate*Pipelines calls are cache hits. With vpvk_prewarm() run by the app beforehand this is
   // mostly binary-archive lookups.
@@ -2520,6 +2523,7 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkBeginCommandBuffer(VkCommandBuffer 
 }
 
 VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkEndCommandBuffer(VkCommandBuffer cb) {
+  from<CommandBuffer>(cb)->rec->flushHoisted();  // (a pass left open to be resumed)
   from<CommandBuffer>(cb)->state = CommandBuffer::State::Executable;
   return VK_SUCCESS;
 }
@@ -2563,6 +2567,7 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdBeginRenderPass(VkCommandBuffer cb,
   r.bound.fbWidth = op.framebuffer ? op.framebuffer->width : 0;
   r.bound.fbHeight = op.framebuffer ? op.framebuffer->height : 0;
   r.bound.fbLayers = op.framebuffer ? op.framebuffer->layers : 0;
+  r.flushHoisted();  // (a pass that was never ended)
   r.passBegin = r.ops.size();
   r.ops.emplace_back(std::move(op));
   r.inPass = true;
@@ -2576,6 +2581,7 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdBeginRenderPass2(VkCommandBuffer cb,
 
 VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdEndRenderPass(VkCommandBuffer cb) {
   Recorder& r = *from<CommandBuffer>(cb)->rec;
+  r.flushHoisted();
   r.ops.emplace_back(OpEndPass{});
   r.inPass = false;
   r.passBegin = SIZE_MAX;

@@ -2708,8 +2708,9 @@ void requestIndexU8(Device* d) {
   });
 }
 
-// True when the kernel is compiled; waits (bounded, 2 s, with a backoff after a timeout) while it is queued or compiling.
-bool indexU8Ready(Device* d, vpgpu::PipelineKey& key) {
+// True when the kernel is compiled (it is requested when the device is created: vkCreateDevice). While it is queued or compiling it
+// waits (bounded, 2 s, with a backoff after a timeout) only when `mayWait`: a caller that can read the indices on the CPU does not.
+bool indexU8Ready(Device* d, vpgpu::PipelineKey& key, bool mayWait) {
   requestIndexU8(d);
   key = d->indexU8Key;
   using Status = vpgpu::PipelineCache::Status;
@@ -2717,7 +2718,7 @@ bool indexU8Ready(Device* d, vpgpu::PipelineKey& key) {
   const auto nowNs = [] { return int64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now().time_since_epoch()).count()); };
   vpgpu::PipelineCache& cache = d->gpu->pipelines();
   Status st = cache.status(key);
-  if ((st == Status::Queued || st == Status::Compiling) && nowNs() >= d->indexU8BackoffNs.load(std::memory_order_relaxed)) {
+  if (mayWait && (st == Status::Queued || st == Status::Compiling) && nowNs() >= d->indexU8BackoffNs.load(std::memory_order_relaxed)) {
     cache.boost(key);
     cache.waitReady({key}, std::chrono::milliseconds(2000));
     st = cache.status(key);
@@ -2739,7 +2740,13 @@ static bool widenIndexU8(Recorder& r, uint64_t first, uint64_t n, bool restart, 
   if (!n || n > 0xFFFFFFFFull) return false;
   const uint64_t at = r.bound.indexOffset + first;
   vpgpu::PipelineKey key{};
-  if (r.passBegin != SIZE_MAX && r.passBegin < r.ops.size() && ib->id && indexU8Ready(r.device, key)) {
+  const bool inPass = r.passBegin != SIZE_MAX && r.passBegin < r.ops.size() && ib->id;
+  if (inPass)  // the same range drawn again in this pass (indirect draws widen the whole bound range): one copy
+    for (const Recorder::Widened& w : r.widened)
+      if (w.buffer == ib->id && w.at == at && w.n == n && w.restart == restart) return out = w.out, true;
+  // (A kernel still compiling is not waited for when the indices can be read on the CPU now.)
+  const bool hostReadable = ib->memory && ib->memory->host;
+  if (inPass && indexU8Ready(r.device, key, !hostReadable)) {
     std::vector<uint8_t> blob(16 + n * 2, 0);
     const uint32_t head[2] = {uint32_t(n), restart ? 1u : 0u};
     std::memcpy(blob.data(), head, sizeof head);
@@ -2759,9 +2766,9 @@ static bool widenIndexU8(Recorder& r, uint64_t first, uint64_t n, bool restart, 
     };
     dp.dispatch.bindings.push_back(acc(vpgpu::ResourceRange::bytes(ib->id, at, n), false, 0));
     dp.dispatch.bindings.push_back(acc(vpgpu::ResourceRange::bytes(arena, aoff, blob.size()), true, 1));
-    r.ops.insert(r.ops.begin() + std::ptrdiff_t(r.passBegin), Op{std::move(dp)});
-    ++r.passBegin;
+    r.hoisted.emplace_back(std::move(dp));  // before the pass begins: flushHoisted at its end
     out = vpgpu::IndexBuffer{arena, aoff + 16, false};
+    if (r.widened.size() < 16) r.widened.push_back({ib->id, at, n, restart, out});
     return true;
   }
   if (!ib->memory || !ib->memory->host) return false;
@@ -3210,8 +3217,7 @@ void recordIndirectDraw(Recorder& r, const Buffer* b, VkDeviceSize off, uint32_t
   dp.dispatch.bindings.push_back(acc(vpgpu::ResourceRange::bytes(arena, aoff, blob.size() * 4), true, 1));
   if (countBuf) dp.dispatch.bindings.push_back(acc(vpgpu::ResourceRange::bytes(countBuf->id, countOff, 4), false, 2));
   else dp.dispatch.bindings.push_back(acc(vpgpu::ResourceRange::bytes(b->id, off, 4), false, 2));
-  r.ops.insert(r.ops.begin() + std::ptrdiff_t(r.passBegin), Op{std::move(dp)});
-  ++r.passBegin;
+  r.hoisted.emplace_back(std::move(dp));  // before the pass begins: flushHoisted at its end
   op.gpuBuffer = arena, op.gpuOffset = aoff + 32;
   op.indirectStride = words * 4;
   r.ops.emplace_back(std::move(op));
@@ -3542,12 +3548,14 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdBeginRendering(VkCommandBuffer cb, c
   for (uint32_t i = 0; i < ri->colorAttachmentCount; ++i) keepImage(&ri->pColorAttachments[i]);
   keepImage(ri->pDepthAttachment);
   keepImage(ri->pStencilAttachment);
+  r.flushHoisted();  // (a pass that was never ended)
   r.passBegin = r.ops.size();
   r.ops.emplace_back(std::move(op));
   r.inPass = true;
 }
 VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdEndRendering(VkCommandBuffer cb) {
   Recorder& r = rec(cb);
+  r.flushHoisted();
   r.ops.emplace_back(OpEndPass{});
   r.inPass = false;
   r.passBegin = SIZE_MAX;

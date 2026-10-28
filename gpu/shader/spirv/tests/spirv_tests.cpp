@@ -946,6 +946,33 @@ void floatToInt(const std::string& dir) {
     }
 }
 
+// OpConvertFToS / OpConvertFToU of values a clamp bounds (ftoi_bounded.comp.spvasm): converted directly, none of the NaN / overflow
+// selects of the general case, same results. in = {3e10, -3e10, 200.25, -1.5}.
+void floatToIntBounded(const std::string& dir) {
+    spirv::SpirvLowerOptions o;
+    o.entry = "main";
+    o.stage = vpir::Stage::Compute;
+    o.layout = {bind(0, 0, vpgpu::BindKind::Buffer, 0), bind(0, 1, vpgpu::BindKind::Buffer, 1)};
+    Result r = run(dir + "/ftoi_bounded.comp.spv", o);
+    CHECK(r.ok);
+    if (!r.ok) return;
+    CHECK(vpir::print(r.module).find("isnan") == std::string::npos);
+    const float in[4] = {3e10f, -3e10f, 200.25f, -1.5f};
+    vpireval::Invocation inv;
+    inv.memory[0].resize(16);
+    std::memcpy(inv.memory[0].data(), in, 16);
+    inv.memory[1].assign(32, 0);
+    std::string err;
+    CHECK(vpireval::run(r.module, inv, err));
+    uint32_t got[8] = {};
+    if (inv.memory[1].size() >= 32) std::memcpy(got, inv.memory[1].data(), 32);
+    const uint32_t want[8] = {255, 0, 200, 0, 100, uint32_t(-100), 100, uint32_t(-1)};
+    for (int i = 0; i < 8; ++i) {
+        CHECK(got[i] == want[i]);
+        if (got[i] != want[i]) std::fprintf(stderr, "  [%d] got %08x want %08x\n", i, got[i], want[i]);
+    }
+}
+
 // 16-bit float GLSL.std.450 functions (f16math.comp.spvasm), evaluated: their constants must be binary16 and their
 // bit tricks / approximations run in 32 bits. in = {180, 1, -2, 11}.
 void f16Math(const std::string& dir) {
@@ -1815,6 +1842,7 @@ int main(int argc, char** argv) {
     else if (c == "dot") dotProduct(dir);
     else if (c == "zero_init") zeroInit(dir);
     else if (c == "float_to_int") floatToInt(dir);
+    else if (c == "float_to_int_bounded") floatToIntBounded(dir);
     else if (c == "f16_math") f16Math(dir);
     else if (c == "ldexp_range") ldexpRange(dir);
     else if (c == "output_init") outputInit(dir);

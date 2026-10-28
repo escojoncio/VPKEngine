@@ -637,11 +637,12 @@ public:
         Image* image = nullptr;
         uint32_t level = 0, layer = 0, layers = 1;
         bool multiview = false;
-        Image* resolve = nullptr;  // multisampled default-framebuffer colour: the single-sample image the pass resolves it into
         // EXT_multisampled_render_to_texture: `image` is single-sample and the pass renders in a transient multisample twin of it,
-        // resolved into it when the pass ends (the twin is never stored: it stays on the tile).
+        // resolved into it when the pass ends (the twin is never stored: it stays on the tile). The colour of a multisample default
+        // framebuffer is the same: `image` is the surface's presented image.
         bool implicit = false;
         GLuint tex = 0;  // the texture of such an attachment (its contents seed the twin)
+        ImageP seedImage;  // ... or, with no texture (the default framebuffer), the image that seeds the twin
     };
     struct FbInfo {
         std::array<FbTarget, kMaxDrawBuffers> color{};

@@ -279,8 +279,10 @@ ImageP Context::msTwin(const FormatInfo* f, uint32_t w, uint32_t h, uint32_t lay
         for (auto& [k, img] : msTwins_) keep(img);
         msTwins_.clear();
     }
+    // Transient: the samples never reach memory (the pass resolves them and the next one is seeded), so the backend keeps them on the tile.
     ImageP img = createImage2D(dev, f, w, h, layers, samples,
-                               f->depth || f->stencil ? VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT : VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT);
+                               (f->depth || f->stencil ? VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT : VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) |
+                                   VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT);
     if (!img) return nullptr;
     imageInit(*img);
     return msTwins_[key] = img;

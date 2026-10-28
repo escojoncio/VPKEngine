@@ -103,14 +103,18 @@ std::mutex gEglLock;
 bool createSurfaceImages(Device* dev, Surface& s) {
     const uint32_t n = s.config->samples > 1 ? renderSamples(uint32_t(s.config->samples)) : 1;
     auto make = [&](VkFormat f, bool depth, uint32_t samples) -> ImageP {
+        // Multisample images are attachments only: their samples are never read, so the backend can keep them on the tile.
         const VkImageUsageFlags usage =
-            (depth ? VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT : VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT) |
-            VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+            samples > 1 ? VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT
+                        : (depth ? VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT : VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT) |
+                              VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
         return createImage2D(dev, formatByVk(f), s.width, s.height, 1, samples, usage);
     };
     s.color = make(s.config->color, false, 1);
     if (!s.color) return false;
-    if (n > 1 && !(s.msColor = make(s.config->color, false, n))) return false;
+    // The multisample colour is not an image of the surface: the passes render it in a transient twin (Context::msTwin, an
+    // implicit-multisample attachment) that resolves into `color` and is seeded from it when a pass continues the picture.
+    s.msSamples = n;
     if (s.config->ds != VK_FORMAT_UNDEFINED) s.depthStencil = make(s.config->ds, true, n);
     return true;
 }
@@ -315,7 +319,6 @@ static EGLSurface CreateSurface(EGLConfig c, Surface::Kind kind, void* window, c
     Context tmp(device(), new ShareGroup, 3, 0);
     tmp.imageInit(*s->color);
     zeroSurfaceImage(tmp, *s->color);
-    if (s->msColor) tmp.imageInit(*s->msColor);  // read before written: VPVulkan's lazy zero-fill
     if (s->depthStencil) {
         tmp.imageInit(*s->depthStencil);
         if (s->depthStencil->samples == VK_SAMPLE_COUNT_1_BIT) zeroSurfaceImage(tmp, *s->depthStencil);

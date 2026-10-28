@@ -4651,6 +4651,45 @@ void testMsaaForce() {
       CHECK(!r.colors[0].autoMsaa && !r.depth.autoMsaa && r.colors[0].load == vpgpu::LoadAction::Load);
     }
     CHECK(d->msaaTwins.gameAuto == 3);  // the eligible pass (2) and the colour of the mixed one
+    {  // a depth the game never resolves and discards (the usual MSAA depth), beside an autoMsaa colour, gets a 1x partner of ours
+       // as its resolve target: nothing resolves into it unless the frame compiler cuts a heavy encoder
+      auto discarding = [&](vpgpu::TextureId color, vpgpu::TextureId colorResolve, vpgpu::TextureId depth, vpgpu::StoreAction depthStore,
+                            vpgpu::TextureId depthResolve = {}) {
+        OpBeginRendering b;
+        b.area = {{0, 0}, {640, 480}};
+        b.desc.colors[0].texture = color, b.desc.colors[0].store = vpgpu::StoreAction::Resolve, b.desc.colors[0].resolve = colorResolve;
+        b.desc.colors[0].load = vpgpu::LoadAction::Clear;
+        b.desc.depth.texture = depth, b.desc.depth.store = depthStore, b.desc.depth.resolve = depthResolve;
+        b.desc.depth.load = vpgpu::LoadAction::Clear;
+        OpDraw geo;
+        geo.draw.count = 3;
+        Recorder rec;
+        rec.ops.emplace_back(b), rec.ops.emplace_back(geo), rec.ops.emplace_back(OpEndPass{});
+        vpgpu::Frame f;
+        TranslateStats st;
+        translate(rec, f, st, nullptr, nullptr, nullptr, nullptr, d);
+        return std::get<vpgpu::RenderPass>(f.commands().at(0)).desc;
+      };
+      const vpgpu::RenderPassDesc r = discarding(mc, g1, md, vpgpu::StoreAction::DontCare);
+      vpgpu::TextureDesc pd;
+      CHECK(r.colors[0].autoMsaa && r.depth.autoMsaa && r.depth.resolve && r.depth.store == vpgpu::StoreAction::DontCare);
+      CHECK(c.gpu().textureDesc(r.depth.resolve, pd) && pd.samples == 1 && (pd.usage & vpgpu::usage::sampled) && pd.format == vpgpu::Format::D32Float);
+      CHECK(r.depth.depthResolve == vpgpu::ResolveMode::Sample0);
+      CHECK(discarding(mc, g1, md, vpgpu::StoreAction::DontCare).depth.resolve == r.depth.resolve);  // one partner per depth image
+      // the depth is kept (Store): the samples are the data
+      CHECK(!discarding(mc, g1, md, vpgpu::StoreAction::Store).depth.autoMsaa);
+      // not beside a colour that is not autoMsaa (a memoryless depth next to memory-backed samples would meet the tiler's flush)
+      CHECK(!discarding(rc, g1, md, vpgpu::StoreAction::DontCare).depth.autoMsaa);
+      // a stencil aspect: the partner is created with format views (the stencil plane is read through a stencil view) ...
+      const vpgpu::TextureId sd = mk(vpgpu::Format::D32FloatS8, 4, false);
+      const vpgpu::RenderPassDesc rs = discarding(mc, g1, sd, vpgpu::StoreAction::DontCare);
+      CHECK(rs.depth.autoMsaa && c.gpu().textureDesc(rs.depth.resolve, pd) && (pd.usage & vpgpu::usage::formatView) &&
+            rs.depth.stencilResolve == vpgpu::ResolveMode::Sample0);
+      // ... and a game resolve target without them cannot serve a stencil seed: left alone (also without a resolved stencil)
+      const vpgpu::TextureId gs = mk(vpgpu::Format::D32FloatS8, 1, true);
+      CHECK(!discarding(mc, g1, sd, vpgpu::StoreAction::Resolve, gs).depth.autoMsaa);
+      for (vpgpu::TextureId t : {sd, gs}) c.gpu().destroy(t);
+    }
     // The 1x attachment images get no extra usage from the game's own MSAA (a resolve target that is not readable is skipped above).
     auto img = [&](VkImageUsageFlags u, VkSampleCountFlagBits n) {
       VkImageCreateInfo ii{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
@@ -5510,7 +5549,7 @@ void testFoveation() {
 // CMake source fingerprint: a refactor that leaves the output alone keeps the digest (and every cache), a change of
 // output moves it. When this test fails the translator's OUTPUT changed: bump kLowerVersion (SPIR-V -> VPIR) or
 // kEmitVersion (VPIR -> MSL) in recipes.h, then update kCorpusDigest to the printed value in the same change.
-constexpr uint64_t kCorpusDigest = 0xe66673416a935ab0ull;  // the "corpus digest" line the test prints
+constexpr uint64_t kCorpusDigest = 0x31589cfbd8e1ecd8ull;  // the "corpus digest" line the test prints
 
 uint64_t corpusDigest(unsigned& modules, unsigned& failed) {
   std::vector<std::string> names;

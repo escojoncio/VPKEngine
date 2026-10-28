@@ -575,8 +575,7 @@ void Context::copyTexImage(GLenum target, GLint level, GLenum internalFormat, GL
     int idx = 0;
     if (rf && readFbo && rf->readBuffer >= gl::COLOR_ATTACHMENT0) idx = int(rf->readBuffer - gl::COLOR_ATTACHMENT0);
     FbTarget src = fb.color[size_t(idx)];
-    if (src.resolve) src.image = src.resolve;  // multisample default framebuffer: its resolved image
-    else if (src.image && src.image->samples > 1) return setError(gl::INVALID_OPERATION, target);
+    if (src.image && src.image->samples > 1) return setError(gl::INVALID_OPERATION, target);
     if (!src.image) return setError(gl::INVALID_OPERATION, target);
     if (!sub) {
         GLenum fmt = internalFormat;

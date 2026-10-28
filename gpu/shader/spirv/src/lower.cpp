@@ -161,6 +161,8 @@ struct Scope {
     std::unordered_map<uint32_t, Instr> texelPointers;
     std::unordered_map<uint32_t, RPtr> varPtrs;  // variable pointers: template; the value is {tag, byte address}
     std::unordered_map<uint32_t, const Instr*> ptrDefs;  // pointer-producing instructions of the function (lazy)
+    std::unordered_map<uint32_t, const Instr*> floatDefs;  // float arithmetic / conversion / GLSL.std.450 instructions (lazy, floatRange)
+    bool floatDefsBuilt = false;
     std::unordered_set<uint32_t> spilled;
     std::unordered_map<uint32_t, std::vector<uint32_t>> phiVars;  // phi id -> its variables
     uint32_t block = 0;             // label being emitted
@@ -3469,7 +3471,7 @@ private:
                 Type to = vt(rtId);
                 if (op == OpConvertSToF) v = intOperand(w(in, 3), Scalar::I32);
                 if (op == OpConvertUToF) v = intOperand(w(in, 3), Scalar::U32);
-                if (op == OpConvertFToS || op == OpConvertFToU) return one(castBits(floatToInt(v, op == OpConvertFToS, rtId), to));
+                if (op == OpConvertFToS || op == OpConvertFToU) return one(castBits(floatToInt(v, op == OpConvertFToS, rtId, w(in, 3)), to));
                 if (typeOfValue(v) == to) return one(v);
                 return one(un(Op::Convert, v, to));
             }
@@ -3892,12 +3894,147 @@ private:
         return bin(Op::Dot, a, c, t.element());
     }
 
+    // Interval [lo, hi] (infinite bounds allowed) a 32-bit float SPIR-V value stays in, from constants, integer-to-float conversions
+    // of narrow integers, + - * of bounded values and min / max / clamp / floor / ceil / round / trunc / abs; false when nothing
+    // is known. NaN is not modelled: the operations above do not produce it from bounded operands, and the clamps Metal compiles
+    // (fmin / fmax) return the non-NaN operand.
+    struct FRange {
+        double lo = -INFINITY, hi = INFINITY;
+    };
+    bool floatRange(uint32_t id, int depth, FRange& r) {
+        if (depth > 6) return false;
+        if (isConstant(id)) {
+            const ConstantDef& c = m_.constants.at(id);
+            if (c.composite) {
+                bool any = false;
+                for (uint32_t part : c.parts) {
+                    FRange p;
+                    if (!floatRange(part, depth + 1, p)) return false;
+                    r.lo = any ? std::min(r.lo, p.lo) : p.lo, r.hi = any ? std::max(r.hi, p.hi) : p.hi, any = true;
+                }
+                return any;
+            }
+            const TypeInfo& t = T(c.type);
+            if (t.kind != TypeKind::Float || t.width != 32 || c.specOp.op) return false;
+            const uint32_t bits = uint32_t(constScalarRaw(id));
+            float f;
+            std::memcpy(&f, &bits, 4);
+            if (!std::isfinite(f)) return false;
+            r.lo = r.hi = double(f);
+            return true;
+        }
+        Scope& sc = *scope_;
+        if (!sc.floatDefsBuilt) {
+            sc.floatDefsBuilt = true;
+            for (const Block& bl : sc.fn->blocks)
+                for (const Instr& in : bl.body)
+                    if (in.op == OpExtInst || in.op == OpConvertSToF || in.op == OpConvertUToF || in.op == OpFAdd || in.op == OpFSub ||
+                        in.op == OpFMul || in.op == OpFNegate)
+                        sc.floatDefs[m_.w(in, 2)] = &in;
+        }
+        auto it = sc.floatDefs.find(id);
+        if (it == sc.floatDefs.end()) return false;
+        const Instr& in = *it->second;
+        if (T(w(in, 1)).kind != TypeKind::Float && !(T(w(in, 1)).kind == TypeKind::Vector && T(T(w(in, 1)).elem).kind == TypeKind::Float))
+            return false;
+        auto arg = [&](uint32_t i) {  // an operand's range; unbounded when unknown
+            FRange a;
+            if (!floatRange(w(in, i), depth + 1, a)) a = FRange{};
+            return a;
+        };
+        auto known = [](const FRange& a) { return std::isfinite(a.lo) || std::isfinite(a.hi); };
+        auto fin = [](double d) { return std::isnan(d) ? 0.0 : d; };
+        switch (in.op) {
+            case OpConvertSToF: case OpConvertUToF: {
+                const uint32_t bits = intBits(typeOf(w(in, 3)));
+                if (!bits || bits > 16) return false;
+                const bool sgn = in.op == OpConvertSToF;
+                r.lo = sgn ? -double(1u << (bits - 1)) : 0.0, r.hi = sgn ? double((1u << (bits - 1)) - 1) : double((1u << bits) - 1);
+                return true;
+            }
+            case OpFNegate: {
+                FRange a = arg(3);
+                r = {-a.hi, -a.lo};
+                return known(r);
+            }
+            case OpFAdd: case OpFSub: {
+                FRange a = arg(3), b = arg(4);
+                if (in.op == OpFSub) b = {-b.hi, -b.lo};
+                r = {a.lo + b.lo, a.hi + b.hi};
+                if (std::isnan(r.lo)) r.lo = -INFINITY;
+                if (std::isnan(r.hi)) r.hi = INFINITY;
+                return known(r);
+            }
+            case OpFMul: {
+                FRange a = arg(3), b = arg(4);
+                if (!std::isfinite(a.lo) || !std::isfinite(a.hi) || !std::isfinite(b.lo) || !std::isfinite(b.hi)) return false;
+                const double v[4] = {a.lo * b.lo, a.lo * b.hi, a.hi * b.lo, a.hi * b.hi};
+                r = {*std::min_element(v, v + 4), *std::max_element(v, v + 4)};
+                return true;
+            }
+            case OpExtInst: {
+                if (w(in, 3) != m_.glslExt) return false;
+                const uint32_t e = w(in, 4);
+                switch (e) {
+                    case GLSL_FMin: case GLSL_NMin: {
+                        FRange a = arg(5), b = arg(6);
+                        r = {std::min(a.lo, b.lo), std::min(a.hi, b.hi)};
+                        return known(r);
+                    }
+                    case GLSL_FMax: case GLSL_NMax: {
+                        FRange a = arg(5), b = arg(6);
+                        r = {std::max(a.lo, b.lo), std::max(a.hi, b.hi)};
+                        return known(r);
+                    }
+                    case GLSL_FClamp: case GLSL_NClamp: {
+                        FRange x = arg(5), lo = arg(6), hi = arg(7);
+                        if (!std::isfinite(lo.lo) || !std::isfinite(hi.hi) || lo.lo > hi.hi) return false;
+                        r = {std::max(x.lo, lo.lo), std::min(x.hi, hi.hi)};
+                        r.lo = std::min(r.lo, hi.hi), r.hi = std::max(r.hi, lo.lo);
+                        return true;
+                    }
+                    case GLSL_Floor: case GLSL_Ceil: case GLSL_Round: case GLSL_RoundEven: case GLSL_Trunc: {
+                        FRange a = arg(5);
+                        auto f = [&](double d) {
+                            return !std::isfinite(d) ? d : e == GLSL_Floor ? std::floor(d) : e == GLSL_Ceil ? std::ceil(d)
+                                   : e == GLSL_Trunc ? std::trunc(d) : e == GLSL_Round ? std::round(d) : std::nearbyint(d);
+                        };
+                        r = {f(a.lo), f(a.hi)};
+                        return known(r);
+                    }
+                    case GLSL_FAbs: {
+                        FRange a = arg(5);
+                        r = {a.lo <= 0 && a.hi >= 0 ? 0.0 : std::min(std::fabs(fin(a.lo)), std::fabs(fin(a.hi))),
+                             std::max(std::fabs(a.lo), std::fabs(a.hi))};
+                        if (!std::isfinite(a.lo) && !std::isfinite(a.hi)) return false;
+                        return known(r);
+                    }
+                    default: return false;
+                }
+            }
+            default: return false;
+        }
+    }
     // OpConvertFToS / OpConvertFToU: out-of-range values saturate (to the result type's range) and NaN gives 0, the
-    // behaviour hardware conversions have and the CTS expects; Metal's own conversion of such values is undefined.
-    ValueId floatToInt(ValueId v, bool sign, uint32_t resultType) {
+    // behaviour hardware conversions have and the CTS expects; Metal's own conversion of such values is undefined. A source
+    // that floatRange proves well inside the type's range (a clamped, a narrow-integer or a constant value: the pack / unpack
+    // idioms of engines) converts directly.
+    ValueId floatToInt(ValueId v, bool sign, uint32_t resultType, uint32_t srcId) {
         const uint8_t n = typeOfValue(v).width;
         const Type f32t(Scalar::F32, n), it(sign ? Scalar::I32 : Scalar::U32, n);
         ValueId x = typeOfValue(v).scalar == Scalar::F32 ? v : un(Op::Convert, v, f32t);
+        FRange fr;
+        if (typeOfValue(v).scalar == Scalar::F32 && floatRange(srcId, 0, fr) &&
+            fr.lo >= (sign ? -1.0e9 : 0.0) && fr.hi <= (sign ? 1.0e9 : 2.0e9)) {
+            ValueId d = un(Op::Convert, x, it);
+            const uint32_t dbits = intBits(resultType);
+            if (dbits == 8 || dbits == 16) {  // (as below)
+                const uint32_t top = sign ? (1u << (dbits - 1)) - 1 : (1u << dbits) - 1;
+                const uint32_t bot = sign ? uint32_t(-int32_t(1u << (dbits - 1))) : 0;
+                d = bin(Op::Min, bin(Op::Max, d, splat(it, bot), it), splat(it, top), it);
+            }
+            return d;
+        }
         ValueId nan = un(Op::IsNan, x, vpir::kBool.withWidth(n));
         ValueId lo = splat(f32t, floatBits(sign ? -2147483648.0f : 0.0f));
         ValueId hi = splat(f32t, floatBits(sign ? 2147483520.0f : 4294967040.0f));  // largest floats below 2^31 / 2^32

@@ -351,6 +351,28 @@ struct Recorder {
   uint32_t barriers = 0;  // vkCmdPipelineBarrier calls dropped (the core derives its own)
   bool inPass = false;
   size_t passBegin = SIZE_MAX;  // index of the open pass's begin op (indirect argument patches go before it)
+  // Compute ops that must run before the open pass (index widening, indirect argument patches): collected while the pass
+  // records and put before its begin op in one insertion when it ends (flushHoisted), not one insert per draw.
+  std::vector<Op> hoisted;
+  // The 8-bit index buffers widened in the open pass (the same bound range drawn again reuses the arena copy).
+  struct Widened {
+    vpgpu::BufferId buffer;
+    uint64_t at = 0, n = 0;
+    bool restart = false;
+    vpgpu::IndexBuffer out;
+  };
+  std::vector<Widened> widened;
+  void flushHoisted() {
+    widened.clear();
+    if (hoisted.empty()) return;
+    if (passBegin < ops.size()) {
+      ops.insert(ops.begin() + std::ptrdiff_t(passBegin), std::make_move_iterator(hoisted.begin()), std::make_move_iterator(hoisted.end()));
+      passBegin += hoisted.size();
+    } else {
+      for (Op& o : hoisted) ops.push_back(std::move(o));
+    }
+    hoisted.clear();
+  }
   bool hasLocalRead = false;    // an in-pass barrier was recorded in a dynamic rendering pass (translator: local read)
   BoundState bound;
   UploadArena arena;
@@ -368,6 +390,8 @@ struct Recorder {
     barriers = 0;
     inPass = false;
     passBegin = SIZE_MAX;
+    hoisted.clear();
+    widened.clear();
     hasLocalRead = false;
     bound = BoundState{};
     arena.reset();
@@ -434,7 +458,8 @@ void awaitFreshVariants(Device*);
 void requestIndirectPatch(Device*);
 // The 8-bit index widening kernel (VK_EXT_index_type_uint8; pipelines.cpp); indexU8Ref mirrors its MSL for the tests.
 void requestIndexU8(Device*);
-bool indexU8Ready(Device*, vpgpu::PipelineKey&);
+// mayWait false: a kernel still compiling is not waited for (the caller reads the indices on the CPU instead).
+bool indexU8Ready(Device*, vpgpu::PipelineKey&, bool mayWait = true);
 uint16_t indexU8Ref(uint8_t index, bool restartEnabled);
 const char* indexU8Msl();
 bool indirectPatch(Device*, vpgpu::PipelineKey&);

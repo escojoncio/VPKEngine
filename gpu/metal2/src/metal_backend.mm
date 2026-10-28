@@ -881,10 +881,23 @@ struct MetalBackend::Impl {
   // Forced-MSAA seed (Attachment::needsSeed): the start of an encoder whose autoMsaa slots continue a picture an earlier encoder
   // resolved draws one fullscreen triangle per layer that fills every sample from the 1x partner (colour: the texel read as is;
   // depth: depth(any)). One pipeline (and library) per signature of the encoder's attachments; nil = failed (logged once).
+  struct SeedSig {
+    bool layered = false, color = false, depth = false, stencil = false;
+    MTLPixelFormat colors[kMaxColorAttachments] = {};
+    MTLPixelFormat depthPf = MTLPixelFormatInvalid, stencilPf = MTLPixelFormatInvalid;
+    NSUInteger samples = 1;
+    uint64_t key = 0;
+  };
+  std::mutex seedMutex;  // seedPipelines / seedPending: the submit thread looks up, seedQueue publishes
   std::unordered_map<uint64_t, id<MTLRenderPipelineState>> seedPipelines;
+  std::unordered_set<uint64_t> seedPending;  // compiles queued or running
+  dispatch_queue_t seedQueue = nil;          // serial: compiles the seed pipelines (created by the submit thread, drained in ~MetalBackend)
   id<MTLDepthStencilState> seedDepthOff, seedDepthOn;  // compare Always, depth write off / on
-  id<MTLRenderPipelineState> seedPipeline(MTLRenderPassDescriptor* rp, bool layered, bool color, bool depth, std::string& error);
+  id<MTLDepthStencilState> seedStencilBit[8];          // stencil Replace through write mask 1 << bit (depth untouched)
+  id<MTLRenderPipelineState> seedPipeline(MTLRenderPassDescriptor* rp, bool layered, bool color, bool depth, bool stencil, std::string& error);
+  void buildSeedPipeline(const SeedSig& sig);
   std::atomic<uint64_t> seedDrawsDone{0};
+  std::atomic<uint32_t> seedSkipped{0};  // encoders whose seed waited for its pipeline (log cadence)
   uint64_t fovEncoders = 0;  // foveated encoders so far (log cadence)
   std::unordered_set<std::string> fovWarned;
 
@@ -2682,86 +2695,135 @@ id<MTLRenderPipelineState> MetalBackend::Impl::fovPipeline(int kind, MTLPixelFor
 // ---- Forced MSAA: seed the samples of an autoMsaa attachment from its 1x partner ----
 // The source is bound as a 2D-array view (one mip, the pass's layers), so one shader serves 2D and array images; the layer is the
 // render target array index. The pipeline declares every attachment of the encoder (Metal checks them all); only colour 0 and
-// depth are written.
-id<MTLRenderPipelineState> MetalBackend::Impl::seedPipeline(MTLRenderPassDescriptor* rp, bool layered, bool color, bool depth,
+// depth are written. `stencil` (alone: no colour, no depth) is one bit plane of the stencil: the fragment discards where the 1x
+// stencil lacks the bit (buffer 0) and the depth-stencil state replaces only that bit.
+// A pipeline is compiled on seedQueue, never on the submit thread: until it is ready the lookup answers error "pending" and the
+// encoder skips the seed (counted, logged); a failure is cached.
+id<MTLRenderPipelineState> MetalBackend::Impl::seedPipeline(MTLRenderPassDescriptor* rp, bool layered, bool color, bool depth, bool stencil,
                                                            std::string& error) {
+  SeedSig sig;
+  sig.layered = layered, sig.color = color, sig.depth = depth, sig.stencil = stencil;
   uint64_t key = 1469598103934665603ull;
   auto mix = [&](uint64_t v) { key = (key ^ v) * 1099511628211ull; };
-  mix(uint64_t(layered) | uint64_t(color) << 1 | uint64_t(depth) << 2);
+  mix(uint64_t(layered) | uint64_t(color) << 1 | uint64_t(depth) << 2 | uint64_t(stencil) << 3);
   NSUInteger samples = 1;
   for (int i = 0; i < kMaxColorAttachments; ++i) {
     id<MTLTexture> t = rp.colorAttachments[i].texture;
+    sig.colors[i] = t ? t.pixelFormat : MTLPixelFormatInvalid;
     mix(t ? uint64_t(t.pixelFormat) | uint64_t(t.sampleCount) << 32 : 0);
     if (t) samples = t.sampleCount;
   }
   id<MTLTexture> dt = rp.depthAttachment.texture ? rp.depthAttachment.texture : rp.stencilAttachment.texture;
   mix(dt ? uint64_t(dt.pixelFormat) | uint64_t(dt.sampleCount) << 32 : 0);
   if (dt) samples = dt.sampleCount;
-  if (auto it = seedPipelines.find(key); it != seedPipelines.end()) {
-    if (!it->second) error = "pipeline_failed";
-    return it->second;
+  sig.depthPf = rp.depthAttachment.texture ? rp.depthAttachment.texture.pixelFormat : MTLPixelFormatInvalid;
+  sig.stencilPf = rp.stencilAttachment.texture ? rp.stencilAttachment.texture.pixelFormat : MTLPixelFormatInvalid;
+  sig.samples = samples, sig.key = key;
+  {
+    std::lock_guard<std::mutex> lock(seedMutex);
+    if (auto it = seedPipelines.find(key); it != seedPipelines.end()) {
+      if (!it->second) error = "pipeline_failed";
+      return it->second;
+    }
+    if (!seedPending.insert(key).second) {
+      error = "pending";
+      return nil;
+    }
   }
-  std::string src =
-      "#include <metal_stdlib>\nusing namespace metal;\n"
-      "struct VpSeedV { float4 pos [[position]]; };\n"
-      "struct VpSeedVL { float4 pos [[position]]; uint layer [[render_target_array_index]]; };\n";
-  src += layered ? "vertex VpSeedVL vp_seed_vs(uint vid [[vertex_id]], uint inst [[instance_id]]) {\n  VpSeedVL o;\n  o.layer = inst;\n"
-                 : "vertex VpSeedV vp_seed_vs(uint vid [[vertex_id]]) {\n  VpSeedV o;\n";
-  src += "  o.pos = float4(vid == 1u ? 3.0f : -1.0f, vid == 2u ? 3.0f : -1.0f, 0.0f, 1.0f);\n  return o;\n}\n";
-  src += "struct VpSeedF {";
-  if (color) src += " float4 c [[color(0)]];";
-  if (depth) src += " float d [[depth(any)]];";
-  src += " };\nfragment VpSeedF vp_seed_fs(float4 pos [[position]]";
-  if (layered) src += ", uint layer [[render_target_array_index]]";
-  if (color) src += ", texture2d_array<float> sc [[texture(0)]]";
-  if (depth) src += ", depth2d_array<float> sd [[texture(1)]]";
-  src += ") {\n  const uint2 p = uint2(pos.xy);\n";
-  src += layered ? "  const uint l = layer;\n" : "  const uint l = 0u;\n";
-  src += "  VpSeedF o;\n";
-  if (color) src += "  o.c = sc.read(p, l);\n";
-  if (depth) src += "  o.d = sd.read(p, l);\n";
-  src += "  return o;\n}\n";
-  MTLCompileOptions* o = [MTLCompileOptions new];
-  o.languageVersion = MTLLanguageVersion3_2;
-  NSError* e = nil;
-  const attr::Probe probe(device);
-  id<MTLLibrary> lib = compileRetrying(&e, [&](NSError* __autoreleasing* pe) {
-    return [device newLibraryWithSource:@(src.c_str()) options:o error:pe];
-  });
-  attr::trackObject("m2.lib.seed", lib, probe);
-  if (!lib) {
-    error = "library: " + str(e);
-    if (!compilerUnreachable(e)) seedPipelines[key] = nil;
+  if (closing) {
+    std::lock_guard<std::mutex> lock(seedMutex);
+    seedPending.erase(key);
+    error = "closing";
     return nil;
   }
-  MTLRenderPipelineDescriptor* d = [MTLRenderPipelineDescriptor new];
-  d.label = @"vpgpu.seed";
-  d.vertexFunction = [lib newFunctionWithName:@"vp_seed_vs"];
-  d.fragmentFunction = [lib newFunctionWithName:@"vp_seed_fs"];
-  for (int i = 0; i < kMaxColorAttachments; ++i)
-    if (id<MTLTexture> t = rp.colorAttachments[i].texture) {
-      d.colorAttachments[i].pixelFormat = t.pixelFormat;
-      if (i != 0 || !color) d.colorAttachments[i].writeMask = MTLColorWriteMaskNone;
+  if (!seedQueue)
+    seedQueue = dispatch_queue_create("vpgpu.seed.compile", dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INITIATED, 0));
+  dispatch_async(seedQueue, ^{
+    if (!closing) buildSeedPipeline(sig);
+    std::lock_guard<std::mutex> lock(seedMutex);
+    seedPending.erase(sig.key);
+  });
+  error = "pending";
+  return nil;
+}
+
+void MetalBackend::Impl::buildSeedPipeline(const SeedSig& sig) {
+  @autoreleasepool {
+    std::string src =
+        "#include <metal_stdlib>\nusing namespace metal;\n"
+        "struct VpSeedV { float4 pos [[position]]; };\n"
+        "struct VpSeedVL { float4 pos [[position]]; uint layer [[render_target_array_index]]; };\n";
+    src += sig.layered ? "vertex VpSeedVL vp_seed_vs(uint vid [[vertex_id]], uint inst [[instance_id]]) {\n  VpSeedVL o;\n  o.layer = inst;\n"
+                       : "vertex VpSeedV vp_seed_vs(uint vid [[vertex_id]]) {\n  VpSeedV o;\n";
+    src += "  o.pos = float4(vid == 1u ? 3.0f : -1.0f, vid == 2u ? 3.0f : -1.0f, 0.0f, 1.0f);\n  return o;\n}\n";
+    if (sig.stencil) {
+      src += "fragment void vp_seed_fs(float4 pos [[position]]";
+      if (sig.layered) src += ", uint layer [[render_target_array_index]]";
+      src += ", texture2d_array<uint> ss [[texture(2)]], constant uint& bitMask [[buffer(0)]]) {\n  const uint2 p = uint2(pos.xy);\n";
+      src += sig.layered ? "  const uint l = layer;\n" : "  const uint l = 0u;\n";
+      src += "  if ((ss.read(p, l).x & bitMask) == 0u) discard_fragment();\n}\n";
+    } else {
+      src += "struct VpSeedF {";
+      if (sig.color) src += " float4 c [[color(0)]];";
+      if (sig.depth) src += " float d [[depth(any)]];";
+      src += " };\nfragment VpSeedF vp_seed_fs(float4 pos [[position]]";
+      if (sig.layered) src += ", uint layer [[render_target_array_index]]";
+      if (sig.color) src += ", texture2d_array<float> sc [[texture(0)]]";
+      if (sig.depth) src += ", depth2d_array<float> sd [[texture(1)]]";
+      src += ") {\n  const uint2 p = uint2(pos.xy);\n";
+      src += sig.layered ? "  const uint l = layer;\n" : "  const uint l = 0u;\n";
+      src += "  VpSeedF o;\n";
+      if (sig.color) src += "  o.c = sc.read(p, l);\n";
+      if (sig.depth) src += "  o.d = sd.read(p, l);\n";
+      src += "  return o;\n}\n";
     }
-  if (rp.depthAttachment.texture) d.depthAttachmentPixelFormat = rp.depthAttachment.texture.pixelFormat;
-  if (rp.stencilAttachment.texture) d.stencilAttachmentPixelFormat = rp.stencilAttachment.texture.pixelFormat;
-  d.rasterSampleCount = samples;
-  d.inputPrimitiveTopology = MTLPrimitiveTopologyClassTriangle;
-  const attr::Probe probe2(device);
-  id<MTLRenderPipelineState> p =
-      d.vertexFunction && d.fragmentFunction
-          ? compileRetrying(&e, [&](NSError* __autoreleasing* pe) { return [device newRenderPipelineStateWithDescriptor:d error:pe]; })
-          : nil;
-  attr::trackObject("m2.pso.seed", p, probe2);
-  if (!p) error = "pipeline: " + str(e);
-  if (p || !compilerUnreachable(e)) seedPipelines[key] = p;
-  if (p) {
-    char line[160];
-    std::snprintf(line, sizeof line, "gpu.seed pipeline samples=%lu layered=%d colour=%d depth=%d", (unsigned long)samples, int(layered),
-                  int(color), int(depth));
-    info(line);
+    MTLCompileOptions* o = [MTLCompileOptions new];
+    o.languageVersion = MTLLanguageVersion3_2;
+    NSError* e = nil;
+    const attr::Probe probe(device);
+    id<MTLLibrary> lib = compileRetrying(&e, [&](NSError* __autoreleasing* pe) {
+      return [device newLibraryWithSource:@(src.c_str()) options:o error:pe];
+    });
+    attr::trackObject("m2.lib.seed", lib, probe);
+    if (!lib) {
+      err("what=seed_library error=%s", str(e).c_str());
+      if (!compilerUnreachable(e)) {
+        std::lock_guard<std::mutex> lock(seedMutex);
+        seedPipelines[sig.key] = nil;
+      }
+      return;
+    }
+    MTLRenderPipelineDescriptor* d = [MTLRenderPipelineDescriptor new];
+    d.label = @"vpgpu.seed";
+    d.vertexFunction = [lib newFunctionWithName:@"vp_seed_vs"];
+    d.fragmentFunction = [lib newFunctionWithName:@"vp_seed_fs"];
+    for (int i = 0; i < kMaxColorAttachments; ++i)
+      if (sig.colors[i] != MTLPixelFormatInvalid) {
+        d.colorAttachments[i].pixelFormat = sig.colors[i];
+        if (i != 0 || !sig.color) d.colorAttachments[i].writeMask = MTLColorWriteMaskNone;
+      }
+    if (sig.depthPf != MTLPixelFormatInvalid) d.depthAttachmentPixelFormat = sig.depthPf;
+    if (sig.stencilPf != MTLPixelFormatInvalid) d.stencilAttachmentPixelFormat = sig.stencilPf;
+    d.rasterSampleCount = sig.samples;
+    d.inputPrimitiveTopology = MTLPrimitiveTopologyClassTriangle;
+    const attr::Probe probe2(device);
+    id<MTLRenderPipelineState> p =
+        d.vertexFunction && d.fragmentFunction
+            ? compileRetrying(&e, [&](NSError* __autoreleasing* pe) { return [device newRenderPipelineStateWithDescriptor:d error:pe]; })
+            : nil;
+    attr::trackObject("m2.pso.seed", p, probe2);
+    if (!p) err("what=seed_pipeline_build error=%s", str(e).c_str());
+    if (p || !compilerUnreachable(e)) {
+      std::lock_guard<std::mutex> lock(seedMutex);
+      seedPipelines[sig.key] = p;
+    }
+    if (p) {
+      char line[160];
+      std::snprintf(line, sizeof line, "gpu.seed pipeline samples=%lu layered=%d colour=%d depth=%d stencil=%d", (unsigned long)sig.samples,
+                    int(sig.layered), int(sig.color), int(sig.depth), int(sig.stencil));
+      info(line);
+    }
   }
-  return p;
 }
 
 MetalBackend::Impl::FovMap* MetalBackend::Impl::fovMapFor(const RateMap& rm) {
@@ -5355,6 +5417,8 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
           attach(rp.stencilAttachment, unresolved(d, d.stencilResolve), t);
           rp.stencilAttachment.clearStencil = d.clear.stencil;
           rp.stencilAttachment.stencilResolveFilter = MTLMultisampleStencilResolveFilterSample0;
+          // A seeded stencil (needsSeed: its load is DontCare) is rebuilt bit plane by bit plane on top of zeros (seed draws below).
+          if (d.needsSeed) rp.stencilAttachment.loadAction = MTLLoadActionClear, rp.stencilAttachment.clearStencil = 0;
         }
       }
       // ---- Foveation (RenderPassDesc::rateMap): the pass draws into physically smaller shadow attachments
@@ -5818,38 +5882,63 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
       if (open.render && !fovM) {
         const Attachment& sc = enc.pass.colors[0];
         const Attachment& sd = enc.pass.depth;
-        const bool wantC = sc.texture && sc.needsSeed, wantD = sd.texture && sd.needsSeed;
+        const bool wantC = sc.texture && sc.needsSeed;
+        const bool wantD = sd.texture && sd.needsSeed && rp.depthAttachment.texture;
+        const bool wantS = sd.texture && sd.needsSeed && rp.stencilAttachment.texture;  // (its load is Clear 0: see the rp above)
         bool otherSeed = false;
         for (int i = 1; i < kMaxColorAttachments; ++i) otherSeed = otherSeed || (enc.pass.colors[i].texture && enc.pass.colors[i].needsSeed);
         if (otherSeed && blitWarned.insert("seed_other_slot").second)
           err("what=seed_unsupported f=%llu enc=%u (only colour 0 and depth are seeded)", (unsigned long long)frameIndex, e);
-        if (wantC || wantD) {
-          // A 2D-array view of the 1x source: its mip, the pass's layers starting at the resolve layer (+ the view of a split pass).
-          auto sourceView = [&](const Attachment& a, id<MTLTexture> target) -> id<MTLTexture> {
+        if (wantC || wantD || wantS) {
+          // A 2D-array view of the 1x source (pixel format `pf`): its mip, the pass's layers starting at the resolve layer (+ the view
+          // of a split pass). A view of another format than the texture's own needs the texture created with format views.
+          auto sourceView = [&](const Attachment& a, MTLPixelFormat pf) -> id<MTLTexture> {
             id<MTLTexture> t = a.seedSrc ? texture(a.seedSrc) : nil;
-            if (!t || !target || t.sampleCount != 1 || !(t.usage & MTLTextureUsageShaderRead) || a.seedMip >= t.mipmapLevelCount) return nil;
+            if (!t || pf == MTLPixelFormatInvalid || t.sampleCount != 1 || !(t.usage & MTLTextureUsageShaderRead) || a.seedMip >= t.mipmapLevelCount) return nil;
             if (t.textureType != MTLTextureType2D && t.textureType != MTLTextureType2DArray) return nil;
+            if (pf != t.pixelFormat && !(t.usage & MTLTextureUsagePixelFormatView)) return nil;
             const NSUInteger first = NSUInteger(a.seedLayer) + viewOff;
             const NSUInteger have = t.textureType == MTLTextureType2DArray ? t.arrayLength : 1;
             if (first + passLayers > have) return nil;
-            return [t newTextureViewWithPixelFormat:target.pixelFormat
+            return [t newTextureViewWithPixelFormat:pf
                                         textureType:MTLTextureType2DArray
                                              levels:NSMakeRange(a.seedMip, 1)
                                              slices:NSMakeRange(first, passLayers)];
           };
-          id<MTLTexture> vc = wantC ? sourceView(sc, rp.colorAttachments[0].texture) : nil;
-          id<MTLTexture> vd = wantD ? sourceView(sd, rp.depthAttachment.texture) : nil;
-          const bool useC = wantC && vc, useD = wantD && vd;
-          if ((wantC && !vc) || (wantD && !vd)) {
+          // The stencil plane of a depth/stencil format as a readable format (Stencil8 as is).
+          auto stencilPlane = [](MTLPixelFormat pf) {
+            return pf == MTLPixelFormatDepth32Float_Stencil8 ? MTLPixelFormatX32_Stencil8
+                   : pf == MTLPixelFormatStencil8             ? MTLPixelFormatStencil8
+                                                              : MTLPixelFormatInvalid;
+          };
+          id<MTLTexture> vc = wantC ? sourceView(sc, rp.colorAttachments[0].texture.pixelFormat) : nil;
+          id<MTLTexture> vd = wantD ? sourceView(sd, rp.depthAttachment.texture.pixelFormat) : nil;
+          id<MTLTexture> vs = wantS ? sourceView(sd, stencilPlane(rp.stencilAttachment.texture.pixelFormat)) : nil;
+          const bool useC = wantC && vc, useD = wantD && vd, useS = wantS && vs;
+          if ((wantC && !vc) || (wantD && !vd) || (wantS && !vs)) {
             if (blitWarned.insert("seed_source").second)
-              err("what=seed_source f=%llu enc=%u colour=%d depth=%d (1x partner missing, not readable or too small: samples start undefined)",
-                  (unsigned long long)frameIndex, e, int(wantC && !vc), int(wantD && !vd));
+              err("what=seed_source f=%llu enc=%u colour=%d depth=%d stencil=%d (1x partner missing, not readable, too small or without format views: samples start undefined)",
+                  (unsigned long long)frameIndex, e, int(wantC && !vc), int(wantD && !vd), int(wantS && !vs));
           }
-          std::string perr;
-          id<MTLRenderPipelineState> ps = useC || useD ? seedPipeline(rp, passLayers > 1, useC, useD, perr) : nil;
-          if ((useC || useD) && !ps) ++missingPipelines;
-          if ((useC || useD) && !ps && blitWarned.insert("seed_pipeline").second)
-            err("what=seed_pipeline f=%llu enc=%u error=%s", (unsigned long long)frameIndex, e, perr.c_str());
+          // (A pipeline still compiling in the background is not an error: the seed is skipped until it is ready.)
+          std::string perr, serr;
+          id<MTLRenderPipelineState> ps = useC || useD ? seedPipeline(rp, passLayers > 1, useC, useD, false, perr) : nil;
+          id<MTLRenderPipelineState> pss = useS ? seedPipeline(rp, passLayers > 1, false, false, true, serr) : nil;
+          const bool pending = (useC || useD) && !ps && perr == "pending", pendingS = useS && !pss && serr == "pending";
+          if (pending || pendingS) {
+            if (seedSkipped.fetch_add(1, std::memory_order_relaxed) < 8)
+              info("gpu.seed pipeline_pending f=" + std::to_string(frameIndex) + " enc=" + std::to_string(e) + " (compiling off the submit thread; samples start undefined)");
+          }
+          if ((useC || useD) && !ps && !pending) ++missingPipelines;
+          if (((useC || useD) && !ps && !pending && blitWarned.insert("seed_pipeline").second) ||
+              (useS && !pss && !pendingS && blitWarned.insert("seed_pipeline_stencil").second))
+            err("what=seed_pipeline f=%llu enc=%u error=%s", (unsigned long long)frameIndex, e, (ps ? serr : perr).c_str());
+          if (useS && !pss && !pendingS) ++missingPipelines;
+          const bool anyDepthStencil = rp.depthAttachment.texture || rp.stencilAttachment.texture;
+          if (ps || pss) {
+            [open.render setCullMode:MTLCullModeNone];
+            [open.render setViewport:(MTLViewport){0, 0, double(rtW), double(rtH), 0.0, 1.0}];
+          }
           if (ps) {
             __strong id<MTLDepthStencilState>& dss = useD ? seedDepthOn : seedDepthOff;
             if (!dss) {
@@ -5859,12 +5948,41 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
               dss = [device newDepthStencilStateWithDescriptor:ds];
             }
             [open.render setRenderPipelineState:ps];
-            if (rp.depthAttachment.texture || rp.stencilAttachment.texture) [open.render setDepthStencilState:dss];
-            [open.render setCullMode:MTLCullModeNone];
-            [open.render setViewport:(MTLViewport){0, 0, double(rtW), double(rtH), 0.0, 1.0}];
+            if (anyDepthStencil) [open.render setDepthStencilState:dss];
             if (useC) [open.render setFragmentTexture:vc atIndex:0];
             if (useD) [open.render setFragmentTexture:vd atIndex:1];
             [open.render drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3 instanceCount:passLayers];
+          }
+          if (pss) {
+            // Stencil has no value output on every Apple GPU: one fullscreen draw per bit plane writes (Replace, 0xFF) only the bit
+            // of the write mask where the 1x stencil has it set (the others are discarded), on top of the zeros the load cleared.
+            [open.render setRenderPipelineState:pss];
+            [open.render setFragmentTexture:vs atIndex:2];
+            [open.render setStencilReferenceValue:0xFF];
+            for (uint32_t bit = 0; bit < 8; ++bit) {
+              __strong id<MTLDepthStencilState>& bs = seedStencilBit[bit];
+              if (!bs) {
+                MTLStencilDescriptor* sdsc = [MTLStencilDescriptor new];
+                sdsc.stencilCompareFunction = MTLCompareFunctionAlways;
+                sdsc.stencilFailureOperation = MTLStencilOperationKeep;
+                sdsc.depthFailureOperation = MTLStencilOperationKeep;
+                sdsc.depthStencilPassOperation = MTLStencilOperationReplace;
+                sdsc.readMask = 0xFF;
+                sdsc.writeMask = 1u << bit;
+                MTLDepthStencilDescriptor* ds = [MTLDepthStencilDescriptor new];
+                ds.depthCompareFunction = MTLCompareFunctionAlways;
+                ds.depthWriteEnabled = NO;
+                ds.frontFaceStencil = sdsc;
+                ds.backFaceStencil = sdsc;
+                bs = [device newDepthStencilStateWithDescriptor:ds];
+              }
+              const uint32_t mask = 1u << bit;
+              [open.render setDepthStencilState:bs];
+              [open.render setFragmentBytes:&mask length:sizeof mask atIndex:0];
+              [open.render drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3 instanceCount:passLayers];
+            }
+          }
+          if (ps || pss) {
             st = EncState{};  // the draws that follow set everything they need again
             vpDirty = scDirty = true;
             seedDrawsDone.fetch_add(1, std::memory_order_relaxed);
@@ -7329,6 +7447,7 @@ MetalBackend::~MetalBackend() {
   for (dispatch_queue_t q : impl_->prewarmQueues)
     if (q) dispatch_sync(q, ^{});  // queued prewarms see `closing`; the running one finishes
   if (impl_->knockFsrQueue) dispatch_sync(impl_->knockFsrQueue, ^{});  // same for the knock's substitutes
+  if (impl_->seedQueue) dispatch_sync(impl_->seedQueue, ^{});  // and the seed pipelines
   if (ok()) {
     vpgpu::backgroundGate().release();  // a commit parked for the background holds a slot drain() waits for
     bool drained = false;

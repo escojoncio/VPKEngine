@@ -707,16 +707,18 @@ uint64_t splitSignature(const Encoder& enc, const ResourceTable& res) {
 // chunks under the limits instead of getting memory: every chunk resolves at its end (the 1x partner holds the picture) and the
 // next Loads the twin, which placeTiles turns into a seed from that resolve. An indirect draw (GPU-written counts) gets a chunk of
 // its own. CompileOptions::HeavyMode Off / Observe do not split (the diagnostic wants the unsplit encoders), nor do encoders with
-// any other attachment (their samples would need a store), nor a depth attachment with a stencil aspect (the seed only restores
-// depth), nor more than kMaxTileChunks chunks / a single one (heavy ones left whole are counted: tileSplitSkipped, by reason).
-constexpr uint32_t kMaxTileChunks = 32;
+// any other attachment (their samples would need a store), nor a single chunk / more than kMaxTileChunks (a sanity bound far
+// above any real frame; heavy ones left whole are counted: tileSplitSkipped, by reason). A depth attachment with a stencil aspect
+// is split too: both aspects resolve at every cut and the backend's seed restores both (stencil needs a formatView resolve target,
+// checked below).
+constexpr uint32_t kMaxTileChunks = 1024;
 void splitHeavyAuto(CompiledFrame& out, const std::vector<Command>& cmds, const ResourceTable& res, const CompileOptions& options) {
   if (options.heavyMode != CompileOptions::HeavyMode::On) return;
   std::vector<Encoder> encoders;
   encoders.reserve(out.encoders.size());
   for (Encoder& enc : out.encoders) {
     bool candidate = enc.kind == Encoder::Kind::Render && enc.view < 0;
-    bool stencil = false;  // the depth attachment has a stencil aspect
+    bool stencil = false;  // the depth attachment has a stencil aspect the seed cannot restore (its 1x partner has no format view)
     int attached = 0;
     if (candidate)
       forEachSlot(enc.pass, [&](const Attachment& a, int slot) {
@@ -726,7 +728,9 @@ void splitHeavyAuto(CompiledFrame& out, const std::vector<Command>& cmds, const 
         if (slot == kDepthSlot) {
           const TextureDesc* d = res.get(a.texture);
           const Format f = a.format != Format::Undefined ? a.format : d ? d->format : Format::Undefined;
-          stencil = formatInfo(f).stencil();
+          const TextureDesc* r = a.resolve ? res.get(a.resolve) : nullptr;
+          // (The stencil plane of the 1x is read through a stencil view: Metal needs the texture created with format views.)
+          stencil = formatInfo(f).stencil() && !(r && (r->usage & usage::formatView));
         }
       });
     if (!candidate || !attached) {
@@ -754,7 +758,7 @@ void splitHeavyAuto(CompiledFrame& out, const std::vector<Command>& cmds, const 
       encoders.push_back(std::move(enc));
       continue;
     }
-    if (stencil) {  // heavy, but a chunk's seed restores depth only: the stencil would be lost between chunks
+    if (stencil) {  // heavy, but the 1x partner cannot be read for its stencil: it would be lost between chunks
       ++out.stats.tileSplitSkipStencil, ++out.stats.tileSplitSkipped;
       encoders.push_back(std::move(enc));
       continue;
@@ -779,10 +783,17 @@ void splitHeavyAuto(CompiledFrame& out, const std::vector<Command>& cmds, const 
       chunk.drawBegin = starts[k];
       chunk.drawEnd = k + 1 < starts.size() ? starts[k + 1] : UINT32_MAX;
       if (k) chunk.reason = CutReason::TileSplit, ++out.stats.tileSplits;
-      forEachSlot(chunk.pass, [&](Attachment& a, int) {
+      forEachSlot(chunk.pass, [&](Attachment& a, int slot) {
         if (!a.texture) return;
         if (k) a.load = LoadAction::Load;  // the previous chunk's resolve (placeTiles: a seed)
-        if (k + 1 < starts.size()) a.store = StoreAction::Resolve;
+        if (k + 1 < starts.size()) {
+          a.store = StoreAction::Resolve;
+          // Both aspects of a depth/stencil attachment cross the cut (the final chunk keeps the client's modes).
+          if (slot == kDepthSlot) {
+            if (a.depthResolve == ResolveMode::None) a.depthResolve = ResolveMode::Sample0;
+            if (a.stencilResolve == ResolveMode::None) a.stencilResolve = ResolveMode::Sample0;
+          }
+        }
       });
       encoders.push_back(std::move(chunk));
     }

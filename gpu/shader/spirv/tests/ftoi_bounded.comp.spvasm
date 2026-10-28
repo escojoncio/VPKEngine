@@ -1,0 +1,102 @@
+; Compute shader: OpConvertFToS / OpConvertFToU of values a clamp bounds (the pack idioms of engines) convert directly, with no
+; NaN / overflow selects. in = {3e10, -3e10, 200.25, -1.5}; out = FToU(Round(FClamp(x, 0, 255))) x4, FToS(FClamp(x, -100, 100)) x4.
+OpCapability Cap:Shader
+%glsl = OpExtInstImport "GLSL.std.450"
+OpMemoryModel AddrModel:Logical MemModel:GLSL450
+OpEntryPoint Model:GLCompute %main "main"
+OpExecutionMode %main ExecMode:LocalSize 1 1 1
+OpDecorate %inblk Deco:Block
+OpMemberDecorate %inblk 0 Deco:Offset 0
+OpMemberDecorate %inblk 1 Deco:Offset 4
+OpMemberDecorate %inblk 2 Deco:Offset 8
+OpMemberDecorate %inblk 3 Deco:Offset 12
+OpDecorate %outblk Deco:Block
+OpMemberDecorate %outblk 0 Deco:Offset 0
+OpMemberDecorate %outblk 1 Deco:Offset 4
+OpMemberDecorate %outblk 2 Deco:Offset 8
+OpMemberDecorate %outblk 3 Deco:Offset 12
+OpMemberDecorate %outblk 4 Deco:Offset 16
+OpMemberDecorate %outblk 5 Deco:Offset 20
+OpMemberDecorate %outblk 6 Deco:Offset 24
+OpMemberDecorate %outblk 7 Deco:Offset 28
+OpDecorate %in Deco:DescriptorSet 0
+OpDecorate %in Deco:Binding 0
+OpDecorate %out Deco:DescriptorSet 0
+OpDecorate %out Deco:Binding 1
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%u32 = OpTypeInt 32 0
+%i32 = OpTypeInt 32 1
+%f32 = OpTypeFloat 32
+%inblk = OpTypeStruct %f32 %f32 %f32 %f32
+%outblk = OpTypeStruct %u32 %u32 %u32 %u32 %u32 %u32 %u32 %u32
+%pin = OpTypePointer Storage:StorageBuffer %inblk
+%pout = OpTypePointer Storage:StorageBuffer %outblk
+%pf32 = OpTypePointer Storage:StorageBuffer %f32
+%pu32 = OpTypePointer Storage:StorageBuffer %u32
+%in = OpVariable %pin Storage:StorageBuffer
+%out = OpVariable %pout Storage:StorageBuffer
+%c0 = OpConstant %i32 0
+%c1 = OpConstant %i32 1
+%c2 = OpConstant %i32 2
+%c3 = OpConstant %i32 3
+%c4 = OpConstant %i32 4
+%c5 = OpConstant %i32 5
+%c6 = OpConstant %i32 6
+%c7 = OpConstant %i32 7
+%f0 = OpConstant %f32 f32:0
+%f255 = OpConstant %f32 f32:255
+%fm100 = OpConstant %f32 f32:-100
+%f100 = OpConstant %f32 f32:100
+%main = OpFunction %void 0 %fn
+%l = OpLabel
+%pi0 = OpAccessChain %pf32 %in %c0
+%x0 = OpLoad %f32 %pi0
+%cu0 = OpExtInst %f32 %glsl 43 %x0 %f0 %f255
+%ru0 = OpExtInst %f32 %glsl 1 %cu0
+%u0 = OpConvertFToU %u32 %ru0
+%cs0 = OpExtInst %f32 %glsl 43 %x0 %fm100 %f100
+%s0 = OpConvertFToS %i32 %cs0
+%sw0 = OpBitcast %u32 %s0
+%po0 = OpAccessChain %pu32 %out %c0
+OpStore %po0 %u0
+%pq0 = OpAccessChain %pu32 %out %c4
+OpStore %pq0 %sw0
+%pi1 = OpAccessChain %pf32 %in %c1
+%x1 = OpLoad %f32 %pi1
+%cu1 = OpExtInst %f32 %glsl 43 %x1 %f0 %f255
+%ru1 = OpExtInst %f32 %glsl 1 %cu1
+%u1 = OpConvertFToU %u32 %ru1
+%cs1 = OpExtInst %f32 %glsl 43 %x1 %fm100 %f100
+%s1 = OpConvertFToS %i32 %cs1
+%sw1 = OpBitcast %u32 %s1
+%po1 = OpAccessChain %pu32 %out %c1
+OpStore %po1 %u1
+%pq1 = OpAccessChain %pu32 %out %c5
+OpStore %pq1 %sw1
+%pi2 = OpAccessChain %pf32 %in %c2
+%x2 = OpLoad %f32 %pi2
+%cu2 = OpExtInst %f32 %glsl 43 %x2 %f0 %f255
+%ru2 = OpExtInst %f32 %glsl 1 %cu2
+%u2 = OpConvertFToU %u32 %ru2
+%cs2 = OpExtInst %f32 %glsl 43 %x2 %fm100 %f100
+%s2 = OpConvertFToS %i32 %cs2
+%sw2 = OpBitcast %u32 %s2
+%po2 = OpAccessChain %pu32 %out %c2
+OpStore %po2 %u2
+%pq2 = OpAccessChain %pu32 %out %c6
+OpStore %pq2 %sw2
+%pi3 = OpAccessChain %pf32 %in %c3
+%x3 = OpLoad %f32 %pi3
+%cu3 = OpExtInst %f32 %glsl 43 %x3 %f0 %f255
+%ru3 = OpExtInst %f32 %glsl 1 %cu3
+%u3 = OpConvertFToU %u32 %ru3
+%cs3 = OpExtInst %f32 %glsl 43 %x3 %fm100 %f100
+%s3 = OpConvertFToS %i32 %cs3
+%sw3 = OpBitcast %u32 %s3
+%po3 = OpAccessChain %pu32 %out %c3
+OpStore %po3 %u3
+%pq3 = OpAccessChain %pu32 %out %c7
+OpStore %pq3 %sw3
+OpReturn
+OpFunctionEnd
