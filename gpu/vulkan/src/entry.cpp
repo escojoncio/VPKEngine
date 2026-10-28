@@ -1066,8 +1066,18 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkGetPhysicalDeviceImageFormatPropert
     if (const auto* su = static_cast<const VkImageStencilUsageCreateInfo*>(
             findNext(in->pNext, VK_STRUCTURE_TYPE_IMAGE_STENCIL_USAGE_CREATE_INFO)))
       usage |= su->stencilUsage;
-  const VkResult r = vkGetPhysicalDeviceImageFormatProperties(pd, in->format, in->type, in->tiling, usage,
-                                                              in->flags, &out->imageFormatProperties);
+  VkResult r = vkGetPhysicalDeviceImageFormatProperties(pd, in->format, in->type, in->tiling, usage, in->flags,
+                                                        &out->imageFormatProperties);
+  // VK_KHR_maintenance2 EXTENDED_USAGE: the usage is valid when a view format of the list supports it (an sRGB image
+  // used as storage through its UNORM view).
+  if (r == VK_ERROR_FORMAT_NOT_SUPPORTED && (in->flags & VK_IMAGE_CREATE_EXTENDED_USAGE_BIT) &&
+      (in->flags & VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT))
+    if (const auto* fl = static_cast<const VkImageFormatListCreateInfo*>(
+            findNext(in->pNext, VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO)))
+      for (uint32_t i = 0; i < fl->viewFormatCount && r != VK_SUCCESS; ++i)
+        if (fl->pViewFormats[i] != in->format)
+          r = vkGetPhysicalDeviceImageFormatProperties(pd, fl->pViewFormats[i], in->type, in->tiling, usage, in->flags,
+                                                       &out->imageFormatProperties);
   if (auto* q = static_cast<VkHostImageCopyDevicePerformanceQueryEXT*>(
           findNextOut(out->pNext, VK_STRUCTURE_TYPE_HOST_IMAGE_COPY_DEVICE_PERFORMANCE_QUERY_EXT))) {
     if (nativeExtras()) {
