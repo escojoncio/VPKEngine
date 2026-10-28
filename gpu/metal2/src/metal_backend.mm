@@ -1506,17 +1506,28 @@ vertex VpOut vp_main(uint in_vertex_id [[vertex_id]]) {
 )MSL";
     static const char* kFs = R"MSL(#include <metal_stdlib>
 using namespace metal;
-#if VAR==2 || VAR==6
-#define BFV(X) (X)
+#define ALLF(X) (X)
+#if VAR==0
+#define BFV(X) simd_broadcast_first(X)
+#define BFC(X) simd_broadcast_first(X)
 #elif VAR==1
 #define BFV(X) uint2(simd_broadcast_first((X).x), simd_broadcast_first((X).y))
-#else
+#define BFC(X) uint2(simd_broadcast_first((X).x), simd_broadcast_first((X).y))
+#elif VAR==7
 #define BFV(X) simd_broadcast_first(X)
-#endif
-#if VAR==3 || VAR==6
-#define ALLF(X) (X)
+#define BFC(X) (X)
+#elif VAR==8
+#define BFV(X) (X)
+#define BFC(X) simd_broadcast_first(X)
+#elif VAR==9
+#define BFV(X) uint2(simd_shuffle((X).x, ushort(ctz(simd_or(1u << in_subgroup_invocation)))), simd_shuffle((X).y, ushort(ctz(simd_or(1u << in_subgroup_invocation)))))
+#define BFC(X) BFV(X)
+#elif VAR==10
+#define BFV(X) simd_max(X)
+#define BFC(X) simd_max(X)
 #else
-#define ALLF(X) simd_all(X)
+#define BFV(X) uint2(simd_broadcast_first((X).x), (X).y)
+#define BFC(X) uint2(simd_broadcast_first((X).x), (X).y)
 #endif
 #ifndef VP_PSZ
 #define VP_PSZ point_size
@@ -1543,11 +1554,7 @@ fragment VpOut vp_main(constant VpArgs& vp_args [[buffer(0)]],
     l1 = 0u;
     const uint v4 = in_subgroup_invocation * 8u;
     uint2 v5 = uint2(0);
-#if VAR==5
-    v5 = uint2(5u);
-#else
     if (ulong(v4) + 8ul <= ((vp_args.bs0 + 3ul) & ~3ul)) v5 = uint2(*(const device packed_uint2*)(vp_args.b0 + v4));
-#endif
     const uint2 v6 = uint2(0u);
     const bool2 v7 = v5 != v6;
     const float2 v10 = select(float2(0.0f), float2(1.0f), v7);
@@ -1564,7 +1571,7 @@ fragment VpOut vp_main(constant VpArgs& vp_args [[buffer(0)]],
     const bool2 v29 = bool2(v28);
     const uint2 v32 = select(v6, v19, v29);
     vp_p1_0 = v32;
-    const uint2 v38 = BFV(v19);
+    const uint2 v38 = BFC(v19);
     const bool2 v40 = v38 != v6;
     const bool2 v41 = bool2(true) == v40;
     const bool v44 = v41.x && v41.y;
@@ -1576,11 +1583,7 @@ fragment VpOut vp_main(constant VpArgs& vp_args [[buffer(0)]],
     const uint v54 = v52 | 2u;
     vp_p2_0 = v54;
     uint2 v57 = uint2(0);
-#if VAR==5
-    v57 = uint2(5u);
-#else
     if (ulong(0u) + 8ul <= ((vp_args.bs0 + 3ul) & ~3ul)) v57 = uint2(*(const device packed_uint2*)(vp_args.b0));
-#endif
     const bool2 v59 = v57 != v6;
     const uint2 v62 = select(v6, v19, v59);
     const uint2 v63 = BFV(v62);
@@ -1622,13 +1625,11 @@ fragment VpOut vp_main(constant VpArgs& vp_args [[buffer(0)]],
     const uint4 v126 = uint4(simd_or(1u << in_subgroup_invocation), 0u, 0u, 0u);
     const uint v128 = ctz(v126.x);
     const bool v130 = in_subgroup_invocation == v128;
-#if VAR!=4 && VAR!=6
     if (v130) {
         const uint v132 = vp_p2_0;
         const uint v134 = v132 | 18u;
         vp_p2_0 = v134;
     }
-#endif
     const uint v137 = vp_p2_0;
     l0 = v137;
     const uint v138 = l0;
@@ -1648,7 +1649,7 @@ fragment VpOut vp_main(constant VpArgs& vp_args [[buffer(0)]],
     td.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
     td.storageMode = MTLStorageModeShared;
     id<MTLTexture> rt = [dev newTextureWithDescriptor:td];
-    for (int v : {6, 2, 3, 4, 5, 1, 0}) {
+    for (int v : {10, 11, 9, 1, 7, 8, 0}) {
       MTLCompileOptions* co = [MTLCompileOptions new];
       co.preprocessorMacros = @{@"VAR": @(v)};
       id<MTLLibrary> flib = [dev newLibraryWithSource:@(kFs) options:co error:&e];
@@ -1678,6 +1679,7 @@ fragment VpOut vp_main(constant VpArgs& vp_args [[buffer(0)]],
         [enc endEncoding];
         [cb commit];
         [cb waitUntilCompleted];
+        if (cb.status == MTLCommandBufferStatusError) q = [dev newCommandQueue];
         uint32_t px[8] = {};
         [rt getBytes:px bytesPerRow:4096 fromRegion:MTLRegionMake2D(0, 0, 8, 1) mipmapLevel:0];
         char buf[256];
