@@ -64,6 +64,11 @@ GLuint* Context::textureBinding(GLenum target, int unit) {
     }
 }
 
+Texture* Context::defaultTexture(GLenum target) {
+    auto it = share->textures.find(0xFFFF0000u | (target & 0xFFFF));
+    return it == share->textures.end() ? nullptr : it->second.get();
+}
+
 Texture* Context::boundTexture(GLenum target) {
     GLuint* b = textureBinding(target, activeUnit);
     if (!b) return nullptr;
@@ -1108,15 +1113,39 @@ static GLuint unitTexture(const Context::Unit& u, const vpglsl::Variable& v) {
     }
 }
 
+// The texture target a sampler uniform reads (the same mapping as unitTexture).
+static GLenum samplerTarget(const vpglsl::Variable& v) {
+    switch (v.glType) {
+        case 0x8B60: case 0x8DC5: case 0x8DCC: case 0x8DD4: return gl::TEXTURE_CUBE_MAP;
+        case 0x8B5F: case 0x8DCB: case 0x8DD3: return gl::TEXTURE_3D;
+        case 0x8DC1: case 0x8DC4: case 0x8DCF: case 0x8DD7: return gl::TEXTURE_2D_ARRAY;
+        case 0x8D66: return gl::TEXTURE_EXTERNAL_OES;
+        case 0x9108: case 0x9109: case 0x910A: return gl::TEXTURE_2D_MULTISAMPLE;
+        default: return gl::TEXTURE_2D;
+    }
+}
+
 // Texture completeness (GLES 3.0 §8.17): an incomplete texture samples as (0, 0, 0, 1). `sp` are the sampling parameters
 // the unit really uses (a sampler object bound to the unit replaces the texture's own).
 static bool complete(const Texture& t, const SamplerParams& sp) {
     if (!t.image || t.levels.empty() || !t.levels[0].format) return false;
     const bool mip = sp.minFilter != gl::NEAREST && sp.minFilter != gl::LINEAR;
-    if (!mip || t.immutable) return true;
+    if (t.immutable) return true;
     const uint32_t base = uint32_t(std::max(0, t.baseLevel));
+    const uint32_t last = mip ? std::min<uint32_t>(uint32_t(t.maxLevel), t.image->levels - 1) : base;
+    if (t.target == gl::TEXTURE_CUBE_MAP) {
+        // Every face has the same size and format at the base level, and (mipmapped) at every level up to the last.
+        for (const auto& fl : t.faceLevels) {
+            if (base >= fl.size()) return false;
+            for (uint32_t l = base; l <= last; ++l) {
+                if (l >= fl.size() || fl[l].format != t.image->format) return false;
+                if (fl[l].w != std::max(1u, t.image->width >> l) || fl[l].h != std::max(1u, t.image->height >> l)) return false;
+            }
+        }
+        return true;
+    }
+    if (!mip) return true;
     if (base >= t.levels.size()) return false;
-    const uint32_t last = std::min<uint32_t>(uint32_t(t.maxLevel), t.image->levels - 1);
     for (uint32_t l = base; l <= last; ++l) {
         if (l >= t.levels.size() || t.levels[l].format != t.image->format) return false;
         if (t.levels[l].w != std::max(1u, t.image->width >> l) || t.levels[l].h != std::max(1u, t.image->height >> l)) return false;
@@ -1231,7 +1260,7 @@ bool Context::bindResources(Program& p, const StorageP& xfbScratch) {
             const int unit = p.samplerUnits[i][size_t(e)];
             const Unit& un = units[size_t(unit)];
             GLuint name = unitTexture(un, u);
-            Texture* t = name ? texture(name) : nullptr;
+            Texture* t = name ? texture(name) : defaultTexture(samplerTarget(u));  // name 0: the target's default texture object
             VkDescriptorImageInfo ii{};
             ii.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
             SamplerParams sp;
@@ -1655,6 +1684,7 @@ bool Context::prepareDraw(GLenum mode, VkPrimitiveTopology& topo, uint32_t verte
             attrs.push_back(ad);
         }
     }
+    blackTexture();  // created before the pass: its upload ends the pass it is made in (a draw would be dropped)
     if (!beginPass(drawFb_)) return false;
     VkPipeline pl = pipelineFor(*p, drawFb_, topo, binds, attrs, bool(xfbScratch_));
     if (!pl) {

@@ -775,6 +775,22 @@ void testTextures() {
         glTexImage2D(gl::TEXTURE_2D, 0, gl::RGBA, 16, 16, 0, gl::RGBA, gl::UNSIGNED_BYTE, px.data());
         CHECK(err() == gl::NO_ERROR && counts.copiesToImage == 2);
     }
+    // An empty base level (0 x 0) leaves the texture without an image and without a GL error (the other levels are accepted);
+    // a level larger than the base's mip chain allows is kept as a definition only (no upload into a smaller level).
+    {
+        GLuint z[2];
+        glGenTextures(2, z);
+        glBindTexture(gl::TEXTURE_2D, z[0]);
+        counts = {};
+        glTexImage2D(gl::TEXTURE_2D, 0, gl::RGBA, 0, 0, 0, gl::RGBA, gl::UNSIGNED_BYTE, px.data());
+        glTexImage2D(gl::TEXTURE_2D, 1, gl::RGBA, 8, 8, 0, gl::RGBA, gl::UNSIGNED_BYTE, px.data());
+        CHECK(err() == gl::NO_ERROR && counts.copiesToImage == 0);
+        glBindTexture(gl::TEXTURE_2D, z[1]);
+        counts = {};
+        glTexImage2D(gl::TEXTURE_2D, 0, gl::RGBA, 32, 32, 0, gl::RGBA, gl::UNSIGNED_BYTE, px.data());
+        glTexImage2D(gl::TEXTURE_2D, 1, gl::RGBA, 17, 17, 0, gl::RGBA, gl::UNSIGNED_BYTE, px.data());
+        CHECK(err() == gl::NO_ERROR && counts.copiesToImage == 1);
+    }
     // The first texture of a format is logged when it is made: the periodic summary needs a swap / flush / terminate, which
     // a host that presents through its own swapchain and is killed never gives.
     {

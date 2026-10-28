@@ -72,6 +72,7 @@ static bool storageCapable(VkFormat f) {
 bool Context::realizeTexture(Texture& t) {
     if (t.levels.empty() || !t.levels[0].format) return false;
     const Texture::Level& l0 = t.levels[0];
+    if (!l0.w || !l0.h || !l0.d) return false;  // an empty base level: no image, the texture is incomplete
     const bool cube = t.target == gl::TEXTURE_CUBE_MAP;
     const bool is3D = t.target == gl::TEXTURE_3D;
     const bool array = t.target == gl::TEXTURE_2D_ARRAY;
@@ -262,6 +263,11 @@ void Context::texImage(GLenum target, GLint level, GLenum internalFormat, GLsize
         Texture::Level& lv = t->levels[size_t(level)];
         lv.w = uint32_t(w), lv.h = uint32_t(h), lv.d = uint32_t(std::max(d, 1));
         lv.format = fi;
+        if (cube) {
+            auto& fl = t->faceLevels[face];
+            if (fl.size() <= size_t(level)) fl.resize(size_t(level) + 1);
+            fl[size_t(level)] = lv;
+        }
         // An empty level (0 x 0 x 0 resets a texture, as gluStateReset does) has no storage: level 0 drops the image.
         if (w == 0 || h == 0 || d == 0) {
             if (level == 0 && t->image) {
@@ -282,6 +288,9 @@ void Context::texImage(GLenum target, GLint level, GLenum internalFormat, GLsize
             }
         } else if (t->image->format != fi) {
             return;  // inconsistent level: texture incomplete until redefined
+        } else if (uint32_t(level) >= t->image->levels || uint32_t(w) > std::max(1u, t->image->width >> level) ||
+                   uint32_t(h) > std::max(1u, t->image->height >> level)) {
+            return;  // a level outside the image's chain or larger than it: kept as a definition only (incomplete / unused)
         }
         if (!pixels && !pixelUnpack) return;
         xo = yo = zo = 0;
@@ -516,6 +525,11 @@ void Context::generateMipmap(GLenum target) {
         if (t->levels.size() <= l) t->levels.resize(l + 1);
         t->levels[l] = {uint32_t(b.dstOffsets[1].x), uint32_t(b.dstOffsets[1].y),
                         target == gl::TEXTURE_3D ? uint32_t(b.dstOffsets[1].z) : t->levels[0].d, img.format};
+        if (target == gl::TEXTURE_CUBE_MAP)
+            for (auto& fl : t->faceLevels) {
+                if (fl.size() <= l) fl.resize(l + 1);
+                fl[l] = t->levels[l];
+            }
     }
 }
 

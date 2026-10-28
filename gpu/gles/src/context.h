@@ -188,6 +188,8 @@ struct Texture {
         const FormatInfo* format = nullptr;
     };
     std::vector<Level> levels;
+    // Cube maps: the same definitions per face (a face's level can differ from the others', which makes the cube incomplete).
+    std::array<std::vector<Level>, 6> faceLevels;
     // Uploads to levels above 0 that arrived before level 0 defined the image (UE4 streams the small mips first): kept
     // here (already converted, ready to copy) until the base creates the image, then uploaded and freed.
     struct PendingUpload {
@@ -762,6 +764,7 @@ private:
     bool provoke_ = false;  // this draw runs as an index list with each primitive's last vertex first (flat varyings, see prepareDraw)
     std::unique_ptr<Texture> black_;
     Texture& blackTexture();
+    Texture* defaultTexture(GLenum target);  // texture object 0 of the target if the app ever used it, else null
 };
 
 GLint uniformLocation(const Program& p, const char* name);
