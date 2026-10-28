@@ -519,6 +519,27 @@ void testFormats() {
     uint16_t p565 = uint16_t(31 << 11 | 63 << 5);
     CHECK(convertReadback(*formatFor(gl::RGB565), gl::RGBA, gl::UNSIGNED_BYTE, reinterpret_cast<uint8_t*>(&p565), 1, rgbaOut));
     CHECK(rgbaOut[0] == 255 && rgbaOut[1] == 255 && rgbaOut[2] == 0 && rgbaOut[3] == 255);
+    // Readback of formats without a raw layout match: RG8, R16I, R16F, RGB10_A2, R11F_G11F_B10F into the usual client types.
+    uint8_t rg8[2] = {255, 128}, rbOut[16];
+    CHECK(convertReadback(*formatFor(gl::RG8), gl::RGBA, gl::UNSIGNED_BYTE, rg8, 1, rbOut));
+    CHECK(rbOut[0] == 255 && rbOut[1] == 128 && rbOut[2] == 0 && rbOut[3] == 255);
+    int16_t r16i = -32768;
+    int32_t i4[4];
+    CHECK(convertReadback(*formatFor(gl::R16I), gl::RGBA_INTEGER, gl::INT, reinterpret_cast<uint8_t*>(&r16i), 1, rbOut));
+    std::memcpy(i4, rbOut, 16);
+    CHECK(i4[0] == -32768 && i4[1] == 0 && i4[2] == 0 && i4[3] == 1);
+    uint16_t r16f = 0x3800;  // 0.5
+    float f4[4];
+    CHECK(convertReadback(*formatFor(gl::R16F), gl::RGBA, gl::FLOAT, reinterpret_cast<uint8_t*>(&r16f), 1, rbOut));
+    std::memcpy(f4, rbOut, 16);
+    CHECK(f4[0] == 0.5f && f4[1] == 0 && f4[3] == 1);
+    uint32_t a2 = 0xC0000000u | 1023u << 20 | 512u << 10;
+    CHECK(convertReadback(*formatFor(gl::RGB10_A2), gl::RGBA, gl::UNSIGNED_BYTE, reinterpret_cast<uint8_t*>(&a2), 1, rbOut));
+    CHECK(rbOut[0] == 0 && rbOut[1] == 128 && rbOut[2] == 255 && rbOut[3] == 255);
+    uint32_t r11 = (0x3C00 >> 4) | (0x3800 >> 4) << 11 | (0x4000 >> 5) << 22;  // 1.0, 0.5, 2.0
+    CHECK(convertReadback(*formatFor(gl::R11F_G11F_B10F), gl::RGBA, gl::FLOAT, reinterpret_cast<uint8_t*>(&r11), 1, rbOut));
+    std::memcpy(f4, rbOut, 16);
+    CHECK(f4[0] == 1.0f && f4[1] == 0.5f && f4[2] == 2.0f && f4[3] == 1.0f);
     CHECK(clientPixelBytes(gl::RGBA, gl::FLOAT) == 16 && clientPixelBytes(gl::RGB, gl::UNSIGNED_SHORT_5_6_5) == 2);
     // DEPTH_COMPONENT uploads: every client type into D16 / D32F / D24.
     const FormatInfo* d16 = formatFor(gl::DEPTH_COMPONENT16);
