@@ -1,0 +1,2 @@
+attempt 1: exit=0 why=exit done=6 open=None remaining=0
+{"Pass": 6}

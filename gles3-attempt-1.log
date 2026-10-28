@@ -1,0 +1,205 @@
+vpk.version sha=6f03495e14ef
+vk.instance app=vpgles engine= api=1.3 exts=0
+vk.caps identity=quest vendor=0x5143 device="Adreno (TM) 740"
+vk.caps limits apiVersion=1.3.0 maxVertexOutputComponents=124 maxFragmentInputComponents=124 maxColorAttachments=8 maxComputeWorkGroupInvocations=1024 maxComputeSharedMemorySize=32768 maxImageDimension2D=16384 maxImageArrayLayers=2048 maxPerStageDescriptorStorageBuffers=24 maxPerStageDescriptorStorageImages=8 maxBoundDescriptorSets=7 maxSamplerAnisotropy=16 framebufferColorSampleCounts=0x7 sampledImageColorSampleCounts=0x7
+vk.format device bc_texture_compression=1
+vk.caps features geometryShader=0 tessellationShader=0 imageCubeArray=1 sampleRateShading=1 fragmentStoresAndAtomics=1 vertexPipelineStoresAndAtomics=1 shaderInt16=1 shaderFloat64=0 shaderStorageImageMultisample=0 shaderClipDistance=1 multiViewport=0 astc=1 etc2=1 bc=1 depthClamp=1 independentBlend=1 dualSrcBlend=1 logicOp=0 multiDrawIndirect=1
+gpu.cfg frames_in_flight=3
+gpu.metal.info what=no_residency_set fallback=use_resource error=unknown_error
+gpu.state elide on=1
+gpu.state buf_immutable on=1
+gpu.state full_barriers on=0
+gpu.metal device=Apple_Paravirtual_device simulator=0 metal3=0 apple4=1 apple7=0 argument_buffers_tier=2 bindless=0 stage_timestamps=0 residency=0 archive=0 tile_memory=1
+gpu.hold armed max_ms=1500
+gpu.msaa resolve_on_tile=colour
+gpu.tile heavy_max_draws=2000 heavy_max_vertices=3000000 heavy_mode=on
+vk.translator mode=0 native_fetch=0 amplify=0 unpack_fetch=0 kill_exit=1 id=37
+vk.device exts=3 multiview=1 fdm=0 metal_objects=0
+vk.msaa device_max=4 (supportsTextureSampleCount 8=0 4=1 2=1)
+vk.cfg effective gen=0 fov=off sharp=0.35 periphery=0.50 vpktaa=0 50% sharp=0.50 scale=1.00 taa_native=0 taa_ui_mask=0 rcas=0.00 asw_off=1 quest3=1 anisotropy=16 prewarm=0 force_1x=0 msaa_override=0 msaa_device_max=4 fov_apply=0 fov_active=0 set_by_app=no(defaults)
+gles.init device=Adreno (TM) 740 vendor=0x5143
+vpgles-shim: 390 of 401 core entry points resolved
+Writing test log into /Users/runner/work/VPKEngine/VPKEngine/build/smoke/gles3/out/attempt-1.qpa
+dEQP Core vulkan-cts-1.4.6.2-0-gf6a29701220f34dd1407513bfe80d74ca7b392ce (0xf6a29701) starting..
+  target implementation = 'VPGLES'
+gpu.shader.lib compiled=1 dedup=0 prewarmed=0 ms_total=1 ms_max=1 last_ms=1 bytes=790 wait_ms=0 src=prewarm
+vk.msaa_tile memoryless image=256x256x1 samples=1 format=37 usage=0x17 (0.2 MiB if resident)
+vk.msaa_tile memoryless image=256x256x1 samples=1 format=129 usage=0x23 (0.2 MiB if resident)
+gpu.metal.info what=msaa_materialized index=0 256x256x1 samples=1 fmt=RGBA8Unorm mb=0.2 why=None load=2 store=1 label=
+gpu.metal.info what=msaa_materialized index=1 256x256x1 samples=1 fmt=D24UnormS8 mb=0.5 why=None load=2 store=1 label=
+gpu.frame f=0 enc=2 render=2 compute=0 naive=2 passes=2 merged=0 hoisted=0 sunk=0 dropped=0 barriers=0 intra=0 raw=0 war=0 waw=0 tile_local=0 tile_rejected=0 saved_mb=0.0 split=0 verts=0 tile_max=3000000 heavy_enc=0 cpu_ms=0.024
+gpu.cut f=0 FrameStart=1 AttachmentChange=1 ClearLoad=0 Feedback=0 TileBudget=0 PinnedCopy=0 ComputeBetween=0 ComputeWork=0 CopyWork=0 ViewSplit=0 TileSplit=0
+gpu.pso f=0 compiled=0 failed=0 hits=0 misses=1 ms=0.00 max_ms=0.00
+gpu.enc f=0 i=0 kind=render reason=FrameStart cmds=1 passes=1 ls=c0:CS label=vk.clear
+gpu.enc f=0 i=1 kind=render reason=AttachmentChange cmds=1 passes=1 ls=d:CS label=vk.clear
+vk.pso.census created=0 compiled=0 failed=0 timed_out=0 archived=0 not_archived_depth_only=0 not_archived_other=0 archive_hits=0 compiled_in_session=0 archive_dup=0 archive_pending=0 archive_spilled=0
+vk.submit n=1 cbs=1 passes=0 draws=0 dispatches=0 copies=0 clears=2 vk_barriers=2 draws_skipped=0 dispatch_skipped=0 dropped=0
+gpu.pso.hot label=vk.indirect_patch ms=73
+gpu.pso.miss n=1 kind=compute label=vk.indirect_patch key=5739658356830076479 ms=73
+gpu.pso.aot archived=0 hot=1 hot_ms_total=73 hot_ms_max=73
+gpu.slowcb f=0 ms=91.5 draws=0 passes=2 est_cost=1 label=vpgpu.f0
+
+Test case 'dEQP-GLES3.info.vendor'..
+gpu.frame f=1 enc=1 render=1 compute=0 naive=1 passes=1 merged=0 hoisted=0 sunk=0 dropped=0 barriers=0 intra=0 raw=0 war=0 waw=0 tile_local=0 tile_rejected=0 saved_mb=0.0 split=0 verts=0 tile_max=3000000 heavy_enc=0 cpu_ms=0.018
+gpu.cut f=1 FrameStart=1 AttachmentChange=0 ClearLoad=0 Feedback=0 TileBudget=0 PinnedCopy=0 ComputeBetween=0 ComputeWork=0 CopyWork=0 ViewSplit=0 TileSplit=0
+gpu.pso f=1 compiled=1 failed=0 hits=0 misses=0 ms=74.65 max_ms=74.65
+gpu.time f=0 gpu_ms=91.511 t=122.9
+vk.submit n=2 cbs=1 passes=1 draws=0 dispatches=0 copies=0 clears=0 vk_barriers=1 draws_skipped=0 dispatch_skipped=0 dropped=0
+vk.hitch submit=2 dt_ms=93.4 submit_ms=0.27 translate_ms=0.00 backend_ms=0.26 pso_create_ms=0.00 lib_compile_ms=0.00 fence_wait_ms=92.29 alloc_ms=0.00 upload_bytes=0 gles_link_ms=0.00 lock_ms=0.00 guest_gap_ms=0.9
+  Pass (Pass)
+
+Test case 'dEQP-GLES3.info.renderer'..
+gpu.frame f=2 enc=1 render=1 compute=0 naive=1 passes=1 merged=0 hoisted=0 sunk=0 dropped=0 barriers=0 intra=0 raw=0 war=0 waw=0 tile_local=0 tile_rejected=0 saved_mb=0.0 split=0 verts=0 tile_max=3000000 heavy_enc=0 cpu_ms=0.025
+gpu.cut f=2 FrameStart=1 AttachmentChange=0 ClearLoad=0 Feedback=0 TileBudget=0 PinnedCopy=0 ComputeBetween=0 ComputeWork=0 CopyWork=0 ViewSplit=0 TileSplit=0
+gpu.time f=1 gpu_ms=1.345 t=125.8
+vk.submit n=3 cbs=1 passes=1 draws=0 dispatches=0 copies=0 clears=0 vk_barriers=1 draws_skipped=0 dispatch_skipped=0 dropped=0
+  Pass (Pass)
+
+Test case 'dEQP-GLES3.info.version'..
+gpu.frame f=3 enc=1 render=1 compute=0 naive=1 passes=1 merged=0 hoisted=0 sunk=0 dropped=0 barriers=0 intra=0 raw=0 war=0 waw=0 tile_local=0 tile_rejected=0 saved_mb=0.0 split=0 verts=0 tile_max=3000000 heavy_enc=0 cpu_ms=0.014
+gpu.cut f=3 FrameStart=1 AttachmentChange=0 ClearLoad=0 Feedback=0 TileBudget=0 PinnedCopy=0 ComputeBetween=0 ComputeWork=0 CopyWork=0 ViewSplit=0 TileSplit=0
+gpu.time f=2 gpu_ms=1.146 t=128.1
+  Pass (Pass)
+
+Test case 'dEQP-GLES3.info.shading_language_version'..
+gpu.frame f=4 enc=1 render=1 compute=0 naive=1 passes=1 merged=0 hoisted=0 sunk=0 dropped=0 barriers=0 intra=0 raw=0 war=0 waw=0 tile_local=0 tile_rejected=0 saved_mb=0.0 split=0 verts=0 tile_max=3000000 heavy_enc=0 cpu_ms=0.012
+gpu.cut f=4 FrameStart=1 AttachmentChange=0 ClearLoad=0 Feedback=0 TileBudget=0 PinnedCopy=0 ComputeBetween=0 ComputeWork=0 CopyWork=0 ViewSplit=0 TileSplit=0
+gpu.time f=3 gpu_ms=1.171 t=130.3
+  Pass (Pass)
+
+Test case 'dEQP-GLES3.info.extensions'..
+gpu.frame f=5 enc=1 render=1 compute=0 naive=1 passes=1 merged=0 hoisted=0 sunk=0 dropped=0 barriers=0 intra=0 raw=0 war=0 waw=0 tile_local=0 tile_rejected=0 saved_mb=0.0 split=0 verts=0 tile_max=3000000 heavy_enc=0 cpu_ms=0.015
+gpu.cut f=5 FrameStart=1 AttachmentChange=0 ClearLoad=0 Feedback=0 TileBudget=0 PinnedCopy=0 ComputeBetween=0 ComputeWork=0 CopyWork=0 ViewSplit=0 TileSplit=0
+gpu.time f=4 gpu_ms=0.933 t=132.9
+  Pass (Pass)
+
+Test case 'dEQP-GLES3.info.render_target'..
+gpu.frame f=6 enc=1 render=1 compute=0 naive=1 passes=1 merged=0 hoisted=0 sunk=0 dropped=0 barriers=0 intra=0 raw=0 war=0 waw=0 tile_local=0 tile_rejected=0 saved_mb=0.0 split=0 verts=0 tile_max=3000000 heavy_enc=0 cpu_ms=0.013
+gpu.cut f=6 FrameStart=1 AttachmentChange=0 ClearLoad=0 Feedback=0 TileBudget=0 PinnedCopy=0 ComputeBetween=0 ComputeWork=0 CopyWork=0 ViewSplit=0 TileSplit=0
+gpu.time f=5 gpu_ms=1.546 t=135.6
+  Pass (Pass)
+
+Test case 'dEQP-GLES3.functional.prerequisite.state_reset'..
+gpu.frame f=7 enc=1 render=1 compute=0 naive=1 passes=1 merged=0 hoisted=0 sunk=0 dropped=0 barriers=0 intra=0 raw=0 war=0 waw=0 tile_local=0 tile_rejected=0 saved_mb=0.0 split=0 verts=0 tile_max=3000000 heavy_enc=0 cpu_ms=0.013
+gpu.cut f=7 FrameStart=1 AttachmentChange=0 ClearLoad=0 Feedback=0 TileBudget=0 PinnedCopy=0 ComputeBetween=0 ComputeWork=0 CopyWork=0 ViewSplit=0 TileSplit=0
+gpu.time f=6 gpu_ms=1.586 t=138.6
+  Pass (Pass)
+
+Test case 'dEQP-GLES3.functional.prerequisite.clear_color'..
+gpu.clear f=8 mask=0x1 d=0 s=0 n=1 fmt0=70 samples0=1 kind0=0 bits0=00000000,00000000,00000000,3f800000 ndc0=-1.000,1.000,1.000,-1.000 z=0.500 layered=0 size=256x256 load0=2
+gpu.frame f=8 enc=1 render=1 compute=0 naive=1 passes=1 merged=0 hoisted=0 sunk=0 dropped=0 barriers=0 intra=0 raw=0 war=0 waw=0 tile_local=0 tile_rejected=0 saved_mb=0.0 split=0 verts=0 tile_max=3000000 heavy_enc=0 cpu_ms=0.066
+gpu.cut f=8 FrameStart=1 AttachmentChange=0 ClearLoad=0 Feedback=0 TileBudget=0 PinnedCopy=0 ComputeBetween=0 ComputeWork=0 CopyWork=0 ViewSplit=0 TileSplit=0
+gpu.time f=7 gpu_ms=1.260 t=142.8
+gpu.slowcb f=8 ms=18.1 draws=0 passes=1 est_cost=2 label=vpgpu.f8
+gpu.clear f=9 mask=0x1 d=0 s=0 n=1 fmt0=70 samples0=1 kind0=0 bits0=3f800000,3f800000,3f800000,3f800000 ndc0=-1.000,1.000,1.000,-1.000 z=0.500 layered=0 size=256x256 load0=2
+gpu.frame f=9 enc=1 render=1 compute=0 naive=1 passes=1 merged=0 hoisted=0 sunk=0 dropped=0 barriers=0 intra=0 raw=0 war=0 waw=0 tile_local=0 tile_rejected=0 saved_mb=0.0 split=0 verts=0 tile_max=3000000 heavy_enc=0 cpu_ms=0.034
+gpu.cut f=9 FrameStart=1 AttachmentChange=0 ClearLoad=0 Feedback=0 TileBudget=0 PinnedCopy=0 ComputeBetween=0 ComputeWork=0 CopyWork=0 ViewSplit=0 TileSplit=0
+gpu.time f=8 gpu_ms=18.058 t=161.5
+gpu.clear f=10 mask=0x1 d=0 s=0 n=1 fmt0=70 samples0=1 kind0=0 bits0=3f800000,00000000,00000000,3f800000 ndc0=-1.000,1.000,1.000,-1.000 z=0.500 layered=0 size=256x256 load0=2
+gpu.frame f=10 enc=1 render=1 compute=0 naive=1 passes=1 merged=0 hoisted=0 sunk=0 dropped=0 barriers=0 intra=0 raw=0 war=0 waw=0 tile_local=0 tile_rejected=0 saved_mb=0.0 split=0 verts=0 tile_max=3000000 heavy_enc=0 cpu_ms=0.019
+gpu.cut f=10 FrameStart=1 AttachmentChange=0 ClearLoad=0 Feedback=0 TileBudget=0 PinnedCopy=0 ComputeBetween=0 ComputeWork=0 CopyWork=0 ViewSplit=0 TileSplit=0
+gpu.time f=9 gpu_ms=2.795 t=164.8
+gpu.clear f=11 mask=0x1 d=0 s=0 n=1 fmt0=70 samples0=1 kind0=0 bits0=00000000,3f800000,00000000,3f800000 ndc0=-1.000,1.000,1.000,-1.000 z=0.500 layered=0 size=256x256 load0=2
+gpu.frame f=11 enc=1 render=1 compute=0 naive=1 passes=1 merged=0 hoisted=0 sunk=0 dropped=0 barriers=0 intra=0 raw=0 war=0 waw=0 tile_local=0 tile_rejected=0 saved_mb=0.0 split=0 verts=0 tile_max=3000000 heavy_enc=0 cpu_ms=0.015
+gpu.cut f=11 FrameStart=1 AttachmentChange=0 ClearLoad=0 Feedback=0 TileBudget=0 PinnedCopy=0 ComputeBetween=0 ComputeWork=0 CopyWork=0 ViewSplit=0 TileSplit=0
+gpu.time f=10 gpu_ms=2.469 t=167.6
+gpu.clear f=12 mask=0x1 d=0 s=0 n=1 fmt0=70 samples0=1 kind0=0 bits0=00000000,00000000,3f800000,3f800000 ndc0=-1.000,1.000,1.000,-1.000 z=0.500 layered=0 size=256x256 load0=2
+gpu.frame f=12 enc=1 render=1 compute=0 naive=1 passes=1 merged=0 hoisted=0 sunk=0 dropped=0 barriers=0 intra=0 raw=0 war=0 waw=0 tile_local=0 tile_rejected=0 saved_mb=0.0 split=0 verts=0 tile_max=3000000 heavy_enc=0 cpu_ms=0.010
+gpu.cut f=12 FrameStart=1 AttachmentChange=0 ClearLoad=0 Feedback=0 TileBudget=0 PinnedCopy=0 ComputeBetween=0 ComputeWork=0 CopyWork=0 ViewSplit=0 TileSplit=0
+gpu.time f=11 gpu_ms=0.997 t=169.1
+gpu.clear f=13 mask=0x1 d=0 s=0 n=1 fmt0=70 samples0=1 kind0=0 bits0=3ee4e4e5,3f4dcdce,3d888889,3f4fcfd0 ndc0=-1.000,1.000,1.000,-1.000 z=0.500 layered=0 size=256x256 load0=2
+gpu.frame f=13 enc=1 render=1 compute=0 naive=1 passes=1 merged=0 hoisted=0 sunk=0 dropped=0 barriers=0 intra=0 raw=0 war=0 waw=0 tile_local=0 tile_rejected=0 saved_mb=0.0 split=0 verts=0 tile_max=3000000 heavy_enc=0 cpu_ms=0.023
+gpu.cut f=13 FrameStart=1 AttachmentChange=0 ClearLoad=0 Feedback=0 TileBudget=0 PinnedCopy=0 ComputeBetween=0 ComputeWork=0 CopyWork=0 ViewSplit=0 TileSplit=0
+gpu.time f=12 gpu_ms=1.128 t=170.6
+gpu.clear f=14 mask=0x1 d=0 s=0 n=1 fmt0=70 samples0=1 kind0=0 bits0=3f5dddde,3eececed,3ecccccd,3f0a8a8b ndc0=-1.000,1.000,1.000,-1.000 z=0.500 layered=0 size=256x256 load0=2
+gpu.frame f=14 enc=1 render=1 compute=0 naive=1 passes=1 merged=0 hoisted=0 sunk=0 dropped=0 barriers=0 intra=0 raw=0 war=0 waw=0 tile_local=0 tile_rejected=0 saved_mb=0.0 split=0 verts=0 tile_max=3000000 heavy_enc=0 cpu_ms=0.011
+gpu.cut f=14 FrameStart=1 AttachmentChange=0 ClearLoad=0 Feedback=0 TileBudget=0 PinnedCopy=0 ComputeBetween=0 ComputeWork=0 CopyWork=0 ViewSplit=0 TileSplit=0
+gpu.time f=13 gpu_ms=0.859 t=171.8
+gpu.clear f=15 mask=0x1 d=0 s=0 n=1 fmt0=70 samples0=1 kind0=0 bits0=3f3ebebf,3f7afafb,3f34b4b5,3f57d7d8 ndc0=-1.000,1.000,1.000,-1.000 z=0.500 layered=0 size=256x256 load0=2
+gpu.frame f=15 enc=1 render=1 compute=0 naive=1 passes=1 merged=0 hoisted=0 sunk=0 dropped=0 barriers=0 intra=0 raw=0 war=0 waw=0 tile_local=0 tile_rejected=0 saved_mb=0.0 split=0 verts=0 tile_max=3000000 heavy_enc=0 cpu_ms=0.009
+gpu.cut f=15 FrameStart=1 AttachmentChange=0 ClearLoad=0 Feedback=0 TileBudget=0 PinnedCopy=0 ComputeBetween=0 ComputeWork=0 CopyWork=0 ViewSplit=0 TileSplit=0
+gpu.time f=14 gpu_ms=0.570 t=172.7
+gpu.clear f=16 mask=0x1 d=0 s=0 n=1 fmt0=70 samples0=1 kind0=0 bits0=3f119192,3d60e0e1,3e38b8b9,3f0c8c8d ndc0=-1.000,1.000,1.000,-1.000 z=0.500 layered=0 size=256x256 load0=2
+gpu.frame f=16 enc=1 render=1 compute=0 naive=1 passes=1 merged=0 hoisted=0 sunk=0 dropped=0 barriers=0 intra=0 raw=0 war=0 waw=0 tile_local=0 tile_rejected=0 saved_mb=0.0 split=0 verts=0 tile_max=3000000 heavy_enc=0 cpu_ms=0.009
+gpu.cut f=16 FrameStart=1 AttachmentChange=0 ClearLoad=0 Feedback=0 TileBudget=0 PinnedCopy=0 ComputeBetween=0 ComputeWork=0 CopyWork=0 ViewSplit=0 TileSplit=0
+gpu.time f=15 gpu_ms=0.973 t=174.0
+gpu.clear f=17 mask=0x1 d=0 s=0 n=1 fmt0=70 samples0=1 kind0=0 bits0=3f018182,3ed6d6d7,3e30b0b1,3f4ccccd ndc0=-1.000,1.000,1.000,-1.000 z=0.500 layered=0 size=256x256 load0=2
+gpu.frame f=17 enc=1 render=1 compute=0 naive=1 passes=1 merged=0 hoisted=0 sunk=0 dropped=0 barriers=0 intra=0 raw=0 war=0 waw=0 tile_local=0 tile_rejected=0 saved_mb=0.0 split=0 verts=0 tile_max=3000000 heavy_enc=0 cpu_ms=0.015
+gpu.cut f=17 FrameStart=1 AttachmentChange=0 ClearLoad=0 Feedback=0 TileBudget=0 PinnedCopy=0 ComputeBetween=0 ComputeWork=0 CopyWork=0 ViewSplit=0 TileSplit=0
+gpu.time f=16 gpu_ms=1.236 t=175.6
+  Pass (Pass)
+
+Test case 'dEQP-GLES3.functional.prerequisite.read_pixels'..
+gpu.clear f=18 mask=0x1 d=0 s=0 n=1 fmt0=70 samples0=1 kind0=0 bits0=3f038384,3ed8d8d9,3f3ababb,3f800000 ndc0=-1.000,1.000,1.000,-1.000 z=0.500 layered=0 size=256x256 load0=2
+gpu.frame f=18 enc=2 render=1 compute=1 naive=2 passes=1 merged=0 hoisted=0 sunk=1 dropped=0 barriers=1 intra=0 raw=1 war=0 waw=0 tile_local=0 tile_rejected=0 saved_mb=0.0 split=0 verts=0 tile_max=3000000 heavy_enc=0 cpu_ms=0.026
+gpu.cut f=18 FrameStart=1 AttachmentChange=0 ClearLoad=0 Feedback=0 TileBudget=0 PinnedCopy=0 ComputeBetween=0 ComputeWork=0 CopyWork=1 ViewSplit=0 TileSplit=0
+gpu.time f=17 gpu_ms=0.953 t=178.4
+gpu.clear f=19 mask=0x1 d=0 s=0 n=1 fmt0=70 samples0=1 kind0=0 bits0=3e60e0e1,3cc0c0c1,3f028283,3f800000 ndc0=-1.000,1.000,1.000,-1.000 z=0.500 layered=0 size=256x256 load0=2
+gpu.frame f=19 enc=2 render=1 compute=1 naive=2 passes=1 merged=0 hoisted=0 sunk=1 dropped=0 barriers=1 intra=0 raw=1 war=0 waw=0 tile_local=0 tile_rejected=0 saved_mb=0.0 split=0 verts=0 tile_max=3000000 heavy_enc=0 cpu_ms=0.018
+gpu.cut f=19 FrameStart=1 AttachmentChange=0 ClearLoad=0 Feedback=0 TileBudget=0 PinnedCopy=0 ComputeBetween=0 ComputeWork=0 CopyWork=1 ViewSplit=0 TileSplit=0
+gpu.time f=18 gpu_ms=1.347 t=181.4
+gpu.frame f=20 enc=2 render=1 compute=1 naive=2 passes=1 merged=0 hoisted=0 sunk=1 dropped=0 barriers=1 intra=0 raw=1 war=0 waw=0 tile_local=0 tile_rejected=0 saved_mb=0.0 split=0 verts=0 tile_max=3000000 heavy_enc=0 cpu_ms=0.017
+gpu.cut f=20 FrameStart=1 AttachmentChange=0 ClearLoad=0 Feedback=0 TileBudget=0 PinnedCopy=0 ComputeBetween=0 ComputeWork=0 CopyWork=1 ViewSplit=0 TileSplit=0
+gpu.time f=19 gpu_ms=1.952 t=184.0
+gpu.frame f=21 enc=2 render=1 compute=1 naive=2 passes=1 merged=0 hoisted=0 sunk=1 dropped=0 barriers=1 intra=0 raw=1 war=0 waw=0 tile_local=0 tile_rejected=0 saved_mb=0.0 split=0 verts=0 tile_max=3000000 heavy_enc=0 cpu_ms=0.029
+gpu.cut f=21 FrameStart=1 AttachmentChange=0 ClearLoad=0 Feedback=0 TileBudget=0 PinnedCopy=0 ComputeBetween=0 ComputeWork=0 CopyWork=1 ViewSplit=0 TileSplit=0
+gpu.time f=20 gpu_ms=5.807 t=190.6
+gpu.frame f=22 enc=2 render=1 compute=1 naive=2 passes=1 merged=0 hoisted=0 sunk=1 dropped=0 barriers=1 intra=0 raw=1 war=0 waw=0 tile_local=0 tile_rejected=0 saved_mb=0.0 split=0 verts=0 tile_max=3000000 heavy_enc=0 cpu_ms=0.016
+gpu.cut f=22 FrameStart=1 AttachmentChange=0 ClearLoad=0 Feedback=0 TileBudget=0 PinnedCopy=0 ComputeBetween=0 ComputeWork=0 CopyWork=1 ViewSplit=0 TileSplit=0
+gpu.time f=21 gpu_ms=7.033 t=198.8
+gpu.frame f=23 enc=2 render=1 compute=1 naive=2 passes=1 merged=0 hoisted=0 sunk=1 dropped=0 barriers=1 intra=0 raw=1 war=0 waw=0 tile_local=0 tile_rejected=0 saved_mb=0.0 split=0 verts=0 tile_max=3000000 heavy_enc=0 cpu_ms=0.016
+gpu.cut f=23 FrameStart=1 AttachmentChange=0 ClearLoad=0 Feedback=0 TileBudget=0 PinnedCopy=0 ComputeBetween=0 ComputeWork=0 CopyWork=1 ViewSplit=0 TileSplit=0
+gpu.time f=22 gpu_ms=2.644 t=202.3
+gpu.frame f=24 enc=2 render=1 compute=1 naive=2 passes=1 merged=0 hoisted=0 sunk=1 dropped=0 barriers=1 intra=0 raw=1 war=0 waw=0 tile_local=0 tile_rejected=0 saved_mb=0.0 split=0 verts=0 tile_max=3000000 heavy_enc=0 cpu_ms=0.023
+gpu.cut f=24 FrameStart=1 AttachmentChange=0 ClearLoad=0 Feedback=0 TileBudget=0 PinnedCopy=0 ComputeBetween=0 ComputeWork=0 CopyWork=1 ViewSplit=0 TileSplit=0
+gpu.time f=23 gpu_ms=4.354 t=207.3
+gpu.frame f=25 enc=2 render=1 compute=1 naive=2 passes=1 merged=0 hoisted=0 sunk=1 dropped=0 barriers=1 intra=0 raw=1 war=0 waw=0 tile_local=0 tile_rejected=0 saved_mb=0.0 split=0 verts=0 tile_max=3000000 heavy_enc=0 cpu_ms=0.015
+gpu.cut f=25 FrameStart=1 AttachmentChange=0 ClearLoad=0 Feedback=0 TileBudget=0 PinnedCopy=0 ComputeBetween=0 ComputeWork=0 CopyWork=1 ViewSplit=0 TileSplit=0
+gpu.time f=24 gpu_ms=4.252 t=212.2
+gpu.frame f=26 enc=2 render=1 compute=1 naive=2 passes=1 merged=0 hoisted=0 sunk=1 dropped=0 barriers=1 intra=0 raw=1 war=0 waw=0 tile_local=0 tile_rejected=0 saved_mb=0.0 split=0 verts=0 tile_max=3000000 heavy_enc=0 cpu_ms=0.016
+gpu.cut f=26 FrameStart=1 AttachmentChange=0 ClearLoad=0 Feedback=0 TileBudget=0 PinnedCopy=0 ComputeBetween=0 ComputeWork=0 CopyWork=1 ViewSplit=0 TileSplit=0
+gpu.time f=25 gpu_ms=3.231 t=216.1
+gpu.frame f=27 enc=2 render=1 compute=1 naive=2 passes=1 merged=0 hoisted=0 sunk=1 dropped=0 barriers=1 intra=0 raw=1 war=0 waw=0 tile_local=0 tile_rejected=0 saved_mb=0.0 split=0 verts=0 tile_max=3000000 heavy_enc=0 cpu_ms=0.015
+gpu.cut f=27 FrameStart=1 AttachmentChange=0 ClearLoad=0 Feedback=0 TileBudget=0 PinnedCopy=0 ComputeBetween=0 ComputeWork=0 CopyWork=1 ViewSplit=0 TileSplit=0
+gpu.time f=26 gpu_ms=3.218 t=219.9
+gpu.frame f=28 enc=2 render=1 compute=1 naive=2 passes=1 merged=0 hoisted=0 sunk=1 dropped=0 barriers=1 intra=0 raw=1 war=0 waw=0 tile_local=0 tile_rejected=0 saved_mb=0.0 split=0 verts=0 tile_max=3000000 heavy_enc=0 cpu_ms=0.015
+gpu.cut f=28 FrameStart=1 AttachmentChange=0 ClearLoad=0 Feedback=0 TileBudget=0 PinnedCopy=0 ComputeBetween=0 ComputeWork=0 CopyWork=1 ViewSplit=0 TileSplit=0
+gpu.time f=27 gpu_ms=2.041 t=222.4
+gpu.frame f=29 enc=2 render=1 compute=1 naive=2 passes=1 merged=0 hoisted=0 sunk=1 dropped=0 barriers=1 intra=0 raw=1 war=0 waw=0 tile_local=0 tile_rejected=0 saved_mb=0.0 split=0 verts=0 tile_max=3000000 heavy_enc=0 cpu_ms=0.014
+gpu.cut f=29 FrameStart=1 AttachmentChange=0 ClearLoad=0 Feedback=0 TileBudget=0 PinnedCopy=0 ComputeBetween=0 ComputeWork=0 CopyWork=1 ViewSplit=0 TileSplit=0
+gpu.time f=28 gpu_ms=1.893 t=224.8
+gpu.frame f=30 enc=2 render=1 compute=1 naive=2 passes=1 merged=0 hoisted=0 sunk=1 dropped=0 barriers=1 intra=0 raw=1 war=0 waw=0 tile_local=0 tile_rejected=0 saved_mb=0.0 split=0 verts=0 tile_max=3000000 heavy_enc=0 cpu_ms=0.018
+gpu.cut f=30 FrameStart=1 AttachmentChange=0 ClearLoad=0 Feedback=0 TileBudget=0 PinnedCopy=0 ComputeBetween=0 ComputeWork=0 CopyWork=1 ViewSplit=0 TileSplit=0
+gpu.time f=29 gpu_ms=1.677 t=226.9
+gpu.frame f=31 enc=2 render=1 compute=1 naive=2 passes=1 merged=0 hoisted=0 sunk=1 dropped=0 barriers=1 intra=0 raw=1 war=0 waw=0 tile_local=0 tile_rejected=0 saved_mb=0.0 split=0 verts=0 tile_max=3000000 heavy_enc=0 cpu_ms=0.017
+gpu.cut f=31 FrameStart=1 AttachmentChange=0 ClearLoad=0 Feedback=0 TileBudget=0 PinnedCopy=0 ComputeBetween=0 ComputeWork=0 CopyWork=1 ViewSplit=0 TileSplit=0
+gpu.time f=30 gpu_ms=2.302 t=229.7
+gpu.frame f=32 enc=2 render=1 compute=1 naive=2 passes=1 merged=0 hoisted=0 sunk=1 dropped=0 barriers=1 intra=0 raw=1 war=0 waw=0 tile_local=0 tile_rejected=0 saved_mb=0.0 split=0 verts=0 tile_max=3000000 heavy_enc=0 cpu_ms=0.015
+gpu.cut f=32 FrameStart=1 AttachmentChange=0 ClearLoad=0 Feedback=0 TileBudget=0 PinnedCopy=0 ComputeBetween=0 ComputeWork=0 CopyWork=1 ViewSplit=0 TileSplit=0
+gpu.time f=31 gpu_ms=2.154 t=232.4
+gpu.frame f=33 enc=2 render=1 compute=1 naive=2 passes=1 merged=0 hoisted=0 sunk=1 dropped=0 barriers=1 intra=0 raw=1 war=0 waw=0 tile_local=0 tile_rejected=0 saved_mb=0.0 split=0 verts=0 tile_max=3000000 heavy_enc=0 cpu_ms=0.030
+gpu.cut f=33 FrameStart=1 AttachmentChange=0 ClearLoad=0 Feedback=0 TileBudget=0 PinnedCopy=0 ComputeBetween=0 ComputeWork=0 CopyWork=1 ViewSplit=0 TileSplit=0
+gpu.time f=32 gpu_ms=2.229 t=235.6
+gpu.frame f=34 enc=2 render=1 compute=1 naive=2 passes=1 merged=0 hoisted=0 sunk=1 dropped=0 barriers=1 intra=0 raw=1 war=0 waw=0 tile_local=0 tile_rejected=0 saved_mb=0.0 split=0 verts=0 tile_max=3000000 heavy_enc=0 cpu_ms=0.017
+gpu.cut f=34 FrameStart=1 AttachmentChange=0 ClearLoad=0 Feedback=0 TileBudget=0 PinnedCopy=0 ComputeBetween=0 ComputeWork=0 CopyWork=1 ViewSplit=0 TileSplit=0
+gpu.time f=33 gpu_ms=2.151 t=238.6
+gpu.frame f=35 enc=2 render=1 compute=1 naive=2 passes=1 merged=0 hoisted=0 sunk=1 dropped=0 barriers=1 intra=0 raw=1 war=0 waw=0 tile_local=0 tile_rejected=0 saved_mb=0.0 split=0 verts=0 tile_max=3000000 heavy_enc=0 cpu_ms=0.014
+gpu.cut f=35 FrameStart=1 AttachmentChange=0 ClearLoad=0 Feedback=0 TileBudget=0 PinnedCopy=0 ComputeBetween=0 ComputeWork=0 CopyWork=1 ViewSplit=0 TileSplit=0
+gpu.time f=34 gpu_ms=2.178 t=241.2
+gpu.frame f=36 enc=2 render=1 compute=1 naive=2 passes=1 merged=0 hoisted=0 sunk=1 dropped=0 barriers=1 intra=0 raw=1 war=0 waw=0 tile_local=0 tile_rejected=0 saved_mb=0.0 split=0 verts=0 tile_max=3000000 heavy_enc=0 cpu_ms=0.016
+gpu.cut f=36 FrameStart=1 AttachmentChange=0 ClearLoad=0 Feedback=0 TileBudget=0 PinnedCopy=0 ComputeBetween=0 ComputeWork=0 CopyWork=1 ViewSplit=0 TileSplit=0
+gpu.time f=35 gpu_ms=1.935 t=244.0
+gpu.frame f=37 enc=2 render=1 compute=1 naive=2 passes=1 merged=0 hoisted=0 sunk=1 dropped=0 barriers=1 intra=0 raw=1 war=0 waw=0 tile_local=0 tile_rejected=0 saved_mb=0.0 split=0 verts=0 tile_max=3000000 heavy_enc=0 cpu_ms=0.018
+gpu.cut f=37 FrameStart=1 AttachmentChange=0 ClearLoad=0 Feedback=0 TileBudget=0 PinnedCopy=0 ComputeBetween=0 ComputeWork=0 CopyWork=1 ViewSplit=0 TileSplit=0
+gpu.time f=36 gpu_ms=3.076 t=248.6
+  Pass (Pass)
+gles.pso.recipe saved=0 loaded=0 prewarmed=0 miss_in_game=0
+
+DONE!
+
+Test run totals:
+  Passed:        9/9 (100.0%)
+  Failed:        0/9 (0.0%)
+  Not supported: 0/9 (0.0%)
+  Warnings:      0/9 (0.0%)
+  Waived:        0/9 (0.0%)

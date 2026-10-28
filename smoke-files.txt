@@ -1,0 +1,12 @@
+total 67800
+drwxr-xr-x  11 runner  staff       352 Oct 28 12:12 .
+drwxr-xr-x  29 runner  staff       928 Oct 28 12:12 ..
+-rwxr-xr-x   1 runner  staff   7982744 Oct 27 23:44 deqp-gles2
+-rwxr-xr-x   1 runner  staff  14233080 Oct 27 23:46 deqp-gles3
+-rwxr-xr-x   1 runner  staff  12378552 Oct 27 23:46 deqp-gles31
+drwxr-xr-x   4 runner  staff       128 Oct 27 23:44 gles2
+drwxr-xr-x   5 runner  staff       160 Oct 27 23:46 gles3
+drwxr-xr-x   4 runner  staff       128 Oct 27 23:46 gles31
+-rw-r--r--   1 runner  staff     16816 Oct 28 12:12 libEGL.dylib
+-rw-r--r--   1 runner  staff     16816 Oct 28 12:12 libGLESv2.dylib
+-rw-r--r--   1 runner  staff     72528 Oct 28 12:12 libVPGLES.dylib

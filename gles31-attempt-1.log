@@ -1,0 +1,78 @@
+vpk.version sha=6f03495e14ef
+vk.instance app=vpgles engine= api=1.3 exts=0
+vk.caps identity=quest vendor=0x5143 device="Adreno (TM) 740"
+vk.caps limits apiVersion=1.3.0 maxVertexOutputComponents=124 maxFragmentInputComponents=124 maxColorAttachments=8 maxComputeWorkGroupInvocations=1024 maxComputeSharedMemorySize=32768 maxImageDimension2D=16384 maxImageArrayLayers=2048 maxPerStageDescriptorStorageBuffers=24 maxPerStageDescriptorStorageImages=8 maxBoundDescriptorSets=7 maxSamplerAnisotropy=16 framebufferColorSampleCounts=0x7 sampledImageColorSampleCounts=0x7
+vk.format device bc_texture_compression=1
+vk.caps features geometryShader=0 tessellationShader=0 imageCubeArray=1 sampleRateShading=1 fragmentStoresAndAtomics=1 vertexPipelineStoresAndAtomics=1 shaderInt16=1 shaderFloat64=0 shaderStorageImageMultisample=0 shaderClipDistance=1 multiViewport=0 astc=1 etc2=1 bc=1 depthClamp=1 independentBlend=1 dualSrcBlend=1 logicOp=0 multiDrawIndirect=1
+gpu.cfg frames_in_flight=3
+gpu.metal.info what=no_residency_set fallback=use_resource error=unknown_error
+gpu.state elide on=1
+gpu.state buf_immutable on=1
+gpu.state full_barriers on=0
+gpu.metal device=Apple_Paravirtual_device simulator=0 metal3=0 apple4=1 apple7=0 argument_buffers_tier=2 bindless=0 stage_timestamps=0 residency=0 archive=0 tile_memory=1
+gpu.hold armed max_ms=1500
+gpu.msaa resolve_on_tile=colour
+gpu.tile heavy_max_draws=2000 heavy_max_vertices=3000000 heavy_mode=on
+vk.translator mode=0 native_fetch=0 amplify=0 unpack_fetch=0 kill_exit=1 id=37
+vk.device exts=3 multiview=1 fdm=0 metal_objects=0
+vk.msaa device_max=4 (supportsTextureSampleCount 8=0 4=1 2=1)
+vk.cfg effective gen=0 fov=off sharp=0.35 periphery=0.50 vpktaa=0 50% sharp=0.50 scale=1.00 taa_native=0 taa_ui_mask=0 rcas=0.00 asw_off=1 quest3=1 anisotropy=16 prewarm=0 force_1x=0 msaa_override=0 msaa_device_max=4 fov_apply=0 fov_active=0 set_by_app=no(defaults)
+gles.init device=Adreno (TM) 740 vendor=0x5143
+gpu.shader.lib compiled=1 dedup=0 prewarmed=0 ms_total=1 ms_max=1 last_ms=1 bytes=790 wait_ms=0 src=prewarm
+vpgles-shim: 390 of 401 core entry points resolved
+Writing test log into /Users/runner/work/VPKEngine/VPKEngine/build/smoke/gles31/out/attempt-1.qpa
+dEQP Core vulkan-cts-1.4.6.2-0-gf6a29701220f34dd1407513bfe80d74ca7b392ce (0xf6a29701) starting..
+  target implementation = 'VPGLES'
+vk.msaa_tile memoryless image=256x256x1 samples=1 format=37 usage=0x17 (0.2 MiB if resident)
+vk.msaa_tile memoryless image=256x256x1 samples=1 format=129 usage=0x23 (0.2 MiB if resident)
+gpu.metal.info what=msaa_materialized index=0 256x256x1 samples=1 fmt=RGBA8Unorm mb=0.2 why=None load=2 store=1 label=
+gpu.metal.info what=msaa_materialized index=1 256x256x1 samples=1 fmt=D24UnormS8 mb=0.5 why=None load=2 store=1 label=
+gpu.frame f=0 enc=2 render=2 compute=0 naive=2 passes=2 merged=0 hoisted=0 sunk=0 dropped=0 barriers=0 intra=0 raw=0 war=0 waw=0 tile_local=0 tile_rejected=0 saved_mb=0.0 split=0 verts=0 tile_max=3000000 heavy_enc=0 cpu_ms=0.045
+gpu.cut f=0 FrameStart=1 AttachmentChange=1 ClearLoad=0 Feedback=0 TileBudget=0 PinnedCopy=0 ComputeBetween=0 ComputeWork=0 CopyWork=0 ViewSplit=0 TileSplit=0
+gpu.pso f=0 compiled=0 failed=0 hits=0 misses=1 ms=0.00 max_ms=0.00
+gpu.enc f=0 i=0 kind=render reason=FrameStart cmds=1 passes=1 ls=c0:CS label=vk.clear
+gpu.enc f=0 i=1 kind=render reason=AttachmentChange cmds=1 passes=1 ls=d:CS label=vk.clear
+vk.pso.census created=0 compiled=0 failed=0 timed_out=0 archived=0 not_archived_depth_only=0 not_archived_other=0 archive_hits=0 compiled_in_session=0 archive_dup=0 archive_pending=0 archive_spilled=0
+vk.submit n=1 cbs=1 passes=0 draws=0 dispatches=0 copies=0 clears=2 vk_barriers=2 draws_skipped=0 dispatch_skipped=0 dropped=0
+gpu.pso.hot label=vk.indirect_patch ms=75
+gpu.pso.miss n=1 kind=compute label=vk.indirect_patch key=5739658356830076479 ms=75
+gpu.pso.aot archived=0 hot=1 hot_ms_total=75 hot_ms_max=75
+gpu.slowcb f=0 ms=79.1 draws=0 passes=2 est_cost=1 label=vpgpu.f0
+vk.msaa_tile memoryless image=256x256x1 samples=1 format=37 usage=0x17 (0.2 MiB if resident)
+vk.msaa_tile memoryless image=256x256x1 samples=1 format=129 usage=0x23 (0.2 MiB if resident)
+gpu.metal.info what=msaa_materialized index=2 256x256x1 samples=1 fmt=RGBA8Unorm mb=0.2 why=None load=2 store=1 label=
+gpu.metal.info what=msaa_materialized index=3 256x256x1 samples=1 fmt=D24UnormS8 mb=0.5 why=None load=2 store=1 label=
+gpu.frame f=1 enc=2 render=2 compute=0 naive=2 passes=2 merged=0 hoisted=0 sunk=0 dropped=0 barriers=0 intra=0 raw=0 war=0 waw=0 tile_local=0 tile_rejected=0 saved_mb=0.0 split=0 verts=0 tile_max=3000000 heavy_enc=0 cpu_ms=0.016
+gpu.cut f=1 FrameStart=1 AttachmentChange=1 ClearLoad=0 Feedback=0 TileBudget=0 PinnedCopy=0 ComputeBetween=0 ComputeWork=0 CopyWork=0 ViewSplit=0 TileSplit=0
+gpu.pso f=1 compiled=1 failed=0 hits=0 misses=0 ms=75.54 max_ms=75.54
+gpu.time f=0 gpu_ms=79.119 t=117.1
+vk.submit n=2 cbs=1 passes=0 draws=0 dispatches=0 copies=0 clears=2 vk_barriers=2 draws_skipped=0 dispatch_skipped=0 dropped=0
+vk.hitch submit=2 dt_ms=81.5 submit_ms=0.37 translate_ms=0.01 backend_ms=0.36 pso_create_ms=0.00 lib_compile_ms=0.00 fence_wait_ms=80.15 alloc_ms=0.08 upload_bytes=0 gles_link_ms=0.00 lock_ms=0.00 guest_gap_ms=0.9
+
+Test case 'dEQP-GLES31.info.vendor'..
+  Pass (Pass)
+
+Test case 'dEQP-GLES31.info.renderer'..
+  Pass (Pass)
+
+Test case 'dEQP-GLES31.info.version'..
+  Pass (Pass)
+
+Test case 'dEQP-GLES31.info.shading_language_version'..
+  Pass (Pass)
+
+Test case 'dEQP-GLES31.info.extensions'..
+  Pass (Pass)
+
+Test case 'dEQP-GLES31.info.render_target'..
+  Pass (Pass)
+gles.pso.recipe saved=0 loaded=0 prewarmed=0 miss_in_game=0
+
+DONE!
+
+Test run totals:
+  Passed:        6/6 (100.0%)
+  Failed:        0/6 (0.0%)
+  Not supported: 0/6 (0.0%)
+  Warnings:      0/6 (0.0%)
+  Waived:        0/6 (0.0%)
