@@ -51,7 +51,8 @@ struct ResourceRange {
 // from the range (buffer -> Buffer, texture -> Texture or StorageTexture if written, sampler).
 // BufferSize: not a binding of its own — the byte size of the Buffer binding with the same slot
 // (vpir::ResourceKind::BufferSize, SPIR-V OpArrayLength); the backend writes it as a 64-bit integer.
-enum class BindKind : uint8_t { Auto, Buffer, ConstantBuffer, Texture, Sampler, StorageTexture, BufferSize };
+// SamplerBias: the shader-side lod bias (float) of the Sampler binding with the same slot (vpir::ResourceKind::SamplerBias).
+enum class BindKind : uint8_t { Auto, Buffer, ConstantBuffer, Texture, Sampler, StorageTexture, BufferSize, SamplerBias };
 
 struct Access {
   ResourceRange range;

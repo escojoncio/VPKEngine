@@ -569,6 +569,7 @@ struct MetalBackend::Impl {
   struct Sampler {
     uint32_t generation = 0;
     id<MTLSamplerState> sampler;
+    float shaderBias = 0.0f;  // SamplerBias argument
   };
   // Argument table of one stage: its declared layout and the [[buffer(n)]] it is bound at.
   struct Table {
@@ -1401,6 +1402,7 @@ struct MetalBackend::Impl {
       case BindKind::Sampler: return "sampler";
       case BindKind::StorageTexture: return "storage_texture";
       case BindKind::BufferSize: return "buffer_size";
+      case BindKind::SamplerBias: return "sampler_bias";
     }
     return "?";
   }
@@ -4343,7 +4345,9 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
     std::memset(t, 0, bytes);
     for (const ShaderArgument& a : stage.args) {
       // A BufferSize entry reads the Buffer binding of its slot (SPIR-V OpArrayLength).
-      const BindKind want = a.kind == BindKind::BufferSize ? BindKind::Buffer : a.kind;
+      // A SamplerBias entry reads the Sampler binding of its slot.
+      const BindKind want = a.kind == BindKind::BufferSize ? BindKind::Buffer
+                            : a.kind == BindKind::SamplerBias ? BindKind::Sampler : a.kind;
       auto it = std::find_if(bindings.begin(), bindings.end(), [&](const Access& x) {
         return !x.pixelLocal && bindKind(x) == want && x.slot == a.slot && (x.stages == 0 || (x.stages & forStage));
       });
@@ -4382,6 +4386,15 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
           }
         }
         std::memcpy(t + a.offset, &rangeBytes, sizeof rangeBytes);
+        continue;
+      }
+      if (a.kind == BindKind::SamplerBias) {
+        float bias = 0.0f;  // 0 when the sampler is gone (as its Sampler entry is null)
+        if (r.kind == ResourceRange::Kind::Sampler) {
+          auto sm = samplers.find(r.index);
+          if (sm != samplers.end() && sm->second.generation == r.generation) bias = sm->second.shaderBias;
+        }
+        std::memcpy(t + a.offset, &bias, sizeof bias);
         continue;
       }
       MTLResourceUsage u = MTLResourceUsageRead;
@@ -7470,7 +7483,7 @@ void MetalBackend::createSampler(SamplerId handle, const SamplerDesc& d) {
     return;
   }
   std::lock_guard<std::recursive_mutex> tables(m.tableMutex);
-  m.samplers[handle.index] = {handle.generation, st};
+  m.samplers[handle.index] = {handle.generation, st, d.normalized ? d.shaderLodBias : 0.0f};
 }
 
 void MetalBackend::destroyBuffer(BufferId handle) {

@@ -244,6 +244,7 @@ private:
                 case ResourceKind::Texture:
                 case ResourceKind::StorageTexture: decl = textureType(r); break;
                 case ResourceKind::BufferSize: decl = "ulong"; break;  // bytes of the bound range
+                case ResourceKind::SamplerBias: decl = "float"; break;  // lod bias of the sampler (8-byte entry: next member is aligned)
             }
             out_ += "    " + decl + " " + ident(r.name) + ";\n";
         }
@@ -921,12 +922,20 @@ private:
         size_t i = 1;  // optional operands follow the coordinate
         std::string lod, offset, compare;
         static const char* grad[] = {"", "gradient2d", "gradient2d", "gradient3d", "gradientcube", "gradientcube"};
-        if (in.image & kImageLod) lod = "level(" + ex(in.args[i++]) + ")";
-        if (in.image & kImageBias) lod = "bias(" + ex(in.args[i++]) + ")";
+        // The sampler's lod bias (a backend-written argument; EmitOptions::samplerBias), added to the lod.
+        std::string sb;
+        if (!gather)
+            for (const Resource& x : m_.resources)
+                if (x.kind == ResourceKind::SamplerBias && x.index == m_.resources[in.sampler].index) sb = "vp_args." + ident(x.name);
+        const std::string plus = sb.empty() ? "" : " + " + sb;
+        if (in.image & kImageLod) lod = "level(" + ex(in.args[i++]) + plus + ")";
+        if (in.image & kImageBias) lod = "bias(" + ex(in.args[i++]) + plus + ")";
         if (in.image & kImageGrad) {
-            lod = std::string(grad[unsigned(r.dim)]) + "(" + ex(in.args[i]) + ", " + ex(in.args[i + 1]) + ")";
+            const std::string scale = sb.empty() ? "" : " * exp2(" + sb + ")";  // lod + bias = log2(rho * 2^bias)
+            lod = std::string(grad[unsigned(r.dim)]) + "(" + ex(in.args[i]) + scale + ", " + ex(in.args[i + 1]) + scale + ")";
             i += 2;
         }
+        if (lod.empty() && !sb.empty() && m_.stage == Stage::Fragment) lod = "bias(" + sb + ")";
         if (in.image & kImageOffset) offset = ex(in.args[i++]);
         if (in.image & kImageCompare) compare = ex(in.args[i++]);
 
@@ -1527,10 +1536,32 @@ EmitResult emitMsl(const Module& module, const EmitOptions& options) {
             m.resources.push_back(r);
         }
     }
+    if (options.samplerBias) {
+        // A SamplerBias entry for every sampler a sample goes through.
+        std::set<uint32_t> used;
+        std::function<void(const Block&)> walk = [&](const Block& b) {
+            for (const Node& n : b) {
+                const Inst& in = n.inst;
+                if (n.kind == NodeKind::Inst && in.op == Op::ImageSample && in.sampler < m.resources.size())
+                    used.insert(m.resources[in.sampler].index);
+                walk(n.body);
+                walk(n.elseBody);
+            }
+        };
+        for (const Function& f : m.functions) walk(f.body);
+        for (uint32_t slot : used) {
+            Resource r;
+            r.kind = ResourceKind::SamplerBias;
+            r.index = slot;
+            r.name = "sbias" + std::to_string(slot);
+            r.access = Access::Read;
+            m.resources.push_back(r);
+        }
+    }
     if (options.positionalNames) {
         // Same order as argumentBuffer(): (kind, slot).
-        static const char* prefix[] = {"b", "c", "t", "s", "u", "bs"};  // by ResourceKind
-        static_assert(std::size(prefix) == size_t(ResourceKind::BufferSize) + 1);
+        static const char* prefix[] = {"b", "c", "t", "s", "u", "bs", "sb"};  // by ResourceKind
+        static_assert(std::size(prefix) == size_t(ResourceKind::SamplerBias) + 1);
         std::vector<size_t> order(m.resources.size());
         for (size_t i = 0; i < order.size(); ++i) order[i] = i;
         std::sort(order.begin(), order.end(), [&](size_t a, size_t b) {
@@ -1553,8 +1584,8 @@ EmitResult emitMsl(const Module& module, const EmitOptions& options) {
 }
 
 std::string describeKey(const MslShader& s) {
-    static const char* kind[] = {"b", "c", "t", "s", "u", "bs"};  // by ResourceKind
-    static_assert(std::size(kind) == size_t(ResourceKind::BufferSize) + 1);
+    static const char* kind[] = {"b", "c", "t", "s", "u", "bs", "sb"};  // by ResourceKind
+    static_assert(std::size(kind) == size_t(ResourceKind::SamplerBias) + 1);
     char head[96];
     std::snprintf(head, sizeof head, "src=%016llx bytes=%zu args=", (unsigned long long)sourceHash(s.source), s.source.size());
     std::string out = head;

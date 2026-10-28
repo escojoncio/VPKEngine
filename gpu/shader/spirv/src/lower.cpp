@@ -646,8 +646,8 @@ private:
         vpir::Resource r;
         r.kind = kind;
         r.index = slot;
-        static const char* prefix[] = {"b", "c", "t", "s", "u", "bs"};  // by ResourceKind
-        static_assert(std::size(prefix) == size_t(vpir::ResourceKind::BufferSize) + 1);
+        static const char* prefix[] = {"b", "c", "t", "s", "u", "bs", "sb"};  // by ResourceKind
+        static_assert(std::size(prefix) == size_t(vpir::ResourceKind::SamplerBias) + 1);
         r.name = std::string(prefix[int(kind)]) + std::to_string(slot);
         r.access = vpir::Access::ReadWrite;
         if (init) init(r);

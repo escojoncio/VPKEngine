@@ -1327,6 +1327,7 @@ TranslateFail lowerAndEmit(const spirv::SpirvModule& m, const spirv::SpirvLowerO
   vpmsl::EmitOptions eo;
   eo.positionalNames = true;  // MSL text independent of absolute slots (precompile == runtime)
   eo.loopGuard = kVulkanLoopGuard;
+  eo.samplerBias = true;  // mipLodBias reaches the shader (Metal ignores the sampler descriptor lodBias)
   eo.robustBuffers = opt.robustBuffers;  // robustBufferAccess (VPVK_ROBUST): OOB / null storage buffers cannot fault the GPU
   vpmsl::EmitResult e = vpmsl::emitMsl(mod, eo);
   if (!e.errors.empty()) {

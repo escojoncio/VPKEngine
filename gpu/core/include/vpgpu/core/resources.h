@@ -141,7 +141,8 @@ struct SamplerDesc {
   std::optional<CompareOp> compare;  // set for depth-comparison samplers
   BorderColor border = BorderColor::TransparentBlack;
   float lodMin = 0.0f, lodMax = 1000.0f;
-  float lodBias = 0.0f;    // added to the computed lod (Vulkan mipLodBias)
+  float lodBias = 0.0f;    // added to the computed lod by the sampler state (GLES/PS4); no effect on the device
+  float shaderLodBias = 0.0f;  // added to the lod by the shader (SamplerBias argument; Vulkan mipLodBias)
   bool normalized = true;  // false: texel coordinates (Vulkan unnormalizedCoordinates)
   std::string label;
 };

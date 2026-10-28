@@ -1,6 +1,7 @@
 // Golden test: golden IN.vpir EXPECTED.metal. With VPMSL_UPDATE=1 it rewrites EXPECTED instead.
 // `golden IN.vpir --reject SUBSTRING` expects emission to fail with that error.
 // `golden IN.vpir EXPECTED.metal --color-outputs MASK` also checks MslShader::colorOutputs.
+// `golden IN.vpir EXPECTED.metal --sampler-bias` emits with EmitOptions::samplerBias.
 // `golden IN.vpir EXPECTED.metal --rate-map` emits with Module::rateMapPosition set (foveation).
 #include <cstdio>
 #include <cstdlib>
@@ -24,7 +25,8 @@ int main(int argc, char** argv) {
     const bool reject = argc == 4 && std::string(argv[2]) == "--reject";
     const bool mask = argc == 5 && std::string(argv[3]) == "--color-outputs";
     const bool rateMap = argc == 4 && std::string(argv[3]) == "--rate-map";
-    if (argc != 3 && !reject && !mask && !rateMap) {
+    const bool samplerBias = argc == 4 && std::string(argv[3]) == "--sampler-bias";
+    if (argc != 3 && !reject && !mask && !rateMap && !samplerBias) {
         std::fprintf(stderr, "usage: vpmsl_golden IN.vpir (EXPECTED.metal [--color-outputs MASK] | --reject SUBSTRING)\n");
         return 2;
     }
@@ -34,7 +36,9 @@ int main(int argc, char** argv) {
         return 1;
     }
     if (rateMap) p.module->rateMapPosition = true;
-    vpmsl::EmitResult r = vpmsl::emitMsl(*p.module);
+    vpmsl::EmitOptions options;
+    options.samplerBias = samplerBias;
+    vpmsl::EmitResult r = vpmsl::emitMsl(*p.module, options);
     if (reject) {
         for (const std::string& e : r.errors)
             if (e.find(argv[3]) != std::string::npos) return 0;

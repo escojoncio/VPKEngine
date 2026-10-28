@@ -2213,7 +2213,7 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkCreateSampler(VkDevice dv, const Vk
   }
   d.lodMin = ci->minLod;
   d.lodMax = ci->maxLod;
-  d.lodBias = std::clamp(ci->mipLodBias, -16.0f, 15.99f);  // maxSamplerLodBias; Metal S4.6
+  d.shaderLodBias = std::clamp(ci->mipLodBias, -16.0f, 15.99f);  // maxSamplerLodBias; applied by the shader (SamplerBias)
   // Texel coordinates: Vulkan's restrictions (one filter, no mips, clamp modes, lod 0) match
   // Metal's for normalizedCoordinates = NO.
   d.normalized = !ci->unnormalizedCoordinates;

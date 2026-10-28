@@ -120,6 +120,7 @@ vpgpu::BindKind bindKind(vpir::ResourceKind k) {
         case vpir::ResourceKind::Sampler: return vpgpu::BindKind::Sampler;
         case vpir::ResourceKind::StorageTexture: return vpgpu::BindKind::StorageTexture;
         case vpir::ResourceKind::BufferSize: return vpgpu::BindKind::BufferSize;
+        case vpir::ResourceKind::SamplerBias: return vpgpu::BindKind::SamplerBias;
     }
     return vpgpu::BindKind::Auto;
 }
@@ -1075,6 +1076,7 @@ struct Renderer::Impl {
                     break;
                 }
                 case vpir::ResourceKind::BufferSize:  // SPIR-V only (the GCN lifter never makes one)
+                case vpir::ResourceKind::SamplerBias:  // opt-in (EmitOptions::samplerBias), Vulkan only
                     return why = "buffer_size resource", false;
             }
             out.push_back(a);

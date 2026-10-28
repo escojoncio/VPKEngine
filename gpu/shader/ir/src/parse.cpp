@@ -130,7 +130,7 @@ public:
                 continue;  // the closing brace already consumed the line
             } else {
                 ResourceKind k;
-                if (!lookupEnum<ResourceKind>(kw, k, toString, ResourceKind::BufferSize))
+                if (!lookupEnum<ResourceKind>(kw, k, toString, ResourceKind::SamplerBias))
                     fail("unknown declaration '" + std::string(kw) + "'");
                 m_.resources.push_back(parseResource(k));
             }

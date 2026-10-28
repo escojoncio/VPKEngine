@@ -102,7 +102,10 @@ struct IoVar {
 // draw; the emitter places it in the `constant` address space so reads skip generic memory paths.
 // BufferSize: the byte size of the range bound to Buffer slot `index` (the same binding), read with
 // buffer_size (SPIR-V OpArrayLength). Last, so the other kinds keep their argument-table order.
-enum class ResourceKind : uint8_t { Buffer, ConstantBuffer, Texture, Sampler, StorageTexture, BufferSize };
+// SamplerBias: the lod bias (float) of the Sampler with the same `index`, written by the backend (the
+// sampler's mipLodBias; Metal's own sampler lodBias has no effect on the device); the emitter adds it
+// to the lod of every sample through that sampler.
+enum class ResourceKind : uint8_t { Buffer, ConstantBuffer, Texture, Sampler, StorageTexture, BufferSize, SamplerBias };
 enum class TexDim : uint8_t { D1, D2, D2Array, D3, Cube, CubeArray };
 enum class Access : uint8_t { Read, Write, ReadWrite };
 
