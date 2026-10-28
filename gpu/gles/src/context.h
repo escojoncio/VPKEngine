@@ -130,6 +130,8 @@ struct SamplerParams {
     float minLod = -1000.0f, maxLod = 1000.0f, maxAnisotropy = 1.0f;
     GLenum compareMode = gl::NONE, compareFunc = gl::LEQUAL;
     float border[4] = {0, 0, 0, 0};
+    int32_t borderI[4] = {0, 0, 0, 0};  // glTexParameterI[u]iv: the border colour as the pure integers the app gave
+    bool borderInt = false;             // the last write of the border colour was an integer one (borderI is the exact value)
     bool operator==(const SamplerParams& o) const;
 };
 

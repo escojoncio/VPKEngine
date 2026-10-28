@@ -100,6 +100,7 @@ GLOBAL_EXCLUDE = [
     "functional.geometry_shading.", "functional.tessellation.", "functional.tessellation_geometry_interaction.",
     "functional.debug.", "functional.robustness.", "functional.blend_equation_advanced.",
     "functional.sample_shading.", "functional.primitive_bounding_box.", "stress.", "performance.", "accuracy.",
+    "functional.shaders.implicit_conversions.",  # need GL_EXT_shader_implicit_conversions (not offered): always NotSupported
     "functional.android_extension_pack.",  # GL_ANDROID_extension_pack_es31a (ES 3.2 stages): not offered, ES 3.1 mustpass has none
 ]
 # Cases of the allowed groups that need a geometry or tessellation stage (not offered; glCreateShader of it is INVALID_ENUM).

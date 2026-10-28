@@ -652,6 +652,24 @@ void testTextures() {
     GLuint t[4];
     glGenTextures(4, t);
     glBindTexture(gl::TEXTURE_2D, t[0]);
+    // Pure integer parameters (ES 3.2 / EXT_texture_border_clamp): the border colour keeps its exact integers.
+    {
+        G(glTexParameterIiv, void (*)(GLenum, GLenum, const GLint*));
+        G(glGetTexParameterIiv, void (*)(GLenum, GLenum, GLint*));
+        G(glTexParameterIuiv, void (*)(GLenum, GLenum, const GLuint*));
+        G(glGetTexParameterIuiv, void (*)(GLenum, GLenum, GLuint*));
+        CHECK(glTexParameterIiv && glGetTexParameterIiv && glTexParameterIuiv && glGetTexParameterIuiv);
+        const GLint set[4] = {-5, 7, 123456789, -2000000000};
+        GLint got[4] = {0, 0, 0, 0};
+        glTexParameterIiv(gl::TEXTURE_2D, gl::TEXTURE_BORDER_COLOR, set);
+        glGetTexParameterIiv(gl::TEXTURE_2D, gl::TEXTURE_BORDER_COLOR, got);
+        CHECK(err() == gl::NO_ERROR && got[0] == -5 && got[1] == 7 && got[2] == 123456789 && got[3] == -2000000000);
+        const GLint wrap = GLint(gl::CLAMP_TO_EDGE);
+        GLuint ugot = 0;
+        glTexParameterIiv(gl::TEXTURE_2D, gl::TEXTURE_WRAP_S, &wrap);
+        glGetTexParameterIuiv(gl::TEXTURE_2D, gl::TEXTURE_WRAP_S, &ugot);
+        CHECK(err() == gl::NO_ERROR && ugot == gl::CLAMP_TO_EDGE);
+    }
     std::vector<uint8_t> px(64 * 64 * 4, 200);
     counts = {};
     glTexImage2D(gl::TEXTURE_2D, 0, gl::RGBA, 64, 64, 0, gl::RGBA, gl::UNSIGNED_BYTE, px.data());
@@ -1337,6 +1355,46 @@ void testDraw() {
     CHECK(err() == gl::NO_ERROR && counts.lastInstances == 4);
     glDrawArrays(0x77, 0, 3);
     CHECK(err() == gl::INVALID_ENUM);
+    // An instance array of uniform blocks (uniform B { .. } blk[3]): each element is a block of its own with its binding.
+    {
+        static const char* kVsU =
+            "#version 300 es\nlayout(std140) uniform Blk { highp vec4 v; } blk[3]; in vec4 a_pos;\n"
+            "void main() { gl_Position = a_pos + blk[0].v + blk[2].v; }\n";
+        static const char* kFsU = "#version 300 es\nprecision mediump float; out vec4 o;\nvoid main() { o = vec4(1.0); }\n";
+        G(glGetUniformBlockIndex, GLuint (*)(GLuint, const char*));
+        G(glUniformBlockBinding, void (*)(GLuint, GLuint, GLuint));
+        G(glBindBufferBase, void (*)(GLenum, GLuint, GLuint));
+        const GLuint pu = program(kVsU, kFsU);
+        glUseProgram(pu);
+        GLuint ub[3];
+        glGenBuffers(3, ub);
+        const GLuint idx0 = glGetUniformBlockIndex(pu, "Blk[0]"), idx2 = glGetUniformBlockIndex(pu, "Blk[2]");
+        CHECK(idx0 != 0xFFFFFFFFu && idx2 != 0xFFFFFFFFu && idx0 != idx2);
+        for (int i = 0; i < 3; ++i) {
+            const float zero[4] = {0, 0, 0, 0};
+            glBindBuffer(gl::UNIFORM_BUFFER, ub[i]);
+            glBufferData(gl::UNIFORM_BUFFER, sizeof zero, zero, gl::STATIC_DRAW);
+            glBindBufferBase(gl::UNIFORM_BUFFER, GLuint(i), ub[i]);
+            glUniformBlockBinding(pu, glGetUniformBlockIndex(pu, i == 0 ? "Blk[0]" : i == 1 ? "Blk[1]" : "Blk[2]"), GLuint(i));
+        }
+        // Every element of the block array lists the same member indices (the members exist once, as active uniforms).
+        {
+            G(glGetActiveUniformBlockiv, void (*)(GLuint, GLuint, GLenum, GLint*));
+            G(glGetProgramiv, void (*)(GLuint, GLenum, GLint*));
+            GLint nUniforms = 0, i0 = -1, i1 = -1, n1 = -1;
+            glGetProgramiv(pu, gl::ACTIVE_UNIFORMS, &nUniforms);
+            glGetActiveUniformBlockiv(pu, idx0, gl::UNIFORM_BLOCK_ACTIVE_UNIFORM_INDICES, &i0);
+            glGetActiveUniformBlockiv(pu, idx2, gl::UNIFORM_BLOCK_ACTIVE_UNIFORM_INDICES, &i1);
+            glGetActiveUniformBlockiv(pu, idx2, gl::UNIFORM_BLOCK_ACTIVE_UNIFORMS, &n1);
+            CHECK(nUniforms == 1 && n1 == 1 && i0 == i1 && i1 >= 0 && i1 < nUniforms && err() == gl::NO_ERROR);
+        }
+        glBindBuffer(gl::ARRAY_BUFFER, vb);
+        glVertexAttribPointer(0, 4, gl::FLOAT, 0, 24, nullptr);
+        glEnableVertexAttribArray(0);
+        glDrawArrays(gl::TRIANGLES, 0, 3);
+        CHECK(err() == gl::NO_ERROR);
+        glUseProgram(p);
+    }
     glUseProgram(0);
     glDrawArrays(gl::TRIANGLES, 0, 3);
     CHECK(err() == gl::INVALID_OPERATION);

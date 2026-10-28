@@ -1515,7 +1515,12 @@ void texParam(Context* c, Texture* t, SamplerParams& s, GLenum p, double v, cons
         case gl::TEXTURE_COMPARE_MODE: s.compareMode = GLenum(v); return;
         case gl::TEXTURE_COMPARE_FUNC: s.compareFunc = GLenum(v); return;
         case gl::TEXTURE_MAX_ANISOTROPY_EXT: s.maxAnisotropy = std::clamp(float(v), 1.0f, 16.0f); return;
-        case gl::TEXTURE_BORDER_COLOR: if (vv) for (int i = 0; i < 4; ++i) s.border[i] = float(vv[i]); return;
+        case gl::TEXTURE_BORDER_COLOR:
+            if (vv) {
+                for (int i = 0; i < 4; ++i) s.border[i] = float(vv[i]);
+                s.borderInt = false;
+            }
+            return;
         default: break;
     }
     if (!t) return c->setError(gl::INVALID_ENUM, p);
@@ -1529,6 +1534,16 @@ void texParam(Context* c, Texture* t, SamplerParams& s, GLenum p, double v, cons
         case gl::TEXTURE_SRGB_DECODE_EXT: t->srgbDecode = GLenum(v) == gl::DECODE_EXT; return;
         default: c->setError(gl::INVALID_ENUM, p);
     }
+}
+// Only the border colour differs from the plain forms: its four integers are kept exactly.
+void setBorderInt(SamplerParams& s, const GLint* v) {
+    for (int i = 0; i < 4; ++i) s.borderI[i] = v[i], s.border[i] = float(v[i]);
+    s.borderInt = true;
+}
+// The border colour as four GLint: the stored integers, or the float colour converted with the glGet*iv rule (-1..1 spans the range).
+void borderAsInt(const SamplerParams& s, GLint* v) {
+    for (int i = 0; i < 4; ++i)
+        v[i] = s.borderInt ? s.borderI[i] : GLint(std::clamp(double(s.border[i]) * 2147483647.0, -2147483648.0, 2147483647.0));
 }
 void TexParameteri(GLenum target, GLenum p, GLint v) {
     CTX()
@@ -1584,6 +1599,7 @@ void GetTexParameteriv(GLenum target, GLenum p, GLint* v) {
             return;
         case gl::DEPTH_STENCIL_TEXTURE_MODE: *v = GLint(t->depthStencilMode); return;
         case gl::TEXTURE_MAX_ANISOTROPY_EXT: *v = GLint(s.maxAnisotropy); return;
+        case gl::TEXTURE_BORDER_COLOR: borderAsInt(s, v); return;
         default: c->setError(gl::INVALID_ENUM, target);
     }
 }
@@ -1594,10 +1610,32 @@ void GetTexParameterfv(GLenum target, GLenum p, GLfloat* v) {
     if (p == gl::TEXTURE_MIN_LOD) { *v = t->sampler.minLod; return; }
     if (p == gl::TEXTURE_MAX_LOD) { *v = t->sampler.maxLod; return; }
     if (p == gl::TEXTURE_MAX_ANISOTROPY_EXT) { *v = t->sampler.maxAnisotropy; return; }
+    if (p == gl::TEXTURE_BORDER_COLOR) {
+        for (int i = 0; i < 4; ++i) v[i] = t->sampler.borderInt ? float(t->sampler.borderI[i]) : t->sampler.border[i];
+        return;
+    }
     GLint x = 0;
     GetTexParameteriv(target, p, &x);
     *v = GLfloat(x);
 }
+// ---- pure integer parameters (ES 3.2 / EXT_texture_border_clamp): glTexParameterI[u]iv, glSamplerParameterI[u]iv ------------
+void TexParameterIiv(GLenum target, GLenum p, const GLint* v) {
+    CTX()
+    Texture* t = c->boundTexture(target);
+    if (!t) return c->setError(gl::INVALID_ENUM, target);
+    if (p == gl::TEXTURE_BORDER_COLOR) return setBorderInt(t->sampler, v);
+    texParam(c, t, t->sampler, p, v[0], nullptr);
+}
+void TexParameterIuiv(GLenum target, GLenum p, const GLuint* v) { TexParameterIiv(target, p, reinterpret_cast<const GLint*>(v)); }
+void GetTexParameterIiv(GLenum target, GLenum p, GLint* v) {
+    CTX()
+    Texture* t = c->boundTexture(target);
+    if (!t) return c->setError(gl::INVALID_ENUM, target);
+    if (p == gl::TEXTURE_BORDER_COLOR) return borderAsInt(t->sampler, v);
+    GetTexParameteriv(target, p, v);
+}
+void GetTexParameterIuiv(GLenum target, GLenum p, GLuint* v) { GetTexParameterIiv(target, p, reinterpret_cast<GLint*>(v)); }
+
 void EGLImageTargetTexture2DOES(GLenum target, void* image) {
     CTX()
     Texture* t = c->boundTexture(target);
@@ -1807,7 +1845,21 @@ void SamplerParameterf(GLuint s, GLenum p, GLfloat v) {
     CTX()
     if (SamplerObj* o = samplerObj(c, s)) texParam(c, nullptr, o->params, p, v, nullptr);
 }
-void SamplerParameteriv(GLuint s, GLenum p, const GLint* v) { SamplerParameteri(s, p, v[0]); }
+void SamplerParameteriv(GLuint s, GLenum p, const GLint* v) {
+    CTX()
+    double vv[4] = {double(v[0]), 0, 0, 0};
+    if (p == gl::TEXTURE_BORDER_COLOR)
+        for (int i = 0; i < 4; ++i) vv[i] = v[i] / 2147483647.0;
+    if (SamplerObj* o = samplerObj(c, s)) texParam(c, nullptr, o->params, p, vv[0], vv);
+}
+void SamplerParameterIiv(GLuint s, GLenum p, const GLint* v) {
+    CTX()
+    SamplerObj* o = samplerObj(c, s);
+    if (!o) return;
+    if (p == gl::TEXTURE_BORDER_COLOR) return setBorderInt(o->params, v);
+    texParam(c, nullptr, o->params, p, v[0], nullptr);
+}
+void SamplerParameterIuiv(GLuint s, GLenum p, const GLuint* v) { SamplerParameterIiv(s, p, reinterpret_cast<const GLint*>(v)); }
 void SamplerParameterfv(GLuint s, GLenum p, const GLfloat* v) {
     CTX()
     double vv[4] = {v[0], 0, 0, 0};
@@ -1829,15 +1881,22 @@ void GetSamplerParameteriv(GLuint s, GLenum p, GLint* v) {
         case gl::TEXTURE_COMPARE_FUNC: *v = GLint(o->params.compareFunc); return;
         case gl::TEXTURE_MIN_LOD: *v = GLint(o->params.minLod); return;
         case gl::TEXTURE_MAX_LOD: *v = GLint(o->params.maxLod); return;
+        case gl::TEXTURE_BORDER_COLOR: borderAsInt(o->params, v); return;
         default: c->setError(gl::INVALID_ENUM, p);
     }
 }
+void GetSamplerParameterIiv(GLuint s, GLenum p, GLint* v) { GetSamplerParameteriv(s, p, v); }
+void GetSamplerParameterIuiv(GLuint s, GLenum p, GLuint* v) { GetSamplerParameteriv(s, p, reinterpret_cast<GLint*>(v)); }
 void GetSamplerParameterfv(GLuint s, GLenum p, GLfloat* v) {
     CTX()
     SamplerObj* o = samplerObj(c, s);
     if (!o) return;
     if (p == gl::TEXTURE_MIN_LOD) { *v = o->params.minLod; return; }
     if (p == gl::TEXTURE_MAX_LOD) { *v = o->params.maxLod; return; }
+    if (p == gl::TEXTURE_BORDER_COLOR) {
+        for (int i = 0; i < 4; ++i) v[i] = o->params.borderInt ? float(o->params.borderI[i]) : o->params.border[i];
+        return;
+    }
     GLint x = 0;
     GetSamplerParameteriv(s, p, &x);
     *v = GLfloat(x);
@@ -2641,8 +2700,11 @@ void GetActiveUniformBlockiv(GLuint pn, GLuint i, GLenum q, GLint* v) {
         case gl::UNIFORM_BLOCK_NAME_LENGTH: *v = GLint(b.name.size() + 1); return;
         case gl::UNIFORM_BLOCK_ACTIVE_UNIFORMS: *v = GLint(b.members.size()); return;
         case gl::UNIFORM_BLOCK_ACTIVE_UNIFORM_INDICES: {
+            // The members are listed once per declaration: every element of a block array shares the indices of element 0.
+            size_t first = i;
+            while (p->refl.blocks[first].element != 0 && first > 0) --first;
             GLuint k = GLuint(p->refl.uniforms.size());
-            for (size_t x = 0; x < i; ++x)
+            for (size_t x = 0; x < first; ++x)
                 if (p->refl.blocks[x].element == 0) k += GLuint(p->refl.blocks[x].members.size());
             for (size_t m = 0; m < b.members.size(); ++m) v[m] = GLint(k + m);
             return;
@@ -2759,6 +2821,7 @@ bool validInterface(GLenum i) {
 // Buffer variables: the members of every shader storage block, block after block.
 const vpglsl::Variable* bufferVariable(const Program& p, GLuint i, int* block) {
     for (size_t b = 0; b < p.refl.storageBlocks.size(); ++b) {
+        if (p.refl.storageBlocks[b].element != 0) continue;  // block arrays list their members once (element 0)
         const auto& m = p.refl.storageBlocks[b].members;
         if (i < m.size()) {
             *block = int(b);
@@ -2770,7 +2833,8 @@ const vpglsl::Variable* bufferVariable(const Program& p, GLuint i, int* block) {
 }
 GLuint bufferVariableCount(const Program& p) {
     GLuint n = 0;
-    for (const auto& b : p.refl.storageBlocks) n += GLuint(b.members.size());
+    for (const auto& b : p.refl.storageBlocks)
+        if (b.element == 0) n += GLuint(b.members.size());
     return n;
 }
 GLuint resourceCount(const Program& p, GLenum iface) {
@@ -2989,7 +3053,9 @@ void GetProgramResourceiv(GLuint pn, GLenum iface, GLuint index, GLsizei propCou
                                 if (p->refl.blocks[x].element == 0) first += GLuint(p->refl.blocks[x].members.size());
                         }
                     } else {
-                        for (GLuint x = 0; x < index; ++x) first += GLuint(p->refl.storageBlocks[x].members.size());
+                        const GLuint e0 = index - ub->element;  // elements of a block array share element 0's variables
+                        for (GLuint x = 0; x < e0; ++x)
+                            if (p->refl.storageBlocks[x].element == 0) first += GLuint(p->refl.storageBlocks[x].members.size());
                     }
                     for (size_t m = 0; m < ub->members.size(); ++m) vals.push_back(GLint(first + GLuint(m)));
                 }
@@ -3612,7 +3678,8 @@ const Entry kEntries[] = {
     E(TexParameteri), E(TexParameterf), E(TexParameteriv), E(TexParameterfv), E(GetTexParameteriv),
     E(GetTexParameterfv), E(EGLImageTargetTexture2DOES), E(GenSamplers), E(DeleteSamplers), E(IsSampler),
     E(BindSampler), E(SamplerParameteri), E(SamplerParameterf), E(SamplerParameteriv), E(SamplerParameterfv),
-    E(GetSamplerParameteriv), E(GetSamplerParameterfv), E(GenRenderbuffers), E(DeleteRenderbuffers),
+    E(GetSamplerParameteriv), E(GetSamplerParameterfv), E(TexParameterIiv), E(TexParameterIuiv), E(GetTexParameterIiv),
+    E(GetTexParameterIuiv), E(SamplerParameterIiv), E(SamplerParameterIuiv), E(GetSamplerParameterIiv), E(GetSamplerParameterIuiv), E(GenRenderbuffers), E(DeleteRenderbuffers),
     E(IsRenderbuffer), E(BindRenderbuffer), E(RenderbufferStorage), E(RenderbufferStorageMultisample),
     E(GetRenderbufferParameteriv), E(GetInternalformativ), E(GenFramebuffers), E(DeleteFramebuffers),
     E(IsFramebuffer), E(BindFramebuffer), E(FramebufferTexture2D), E(FramebufferTextureLayer), E(FramebufferTexture),
