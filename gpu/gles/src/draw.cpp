@@ -131,6 +131,11 @@ Context::FbInfo Context::resolveFramebuffer(GLuint name, bool forDraw) {
         }
         fb.width = s->width, fb.height = s->height;
         fb.color[0].image = s->color.get();
+        if (s->msColor) {  // rendered multisampled, resolved into the presented image when the pass ends
+            fb.color[0].image = s->msColor.get();
+            fb.color[0].resolve = s->color.get();
+            fb.samples = uint32_t(s->msColor->samples);
+        }
         if (s->depthStencil) {
             fb.depth.image = s->depthStencil.get();
             if (s->depthStencil->format->stencil) fb.stencil.image = s->depthStencil.get();
@@ -143,7 +148,7 @@ Context::FbInfo Context::resolveFramebuffer(GLuint name, bool forDraw) {
         return fb;
     }
     bool any = false, first = true;
-    uint32_t views = 0;
+    uint32_t views = 0, samples = 1;
     // kind: 0 colour, 1 depth, 2 stencil (the attached format must be renderable for that attachment point).
     auto take = [&](const Attachment& a, FbTarget& t, int kind) -> bool {
         if (a.kind == Attachment::None) return true;
@@ -158,8 +163,13 @@ Context::FbInfo Context::resolveFramebuffer(GLuint name, bool forDraw) {
             return false;
         }
         const uint32_t v = t.multiview ? t.layers : 0;
-        if (first) fb.width = w, fb.height = h, views = v, first = false;
+        const uint32_t n = uint32_t(t.image->samples);
+        if (first) fb.width = w, fb.height = h, views = v, samples = n, first = false;
         else {
+            if (n != samples) {
+                fb.status = 0x8D56;  // FRAMEBUFFER_INCOMPLETE_MULTISAMPLE
+                return false;
+            }
             // GLES 3: the framebuffer is the intersection of its attachments.
             fb.width = std::min(fb.width, w), fb.height = std::min(fb.height, h);
             if (v != views) {
@@ -187,17 +197,20 @@ Context::FbInfo Context::resolveFramebuffer(GLuint name, bool forDraw) {
         return fb;
     }
     fb.viewCount = views;
+    fb.samples = samples;
     return fb;
 }
 
 bool Context::PassKey::operator==(const PassKey& o) const {
-    return color == o.color && depth == o.depth && stencil == o.stencil && w == o.w && h == o.h && viewMask == o.viewMask;
+    return color == o.color && colorResolve == o.colorResolve && depth == o.depth && stencil == o.stencil && w == o.w && h == o.h &&
+           viewMask == o.viewMask && samples == o.samples;
 }
 
 Context::PassKey Context::passKeyFor(const FbInfo& fb) {
     PassKey key;
     key.w = fb.width, key.h = fb.height;
     key.viewMask = fb.viewCount > 1 ? (1u << fb.viewCount) - 1 : 0;
+    key.samples = fb.samples;
     const uint32_t layerCount = fb.viewCount > 1 ? fb.viewCount : 1;
     std::array<GLenum, kMaxDrawBuffers> bufs{};
     if (fb.defaultFb) {
@@ -210,6 +223,7 @@ Context::PassKey Context::passKeyFor(const FbInfo& fb) {
         if (bufs[size_t(i)] == gl::NONE) continue;
         const FbTarget& t = fb.color[size_t(i)];
         if (t.image) key.color[size_t(i)] = t.image->attachmentView(t.level, t.layer, layerCount);
+        if (t.image && t.resolve) key.colorResolve[size_t(i)] = t.resolve->attachmentView(0, 0, layerCount);
     }
     if (fb.depth.image) key.depth = fb.depth.image->attachmentView(fb.depth.level, fb.depth.layer, layerCount);
     if (fb.stencil.image) key.stencil = fb.stencil.image->attachmentView(fb.stencil.level, fb.stencil.layer, layerCount);
@@ -282,18 +296,26 @@ bool Context::beginPass(const FbInfo& fb, std::vector<VkClearAttachment>* firstC
         }
         *firstClear = std::move(rest);
     }
-    auto fill = [&](VkRenderingAttachmentInfo& a, VkImageView v, size_t idx) {
+    // `resolve`: the single-sample view a multisample colour attachment is resolved into at the end of the pass (the samples
+    // are stored too: the next pass loads them).
+    auto fill = [&](VkRenderingAttachmentInfo& a, VkImageView v, size_t idx, VkImageView resolve = VK_NULL_HANDLE, bool integer = false) {
         a.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
         a.imageView = v;
         a.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
         a.loadOp = load[idx];
         a.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
         a.clearValue = clearValue[idx];
+        if (resolve) {
+            a.resolveMode = integer ? VK_RESOLVE_MODE_SAMPLE_ZERO_BIT : VK_RESOLVE_MODE_AVERAGE_BIT;
+            a.resolveImageView = resolve;
+            a.resolveImageLayout = VK_IMAGE_LAYOUT_GENERAL;
+        }
     };
     VkRenderingAttachmentInfo colors[kMaxDrawBuffers]{};
     uint32_t colorCount = 0;
     for (int i = 0; i < kMaxDrawBuffers; ++i) {
-        fill(colors[i], key.color[size_t(i)], size_t(i));
+        fill(colors[i], key.color[size_t(i)], size_t(i), key.colorResolve[size_t(i)],
+             fb.color[size_t(i)].image && fb.color[size_t(i)].image->format->integer);
         if (colors[i].imageView) colorCount = uint32_t(i + 1);
     }
     VkRenderingAttachmentInfo depth{}, stencil{};
@@ -1009,6 +1031,18 @@ VkPipeline Context::pipelineFor(Program& p, const FbInfo& fb, VkPrimitiveTopolog
     for (auto& a : attrs) h.add(a);
     h.add(xfb), h.add(rasterizerDiscard), h.add(cullFace), h.add(cullMode), h.add(frontFace), h.add(polygonOffsetFill);
     h.add(primitiveRestart), h.add(sampleAlphaToCoverage);
+    // Multisample: the sample count of the pass and the mask GL_SAMPLE_MASK / GL_SAMPLE_COVERAGE leave (all ones: none).
+    const uint32_t full = fb.samples >= 32 ? ~0u : (1u << fb.samples) - 1;
+    VkSampleMask sampleMaskBits = full;
+    if (fb.samples > 1) {
+        if (sampleMaskEnable) sampleMaskBits &= sampleMask;
+        if (sampleCoverage) {
+            const uint32_t n = uint32_t(std::lround(sampleCoverageValue * float(fb.samples)));
+            const uint32_t cov = (1u << n) - 1;
+            sampleMaskBits &= sampleCoverageInvert ? ~cov : cov;
+        }
+    }
+    h.add(fb.samples), h.add(sampleMaskBits);
     const bool dt = depthTest && hasDepth, st = stencilTest && hasStencil;
     h.add(dt), h.add(dt ? depthFunc : 0u), h.add(dt && depthMask), h.add(st);
     if (st)
@@ -1049,7 +1083,8 @@ VkPipeline Context::pipelineFor(Program& p, const FbInfo& fb, VkPrimitiveTopolog
     rs.depthBiasEnable = polygonOffsetFill;
     rs.lineWidth = 1.0f;
     VkPipelineMultisampleStateCreateInfo ms{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
-    ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+    ms.rasterizationSamples = VkSampleCountFlagBits(fb.samples);
+    if (sampleMaskBits != full) ms.pSampleMask = &sampleMaskBits;
     ms.alphaToCoverageEnable = sampleAlphaToCoverage;
     VkPipelineDepthStencilStateCreateInfo ds{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
     ds.depthTestEnable = dt;
@@ -2137,14 +2172,14 @@ bool Context::clearByDraw(const FbInfo& fb, const VkRect2D& rect, const ClearDra
     std::copy(viewport, viewport + 4, sViewport);
     std::copy(scissor, scissor + 4, sScissor);
     const bool sDiscard = rasterizerDiscard, sCull = cullFace, sOffset = polygonOffsetFill, sRestart = primitiveRestart,
-               sCoverage = sampleAlphaToCoverage, sDepth = depthTest, sStencilTest = stencilTest, sScissorTest = scissorTest;
+               sCoverage = sampleAlphaToCoverage, sSampleCov = sampleCoverage, sSampleMask = sampleMaskEnable, sDepth = depthTest, sStencilTest = stencilTest, sScissorTest = scissorTest;
     const GLenum sError = error;
     const uint64_t sDraws = drawCount;
     for (size_t i = 0; i < blend.size(); ++i) {
         blend[i].enabled = false;
         if (!(cd.colorBits >> i & 1)) blend[i].mask[0] = blend[i].mask[1] = blend[i].mask[2] = blend[i].mask[3] = false;
     }
-    rasterizerDiscard = cullFace = polygonOffsetFill = primitiveRestart = sampleAlphaToCoverage = depthTest = false;
+    rasterizerDiscard = cullFace = polygonOffsetFill = primitiveRestart = sampleAlphaToCoverage = sampleCoverage = sampleMaskEnable = depthTest = false;
     stencilTest = cd.stencil;
     if (cd.stencil)
         for (int f = 0; f < 2; ++f)
@@ -2165,7 +2200,7 @@ bool Context::clearByDraw(const FbInfo& fb, const VkRect2D& rect, const ClearDra
     std::copy(sViewport, sViewport + 4, viewport);
     std::copy(sScissor, sScissor + 4, scissor);
     rasterizerDiscard = sDiscard, cullFace = sCull, polygonOffsetFill = sOffset, primitiveRestart = sRestart;
-    sampleAlphaToCoverage = sCoverage, depthTest = sDepth, stencilTest = sStencilTest, scissorTest = sScissorTest;
+    sampleAlphaToCoverage = sCoverage, sampleCoverage = sSampleCov, sampleMaskEnable = sSampleMask, depthTest = sDepth, stencilTest = sStencilTest, scissorTest = sScissorTest;
     return true;
 }
 
@@ -2309,7 +2344,9 @@ void Context::readPixels(GLint x, GLint y, GLsizei w, GLsizei h, GLenum format, 
         if (f->readBuffer == gl::NONE) return setError(gl::INVALID_OPERATION, format);
         idx = int(f->readBuffer - gl::COLOR_ATTACHMENT0);
     }
-    const FbTarget src = fb.color[size_t(idx)];
+    FbTarget src = fb.color[size_t(idx)];
+    if (src.resolve) src.image = src.resolve;  // multisample default framebuffer: its resolved image
+    else if (src.image && src.image->samples > 1) return setError(gl::INVALID_OPERATION, format);
     if (!src.image) return setError(gl::INVALID_OPERATION, format);
     const uint32_t outPx = clientPixelBytes(format, type);
     if (!outPx) return setError(gl::INVALID_ENUM, format);
@@ -2358,10 +2395,70 @@ void Context::blitFramebuffer(GLint sx0, GLint sy0, GLint sx1, GLint sy1, GLint 
     if (rf.status != gl::FRAMEBUFFER_COMPLETE || df.status != gl::FRAMEBUFFER_COMPLETE)
         return setError(gl::INVALID_FRAMEBUFFER_OPERATION);
     if ((mask & (gl::DEPTH_BUFFER_BIT | gl::STENCIL_BUFFER_BIT)) && filter != gl::NEAREST) return setError(gl::INVALID_OPERATION);
+    // ES 3.0: a multisample draw framebuffer is an error; a multisample read framebuffer is resolved (identical rectangles,
+    // same formats). The multisample default framebuffer's colour is read through the single-sample image it resolves into.
+    if (df.samples > 1) return setError(gl::INVALID_OPERATION);
+    int ri = 0;
+    if (readFbo) ri = int(fbo(readFbo)->readBuffer - gl::COLOR_ATTACHMENT0);
+    FbTarget& rc = rf.color[size_t(std::clamp(ri, 0, kMaxDrawBuffers - 1))];
+    if (rc.resolve) rc.image = rc.resolve;
+    const auto& bufs = drawFbo ? fbo(drawFbo)->drawBuffers : fbos[0]->drawBuffers;
+    auto multisampled = [](const FbTarget& t) { return t.image && t.image->samples > 1; };
+    const bool msColor = (mask & gl::COLOR_BUFFER_BIT) && multisampled(rc);
+    const bool msDepth = (mask & gl::DEPTH_BUFFER_BIT) && multisampled(rf.depth);
+    const bool msStencil = (mask & gl::STENCIL_BUFFER_BIT) && multisampled(rf.stencil);
+    if (msColor || msDepth || msStencil) {
+        if (sx1 - sx0 != dx1 - dx0 || sy1 - sy0 != dy1 - dy0) return setError(gl::INVALID_OPERATION);
+        if (msColor)
+            for (int i = 0; i < kMaxDrawBuffers; ++i)
+                if (bufs[size_t(i)] != gl::NONE && df.color[size_t(i)].image && df.color[size_t(i)].image->format != rc.image->format)
+                    return setError(gl::INVALID_OPERATION);
+        if ((msDepth && df.depth.image && df.depth.image->format != rf.depth.image->format) ||
+            (msStencil && df.stencil.image && df.stencil.image->format != rf.stencil.image->format))
+            return setError(gl::INVALID_OPERATION);
+    }
     barrier();
     auto blit = [&](const FbTarget& s, const FbTarget& d, VkImageAspectFlags aspect) {
         if (!s.image || !d.image) return;
         s.image->invalid.clear(), d.image->invalid.clear();
+        if (s.image->samples > 1) {
+            const int32_t x0 = std::min(sx0, sx1), y0 = std::min(sy0, sy1), w = std::abs(sx1 - sx0), h = std::abs(sy1 - sy0);
+            const int32_t ox = std::min(dx0, dx1), oy = std::min(dy0, dy1);
+            const int32_t sw = int32_t(std::max(1u, s.image->width >> s.level)), sh = int32_t(std::max(1u, s.image->height >> s.level));
+            const int32_t dw = int32_t(std::max(1u, d.image->width >> d.level)), dh = int32_t(std::max(1u, d.image->height >> d.level));
+            // The part of the rectangle inside both images.
+            const int32_t cx0 = std::max({0, -x0, -ox}), cx1 = std::min({w, sw - x0, dw - ox});
+            const int32_t cy0 = std::max({0, -y0, -oy}), cy1 = std::min({h, sh - y0, dh - oy});
+            if (cx1 <= cx0 || cy1 <= cy0) return;
+            if (aspect == VK_IMAGE_ASPECT_COLOR_BIT) {
+                VkImageResolve r{};
+                r.srcSubresource = {aspect, s.level, s.layer, 1};
+                r.dstSubresource = {aspect, d.level, d.layer, 1};
+                r.srcOffset = {x0 + cx0, y0 + cy0, 0}, r.dstOffset = {ox + cx0, oy + cy0, 0};
+                r.extent = {uint32_t(cx1 - cx0), uint32_t(cy1 - cy0), 1};
+                dev->vk.vkCmdResolveImage(cmd(), s.image->image, VK_IMAGE_LAYOUT_GENERAL, d.image->image, VK_IMAGE_LAYOUT_GENERAL, 1, &r);
+                return;
+            }
+            // Depth / stencil: vkCmdResolveImage is colour-only; an empty pass resolves them (the whole level).
+            if (x0 != ox || y0 != oy || w != sw || h != sh || sw != dw || sh != dh)
+                logf("gles.warn blit_resolve_depth_stencil partial rect %dx%d of %dx%d: the whole level is resolved", w, h, sw, sh);
+            endPass();
+            VkRenderingAttachmentInfo a{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+            a.imageView = s.image->attachmentView(s.level, s.layer, 1);
+            a.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+            a.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD, a.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+            a.resolveMode = VK_RESOLVE_MODE_SAMPLE_ZERO_BIT;
+            a.resolveImageView = d.image->attachmentView(d.level, d.layer, 1);
+            a.resolveImageLayout = VK_IMAGE_LAYOUT_GENERAL;
+            VkRenderingInfo info{VK_STRUCTURE_TYPE_RENDERING_INFO};
+            info.renderArea = {{0, 0}, {uint32_t(sw), uint32_t(sh)}};
+            info.layerCount = 1;
+            if (aspect == VK_IMAGE_ASPECT_DEPTH_BIT) info.pDepthAttachment = &a;
+            else info.pStencilAttachment = &a;
+            dev->vk.vkCmdBeginRendering(cmd(), &info);
+            dev->vk.vkCmdEndRendering(cmd());
+            return;
+        }
         VkImageBlit b{};
         b.srcSubresource = {aspect, s.level, s.layer, 1};
         b.dstSubresource = {aspect, d.level, d.layer, 1};
@@ -2370,13 +2467,9 @@ void Context::blitFramebuffer(GLint sx0, GLint sy0, GLint sx1, GLint sy1, GLint 
         dev->vk.vkCmdBlitImage(cmd(), s.image->image, VK_IMAGE_LAYOUT_GENERAL, d.image->image, VK_IMAGE_LAYOUT_GENERAL, 1, &b,
                                filter == gl::LINEAR ? VK_FILTER_LINEAR : VK_FILTER_NEAREST);
     };
-    if (mask & gl::COLOR_BUFFER_BIT) {
-        int ri = 0;
-        if (readFbo) ri = int(fbo(readFbo)->readBuffer - gl::COLOR_ATTACHMENT0);
-        const auto& bufs = drawFbo ? fbo(drawFbo)->drawBuffers : fbos[0]->drawBuffers;
+    if (mask & gl::COLOR_BUFFER_BIT)
         for (int i = 0; i < kMaxDrawBuffers; ++i)
-            if (bufs[size_t(i)] != gl::NONE) blit(rf.color[size_t(std::clamp(ri, 0, kMaxDrawBuffers - 1))], df.color[size_t(i)], VK_IMAGE_ASPECT_COLOR_BIT);
-    }
+            if (bufs[size_t(i)] != gl::NONE) blit(rc, df.color[size_t(i)], VK_IMAGE_ASPECT_COLOR_BIT);
     if (mask & gl::DEPTH_BUFFER_BIT) blit(rf.depth, df.depth, VK_IMAGE_ASPECT_DEPTH_BIT);
     if (mask & gl::STENCIL_BUFFER_BIT) blit(rf.stencil, df.stencil, VK_IMAGE_ASPECT_STENCIL_BIT);
     barrier();

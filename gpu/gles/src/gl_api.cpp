@@ -300,8 +300,11 @@ int queryState(Context* c, GLenum p, double* out) {
         case gl::ALPHA_BITS: return one(fbBits(3));
         case gl::DEPTH_BITS: return one(fbBits(4));
         case gl::STENCIL_BITS: return one(fbBits(5));
-        case gl::SAMPLE_BUFFERS: return one(0);
-        case gl::SAMPLES: return one(0);
+        case gl::SAMPLE_BUFFERS: case gl::SAMPLES: {
+            const auto fb = c->resolveFramebuffer(c->drawFbo, true);
+            const GLint n = fb.status == gl::FRAMEBUFFER_COMPLETE && fb.samples > 1 ? GLint(fb.samples) : 0;
+            return one(p == gl::SAMPLES ? n : (n ? 1 : 0));
+        }
         case gl::IMPLEMENTATION_COLOR_READ_FORMAT: return one(gl::RGBA);
         case gl::IMPLEMENTATION_COLOR_READ_TYPE: return one(gl::UNSIGNED_BYTE);
         case gl::VIEWPORT: for (int i = 0; i < 4; ++i) out[i] = c->viewport[i]; return 4;
@@ -413,7 +416,8 @@ bool IsEnabledImpl(Context* c, GLenum cap, bool& ok) {
         case gl::RASTERIZER_DISCARD: return c->rasterizerDiscard;
         case gl::DEBUG_OUTPUT: return c->debugOutput;
         case gl::DEBUG_OUTPUT_SYNCHRONOUS: return c->debugSync;
-        case gl::SAMPLE_MASK: case 0x8C36 /* SAMPLE_SHADING */: case gl::FRAMEBUFFER_SRGB_EXT: return false;
+        case gl::SAMPLE_MASK: return c->sampleMaskEnable;
+        case 0x8C36 /* SAMPLE_SHADING */: case gl::FRAMEBUFFER_SRGB_EXT: return false;
         default: ok = false; return false;
     }
 }
@@ -592,7 +596,8 @@ void Enable_(GLenum cap, bool on) {
         case gl::RASTERIZER_DISCARD: c->rasterizerDiscard = on; break;
         case gl::DEBUG_OUTPUT: c->debugOutput = on; break;
         case gl::DEBUG_OUTPUT_SYNCHRONOUS: c->debugSync = on; break;
-        case gl::SAMPLE_MASK: case 0x8C36 /* SAMPLE_SHADING */: case gl::FRAMEBUFFER_SRGB_EXT: break;
+        case gl::SAMPLE_MASK: c->sampleMaskEnable = on; break;
+        case 0x8C36 /* SAMPLE_SHADING */: case gl::FRAMEBUFFER_SRGB_EXT: break;
         default: c->setError(gl::INVALID_ENUM, cap);
     }
 }
@@ -1785,7 +1790,7 @@ void GetTexLevelParameterfv(GLenum target, GLint level, GLenum p, GLfloat* v) {
 }
 
 // ---- multisample textures --------------------------------------------------------------------------------
-// The images are 1x (VPKTAA does the AA); the texture reports the samples and fixed-location flag it was given.
+// The image has renderSamples(samples) samples; the texture reports the count it was given and its fixed-location flag.
 void TexStorage2DMultisample(GLenum target, GLsizei samples, GLenum ifmt, GLsizei w, GLsizei h, GLboolean fixed) {
     CTX()
     if (target != gl::TEXTURE_2D_MULTISAMPLE) return c->setError(gl::INVALID_ENUM, target);
@@ -1991,27 +1996,14 @@ void RenderbufferStorageMultisample(GLenum target, GLsizei samples, GLenum ifmt,
     const FormatInfo* f = formatFor(ifmt);
     if (!f || f->compressed || (!f->renderable && !(f->depth || f->stencil))) return c->setError(gl::INVALID_ENUM, target);
     if (r->image) c->keep(r->image);
-    // Rendered 1x (VPKTAA does the AA); the renderbuffer reports the samples asked for.
-    auto img = std::make_shared<Image>();
-    img->dev = c->dev;
-    img->format = f;
-    img->width = uint32_t(std::max(w, 1)), img->height = uint32_t(std::max(h, 1));
-    VkImageCreateInfo ci{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
-    ci.imageType = VK_IMAGE_TYPE_2D, ci.format = f->vk, ci.extent = {img->width, img->height, 1};
-    ci.mipLevels = 1, ci.arrayLayers = 1, ci.samples = VK_SAMPLE_COUNT_1_BIT;
-    ci.usage = (f->depth || f->stencil ? VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT : VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) |
-               VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
-    if (c->dev->vk.vkCreateImage(c->dev->device, &ci, nullptr, &img->image) != VK_SUCCESS) return c->setError(gl::OUT_OF_MEMORY, target);
-    VkMemoryRequirements req;
-    c->dev->vk.vkGetImageMemoryRequirements(c->dev->device, img->image, &req);
-    VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
-    mai.allocationSize = req.size;
-    mai.memoryTypeIndex = uint32_t(c->dev->memoryType(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT));
-    c->dev->vk.vkAllocateMemory(c->dev->device, &mai, nullptr, &img->memory);
-    c->dev->vk.vkBindImageMemory(c->dev->device, img->image, img->memory, 0);
+    const uint32_t n = samples > 0 ? renderSamples(uint32_t(samples)) : 1;
+    ImageP img = createImage2D(c->dev, f, uint32_t(std::max(w, 1)), uint32_t(std::max(h, 1)), 1, n,
+                               (f->depth || f->stencil ? VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT : VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) |
+                                   VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT);
+    if (!img) return c->setError(n > 1 ? gl::INVALID_OPERATION : gl::OUT_OF_MEMORY, target);
     c->imageInit(*img);
     r->image = img;
-    r->internalFormat = ifmt, r->width = w, r->height = h, r->samples = samples;
+    r->internalFormat = ifmt, r->width = w, r->height = h, r->samples = GLsizei(n > 1 ? n : 0);
 }
 void RenderbufferStorage(GLenum target, GLenum ifmt, GLsizei w, GLsizei h) { RenderbufferStorageMultisample(target, 0, ifmt, w, h); }
 void GetRenderbufferParameteriv(GLenum target, GLenum p, GLint* v) {
@@ -3381,10 +3373,6 @@ void SampleMaski(GLuint maskNumber, GLbitfield mask) {
     CTX()
     if (maskNumber >= 1) return c->setError(gl::INVALID_VALUE);  // MAX_SAMPLE_MASK_WORDS = 1
     c->sampleMask = mask;
-    if (!c->sampleMaskWarned && mask != ~0u) {
-        c->sampleMaskWarned = true;
-        logf("gles.warn glSampleMaski mask=0x%x stored but not applied: the pipelines are single-sample", mask);
-    }
 }
 void GetTransformFeedbackVarying(GLuint pn, GLuint index, GLsizei max, GLsizei* len, GLsizei* size, GLenum* type, GLchar* name) {
     CTX()

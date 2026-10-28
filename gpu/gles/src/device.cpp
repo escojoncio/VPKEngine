@@ -323,7 +323,7 @@ VkImageView Texture::sampledView() {
     switch (target) {
         case gl::TEXTURE_CUBE_MAP: ci.viewType = VK_IMAGE_VIEW_TYPE_CUBE; break;
         case gl::TEXTURE_3D: ci.viewType = VK_IMAGE_VIEW_TYPE_3D; break;
-        case gl::TEXTURE_2D_ARRAY: ci.viewType = VK_IMAGE_VIEW_TYPE_2D_ARRAY; break;
+        case gl::TEXTURE_2D_ARRAY: case gl::TEXTURE_2D_MULTISAMPLE_ARRAY: ci.viewType = VK_IMAGE_VIEW_TYPE_2D_ARRAY; break;
         default: ci.viewType = image->layers > 1 ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : VK_IMAGE_VIEW_TYPE_2D;
     }
     ci.format = image->format->vk;

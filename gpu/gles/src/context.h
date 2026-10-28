@@ -168,6 +168,8 @@ struct Image {  // a VkImage with its memory
                             VkFormat format = VK_FORMAT_UNDEFINED);
 };
 using ImageP = std::shared_ptr<Image>;
+// The sample count a request of `n` (> 1) samples is rendered with: 2 or 4 (MAX_SAMPLES).
+inline uint32_t renderSamples(uint32_t n) { return n <= 2 ? 2u : 4u; }
 // A 2D (array) image of `samples` samples with its device-local memory bound; null when Vulkan refuses it. The caller
 // records Context::imageInit.
 ImageP createImage2D(Device* dev, const FormatInfo* f, uint32_t w, uint32_t h, uint32_t layers, uint32_t samples,
@@ -205,7 +207,7 @@ struct Texture {
     GLenum swizzle[4] = {gl::RED, gl::GREEN, gl::BLUE, gl::ALPHA};
     GLenum depthStencilMode = gl::DEPTH_COMPONENT;
     bool srgbDecode = true;
-    GLint samples = 0;          // glTexStorage2DMultisample / glTexImage2DMultisample (the image itself is 1x)
+    GLint samples = 0;          // glTexStorage2DMultisample / glTexImage2DMultisample (the image has renderSamples(samples))
     bool fixedSampleLocations = false;
     // Buffer texture (glTexBuffer / glTexBufferRange): the data store is a range of a buffer object.
     GLuint bufferName = 0;
@@ -533,7 +535,7 @@ public:
     GLuint programPipeline = 0, nextProgramPipeline = 1;
     // glSampleMaski: stored only (rendering is 1x, the coverage mask has nothing to apply to).
     GLbitfield sampleMask = ~0u;
-    bool sampleMaskWarned = false;
+    bool sampleMaskEnable = false;  // GL_SAMPLE_MASK
     int activeUnit = 0;
     struct Unit {
         GLuint tex2D = 0, texCube = 0, tex3D = 0, tex2DArray = 0, texExternal = 0, tex2DMS = 0, sampler = 0;
@@ -629,11 +631,12 @@ public:
         Image* image = nullptr;
         uint32_t level = 0, layer = 0, layers = 1;
         bool multiview = false;
+        Image* resolve = nullptr;  // multisampled default-framebuffer colour: the single-sample image the pass resolves it into
     };
     struct FbInfo {
         std::array<FbTarget, kMaxDrawBuffers> color{};
         FbTarget depth, stencil;
-        uint32_t width = 0, height = 0, viewCount = 0;
+        uint32_t width = 0, height = 0, viewCount = 0, samples = 1;
         GLenum status = gl::FRAMEBUFFER_COMPLETE;
         bool defaultFb = false;
     };
@@ -710,9 +713,9 @@ private:
     uint32_t passDrop_ = 0;
     void setPassDrop(uint32_t mask);
     struct PassKey {
-        std::array<VkImageView, kMaxDrawBuffers> color{};
+        std::array<VkImageView, kMaxDrawBuffers> color{}, colorResolve{};  // resolve: the 1x view a multisample colour is resolved into
         VkImageView depth = VK_NULL_HANDLE, stencil = VK_NULL_HANDLE;
-        uint32_t w = 0, h = 0, viewMask = 0;
+        uint32_t w = 0, h = 0, viewMask = 0, samples = 1;
         bool operator==(const PassKey& o) const;
     } pass_;
     PassKey passKeyFor(const FbInfo& fb);  // the attachments a pass on `fb` would have

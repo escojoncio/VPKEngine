@@ -75,13 +75,16 @@ bool Context::realizeTexture(Texture& t) {
     if (!l0.w || !l0.h || !l0.d) return false;  // an empty base level: no image, the texture is incomplete
     const bool cube = t.target == gl::TEXTURE_CUBE_MAP;
     const bool is3D = t.target == gl::TEXTURE_3D;
-    const bool array = t.target == gl::TEXTURE_2D_ARRAY;
+    const bool array = t.target == gl::TEXTURE_2D_ARRAY || t.target == gl::TEXTURE_2D_MULTISAMPLE_ARRAY;
+    const uint32_t samples = (t.target == gl::TEXTURE_2D_MULTISAMPLE || t.target == gl::TEXTURE_2D_MULTISAMPLE_ARRAY) && t.samples > 1
+                                 ? renderSamples(uint32_t(t.samples)) : 1;
     const uint32_t layers = cube ? 6 : array ? l0.d : 1;
     const uint32_t depth = is3D ? l0.d : 1;
     const uint32_t levels = t.immutable ? uint32_t(t.immutableLevels) : mipCount(l0.w, l0.h, depth);
     const bool storage = t.wantStorage && storageCapable(l0.format->vk);
     if (t.image && t.image->format == l0.format && t.image->width == l0.w && t.image->height == l0.h &&
-        t.image->depth == depth && t.image->layers == layers && t.image->levels == levels && t.image->storage == storage)
+        t.image->depth == depth && t.image->layers == layers && t.image->levels == levels && t.image->storage == storage &&
+        uint32_t(t.image->samples) == samples)
         return true;
     auto img = std::make_shared<Image>();
     img->dev = dev;
@@ -89,6 +92,7 @@ bool Context::realizeTexture(Texture& t) {
     img->width = l0.w, img->height = l0.h, img->depth = depth, img->layers = layers, img->levels = levels;
     img->cube = cube;
     img->storage = storage;
+    img->samples = VkSampleCountFlagBits(samples);
     img->type = is3D ? VK_IMAGE_TYPE_3D : VK_IMAGE_TYPE_2D;
     VkImageCreateInfo ci{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
     ci.flags = cube ? VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT : 0;
@@ -100,7 +104,7 @@ bool Context::realizeTexture(Texture& t) {
     ci.imageType = img->type;
     ci.format = l0.format->vk;
     ci.extent = {l0.w, l0.h, depth};
-    ci.mipLevels = levels, ci.arrayLayers = layers, ci.samples = VK_SAMPLE_COUNT_1_BIT;
+    ci.mipLevels = levels, ci.arrayLayers = layers, ci.samples = VkSampleCountFlagBits(samples);
     ci.tiling = VK_IMAGE_TILING_OPTIMAL;
     ci.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
     if (!l0.format->compressed && (!is3D || (ci.flags & VK_IMAGE_CREATE_2D_ARRAY_COMPATIBLE_BIT)))
@@ -410,7 +414,6 @@ void Context::texStorage(GLenum target, GLsizei levels, GLenum internalFormat, G
         lv.d = target == gl::TEXTURE_3D ? std::max(1u, uint32_t(d) >> i) : uint32_t(d);
         lv.format = fi;
     }
-    if (samples > 1) logf("gles.note what=texstorage_multisample samples=%d (created 1x: VPKTAA does AA)", samples);
     realizeTexture(*t);
     t->maxLevel = std::min(t->maxLevel, levels - 1 + t->baseLevel);
 }
@@ -552,6 +555,8 @@ void Context::copyTexImage(GLenum target, GLint level, GLenum internalFormat, GL
     int idx = 0;
     if (rf && readFbo && rf->readBuffer >= gl::COLOR_ATTACHMENT0) idx = int(rf->readBuffer - gl::COLOR_ATTACHMENT0);
     FbTarget src = fb.color[size_t(idx)];
+    if (src.resolve) src.image = src.resolve;  // multisample default framebuffer: its resolved image
+    else if (src.image && src.image->samples > 1) return setError(gl::INVALID_OPERATION, target);
     if (!src.image) return setError(gl::INVALID_OPERATION, target);
     if (!sub) {
         GLenum fmt = internalFormat;

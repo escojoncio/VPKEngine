@@ -38,7 +38,7 @@ vpgles_window_size_fn gWindowSize = nullptr;
 void* gWindowSizeCtx = nullptr;
 
 // RGBA8888/D24S8 first (what Unity/Unreal ask for), then without depth, RGB565, and 4x variants
-// (rendered 1x: VPKTAA does the AA; the config still reports the samples the game asked for).
+// (rendered in a 4-sample colour + depth, resolved into the presented image).
 const Config kConfigs[] = {
     {1, 8, 8, 8, 8, 24, 8, 0, VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_D24_UNORM_S8_UINT},
     {2, 8, 8, 8, 8, 0, 0, 0, VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_UNDEFINED},
@@ -101,31 +101,17 @@ std::mutex gEglLock;
 }  // namespace
 
 bool createSurfaceImages(Device* dev, Surface& s) {
-    auto make = [&](VkFormat f, bool depth) -> ImageP {
-        auto img = std::make_shared<Image>();
-        img->dev = dev;
-        img->format = formatByVk(f);
-        img->width = s.width, img->height = s.height;
-        VkImageCreateInfo ci{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
-        ci.imageType = VK_IMAGE_TYPE_2D;
-        ci.format = f;
-        ci.extent = {s.width, s.height, 1};
-        ci.mipLevels = 1, ci.arrayLayers = 1, ci.samples = VK_SAMPLE_COUNT_1_BIT;
-        ci.usage = (depth ? VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT : VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT) |
-                   VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
-        if (dev->vk.vkCreateImage(dev->device, &ci, nullptr, &img->image) != VK_SUCCESS) return nullptr;
-        VkMemoryRequirements req;
-        dev->vk.vkGetImageMemoryRequirements(dev->device, img->image, &req);
-        VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
-        mai.allocationSize = req.size;
-        mai.memoryTypeIndex = uint32_t(dev->memoryType(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT));
-        dev->vk.vkAllocateMemory(dev->device, &mai, nullptr, &img->memory);
-        dev->vk.vkBindImageMemory(dev->device, img->image, img->memory, 0);
-        return img;
+    const uint32_t n = s.config->samples > 1 ? renderSamples(uint32_t(s.config->samples)) : 1;
+    auto make = [&](VkFormat f, bool depth, uint32_t samples) -> ImageP {
+        const VkImageUsageFlags usage =
+            (depth ? VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT : VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT) |
+            VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+        return createImage2D(dev, formatByVk(f), s.width, s.height, 1, samples, usage);
     };
-    s.color = make(s.config->color, false);
+    s.color = make(s.config->color, false, 1);
     if (!s.color) return false;
-    if (s.config->ds != VK_FORMAT_UNDEFINED) s.depthStencil = make(s.config->ds, true);
+    if (n > 1 && !(s.msColor = make(s.config->color, false, n))) return false;
+    if (s.config->ds != VK_FORMAT_UNDEFINED) s.depthStencil = make(s.config->ds, true, n);
     return true;
 }
 
@@ -329,9 +315,10 @@ static EGLSurface CreateSurface(EGLConfig c, Surface::Kind kind, void* window, c
     Context tmp(device(), new ShareGroup, 3, 0);
     tmp.imageInit(*s->color);
     zeroSurfaceImage(tmp, *s->color);
+    if (s->msColor) tmp.imageInit(*s->msColor);  // read before written: VPVulkan's lazy zero-fill
     if (s->depthStencil) {
         tmp.imageInit(*s->depthStencil);
-        zeroSurfaceImage(tmp, *s->depthStencil);
+        if (s->depthStencil->samples == VK_SAMPLE_COUNT_1_BIT) zeroSurfaceImage(tmp, *s->depthStencil);
     }
     tmp.flush(true);
     return s;

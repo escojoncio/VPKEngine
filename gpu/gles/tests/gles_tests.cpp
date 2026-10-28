@@ -845,8 +845,10 @@ void testFbo() {
     glRenderbufferStorageMultisample(gl::RENDERBUFFER, 4, gl::DEPTH24_STENCIL8, 32, 32);
     GLint samples = 0;
     glGetRenderbufferParameteriv(gl::RENDERBUFFER, gl::RENDERBUFFER_SAMPLES, &samples);
-    CHECK(samples == 4);  // reported as asked (rendered 1x)
+    CHECK(samples == 4);  // a real 4-sample image
     glFramebufferRenderbuffer(gl::FRAMEBUFFER, gl::DEPTH_STENCIL_ATTACHMENT, gl::RENDERBUFFER, rb);
+    CHECK(glCheckFramebufferStatus(gl::FRAMEBUFFER) == 0x8D56);  // single-sample colour + 4-sample depth: INCOMPLETE_MULTISAMPLE
+    glRenderbufferStorageMultisample(gl::RENDERBUFFER, 0, gl::DEPTH24_STENCIL8, 32, 32);
     CHECK(glCheckFramebufferStatus(gl::FRAMEBUFFER) == gl::FRAMEBUFFER_COMPLETE);
     GLint type = 0;
     glGetFramebufferAttachmentParameteriv(gl::FRAMEBUFFER, (gl::COLOR_ATTACHMENT0 + 1), gl::FRAMEBUFFER_ATTACHMENT_COMPONENT_TYPE, &type);
