@@ -2624,16 +2624,21 @@ void Context::blitFramebuffer(GLint sx0, GLint sy0, GLint sx1, GLint sy1, GLint 
                 dev->vk.vkCmdResolveImage(cmd(), s.image->image, VK_IMAGE_LAYOUT_GENERAL, d.image->image, VK_IMAGE_LAYOUT_GENERAL, 1, &r);
                 return;
             }
-            // Depth / stencil: vkCmdResolveImage is colour-only; an empty pass resolves them (the whole level).
-            if (x0 != ox || y0 != oy || w != sw || h != sh || sw != dw || sh != dh)
-                logf("gles.warn blit_resolve_depth_stencil partial rect %dx%d of %dx%d: the whole level is resolved", w, h, sw, sh);
+            // Depth / stencil: vkCmdResolveImage is colour-only. An empty pass resolves the whole level into a single-sample
+            // image of the source's size (a pass resolve needs the same size as its attachment); the blit then copies the
+            // rectangle, so a destination of another size (the default framebuffer) or a partial rectangle works.
+            ImageP tmp = createImage2D(dev, s.image->format, uint32_t(sw), uint32_t(sh), 1, 1,
+                                       VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
+            if (!tmp) return setError(gl::OUT_OF_MEMORY);
+            imageInit(*tmp);
+            keep(tmp);
             endPass();
             VkRenderingAttachmentInfo a{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
             a.imageView = s.image->attachmentView(s.level, s.layer, 1);
             a.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
             a.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD, a.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
             a.resolveMode = VK_RESOLVE_MODE_SAMPLE_ZERO_BIT;
-            a.resolveImageView = d.image->attachmentView(d.level, d.layer, 1);
+            a.resolveImageView = tmp->attachmentView(0, 0, 1);
             a.resolveImageLayout = VK_IMAGE_LAYOUT_GENERAL;
             VkRenderingInfo info{VK_STRUCTURE_TYPE_RENDERING_INFO};
             info.renderArea = {{0, 0}, {uint32_t(sw), uint32_t(sh)}};
@@ -2642,6 +2647,13 @@ void Context::blitFramebuffer(GLint sx0, GLint sy0, GLint sx1, GLint sy1, GLint 
             else info.pStencilAttachment = &a;
             dev->vk.vkCmdBeginRendering(cmd(), &info);
             dev->vk.vkCmdEndRendering(cmd());
+            barrier();
+            VkImageBlit cp{};
+            cp.srcSubresource = {aspect, 0, 0, 1};
+            cp.dstSubresource = {aspect, d.level, d.layer, 1};
+            cp.srcOffsets[0] = {x0 + cx0, y0 + cy0, 0}, cp.srcOffsets[1] = {x0 + cx1, y0 + cy1, 1};
+            cp.dstOffsets[0] = {ox + cx0, oy + cy0, 0}, cp.dstOffsets[1] = {ox + cx1, oy + cy1, 1};
+            dev->vk.vkCmdBlitImage(cmd(), tmp->image, VK_IMAGE_LAYOUT_GENERAL, d.image->image, VK_IMAGE_LAYOUT_GENERAL, 1, &cp, VK_FILTER_NEAREST);
             return;
         }
         VkImageBlit b{};
