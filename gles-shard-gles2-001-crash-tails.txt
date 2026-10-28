@@ -1,0 +1,42 @@
+=== attempt 1 exit=1 cases=['dEQP-GLES2.info.vendor', 'dEQP-GLES2.functional.uniform_api.value.assigned.by_value.get_uniform.multiple_nested_structs_arrays.fragment', 'dEQP-GLES2.functional.uniform_api.value.assigned.by_value.get_uniform.multiple_nested_structs_arrays.both']
+  Pass (Passed)
+
+Test case 'dEQP-GLES2.functional.uniform_api.value.assigned.by_value.get_uniform.multiple_nested_structs_arrays.vertex'..
+  Pass (Passed)
+
+Test case 'dEQP-GLES2.functional.uniform_api.value.assigned.by_value.get_uniform.multiple_nested_structs_arrays.fragment'..
+  Pass (Passed)
+
+Test case 'dEQP-GLES2.functional.uniform_api.value.assigned.by_value.get_uniform.multiple_nested_structs_arrays.both'..
+  Pass (Passed)
+gles.tex fmt=0x1906 count=9
+gles.tex fmt=0x1909 count=43
+gles.tex fmt=0x190a count=7
+gles.tex fmt=0x8051 count=318
+gles.tex fmt=0x8056 count=49
+gles.tex fmt=0x8057 count=2
+gles.tex fmt=0x8058 count=274
+gles.tex fmt=0x8059 count=3
+gles.tex fmt=0x822b count=2
+gles.tex fmt=0x822d count=2
+gles.tex fmt=0x822e count=2
+gles.tex fmt=0x822f count=2
+gles.tex fmt=0x881a count=2
+gles.tex fmt=0x881b count=2
+gles.tex fmt=0x88f0 count=4
+gles.tex fmt=0x8c41 count=2
+gles.tex fmt=0x8c43 count=2
+gles.tex fmt=0x8d62 count=8
+gles.tex fmt=0x8d64 count=8
+gles.tex fmt=0x93a1 count=10
+gles.pso.recipe saved=0 loaded=0 prewarmed=0 miss_in_game=0
+
+DONE!
+
+Test run totals:
+  Passed:        1466/1500 (97.7%)
+  Failed:        5/1500 (0.3%)
+  Not supported: 29/1500 (1.9%)
+  Warnings:      0/1500 (0.0%)
+  Waived:        0/1500 (0.0%)
+

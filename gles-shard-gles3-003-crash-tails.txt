@@ -1,0 +1,42 @@
+=== attempt 1 exit=1 cases=['dEQP-GLES3.functional.uniform_api.info_query.active_uniform.array_in_struct.mat4_mat2_fragment', 'dEQP-GLES3.functional.draw_buffers_indexed.random.max_implementation_draw_buffers.2', 'dEQP-GLES3.functional.draw_buffers_indexed.random.max_implementation_draw_buffers.11']
+gpu.metal.info what=msaa_materialized index=22 64x64x1 samples=1 fmt=RGBA8Sint mb=0.0 why=None load=2 store=1 label=
+gpu.frame f=4818 enc=7 render=7 compute=0 naive=7 passes=7 merged=0 hoisted=0 sunk=0 dropped=0 barriers=0 intra=0 raw=0 war=0 waw=0 tile_local=0 tile_rejected=0 saved_mb=0.0 split=0 verts=0 tile_max=3000000 heavy_enc=0 cpu_ms=0.023
+gpu.cut f=4818 FrameStart=1 AttachmentChange=6 ClearLoad=0 Feedback=0 TileBudget=0 PinnedCopy=0 ComputeBetween=0 ComputeWork=0 CopyWork=0 ViewSplit=0 TileSplit=0
+gpu.pso f=4818 compiled=1 failed=0 hits=0 misses=1 ms=19.46 max_ms=19.46
+gpu.metal.info what=msaa_materialized index=5 64x64x1 samples=1 fmt=RGBA8Unorm mb=0.0 why=None load=2 store=1 label=
+vk.perf dt_ms=1080 frames=72 submit_ms{avg=3.63 max=92.62} translate_ms{avg=0.01 max=0.14} backend_ms{avg=3.56 max=91.40} compile_ms{avg=0.03 max=0.39} gpu_cb{n=78 avg_ms=6.15 max_ms=58.38 sum_ms=479.3} dispatches=0 draws=46 draws_inst=0 ind{gpu=0 cpu=0 cpu_sec=0} barriers=42 barr_c2d=0 pso_wait_ms{create=239.6 record=0.0 gate=0.0 hold=0.0} hard_waits=0 fence_wait{n=72 ms=469.0 max=58.8} idle_wait{n=0 ms=0.0 max=0.0}
+gpu.time f=4819 gpu_ms=128.268 t=77450.8
+vk.hitch submit=4556 dt_ms=129.8 submit_ms=0.59 translate_ms=0.01 backend_ms=0.58 pso_create_ms=0.00 lib_compile_ms=0.00 fence_wait_ms=128.69 alloc_ms=0.00 upload_bytes=0 gles_link_ms=0.00 lock_ms=0.00 guest_gap_ms=0.5
+  Pass (Pass)
+
+Test case 'dEQP-GLES3.functional.draw_buffers_indexed.random.max_implementation_draw_buffers.11'..
+gpu.metal.info what=msaa_materialized index=15 64x64x1 samples=1 fmt=RGBA8Unorm mb=0.0 why=None load=2 store=1 label=
+gpu.metal.info what=msaa_materialized index=11 64x64x1 samples=1 fmt=RG32Uint mb=0.0 why=None load=2 store=1 label=
+gpu.metal.info what=msaa_materialized index=16 64x64x1 samples=1 fmt=R8Unorm mb=0.0 why=None load=2 store=1 label=
+gpu.metal.info what=msaa_materialized index=23 64x64x1 samples=1 fmt=R16Uint mb=0.0 why=None load=2 store=1 label=
+gpu.metal.info what=msaa_materialized index=24 64x64x1 samples=1 fmt=R32Uint mb=0.0 why=None load=2 store=1 label=
+gpu.metal.info what=msaa_materialized index=25 64x64x1 samples=1 fmt=RGB10A2Unorm mb=0.0 why=None load=2 store=1 label=
+gpu.metal.info what=msaa_materialized index=26 64x64x1 samples=1 fmt=R8Uint mb=0.0 why=None load=2 store=1 label=
+gpu.frame f=4828 enc=7 render=7 compute=0 naive=7 passes=7 merged=0 hoisted=0 sunk=0 dropped=0 barriers=0 intra=0 raw=0 war=0 waw=0 tile_local=0 tile_rejected=0 saved_mb=0.0 split=0 verts=0 tile_max=3000000 heavy_enc=0 cpu_ms=0.050
+gpu.cut f=4828 FrameStart=1 AttachmentChange=6 ClearLoad=0 Feedback=0 TileBudget=0 PinnedCopy=0 ComputeBetween=0 ComputeWork=0 CopyWork=0 ViewSplit=0 TileSplit=0
+gpu.pso f=4828 compiled=1 failed=0 hits=0 misses=1 ms=42.42 max_ms=42.42
+gpu.metal.info what=msaa_materialized index=6 64x64x1 samples=1 fmt=RGBA16Uint mb=0.0 why=None load=2 store=1 label=
+gpu.sec f=4829 n=63 p50=2.31 p95=43.80 max=128.27 over10=10
+gpu.time f=4829 gpu_ms=92.591 t=77732.4
+  Pass (Pass)
+gles.tex fmt=0x8051 count=29
+gles.tex fmt=0x8058 count=252
+gles.tex fmt=0x8d82 count=2
+gles.tex fmt=0x9274 count=2
+gles.tex fmt=0x9278 count=9
+gles.pso.recipe saved=0 loaded=0 prewarmed=0 miss_in_game=0
+
+DONE!
+
+Test run totals:
+  Passed:        1225/1243 (98.6%)
+  Failed:        6/1243 (0.5%)
+  Not supported: 11/1243 (0.9%)
+  Warnings:      1/1243 (0.1%)
+  Waived:        0/1243 (0.0%)
+

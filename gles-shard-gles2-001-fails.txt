@@ -1,0 +1,30 @@
+=== dEQP-GLES2.functional.shaders.invariance.mediump.loop_1
+Shader 1:
+Shader 2:
+Testing position invariance.
+Drawing position test pattern using shader 1. Primitive color: red - purple.
+Drawing position test pattern using shader 2. Primitive color: green.
+Verifying output. Expecting only green or background colored pixels.
+No variance found.
+Testing position invariance with z-test. Enabling GL_DEPTH_TEST.
+Drawing Z-test pattern using shader 1. Primitive color: red - purple. DepthFunc: GL_ALWAYS
+Drawing Z-test pattern using shader 2. Primitive color: green. DepthFunc: GL_EQUAL
+Verifying output. Expecting only green or background colored pixels.
+Invalid pixels found (fragments from first render pass found). Variance detected.
+<Result StatusCode="Fail">Detected variance between two invariant values</Result>
+=== dEQP-GLES2.functional.texture.mipmap.2d.projected.linear_linear_clamp
+Warning: High precision not supported in fragment shaders.
+ERROR: Image verification failed, found 31 invalid pixels!
+<Result StatusCode="Fail">Image verification failed</Result>
+=== dEQP-GLES2.functional.texture.mipmap.2d.projected.linear_nearest_clamp
+Warning: High precision not supported in fragment shaders.
+ERROR: Image verification failed, found 13 invalid pixels!
+<Result StatusCode="Fail">Image verification failed</Result>
+=== dEQP-GLES2.functional.texture.mipmap.2d.projected.linear_nearest_repeat
+Warning: High precision not supported in fragment shaders.
+ERROR: Image verification failed, found 13 invalid pixels!
+<Result StatusCode="Fail">Image verification failed</Result>
+=== dEQP-GLES2.functional.texture.mipmap.2d.projected.nearest_linear_mirror
+Warning: High precision not supported in fragment shaders.
+ERROR: Image verification failed, found 31 invalid pixels!
+<Result StatusCode="Fail">Image verification failed</Result>

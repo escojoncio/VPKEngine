@@ -1,0 +1,607 @@
+=== dEQP-GLES3.functional.fbo.blit.default_framebuffer.rg8_linear_out_of_bounds_blit_to_default
+glGenFramebuffers(1, 0x000000016d79df94);
+// framebuffers = { 356 }
+glGenTextures(1, 0x000000016d79df90);
+// textures = { 6322 }
+glBindTexture(GL_TEXTURE_2D, 6322);
+glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+glTexImage2D(GL_TEXTURE_2D, 0, GL_RG8, 128, 128, 0, GL_RG, GL_UNSIGNED_BYTE, 0);
+glBindFramebuffer(GL_FRAMEBUFFER, 356);
+glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, 6322, 0);
+glGetError();
+// GL_NO_ERROR returned
+glCheckFramebufferStatus(GL_FRAMEBUFFER);
+// GL_FRAMEBUFFER_COMPLETE returned
+glGenTextures(1, 0x000000016d79ddfc);
+// textures = { 6326 }
+glBindTexture(GL_TEXTURE_2D, 6326);
+glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, 128, 128, 0, GL_RGBA, GL_UNSIGNED_BYTE, 0x8aa8cc010);
+glBindFramebuffer(GL_FRAMEBUFFER, 356);
+glViewport(0, 0, 128, 128);
+glClearBufferfv(GL_COLOR, 0, 0x000000016d79dd90);
+glUseProgram(6323);
+glGetUniformLocation(6323, u_sampler0);
+// 0 returned
+glUniform1i(0, 0);
+glGetUniformLocation(6323, u_texScale0);
+// 1 returned
+glUniform4fv(1, 1, { 1, 1, 1, 1 });
+glGetUniformLocation(6323, u_texBias0);
+// 2 returned
+glUniform4fv(2, 1, { 0, 0, 0, 0 });
+glGetUniformLocation(6323, u_outScale0);
+// 3 returned
+glUniform4fv(3, 1, { 1, 1, 1, 1 });
+glGetUniformLocation(6323, u_outBias0);
+// 4 returned
+glUniform4fv(4, 1, { 0, 0, 0, 0 });
+glGetAttribLocation(6323, a_position);
+// 0 returned
+glGetAttribLocation(6323, a_coord);
+// 1 returned
+glUseProgram(6323);
+glEnableVertexAttribArray(0);
+glVertexAttribPointer(0, 4, GL_FLOAT, GL_FALSE, 0, 0x16d79dce8);
+glEnableVertexAttribArray(1);
+glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 0, 0x16d79dcc0);
+glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_SHORT, 0x16d79dcb0);
+glDisableVertexAttribArray(0);
+glDisableVertexAttribArray(1);
+glUseProgram(0);
+glBindFramebuffer(GL_READ_FRAMEBUFFER, 356);
+glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
+glGetError();
+// GL_NO_ERROR returned
+glClearBufferfv(GL_COLOR, 0, 0x000000016d79de10);
+glBlitFramebuffer(-10, -15, 100, 63, 181, 157, 264, 272, GL_COLOR_BUFFER
+=== dEQP-GLES3.functional.fbo.blit.default_framebuffer.rgb565_linear_out_of_bounds_blit_to_default
+glGenFramebuffers(1, 0x000000016d79df94);
+// framebuffers = { 355 }
+glGenTextures(1, 0x000000016d79df90);
+// textures = { 6317 }
+glBindTexture(GL_TEXTURE_2D, 6317);
+glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB565, 128, 128, 0, GL_RGB, GL_UNSIGNED_SHORT_5_6_5, 0);
+glBindFramebuffer(GL_FRAMEBUFFER, 355);
+glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, 6317, 0);
+glGetError();
+// GL_NO_ERROR returned
+glCheckFramebufferStatus(GL_FRAMEBUFFER);
+// GL_FRAMEBUFFER_COMPLETE returned
+glGenTextures(1, 0x000000016d79ddfc);
+// textures = { 6321 }
+glBindTexture(GL_TEXTURE_2D, 6321);
+glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, 128, 128, 0, GL_RGBA, GL_UNSIGNED_BYTE, 0x8aa8cc010);
+glBindFramebuffer(GL_FRAMEBUFFER, 355);
+glViewport(0, 0, 128, 128);
+glClearBufferfv(GL_COLOR, 0, 0x000000016d79dd90);
+glUseProgram(6318);
+glGetUniformLocation(6318, u_sampler0);
+// 0 returned
+glUniform1i(0, 0);
+glGetUniformLocation(6318, u_texScale0);
+// 1 returned
+glUniform4fv(1, 1, { 1, 1, 1, 1 });
+glGetUniformLocation(6318, u_texBias0);
+// 2 returned
+glUniform4fv(2, 1, { 0, 0, 0, 0 });
+glGetUniformLocation(6318, u_outScale0);
+// 3 returned
+glUniform4fv(3, 1, { 1, 1, 1, 1 });
+glGetUniformLocation(6318, u_outBias0);
+// 4 returned
+glUniform4fv(4, 1, { 0, 0, 0, 0 });
+glGetAttribLocation(6318, a_position);
+// 0 returned
+glGetAttribLocation(6318, a_coord);
+// 1 returned
+glUseProgram(6318);
+glEnableVertexAttribArray(0);
+glVertexAttribPointer(0, 4, GL_FLOAT, GL_FALSE, 0, 0x16d79dce8);
+glEnableVertexAttribArray(1);
+glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 0, 0x16d79dcc0);
+glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_SHORT, 0x16d79dcb0);
+glDisableVertexAttribArray(0);
+glDisableVertexAttribArray(1);
+glUseProgram(0);
+glBindFramebuffer(GL_READ_FRAMEBUFFER, 355);
+glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
+glGetError();
+// GL_NO_ERROR returned
+glClearBufferfv(GL_COLOR, 0, 0x000000016d79de10);
+glBlitFramebuffer(-10, -15, 100, 63, 181, 157, 264, 272, GL_C
+=== dEQP-GLES3.functional.fbo.blit.default_framebuffer.rgb5_a1_linear_out_of_bounds_blit_from_default
+glGenFramebuffers(1, 0x000000016d79df94);
+// framebuffers = { 354 }
+glGenTextures(1, 0x000000016d79df90);
+// textures = { 6312 }
+glBindTexture(GL_TEXTURE_2D, 6312);
+glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB5_A1, 128, 128, 0, GL_RGBA, GL_UNSIGNED_SHORT_5_5_5_1, 0);
+glBindFramebuffer(GL_FRAMEBUFFER, 354);
+glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, 6312, 0);
+glGetError();
+// GL_NO_ERROR returned
+glCheckFramebufferStatus(GL_FRAMEBUFFER);
+// GL_FRAMEBUFFER_COMPLETE returned
+glGenTextures(1, 0x000000016d79ddfc);
+// textures = { 6316 }
+glBindTexture(GL_TEXTURE_2D, 6316);
+glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, 128, 128, 0, GL_RGBA, GL_UNSIGNED_BYTE, 0x8aa8cc010);
+glBindFramebuffer(GL_FRAMEBUFFER, 0);
+glViewport(0, 0, 256, 256);
+glClearBufferfv(GL_COLOR, 0, 0x000000016d79dd90);
+glUseProgram(6313);
+glGetUniformLocation(6313, u_sampler0);
+// 0 returned
+glUniform1i(0, 0);
+glGetUniformLocation(6313, u_texScale0);
+// 1 returned
+glUniform4fv(1, 1, { 1, 1, 1, 1 });
+glGetUniformLocation(6313, u_texBias0);
+// 2 returned
+glUniform4fv(2, 1, { 0, 0, 0, 0 });
+glGetUniformLocation(6313, u_outScale0);
+// 3 returned
+glUniform4fv(3, 1, { 1, 1, 1, 1 });
+glGetUniformLocation(6313, u_outBias0);
+// 4 returned
+glUniform4fv(4, 1, { 0, 0, 0, 0 });
+glGetAttribLocation(6313, a_position);
+// 0 returned
+glGetAttribLocation(6313, a_coord);
+// 1 returned
+glUseProgram(6313);
+glEnableVertexAttribArray(0);
+glVertexAttribPointer(0, 4, GL_FLOAT, GL_FALSE, 0, 0x16d79dce8);
+glEnableVertexAttribArray(1);
+glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 0, 0x16d79dcc0);
+glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_SHORT, 0x16d79dcb0);
+glDisableVertexAttribArray(0);
+glDisableVertexAttribArray(1);
+glUseProgram(0);
+glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
+glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 354);
+glGetError();
+// GL_NO_ERROR returned
+glClearBufferfv(GL_COLOR, 0, 0x000000016d79de10);
+glBlitFramebuffer(-10, -15, 100, 63, 53, 29, 136, 144, GL_C
+=== dEQP-GLES3.functional.shaders.linkage.varying.struct.ivec3
+ERROR: expected shaders to compile and link properly, but failed to link.
+<Result StatusCode="Fail">expected shaders to compile and link properly, but failed to link.</Result>
+=== dEQP-GLES3.functional.shaders.linkage.varying.struct.mat3x4
+ERROR: expected shaders to compile and link properly, but failed to link.
+<Result StatusCode="Fail">expected shaders to compile and link properly, but failed to link.</Result>
+=== dEQP-GLES3.functional.texture.filtering.cube.combinations.linear_mipmap_linear_linear_repeat_clamp
+Coordinates: (-1.25, -1.2) -&gt; (1.2, 1.25)
+Face -X
+Face +X
+ERROR: Result verification failed, got 1 invalid pixels!
+Warning: Verification against high precision requirements failed, trying with lower requirements.
+Face -Y
+ERROR: Result verification failed, got 9 invalid pixels!
+Warning: Verification against high precision requirements failed, trying with lower requirements.
+Face +Y
+ERROR: Result verification failed, got 22 invalid pixels!
+Warning: Verification against high precision requirements failed, trying with lower requirements.
+Face -Z
+ERROR: Result verification failed, got 3 invalid pixels!
+Warning: Verification against high precision requirements failed, trying with lower requirements.
+Face +Z
+ERROR: Result verification failed, got 2 invalid pixels!
+Warning: Verification against high precision requirements failed, trying with lower requirements.
+Coordinates: (0.8, 0.8) -&gt; (1.25, 1.2)
+Face -X
+Face +X
+Face -Y
+Face +Y
+Face -Z
+Face +Z
+Coordinates: (-1.19, -1.3) -&gt; (1.1, 1.35)
+Face -X
+ERROR: Result verification failed, got 480 invalid pixels!
+Warning: Verification against high precision requirements failed, trying with lower requirements.
+ERROR: Result verification failed, got 364 invalid pixels!
+ERROR: Verification against low precision requirements failed, failing test case.
+Face +X
+ERROR: Result verification failed, got 625 invalid pixels!
+Warning: Verification against high precision requirements failed, trying with lower requirements.
+ERROR: Result verification failed, got 515 invalid pixels!
+ERROR: Verification against low precision requirements failed, failing test case.
+Face -Y
+ERROR: Result verification failed, got 597 invalid pixels!
+Warning: Verification against high precision requirements failed, trying with lower requirements.
+ERROR: Result verification failed, got 488 invalid pixels!
+ERROR: Verification against low precision requirements failed, failing test case.
+Face +Y
+ERROR: Result verification failed, got 610 invalid pixels!
+Warning: Verification against high precision requirements failed, trying with lower requirements.
+ERROR: Result verification failed, got 513 invalid pixels!
+ERROR: Verification against low precision requirements failed, failing test case.
+Face -Z
+ERROR: Result verification failed, got 623 invalid pixels!
+Warning: Verification against high precision requirements failed, trying with lower requirements.
+ERROR: Result verification failed, got 509 invalid pixels!
+ERROR: Verification against low precision requir
+=== dEQP-GLES3.functional.texture.filtering.cube.combinations.nearest_mipmap_nearest_linear_mirror_repeat
+Coordinates: (-1.25, -1.2) -&gt; (1.2, 1.25)
+Face -X
+ERROR: Result verification failed, got 2 invalid pixels!
+Warning: Verification against high precision requirements failed, trying with lower requirements.
+ERROR: Result verification failed, got 2 invalid pixels!
+ERROR: Verification against low precision requirements failed, failing test case.
+Face +X
+Face -Y
+Face +Y
+Face -Z
+ERROR: Result verification failed, got 1 invalid pixels!
+Warning: Verification against high precision requirements failed, trying with lower requirements.
+ERROR: Result verification failed, got 1 invalid pixels!
+ERROR: Verification against low precision requirements failed, failing test case.
+Face +Z
+ERROR: Result verification failed, got 1 invalid pixels!
+Warning: Verification against high precision requirements failed, trying with lower requirements.
+ERROR: Result verification failed, got 1 invalid pixels!
+ERROR: Verification against low precision requirements failed, failing test case.
+Coordinates: (0.8, 0.8) -&gt; (1.25, 1.2)
+Face -X
+Face +X
+Face -Y
+Face +Y
+Face -Z
+Face +Z
+Coordinates: (-1.19, -1.3) -&gt; (1.1, 1.35)
+Face -X
+Face +X
+Face -Y
+Face +Y
+Face -Z
+Face +Z
+Coordinates: (-1.2, -1.1) -&gt; (-0.8, -0.8)
+Face -X
+Face +X
+Face -Y
+Face +Y
+Face -Z
+Face +Z
+<Result StatusCode="Fail">Image verification failed</Result>
+=== dEQP-GLES3.functional.texture.filtering.cube.formats.rgb5_a1_linear_mipmap_linear
+Coordinates: (-1.25, -1.2) -&gt; (1.2, 1.25)
+Face -X
+ERROR: Result verification failed, got 4 invalid pixels!
+Warning: Verification against high precision requirements failed, trying with lower requirements.
+Face +X
+ERROR: Result verification failed, got 1 invalid pixels!
+Warning: Verification against high precision requirements failed, trying with lower requirements.
+Face -Y
+ERROR: Result verification failed, got 17 invalid pixels!
+Warning: Verification against high precision requirements failed, trying with lower requirements.
+ERROR: Result verification failed, got 4 invalid pixels!
+ERROR: Verification against low precision requirements failed, failing test case.
+Face +Y
+ERROR: Result verification failed, got 16 invalid pixels!
+Warning: Verification against high precision requirements failed, trying with lower requirements.
+ERROR: Result verification failed, got 5 invalid pixels!
+ERROR: Verification against low precision requirements failed, failing test case.
+Face -Z
+ERROR: Result verification failed, got 4 invalid pixels!
+Warning: Verification against high precision requirements failed, trying with lower requirements.
+Face +Z
+ERROR: Result verification failed, got 3 invalid pixels!
+Warning: Verification against high precision requirements failed, trying with lower requirements.
+Coordinates: (0.8, 0.8) -&gt; (1.25, 1.2)
+Face -X
+Face +X
+Face -Y
+Face +Y
+Face -Z
+Face +Z
+Coordinates: (-1.19, -1.3) -&gt; (1.1, 1.35)
+Face -X
+ERROR: Result verification failed, got 420 invalid pixels!
+Warning: Verification against high precision requirements failed, trying with lower requirements.
+ERROR: Result verification failed, got 350 invalid pixels!
+ERROR: Verification against low precision requirements failed, failing test case.
+Face +X
+ERROR: Result verification failed, got 571 invalid pixels!
+Warning: Verification against high precision requirements failed, trying with lower requirements.
+ERROR: Result verification failed, got 502 invalid pixels!
+ERROR: Verification against low precision requirements failed, failing test case.
+Face -Y
+ERROR: Result verification failed, got 568 invalid pixels!
+Warning: Verification against high precision requirements failed, trying with lower requirements.
+ERROR: Result verification failed, got 520 invalid pixels!
+ERROR: Verification against low precision requirements failed, failing test case.
+Face +Y
+ERROR: Result verification failed, got 572 invalid pixels!
+Warning: Verification against high precision requirements failed, trying with
+=== dEQP-GLES3.functional.texture.filtering.cube.sizes.63x63_nearest_mipmap_linear
+Coordinates: (-1.25, -1.2) -&gt; (1.2, 1.25)
+Face -X
+ERROR: Result verification failed, got 1 invalid pixels!
+Warning: Verification against high precision requirements failed, trying with lower requirements.
+ERROR: Result verification failed, got 1 invalid pixels!
+ERROR: Verification against low precision requirements failed, failing test case.
+Face +X
+Face -Y
+Face +Y
+ERROR: Result verification failed, got 1 invalid pixels!
+Warning: Verification against high precision requirements failed, trying with lower requirements.
+ERROR: Result verification failed, got 1 invalid pixels!
+ERROR: Verification against low precision requirements failed, failing test case.
+Face -Z
+ERROR: Result verification failed, got 1 invalid pixels!
+Warning: Verification against high precision requirements failed, trying with lower requirements.
+ERROR: Result verification failed, got 1 invalid pixels!
+ERROR: Verification against low precision requirements failed, failing test case.
+Face +Z
+ERROR: Result verification failed, got 1 invalid pixels!
+Warning: Verification against high precision requirements failed, trying with lower requirements.
+ERROR: Result verification failed, got 1 invalid pixels!
+ERROR: Verification against low precision requirements failed, failing test case.
+Coordinates: (0.8, 0.8) -&gt; (1.25, 1.2)
+Face -X
+Face +X
+Face -Y
+Face +Y
+Face -Z
+Face +Z
+Coordinates: (-1.19, -1.3) -&gt; (1.1, 1.35)
+Face -X
+Face +X
+Face -Y
+Face +Y
+Face -Z
+Face +Z
+Coordinates: (-1.2, -1.1) -&gt; (-0.8, -0.8)
+Face -X
+Face +X
+Face -Y
+Face +Y
+Face -Z
+Face +Z
+<Result StatusCode="Fail">Image verification failed</Result>
+=== dEQP-GLES3.functional.texture.format.sized.2d_array.depth24_stencil8_pot
+Image comparison failed: max difference = (0, 253, 253, 0), threshold = (2, 2, 2, 2)
+Image comparison failed: max difference = (0, 253, 253, 0), threshold = (2, 2, 2, 2)
+Image comparison failed: max difference = (0, 253, 253, 0), threshold = (2, 2, 2, 2)
+Image comparison failed: max difference = (0, 253, 253, 0), threshold = (2, 2, 2, 2)
+Image comparison failed: max difference = (0, 253, 253, 0), threshold = (2, 2, 2, 2)
+Image comparison failed: max difference = (0, 253, 253, 0), threshold = (2, 2, 2, 2)
+Image comparison failed: max difference = (0, 253, 253, 0), threshold = (2, 2, 2, 2)
+Image comparison failed: max difference = (0, 253, 253, 0), threshold = (2, 2, 2, 2)
+<Result StatusCode="Fail">Image comparison failed</Result>
+=== dEQP-GLES3.functional.texture.format.sized.cube.depth24_stencil8_pot
+Cube map texture, GL_DEPTH24_STENCIL8, 64x64,
+CUBEFACE_NEGATIVE_X
+u_sampler = 0
+u_colorScale = (1, 1, 1, 1)
+u_colorBias = (0, 0, 0, 0)
+Image comparison failed: max difference = (0, 253, 253, 0), threshold = (2, 2, 2, 2)
+CUBEFACE_POSITIVE_X
+Image comparison failed: max difference = (0, 253, 253, 0), threshold = (2, 2, 2, 2)
+CUBEFACE_NEGATIVE_Y
+Image comparison failed: max difference = (0, 253, 253, 0), threshold = (2, 2, 2, 2)
+CUBEFACE_POSITIVE_Y
+Image comparison failed: max difference = (0, 253, 253, 0), threshold = (2, 2, 2, 2)
+CUBEFACE_NEGATIVE_Z
+Image comparison failed: max difference = (0, 253, 253, 0), threshold = (2, 2, 2, 2)
+CUBEFACE_POSITIVE_Z
+Image comparison failed: max difference = (0, 253, 253, 0), threshold = (2, 2, 2, 2)
+<Result StatusCode="Fail">Image comparison failed</Result>
+=== dEQP-GLES3.functional.texture.format.sized.cube.depth32f_stencil8_npot
+Cube map texture, GL_DEPTH32F_STENCIL8, 57x57,
+CUBEFACE_NEGATIVE_X
+u_sampler = 0
+u_colorScale = (1, 1, 1, 1)
+u_colorBias = (0, 0, 0, 0)
+Image comparison failed: max difference = (0, 253, 253, 0), threshold = (2, 2, 2, 2)
+CUBEFACE_POSITIVE_X
+Image comparison failed: max difference = (0, 253, 253, 0), threshold = (2, 2, 2, 2)
+CUBEFACE_NEGATIVE_Y
+Image comparison failed: max difference = (0, 253, 253, 0), threshold = (2, 2, 2, 2)
+CUBEFACE_POSITIVE_Y
+Image comparison failed: max difference = (0, 253, 253, 0), threshold = (2, 2, 2, 2)
+CUBEFACE_NEGATIVE_Z
+Image comparison failed: max difference = (0, 253, 253, 0), threshold = (2, 2, 2, 2)
+CUBEFACE_POSITIVE_Z
+Image comparison failed: max difference = (0, 253, 253, 0), threshold = (2, 2, 2, 2)
+<Result StatusCode="Fail">Image comparison failed</Result>
+=== dEQP-GLES3.functional.texture.format.sized.cube.depth_component24_pot
+Cube map texture, GL_DEPTH_COMPONENT24, 64x64,
+CUBEFACE_NEGATIVE_X
+u_sampler = 0
+u_colorScale = (1, 1, 1, 1)
+u_colorBias = (0, 0, 0, 0)
+Image comparison failed: max difference = (0, 253, 253, 0), threshold = (2, 2, 2, 2)
+CUBEFACE_POSITIVE_X
+Image comparison failed: max difference = (0, 253, 253, 0), threshold = (2, 2, 2, 2)
+CUBEFACE_NEGATIVE_Y
+Image comparison failed: max difference = (0, 253, 253, 0), threshold = (2, 2, 2, 2)
+CUBEFACE_POSITIVE_Y
+Image comparison failed: max difference = (0, 253, 253, 0), threshold = (2, 2, 2, 2)
+CUBEFACE_NEGATIVE_Z
+Image comparison failed: max difference = (0, 253, 253, 0), threshold = (2, 2, 2, 2)
+CUBEFACE_POSITIVE_Z
+Image comparison failed: max difference = (0, 253, 253, 0), threshold = (2, 2, 2, 2)
+<Result StatusCode="Fail">Image comparison failed</Result>
+=== dEQP-GLES3.functional.texture.mipmap.2d.projected.nearest_linear_clamp
+ERROR: Image verification failed, found 31 invalid pixels!
+<Result StatusCode="Fail">Image verification failed</Result>
+=== dEQP-GLES3.functional.texture.specification.teximage2d_depth.depth32f_stencil8
+glClearColor(0.125, 0.25, 0.5, 1);
+glClear(GL_DEPTH_BUFFER_BIT|GL_STENCIL_BUFFER_BIT|GL_COLOR_BUFFER_BIT);
+glGenTextures(1, 0x000000016d79decc);
+// textures = { 3858 }
+glBindTexture(GL_TEXTURE_2D, 3858);
+glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+glGetError();
+// GL_NO_ERROR returned
+glTexImage2D(GL_TEXTURE_2D, 0, GL_DEPTH32F_STENCIL8, 64, 128, 0, GL_DEPTH_STENCIL, GL_FLOAT_32_UNSIGNED_INT_24_8_REV, 0x8aa8cc010);
+glTexImage2D(GL_TEXTURE_2D, 1, GL_DEPTH32F_STENCIL8, 32, 64, 0, GL_DEPTH_STENCIL, GL_FLOAT_32_UNSIGNED_INT_24_8_REV, 0x8aae54010);
+glTexImage2D(GL_TEXTURE_2D, 2, GL_DEPTH32F_STENCIL8, 16, 32, 0, GL_DEPTH_STENCIL, GL_FLOAT_32_UNSIGNED_INT_24_8_REV, 0x8ab1d0010);
+glTexImage2D(GL_TEXTURE_2D, 3, GL_DEPTH32F_STENCIL8, 8, 16, 0, GL_DEPTH_STENCIL, GL_FLOAT_32_UNSIGNED_INT_24_8_REV, 0x8ab270010);
+glTexImage2D(GL_TEXTURE_2D, 4, GL_DEPTH32F_STENCIL8, 4, 8, 0, GL_DEPTH_STENCIL, GL_FLOAT_32_UNSIGNED_INT_24_8_REV, 0x8aad89a50);
+glTexImage2D(GL_TEXTURE_2D, 5, GL_DEPTH32F_STENCIL8, 2, 4, 0, GL_DEPTH_STENCIL, GL_FLOAT_32_UNSIGNED_INT_24_8_REV, 0x8aac3a950);
+glTexImage2D(GL_TEXTURE_2D, 6, GL_DEPTH32F_STENCIL8, 1, 2, 0, GL_DEPTH_STENCIL, GL_FLOAT_32_UNSIGNED_INT_24_8_REV, 0x8aad6f880);
+glTexImage2D(GL_TEXTURE_2D, 7, GL_DEPTH32F_STENCIL8, 1, 1, 0, GL_DEPTH_STENCIL, GL_FLOAT_32_UNSIGNED_INT_24_8_REV, 0x8ab0d5230);
+glGetError();
+// GL_NO_ERROR returned
+Image comparison failed: max difference = (64, 255, 255, 0), threshold = (2, 2, 2, 2)
+<Result StatusCode="Fail">Image comparison failed</Result>
+=== dEQP-GLES3.functional.texture.specification.teximage2d_depth_pbo.depth_component16
+glClearColor(0.125, 0.25, 0.5, 1);
+glClear(GL_DEPTH_BUFFER_BIT|GL_STENCIL_BUFFER_BIT|GL_COLOR_BUFFER_BIT);
+glGenBuffers(1, 0x000000016d79dedc);
+// buffers = { 3867 }
+glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 3867);
+glBufferData(GL_PIXEL_UNPACK_BUFFER, 16384, 0x8ab214000, GL_STATIC_DRAW);
+glPixelStorei(GL_UNPACK_ROW_LENGTH, 64);
+glPixelStorei(GL_UNPACK_SKIP_ROWS, 0);
+glPixelStorei(GL_UNPACK_SKIP_PIXELS, 0);
+glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+glGenTextures(1, 0x000000016d79ded8);
+// textures = { 3868 }
+glBindTexture(GL_TEXTURE_2D, 3868);
+glTexImage2D(GL_TEXTURE_2D, 0, GL_DEPTH_COMPONENT16, 64, 128, 0, GL_DEPTH_COMPONENT, GL_UNSIGNED_SHORT, 0);
+glDeleteBuffers(1, { 3867 });
+glGetError();
+// GL_NO_ERROR returned
+Image comparison failed: max difference = (0, 255, 255, 0), threshold = (2, 2, 2, 2)
+<Result StatusCode="Fail">Image comparison failed</Result>
+=== dEQP-GLES3.functional.texture.specification.teximage2d_depth_pbo.depth_component32f
+glClearColor(0.125, 0.25, 0.5, 1);
+glClear(GL_DEPTH_BUFFER_BIT|GL_STENCIL_BUFFER_BIT|GL_COLOR_BUFFER_BIT);
+glGenBuffers(1, 0x000000016d79dedc);
+// buffers = { 3862 }
+glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 3862);
+glBufferData(GL_PIXEL_UNPACK_BUFFER, 32768, 0x8a98f4000, GL_STATIC_DRAW);
+glPixelStorei(GL_UNPACK_ROW_LENGTH, 64);
+glPixelStorei(GL_UNPACK_SKIP_ROWS, 0);
+glPixelStorei(GL_UNPACK_SKIP_PIXELS, 0);
+glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+glGenTextures(1, 0x000000016d79ded8);
+// textures = { 3863 }
+glBindTexture(GL_TEXTURE_2D, 3863);
+glTexImage2D(GL_TEXTURE_2D, 0, GL_DEPTH_COMPONENT32F, 64, 128, 0, GL_DEPTH_COMPONENT, GL_FLOAT, 0);
+glDeleteBuffers(1, { 3862 });
+glGetError();
+// GL_NO_ERROR returned
+Image comparison failed: max difference = (64, 255, 255, 0), threshold = (2, 2, 2, 2)
+<Result StatusCode="Fail">Image comparison failed</Result>
+=== dEQP-GLES3.functional.texture.specification.teximage3d_depth_pbo.depth_component24_2d_array
+glClearColor(0.125, 0.25, 0.5, 1);
+glClear(GL_DEPTH_BUFFER_BIT|GL_STENCIL_BUFFER_BIT|GL_COLOR_BUFFER_BIT);
+glGenBuffers(1, 0x000000016d79ded8);
+// buffers = { 4084 }
+glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 4084);
+glBufferData(GL_PIXEL_UNPACK_BUFFER, 65536, 0x8aa8b0000, GL_STATIC_DRAW);
+glPixelStorei(GL_UNPACK_IMAGE_HEIGHT, 64);
+glPixelStorei(GL_UNPACK_ROW_LENGTH, 32);
+glPixelStorei(GL_UNPACK_SKIP_IMAGES, 0);
+glPixelStorei(GL_UNPACK_SKIP_ROWS, 0);
+glPixelStorei(GL_UNPACK_SKIP_PIXELS, 0);
+glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+glGenTextures(1, 0x000000016d79dedc);
+// textures = { 4085 }
+glBindTexture(GL_TEXTURE_2D_ARRAY, 4085);
+glTexImage3D(GL_TEXTURE_2D_ARRAY, 0, GL_DEPTH_COMPONENT24, 32, 64, 8, 0, GL_DEPTH_COMPONENT, GL_UNSIGNED_INT, 0);
+glDeleteBuffers(1, { 4084 });
+glGetError();
+// GL_NO_ERROR returned
+Image comparison failed: max difference = (0, 255, 255, 0), threshold = (2, 2, 2, 2)
+<Result StatusCode="Fail">Image comparison failed</Result>
+=== dEQP-GLES3.functional.texture.specification.texstorage2d.format.depth_component24_2d
+glClearColor(0.125, 0.25, 0.5, 1);
+glClear(GL_DEPTH_BUFFER_BIT|GL_STENCIL_BUFFER_BIT|GL_COLOR_BUFFER_BIT);
+glGenTextures(1, 0x000000016d79de9c);
+// textures = { 4190 }
+glBindTexture(GL_TEXTURE_2D, 4190);
+glTexStorage2D(GL_TEXTURE_2D, 7, GL_DEPTH_COMPONENT24, 117, 97);
+glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 117, 97, GL_DEPTH_COMPONENT, GL_UNSIGNED_INT, 0x8aa8cc010);
+glTexSubImage2D(GL_TEXTURE_2D, 1, 0, 0, 58, 48, GL_DEPTH_COMPONENT, GL_UNSIGNED_INT, 0x8ab1f0010);
+glTexSubImage2D(GL_TEXTURE_2D, 2, 0, 0, 29, 24, GL_DEPTH_COMPONENT, GL_UNSIGNED_INT, 0x8aac2f010);
+glTexSubImage2D(GL_TEXTURE_2D, 3, 0, 0, 14, 12, GL_DEPTH_COMPONENT, GL_UNSIGNED_INT, 0x8aa444010);
+glTexSubImage2D(GL_TEXTURE_2D, 4, 0, 0, 7, 6, GL_DEPTH_COMPONENT, GL_UNSIGNED_INT, 0x8ab0bd450);
+glTexSubImage2D(GL_TEXTURE_2D, 5, 0, 0, 3, 3, GL_DEPTH_COMPONENT, GL_UNSIGNED_INT, 0x8ab578310);
+glTexSubImage2D(GL_TEXTURE_2D, 6, 0, 0, 1, 1, GL_DEPTH_COMPONENT, GL_UNSIGNED_INT, 0x8ab0d46f0);
+glGetError();
+// GL_NO_ERROR returned
+Image comparison failed: max difference = (0, 235, 235, 0), threshold = (2, 2, 2, 2)
+<Result StatusCode="Fail">Image comparison failed</Result>
+=== dEQP-GLES3.functional.texture.specification.texstorage2d.format.depth_component24_cube
+glClearColor(0.125, 0.25, 0.5, 1);
+glClear(GL_DEPTH_BUFFER_BIT|GL_STENCIL_BUFFER_BIT|GL_COLOR_BUFFER_BIT);
+glGenTextures(1, 0x000000016d79de8c);
+// textures = { 4194 }
+glBindTexture(GL_TEXTURE_CUBE_MAP, 4194);
+glTexStorage2D(GL_TEXTURE_CUBE_MAP, 6, GL_DEPTH_COMPONENT24, 57, 57);
+glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+glTexSubImage2D(GL_TEXTURE_CUBE_MAP_NEGATIVE_X, 0, 0, 0, 57, 57, GL_DEPTH_COMPONENT, GL_UNSIGNED_INT, 0x8ab1b0010);
+glTexSubImage2D(GL_TEXTURE_CUBE_MAP_POSITIVE_X, 0, 0, 0, 57, 57, GL_DEPTH_COMPONENT, GL_UNSIGNED_INT, 0x8ab1b0010);
+glTexSubImage2D(GL_TEXTURE_CUBE_MAP_NEGATIVE_Y, 0, 0, 0, 57, 57, GL_DEPTH_COMPONENT, GL_UNSIGNED_INT, 0x8ab1b0010);
+glTexSubImage2D(GL_TEXTURE_CUBE_MAP_POSITIVE_Y, 0, 0, 0, 57, 57, GL_DEPTH_COMPONENT, GL_UNSIGNED_INT, 0x8ab1b0010);
+glTexSubImage2D(GL_TEXTURE_CUBE_MAP_NEGATIVE_Z, 0, 0, 0, 57, 57, GL_DEPTH_COMPONENT, GL_UNSIGNED_INT, 0x8ab1b0010);
+glTexSubImage2D(GL_TEXTURE_CUBE_MAP_POSITIVE_Z, 0, 0, 0, 57, 57, GL_DEPTH_COMPONENT, GL_UNSIGNED_INT, 0x8ab1b0010);
+glTexSubImage2D(GL_TEXTURE_CUBE_MAP_NEGATIVE_X, 1, 0, 0, 28, 28, GL_DEPTH_COMPONENT, GL_UNSIGNED_INT, 0x8ab2f8010);
+glTexSubImage2D(GL_TEXTURE_CUBE_MAP_POSITIVE_X, 1, 0, 0, 28, 28, GL_DEPTH_COMPONENT, GL_UNSIGNED_INT, 0x8ab2f8010);
+glTexSubImage2D(GL_TEXTURE_CUBE_MAP_NEGATIVE_Y, 1, 0, 0, 28, 28, GL_DEPTH_COMPONENT, GL_UNSIGNED_INT, 0x8ab2f8010);
+glTexSubImage2D(GL_TEXTURE_CUBE_MAP_POSITIVE_Y, 1, 0, 0, 28, 28, GL_DEPTH_COMPONENT, GL_UNSIGNED_INT, 0x8ab2f8010);
+glTexSubImage2D(GL_TEXTURE_CUBE_MAP_NEGATIVE_Z, 1, 0, 0, 28, 28, GL_DEPTH_COMPONENT, GL_UNSIGNED_INT, 0x8ab2f8010);
+glTexSubImage2D(GL_TEXTURE_CUBE_MAP_POSITIVE_Z, 1, 0, 0, 28, 28, GL_DEPTH_COMPONENT, GL_UNSIGNED_INT, 0x8ab2f8010);
+glTexSubImage2D(GL_TEXTURE_CUBE_MAP_NEGATIVE_X, 2, 0, 0, 14, 14, GL_DEPTH_COMPONENT, GL_UNSIGNED_INT, 0x8aa5bc010);
+glTexSubImage2D(GL_TEXTURE_CUBE_MAP_POSITIVE_X, 2, 0, 0, 14, 14, GL_DEPTH_COMPONENT, GL_UNSIGNED_INT, 0x8aa5bc010);
+glTexSubImage2D(GL_TEXTURE_CUBE_MAP_NEGATIVE_Y, 2, 0, 0, 14, 14, GL_DEPTH_COMPONENT, GL_UNSIGNED_INT, 0x8aa5bc010);
+glTexSubImage2D(GL_TEXTURE_CUBE_MAP_POSITIVE_Y, 2, 0, 0, 14, 14, GL_DEPTH_COMPONENT, GL_UNSIGNED_INT, 0x8aa5bc010);
+glTexSubImage2D(GL_TEXTURE_CUBE_MAP_NEGATIVE_Z, 2, 0, 0, 14, 14, GL_DEPTH_COMPONENT, GL_UNSIGNED_INT, 0x8aa5bc010);
+glTexSubImage2D(GL_TEXTURE_CUBE_MAP_POSITIVE_Z, 2, 0, 0, 14, 14, GL_DEPTH_COMPONENT, GL_UNSIGNED_INT, 0x8aa5bc010);
+glTexSubImage2D(GL_TEXTURE_CUBE_MAP_NEGATIVE_X, 3, 0, 0, 7, 7, GL_DEPTH_COMPONENT, GL_UNSIGNE
+=== dEQP-GLES3.functional.texture.specification.texsubimage2d_depth.depth_component16
+glClearColor(0.125, 0.25, 0.5, 1);
+glClear(GL_DEPTH_BUFFER_BIT|GL_STENCIL_BUFFER_BIT|GL_COLOR_BUFFER_BIT);
+glGenTextures(1, 0x000000016d79deb4);
+// textures = { 3968 }
+glBindTexture(GL_TEXTURE_2D, 3968);
+glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+glGetError();
+// GL_NO_ERROR returned
+glTexImage2D(GL_TEXTURE_2D, 0, GL_DEPTH_COMPONENT16, 64, 32, 0, GL_DEPTH_COMPONENT, GL_UNSIGNED_SHORT, 0x8ab1d0010);
+glTexImage2D(GL_TEXTURE_2D, 1, GL_DEPTH_COMPONENT16, 32, 16, 0, GL_DEPTH_COMPONENT, GL_UNSIGNED_SHORT, 0x8ab270010);
+glTexImage2D(GL_TEXTURE_2D, 2, GL_DEPTH_COMPONENT16, 16, 8, 0, GL_DEPTH_COMPONENT, GL_UNSIGNED_SHORT, 0x8aad89550);
+glTexImage2D(GL_TEXTURE_2D, 3, GL_DEPTH_COMPONENT16, 8, 4, 0, GL_DEPTH_COMPONENT, GL_UNSIGNED_SHORT, 0x8aac3a950);
+glTexImage2D(GL_TEXTURE_2D, 4, GL_DEPTH_COMPONENT16, 4, 2, 0, GL_DEPTH_COMPONENT, GL_UNSIGNED_SHORT, 0x8a9934640);
+glTexImage2D(GL_TEXTURE_2D, 5, GL_DEPTH_COMPONENT16, 2, 1, 0, GL_DEPTH_COMPONENT, GL_UNSIGNED_SHORT, 0x8ab0d52f0);
+glTexImage2D(GL_TEXTURE_2D, 6, GL_DEPTH_COMPONENT16, 1, 1, 0, GL_DEPTH_COMPONENT, GL_UNSIGNED_SHORT, 0x8ab0d4750);
+glTexSubImage2D(GL_TEXTURE_2D, 0, 10, 1, 15, 12, GL_DEPTH_COMPONENT, GL_UNSIGNED_SHORT, 0x8ab0ba590);
+glTexSubImage2D(GL_TEXTURE_2D, 1, 20, 4, 9, 12, GL_DEPTH_COMPONENT, GL_UNSIGNED_SHORT, 0x8aa67d010);
+glTexSubImage2D(GL_TEXTURE_2D, 2, 4, 1, 12, 6, GL_DEPTH_COMPONENT, GL_UNSIGNED_SHORT, 0x8ab8ca410);
+glTexSubImage2D(GL_TEXTURE_2D, 3, 1, 0, 6, 4, GL_DEPTH_COMPONENT, GL_UNSIGNED_SHORT, 0x8ab169730);
+glTexSubImage2D(GL_TEXTURE_2D, 4, 1, 1, 2, 1, GL_DEPTH_COMPONENT, GL_UNSIGNED_SHORT, 0x8ab0d4750);
+glTexSubImage2D(GL_TEXTURE_2D, 5, 0, 0, 2, 1, GL_DEPTH_COMPONENT, GL_UNSIGNED_SHORT, 0x8ab0d52f0);
+glTexSubImage2D(GL_TEXTURE_2D, 6, 0, 0, 1, 1, GL_DEPTH_COMPONENT, GL_UNSIGNED_SHORT, 0x8ab0d4750);
+glGetError();
+// GL_NO_ERROR returned
+Image comparison failed: max difference = (0, 255, 255, 0), threshold = (2, 2, 2, 2)
+<Result StatusCode="Fail">Image comparison failed</Result>

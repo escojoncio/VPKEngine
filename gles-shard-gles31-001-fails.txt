@@ -1,0 +1,659 @@
+=== dEQP-GLES31.functional.image_load_store.3d.format_reinterpret.r32i_rgba8_snorm
+// Created 2 textures (names 2401 and 2402)
+glActiveTexture(GL_TEXTURE0);
+glBindTexture(GL_TEXTURE_3D, 2401);
+glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+// Filling texture 2401 with xor pattern
+glTexStorage3D(GL_TEXTURE_3D, 1, GL_R32I, 64, 64, 8);
+glPixelStorei(GL_UNPACK_ALIGNMENT, 8);
+glTexSubImage3D(GL_TEXTURE_3D, 0, 0, 0, 0, 64, 64, 8, GL_RED_INTEGER, GL_INT, 0x96a8c4010);
+glActiveTexture(GL_TEXTURE1);
+glBindTexture(GL_TEXTURE_3D, 2402);
+glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+glTexStorage3D(GL_TEXTURE_3D, 1, GL_R32I, 64, 64, 8);
+glUseProgram(2403);
+glBindImageTexture(0, 2401, 0, GL_TRUE, 0, GL_READ_ONLY, GL_RGBA8_SNORM);
+glBindImageTexture(1, 2402, 0, GL_TRUE, 0, GL_WRITE_ONLY, GL_RGBA8_SNORM);
+glDispatchCompute(64, 64, 8);
+glBindFramebuffer(GL_FRAMEBUFFER, 61);
+glMemoryBarrier(GL_FRAMEBUFFER_BARRIER_BIT);
+glActiveTexture(GL_TEXTURE0);
+glBindTexture(GL_TEXTURE_3D, 2402);
+glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+glFramebufferTextureLayer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, 2402, 0, 0);
+glCheckFramebufferStatus(GL_FRAMEBUFFER);
+// GL_FRAMEBUFFER_COMPLETE returned
+glReadPixels(0, 0, 64, 64, GL_RGBA_INTEGER, GL_INT, 0x96aa04000);
+glFramebufferTextureLayer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, 2402, 0, 1);
+glCheckFramebufferStatus(GL_FRAMEBUFFER);
+// GL_FRAMEBUFFER_COMPLETE returned
+glReadPixels(0, 0, 64, 64, GL_RGBA_INTEGER, GL_INT, 0x96a944000);
+Result and reference images are normalized with formula p * (0.015873, 1, 1, 1) + (0, 0, 0, 0)
+Image comparison failed: max difference = (1, 0, 0, 0), threshold = (0, 0, 0, 0)
+<Result StatusCode="Fail">Image comparison failed</Result>
+=== dEQP-GLES31.functional.image_load_store.3d.format_reinterpret.rgba16ui_rgba16i
+// Created 2 textures (names 2389 and 2390)
+glActiveTexture(GL_TEXTURE0);
+glBindTexture(GL_TEXTURE_3D, 2389);
+glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+// Filling texture 2389 with xor pattern
+glTexStorage3D(GL_TEXTURE_3D, 1, GL_RGBA16UI, 64, 64, 8);
+glPixelStorei(GL_UNPACK_ALIGNMENT, 8);
+glTexSubImage3D(GL_TEXTURE_3D, 0, 0, 0, 0, 64, 64, 8, GL_RGBA_INTEGER, GL_UNSIGNED_SHORT, 0x96a944010);
+glActiveTexture(GL_TEXTURE1);
+glBindTexture(GL_TEXTURE_3D, 2390);
+glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+glTexStorage3D(GL_TEXTURE_3D, 1, GL_RGBA16UI, 64, 64, 8);
+glUseProgram(2391);
+glBindImageTexture(0, 2389, 0, GL_TRUE, 0, GL_READ_ONLY, GL_RGBA16I);
+glBindImageTexture(1, 2390, 0, GL_TRUE, 0, GL_WRITE_ONLY, GL_RGBA16I);
+glDispatchCompute(64, 64, 8);
+glBindFramebuffer(GL_FRAMEBUFFER, 59);
+glMemoryBarrier(GL_FRAMEBUFFER_BARRIER_BIT);
+glActiveTexture(GL_TEXTURE0);
+glBindTexture(GL_TEXTURE_3D, 2390);
+glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+glFramebufferTextureLayer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, 2390, 0, 0);
+glCheckFramebufferStatus(GL_FRAMEBUFFER);
+// GL_FRAMEBUFFER_COMPLETE returned
+glReadPixels(0, 0, 64, 64, GL_RGBA_INTEGER, GL_UNSIGNED_INT, 0x96a8d4000);
+glFramebufferTextureLayer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, 2390, 0, 1);
+glCheckFramebufferStatus(GL_FRAMEBUFFER);
+// GL_FRAMEBUFFER_COMPLETE returned
+glReadPixels(0, 0, 64, 64, GL_RGBA_INTEGER, GL_UNSIGNED_INT, 0x96a8c4000);
+Result and reference images are normalized with formula p * (0.015873, 0.015873, 0.015873, 0.015873) + (0, 0, 0, 0)
+Image comparison failed: max difference = (1, 1, 1, 1), threshold = (0, 0, 0, 0)
+<Result StatusCode="Fail">Image comparison failed</Result>
+=== dEQP-GLES31.functional.image_load_store.3d.format_reinterpret.rgba8i_r32ui
+// Created 2 textures (names 2395 and 2396)
+glActiveTexture(GL_TEXTURE0);
+glBindTexture(GL_TEXTURE_3D, 2395);
+glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+// Filling texture 2395 with xor pattern
+glTexStorage3D(GL_TEXTURE_3D, 1, GL_RGBA8I, 64, 64, 8);
+glPixelStorei(GL_UNPACK_ALIGNMENT, 8);
+glTexSubImage3D(GL_TEXTURE_3D, 0, 0, 0, 0, 64, 64, 8, GL_RGBA_INTEGER, GL_BYTE, 0x96a8c4010);
+glActiveTexture(GL_TEXTURE1);
+glBindTexture(GL_TEXTURE_3D, 2396);
+glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+glTexStorage3D(GL_TEXTURE_3D, 1, GL_RGBA8I, 64, 64, 8);
+glUseProgram(2397);
+glBindImageTexture(0, 2395, 0, GL_TRUE, 0, GL_READ_ONLY, GL_R32UI);
+glBindImageTexture(1, 2396, 0, GL_TRUE, 0, GL_WRITE_ONLY, GL_R32UI);
+glDispatchCompute(64, 64, 8);
+glBindFramebuffer(GL_FRAMEBUFFER, 60);
+glMemoryBarrier(GL_FRAMEBUFFER_BARRIER_BIT);
+glActiveTexture(GL_TEXTURE0);
+glBindTexture(GL_TEXTURE_3D, 2396);
+glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+glFramebufferTextureLayer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, 2396, 0, 0);
+glCheckFramebufferStatus(GL_FRAMEBUFFER);
+// GL_FRAMEBUFFER_COMPLETE returned
+glReadPixels(0, 0, 64, 64, GL_RGBA_INTEGER, GL_INT, 0x96a9c4000);
+glFramebufferTextureLayer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, 2396, 0, 1);
+glCheckFramebufferStatus(GL_FRAMEBUFFER);
+// GL_FRAMEBUFFER_COMPLETE returned
+glReadPixels(0, 0, 64, 64, GL_RGBA_INTEGER, GL_INT, 0x96a944000);
+Result and reference images are normalized with formula p * (0.015873, 0.015873, 0.015873, 0.015873) + (0, 0, 0, 0)
+Image comparison failed: max difference = (1, 1, 1, 1), threshold = (0, 0, 0, 0)
+<Result StatusCode="Fail">Image comparison failed</Result>
+=== dEQP-GLES31.functional.image_load_store.3d.store.rgba32i_single_layer
+// Created a texture (name 2359)
+glActiveTexture(GL_TEXTURE0);
+glBindTexture(GL_TEXTURE_3D, 2359);
+glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+glTexStorage3D(GL_TEXTURE_3D, 1, GL_RGBA32I, 64, 64, 8);
+glUseProgram(2360);
+// Assigning to uniform u_layerNdx: 0
+glBindImageTexture(0, 2359, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA32I);
+glDispatchCompute(64, 64, 1);
+glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT);
+// Assigning to uniform u_layerNdx: 1
+glBindImageTexture(0, 2359, 0, GL_FALSE, 1, GL_WRITE_ONLY, GL_RGBA32I);
+glDispatchCompute(64, 64, 1);
+glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT);
+// Assigning to uniform u_layerNdx: 2
+glBindImageTexture(0, 2359, 0, GL_FALSE, 2, GL_WRITE_ONLY, GL_RGBA32I);
+glDispatchCompute(64, 64, 1);
+glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT);
+// Assigning to uniform u_layerNdx: 3
+glBindImageTexture(0, 2359, 0, GL_FALSE, 3, GL_WRITE_ONLY, GL_RGBA32I);
+glDispatchCompute(64, 64, 1);
+glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT);
+// Assigning to uniform u_layerNdx: 4
+glBindImageTexture(0, 2359, 0, GL_FALSE, 4, GL_WRITE_ONLY, GL_RGBA32I);
+glDispatchCompute(64, 64, 1);
+glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT);
+// Assigning to uniform u_layerNdx: 5
+glBindImageTexture(0, 2359, 0, GL_FALSE, 5, GL_WRITE_ONLY, GL_RGBA32I);
+glDispatchCompute(64, 64, 1);
+glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT);
+// Assigning to uniform u_layerNdx: 6
+glBindImageTexture(0, 2359, 0, GL_FALSE, 6, GL_WRITE_ONLY, GL_RGBA32I);
+glDispatchCompute(64, 64, 1);
+glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT);
+// Assigning to uniform u_layerNdx: 7
+glBindImageTexture(0, 2359, 0, GL_FALSE, 7, GL_WRITE_ONLY, GL_RGBA32I);
+glDispatchCompute(64, 64, 1);
+glBindFramebuffer(GL_FRAMEBUFFER, 58);
+glMemoryBarrier(GL_FRAMEBUFFER_BARRIER_BIT);
+glActiveTexture(GL_TEXTURE0);
+glBindTexture(GL_TEXTURE_3D, 2359);
+glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+glFramebufferTextureLayer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, 2359, 0, 0);
+glCheckFramebufferStatus(GL_FRAMEBUFFER);
+// GL_FRAMEBUFFER_COMPLETE returned
+glReadPixels(0, 0, 64, 64, GL_RGBA_INTEGER, GL_INT, 0x96a8c4000);
+glFramebufferTextureLayer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, 2359, 0, 1);
+glCheckFramebufferStatus(GL_FRAMEBUFFER);
+// GL_FRAMEBUFFER_COMPLETE returned
+glReadPixels(0, 0, 64, 64, GL_RGBA_INTE
+=== dEQP-GLES31.functional.image_load_store.buffer.format_reinterpret.rgba32f_rgba32ui
+// Created 2 textures (names 2474 and 2475)
+// Created buffers for the textures (names 2472 and 2473)
+glActiveTexture(GL_TEXTURE0);
+glBindTexture(GL_TEXTURE_BUFFER, 2474);
+// Filling texture 2474 with xor pattern
+glBindBuffer(GL_TEXTURE_BUFFER, 2472);
+glBufferData(GL_TEXTURE_BUFFER, 1024, 0, GL_STATIC_DRAW);
+glTexBuffer(GL_TEXTURE_BUFFER, GL_RGBA32F, 2472);
+glPixelStorei(GL_UNPACK_ALIGNMENT, 8);
+glBindBuffer(GL_TEXTURE_BUFFER, 2472);
+glBufferData(GL_TEXTURE_BUFFER, 1024, 0x96d156810, GL_STATIC_DRAW);
+glActiveTexture(GL_TEXTURE1);
+glBindTexture(GL_TEXTURE_BUFFER, 2475);
+glBindBuffer(GL_TEXTURE_BUFFER, 2473);
+glBufferData(GL_TEXTURE_BUFFER, 1024, 0, GL_STATIC_DRAW);
+glTexBuffer(GL_TEXTURE_BUFFER, GL_RGBA32F, 2473);
+glUseProgram(2476);
+glBindImageTexture(0, 2474, 0, GL_TRUE, 0, GL_READ_ONLY, GL_RGBA32UI);
+glBindImageTexture(1, 2475, 0, GL_TRUE, 0, GL_WRITE_ONLY, GL_RGBA32UI);
+glDispatchCompute(64, 1, 1);
+glBindBuffer(GL_TEXTURE_BUFFER, 2473);
+Result and reference images are normalized with formula p * (0.015873, 0.016129, 0.015873, 0.016129) + (-0, 0, -0, 0)
+Image comparison failed: max difference = (63, 63, 63, 63), threshold = (0.01, 0.01, 0.01, 0.01)
+<Result StatusCode="Fail">Image comparison failed</Result>
+=== dEQP-GLES31.functional.image_load_store.buffer.format_reinterpret.rgba8_rgba8ui
+// Created 2 textures (names 2492 and 2493)
+// Created buffers for the textures (names 2490 and 2491)
+glActiveTexture(GL_TEXTURE0);
+glBindTexture(GL_TEXTURE_BUFFER, 2492);
+// Filling texture 2492 with xor pattern
+glBindBuffer(GL_TEXTURE_BUFFER, 2490);
+glBufferData(GL_TEXTURE_BUFFER, 256, 0, GL_STATIC_DRAW);
+glTexBuffer(GL_TEXTURE_BUFFER, GL_RGBA8, 2490);
+glPixelStorei(GL_UNPACK_ALIGNMENT, 8);
+glBindBuffer(GL_TEXTURE_BUFFER, 2490);
+glBufferData(GL_TEXTURE_BUFFER, 256, 0x96cf88010, GL_STATIC_DRAW);
+glActiveTexture(GL_TEXTURE1);
+glBindTexture(GL_TEXTURE_BUFFER, 2493);
+glBindBuffer(GL_TEXTURE_BUFFER, 2491);
+glBufferData(GL_TEXTURE_BUFFER, 256, 0, GL_STATIC_DRAW);
+glTexBuffer(GL_TEXTURE_BUFFER, GL_RGBA8, 2491);
+glUseProgram(2494);
+glBindImageTexture(0, 2492, 0, GL_TRUE, 0, GL_READ_ONLY, GL_RGBA8UI);
+glBindImageTexture(1, 2493, 0, GL_TRUE, 0, GL_WRITE_ONLY, GL_RGBA8UI);
+glDispatchCompute(64, 1, 1);
+glBindBuffer(GL_TEXTURE_BUFFER, 2491);
+Image comparison failed: max difference = (0.984314, 0.984314, 0.984314, 0.984314), threshold = (0.01, 0.01, 0.01, 0.01)
+<Result StatusCode="Fail">Image comparison failed</Result>
+=== dEQP-GLES31.functional.program_interface_query.program_input.type.separable_fragment.array.vec4
+Querying properties of vec4 in variable.
+getProgramResourceIndex returned GL_INVALID_INDEX for &quot;target[0]&quot;
+<Result StatusCode="Fail">could not find target resource</Result>
+=== dEQP-GLES31.functional.program_interface_query.program_input.type.separable_fragment.basic_type.uvec2
+Querying properties of uvec2 in variable.
+getProgramResourceIndex returned GL_INVALID_INDEX for &quot;target&quot;
+<Result StatusCode="Fail">could not find target resource</Result>
+=== dEQP-GLES31.functional.program_interface_query.program_output.array_size.separable_vertex.var_struct
+Querying properties of vec4 out variable.
+getProgramResourceIndex returned GL_INVALID_INDEX for &quot;target.target&quot;
+getProgramResourceIndex returned GL_INVALID_INDEX for &quot;gl_Position&quot;
+<Result StatusCode="Fail">could not find target resource</Result>
+=== dEQP-GLES31.functional.program_interface_query.program_output.resource_list.separable_vertex.var_struct
+Querying GL_PROGRAM_OUTPUT interface:
+GL_ACTIVE_RESOURCES = 0
+Querying all active resources
+GL returned resources:
+Expected list of resources:
+0: target.target
+1: gl_Position
+Verifying resource list contents.
+Error, resource list did not contain active resource target.target
+Error, resource list did not contain active resource gl_Position
+Verifying GetProgramResourceIndex returns correct indices for resource names.
+Error, for active resource &quot;target.target&quot; got index GL_INVALID_INDEX.
+Error, for active resource &quot;gl_Position&quot; got index GL_INVALID_INDEX.
+Verifying MAX_NAME_LENGTH, expecting 0 (i.e. consistent with the queried resource list)
+<Result StatusCode="Fail">GetProgramResourceIndex returned unexpected values</Result>
+=== dEQP-GLES31.functional.program_interface_query.program_output.type.separable_vertex.struct.mat2x4
+Querying properties of mat2x4 out variable.
+getProgramResourceIndex returned GL_INVALID_INDEX for &quot;target.target&quot;
+getProgramResourceIndex returned GL_INVALID_INDEX for &quot;gl_Position&quot;
+<Result StatusCode="Fail">could not find target resource</Result>
+=== dEQP-GLES31.functional.program_interface_query.program_output.type.separable_vertex.struct.vec4
+Querying properties of vec4 out variable.
+getProgramResourceIndex returned GL_INVALID_INDEX for &quot;target.target&quot;
+getProgramResourceIndex returned GL_INVALID_INDEX for &quot;gl_Position&quot;
+<Result StatusCode="Fail">could not find target resource</Result>
+=== dEQP-GLES31.functional.program_interface_query.transform_feedback_varying.type.vertex_fragment.array.mat4x3
+Querying properties of mat4x3 out variable.
+Transform feedback varyings: {&quot;target[0]&quot;}
+getProgramResourceIndex returned GL_INVALID_INDEX for &quot;target[0]&quot;
+<Result StatusCode="Fail">could not find target resource</Result>
+=== dEQP-GLES31.functional.program_interface_query.transform_feedback_varying.type.vertex_fragment.array.uvec3
+Querying properties of uvec3 out variable.
+Transform feedback varyings: {&quot;target[0]&quot;}
+getProgramResourceIndex returned GL_INVALID_INDEX for &quot;target[0]&quot;
+<Result StatusCode="Fail">could not find target resource</Result>
+=== dEQP-GLES31.functional.ssbo.layout.random.nested_structs_arrays_instance_arrays.4
+0: BlockC[0] { name = BlockC[0], size = 16, activeVarIndices = [0, 1, 2] }
+1: BlockC[1] { name = BlockC[1], size = 16, activeVarIndices = [0, 1, 2] }
+2: BlockD[0] { name = BlockD[0], size = 0, activeVarIndices = [3] }
+0: BlockC.b { type = uint, blockNdx = 0, offset = 0, arraySize = 1, arrayStride = 0, matrixStride = 0, topLevelArraySize = 1, topLevelArrayStride = 0, isRowMajor = false }
+1: BlockC.c { type = uint, blockNdx = 0, offset = 4, arraySize = 1, arrayStride = 0, matrixStride = 0, topLevelArraySize = 1, topLevelArrayStride = 0, isRowMajor = false }
+2: BlockC.d[0] { type = mat4x2, blockNdx = 0, offset = 16, arraySize = 0, arrayStride = 32, matrixStride = 16, topLevelArraySize = 1, topLevelArrayStride = 0, isRowMajor = true }
+3: BlockD.e[0] { type = ivec2, blockNdx = 2, offset = 0, arraySize = 0, arrayStride = 16, matrixStride = 0, topLevelArraySize = 1, topLevelArrayStride = 0, isRowMajor = false }
+Error: Buffer block &apos;BlockB&apos; not found
+<Result StatusCode="Fail">Invalid std140 or std430 layout</Result>
+=== dEQP-GLES31.functional.state_query.internal_format.renderbuffer.rg16i_samples
+Format must support sample count of GL_MAX_INTEGER_SAMPLES
+GL_MAX_INTEGER_SAMPLES = 4
+GL_NUM_SAMPLE_COUNTS = 0
+ERROR: Format MUST support some multisample configuration, got GL_NUM_SAMPLE_COUNTS = 0
+glGetInternalFormativ() reported 0 supported sample counts at es31fInternalFormatQueryTests.cpp:174
+<Result StatusCode="Fail">glGetInternalFormativ() reported 0 supported sample counts at es31fInternalFormatQueryTests.cpp:174</Result>
+=== dEQP-GLES31.functional.state_query.internal_format.renderbuffer.rgba8ui_samples
+Format must support sample count of GL_MAX_INTEGER_SAMPLES
+GL_MAX_INTEGER_SAMPLES = 4
+GL_NUM_SAMPLE_COUNTS = 0
+ERROR: Format MUST support some multisample configuration, got GL_NUM_SAMPLE_COUNTS = 0
+glGetInternalFormativ() reported 0 supported sample counts at es31fInternalFormatQueryTests.cpp:174
+<Result StatusCode="Fail">glGetInternalFormativ() reported 0 supported sample counts at es31fInternalFormatQueryTests.cpp:174</Result>
+=== dEQP-GLES31.functional.state_query.internal_format.texture_2d_multisample.r16ui_samples
+Format must support sample count of GL_MAX_INTEGER_SAMPLES
+GL_MAX_INTEGER_SAMPLES = 4
+GL_NUM_SAMPLE_COUNTS = 0
+ERROR: Format MUST support some multisample configuration, got GL_NUM_SAMPLE_COUNTS = 0
+glGetInternalFormativ() reported 0 supported sample counts at es31fInternalFormatQueryTests.cpp:174
+<Result StatusCode="Fail">glGetInternalFormativ() reported 0 supported sample counts at es31fInternalFormatQueryTests.cpp:174</Result>
+=== dEQP-GLES31.functional.state_query.texture_level.texture_2d_multisample.buffer_offset_float
+glGenTextures(1, 0x000000096cde1e60);
+// textures = { 4792 }
+glBindTexture(GL_TEXTURE_2D_MULTISAMPLE, 4792);
+glGetError();
+// GL_NO_ERROR returned
+Verifying GL_TEXTURE_BUFFER_OFFSET, expecting 0
+glGetTexLevelParameterfv(GL_TEXTURE_2D_MULTISAMPLE, 0, GL_TEXTURE_BUFFER_OFFSET, 0x000000016fa15254);
+// params = { -8.02976e+18 }
+glGetError();
+// GL_INVALID_ENUM returned
+// ERROR: glGetTexLevelParameterfv: glGetError() returned GL_INVALID_ENUM
+glDeleteTextures(1, { 4792 });
+Following iteration(s) failed: 1
+<Result StatusCode="Fail">One or more iterations failed</Result>
+=== dEQP-GLES31.functional.state_query.texture_level.texture_buffer.depth_integer
+glGenTextures(1, 0x000000096bf51920);
+// textures = { 4818 }
+glBindTexture(GL_TEXTURE_BUFFER, 4818);
+glGetError();
+// GL_NO_ERROR returned
+Verifying GL_TEXTURE_DEPTH, expecting 0
+glGetTexLevelParameteriv(GL_TEXTURE_BUFFER, 0, GL_TEXTURE_DEPTH, 0x000000016fa15254);
+// params = { 1 }
+glGetError();
+// GL_NO_ERROR returned
+// ERROR: Expected 0(0x00000000) , got 1(0x00000001)
+glDeleteTextures(1, { 4818 });
+glGenTextures(1, 0x000000096bf51920);
+// textures = { 4819 }
+glBindTexture(GL_TEXTURE_BUFFER, 4819);
+glGetError();
+// GL_NO_ERROR returned
+glGenBuffers(1, 0x000000096bf51924);
+// buffers = { 4820 }
+glBindBuffer(GL_TEXTURE_BUFFER, 4820);
+glBufferData(GL_TEXTURE_BUFFER, 131, 0, GL_STATIC_DRAW);
+glTexBuffer(GL_TEXTURE_BUFFER, GL_RGBA8, 4820);
+glGetError();
+// GL_NO_ERROR returned
+Verifying GL_TEXTURE_DEPTH, expecting 1
+glGetTexLevelParameteriv(GL_TEXTURE_BUFFER, 0, GL_TEXTURE_DEPTH, 0x000000016fa15204);
+// params = { 1 }
+glGetError();
+// GL_NO_ERROR returned
+glDeleteTextures(1, { 4819 });
+glDeleteBuffers(1, { 4820 });
+glGenTextures(1, 0x000000096bf51920);
+// textures = { 4821 }
+glBindTexture(GL_TEXTURE_BUFFER, 4821);
+glGetError();
+// GL_NO_ERROR returned
+glGenBuffers(1, 0x000000096bf51924);
+// buffers = { 4822 }
+glBindBuffer(GL_TEXTURE_BUFFER, 4822);
+glBufferData(GL_TEXTURE_BUFFER, 323, 0, GL_STATIC_DRAW);
+glTexBufferRange(GL_TEXTURE_BUFFER, GL_RGBA8, 4822, 256, 67);
+glGetError();
+// GL_NO_ERROR returned
+Verifying GL_TEXTURE_DEPTH, expecting 1
+glGetTexLevelParameteriv(GL_TEXTURE_BUFFER, 0, GL_TEXTURE_DEPTH, 0x000000016fa15204);
+// params = { 1 }
+glGetError();
+// GL_NO_ERROR returned
+glDeleteTextures(1, { 4821 });
+glDeleteBuffers(1, { 4822 });
+Following iteration(s) failed: 1
+<Result StatusCode="Fail">One or more iterations failed</Result>
+=== dEQP-GLES31.functional.state_query.texture_level.texture_buffer.height_float
+glGenTextures(1, 0x000000096bf51860);
+// textures = { 4813 }
+glBindTexture(GL_TEXTURE_BUFFER, 4813);
+glGetError();
+// GL_NO_ERROR returned
+Verifying GL_TEXTURE_HEIGHT, expecting 0
+glGetTexLevelParameterfv(GL_TEXTURE_BUFFER, 0, GL_TEXTURE_HEIGHT, 0x000000016fa15254);
+// params = { 1 }
+glGetError();
+// GL_NO_ERROR returned
+// ERROR: Expected 0, got 1
+glDeleteTextures(1, { 4813 });
+glGenTextures(1, 0x000000096bf51860);
+// textures = { 4814 }
+glBindTexture(GL_TEXTURE_BUFFER, 4814);
+glGetError();
+// GL_NO_ERROR returned
+glGenBuffers(1, 0x000000096bf51864);
+// buffers = { 4815 }
+glBindBuffer(GL_TEXTURE_BUFFER, 4815);
+glBufferData(GL_TEXTURE_BUFFER, 131, 0, GL_STATIC_DRAW);
+glTexBuffer(GL_TEXTURE_BUFFER, GL_RGBA8, 4815);
+glGetError();
+// GL_NO_ERROR returned
+Verifying GL_TEXTURE_HEIGHT, expecting 1
+glGetTexLevelParameterfv(GL_TEXTURE_BUFFER, 0, GL_TEXTURE_HEIGHT, 0x000000016fa15204);
+// params = { 1 }
+glGetError();
+// GL_NO_ERROR returned
+glDeleteTextures(1, { 4814 });
+glDeleteBuffers(1, { 4815 });
+glGenTextures(1, 0x000000096bf51860);
+// textures = { 4816 }
+glBindTexture(GL_TEXTURE_BUFFER, 4816);
+glGetError();
+// GL_NO_ERROR returned
+glGenBuffers(1, 0x000000096bf51864);
+// buffers = { 4817 }
+glBindBuffer(GL_TEXTURE_BUFFER, 4817);
+glBufferData(GL_TEXTURE_BUFFER, 323, 0, GL_STATIC_DRAW);
+glTexBufferRange(GL_TEXTURE_BUFFER, GL_RGBA8, 4817, 256, 67);
+glGetError();
+// GL_NO_ERROR returned
+Verifying GL_TEXTURE_HEIGHT, expecting 1
+glGetTexLevelParameterfv(GL_TEXTURE_BUFFER, 0, GL_TEXTURE_HEIGHT, 0x000000016fa15204);
+// params = { 1 }
+glGetError();
+// GL_NO_ERROR returned
+glDeleteTextures(1, { 4816 });
+glDeleteBuffers(1, { 4817 });
+Following iteration(s) failed: 1
+<Result StatusCode="Fail">One or more iterations failed</Result>
+=== dEQP-GLES31.functional.state_query.texture_level.texture_buffer.height_integer
+glGenTextures(1, 0x000000096bf517a0);
+// textures = { 4808 }
+glBindTexture(GL_TEXTURE_BUFFER, 4808);
+glGetError();
+// GL_NO_ERROR returned
+Verifying GL_TEXTURE_HEIGHT, expecting 0
+glGetTexLevelParameteriv(GL_TEXTURE_BUFFER, 0, GL_TEXTURE_HEIGHT, 0x000000016fa15254);
+// params = { 1 }
+glGetError();
+// GL_NO_ERROR returned
+// ERROR: Expected 0(0x00000000) , got 1(0x00000001)
+glDeleteTextures(1, { 4808 });
+glGenTextures(1, 0x000000096bf517a0);
+// textures = { 4809 }
+glBindTexture(GL_TEXTURE_BUFFER, 4809);
+glGetError();
+// GL_NO_ERROR returned
+glGenBuffers(1, 0x000000096bf517a4);
+// buffers = { 4810 }
+glBindBuffer(GL_TEXTURE_BUFFER, 4810);
+glBufferData(GL_TEXTURE_BUFFER, 131, 0, GL_STATIC_DRAW);
+glTexBuffer(GL_TEXTURE_BUFFER, GL_RGBA8, 4810);
+glGetError();
+// GL_NO_ERROR returned
+Verifying GL_TEXTURE_HEIGHT, expecting 1
+glGetTexLevelParameteriv(GL_TEXTURE_BUFFER, 0, GL_TEXTURE_HEIGHT, 0x000000016fa15204);
+// params = { 1 }
+glGetError();
+// GL_NO_ERROR returned
+glDeleteTextures(1, { 4809 });
+glDeleteBuffers(1, { 4810 });
+glGenTextures(1, 0x000000096bf517a0);
+// textures = { 4811 }
+glBindTexture(GL_TEXTURE_BUFFER, 4811);
+glGetError();
+// GL_NO_ERROR returned
+glGenBuffers(1, 0x000000096bf517a4);
+// buffers = { 4812 }
+glBindBuffer(GL_TEXTURE_BUFFER, 4812);
+glBufferData(GL_TEXTURE_BUFFER, 323, 0, GL_STATIC_DRAW);
+glTexBufferRange(GL_TEXTURE_BUFFER, GL_RGBA8, 4812, 256, 67);
+glGetError();
+// GL_NO_ERROR returned
+Verifying GL_TEXTURE_HEIGHT, expecting 1
+glGetTexLevelParameteriv(GL_TEXTURE_BUFFER, 0, GL_TEXTURE_HEIGHT, 0x000000016fa15204);
+// params = { 1 }
+glGetError();
+// GL_NO_ERROR returned
+glDeleteTextures(1, { 4811 });
+glDeleteBuffers(1, { 4812 });
+Following iteration(s) failed: 1
+<Result StatusCode="Fail">One or more iterations failed</Result>
+=== dEQP-GLES31.functional.state_query.texture_level.texture_cube_map.buffer_offset_float
+glGenTextures(1, 0x000000096cde2460);
+// textures = { 4677 }
+glBindTexture(GL_TEXTURE_CUBE_MAP, 4677);
+glGetError();
+// GL_NO_ERROR returned
+Verifying GL_TEXTURE_BUFFER_OFFSET, expecting 0
+glGetTexLevelParameterfv(GL_TEXTURE_CUBE_MAP_NEGATIVE_Y, 0, GL_TEXTURE_BUFFER_OFFSET, 0x000000016fa15254);
+// params = { -8.02976e+18 }
+glGetError();
+// GL_INVALID_ENUM returned
+// ERROR: glGetTexLevelParameterfv: glGetError() returned GL_INVALID_ENUM
+glDeleteTextures(1, { 4677 });
+Following iteration(s) failed: 1
+<Result StatusCode="Fail">One or more iterations failed</Result>
+=== dEQP-GLES31.functional.state_query.vertex_attribute_binding.indexed.vertex_binding_buffer_getboolean
+glBindVertexArray(569);
+glGetIntegerv(GL_MAX_VERTEX_ATTRIB_BINDINGS, 0x000000016fa1562c);
+// data = { 32 }
+glGetError();
+// GL_NO_ERROR returned
+glGetBooleani_v(GL_VERTEX_BINDING_BUFFER, 0, 0x000000016fa153b1);
+// data = { GL_FALSE }
+glGetError();
+// GL_NO_ERROR returned
+glGetBooleani_v(GL_VERTEX_BINDING_BUFFER, 1, 0x000000016fa153b1);
+// data = { GL_FALSE }
+glGetError();
+// GL_NO_ERROR returned
+glGetBooleani_v(GL_VERTEX_BINDING_BUFFER, 2, 0x000000016fa153b1);
+// data = { GL_FALSE }
+glGetError();
+// GL_NO_ERROR returned
+glGetBooleani_v(GL_VERTEX_BINDING_BUFFER, 3, 0x000000016fa153b1);
+// data = { GL_FALSE }
+glGetError();
+// GL_NO_ERROR returned
+glGetBooleani_v(GL_VERTEX_BINDING_BUFFER, 4, 0x000000016fa153b1);
+// data = { GL_FALSE }
+glGetError();
+// GL_NO_ERROR returned
+glGetBooleani_v(GL_VERTEX_BINDING_BUFFER, 5, 0x000000016fa153b1);
+// data = { GL_FALSE }
+glGetError();
+// GL_NO_ERROR returned
+glGetBooleani_v(GL_VERTEX_BINDING_BUFFER, 6, 0x000000016fa153b1);
+// data = { GL_FALSE }
+glGetError();
+// GL_NO_ERROR returned
+glGetBooleani_v(GL_VERTEX_BINDING_BUFFER, 7, 0x000000016fa153b1);
+// data = { GL_FALSE }
+glGetError();
+// GL_NO_ERROR returned
+glGetBooleani_v(GL_VERTEX_BINDING_BUFFER, 8, 0x000000016fa153b1);
+// data = { GL_FALSE }
+glGetError();
+// GL_NO_ERROR returned
+glGetBooleani_v(GL_VERTEX_BINDING_BUFFER, 9, 0x000000016fa153b1);
+// data = { GL_FALSE }
+glGetError();
+// GL_NO_ERROR returned
+glGetBooleani_v(GL_VERTEX_BINDING_BUFFER, 10, 0x000000016fa153b1);
+// data = { GL_FALSE }
+glGetError();
+// GL_NO_ERROR returned
+glGetBooleani_v(GL_VERTEX_BINDING_BUFFER, 11, 0x000000016fa153b1);
+// data = { GL_FALSE }
+glGetError();
+// GL_NO_ERROR returned
+glGetBooleani_v(GL_VERTEX_BINDING_BUFFER, 12, 0x000000016fa153b1);
+// data = { GL_FALSE }
+glGetError();
+// GL_NO_ERROR returned
+glGetBooleani_v(GL_VERTEX_BINDING_BUFFER, 13, 0x000000016fa153b1);
+// data = { GL_FALSE }
+glGetError();
+// GL_NO_ERROR returned
+glGetBooleani_v(GL_VERTEX_BINDING_BUFFER, 14, 0x000000016fa153b1);
+// data = { GL_FALSE }
+glGetError();
+// GL_NO_ERROR returned
+glGetBooleani_v(GL_VERTEX_BINDING_BUFFER, 15, 0x000000016fa153b1);
+// data = { GL_FALSE }
+glGetError();
+// GL_NO_ERROR returned
+glGetBooleani_v(GL_VERTEX_BINDING_BUFFER, 16, 0x000000016fa153b1);
+// data = { GL_FALSE }
+glGetError();
+// GL_NO_ERROR returned
+glGetBooleani_v(GL_VERTEX_BINDING_BUFFER, 17, 0x000000016fa153b1);
+// data = { GL_FALSE }
+glGetError();
+// GL_NO_ERROR returned
+glGetBooleani_v(GL_VERTEX_BINDING_BUFFER, 18, 0x000000016fa15
+=== dEQP-GLES31.functional.state_query.vertex_attribute_binding.indexed.vertex_binding_stride_getintegeri
+glBindVertexArray(567);
+glGetIntegerv(GL_MAX_VERTEX_ATTRIB_BINDINGS, 0x000000016fa1561c);
+// data = { 32 }
+glGetError();
+// GL_NO_ERROR returned
+glGetIntegeri_v(GL_VERTEX_BINDING_STRIDE, 0, 0x000000016fa153c4);
+// data = { 0 }
+glGetError();
+// GL_NO_ERROR returned
+// ERROR: Expected 16(0x00000010) , got 0(0x00000000)
+glGetIntegeri_v(GL_VERTEX_BINDING_STRIDE, 1, 0x000000016fa153c4);
+// data = { 0 }
+glGetError();
+// GL_NO_ERROR returned
+// ERROR: Expected 16(0x00000010) , got 0(0x00000000)
+glGetIntegeri_v(GL_VERTEX_BINDING_STRIDE, 2, 0x000000016fa153c4);
+// data = { 0 }
+glGetError();
+// GL_NO_ERROR returned
+// ERROR: Expected 16(0x00000010) , got 0(0x00000000)
+glGetIntegeri_v(GL_VERTEX_BINDING_STRIDE, 3, 0x000000016fa153c4);
+// data = { 0 }
+glGetError();
+// GL_NO_ERROR returned
+// ERROR: Expected 16(0x00000010) , got 0(0x00000000)
+glGetIntegeri_v(GL_VERTEX_BINDING_STRIDE, 4, 0x000000016fa153c4);
+// data = { 0 }
+glGetError();
+// GL_NO_ERROR returned
+// ERROR: Expected 16(0x00000010) , got 0(0x00000000)
+glGetIntegeri_v(GL_VERTEX_BINDING_STRIDE, 5, 0x000000016fa153c4);
+// data = { 0 }
+glGetError();
+// GL_NO_ERROR returned
+// ERROR: Expected 16(0x00000010) , got 0(0x00000000)
+glGetIntegeri_v(GL_VERTEX_BINDING_STRIDE, 6, 0x000000016fa153c4);
+// data = { 0 }
+glGetError();
+// GL_NO_ERROR returned
+// ERROR: Expected 16(0x00000010) , got 0(0x00000000)
+glGetIntegeri_v(GL_VERTEX_BINDING_STRIDE, 7, 0x000000016fa153c4);
+// data = { 0 }
+glGetError();
+// GL_NO_ERROR returned
+// ERROR: Expected 16(0x00000010) , got 0(0x00000000)
+glGetIntegeri_v(GL_VERTEX_BINDING_STRIDE, 8, 0x000000016fa153c4);
+// data = { 0 }
+glGetError();
+// GL_NO_ERROR returned
+// ERROR: Expected 16(0x00000010) , got 0(0x00000000)
+glGetIntegeri_v(GL_VERTEX_BINDING_STRIDE, 9, 0x000000016fa153c4);
+// data = { 0 }
+glGetError();
+// GL_NO_ERROR returned
+// ERROR: Expected 16(0x00000010) , got 0(0x00000000)
+glGetIntegeri_v(GL_VERTEX_BINDING_STRIDE, 10, 0x000000016fa153c4);
+// data = { 0 }
+glGetError();
+// GL_NO_ERROR returned
+// ERROR: Expected 16(0x00000010) , got 0(0x00000000)
+glGetIntegeri_v(GL_VERTEX_BINDING_STRIDE, 11, 0x000000016fa153c4);
+// data = { 0 }
+glGetError();
+// GL_NO_ERROR returned
+// ERROR: Expected 16(0x00000010) , got 0(0x00000000)
+glGetIntegeri_v(GL_VERTEX_BINDING_STRIDE, 12, 0x000000016fa153c4);
+// data = { 0 }
+glGetError();
+// GL_NO_ERROR returned
+// ERROR: Expected 16(0x00000010) , got 0(0x00000000)
+glGetIntegeri_v(GL_VERTEX_BINDING_STRIDE, 13, 0x000000016fa153c4);
+// data = { 0 }
+glGetEr
+=== dEQP-GLES31.functional.texture.gather.basic.2d_array.rgba8i.base_level.level_1
+Using a framebuffer object with renderbuffer with format GL_RGBA8I and size (64, 64)
+Note: texture level&apos;s size is (32, 32, 3)
+Texture base level is 1
+s and t wrap modes are GL_REPEAT and GL_REPEAT, respectively
+Minification and magnification filter modes are GL_NEAREST and GL_NEAREST, respectively (note that they should have no effect on gather result)
+Using texture swizzle [default swizzle state]
+Texture coordinates run from (-0.3, -0.4, -1) to (1.5, 1.6, -1)
+<Result StatusCode="Fail">Result verification failed</Result>
+=== dEQP-GLES31.functional.texture.multisample.samples_1.sample_mask_only
+glGetInternalformativ(GL_SAMPLES) = 4
+Creating multisample texture with sample count 1
+Attaching texture to FBO
+Clearing image
+Setting sample mask to 0b0
+Drawing test grid
+Reading from texture with sampler shader, u_sample = -1
+Image verification failed, disabled samples found.
+Clearing image
+Setting sample mask to 0b1
+Drawing test grid
+Reading from texture with sampler shader, u_sample = 0
+Image verification ok, no disabled samples found.
+<Result StatusCode="Fail">Sample test failed</Result>
+=== dEQP-GLES31.functional.uniform_location.nested_array.usampler2D_fragment
+ERROR: found uniform uni0[0][0] in location -1 when it should have been in 46
+<Result StatusCode="Fail">Incorrect uniform location</Result>

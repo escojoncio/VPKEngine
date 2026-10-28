@@ -1,0 +1,53 @@
+=== dEQP-GLES3.functional.shaders.invariance.lowp.common_subexpression_3
+Shader 1:
+Shader 2:
+Testing position invariance.
+Drawing position test pattern using shader 1. Primitive color: red - purple.
+Drawing position test pattern using shader 2. Primitive color: green.
+Verifying output. Expecting only green or background colored pixels.
+No variance found.
+Testing position invariance with z-test. Enabling GL_DEPTH_TEST.
+Drawing Z-test pattern using shader 1. Primitive color: red - purple. DepthFunc: GL_ALWAYS
+Drawing Z-test pattern using shader 2. Primitive color: green. DepthFunc: GL_EQUAL
+Verifying output. Expecting only green or background colored pixels.
+Invalid pixels found (fragments from first render pass found). Variance detected.
+<Result StatusCode="Fail">Detected variance between two invariant values</Result>
+=== dEQP-GLES3.functional.ubo.random.nested_structs_arrays.2
+0: BlockB { name = BlockB, size = 96, activeUniformIndices = [0, 1, 2, 3, 4, 5, 6] }
+1: BlockC { name = BlockC, size = 96, activeUniformIndices = [7, 8, 9, 10] }
+2: BlockD { name = BlockD, size = 32, activeUniformIndices = [11, 12] }
+0: BlockB.a.mA { type = uint, size = 1, blockNdx = 0, offset = 0, arrayStride = 0, matrixStride = 0, isRowMajor = false }
+1: BlockB.a.mB { type = int, size = 1, blockNdx = 0, offset = 4, arrayStride = 0, matrixStride = 0, isRowMajor = false }
+2: BlockB.a.mC { type = bool, size = 1, blockNdx = 0, offset = 8, arrayStride = 0, matrixStride = 0, isRowMajor = false }
+3: BlockB.b { type = uvec3, size = 1, blockNdx = 0, offset = 16, arrayStride = 0, matrixStride = 0, isRowMajor = false }
+4: BlockB.c { type = mat3x4, size = 1, blockNdx = 0, offset = 32, arrayStride = 0, matrixStride = 16, isRowMajor = false }
+5: BlockB.d { type = uvec3, size = 1, blockNdx = 0, offset = 80, arrayStride = 0, matrixStride = 0, isRowMajor = false }
+6: BlockB.e { type = int, size = 1, blockNdx = 0, offset = 92, arrayStride = 0, matrixStride = 0, isRowMajor = false }
+7: BlockC.f { type = mat4x2, size = 1, blockNdx = 1, offset = 0, arrayStride = 0, matrixStride = 16, isRowMajor = true }
+8: BlockC.g { type = ivec3, size = 1, blockNdx = 1, offset = 32, arrayStride = 0, matrixStride = 0, isRowMajor = false }
+9: BlockC.h { type = ivec2, size = 1, blockNdx = 1, offset = 48, arrayStride = 0, matrixStride = 0, isRowMajor = false }
+10: BlockC.i { type = mat2, size = 1, blockNdx = 1, offset = 64, arrayStride = 0, matrixStride = 16, isRowMajor = true }
+11: BlockD.j { type = int, size = 1, blockNdx = 2, offset = 0, arrayStride = 0, matrixStride = 0, isRowMajor = false }
+12: BlockD.k { type = bvec4, size = 1, blockNdx = 2, offset = 16, arrayStride = 0, matrixStride = 0, isRowMajor = false }
+Error: Uniform block &apos;BlockE&apos; not found
+<Result StatusCode="Fail">Invalid std140 layout</Result>
+=== dEQP-GLES3.functional.ubo.random.nested_structs_instance_arrays.18
+0: BlockB { name = BlockB, size = 32, activeUniformIndices = [0, 1] }
+1: BlockC { name = BlockC, size = 160, activeUniformIndices = [2, 3, 4, 5, 6] }
+2: BlockE { name = BlockE, size = 80, activeUniformIndices = [7, 8, 9, 10, 11] }
+3: BlockF { name = BlockF, size = 16, activeUniformIndices = [12] }
+0: a { type = bvec3, size = 1, blockNdx = 0, offset = 0, arrayStride = 0, matrixStride = 0, isRowMajor = false }
+1: b { type = ivec4, size = 1, blockNdx = 0, offset = 16, arrayStride = 0, matrixStride = 0, isRowMajor = false }
+2: c { type = ivec2, size = 1, blockNdx = 1, offset = 0, arrayStride = 0, matrixStride = 0, isRowMajor = false }
+3: d { type = mat4, size = 1, blockNdx = 1, offset = 16, arrayStride = 0, matrixStride = 16, isRowMajor = true }
+4: e { type = mat2, size = 1, blockNdx = 1, offset = 80, arrayStride = 0, matrixStride = 16, isRowMajor = true }
+5: f { type = mat4x2, size = 1, blockNdx = 1, offset = 112, arrayStride = 0, matrixStride = 16, isRowMajor = true }
+6: g { type = float, size = 1, blockNdx = 1, offset = 144, arrayStride = 0, matrixStride = 0, isRowMajor = false }
+7: BlockE.j { type = mat2, size = 1, blockNdx = 2, offset = 0, arrayStride = 0, matrixStride = 16, isRowMajor = false }
+8: BlockE.k { type = bvec2, size = 1, blockNdx = 2, offset = 32, arrayStride = 0, matrixStride = 0, isRowMajor = false }
+9: BlockE.l { type = ivec3, size = 1, blockNdx = 2, offset = 48, arrayStride = 0, matrixStride = 0, isRowMajor = false }
+10: BlockE.m { type = uint, size = 1, blockNdx = 2, offset = 60, arrayStride = 0, matrixStride = 0, isRowMajor = false }
+11: BlockE.n { type = bvec4, size = 1, blockNdx = 2, offset = 64, arrayStride = 0, matrixStride = 0, isRowMajor = false }
+12: BlockF.o.mA { type = bvec3, size = 1, blockNdx = 3, offset = 0, arrayStride = 0, matrixStride = 0, isRowMajor = false }
+Error: Uniform block &apos;BlockD[0]&apos; not found
+<Result StatusCode="Fail">Invalid std140 layout</Result>

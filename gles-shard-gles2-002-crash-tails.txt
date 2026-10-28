@@ -1,0 +1,42 @@
+=== attempt 1 exit=1 cases=['dEQP-GLES2.functional.uniform_api.value.assigned.by_value.render.basic.vec4_both', 'dEQP-GLES2.functional.lifetime.delete.renderbuffer', 'dEQP-GLES2.functional.lifetime.delete_bound.framebuffer']
+  Pass (Pass)
+
+Test case 'dEQP-GLES2.functional.default_vertex_attrib.float.vertex_attrib_1fv'..
+gpu.frame f=2259 enc=2 render=1 compute=1 naive=2 passes=1 merged=0 hoisted=0 sunk=1 dropped=0 barriers=1 intra=0 raw=1 war=1 waw=0 tile_local=0 tile_rejected=0 saved_mb=0.0 split=0 verts=4 tile_max=3000000 heavy_enc=0 cpu_ms=0.018
+gpu.cut f=2259 FrameStart=1 AttachmentChange=0 ClearLoad=0 Feedback=0 TileBudget=0 PinnedCopy=0 ComputeBetween=0 ComputeWork=0 CopyWork=1 ViewSplit=0 TileSplit=0
+gpu.pso f=2259 compiled=1 failed=0 hits=0 misses=1 ms=0.59 max_ms=0.59
+  Pass (Pass)
+
+Test case 'dEQP-GLES2.functional.default_vertex_attrib.vec2.vertex_attrib_4fv'..
+gpu.frame f=2266 enc=2 render=1 compute=1 naive=2 passes=1 merged=0 hoisted=0 sunk=1 dropped=0 barriers=1 intra=0 raw=1 war=1 waw=0 tile_local=0 tile_rejected=0 saved_mb=0.0 split=0 verts=4 tile_max=3000000 heavy_enc=0 cpu_ms=0.020
+gpu.cut f=2266 FrameStart=1 AttachmentChange=0 ClearLoad=0 Feedback=0 TileBudget=0 PinnedCopy=0 ComputeBetween=0 ComputeWork=0 CopyWork=1 ViewSplit=0 TileSplit=0
+gpu.pso f=2266 compiled=1 failed=0 hits=0 misses=1 ms=17.25 max_ms=17.25
+gpu.time f=2266 gpu_ms=13.354 t=32515.0
+  Pass (Pass)
+
+Test case 'dEQP-GLES2.functional.default_vertex_attrib.vec4.vertex_attrib_1f'..
+gpu.frame f=2273 enc=2 render=1 compute=1 naive=2 passes=1 merged=0 hoisted=0 sunk=1 dropped=0 barriers=1 intra=0 raw=1 war=1 waw=0 tile_local=0 tile_rejected=0 saved_mb=0.0 split=0 verts=4 tile_max=3000000 heavy_enc=0 cpu_ms=0.020
+gpu.cut f=2273 FrameStart=1 AttachmentChange=0 ClearLoad=0 Feedback=0 TileBudget=0 PinnedCopy=0 ComputeBetween=0 ComputeWork=0 CopyWork=1 ViewSplit=0 TileSplit=0
+gpu.pso f=2273 compiled=1 failed=0 hits=0 misses=1 ms=23.35 max_ms=23.35
+vk.hitch submit=2267 dt_ms=41.3 submit_ms=5.54 translate_ms=0.01 backend_ms=5.52 pso_create_ms=24.25 lib_compile_ms=15.63 fence_wait_ms=8.69 alloc_ms=0.01 upload_bytes=0 gles_link_ms=0.13 lock_ms=0.00 guest_gap_ms=2.6
+gpu.time f=2273 gpu_ms=14.835 t=32624.8
+gpu.time f=2274 gpu_ms=12.288 t=32641.2
+  Pass (Pass)
+
+Test case 'dEQP-GLES2.functional.lifetime.delete.renderbuffer'..
+  Pass (Pass)
+
+Test case 'dEQP-GLES2.functional.lifetime.delete_bound.framebuffer'..
+  Pass (Pass)
+gles.tex fmt=0x8058 count=64
+gles.pso.recipe saved=0 loaded=0 prewarmed=0 miss_in_game=0
+
+DONE!
+
+Test run totals:
+  Passed:        683/691 (98.8%)
+  Failed:        1/691 (0.1%)
+  Not supported: 7/691 (1.0%)
+  Warnings:      0/691 (0.0%)
+  Waived:        0/691 (0.0%)
+

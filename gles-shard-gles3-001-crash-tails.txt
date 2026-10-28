@@ -1,0 +1,42 @@
+=== attempt 1 exit=1 cases=['dEQP-GLES3.info.vendor', 'dEQP-GLES3.functional.fbo.invalidate.target.read_framebuffer_draw_framebuffer_color', 'dEQP-GLES3.functional.fbo.invalidate.target.draw_framebuffer_framebuffer_depth_stencil']
+gles.tex fmt=0x9276 count=2
+gles.tex fmt=0x9277 count=2
+gles.tex fmt=0x9278 count=13
+gles.tex fmt=0x93a1 count=19
+gles.tex fmt=0x93b0 count=3
+gles.tex fmt=0x93b1 count=4
+gles.tex fmt=0x93b2 count=4
+gles.tex fmt=0x93b3 count=36
+gles.tex fmt=0x93b4 count=9
+gles.tex fmt=0x93b5 count=3
+gles.tex fmt=0x93b6 count=2
+gles.tex fmt=0x93b7 count=6
+gles.tex fmt=0x93b8 count=8
+gles.tex fmt=0x93b9 count=63
+gles.tex fmt=0x93ba count=9
+gles.tex fmt=0x93bb count=103
+gles.tex fmt=0x93bd count=22
+gles.tex fmt=0x93d0 count=3
+gles.tex fmt=0x93d1 count=3
+gles.tex fmt=0x93d2 count=8
+gles.tex fmt=0x93d3 count=2
+gles.tex fmt=0x93d4 count=3
+gles.tex fmt=0x93d5 count=5
+gles.tex fmt=0x93d7 count=3
+gles.tex fmt=0x93d8 count=3
+gles.tex fmt=0x93d9 count=14
+gles.tex fmt=0x93da count=9
+gles.tex fmt=0x93db count=4
+gles.tex fmt=0x93dc count=51
+gles.tex fmt=0x93dd count=146
+gles.pso.recipe saved=0 loaded=0 prewarmed=0 miss_in_game=0
+
+DONE!
+
+Test run totals:
+  Passed:        1466/1500 (97.7%)
+  Failed:        21/1500 (1.4%)
+  Not supported: 13/1500 (0.9%)
+  Warnings:      0/1500 (0.0%)
+  Waived:        0/1500 (0.0%)
+

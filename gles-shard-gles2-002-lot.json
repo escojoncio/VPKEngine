@@ -1,0 +1,16 @@
+{
+ "attempts": [
+  {
+   "attempt": 1,
+   "exit": 1,
+   "why": "exit",
+   "cases_done": 691,
+   "open_case": null,
+   "seconds": 32.9,
+   "todo": 691
+  }
+ ],
+ "cases": 691,
+ "left": 0,
+ "startup_failed": false
+}

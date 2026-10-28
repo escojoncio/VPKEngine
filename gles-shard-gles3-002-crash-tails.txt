@@ -1,0 +1,42 @@
+=== attempt 1 exit=1 cases=['dEQP-GLES3.functional.shaders.operator.unary_operator.pre_increment_effect.lowp_int_fragment', 'dEQP-GLES3.functional.uniform_api.info_query.active_uniform.struct_in_array.int_ivec4_vertex', 'dEQP-GLES3.functional.uniform_api.info_query.active_uniform.struct_in_array.uint_uvec4_fragment']
+
+Test case 'dEQP-GLES3.functional.uniform_api.info_query.active_uniform.basic.bvec2_both'..
+  Pass (Passed)
+
+Test case 'dEQP-GLES3.functional.uniform_api.info_query.active_uniform.basic.samplerCube_vertex'..
+  Pass (Passed)
+
+Test case 'dEQP-GLES3.functional.uniform_api.info_query.active_uniform.basic_array.float_fragment'..
+  Pass (Passed)
+
+Test case 'dEQP-GLES3.functional.uniform_api.info_query.active_uniform.basic_struct.int_ivec4_fragment'..
+  Pass (Passed)
+
+Test case 'dEQP-GLES3.functional.uniform_api.info_query.active_uniform.basic_struct.bool_bvec4_fragment'..
+  Pass (Passed)
+
+Test case 'dEQP-GLES3.functional.uniform_api.info_query.active_uniform.basic_struct.sampler2D_samplerCube_fragment'..
+  Pass (Passed)
+
+Test case 'dEQP-GLES3.functional.uniform_api.info_query.active_uniform.struct_in_array.int_ivec4_vertex'..
+  Pass (Passed)
+
+Test case 'dEQP-GLES3.functional.uniform_api.info_query.active_uniform.struct_in_array.uint_uvec4_fragment'..
+  Pass (Passed)
+gles.tex fmt=0x8058 count=40
+gles.tex fmt=0x81a5 count=6
+gles.tex fmt=0x8814 count=3
+gles.tex fmt=0x881a count=22
+gles.tex fmt=0x8d7c count=18
+gles.tex fmt=0x8d8e count=9
+gles.pso.recipe saved=0 loaded=0 prewarmed=0 miss_in_game=0
+
+DONE!
+
+Test run totals:
+  Passed:        1497/1500 (99.8%)
+  Failed:        3/1500 (0.2%)
+  Not supported: 0/1500 (0.0%)
+  Warnings:      0/1500 (0.0%)
+  Waived:        0/1500 (0.0%)
+

@@ -1,0 +1,431 @@
+=== dEQP-GLES3.functional.negative_api.buffer.copy_buffer_sub_data
+glGenBuffers(2, 0x000000016bc516f0);
+// buffers = { 3188, 3189 }
+glBindBuffer(GL_COPY_READ_BUFFER, 3188);
+glBufferData(GL_COPY_READ_BUFFER, 32, 0x8b9127000, GL_DYNAMIC_COPY);
+glBindBuffer(GL_COPY_WRITE_BUFFER, 3189);
+glBufferData(GL_COPY_WRITE_BUFFER, 32, 0x8b9127000, GL_DYNAMIC_COPY);
+glGetError();
+// GL_NO_ERROR returned
+glCopyBufferSubData(0x00008f36, 0x00008f37, 0, 0, fffffffffffffffc);
+glGetError();
+// GL_INVALID_VALUE returned
+glCopyBufferSubData(0x00008f36, 0x00008f37, ffffffffffffffff, 0, 4);
+glGetError();
+// GL_INVALID_VALUE returned
+glCopyBufferSubData(0x00008f36, 0x00008f37, 0, ffffffffffffffff, 4);
+glGetError();
+// GL_INVALID_VALUE returned
+glCopyBufferSubData(0x00008f36, 0x00008f37, 0, 0, 24);
+glGetError();
+// GL_INVALID_VALUE returned
+glCopyBufferSubData(0x00008f36, 0x00008f37, 18, 0, 10);
+glGetError();
+// GL_INVALID_VALUE returned
+glCopyBufferSubData(0x00008f36, 0x00008f37, 24, 0, 4);
+glGetError();
+// GL_INVALID_VALUE returned
+glCopyBufferSubData(0x00008f36, 0x00008f37, 0, 0, 24);
+glGetError();
+// GL_INVALID_VALUE returned
+glCopyBufferSubData(0x00008f36, 0x00008f37, 0, 18, 10);
+glGetError();
+// GL_INVALID_VALUE returned
+glCopyBufferSubData(0x00008f36, 0x00008f37, 0, 24, 4);
+glGetError();
+// GL_INVALID_VALUE returned
+glBindBuffer(GL_COPY_WRITE_BUFFER, 3188);
+glCopyBufferSubData(0x00008f36, 0x00008f37, 0, 10, 4);
+glGetError();
+// GL_NO_ERROR returned
+glCopyBufferSubData(0x00008f36, 0x00008f37, 0, 0, 4);
+glGetError();
+// GL_INVALID_VALUE returned
+glCopyBufferSubData(0x00008f36, 0x00008f37, 0, 10, 12);
+glGetError();
+// GL_INVALID_VALUE returned
+glBindBuffer(GL_COPY_WRITE_BUFFER, 3189);
+glBindBuffer(GL_COPY_READ_BUFFER, 0);
+glCopyBufferSubData(0x00008f36, 0x00008f37, 0, 0, 10);
+glGetError();
+// GL_INVALID_OPERATION returned
+glBindBuffer(GL_COPY_READ_BUFFER, 3188);
+glBindBuffer(GL_COPY_WRITE_BUFFER, 0);
+glCopyBufferSubData(0x00008f36, 0x00008f37, 0, 0, 10);
+glGetError();
+// GL_INVALID_OPERATION returned
+glBindBuffer(GL_COPY_WRITE_BUFFER, 3189);
+glMapBufferRange(GL_COPY_READ_BUFFER, 0, 4, GL_MAP_READ_BIT);
+// 0x8b90e4000 returned
+glCopyBufferSubData(0x00008f36, 0x00008f37, 0, 0, 10);
+glGetError();
+// GL_NO_ERROR returned
+// ERROR: expected GL_INVALID_OPERATION
+glUnmapBuffer(GL_COPY_READ_BUFFER);
+// GL_TRUE returned
+glMapBufferRange(GL_COPY_WRITE_BUFFER, 0, 4, GL_MAP_READ_BIT);
+// 0x8b90f8000 returned
+glCopyBufferSubData(0x00008f36, 0x00008f37, 0, 0, 10);
+glGetError();
+// GL_NO_ERROR returned
+// ERROR: expected GL_INVALID_OPERATION
+glUnmapBuffer(GL_
+=== dEQP-GLES3.functional.negative_api.buffer.read_pixels_fbo_format_mismatch
+glGenTextures(1, 0x000000016bc516d0);
+// textures = { 3181 }
+glBindTexture(GL_TEXTURE_2D, 3181);
+glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 32, 32, 0, GL_RGBA, GL_UNSIGNED_BYTE, 0);
+glGenFramebuffers(1, 0x000000016bc516d4);
+// framebuffers = { 291 }
+glBindFramebuffer(GL_FRAMEBUFFER, 291);
+glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, 3181, 0);
+glGetError();
+// GL_NO_ERROR returned
+glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 32, 32, 0, GL_RGBA, GL_UNSIGNED_BYTE, 0);
+glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, 3181, 0);
+glCheckFramebufferStatus(GL_FRAMEBUFFER);
+// GL_FRAMEBUFFER_COMPLETE returned
+glGetError();
+// GL_NO_ERROR returned
+glReadPixels(0, 0, 1, 1, GL_RGBA, GL_FLOAT, 0x8b9bfc4d0);
+glGetError();
+// GL_NO_ERROR returned
+// ERROR: expected GL_INVALID_OPERATION
+glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA32I, 32, 32, 0, GL_RGBA_INTEGER, GL_INT, 0);
+glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, 3181, 0);
+glCheckFramebufferStatus(GL_FRAMEBUFFER);
+// GL_FRAMEBUFFER_COMPLETE returned
+glGetError();
+// GL_NO_ERROR returned
+glReadPixels(0, 0, 1, 1, GL_RGBA, GL_FLOAT, 0x8b9bfc4d0);
+glGetError();
+// GL_NO_ERROR returned
+// ERROR: expected GL_INVALID_OPERATION
+glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA32UI, 32, 32, 0, GL_RGBA_INTEGER, GL_UNSIGNED_INT, 0);
+glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, 3181, 0);
+glCheckFramebufferStatus(GL_FRAMEBUFFER);
+// GL_FRAMEBUFFER_COMPLETE returned
+glGetError();
+// GL_NO_ERROR returned
+glReadPixels(0, 0, 1, 1, GL_RGBA, GL_FLOAT, 0x8b9bfc4d0);
+glGetError();
+// GL_NO_ERROR returned
+// ERROR: expected GL_INVALID_OPERATION
+glGenRenderbuffers(1, 0x000000016bc516c4);
+// renderbuffers = { 3182 }
+glBindRenderbuffer(GL_RENDERBUFFER, 3182);
+glRenderbufferStorageMultisample(GL_RENDERBUFFER, 4, GL_RGBA8, 32, 32);
+glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, 3182);
+glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, 0x000000016bc516cc);
+// data = { 291 }
+// GL_READ_FRAMEBUFFER_BINDING: 291
+glCheckFramebufferStatus(GL_FRAMEBUFFER);
+// GL_FRAMEBUFFER_COMPLETE returned
+glGetIntegerv(GL_SAMPLE_BUFFERS, 0x000000016bc516c8);
+// data = { 1 }
+// GL_SAMPLE_BUFFERS: 1
+glGetError();
+// GL_NO_ERROR returned
+glReadPixels(0, 0, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, 0x8b93adca0);
+glGetError();
+// GL_INVALID_OPERATION returned
+glBindRenderbuffer(GL_RENDERBUFFER, 0);
+glBindTexture(GL_TEXTURE_2D, 0);
+glBindFramebuffer(GL_FRAMEBUF
+=== dEQP-GLES3.functional.state_query.texture.texture_2d_array_texture_max_level_gettexparameteri
+glGetTexParameteriv(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MAX_LEVEL, 0x000000016bc514e4);
+// params = { 1000 }
+glGetError();
+// GL_NO_ERROR returned
+glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MAX_LEVEL, 44524);
+glGetError();
+// GL_NO_ERROR returned
+glGetTexParameteriv(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MAX_LEVEL, 0x000000016bc514e4);
+// params = { 44524 }
+glGetError();
+// GL_NO_ERROR returned
+glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MAX_LEVEL, 32137);
+glGetError();
+// GL_NO_ERROR returned
+glGetTexParameteriv(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MAX_LEVEL, 0x000000016bc514e4);
+// params = { 32137 }
+glGetError();
+// GL_NO_ERROR returned
+glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MAX_LEVEL, 19815);
+glGetError();
+// GL_NO_ERROR returned
+glGetTexParameteriv(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MAX_LEVEL, 0x000000016bc514e4);
+// params = { 19815 }
+glGetError();
+// GL_NO_ERROR returned
+glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MAX_LEVEL, 7536);
+glGetError();
+// GL_NO_ERROR returned
+glGetTexParameteriv(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MAX_LEVEL, 0x000000016bc514e4);
+// params = { 7536 }
+glGetError();
+// GL_NO_ERROR returned
+glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MAX_LEVEL, 23179);
+glGetError();
+// GL_NO_ERROR returned
+glGetTexParameteriv(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MAX_LEVEL, 0x000000016bc514e4);
+// params = { 23179 }
+glGetError();
+// GL_NO_ERROR returned
+glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MAX_LEVEL, 53196);
+glGetError();
+// GL_NO_ERROR returned
+glGetTexParameteriv(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MAX_LEVEL, 0x000000016bc514e4);
+// params = { 53196 }
+glGetError();
+// GL_NO_ERROR returned
+glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MAX_LEVEL, 20620);
+glGetError();
+// GL_NO_ERROR returned
+glGetTexParameteriv(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MAX_LEVEL, 0x000000016bc514e4);
+// params = { 20620 }
+glGetError();
+// GL_NO_ERROR returned
+glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MAX_LEVEL, 54297);
+glGetError();
+// GL_NO_ERROR returned
+glGetTexParameteriv(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MAX_LEVEL, 0x000000016bc514e4);
+// params = { 54297 }
+glGetError();
+// GL_NO_ERROR returned
+glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MAX_LEVEL, 4773);
+glGetError();
+// GL_NO_ERROR returned
+glGetTexParameteriv(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MAX_LEVEL, 0x000000016bc514e4);
+// params = { 4773 }
+glGetError();
+// GL_NO_ERROR returned
+glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MAX_LEVEL, 13772);
+glGetError();
+// GL_NO_ERROR returned
+glGetTexParamet
+=== dEQP-GLES3.functional.state_query.texture.texture_2d_texture_max_level_gettexparameteri
+glGetTexParameteriv(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, 0x000000016bc514e4);
+// params = { 1000 }
+glGetError();
+// GL_NO_ERROR returned
+glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, 44524);
+glGetError();
+// GL_NO_ERROR returned
+glGetTexParameteriv(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, 0x000000016bc514e4);
+// params = { 44524 }
+glGetError();
+// GL_NO_ERROR returned
+glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, 32137);
+glGetError();
+// GL_NO_ERROR returned
+glGetTexParameteriv(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, 0x000000016bc514e4);
+// params = { 32137 }
+glGetError();
+// GL_NO_ERROR returned
+glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, 19815);
+glGetError();
+// GL_NO_ERROR returned
+glGetTexParameteriv(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, 0x000000016bc514e4);
+// params = { 19815 }
+glGetError();
+// GL_NO_ERROR returned
+glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, 7536);
+glGetError();
+// GL_NO_ERROR returned
+glGetTexParameteriv(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, 0x000000016bc514e4);
+// params = { 7536 }
+glGetError();
+// GL_NO_ERROR returned
+glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, 23179);
+glGetError();
+// GL_NO_ERROR returned
+glGetTexParameteriv(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, 0x000000016bc514e4);
+// params = { 23179 }
+glGetError();
+// GL_NO_ERROR returned
+glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, 53196);
+glGetError();
+// GL_NO_ERROR returned
+glGetTexParameteriv(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, 0x000000016bc514e4);
+// params = { 53196 }
+glGetError();
+// GL_NO_ERROR returned
+glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, 20620);
+glGetError();
+// GL_NO_ERROR returned
+glGetTexParameteriv(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, 0x000000016bc514e4);
+// params = { 20620 }
+glGetError();
+// GL_NO_ERROR returned
+glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, 54297);
+glGetError();
+// GL_NO_ERROR returned
+glGetTexParameteriv(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, 0x000000016bc514e4);
+// params = { 54297 }
+glGetError();
+// GL_NO_ERROR returned
+glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, 4773);
+glGetError();
+// GL_NO_ERROR returned
+glGetTexParameteriv(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, 0x000000016bc514e4);
+// params = { 4773 }
+glGetError();
+// GL_NO_ERROR returned
+glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, 13772);
+glGetError();
+// GL_NO_ERROR returned
+glGetTexParameteriv(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, 0x000000016bc514e4);
+// params = { 13772 }
+glGetError();
+// GL_NO_ERROR return
+=== dEQP-GLES3.functional.state_query.texture.texture_3d_texture_base_level_gettexparameterf
+glGetTexParameterfv(GL_TEXTURE_3D, GL_TEXTURE_BASE_LEVEL, 0x000000016bc514e4);
+// params = { 0 }
+glGetError();
+// GL_NO_ERROR returned
+glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_BASE_LEVEL, 44524);
+glGetError();
+// GL_NO_ERROR returned
+glGetTexParameterfv(GL_TEXTURE_3D, GL_TEXTURE_BASE_LEVEL, 0x000000016bc514e4);
+// params = { 44524 }
+glGetError();
+// GL_NO_ERROR returned
+glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_BASE_LEVEL, 32137);
+glGetError();
+// GL_NO_ERROR returned
+glGetTexParameterfv(GL_TEXTURE_3D, GL_TEXTURE_BASE_LEVEL, 0x000000016bc514e4);
+// params = { 32137 }
+glGetError();
+// GL_NO_ERROR returned
+glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_BASE_LEVEL, 19815);
+glGetError();
+// GL_NO_ERROR returned
+glGetTexParameterfv(GL_TEXTURE_3D, GL_TEXTURE_BASE_LEVEL, 0x000000016bc514e4);
+// params = { 19815 }
+glGetError();
+// GL_NO_ERROR returned
+glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_BASE_LEVEL, 7536);
+glGetError();
+// GL_NO_ERROR returned
+glGetTexParameterfv(GL_TEXTURE_3D, GL_TEXTURE_BASE_LEVEL, 0x000000016bc514e4);
+// params = { 7536 }
+glGetError();
+// GL_NO_ERROR returned
+glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_BASE_LEVEL, 23179);
+glGetError();
+// GL_NO_ERROR returned
+glGetTexParameterfv(GL_TEXTURE_3D, GL_TEXTURE_BASE_LEVEL, 0x000000016bc514e4);
+// params = { 23179 }
+glGetError();
+// GL_NO_ERROR returned
+glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_BASE_LEVEL, 53196);
+glGetError();
+// GL_NO_ERROR returned
+glGetTexParameterfv(GL_TEXTURE_3D, GL_TEXTURE_BASE_LEVEL, 0x000000016bc514e4);
+// params = { 53196 }
+glGetError();
+// GL_NO_ERROR returned
+glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_BASE_LEVEL, 20620);
+glGetError();
+// GL_NO_ERROR returned
+glGetTexParameterfv(GL_TEXTURE_3D, GL_TEXTURE_BASE_LEVEL, 0x000000016bc514e4);
+// params = { 20620 }
+glGetError();
+// GL_NO_ERROR returned
+glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_BASE_LEVEL, 54297);
+glGetError();
+// GL_NO_ERROR returned
+glGetTexParameterfv(GL_TEXTURE_3D, GL_TEXTURE_BASE_LEVEL, 0x000000016bc514e4);
+// params = { 54297 }
+glGetError();
+// GL_NO_ERROR returned
+glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_BASE_LEVEL, 4773);
+glGetError();
+// GL_NO_ERROR returned
+glGetTexParameterfv(GL_TEXTURE_3D, GL_TEXTURE_BASE_LEVEL, 0x000000016bc514e4);
+// params = { 4773 }
+glGetError();
+// GL_NO_ERROR returned
+glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_BASE_LEVEL, 13772);
+glGetError();
+// GL_NO_ERROR returned
+glGetTexParameterfv(GL_TEXTURE_3D, GL_TEXTURE_BASE_LEVEL, 0x000000016bc514e4);
+// params = { 13772 }
+glGetError();
+// 
+=== dEQP-GLES3.functional.state_query.texture.texture_3d_texture_max_level_gettexparameterf
+glGetTexParameterfv(GL_TEXTURE_3D, GL_TEXTURE_MAX_LEVEL, 0x000000016bc514e4);
+// params = { 1000 }
+glGetError();
+// GL_NO_ERROR returned
+glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MAX_LEVEL, 44524);
+glGetError();
+// GL_NO_ERROR returned
+glGetTexParameterfv(GL_TEXTURE_3D, GL_TEXTURE_MAX_LEVEL, 0x000000016bc514e4);
+// params = { 44524 }
+glGetError();
+// GL_NO_ERROR returned
+glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MAX_LEVEL, 32137);
+glGetError();
+// GL_NO_ERROR returned
+glGetTexParameterfv(GL_TEXTURE_3D, GL_TEXTURE_MAX_LEVEL, 0x000000016bc514e4);
+// params = { 32137 }
+glGetError();
+// GL_NO_ERROR returned
+glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MAX_LEVEL, 19815);
+glGetError();
+// GL_NO_ERROR returned
+glGetTexParameterfv(GL_TEXTURE_3D, GL_TEXTURE_MAX_LEVEL, 0x000000016bc514e4);
+// params = { 19815 }
+glGetError();
+// GL_NO_ERROR returned
+glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MAX_LEVEL, 7536);
+glGetError();
+// GL_NO_ERROR returned
+glGetTexParameterfv(GL_TEXTURE_3D, GL_TEXTURE_MAX_LEVEL, 0x000000016bc514e4);
+// params = { 7536 }
+glGetError();
+// GL_NO_ERROR returned
+glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MAX_LEVEL, 23179);
+glGetError();
+// GL_NO_ERROR returned
+glGetTexParameterfv(GL_TEXTURE_3D, GL_TEXTURE_MAX_LEVEL, 0x000000016bc514e4);
+// params = { 23179 }
+glGetError();
+// GL_NO_ERROR returned
+glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MAX_LEVEL, 53196);
+glGetError();
+// GL_NO_ERROR returned
+glGetTexParameterfv(GL_TEXTURE_3D, GL_TEXTURE_MAX_LEVEL, 0x000000016bc514e4);
+// params = { 53196 }
+glGetError();
+// GL_NO_ERROR returned
+glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MAX_LEVEL, 20620);
+glGetError();
+// GL_NO_ERROR returned
+glGetTexParameterfv(GL_TEXTURE_3D, GL_TEXTURE_MAX_LEVEL, 0x000000016bc514e4);
+// params = { 20620 }
+glGetError();
+// GL_NO_ERROR returned
+glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MAX_LEVEL, 54297);
+glGetError();
+// GL_NO_ERROR returned
+glGetTexParameterfv(GL_TEXTURE_3D, GL_TEXTURE_MAX_LEVEL, 0x000000016bc514e4);
+// params = { 54297 }
+glGetError();
+// GL_NO_ERROR returned
+glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MAX_LEVEL, 4773);
+glGetError();
+// GL_NO_ERROR returned
+glGetTexParameterfv(GL_TEXTURE_3D, GL_TEXTURE_MAX_LEVEL, 0x000000016bc514e4);
+// params = { 4773 }
+glGetError();
+// GL_NO_ERROR returned
+glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MAX_LEVEL, 13772);
+glGetError();
+// GL_NO_ERROR returned
+glGetTexParameterfv(GL_TEXTURE_3D, GL_TEXTURE_MAX_LEVEL, 0x000000016bc514e4);
+// params = { 13772 }
+glGetError();
+// GL_NO_ERROR return

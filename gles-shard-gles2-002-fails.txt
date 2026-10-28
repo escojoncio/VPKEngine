@@ -1,0 +1,79 @@
+=== dEQP-GLES2.functional.state_query.floats.sample_coverage_value_getinteger
+glGetIntegerv(GL_SAMPLE_COVERAGE_VALUE, 0x000000016d419684);
+// data = { 1 }
+glGetError();
+// GL_NO_ERROR returned
+glSampleCoverage(0, GL_FALSE);
+glGetIntegerv(GL_SAMPLE_COVERAGE_VALUE, 0x000000016d419684);
+// data = { 0 }
+glGetError();
+// GL_NO_ERROR returned
+glSampleCoverage(0.5, GL_FALSE);
+glGetIntegerv(GL_SAMPLE_COVERAGE_VALUE, 0x000000016d419684);
+// data = { 0 }
+glGetError();
+// GL_NO_ERROR returned
+glSampleCoverage(0.45, GL_FALSE);
+glGetIntegerv(GL_SAMPLE_COVERAGE_VALUE, 0x000000016d419684);
+// data = { 0 }
+glGetError();
+// GL_NO_ERROR returned
+glSampleCoverage(0.55, GL_FALSE);
+glGetIntegerv(GL_SAMPLE_COVERAGE_VALUE, 0x000000016d419684);
+// data = { 0 }
+// ERROR: expected rounding to the nearest integer, valid range [1,1]; got 0
+glGetError();
+// GL_NO_ERROR returned
+glSampleCoverage(-1, GL_FALSE);
+glGetIntegerv(GL_SAMPLE_COVERAGE_VALUE, 0x000000016d419684);
+// data = { 0 }
+glGetError();
+// GL_NO_ERROR returned
+glSampleCoverage(-1.5, GL_FALSE);
+glGetIntegerv(GL_SAMPLE_COVERAGE_VALUE, 0x000000016d419684);
+// data = { 0 }
+glGetError();
+// GL_NO_ERROR returned
+glSampleCoverage(1.45, GL_FALSE);
+glGetIntegerv(GL_SAMPLE_COVERAGE_VALUE, 0x000000016d419684);
+// data = { 1 }
+glGetError();
+// GL_NO_ERROR returned
+glSampleCoverage(3.55, GL_FALSE);
+glGetIntegerv(GL_SAMPLE_COVERAGE_VALUE, 0x000000016d419684);
+// data = { 1 }
+glGetError();
+// GL_NO_ERROR returned
+glSampleCoverage(0.462727, GL_FALSE);
+glGetIntegerv(GL_SAMPLE_COVERAGE_VALUE, 0x000000016d419684);
+// data = { 0 }
+glGetError();
+// GL_NO_ERROR returned
+glSampleCoverage(0.892511, GL_TRUE);
+glGetIntegerv(GL_SAMPLE_COVERAGE_VALUE, 0x000000016d419684);
+// data = { 0 }
+// ERROR: expected rounding to the nearest integer, valid range [1,1]; got 0
+glGetError();
+// GL_NO_ERROR returned
+glSampleCoverage(0.529167, GL_FALSE);
+glGetIntegerv(GL_SAMPLE_COVERAGE_VALUE, 0x000000016d419684);
+// data = { 0 }
+// ERROR: expected rounding to the nearest integer, valid range [1,1]; got 0
+glGetError();
+// GL_NO_ERROR returned
+glSampleCoverage(0.987712, GL_TRUE);
+glGetIntegerv(GL_SAMPLE_COVERAGE_VALUE, 0x000000016d419684);
+// data = { 0 }
+// ERROR: expected rounding to the nearest integer, valid range [1,1]; got 0
+glGetError();
+// GL_NO_ERROR returned
+glSampleCoverage(0.183942, GL_TRUE);
+glGetIntegerv(GL_SAMPLE_COVERAGE_VALUE, 0x000000016d419684);
+// data = { 0 }
+glGetError();
+// GL_NO_ERROR returned
+glSampleCoverage(0.384507, GL_FALSE);
+glGetIntegerv(GL_SAMPLE_COVERAGE_VALUE, 0x000000016d419684);
+// data = { 0 }
+glGetError();
+
