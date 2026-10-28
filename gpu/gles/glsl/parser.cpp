@@ -743,6 +743,52 @@ private:
         sh_->blockStore.push_back(std::move(b));
     }
 
+    // A uniform struct (or array of structs) with samplers has no memory of its own: each leaf becomes a uniform named as GL
+    // names it ("u[1].tex", "u[0].arr[0]" for arrays), and postfix() replaces `u[1].tex` by that leaf (collapseSplit).
+    void splitUniform(Symbol* s) {
+        s->split = true;
+        addLeaves(s, s->name, "", s->type, 0);
+    }
+    void addLeaves(Symbol* root, const std::string& name, const std::string& path, const Type& t, uint8_t prec) {
+        if (t.base == Base::Struct && t.isArray()) {
+            for (int i = 0; i < t.dims[0]; ++i)
+                addLeaves(root, name + "[" + std::to_string(i) + "]", path + "[" + std::to_string(i) + "]", t.element(), prec);
+            return;
+        }
+        if (t.base == Base::Struct) {
+            for (const Member& m : t.st->members)
+                addLeaves(root, name + "." + m.name, path + "." + m.name, m.type, m.prec);
+            return;
+        }
+        Symbol* leaf = sh_->newSymbol();
+        leaf->name = name, leaf->type = t, leaf->storage = Storage::Uniform, leaf->prec = prec;
+        root->leaves[path] = leaf;
+        sh_->globals.push_back({leaf, nullptr});
+    }
+    // `e` selects a leaf of a split uniform (u[1].tex): the leaf as a plain variable. Partial selections stay as they are.
+    ExprP collapseSplit(ExprP e, int line) {
+        std::vector<const Expr*> chain;
+        const Expr* x = e.get();
+        while (x->k == EK::Index || x->k == EK::Field) chain.push_back(x), x = x->a[0].get();
+        if (x->k != EK::Var || !x->sym->split) return e;
+        std::string path;
+        for (auto it = chain.rbegin(); it != chain.rend(); ++it) {
+            const Expr& c = **it;
+            if (c.k == EK::Field) {
+                path += "." + c.a[0]->type.st->members[size_t(c.field)].name;
+            } else {
+                if (!c.a[1]->hasConst) errAt(line, "an array of structs holding samplers needs constant indices");
+                path += "[" + std::to_string(c.a[1]->constI) + "]";
+            }
+        }
+        if (e->type.base == Base::Struct) return e;
+        Symbol* leaf = x->sym->leaves.at(path);
+        leaf->used = true;
+        ExprP v = mkE(EK::Var, leaf->type, line);
+        v->sym = leaf;
+        return v;
+    }
+
     void globalDeclarators(const Qual& q, const Type& base, std::string name, int line) {
         for (;;) {
             Symbol* s = sh_->newSymbol();
@@ -822,7 +868,8 @@ private:
             for (int d : s->type.dims)
                 if (d == 0) errAt(line, "'" + name + "' : implicitly sized array without initialiser");
             declare(s, line);
-            sh_->globals.push_back({s, std::move(init)});
+            if (s->storage == Storage::Uniform && s->type.base == Base::Struct && s->type.containsSampler()) splitUniform(s);
+            else sh_->globals.push_back({s, std::move(init)});
             if (!acceptP(",")) break;
             name = expectIdent();
         }
@@ -1570,7 +1617,7 @@ private:
                 ExprP x = mkE(EK::Index, t, line);
                 x->a.push_back(std::move(e));
                 x->a.push_back(std::move(idx));
-                e = std::move(x);
+                e = collapseSplit(std::move(x), line);
                 continue;
             }
             if (acceptP(".")) {
@@ -1598,7 +1645,7 @@ private:
                     ExprP x = mkE(EK::Field, bt.st->members[size_t(idx)].type, line);
                     x->field = idx;
                     x->a.push_back(std::move(e));
-                    e = std::move(x);
+                    e = collapseSplit(std::move(x), line);
                     continue;
                 }
                 if (e->k == EK::Var && e->sym->storage == Storage::BlockInstance) {

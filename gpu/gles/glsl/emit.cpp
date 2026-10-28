@@ -433,7 +433,6 @@ private:
                         break;
                     }
                     if (s->type.containsSampler()) {
-                        if (s->type.base == Base::Struct) fail("samplers inside structs are not supported: '" + s->name + "'");
                         auto b = L_.samplerBinding.find(s->name);
                         if (b == L_.samplerBinding.end()) continue;
                         vi.storage = SC::UniformConstant;

@@ -118,6 +118,9 @@ struct Symbol {
     uint8_t prec = 0;                    // uniforms: declared precision (Member::prec)
     bool constant = false;               // a `const` whose value is a constant expression (usable in one)
     bool constParam = false;             // a function parameter declared `const`
+    // A uniform struct holding samplers: it has no storage of its own, every leaf ("u[1].tex") is a uniform of its own.
+    bool split = false;
+    std::map<std::string, Symbol*> leaves;  // path relative to the symbol ("[1].tex", ".a") -> leaf uniform
 };
 
 struct UniformBlockDecl {

@@ -1476,8 +1476,9 @@ bool Context::prepareDraw(GLenum mode, VkPrimitiveTopology& topo, uint32_t verte
                     return false;
                 }
                 const bool convert = needsCpuConversion(a, f) || (perInstance && divisor > 1);
-                if (convert || !vb) {
-                    // Client arrays and formats needing conversion: copied into the stream, tightly.
+                // A buffer range that does not start on a 4-byte boundary (glVertexAttribPointer accepts any byte offset) is not bound in place.
+                if (convert || !vb || (where & 3)) {
+                    // Client arrays, unaligned buffer offsets and formats needing conversion: copied into the stream, tightly.
                     const uint32_t outSize = convert ? 16u : esize;
                     Alloc s = stream(VkDeviceSize(rows) * outSize + 16, 16);
                     for (uint32_t r = firstRow; r < rows; ++r) {
@@ -1732,7 +1733,7 @@ bool Context::attribsDirect(Program& p, VertexArray* va) {
             const VertexBinding& vb = va->bindings[a.binding % kMaxVertexBindings];
             Buffer* b = vb.buffer ? buffer(vb.buffer) : nullptr;
             if (!b || !b->storage) return false;
-            if (needsCpuConversion(a, attribFormat(a)) || vb.divisor > 1) return false;
+            if (needsCpuConversion(a, attribFormat(a)) || vb.divisor > 1 || ((vb.offset + a.relativeOffset) & 3)) return false;
         }
     }
     return true;

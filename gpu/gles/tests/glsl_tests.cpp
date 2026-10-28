@@ -565,6 +565,25 @@ void testTextures() {
     const auto* arr = uniform(p, "tarr[0]");
     CHECK(arr && arr->arraySize == 2);
     CHECK(p.link.reflection.samplerCount == 8);
+    // A uniform array of structs holding samplers: every leaf is a uniform of its own, named as GL names it.
+    Program st = build(
+        "#version 300 es\n"
+        "in vec4 a;\n"
+        "void main() { gl_Position = a; }\n",
+        "#version 300 es\n"
+        "precision mediump float;\n"
+        "struct S { sampler2D a; samplerCube b; mediump float x[2]; };\n"
+        "uniform S u[2];\n"
+        "out vec4 o;\n"
+        "void main() { o = texture(u[1].a, vec2(0.5)) + texture(u[0].b, vec3(0.5)) + vec4(u[1].x[1]); }\n");
+    CHECK(st.ok);
+    if (st.ok) {
+        const auto* ua = uniform(st, "u[1].a");
+        const auto* ub = uniform(st, "u[0].b");
+        const auto* ux = uniform(st, "u[1].x[0]");
+        CHECK(ua && ua->glType == 0x8B5E && ub && ub->glType == 0x8B60 && ux && ux->arraySize == 2);
+        CHECK(!uniform(st, "u[0].a"));
+    }
     // ES 1.00 cube + EXT lod + shadow ext.
     Program q = build(
         "attribute vec4 a; varying vec3 d; uniform sampler2D vt; void main() { d = a.xyz; gl_Position = a + texture2DLod(vt, a.xy, 0.0); }",

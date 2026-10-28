@@ -190,7 +190,6 @@ LinkResult link(const std::shared_ptr<Shader>& vs, const std::shared_ptr<Shader>
             continue;
         }
         if (u.sym->type.containsSampler()) {
-            if (u.sym->type.base == Base::Struct) return error("samplers in structs are not supported ('" + n + "')");
             L.samplerBinding[n] = samplerBinding;
             Variable v;
             v.name = u.sym->type.isArray() ? n + "[0]" : n;
