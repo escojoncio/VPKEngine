@@ -1330,6 +1330,7 @@ struct MetalBackend::Impl {
   // VP_BUF_IMMUTABLE=0 (A/B): pipelines do not declare their read-only buffers (argument table, rate map data, draw
   // params) immutable. Part of the pipeline descriptor, hence of descriptorKey and of the binary archives' entries.
   bool bufImmutable = true;
+  bool fullBarriers = false;  // VPVK_FULL_BARRIERS=1: every encoder and every compute item waits for all earlier work (hazard vs math bisect)
   double exclWindowS = 5.0;
   std::mutex exclMutex;  // guards everything below
   std::map<uint64_t, ExclType> exclTypes;
@@ -1539,6 +1540,8 @@ void MetalBackend::Impl::init() {
   info(std::string("gpu.state elide on=") + (stateElide ? "1" : "0"));
   if (const char* x = std::getenv("VP_BUF_IMMUTABLE"); x && *x == '0') bufImmutable = false;
   info(std::string("gpu.state buf_immutable on=") + (bufImmutable ? "1" : "0"));
+  if (const char* x = std::getenv("VPVK_FULL_BARRIERS"); x && *x && *x != '0') fullBarriers = true;
+  info(std::string("gpu.state full_barriers on=") + (fullBarriers ? "1" : "0"));
   // Vertex amplification (multiview vertex shaders translated with VPVK_AMPLIFY=1 declare [[amplification_id]]).
   caps.vertexAmplification = [device supportsVertexAmplificationCount:2];
   if (exclOn || cbOrder)
@@ -5210,7 +5213,7 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
       boundary = true;
       before = compiled.barriers[b++].before;
     }
-    if (dumping) boundary = true, before = stage::vertex;  // serialised: dump copies sit between encoders
+    if (dumping || fullBarriers) boundary = true, before = stage::vertex;  // serialised: dump copies sit between encoders
     close();
     cutIfFull();  // before this encoder opens (the fences of the closed ones carry the order across the cut)
     // Draw budget: this render encoder would take the command buffer past it, so the buffer goes now
@@ -6163,7 +6166,7 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
     for (uint32_t k = 0; k < enc.commands.size(); ++k) {
       const Command& cmd = cmds[enc.commands[k]];
       const bool isDispatch = std::holds_alternative<Dispatch>(cmd);
-      bool wait = (k == 0 && boundary) || carryWait;
+      bool wait = (k == 0 && boundary) || carryWait || (fullBarriers && k > 0);
       StageMask waitBefore = (k == 0 ? before : 0) | carryBefore;
       carryWait = false;
       carryBefore = 0;
