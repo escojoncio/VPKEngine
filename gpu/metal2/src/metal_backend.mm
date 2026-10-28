@@ -1450,6 +1450,97 @@ struct MetalBackend::Impl {
   uint64_t nativeValue = 0, nativeSubmits = 0;
 };
 
+// EXPERIMENT (temporary): VPVK_SGSELFTEST=1 runs hand-written MSL kernels with the CTS subgroup patterns on the device and
+// logs what the SIMD ops return in divergent code (SGTEST lines).
+static void sgSelfTest(id<MTLDevice> dev, id<MTLCommandQueue> q, const std::function<void(const std::string&)>& say) {
+  @autoreleasepool {
+    static const char* kSrc = R"MSL(
+#include <metal_stdlib>
+using namespace metal;
+inline uint actv() { return as_type<uint2>(simd_vote::vote_t(simd_active_threads_mask())).x; }
+inline uint ball() { return as_type<uint2>(simd_vote::vote_t(simd_ballot(true))).x; }
+kernel void k_cts(device uint* out [[buffer(0)]], const device uint* d [[buffer(1)]],
+                  uint tid [[thread_position_in_grid]], uint lane [[thread_index_in_simdgroup]]) {
+  uint base = tid * 8u;
+  uint mask = ball();
+  uint ref = 0u;
+  for (uint i = 0u; i < 32u; ++i) if (((mask >> i) & 1u) != 0u) ref += d[i];
+  uint s1 = simd_sum(d[lane]);
+  out[base + 0] = ref; out[base + 1] = s1; out[base + 2] = mask;
+  if ((lane & 1u) == 1u) {
+    uint mask2 = ball();
+    uint ref2 = 0u;
+    for (uint i = 0u; i < 32u; ++i) if (((mask2 >> i) & 1u) != 0u) ref2 += d[i];
+    uint s2 = simd_sum(d[lane]);
+    out[base + 3] = ref2; out[base + 4] = s2; out[base + 5] = mask2; out[base + 6] = actv();
+    uint am = actv(); uint acc = 0u; uint x = d[lane];
+    for (uint k = 0u; k < 32u; ++k) { uint v = simd_shuffle(x, ushort(k)); if (((am >> k) & 1u) != 0u) acc += v; }
+    out[base + 7] = acc;
+  } else {
+    out[base + 3] = 0xEEEEu;
+  }
+}
+kernel void k_bf(device uint* out [[buffer(0)]], const device uint* d [[buffer(1)]],
+                 uint tid [[thread_position_in_grid]], uint lane [[thread_index_in_simdgroup]]) {
+  uint base = tid * 8u;
+  uint mask = ball();
+  uint first = 0u;
+  for (uint i = 0u; i < 32u; ++i) { if (((mask >> i) & 1u) != 0u) { first = i; break; } }
+  uint a = simd_broadcast_first(d[lane]);
+  uint am = actv();
+  uint b = simd_shuffle(d[lane], ushort(ctz(am)));
+  out[base + 0] = first; out[base + 1] = a; out[base + 2] = b; out[base + 3] = d[first];
+  if (first != lane) {
+    uint mask2 = ball();
+    uint first2 = 0u;
+    for (uint i = 0u; i < 32u; ++i) { if (((mask2 >> i) & 1u) != 0u) { first2 = i; break; } }
+    uint a2 = simd_broadcast_first(d[lane]);
+    uint am2 = actv();
+    uint b2 = simd_shuffle(d[lane], ushort(ctz(am2)));
+    out[base + 4] = first2; out[base + 5] = a2; out[base + 6] = b2; out[base + 7] = mask2;
+  } else {
+    out[base + 4] = 0xEEEEu;
+  }
+}
+)MSL";
+    NSError* e = nil;
+    id<MTLLibrary> lib = [dev newLibraryWithSource:@(kSrc) options:nil error:&e];
+    if (!lib) { say(std::string("SGTEST compile_failed ") + (e ? e.localizedDescription.UTF8String : "?")); return; }
+    uint32_t data[128];
+    for (uint32_t i = 0; i < 128; ++i) data[i] = (i + 1) * (i + 1) + 3;
+    struct Shape { uint32_t x, y, z; };
+    const Shape shapes[] = {{32, 1, 1}, {1, 4, 32}, {8, 1, 1}};
+    for (const char* kn : {"k_cts", "k_bf"}) {
+      id<MTLFunction> fn = [lib newFunctionWithName:@(kn)];
+      id<MTLComputePipelineState> ps = fn ? [dev newComputePipelineStateWithFunction:fn error:&e] : nil;
+      if (!ps) { say(std::string("SGTEST pipeline_failed ") + kn); continue; }
+      for (const Shape& sh : shapes) {
+        const uint32_t n = sh.x * sh.y * sh.z;
+        id<MTLBuffer> out = [dev newBufferWithLength:n * 8 * 4 options:MTLResourceStorageModeShared];
+        id<MTLBuffer> dd = [dev newBufferWithBytes:data length:sizeof data options:MTLResourceStorageModeShared];
+        memset(out.contents, 0xAB, n * 8 * 4);
+        id<MTLCommandBuffer> cb = [q commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        [enc setComputePipelineState:ps];
+        [enc setBuffer:out offset:0 atIndex:0];
+        [enc setBuffer:dd offset:0 atIndex:1];
+        [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(sh.x, sh.y, sh.z)];
+        [enc endEncoding];
+        [cb commit];
+        [cb waitUntilCompleted];
+        const uint32_t* o = static_cast<const uint32_t*>(out.contents);
+        for (uint32_t t : {0u, 1u, 2u, 3u, 31u}) {
+          if (t >= n) continue;
+          char buf[256];
+          std::snprintf(buf, sizeof buf, "SGTEST %s shape=%ux%ux%u tid=%u: %x %x %x | %x %x %x %x %x", kn, sh.x, sh.y, sh.z, t, o[t * 8 + 0],
+                        o[t * 8 + 1], o[t * 8 + 2], o[t * 8 + 3], o[t * 8 + 4], o[t * 8 + 5], o[t * 8 + 6], o[t * 8 + 7]);
+          say(buf);
+        }
+      }
+    }
+  }
+}
+
 void MetalBackend::Impl::init() {
   device = MTLCreateSystemDefaultDevice();
   if (!device) {
@@ -1458,6 +1549,7 @@ void MetalBackend::Impl::init() {
   }
   queue = [device newCommandQueueWithMaxCommandBufferCount:256];  // room for the draw-budget cuts
   queue.label = @"vpgpu";
+  if (const char* st = std::getenv("VPVK_SGSELFTEST"); st && *st == '1') sgSelfTest(device, queue, [this](const std::string& l) { info(l); });  // EXPERIMENT
   caps.simulator = TARGET_OS_SIMULATOR;
   caps.metal3 = [device supportsFamily:MTLGPUFamilyMetal3];
   caps.apple4 = [device supportsFamily:MTLGPUFamilyApple4];
