@@ -78,7 +78,7 @@ std::vector<Token> lex(const std::string& in, std::string& log) {
             for (size_t k = i; k < e + 2 && k < s.size(); ++k)
                 if (s[k] == '\n') {
                     Token t;
-                    t.kind = Tok::Newline, t.line = lineAt(k);
+                    t.kind = Tok::Newline, t.line = lineAt(k), t.ival = 1;  // ival 1: inside a comment
                     out.push_back(t);
                 }
             i = e + 2, space = true;
@@ -221,6 +221,7 @@ public:
         if (log_.size() != logBefore) ok_ = false;  // a character or literal the language does not have
         // Defaults before #version is seen.
         defineSimple("GL_ES", "1");
+        defineSimple("__VERSION__", "100");  // a shader without #version is ES 1.00 (#if __VERSION__ ... is valid)
         defineSimple("GL_FRAGMENT_PRECISION_HIGH", "1");
         for (const char* e : supportedExtensions()) defineSimple(e, "1");
         size_t i = 0;
@@ -228,7 +229,11 @@ public:
         while (toks[i].kind != Tok::End) {
             // Gather one line.
             std::vector<Token> line;
-            while (toks[i].kind != Tok::End && toks[i].kind != Tok::Newline) line.push_back(toks[i++]);
+            // (a newline inside a comment does not end a directive: the comment is one space)
+            while (toks[i].kind != Tok::End && (toks[i].kind != Tok::Newline || (toks[i].ival == 1 && !line.empty() && line[0].kind == Tok::Hash))) {
+                if (toks[i].kind != Tok::Newline) line.push_back(toks[i]);
+                ++i;
+            }
             if (toks[i].kind == Tok::Newline) ++i;
             if (line.empty()) continue;
             for (Token& t : line) t.line += lineDelta_;
@@ -260,7 +265,6 @@ public:
         }
         flushPending(true);
         if (!conds_.empty()) strict("unbalanced_conditional", toks.back().line, "unterminated #if");
-        if (!defines_.count("__VERSION__")) defineSimple("__VERSION__", "100");
         Token end;
         end.kind = Tok::End, end.line = toks.back().line;
         res_.tokens.push_back(end);
@@ -464,6 +468,8 @@ private:
         const std::vector<Token>& t;
         size_t i = 0;
         bool bad = false;
+        int skip = 0;                    // > 0 inside the operand a && / || short-circuits away: nothing in it is evaluated
+        const Token* undef = nullptr;    // first undefined identifier that was evaluated
         const Token* peek() { return i < t.size() ? &t[i] : nullptr; }
         bool is(const char* p) { return peek() && peek()->kind == Tok::Punct && peek()->text == p; }
         int64_t primary() {
@@ -481,7 +487,7 @@ private:
             if (is("+")) return ++i, primary();
             if (is("~")) return ++i, ~primary();
             if (k->kind == Tok::IntLit || k->kind == Tok::UintLit || k->kind == Tok::BoolLit) return ++i, int64_t(k->ival);
-            if (k->kind == Tok::Ident) return ++i, 0;  // undefined identifier: 0
+            if (k->kind == Tok::Ident) return ++i, (!skip && !undef ? (undef = k) : nullptr), 0;  // undefined identifier: 0
             bad = true;
             return 0;
         }
@@ -507,7 +513,10 @@ private:
                 if (p < 0 || p < minPrec) break;
                 std::string op = k->text;
                 ++i;
+                const bool skipped = (op == "&&" && !l) || (op == "||" && l);
+                skip += skipped;
                 int64_t r = expr(p + 1);
+                skip -= skipped;
                 if (op == "||") l = l || r;
                 else if (op == "&&") l = l && r;
                 else if (op == "|") l |= r;
@@ -524,8 +533,8 @@ private:
                 else if (op == "+") l += r;
                 else if (op == "-") l -= r;
                 else if (op == "*") l *= r;
-                else if (op == "/") l = r ? l / r : (bad = true, 0);
-                else if (op == "%") l = r ? l % r : (bad = true, 0);
+                else if (op == "/") l = r ? l / r : (skip ? 0 : (bad = true, 0));
+                else if (op == "%") l = r ? l % r : (skip ? 0 : (bad = true, 0));
             }
             return l;
         }
@@ -560,14 +569,11 @@ private:
         std::vector<Token> ex;
         std::set<std::string> hide;
         expand(pre, ex, hide);
-        for (const Token& t : ex)
-            if (t.kind == Tok::Ident) {  // GLSL ES: an identifier that is not a macro is an error, not 0
-                if (strict("undefined_identifier", line[0].line, "'" + t.text + "' : undefined identifier in a preprocessor expression"))
-                    return false;
-                break;
-            }
         Eval e{ex};
         int64_t v = e.expr(0);
+        // GLSL ES: an identifier that is not a macro is an error, not 0 (only when it is evaluated: `0 && AAA` is valid).
+        if (e.undef && strict("undefined_identifier", line[0].line, "'" + e.undef->text + "' : undefined identifier in a preprocessor expression"))
+            return false;
         if (e.bad || e.i != ex.size()) error(line[0].line, "invalid #if expression");
         return v != 0;
     }

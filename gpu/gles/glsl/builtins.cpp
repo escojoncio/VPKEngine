@@ -472,7 +472,7 @@ static std::optional<T> textureSig(const std::string& name, const TexCall& tc, c
     }
     if (s.ms && !tc.fetch && !tc.size) return std::nullopt;
     // Not in the GLSL ES 3.00 / 3.10 tables (3.20 and the shadow cube / array extensions add them).
-    if (!tc.legacy && c.version < 320 && s.shadow && !tc.size) {
+    if (!tc.legacy && !tc.gather && c.version < 320 && s.shadow && !tc.size) {
         const bool arr = s.dim == SDim::D2Array, cube = s.dim == SDim::Cube;
         if (((arr || cube) && tc.lod) || (arr && tc.offset) || (arr && !tc.lod && !tc.grad && a.size() > 2)) {
             if (!c.lenientAllows("shadow_overload")) return std::nullopt;

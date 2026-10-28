@@ -268,6 +268,11 @@ void testErrors() {
     CHECK(compileFails(Stage::Vertex, "#if A\n#endif\nvoid main() {}", "undefined identifier"));
     CHECK(compileFails(Stage::Vertex, "#ifdef A B\n#endif\nvoid main() {}", "extra tokens"));
     CHECK(compileFails(Stage::Vertex, "#undef __LINE__\nvoid main() {}", "predefined"));
+    // __VERSION__ is 100 without #version; `0 && AAA` / `1 || AAA` never evaluate AAA; a comment spanning lines does not end its #define.
+    CHECK(vpglsl::parse(Stage::Vertex, "#if __VERSION__ != 100\nfloat bad = ;\n#endif\nvoid main() { gl_Position = vec4(0.0); }").shader);
+    CHECK(vpglsl::parse(Stage::Vertex, "#if 0 && AAA\nfloat bad = ;\n#endif\n#if 1 || (BBB / 0)\n#endif\nvoid main() { gl_Position = vec4(0.0); }").shader);
+    CHECK(compileFails(Stage::Vertex, "#if 1 && AAA\n#endif\nvoid main() {}", "undefined identifier"));
+    CHECK(vpglsl::parse(Stage::Vertex, "#define R /* a\n b */ (1.0)\n#define R /* c */ (1.0)\nvoid main() { gl_Position = vec4(R); }").shader);
     CHECK(compileFails(Stage::Vertex, "#define e +1\nvoid main() { int n = 1e; }", "numeric literal"));
     CHECK(compileFails(Stage::Vertex, "#version 300 es\nprecision mediump float;\nvoid main() {}\n#extension all : bogus\n", "behavior"));
     CHECK(compileFails(Stage::Vertex, "#version 300 es\nprecision mediump float;\nin vec4 p;\nlowp centroid out float x; void main() {}", "wrong order"));
@@ -1107,6 +1112,19 @@ void testGather() {
         "#version 310 es\nprecision mediump float;\nuniform sampler2D t; in vec2 uv; out vec4 o;\n"
         "void main() { o = textureGather(t, uv) + textureGatherOffset(t, uv, ivec2(1)); }\n");
     CHECK(q.ok);
+    // ES 3.10 arrays of arrays: `float[2] a[3]` is 3 arrays of 2; implicit inner sizes come from the constructor / initialiser.
+    Program aoa = build(kTrivialVs,
+        "#version 310 es\nprecision mediump float;\nin vec2 uv; out vec4 o;\nvoid main() {\n"
+        "  float[2] a[3] = float[3][2](float[2](uv.x, uv.y), float[2](uv.x, uv.y), float[2](uv.x, uv.y));\n"
+        "  float x[][] = float[][](float[](uv.x, uv.y), float[](uv.y, uv.x));\n"
+        "  float[][] p = float[2][2](float[2](uv.x, uv.y), float[2](uv.x, uv.y)), q = float[2][3](float[3](uv.x, uv.y, 1.0), float[3](uv.x, uv.y, 1.0));\n"
+        "  o = vec4(a[2][1] + x[1][1] + p[0][1] + q[1][2], float(x.length() + q[0].length() + a[0].length()), 0.0, 1.0);\n}\n");
+    CHECK(aoa.ok);
+    // ES 3.10: gather over a shadow array (its table has textureGather[Offset] for sampler2DArrayShadow, unlike texture/textureOffset).
+    Program sa = build(kTrivialVs,
+        "#version 310 es\nprecision mediump float;\nuniform highp sampler2DArrayShadow t; in vec2 uv; out vec4 o;\n"
+        "void main() { o = textureGather(t, vec3(uv, 1.0), 0.5) + textureGatherOffset(t, vec3(uv, 1.0), 0.5, ivec2(-8, 7)); }\n");
+    CHECK(sa.ok);
     // Not in ES 3.00.
     CHECK(compileFails(Stage::Fragment, "#version 300 es\nprecision mediump float;\nuniform sampler2D t; in vec2 uv; out vec4 o;\nvoid main() { o = textureGather(t, uv); }\n", "no matching"));
     // gl_HelperInvocation: ES 3.10 and up.

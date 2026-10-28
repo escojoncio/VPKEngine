@@ -301,6 +301,10 @@ void Context::texImage(GLenum target, GLint level, GLenum internalFormat, GLsize
             if (fi->vk != given->vk) return setError(gl::INVALID_OPERATION);  // a format, but not the level's
             if (imageSize != GLsizei(size_t(compressedSize(*fi, uint32_t(w), uint32_t(h))) * uint32_t(std::max(d, 1))))
                 return setError(gl::INVALID_VALUE);
+            // The region must sit on block boundaries (its far edge may be the edge of the level).
+            if (xo % int(fi->blockW) || yo % int(fi->blockH) || (w % int(fi->blockW) && uint32_t(xo + w) != lv.w) ||
+                (h % int(fi->blockH) && uint32_t(yo + h) != lv.h))
+                return setError(gl::INVALID_OPERATION);
         } else if (GLenum e = transferError(*fi, format, type, true)) {
             return setError(e);
         }
@@ -319,6 +323,11 @@ void Context::texImage(GLenum target, GLint level, GLenum internalFormat, GLsize
                 last = size_t(imageSize);
             } else {
                 const uint32_t px0 = clientPixelBytes(format, type);
+                // The offset must be a multiple of the size of the basic machine unit of the type.
+                const uint32_t unit = (type == gl::BYTE || type == gl::UNSIGNED_BYTE) ? 1u
+                                      : (type == gl::SHORT || type == gl::UNSIGNED_SHORT || type == gl::HALF_FLOAT || type == 0x8033 ||
+                                         type == 0x8034 || type == 0x8363) ? 2u : 4u;
+                if (at % unit) return setError(gl::INVALID_OPERATION);
                 const size_t rl = unpackRowLength ? size_t(unpackRowLength) : size_t(w);
                 const size_t rowB = (rl * px0 + size_t(unpackAlignment) - 1) / size_t(unpackAlignment) * size_t(unpackAlignment);
                 const size_t ih = unpackImageHeight ? size_t(unpackImageHeight) : size_t(h);
@@ -437,16 +446,21 @@ void Context::copyImageSubData(GLuint srcName, GLenum srcTarget, GLint srcLevel,
     if (w == 0 || h == 0 || d == 0) return;
     const FormatInfo& sf = *side[0].image->format;
     const FormatInfo& df = *side[1].image->format;
-    const bool sameClass = sf.compressed == df.compressed && sf.texelBytes == df.texelBytes && sf.blockW == df.blockW &&
-                           sf.blockH == df.blockH && sf.depth == df.depth && sf.stencil == df.stencil;
+    // Same texel size, or a compressed format and an uncompressed one whose texel is as big as the block (extent counted in source texels).
+    const bool mixed = sf.compressed != df.compressed;
+    const bool sameClass = sf.texelBytes == df.texelBytes && sf.depth == df.depth && sf.stencil == df.stencil &&
+                           (mixed || (sf.blockW == df.blockW && sf.blockH == df.blockH));
     if (!sameClass) return setError(gl::INVALID_OPERATION);
+    const uint32_t sbw = sf.compressed ? sf.blockW : 1, sbh = sf.compressed ? sf.blockH : 1;
     const GLint o[2][3] = {{sx, sy, sz}, {dx, dy, dz}};
     for (int i = 0; i < 2; ++i) {
         const Side& sd = side[i];
-        if (o[i][0] < 0 || o[i][1] < 0 || o[i][2] < 0 || uint32_t(o[i][0] + w) > sd.levelW || uint32_t(o[i][1] + h) > sd.levelH ||
+        const FormatInfo& f = *sd.image->format;
+        const uint32_t rw = i == 0 ? uint32_t(w) : (uint32_t(w) + sbw - 1) / sbw * (f.compressed ? f.blockW : 1);
+        const uint32_t rh = i == 0 ? uint32_t(h) : (uint32_t(h) + sbh - 1) / sbh * (f.compressed ? f.blockH : 1);
+        if (o[i][0] < 0 || o[i][1] < 0 || o[i][2] < 0 || uint32_t(o[i][0]) + rw > sd.levelW || uint32_t(o[i][1]) + rh > sd.levelH ||
             uint32_t(o[i][2] + d) > sd.levelD)
             return setError(gl::INVALID_VALUE);
-        const FormatInfo& f = *sd.image->format;
         if (f.compressed && (o[i][0] % f.blockW || o[i][1] % f.blockH)) return setError(gl::INVALID_VALUE);
     }
     const bool anyDepthStencil = sf.depth || sf.stencil;

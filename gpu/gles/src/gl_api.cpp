@@ -47,7 +47,7 @@ GLenum GetError() {
 }
 
 const char* kExtensions[] = {
-    "GL_OES_element_index_uint", "GL_OES_packed_depth_stencil", "GL_OES_depth24", "GL_OES_depth32",
+    "GL_OES_element_index_uint", "GL_OES_packed_depth_stencil", "GL_OES_depth_texture", "GL_OES_depth24", "GL_OES_depth32",
     "GL_OES_rgb8_rgba8", "GL_OES_standard_derivatives", "GL_OES_texture_npot", "GL_OES_vertex_array_object",
     "GL_OES_EGL_image", "GL_OES_EGL_image_external", "GL_OES_EGL_image_external_essl3", "GL_OES_texture_half_float",
     "GL_OES_texture_half_float_linear", "GL_OES_texture_float", "GL_OES_texture_float_linear",
@@ -1113,8 +1113,19 @@ void DisableVertexAttribArray(GLuint i) {
     if (i >= kMaxVertexAttribs) return c->setError(gl::INVALID_VALUE);
     c->currentVao()->attribs[i].enabled = false;
 }
+// Vertex attribute types: the integer ones for glVertexAttribIPointer / IFormat, those and the float-convertible ones otherwise.
+bool attribTypeOk(GLenum type, bool integer) {
+    switch (type) {
+        case gl::BYTE: case gl::UNSIGNED_BYTE: case gl::SHORT: case gl::UNSIGNED_SHORT: case gl::INT: case gl::UNSIGNED_INT: return true;
+        case gl::FLOAT: case gl::HALF_FLOAT: case gl::HALF_FLOAT_OES: case gl::FIXED:
+        case gl::INT_2_10_10_10_REV: case gl::UNSIGNED_INT_2_10_10_10_REV: return !integer;
+        default: return false;
+    }
+}
 void attribPointer(Context* c, GLuint i, GLint size, GLenum type, bool norm, bool integer, GLsizei stride, const void* ptr) {
+    if (!attribTypeOk(type, integer)) return c->setError(gl::INVALID_ENUM, type);
     if (i >= kMaxVertexAttribs || size < 1 || size > 4 || stride < 0) return c->setError(gl::INVALID_VALUE, type);
+    if ((type == gl::INT_2_10_10_10_REV || type == gl::UNSIGNED_INT_2_10_10_10_REV) && size != 4) return c->setError(gl::INVALID_OPERATION, type);
     if (c->vao && !c->arrayBuffer && ptr) return c->setError(gl::INVALID_OPERATION, type);
     VertexArray* va = c->currentVao();
     VertexAttrib& a = va->attribs[i];
@@ -1141,6 +1152,10 @@ void VertexAttribDivisor(GLuint i, GLuint d) {
 }
 // ARB_vertex_attrib_binding (ES 3.1): separate format and buffer binding.
 bool attribFormatCheck(Context* c, GLuint i, GLint size, GLenum type, GLuint relOffset, bool integer) {
+    if (!c->vao) {  // the attribute binding state is not available on the default vertex array object
+        c->setError(gl::INVALID_OPERATION, type);
+        return false;
+    }
     if (i >= kMaxVertexAttribs || relOffset > 2047) {
         c->setError(gl::INVALID_VALUE, type);
         return false;
@@ -1149,16 +1164,13 @@ bool attribFormatCheck(Context* c, GLuint i, GLint size, GLenum type, GLuint rel
         c->setError(gl::INVALID_VALUE, type);
         return false;
     }
-    switch (type) {
-        case gl::BYTE: case gl::UNSIGNED_BYTE: case gl::SHORT: case gl::UNSIGNED_SHORT: case gl::INT: case gl::UNSIGNED_INT: break;
-        case gl::FLOAT: case gl::HALF_FLOAT: case gl::HALF_FLOAT_OES: case gl::FIXED:
-        case gl::INT_2_10_10_10_REV: case gl::UNSIGNED_INT_2_10_10_10_REV:
-            if (integer) {
-                c->setError(gl::INVALID_ENUM, type);
-                return false;
-            }
-            break;
-        default: c->setError(gl::INVALID_ENUM, type); return false;
+    if (!attribTypeOk(type, integer)) {
+        c->setError(gl::INVALID_ENUM, type);
+        return false;
+    }
+    if ((type == gl::INT_2_10_10_10_REV || type == gl::UNSIGNED_INT_2_10_10_10_REV) && size != 4) {
+        c->setError(gl::INVALID_OPERATION, type);
+        return false;
     }
     return true;
 }
@@ -1176,11 +1188,13 @@ void VertexAttribIFormat(GLuint i, GLint size, GLenum type, GLuint relOffset) {
 }
 void VertexAttribBinding(GLuint i, GLuint binding) {
     CTX()
+    if (!c->vao) return c->setError(gl::INVALID_OPERATION);
     if (i >= kMaxVertexAttribs || binding >= kMaxVertexBindings) return c->setError(gl::INVALID_VALUE);
     c->currentVao()->attribs[i].binding = binding;
 }
 void BindVertexBuffer(GLuint binding, GLuint buffer, GLintptr offset, GLsizei stride) {
     CTX()
+    if (!c->vao) return c->setError(gl::INVALID_OPERATION);
     if (binding >= kMaxVertexBindings || offset < 0 || stride < 0 || stride > 2048) return c->setError(gl::INVALID_VALUE);
     if (buffer && !c->buffer(buffer)) return c->setError(gl::INVALID_OPERATION);
     VertexBinding& b = c->currentVao()->bindings[binding];
@@ -1188,6 +1202,7 @@ void BindVertexBuffer(GLuint binding, GLuint buffer, GLintptr offset, GLsizei st
 }
 void VertexBindingDivisor(GLuint binding, GLuint divisor) {
     CTX()
+    if (!c->vao) return c->setError(gl::INVALID_OPERATION);
     if (binding >= kMaxVertexBindings) return c->setError(gl::INVALID_VALUE);
     c->currentVao()->bindings[binding].divisor = divisor;
 }
@@ -1305,8 +1320,9 @@ void DrawElementsInstanced(GLenum m, GLsizei n, GLenum t, const void* idx, GLsiz
     CTX()
     c->drawElements(m, n, t, idx, inst, 0);
 }
-void DrawRangeElements(GLenum m, GLuint, GLuint, GLsizei n, GLenum t, const void* idx) {
+void DrawRangeElements(GLenum m, GLuint start, GLuint end, GLsizei n, GLenum t, const void* idx) {
     CTX()
+    if (end < start) return c->setError(gl::INVALID_VALUE);
     c->drawElements(m, n, t, idx, 1, 0);
 }
 void DrawElementsBaseVertex(GLenum m, GLsizei n, GLenum t, const void* idx, GLint bv) {
@@ -1317,8 +1333,9 @@ void DrawElementsInstancedBaseVertex(GLenum m, GLsizei n, GLenum t, const void* 
     CTX()
     c->drawElements(m, n, t, idx, inst, bv);
 }
-void DrawRangeElementsBaseVertex(GLenum m, GLuint, GLuint, GLsizei n, GLenum t, const void* idx, GLint bv) {
+void DrawRangeElementsBaseVertex(GLenum m, GLuint start, GLuint end, GLsizei n, GLenum t, const void* idx, GLint bv) {
     CTX()
+    if (end < start) return c->setError(gl::INVALID_VALUE);
     c->drawElements(m, n, t, idx, 1, bv);
 }
 void DrawArraysIndirect(GLenum m, const void* indirect) {
@@ -1370,7 +1387,10 @@ void DeleteTextures(GLsizei n, const GLuint* names) {
         for (auto& u : c->units)
             for (GLuint* b : {&u.tex2D, &u.texCube, &u.tex3D, &u.tex2DArray, &u.texExternal, &u.tex2DMS, &u.texCubeArray, &u.tex2DMSArray, &u.texBuffer})
                 if (*b == x) *b = 0;
+        // Only the bound framebuffers (draw / read) lose the attachment; the others keep the name (they are incomplete until
+        // it is replaced, and still answer attachment queries with it).
         for (auto& [k, f] : c->fbos) {
+            if (k != c->drawFbo && k != c->readFbo) continue;
             for (auto& a : f->color)
                 if (a.kind == Attachment::Tex && a.name == x) a = {};
             if (f->depth.kind == Attachment::Tex && f->depth.name == x) f->depth = {};
@@ -1926,6 +1946,7 @@ void DeleteRenderbuffers(GLsizei n, const GLuint* names) {
         if (it->second->image) c->keep(it->second->image);
         if (c->renderbuffer == x) c->renderbuffer = 0;
         for (auto& [k, f] : c->fbos) {
+            if (k != c->drawFbo && k != c->readFbo) continue;  // see DeleteTextures
             for (auto& a : f->color)
                 if (a.kind == Attachment::Rbo && a.name == x) a = {};
             if (f->depth.kind == Attachment::Rbo && f->depth.name == x) f->depth = {};
@@ -1955,6 +1976,10 @@ void RenderbufferStorageMultisample(GLenum target, GLsizei samples, GLenum ifmt,
     if (!r) return c->setError(gl::INVALID_OPERATION, target);
     if (w < 0 || h < 0 || w > 16384 || h > 16384 || samples < 0) return c->setError(gl::INVALID_VALUE, target);
     if (samples > 4) return c->setError(gl::INVALID_OPERATION, target);  // above MAX_SAMPLES / the format's maximum
+    // Unsized base formats (GL_RGB, GL_DEPTH_COMPONENT, ...) are texture formats, not renderbuffer ones.
+    if (ifmt == gl::RGB || ifmt == gl::RGBA || ifmt == 0x1906 /*ALPHA*/ || ifmt == 0x1909 /*LUMINANCE*/ || ifmt == 0x190A /*LUMINANCE_ALPHA*/ ||
+        ifmt == gl::DEPTH_COMPONENT || ifmt == 0x84F9 /*DEPTH_STENCIL*/)
+        return c->setError(gl::INVALID_ENUM, target);
     const FormatInfo* f = formatFor(ifmt);
     if (!f || f->compressed || (!f->renderable && !(f->depth || f->stencil))) return c->setError(gl::INVALID_ENUM, target);
     if (r->image) c->keep(r->image);
@@ -2001,9 +2026,17 @@ void GetRenderbufferParameteriv(GLenum target, GLenum p, GLint* v) {
         default: c->setError(gl::INVALID_ENUM, p);
     }
 }
-void GetInternalformativ(GLenum, GLenum ifmt, GLenum p, GLsizei n, GLint* v) {
+void GetInternalformativ(GLenum target, GLenum ifmt, GLenum p, GLsizei n, GLint* v) {
     CTX()
     if (n < 0) return c->setError(gl::INVALID_VALUE);
+    if (target != 0x8D41 /* RENDERBUFFER */ && target != 0x9100 /* TEXTURE_2D_MULTISAMPLE */ && target != 0x9102 /* TEXTURE_2D_MULTISAMPLE_ARRAY */)
+        return c->setError(gl::INVALID_ENUM, target);
+    if (p != 0x80A9 && p != 0x9380) return c->setError(gl::INVALID_ENUM, p);
+    {
+        const FormatInfo* rf = formatFor(ifmt);
+        const bool unsized = ifmt == 0x1902 || (ifmt >= 0x1906 && ifmt <= 0x190A) || ifmt == 0x84F9;
+        if (unsized || !rf || !(rf->renderable || rf->depth || rf->stencil)) return c->setError(gl::INVALID_ENUM, ifmt);
+    }
     if (n < 1) return;
     if (p == 0x80A9 /* SAMPLES */) {
         const FormatInfo* f = formatFor(ifmt);
@@ -2093,6 +2126,9 @@ void FramebufferTexture2D(GLenum target, GLenum att, GLenum textarget, GLuint te
         if (textarget != gl::TEXTURE_2D && textarget != gl::TEXTURE_2D_MULTISAMPLE && !cube) return c->setError(gl::INVALID_ENUM, textarget);
         Texture* t = c->texture(tex);
         if (!t) return c->setError(gl::INVALID_OPERATION, target);
+        if (level < 0 || level > 14) return c->setError(gl::INVALID_VALUE, target);  // log2(MAX_TEXTURE_SIZE)
+        // The target must suit the texture (once it has one: a texture name that was never bound has none yet).
+        if (t->target && (cube ? t->target != gl::TEXTURE_CUBE_MAP : t->target != textarget)) return c->setError(gl::INVALID_OPERATION, target);
         a.kind = Attachment::Tex, a.name = tex, a.level = level;
         if (textarget >= gl::TEXTURE_CUBE_MAP_POSITIVE_X && textarget <= gl::TEXTURE_CUBE_MAP_NEGATIVE_Z)
             a.layer = GLint(textarget - gl::TEXTURE_CUBE_MAP_POSITIVE_X);
@@ -2105,13 +2141,27 @@ void FramebufferTextureLayer(GLenum target, GLenum att, GLuint tex, GLint level,
     if (!f) return;
     Attachment a;
     if (tex) {
-        if (!c->texture(tex)) return c->setError(gl::INVALID_OPERATION, target);
+        Texture* t = c->texture(tex);
+        if (!t) return c->setError(gl::INVALID_OPERATION, target);
+        // A layer of a 3D, 2D array (or cube array / multisample array) texture.
+        if (t->target && t->target != gl::TEXTURE_3D && t->target != gl::TEXTURE_2D_ARRAY && t->target != gl::TEXTURE_CUBE_MAP_ARRAY &&
+            t->target != gl::TEXTURE_2D_MULTISAMPLE_ARRAY)
+            return c->setError(gl::INVALID_OPERATION, target);
+        if (layer < 0 || layer > 2047 || level < 0 || level > 14) return c->setError(gl::INVALID_VALUE, target);  // MAX_3D_TEXTURE_SIZE / MAX_ARRAY_TEXTURE_LAYERS - 1
         a.kind = Attachment::Tex, a.name = tex, a.level = level, a.layer = layer;
     }
     setAttachment(c, f, att, a);
 }
 void FramebufferTexture(GLenum target, GLenum att, GLuint tex, GLint level) {
-    FramebufferTextureLayer(target, att, tex, level, 0);
+    CTX()
+    Framebuffer* f = targetFbo(c, target);
+    if (!f) return;
+    Attachment a;
+    if (tex) {
+        if (!c->texture(tex)) return c->setError(gl::INVALID_OPERATION, target);
+        a.kind = Attachment::Tex, a.name = tex, a.level = level;
+    }
+    setAttachment(c, f, att, a);
 }
 void FramebufferTexture3D(GLenum target, GLenum att, GLenum textarget, GLuint tex, GLint level, GLint zoffset) {
     CTX()
@@ -2169,6 +2219,11 @@ void GetFramebufferAttachmentParameteriv(GLenum target, GLenum att, GLenum p, GL
     GLuint n = target == gl::READ_FRAMEBUFFER ? c->readFbo : c->drawFbo;
     if (n == 0) {
         // Default framebuffer: BACK / DEPTH / STENCIL.
+        if (att != gl::BACK && att != gl::COLOR && att != gl::DEPTH && att != gl::STENCIL) {
+            const bool known = att == gl::DEPTH_ATTACHMENT || att == gl::STENCIL_ATTACHMENT || att == gl::DEPTH_STENCIL_ATTACHMENT ||
+                               (att >= gl::COLOR_ATTACHMENT0 && att < gl::COLOR_ATTACHMENT0 + kMaxDrawBuffers);
+            return c->setError(known ? gl::INVALID_OPERATION : gl::INVALID_ENUM, att);
+        }
         if (p == gl::FRAMEBUFFER_ATTACHMENT_OBJECT_TYPE) { *v = GLint(gl::FRAMEBUFFER_DEFAULT); return; }
         Context::FbInfo fb = c->resolveFramebuffer(0, true);
         const Image* img = att == gl::BACK || att == gl::COLOR ? fb.color[0].image : fb.depth.image;
@@ -2195,15 +2250,27 @@ void GetFramebufferAttachmentParameteriv(GLenum target, GLenum att, GLenum p, GL
         *v = a->kind == Attachment::None ? 0 : a->kind == Attachment::Tex ? GLint(gl::TEXTURE) : GLint(gl::RENDERBUFFER);
         return;
     }
-    if (a->kind == Attachment::None) return c->setError(gl::INVALID_OPERATION, target);
+    if (a->kind == Attachment::None) {
+        if (p == gl::FRAMEBUFFER_ATTACHMENT_OBJECT_NAME) { *v = 0; return; }
+        return c->setError(gl::INVALID_OPERATION, target);
+    }
+    const Texture* tex = a->kind == Attachment::Tex ? c->texture(a->name) : nullptr;
+    if (a->kind == Attachment::Rbo &&
+        (p == gl::FRAMEBUFFER_ATTACHMENT_TEXTURE_LEVEL || p == gl::FRAMEBUFFER_ATTACHMENT_TEXTURE_CUBE_MAP_FACE ||
+         p == gl::FRAMEBUFFER_ATTACHMENT_TEXTURE_LAYER || p == gl::FRAMEBUFFER_ATTACHMENT_TEXTURE_NUM_VIEWS_OVR ||
+         p == gl::FRAMEBUFFER_ATTACHMENT_TEXTURE_BASE_VIEW_INDEX_OVR))
+        return c->setError(gl::INVALID_ENUM, p);
+    const bool layered = tex && (tex->target == gl::TEXTURE_3D || tex->target == gl::TEXTURE_2D_ARRAY);
     Context::FbTarget t;
     uint32_t w, h;
     const FormatInfo* fi = c->targetOf(*a, t, w, h) ? t.image->format : nullptr;
     switch (p) {
         case gl::FRAMEBUFFER_ATTACHMENT_OBJECT_NAME: *v = GLint(a->name); return;
         case gl::FRAMEBUFFER_ATTACHMENT_TEXTURE_LEVEL: *v = a->level; return;
-        case gl::FRAMEBUFFER_ATTACHMENT_TEXTURE_CUBE_MAP_FACE: *v = GLint(gl::TEXTURE_CUBE_MAP_POSITIVE_X) + a->layer; return;
-        case gl::FRAMEBUFFER_ATTACHMENT_TEXTURE_LAYER: *v = a->layer; return;
+        case gl::FRAMEBUFFER_ATTACHMENT_TEXTURE_CUBE_MAP_FACE:
+            *v = tex && tex->target == gl::TEXTURE_CUBE_MAP ? GLint(gl::TEXTURE_CUBE_MAP_POSITIVE_X) + a->layer : 0;
+            return;
+        case gl::FRAMEBUFFER_ATTACHMENT_TEXTURE_LAYER: *v = layered ? a->layer : 0; return;
         case gl::FRAMEBUFFER_ATTACHMENT_TEXTURE_NUM_VIEWS_OVR: *v = a->numViews; return;
         case gl::FRAMEBUFFER_ATTACHMENT_TEXTURE_BASE_VIEW_INDEX_OVR: *v = a->baseView; return;
         case gl::FRAMEBUFFER_ATTACHMENT_COLOR_ENCODING: *v = fi && fi->srgb ? GLint(gl::SRGB) : GLint(gl::LINEAR_ENC); return;

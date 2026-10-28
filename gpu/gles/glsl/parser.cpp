@@ -564,7 +564,8 @@ private:
         if (!d.empty() && !es3() && (d.size() > 1 || !t.dims.empty())) err("arrays of arrays need GLSL ES 3.10");
         if (!d.empty() && pp_.version < 310 && (d.size() > 1 || !t.dims.empty()))
             strictAt("arrays_of_arrays", peek().line, "arrays of arrays need GLSL ES 3.10");
-        t.dims.insert(t.dims.end(), d.begin(), d.end());
+        // `float[5] a[3]` is an array of 3 arrays of 5: the dimensions after the name are the outer ones.
+        t.dims.insert(t.dims.begin(), d.begin(), d.end());
     }
 
     Type structSpecifier() {
@@ -923,9 +924,10 @@ private:
     }
 
     static void resolveImplicitSize(Type& decl, const Type& init, int line) {
-        if (!decl.dims.empty() && decl.dims[0] == 0) {
+        if (std::find(decl.dims.begin(), decl.dims.end(), 0) != decl.dims.end()) {
             if (init.dims.size() != decl.dims.size()) throw ParseError(line, "array initialiser shape mismatch");
-            decl.dims[0] = init.dims[0];
+            for (size_t k = 0; k < decl.dims.size(); ++k)
+                if (decl.dims[k] == 0) decl.dims[k] = init.dims[k];
         }
     }
 
@@ -1843,6 +1845,9 @@ private:
             if (!es3()) errAt(line, "array constructors need GLSL ES 3.00");
             if (t.dims[0] == 0) t.dims[0] = int(args.size());
             if (int(args.size()) != t.dims[0]) errAt(line, "array constructor: wrong number of elements");
+            // float[][](float[](..), ..): the inner sizes come from the first element.
+            for (size_t k = 1; k < t.dims.size(); ++k)
+                if (t.dims[k] == 0 && args[0]->type.dims.size() == t.dims.size() - 1) t.dims[k] = args[0]->type.dims[k - 1];
             Type et = t.element();
             for (auto& a : args)
                 if (a->type != et) errAt(line, "array constructor: element type mismatch");

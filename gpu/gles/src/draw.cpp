@@ -90,6 +90,11 @@ bool Context::targetOf(const Attachment& a, FbTarget& out, uint32_t& w, uint32_t
         Texture* t = texture(a.name);
         if (!t || !t->image) return false;
         if (uint32_t(a.level) >= t->image->levels) return false;
+        // A layer the texture does not have (3D: of the level's depth; array: of its layers) leaves the attachment incomplete.
+        if (!a.numViews) {
+            if (t->target == gl::TEXTURE_3D && uint32_t(a.layer) >= std::max(1u, t->image->depth >> a.level)) return false;
+            if (t->target == gl::TEXTURE_2D_ARRAY && uint32_t(a.layer) >= t->image->layers) return false;
+        }
         out.image = t->image.get();
         out.level = uint32_t(a.level);
         out.layer = uint32_t(a.numViews ? a.baseView : a.layer);
@@ -134,7 +139,8 @@ Context::FbInfo Context::resolveFramebuffer(GLuint name, bool forDraw) {
     }
     bool any = false, first = true;
     uint32_t views = 0;
-    auto take = [&](const Attachment& a, FbTarget& t, bool color) -> bool {
+    // kind: 0 colour, 1 depth, 2 stencil (the attached format must be renderable for that attachment point).
+    auto take = [&](const Attachment& a, FbTarget& t, int kind) -> bool {
         if (a.kind == Attachment::None) return true;
         uint32_t w = 0, h = 0;
         if (!targetOf(a, t, w, h)) {
@@ -142,8 +148,7 @@ Context::FbInfo Context::resolveFramebuffer(GLuint name, bool forDraw) {
             return false;
         }
         const FormatInfo* fi = t.image->format;
-        if (color ? (fi->depth || fi->stencil || (!fi->renderable && fi->baseFormat != gl::RGB && !fi->integer))
-                  : !(fi->depth || fi->stencil)) {
+        if (kind == 0 ? (fi->depth || fi->stencil || !fi->renderable) : kind == 1 ? !fi->depth : !fi->stencil) {
             fb.status = gl::FRAMEBUFFER_INCOMPLETE_ATTACHMENT;
             return false;
         }
@@ -161,9 +166,9 @@ Context::FbInfo Context::resolveFramebuffer(GLuint name, bool forDraw) {
         return true;
     };
     for (int i = 0; i < kMaxDrawBuffers; ++i)
-        if (!take(f->color[size_t(i)], fb.color[size_t(i)], true)) return fb;
-    if (!take(f->depth, fb.depth, false)) return fb;
-    if (!take(f->stencil, fb.stencil, false)) return fb;
+        if (!take(f->color[size_t(i)], fb.color[size_t(i)], 0)) return fb;
+    if (!take(f->depth, fb.depth, 1)) return fb;
+    if (!take(f->stencil, fb.stencil, 2)) return fb;
     if (fb.depth.image && fb.stencil.image && fb.depth.image != fb.stencil.image) {
         fb.status = gl::FRAMEBUFFER_UNSUPPORTED;  // separate depth and stencil images
         return fb;
@@ -1453,7 +1458,7 @@ static bool needsCpuConversion(const VertexAttrib& a, VkFormat f) {
            f == VK_FORMAT_R16_USCALED || f == VK_FORMAT_R16_SSCALED || f == VK_FORMAT_R16G16_USCALED ||
            f == VK_FORMAT_R16G16_SSCALED || f == VK_FORMAT_R16G16B16_USCALED || f == VK_FORMAT_R16G16B16_SSCALED ||
            f == VK_FORMAT_R16G16B16A16_USCALED || f == VK_FORMAT_R16G16B16A16_SSCALED ||
-           f == VK_FORMAT_A2B10G10R10_SSCALED_PACK32 || f == VK_FORMAT_A2B10G10R10_USCALED_PACK32 ||
+           f == VK_FORMAT_A2B10G10R10_SSCALED_PACK32 || f == VK_FORMAT_A2B10G10R10_USCALED_PACK32 || f == VK_FORMAT_A2B10G10R10_SNORM_PACK32 ||
            f == VK_FORMAT_R16G16B16_UNORM || f == VK_FORMAT_R16G16B16_SNORM || f == VK_FORMAT_R8G8B8_SINT ||
            f == VK_FORMAT_R8G8B8_UINT || f == VK_FORMAT_R16G16B16_SINT || f == VK_FORMAT_R16G16B16_UINT ||
            (a.type == gl::FIXED);
@@ -1517,11 +1522,6 @@ bool Context::prepareDraw(GLenum mode, VkPrimitiveTopology& topo, uint32_t verte
                           uint32_t instances, bool indexed, VkBuffer&) {
     const bool provokeOk = provokeOk_;
     provokeOk_ = false;
-    Program* p = graphicsProgram();
-    if (!p || !p->linked || !p->vsModule) {
-        setError(gl::INVALID_OPERATION);
-        return false;
-    }
     switch (mode) {
         case gl::POINTS: topo = VK_PRIMITIVE_TOPOLOGY_POINT_LIST; break;
         case gl::LINES: topo = VK_PRIMITIVE_TOPOLOGY_LINE_LIST; break;
@@ -1531,6 +1531,21 @@ bool Context::prepareDraw(GLenum mode, VkPrimitiveTopology& topo, uint32_t verte
         case gl::TRIANGLE_STRIP: topo = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP; break;
         case gl::TRIANGLE_FAN: topo = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN; break;
         default: setError(gl::INVALID_ENUM); return false;
+    }
+    // Errors in the order of the spec: mode, framebuffer completeness, transform feedback, then the program.
+    drawFb_ = resolveFramebuffer(drawFbo, true);
+    if (drawFb_.status != gl::FRAMEBUFFER_COMPLETE) {
+        setError(gl::INVALID_FRAMEBUFFER_OPERATION);
+        return false;
+    }
+    if (indexed && curTf().active && !curTf().paused) {
+        setError(gl::INVALID_OPERATION);  // no GL_EXT_geometry_shader: indexed draws are not allowed while capturing
+        return false;
+    }
+    Program* p = graphicsProgram();
+    if (!p || !p->linked || !p->vsModule) {
+        setError(gl::INVALID_OPERATION);
+        return false;
     }
     // `flat` varyings: GL takes the value from a primitive's LAST vertex, Vulkan/Metal from the FIRST. The draw becomes a
     // triangle/line list whose primitives are rotated so the last vertex comes first (a cyclic rotation keeps the winding).
@@ -1544,11 +1559,6 @@ bool Context::prepareDraw(GLenum mode, VkPrimitiveTopology& topo, uint32_t verte
             else if (mode == gl::LINES || mode == gl::LINE_STRIP || mode == gl::LINE_LOOP)
                 provoke_ = true, topo = VK_PRIMITIVE_TOPOLOGY_LINE_LIST;
         }
-    }
-    drawFb_ = resolveFramebuffer(drawFbo, true);
-    if (drawFb_.status != gl::FRAMEBUFFER_COMPLETE) {
-        setError(gl::INVALID_FRAMEBUFFER_OPERATION);
-        return false;
     }
     if (drawFb_.viewCount && drawFb_.viewCount != std::max(1u, p->refl.numViews) && p->refl.numViews > 1) {
         setError(gl::INVALID_OPERATION);  // OVR_multiview: num_views must match the framebuffer
@@ -2007,6 +2017,7 @@ void Context::drawIndirect(GLenum mode, GLenum indexType, const void* indirect) 
     if (indexType && indexType != gl::UNSIGNED_BYTE && indexType != gl::UNSIGNED_SHORT && indexType != gl::UNSIGNED_INT)
         return setError(gl::INVALID_ENUM, indexType);
     if (mode > gl::TRIANGLE_FAN) return setError(gl::INVALID_ENUM, mode);
+    if (!vao) return setError(gl::INVALID_OPERATION, mode);  // indirect draws need a vertex array object
     Program* p = graphicsProgram();
     if (!p || !p->linked || !p->vsModule) return setError(gl::INVALID_OPERATION);
     VertexArray* va = currentVao();

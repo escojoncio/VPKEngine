@@ -1331,6 +1331,24 @@ void testDraw() {
     CHECK(err() == gl::NO_ERROR && counts.draws == 2);
     CHECK(counts.lastFrontFace == VK_FRONT_FACE_CLOCKWISE);  // GL CCW, rows bottom-up
     CHECK(counts.pipelines == 1 && counts.passes == 1);  // pipeline and pass reused
+    // INT_2_10_10_10_REV normalizado: VPVulkan no lo lee en el pipeline (sin formato de vertice nativo), se convierte a float32 en la CPU.
+    {
+        const auto saved = counts;
+        const uint32_t packed[3] = {0x3FF, 0x1FF, 0x200};
+        GLuint pb;
+        glGenBuffers(1, &pb);
+        glBindBuffer(gl::ARRAY_BUFFER, pb);
+        glBufferData(gl::ARRAY_BUFFER, sizeof packed, packed, gl::STATIC_DRAW);
+        glVertexAttribPointer(GLuint(pos), 4, gl::INT_2_10_10_10_REV, 1, 4, nullptr);
+        glDrawArrays(gl::TRIANGLES, 0, 3);
+        CHECK(err() == gl::NO_ERROR);
+        bool f32 = false, snorm = false;
+        for (VkFormat f : counts.lastAttrFormats) f32 |= f == VK_FORMAT_R32G32B32A32_SFLOAT, snorm |= f == VK_FORMAT_A2B10G10R10_SNORM_PACK32;
+        CHECK(f32 && !snorm);
+        counts = saved;
+        glBindBuffer(gl::ARRAY_BUFFER, vb);
+        glVertexAttribPointer(GLuint(pos), 4, gl::FLOAT, 0, 24, nullptr);
+    }
     // Texture completeness uses the filter the unit really samples with: a sampler object bound to the unit overrides the
     // texture's own. A 4x4 texture with only level 0 defined (mutable) is incomplete with a mipmapped min filter (it samples
     // the black stand-in) and complete with LINEAR / NEAREST.
@@ -2184,6 +2202,23 @@ void testEs31() {
     counts = {};
     glCopyImageSubData(rb, gl::RENDERBUFFER, 0, 0, 0, 0, tex[1], gl::TEXTURE_2D, 0, 0, 0, 0, 8, 8, 1);
     CHECK(err() == gl::NO_ERROR && counts.copiesImage == 1);
+
+    // ---- error rules of the negative_api family
+    G(glDrawRangeElements, void (*)(GLenum, GLuint, GLuint, GLsizei, GLenum, const void*));
+    G(glGetInternalformativ, void (*)(GLenum, GLenum, GLenum, GLsizei, GLint*));
+    glDrawRangeElements(gl::TRIANGLES, 5, 1, 3, gl::UNSIGNED_SHORT, nullptr);
+    CHECK(err() == gl::INVALID_VALUE);  // end < start
+    GLint nif[2] = {-1, -1};
+    glGetInternalformativ(gl::TEXTURE_2D, gl::RGBA8, 0x80A9, 2, nif);
+    CHECK(err() == gl::INVALID_ENUM);  // not a multisample target
+    glGetInternalformativ(gl::RENDERBUFFER, gl::RGBA8, 0x1234, 2, nif);
+    CHECK(err() == gl::INVALID_ENUM);  // pname
+    glGetInternalformativ(gl::RENDERBUFFER, 0x1908 /* RGBA: unsized */, 0x80A9, 2, nif);
+    CHECK(err() == gl::INVALID_ENUM);  // not a renderable sized format
+    glVertexAttribPointer(0, 4, 0x7777, 0, 0, nullptr);
+    CHECK(err() == gl::INVALID_ENUM);
+    glVertexAttribPointer(0, 3, 0x8368 /* UNSIGNED_INT_2_10_10_10_REV */, 0, 0, nullptr);
+    CHECK(err() == gl::INVALID_OPERATION);  // packed types need size 4
 
     // ---- glProgramUniform*
     G(glProgramUniform1i, void (*)(GLuint, GLint, GLint));
