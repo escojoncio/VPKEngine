@@ -1066,6 +1066,15 @@ void testAtomics() {
         for (const auto& u : d.link.reflection.uniforms) at8 |= u.name == "c" && u.offset == 8;
         CHECK(at8);
     }
+    {  // A uniform shared by both stages takes the explicit location of whichever stage gives one.
+        Program l = build("#version 310 es\nin vec4 pos; uniform float u;\nvoid main() { gl_Position = pos * u; }\n",
+                          "#version 310 es\nprecision mediump float;\nlayout(location = 7) uniform float u;\nout vec4 o;\nvoid main() { o = vec4(u); }\n");
+        CHECK(l.ok);
+        int loc = -1;
+        for (const auto& u : l.link.reflection.uniforms)
+            if (u.name == "u") loc = u.uniformLocation;
+        CHECK(loc == 7);
+    }
 }
 
 void testGather() {

@@ -152,6 +152,7 @@ LinkResult link(const std::shared_ptr<Shader>& vs, const std::shared_ptr<Shader>
                     strict("binding_contradictory", "uniform '" + g.sym->name + "' has different bindings in the two stages"))
                     return r;
                 if (usedAnywhere(*s, g.sym)) u->stages |= stageBit(s->stage);
+                if (u->sym->location < 0 && g.sym->location >= 0) u->sym = g.sym;  // layout(location) in one stage places the uniform for both
                 continue;
             }
             uniforms.push_back({g.sym->name, {g.sym, usedAnywhere(*s, g.sym) ? stageBit(s->stage) : 0u}});
