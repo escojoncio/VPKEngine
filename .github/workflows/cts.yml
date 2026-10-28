@@ -227,6 +227,10 @@ jobs:
     env:
       VPVK_EXTRA_EXTENSIONS: "1"
       VPVK_QUEST_IDENTITY: "1"
+      # Conformance never drops a draw or dispatch for a slow compile on a loaded runner (defaults: 1.5-2 s).
+      VPVK_PIPELINE_PERSIST_WAIT_MS: "120000"
+      VPVK_PIPELINE_DRAW_WAIT_MS: "120000"
+      VPVK_TRANSLATE_WAIT_MS: "120000"
       VPVK_STRICT_FEATURES: "1"  # vkCreateDevice refuses features reported false (create_device_unsupported_features)
     concurrency:
       group: cts-smoke-${{ github.run_id }}
@@ -278,6 +282,10 @@ jobs:
     env:
       VPVK_EXTRA_EXTENSIONS: "1"
       VPVK_QUEST_IDENTITY: "1"
+      # Conformance never drops a draw or dispatch for a slow compile on a loaded runner (defaults: 1.5-2 s).
+      VPVK_PIPELINE_PERSIST_WAIT_MS: "120000"
+      VPVK_PIPELINE_DRAW_WAIT_MS: "120000"
+      VPVK_TRANSLATE_WAIT_MS: "120000"
       VPVK_STRICT_FEATURES: "1"
     concurrency:
       group: cts-focus-${{ github.ref }}
@@ -344,6 +352,10 @@ jobs:
     env:
       VPVK_EXTRA_EXTENSIONS: "1"
       VPVK_QUEST_IDENTITY: "1"
+      # Conformance never drops a draw or dispatch for a slow compile on a loaded runner (defaults: 1.5-2 s).
+      VPVK_PIPELINE_PERSIST_WAIT_MS: "120000"
+      VPVK_PIPELINE_DRAW_WAIT_MS: "120000"
+      VPVK_TRANSLATE_WAIT_MS: "120000"
       VPVK_STRICT_FEATURES: "1"  # vkCreateDevice refuses features reported false (create_device_unsupported_features)
     steps:
       - uses: actions/checkout@v4
