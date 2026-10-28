@@ -440,7 +440,15 @@ void GetInteger64v(GLenum p, GLint64* v) {
     CTX()
     double tmp[64];
     int n = queryState(c, p, tmp);
-    if (n < 0) return c->setError(gl::INVALID_ENUM, p);
+    if (n < 0) {
+        bool ok;
+        bool e = IsEnabledImpl(c, p, ok);
+        if (ok) {
+            v[0] = e;
+            return;
+        }
+        return c->setError(gl::INVALID_ENUM, p);
+    }
     for (int i = 0; i < n; ++i) v[i] = GLint64(tmp[i]);
 }
 void GetFloatv(GLenum p, GLfloat* v) {

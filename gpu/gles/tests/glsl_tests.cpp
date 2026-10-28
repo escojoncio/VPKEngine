@@ -1055,6 +1055,17 @@ void testAtomics() {
     CHECK(compileFails(Stage::Compute, head + "buffer B { float f; } b;\nvoid main() { atomicAdd(b.f, 1.0); }\n", "no matching"));
     CHECK(compileFails(Stage::Compute, head + "void main() { atomic_uint c; }\n", "local"));
     CHECK(compileFails(Stage::Vertex, "#version 300 es\nvoid main() { uint x = 0u; atomicAdd(x, 1u); gl_Position = vec4(0.0); }\n", "no matching"));
+    // A default offset (`layout(binding, offset) uniform atomic_uint;`) must be a multiple of 4 and moves the next counter.
+    CHECK(compileFails(Stage::Compute, head + "layout(binding = 0, offset = 1) uniform atomic_uint;\nlayout(binding = 0) uniform atomic_uint c;\nvoid main() { atomicCounterIncrement(c); }\n", "multiple of 4"));
+    {
+        Program d = build(kTrivialVs,
+            "#version 310 es\nprecision mediump float;\nlayout(binding = 0, offset = 8) uniform atomic_uint;\nlayout(binding = 0) uniform atomic_uint c;\n"
+            "in vec2 uv; out vec4 o;\nvoid main() { o = vec4(float(atomicCounterIncrement(c))); }\n");
+        CHECK(d.ok);
+        bool at8 = false;
+        for (const auto& u : d.link.reflection.uniforms) at8 |= u.name == "c" && u.offset == 8;
+        CHECK(at8);
+    }
 }
 
 void testGather() {

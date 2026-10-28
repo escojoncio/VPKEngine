@@ -653,7 +653,13 @@ private:
         }
         Type t = typeSpecifier();
         declTypePrec_ = tsPrec_;
-        if (acceptP(";")) return;  // struct declaration only
+        if (acceptP(";")) {  // struct declaration only, or `layout(binding = B, offset = O) uniform atomic_uint;` (default offset)
+            if (t.base == Base::AtomicUint && q.uniform && q.offset >= 0) {
+                if (q.offset % 4) errAt(line, "atomic counter offset must be a multiple of 4");
+                atomicNext_[std::max(0, q.binding)] = q.offset;
+            }
+            return;
+        }
         std::string name = expectIdent();
         if (name != "main") checkName(name, peek().line);
         if (isP("(")) {
