@@ -5220,7 +5220,7 @@ void testFoveation() {
 // CMake source fingerprint: a refactor that leaves the output alone keeps the digest (and every cache), a change of
 // output moves it. When this test fails the translator's OUTPUT changed: bump kLowerVersion (SPIR-V -> VPIR) or
 // kEmitVersion (VPIR -> MSL) in recipes.h, then update kCorpusDigest to the printed value in the same change.
-constexpr uint64_t kCorpusDigest = 0x1a593fdf16f6ed12ull;  // the "corpus digest" line the test prints
+constexpr uint64_t kCorpusDigest = 0xfe784e4cbed3a975ull;  // the "corpus digest" line the test prints
 
 uint64_t corpusDigest(unsigned& modules, unsigned& failed) {
   std::vector<std::string> names;

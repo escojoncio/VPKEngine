@@ -66,7 +66,7 @@ namespace vpvk {
 // BaseVertex/BaseInstance/DrawIndex); 9 robustBufferAccess; 10 loop nests bounded as a whole; 11 16-bit storage;
 // 12 Y'CbCr lowering; 13 VPKTAA nativo: UI fragment shaders with an extra mask output (uiMaskSlot).
 inline constexpr uint32_t kTranslatorBaseline = 13;
-inline constexpr uint32_t kLowerVersion = 5;  // 5: float -> integer conversions saturate (NaN = 0); 4: integer dot product, zero-initialised workgroup memory; 1: Invariant position, OpKill leaves loops, storage image access from use; 2: killExit on by default; 3: row-major matrices load one vector per memory row, one killExit check for a chain of kills
+inline constexpr uint32_t kLowerVersion = 6;  // 6: 16-bit float math (constants in binary16, hyperbolics / exp / log / atan / frexp / ldexp / cross / reflect / determinant in 32 bits); 5: float -> integer conversions saturate (NaN = 0); 4: integer dot product, zero-initialised workgroup memory; 1: Invariant position, OpKill leaves loops, storage image access from use; 2: killExit on by default; 3: row-major matrices load one vector per memory row, one killExit check for a chain of kills
 inline constexpr uint32_t kEmitVersion = 4;  // 4: robust storage-buffer bounds count the range rounded up to a word; 1: constant-only private arrays as program-scope `constant` tables; 2: no loop guard on loops that cannot repeat (switches, inlined calls); 3: vertex amplification view = amplification_id + vp_view_base (buffer 27)
 inline constexpr uint32_t kDriverVersion = 1;  // 1: StageIface keeps dualSource (Src1 blend factors need it)
 // What recipes.bin stores per record (`translator`): equal to 13 while every component is at 0, so files written

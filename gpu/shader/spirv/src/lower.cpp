@@ -188,6 +188,9 @@ uint32_t floatBits(float f) {
     return b;
 }
 
+// The constant bits of `f` as type `t`: binary16 for F16 (a literal's bits are read in the type's own width), else binary32.
+uint32_t fbits(Type t, float f) { return t.scalar == Scalar::F16 ? vpir::floatToHalf(f) : floatBits(f); }
+
 class Lowering {
 public:
     Lowering(const SpirvModule& m, const SpirvLowerOptions& o, vpir::Module& out, SpirvInterface& iface,
@@ -486,7 +489,7 @@ private:
         Type from = typeOfValue(v);
         if (from == to) return v;
         if (from.width != to.width) fail("internal: cast between widths");
-        if (from.isBool()) return tri(Op::Select, v, splat(to, to.isFloat() ? floatBits(1.f) : 1), splat(to, 0), to);
+        if (from.isBool()) return tri(Op::Select, v, splat(to, to.isFloat() ? fbits(to, 1.f) : 1), splat(to, 0), to);
         if (to.isBool()) return bin(Op::Ne, v, splat(from, 0), to);
         if (from.byteSize() == to.byteSize() && from.isInt() && to.isInt()) return un(Op::Bitcast, v, to);
         return un(Op::Convert, v, to);
@@ -4195,7 +4198,7 @@ private:
             // A depth texture reads as (D, 0, 0, 1): gathering g/b/a gives constants (Metal's
             // depth gather would return D for any component).
             Type rt = vt(w(in, 1));
-            return splat(rt, comp == 3 ? (rt.isFloat() ? floatBits(1.f) : 1u) : 0u);
+            return splat(rt, comp == 3 ? (rt.isFloat() ? fbits(rt, 1.f) : 1u) : 0u);
         }
         if (a.offsets4.size() == 4) {
             // textureGatherOffsets: texel i0j0 (component w) of the footprint at each offset.
@@ -4502,7 +4505,17 @@ private:
         // Integer operand as `s` (16-bit ones re-extended: S* functions sign-, U* zero-extend).
         auto ai = [&](uint32_t i, Scalar s) { return intOperand(w(in, 5 + i), s); };
         auto res = [&](ValueId v) { define1(id, castBits(v, t)); };
-        auto sv = [&](float f) { return splat(t, floatBits(f)); };
+        auto sv = [&](float f) { return splat(t, fbits(t, f)); };
+        // 16-bit floats: the approximations, hyperbolics, exp / log and frexp / ldexp run in 32 bits and the result is
+        // narrowed (their constants and bit tricks are 32-bit; half precision would also lose accuracy).
+        const bool h = t.scalar == Scalar::F16;
+        const Type wt = h ? Type(Scalar::F32, t.width) : t;
+        auto aw = [&](uint32_t i) {
+            ValueId v = a(i);
+            return h && typeOfValue(v).scalar == Scalar::F16 ? un(Op::Convert, v, Type(Scalar::F32, typeOfValue(v).width)) : v;
+        };
+        auto svw = [&](float f) { return splat(wt, floatBits(f)); };
+        auto resw = [&](ValueId v) { res(h ? un(Op::Convert, v, t) : v); };
         Type it(Scalar::I32, t.width), ut(Scalar::U32, t.width);
         switch (e) {
             case GLSL_Round: case GLSL_RoundEven: return res(un(Op::Round, a(0), t));
@@ -4525,40 +4538,43 @@ private:
             case GLSL_Floor: return res(un(Op::Floor, a(0), t));
             case GLSL_Ceil: return res(un(Op::Ceil, a(0), t));
             case GLSL_Fract: return res(un(Op::Fract, a(0), t));
-            case GLSL_Radians: return res(bin(Op::Mul, a(0), sv(0.017453292519943295f), t));
-            case GLSL_Degrees: return res(bin(Op::Mul, a(0), sv(57.29577951308232f), t));
+            case GLSL_Radians: return resw(bin(Op::Mul, aw(0), svw(0.017453292519943295f), wt));
+            case GLSL_Degrees: return resw(bin(Op::Mul, aw(0), svw(57.29577951308232f), wt));
             case GLSL_Sin: return res(un(Op::Sin, a(0), t));
             case GLSL_Cos: return res(un(Op::Cos, a(0), t));
             case GLSL_Tan: return res(bin(Op::Div, un(Op::Sin, a(0), t), un(Op::Cos, a(0), t), t));
-            case GLSL_Asin: return res(asinApprox(a(0), t));
-            case GLSL_Acos: return res(bin(Op::Sub, sv(1.5707963267948966f), asinApprox(a(0), t), t));
-            case GLSL_Atan: return res(atanApprox(a(0), t));
-            case GLSL_Atan2: return res(atan2Approx(a(0), a(1), t));
+            case GLSL_Asin: return resw(asinApprox(aw(0), wt));
+            case GLSL_Acos: return resw(bin(Op::Sub, svw(1.5707963267948966f), asinApprox(aw(0), wt), wt));
+            case GLSL_Atan: return resw(atanApprox(aw(0), wt));
+            case GLSL_Atan2: return resw(atan2Approx(aw(0), aw(1), wt));
             case GLSL_Sinh: case GLSL_Cosh: case GLSL_Tanh: {
-                ValueId ex = expE(a(0), t), enx = expE(un(Op::Neg, a(0), t), t);
-                ValueId s = bin(Op::Mul, bin(Op::Sub, ex, enx, t), sv(0.5f), t);
-                ValueId c = bin(Op::Mul, bin(Op::Add, ex, enx, t), sv(0.5f), t);
-                if (e == GLSL_Sinh) return res(s);
-                if (e == GLSL_Cosh) return res(c);
-                return res(bin(Op::Div, s, c, t));
+                ValueId ex = expE(aw(0), wt), enx = expE(un(Op::Neg, aw(0), wt), wt);
+                ValueId s = bin(Op::Mul, bin(Op::Sub, ex, enx, wt), svw(0.5f), wt);
+                ValueId c = bin(Op::Mul, bin(Op::Add, ex, enx, wt), svw(0.5f), wt);
+                if (e == GLSL_Sinh) return resw(s);
+                if (e == GLSL_Cosh) return resw(c);
+                return resw(bin(Op::Div, s, c, wt));
             }
             case GLSL_Asinh: case GLSL_Acosh: case GLSL_Atanh: {
-                ValueId x = a(0);
+                ValueId x = aw(0);
                 if (e == GLSL_Atanh) {
-                    ValueId q = bin(Op::Div, bin(Op::Add, sv(1), x, t), bin(Op::Sub, sv(1), x, t), t);
-                    return res(bin(Op::Mul, logE(q, t), sv(0.5f), t));
+                    ValueId q = bin(Op::Div, bin(Op::Add, svw(1), x, wt), bin(Op::Sub, svw(1), x, wt), wt);
+                    return resw(bin(Op::Mul, logE(q, wt), svw(0.5f), wt));
                 }
-                ValueId r = un(Op::Sqrt, bin(Op::Add, bin(Op::Mul, x, x, t), sv(e == GLSL_Asinh ? 1.f : -1.f), t), t);
-                return res(logE(bin(Op::Add, x, r, t), t));
+                ValueId r = un(Op::Sqrt, bin(Op::Add, bin(Op::Mul, x, x, wt), svw(e == GLSL_Asinh ? 1.f : -1.f), wt), wt);
+                return resw(logE(bin(Op::Add, x, r, wt), wt));
             }
             case GLSL_Pow: return res(bin(Op::Pow, a(0), a(1), t));
-            case GLSL_Exp: return res(expE(a(0), t));
-            case GLSL_Log: return res(logE(a(0), t));
+            case GLSL_Exp: return resw(expE(aw(0), wt));
+            case GLSL_Log: return resw(logE(aw(0), wt));
             case GLSL_Exp2: return res(un(Op::Exp2, a(0), t));
             case GLSL_Log2: return res(un(Op::Log2, a(0), t));
             case GLSL_Sqrt: return res(un(Op::Sqrt, a(0), t));
             case GLSL_InverseSqrt: return res(un(Op::Rsq, a(0), t));
-            case GLSL_Determinant: return define1(id, determinant(get(w(in, 5)), typeOf(w(in, 5))));
+            case GLSL_Determinant: {
+                ValueId d = determinant(get(w(in, 5)), typeOf(w(in, 5)));
+                return define1(id, t.scalar == Scalar::F16 ? un(Op::Convert, d, t) : d);
+            }
             case GLSL_Modf: case GLSL_ModfStruct: {
                 ValueId x = a(0);
                 Type xt = typeOfValue(x);
@@ -4598,9 +4614,10 @@ private:
                 return res(bin(Op::Mul, bin(Op::Mul, x, x, t), k, t));
             }
             case GLSL_Fma: return res(tri(Op::Fma, a(0), a(1), a(2), t));
-            case GLSL_Ldexp: return res(ldexpExact(a(0), ai(1, Scalar::I32), t));
+            case GLSL_Ldexp: return resw(ldexpExact(aw(0), ai(1, Scalar::I32), wt));
             case GLSL_Frexp: case GLSL_FrexpStruct: {
-                auto [m, ei] = frexpExact(a(0), t);
+                auto [m32, ei] = frexpExact(aw(0), wt);
+                ValueId m = h ? un(Op::Convert, m32, t) : m32;
                 if (e == GLSL_FrexpStruct) return define(id, Val{{m, ei}});
                 RPtr p = resolve(w(in, 6), true);
                 size_t at = 0;
@@ -4665,37 +4682,37 @@ private:
                 return res(un(Op::Length, d, t));
             }
             case GLSL_Cross: {
-                ValueId x = a(0), y = a(1);
+                ValueId x = aw(0), y = aw(1);
                 auto c = [&](uint32_t i) { return ext(x, i); };
                 auto d = [&](uint32_t i) { return ext(y, i); };
                 auto m = [&](ValueId p, ValueId q) { return bin(Op::Mul, p, q, vpir::kF32); };
                 ValueId r0 = bin(Op::Sub, m(c(1), d(2)), m(c(2), d(1)), vpir::kF32);
                 ValueId r1 = bin(Op::Sub, m(c(2), d(0)), m(c(0), d(2)), vpir::kF32);
                 ValueId r2 = bin(Op::Sub, m(c(0), d(1)), m(c(1), d(0)), vpir::kF32);
-                return res(vecOf({r0, r1, r2}, t));
+                return resw(vecOf({r0, r1, r2}, wt));
             }
             case GLSL_Normalize: {
                 if (t.width == 1) return res(select(bin(Op::Lt, a(0), sv(0), vpir::kBool), sv(-1), sv(1)));
                 return res(un(Op::Normalize, a(0), t));
             }
             case GLSL_FaceForward: {
-                ValueId d = dot(a(2), a(1));
-                return res(select(bin(Op::Lt, d, f32(0), vpir::kBool), a(0), un(Op::Neg, a(0), t)));
+                ValueId d = dot(aw(2), aw(1));
+                return resw(select(bin(Op::Lt, d, f32(0), vpir::kBool), aw(0), un(Op::Neg, aw(0), wt)));
             }
             case GLSL_Reflect: {
-                ValueId i0 = a(0), n = a(1);
+                ValueId i0 = aw(0), n = aw(1);
                 ValueId d = dot(n, i0);
                 ValueId k = splatValue(bin(Op::Mul, d, f32(2), vpir::kF32), t.width);
-                return res(bin(Op::Sub, i0, bin(Op::Mul, k, n, t), t));
+                return resw(bin(Op::Sub, i0, bin(Op::Mul, k, n, wt), wt));
             }
             case GLSL_Refract: {
-                ValueId i0 = a(0), n = a(1), eta = a(2);
+                ValueId i0 = aw(0), n = aw(1), eta = aw(2);
                 ValueId d = dot(n, i0);
                 ValueId k = bin(Op::Sub, f32(1), bin(Op::Mul, bin(Op::Mul, eta, eta, vpir::kF32),
                                                     bin(Op::Sub, f32(1), bin(Op::Mul, d, d, vpir::kF32), vpir::kF32), vpir::kF32), vpir::kF32);
                 ValueId s = bin(Op::Add, bin(Op::Mul, eta, d, vpir::kF32), un(Op::Sqrt, k, vpir::kF32), vpir::kF32);
-                ValueId r = bin(Op::Sub, bin(Op::Mul, splatValue(eta, t.width), i0, t), bin(Op::Mul, splatValue(s, t.width), n, t), t);
-                return res(select(bin(Op::Lt, k, f32(0), vpir::kBool), zeroOf(t), r));
+                ValueId r = bin(Op::Sub, bin(Op::Mul, splatValue(eta, t.width), i0, wt), bin(Op::Mul, splatValue(s, t.width), n, wt), wt);
+                return resw(select(bin(Op::Lt, k, f32(0), vpir::kBool), zeroOf(wt), r));
             }
             case GLSL_FindILsb: {
                 ValueId x = ai(0, Scalar::U32);
@@ -4814,7 +4831,10 @@ private:
     }
     ValueId determinant(const Val& m, uint32_t typeId) {
         uint32_t n = T(typeId).count;
-        auto e = [&](uint32_t c, uint32_t r) { return ext(m.v[c], r); };
+        auto e = [&](uint32_t c, uint32_t r) {  // 16-bit matrices: computed in 32 bits, narrowed by the caller
+            ValueId v = ext(m.v[c], r);
+            return typeOfValue(v).scalar == Scalar::F16 ? un(Op::Convert, v, vpir::kF32) : v;
+        };
         if (n == 2) return det2(e(0, 0), e(1, 0), e(0, 1), e(1, 1));
         if (n == 3) {
             ValueId c0 = bin(Op::Mul, e(0, 0), det2(e(1, 1), e(2, 1), e(1, 2), e(2, 2)), vpir::kF32);

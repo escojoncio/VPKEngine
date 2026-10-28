@@ -889,6 +889,34 @@ void floatToInt(const std::string& dir) {
     }
 }
 
+// 16-bit float GLSL.std.450 functions (f16math.comp.spvasm), evaluated: their constants must be binary16 and their
+// bit tricks / approximations run in 32 bits. in = {180, 1, -2, 11}.
+void f16Math(const std::string& dir) {
+    spirv::SpirvLowerOptions o;
+    o.entry = "main";
+    o.stage = vpir::Stage::Compute;
+    o.layout = {bind(0, 0, vpgpu::BindKind::Buffer, 0), bind(0, 1, vpgpu::BindKind::Buffer, 1)};
+    Result r = run(dir + "/f16math.comp.spv", o);
+    CHECK(r.ok);
+    if (!r.ok) return;
+    const float in[4] = {180.f, 1.f, -2.f, 11.f};
+    vpireval::Invocation inv;
+    inv.memory[0].resize(16);
+    std::memcpy(inv.memory[0].data(), in, 16);
+    inv.memory[1].assign(24, 0);
+    std::string err;
+    CHECK(vpireval::run(r.module, inv, err));
+    if (!err.empty()) std::fprintf(stderr, "  eval: %s\n", err.c_str());
+    float got[6] = {};
+    if (inv.memory[1].size() >= 24) std::memcpy(got, inv.memory[1].data(), 24);
+    const float want[6] = {3.14159265f, 2.71828183f, -1.f, 29937.07f, 0.78539816f, 16.f};
+    for (int i = 0; i < 6; ++i) {
+        const bool good = std::fabs(got[i] - want[i]) <= 2e-3f * std::fabs(want[i]);  // half precision
+        CHECK(good);
+        if (!good) std::fprintf(stderr, "  [%d] got %g want %g\n", i, double(got[i]), double(want[i]));
+    }
+}
+
 // shaderZeroInitializeWorkgroupMemory: a Workgroup variable with an OpConstantNull initializer is cleared by a
 // strided loop over the threadgroup array and a barrier before the body (zeroinit.comp.spvasm).
 void zeroInit(const std::string& dir) {
@@ -1555,6 +1583,7 @@ int main(int argc, char** argv) {
     else if (c == "dot") dotProduct(dir);
     else if (c == "zero_init") zeroInit(dir);
     else if (c == "float_to_int") floatToInt(dir);
+    else if (c == "f16_math") f16Math(dir);
     else if (c == "ycbcr") ycbcr(dir);
     else if (c == "robust") robust(dir);
     else if (c == "correctness") correctness(dir);
