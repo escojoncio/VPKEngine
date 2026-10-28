@@ -224,6 +224,12 @@ void Context::texImage(GLenum target, GLint level, GLenum internalFormat, GLsize
     Texture* t = boundTexture(bindTarget(target));
     if (!t) return setError(gl::INVALID_OPERATION);
     if (level < 0 || w < 0 || h < 0 || d < 0 || level > 16) return setError(gl::INVALID_VALUE);
+    {  // MAX_TEXTURE_SIZE / MAX_CUBE_MAP_TEXTURE_SIZE 16384, MAX_3D_TEXTURE_SIZE and MAX_ARRAY_TEXTURE_LAYERS 2048 (gl_api.cpp)
+        const bool vol = target == gl::TEXTURE_3D;
+        const GLsizei limit = vol ? 2048 : 16384;
+        if (w > limit || h > limit || ((vol || target == gl::TEXTURE_2D_ARRAY) && d > 2048) || level > (vol ? 11 : 14))
+            return setError(gl::INVALID_VALUE);
+    }
     const bool cube = isCubeFace(target);
     if (target == gl::TEXTURE_CUBE_MAP) return setError(gl::INVALID_ENUM);
     // Targets that bind but cannot hold image data here (cube array, buffer texture, multisample array).
@@ -335,6 +341,9 @@ void Context::texStorage(GLenum target, GLsizei levels, GLenum internalFormat, G
     if (!t) return setError(gl::INVALID_OPERATION);
     if (t->immutable) return setError(gl::INVALID_OPERATION);
     if (levels < 1 || w < 1 || h < 1 || d < 1) return setError(gl::INVALID_VALUE);
+    if (w > (target == gl::TEXTURE_3D ? 2048 : 16384) || h > (target == gl::TEXTURE_3D ? 2048 : 16384) ||
+        ((target == gl::TEXTURE_3D || target == gl::TEXTURE_2D_ARRAY) && d > 2048))
+        return setError(gl::INVALID_VALUE);
     const FormatInfo* fi = formatFor(internalFormat);
     if (!fi || (fi->internal != internalFormat && !fi->compressed)) return setError(gl::INVALID_ENUM);
     if (uint32_t(levels) > mipCount(uint32_t(w), uint32_t(h), target == gl::TEXTURE_3D ? uint32_t(d) : 1))
