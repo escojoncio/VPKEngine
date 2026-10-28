@@ -18,8 +18,8 @@ struct Surface {
     const Config* config = nullptr;
     uint32_t width = 0, height = 0;
     ImageP color;          // colour buffer (memory row 0 = GL row 0)
-    ImageP depthStencil;   // optional (multisampled when the config has samples)
-    uint32_t msSamples = 1;  // multisampled configs: the colour is rendered in a transient multisample twin of `color` (never stored)
+    ImageP depthStencil;   // optional, single-sample (a multisample config renders it in a transient twin, like `color`)
+    uint32_t msSamples = 1;  // multisampled configs: colour and depth/stencil are rendered in transient multisample twins (never stored)
     void* window = nullptr;  // ANativeWindow (opaque)
     uint64_t presented = 0;
     int swapInterval = 1;

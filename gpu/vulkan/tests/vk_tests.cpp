@@ -4690,6 +4690,31 @@ void testMsaaForce() {
       CHECK(!discarding(mc, g1, sd, vpgpu::StoreAction::Resolve, gs).depth.autoMsaa);
       for (vpgpu::TextureId t : {sd, gs}) c.gpu().destroy(t);
     }
+    {  // a transient image (the GLES layer's multisample twin) never keeps its samples: a Load is a seed from the resolve target
+      auto mkT = [&](vpgpu::Format f) {
+        vpgpu::TextureDesc td;
+        td.format = f, td.width = 640, td.height = 480, td.samples = 4, td.samplesReadable = false, td.transient = true;
+        td.usage = vpgpu::formatInfo(f).depth() ? vpgpu::usage::depthTarget : vpgpu::usage::colorTarget;
+        return c.gpu().createTexture(td);
+      };
+      const vpgpu::TextureId tc = mkT(vpgpu::Format::RGBA8Unorm), tz = mkT(vpgpu::Format::D32Float);
+      OpBeginRendering b;
+      b.area = {{0, 0}, {640, 480}};
+      b.desc.colors[0].texture = tc, b.desc.colors[0].store = vpgpu::StoreAction::Resolve, b.desc.colors[0].resolve = g1;
+      b.desc.colors[0].load = vpgpu::LoadAction::Load;
+      b.desc.depth.texture = tz, b.desc.depth.store = vpgpu::StoreAction::Resolve, b.desc.depth.resolve = gd1;
+      b.desc.depth.load = vpgpu::LoadAction::Load;
+      OpDraw geo;
+      geo.draw.count = 3;
+      Recorder rec;
+      rec.ops.emplace_back(b), rec.ops.emplace_back(geo), rec.ops.emplace_back(OpEndPass{});
+      vpgpu::Frame f;
+      TranslateStats st;
+      translate(rec, f, st, nullptr, nullptr, nullptr, nullptr, d);
+      const vpgpu::RenderPassDesc r = std::get<vpgpu::RenderPass>(f.commands().at(0)).desc;
+      CHECK(r.colors[0].autoMsaa && r.depth.autoMsaa && r.depth.resolve == gd1 && r.depth.store == vpgpu::StoreAction::Resolve);
+      for (vpgpu::TextureId t : {tc, tz}) c.gpu().destroy(t);
+    }
     // The 1x attachment images get no extra usage from the game's own MSAA (a resolve target that is not readable is skipped above).
     auto img = [&](VkImageUsageFlags u, VkSampleCountFlagBits n) {
       VkImageCreateInfo ii{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
