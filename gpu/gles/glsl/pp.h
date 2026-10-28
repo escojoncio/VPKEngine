@@ -10,7 +10,7 @@
 
 namespace vpglsl {
 
-enum class Tok : uint8_t { End, Ident, IntLit, UintLit, FloatLit, BoolLit, Punct, Newline, Hash };
+enum class Tok : uint8_t { End, Ident, IntLit, UintLit, FloatLit, BoolLit, Punct, Newline, Hash, Bad };  // Bad: a character the language does not have
 
 struct Token {
     Tok kind = Tok::End;

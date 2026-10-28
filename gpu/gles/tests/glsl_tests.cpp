@@ -251,6 +251,17 @@ void testErrors() {
     CHECK(compileFails(Stage::Vertex, "void main() { float x = float(1u); }", "unsigned"));
     CHECK(compileFails(Stage::Vertex, "#version 300 es\nvoid main() { gl_ViewID_OVR; }", "GL_OVR_multiview"));
     CHECK(compileFails(Stage::Vertex, "float gl_x; void main() {}", "reserved"));
+    // Keywords and reserved words cannot be identifiers; the preprocessor is strict.
+    CHECK(compileFails(Stage::Vertex, "#version 300 es\nvoid main() { float else = 1.0; }", "reserved word"));
+    CHECK(compileFails(Stage::Vertex, "void main() { float class = 1.0; }", "reserved word"));
+    CHECK(compileFails(Stage::Vertex, "#define A 1\n#define A 2\nvoid main() {}", "redefinition"));
+    CHECK(compileFails(Stage::Vertex, "#define F(a,a) a\nvoid main() {}", "duplicate"));
+    CHECK(compileFails(Stage::Vertex, "#if A\n#endif\nvoid main() {}", "undefined identifier"));
+    CHECK(compileFails(Stage::Vertex, "#ifdef A B\n#endif\nvoid main() {}", "extra tokens"));
+    CHECK(compileFails(Stage::Vertex, "#undef __LINE__\nvoid main() {}", "predefined"));
+    CHECK(compileFails(Stage::Vertex, "#define e +1\nvoid main() { int n = 1e; }", "numeric literal"));
+    CHECK(compileFails(Stage::Vertex, "#version 300 es\nprecision mediump float;\nvoid main() {}\n#extension all : bogus\n", "behavior"));
+    CHECK(compileFails(Stage::Vertex, "#version 300 es\nprecision mediump float;\nin vec4 p;\nlowp centroid out float x; void main() {}", "wrong order"));
 }
 
 void testEs100() {

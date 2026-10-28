@@ -118,7 +118,46 @@ private:
         }
         return nullptr;
     }
+    // Keywords and reserved words cannot name anything the shader declares (GLSL ES 1.00 / 3.00 / 3.10 spec, "Keywords").
+    void checkName(const std::string& n, int line) const {
+        static const std::set<std::string> kw100 = {
+            "attribute", "const", "uniform", "varying", "break", "continue", "do", "for", "while", "if", "else", "in", "out", "inout",
+            "float", "int", "void", "bool", "true", "false", "lowp", "mediump", "highp", "precision", "invariant", "discard", "return",
+            "mat2", "mat3", "mat4", "vec2", "vec3", "vec4", "ivec2", "ivec3", "ivec4", "bvec2", "bvec3", "bvec4", "sampler2D",
+            "samplerCube", "struct",
+            // reserved
+            "asm", "class", "union", "enum", "typedef", "template", "this", "packed", "goto", "switch", "default", "inline", "noinline",
+            "volatile", "public", "static", "extern", "external", "interface", "flat", "long", "short", "double", "half", "fixed",
+            "unsigned", "superp", "input", "output", "hvec2", "hvec3", "hvec4", "dvec2", "dvec3", "dvec4", "fvec2", "fvec3", "fvec4",
+            "sampler1D", "sampler3D", "sampler1DShadow", "sampler2DShadow", "sampler2DRect", "sampler3DRect", "sampler2DRectShadow",
+            "sizeof", "cast", "namespace", "using"};
+        static const std::set<std::string> kw300 = {
+            "const", "uniform", "layout", "centroid", "flat", "smooth", "break", "continue", "do", "for", "while", "switch", "case",
+            "default", "if", "else", "in", "out", "inout", "float", "int", "void", "bool", "true", "false", "invariant", "discard",
+            "return", "mat2", "mat3", "mat4", "mat2x2", "mat2x3", "mat2x4", "mat3x2", "mat3x3", "mat3x4", "mat4x2", "mat4x3", "mat4x4",
+            "vec2", "vec3", "vec4", "ivec2", "ivec3", "ivec4", "bvec2", "bvec3", "bvec4", "uint", "uvec2", "uvec3", "uvec4", "lowp",
+            "mediump", "highp", "precision", "sampler2D", "sampler3D", "samplerCube", "sampler2DShadow", "samplerCubeShadow",
+            "sampler2DArray", "sampler2DArrayShadow", "isampler2D", "isampler3D", "isamplerCube", "isampler2DArray", "usampler2D",
+            "usampler3D", "usamplerCube", "usampler2DArray", "struct",
+            // reserved
+            "attribute", "varying", "coherent", "restrict", "readonly", "writeonly", "resource", "atomic_uint", "noperspective",
+            "patch", "sample", "subroutine", "common", "partition", "active", "asm", "class", "union", "enum", "typedef", "template",
+            "this", "goto", "inline", "noinline", "volatile", "public", "static", "extern", "external", "interface", "long", "short",
+            "double", "half", "fixed", "unsigned", "superp", "input", "output", "hvec2", "hvec3", "hvec4", "dvec2", "dvec3", "dvec4",
+            "fvec2", "fvec3", "fvec4", "sampler3DRect", "filter", "image1D", "image2D", "image3D", "imageCube", "iimage1D", "iimage2D",
+            "iimage3D", "iimageCube", "uimage1D", "uimage2D", "uimage3D", "uimageCube", "image1DArray", "image2DArray", "iimage1DArray",
+            "iimage2DArray", "uimage1DArray", "uimage2DArray", "imageBuffer", "iimageBuffer", "uimageBuffer", "sampler1D",
+            "sampler1DShadow", "sampler1DArray", "sampler1DArrayShadow", "isampler1D", "isampler1DArray", "usampler1D",
+            "usampler1DArray", "sampler2DRect", "sampler2DRectShadow", "isampler2DRect", "usampler2DRect", "samplerBuffer",
+            "isamplerBuffer", "usamplerBuffer", "sampler2DMS", "isampler2DMS", "usampler2DMS", "sampler2DMSArray", "isampler2DMSArray",
+            "usampler2DMSArray", "sizeof", "cast", "namespace", "using"};
+        const bool bad = es3() ? (kw300.count(n) != 0 || (pp_.version >= 310 && (n == "buffer" || n == "shared")))
+                               : (kw100.count(n) != 0 || n.find("__") != std::string::npos);
+        if (bad) errAt(line, "'" + n + "' : reserved word or keyword used as an identifier");
+        if (n.size() > 1024) errAt(line, "'" + n.substr(0, 16) + "...' : identifier too long");
+    }
     void declare(Symbol* s, int line) {
+        if (s->storage != Storage::Builtin) checkName(s->name, line);
         if (s->name.rfind("gl_", 0) == 0 && s->storage != Storage::Builtin)
             errAt(line, "'" + s->name + "' : identifiers starting with \"gl_\" are reserved");
         auto& v = scopes_.back().vars;
@@ -359,10 +398,28 @@ private:
         expectP(")");
     }
 
-    Qual qualifiers() {
+    // `param`: a function parameter (const, then in/out/inout, then precision). Before GLSL ES 3.10 the order of
+    // the qualifiers is fixed: [layout] [invariant] [smooth|flat] [centroid] [storage] [precision].
+    Qual qualifiers(bool param = false) {
         Qual q;
+        int lastRank = 0;
+        bool sawStorage = false;
         while (peek().kind == Tok::Ident && qualifierWord(peek().text)) {
+            const int wline = peek().line;
             std::string w = next().text;
+            if (pp_.version < 310) {
+                int rank;
+                if (w == "layout") rank = 0;
+                else if (param) rank = w == "const" ? 1 : w == "in" || w == "out" || w == "inout" ? 2 : 3;
+                else if (w == "invariant") rank = 1;
+                else if (w == "smooth" || w == "flat") rank = 2;
+                else if (w == "highp" || w == "mediump" || w == "lowp") rank = 4;
+                else rank = 3;  // centroid, const, in, out, uniform, attribute, varying
+                if (rank < lastRank || (!param && w == "centroid" && sawStorage))
+                    errAt(wline, "'" + w + "' : qualifiers in the wrong order");
+                lastRank = rank;
+                if (!param && rank == 3 && w != "centroid") sawStorage = true;
+            }
             if (w == "const") q.isConst = true;
             else if (w == "uniform") q.uniform = true;
             else if (w == "in") q.in = true;
@@ -384,6 +441,7 @@ private:
             else if (w == "restrict") q.mem |= kRestrict;
             // precisions and precise: no effect on code generation.
         }
+        if (pp_.version == 300 && q.invariant && q.in) errAt(peek().line, "'invariant' : only shader outputs can be invariant in GLSL ES 3.00");
         return q;
     }
 
@@ -427,7 +485,7 @@ private:
     Type structSpecifier() {
         int line = next().line;  // struct
         auto def = std::make_unique<StructDef>();
-        if (peek().kind == Tok::Ident) def->name = next().text;
+        if (peek().kind == Tok::Ident) checkName(peek().text, peek().line), def->name = next().text;
         else def->name = "__anon" + std::to_string(sh_->structs.size());
         expectP("{");
         while (!acceptP("}")) {
@@ -436,6 +494,7 @@ private:
             do {
                 Member m;
                 m.name = expectIdent();
+                checkName(m.name, peek().line);
                 m.type = base;
                 arraySuffix(m.type);
                 m.rowMajor = q.rowMajor;
@@ -504,6 +563,7 @@ private:
         Type t = typeSpecifier();
         if (acceptP(";")) return;  // struct declaration only
         std::string name = expectIdent();
+        if (name != "main") checkName(name, peek().line);
         if (isP("(")) {
             functionDefinition(t, name, line);
             return;
@@ -516,6 +576,7 @@ private:
         if (q.buffer && pp_.version < 310) errAt(line, "shader storage blocks need GLSL ES 3.10");
         if (!q.uniform && !q.buffer) errAt(line, "only uniform and shader storage blocks are supported (I/O blocks are not)");
         auto b = std::make_unique<UniformBlockDecl>();
+        checkName(peek().text, peek().line);
         b->name = next().text;
         b->binding = q.binding;
         b->buffer = q.buffer;
@@ -529,6 +590,7 @@ private:
             do {
                 Member m;
                 m.name = expectIdent();
+                checkName(m.name, peek().line);
                 m.type = base;
                 arraySuffix(m.type);
                 m.rowMajor = mq.colMajor || q.colMajor ? false : (mq.rowMajor || q.rowMajor || defaultRow);
@@ -666,7 +728,7 @@ private:
         std::vector<Symbol*> params;
         if (isId("void") && isP(")", 1)) next();
         while (!isP(")")) {
-            Qual q = qualifiers();
+            Qual q = qualifiers(true);
             Type t = typeSpecifier();
             if (t.base == Base::Image && q.ifmt) t.ifmt = q.ifmt;
             if (t.base == Base::AtomicUint) errAt(line, "atomic counters cannot be passed to functions");
@@ -1328,7 +1390,8 @@ private:
                     continue;
                 }
                 if (e->k == EK::Index && e->a[0]->k == EK::Var && e->a[0]->sym->storage == Storage::BlockInstance) {
-                    e = blockField(std::move(e), e->a[0]->sym->block, f, line);
+                    UniformBlockDecl* b = e->a[0]->sym->block;  // before the move: the evaluation order of the arguments is unspecified
+                    e = blockField(std::move(e), b, f, line);
                     continue;
                 }
                 if (!bt.isArray() && !bt.cols && bt.numericOrBool() && f.size() <= 4) {
