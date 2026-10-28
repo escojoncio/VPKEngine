@@ -370,7 +370,7 @@ private:
             }
             if (t.text == "__FILE__") {
                 Token n = t;
-                n.kind = Tok::IntLit, n.ival = 0, n.text = "0";
+                n.kind = Tok::IntLit, n.ival = uint64_t(fileNo_), n.text = std::to_string(fileNo_);
                 out.push_back(n), ++i;
                 continue;
             }
@@ -734,12 +734,17 @@ private:
         if (d == "pragma") return;
         if (d == "line") {
             // #line line [source-string-number] : plain decimal integers
-            auto num = [&](size_t k) { return k < line.size() && line[k].kind == Tok::IntLit; };
-            if (!num(2) || line.size() > 4 || (line.size() == 4 && !num(3))) {
+            // The operands are macro-expanded first (`#define A 4` / `#line A`).
+            std::vector<Token> args(line.begin() + 2, line.end()), ex;
+            std::set<std::string> hide;
+            expand(args, ex, hide);
+            auto num = [&](size_t k) { return k < ex.size() && ex[k].kind == Tok::IntLit; };
+            if (!num(0) || ex.size() > 2 || (ex.size() == 2 && !num(1))) {
                 strict("line_syntax", ln, "#line: 'line [source-string-number]' expected");
                 return;
             }
-            lineDelta_ = int(line[2].ival) - (ln - lineDelta_ + 1);
+            lineDelta_ = int(ex[0].ival) - (ln - lineDelta_ + 1);
+            if (ex.size() == 2) fileNo_ = int(ex[1].ival);
             return;
         }
         if (d == "error") {
@@ -758,6 +763,7 @@ private:
     PpResult res_;
     bool ok_ = true;
     int lineDelta_ = 0;       // #line: added to the line of every following token
+    int fileNo_ = 0;          // #line's source string number: what __FILE__ expands to
     bool sawToken_ = false;   // a non-directive token has been seen (#extension must come before)
     int physLine_ = 0;
 };

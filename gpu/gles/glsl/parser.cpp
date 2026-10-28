@@ -700,7 +700,7 @@ private:
                 arraySuffix(m.type);
                 m.prec = effectivePrecision(mq.prec, basePrec, m.type);
                 needPrecision(m.prec, m.type, line, m.name);
-                m.rowMajor = mq.colMajor || q.colMajor ? false : (mq.rowMajor || q.rowMajor || defaultRow);
+                m.rowMajor = mq.colMajor ? false : mq.rowMajor ? true : b->rowMajor;
                 m.mem = uint8_t(q.mem | mq.mem);
                 if (m.type.containsOpaque()) errAt(line, "opaque types are not allowed in blocks");
                 for (size_t k = 0; k < m.type.dims.size(); ++k)

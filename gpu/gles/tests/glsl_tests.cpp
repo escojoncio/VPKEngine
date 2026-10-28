@@ -172,6 +172,14 @@ const vpglsl::Variable* uniform(const Program& p, const std::string& n) {
 void testPp() {
     std::string log;
     int version = 0;
+    {  // #line takes macros; __LINE__ follows it, __FILE__ is its second operand
+        std::string l2;
+        int v2 = 0;
+        std::string o2 = vpglsl::preprocess("#define A 10\n#line 234 A\nx __LINE__ __FILE__\ny __LINE__\n", Stage::Vertex, l2, v2);
+        CHECK(o2.find("x 234 10") != std::string::npos && o2.find("y 235") != std::string::npos);
+        o2 = vpglsl::preprocess("#define A 4\n#line A\nz __LINE__ __FILE__\n", Stage::Vertex, l2, v2);
+        CHECK(o2.find("z 4 0") != std::string::npos);
+    }
     std::string out = vpglsl::preprocess(
         "#version 300 es\n"
         "#define A 2\n"
@@ -434,6 +442,23 @@ void testBlocks() {
         CHECK(li.size == 64 + 48);
         CHECK(cam.binding != li.binding && cam.binding >= vpglsl::kBlockBase);
         CHECK(cam.stages == 3);
+    }
+    // row_major on a block reaches the matrices of struct members: mat3x2 as 2 row vec3s is 32 bytes (48 column-major).
+    Program r = build(
+        "#version 300 es\n"
+        "struct S { highp mat3x2 m; };\n"
+        "layout(std140, row_major) uniform R { highp float f; S s; highp float g; };\n"
+        "in vec4 a_pos;\n"
+        "void main() { gl_Position = a_pos * (f + g + s.m[0][1]); }\n",
+        "#version 300 es\n"
+        "precision mediump float;\n"
+        "out vec4 o;\n"
+        "void main() { o = vec4(1.0); }\n");
+    CHECK(r.ok);
+    if (r.ok && r.link.reflection.blocks.size() == 1) {
+        const auto& m = r.link.reflection.blocks[0].members;
+        CHECK(m.size() == 3 && m[1].name == "s.m" && m[1].rowMajor && m[1].matrixStride == 16);
+        CHECK(m.size() == 3 && m[2].offset == 48);
     }
     // An instance array of blocks is indexed like an array: each element is one block (GL names "Inst[0]", "Inst[1]").
     Program q = build(

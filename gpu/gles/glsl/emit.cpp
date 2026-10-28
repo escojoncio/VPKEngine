@@ -107,7 +107,7 @@ private:
     }
     // `layout`: 0 = none (Function/Private/IO), 1 = std140, 2 = std430 (decorated copies of arrays/structs).
     uint32_t typeId(const Type& t, int layout = 0, bool rowMajor = false) {
-        if (!t.isArray() && t.base != Base::Struct) layout = 0, rowMajor = false;  // leaf types are shared
+        if ((!t.isArray() && t.base != Base::Struct) || !layout) layout = 0, rowMajor = false;  // leaf types are shared
         const std::string key = t.str() + "#" + std::to_string(layout) + (t.st ? "#" + std::to_string(t.st->index) : "") +
                                 (rowMajor ? "R" : "");
         return cached(key, [&]() -> uint32_t {
@@ -154,15 +154,15 @@ private:
                 case Base::AtomicUint: fail("atomic counters have no value type");
                 case Base::Struct: {
                     std::vector<uint32_t> w;
-                    for (const Member& m : t.st->members) w.push_back(typeId(m.type, layout, m.rowMajor));
+                    for (const Member& m : t.st->members) w.push_back(typeId(m.type, layout, m.rowMajor || rowMajor));
                     uint32_t r = id();
                     w.insert(w.begin(), r);
                     instV(types_, OpTypeStruct, w);
                     name(r, t.st->name);
                     if (layout) {
                         uint32_t size = 0;
-                        auto off = std140Offsets(t.st->members, &size, layout == 2);
-                        for (size_t i = 0; i < off.size(); ++i) layoutMember(r, uint32_t(i), t.st->members[i], off[i], layout);
+                        auto off = std140Offsets(t.st->members, &size, layout == 2, rowMajor);
+                        for (size_t i = 0; i < off.size(); ++i) layoutMember(r, uint32_t(i), t.st->members[i], off[i], layout, rowMajor);
                     }
                     return r;
                 }
@@ -170,13 +170,14 @@ private:
             fail("unsupported type " + t.str());
         });
     }
-    void layoutMember(uint32_t st, uint32_t i, const Member& m, uint32_t offset, int layout) {
+    void layoutMember(uint32_t st, uint32_t i, const Member& m, uint32_t offset, int layout, bool rowMajor = false) {
         memberDeco(st, i, Deco::Offset, {offset});
         Type inner = m.type;
         while (inner.isArray()) inner = inner.element();
         if (inner.cols) {
-            memberDeco(st, i, m.rowMajor ? Deco::RowMajor : Deco::ColMajor);
-            memberDeco(st, i, Deco::MatrixStride, {std140MatrixStride(inner, m.rowMajor, layout == 2)});
+            const bool rm = m.rowMajor || rowMajor;
+            memberDeco(st, i, rm ? Deco::RowMajor : Deco::ColMajor);
+            memberDeco(st, i, Deco::MatrixStride, {std140MatrixStride(inner, rm, layout == 2)});
         }
     }
     // OpTypeImage of a sampler (Sampled = 1) or a storage image (Sampled = 2, with its format).
@@ -1018,6 +1019,7 @@ private:
         SC storage = SC::Function;
         Type type;
         int layout = 0;  // 0 none, 1 std140, 2 std430 (memory laid out in a block)
+        bool rowMajor = false;  // matrix layout reaching this pointee (selects the decorated type of structs/arrays)
     };
 
     bool isDefaultUniform(const Symbol* s) const {
@@ -1065,7 +1067,8 @@ private:
                 if (bt.isArray() && base.type.isArray() && base.type.dims.size() > bt.dims.size()) out.type = e.type;
                 out.storage = base.storage;
                 out.layout = base.layout;
-                out.ptr = op(OpAccessChain, ptrType(base.storage, typeId(e.type, base.layout)), {base.ptr, idx});
+                out.rowMajor = base.rowMajor;
+                out.ptr = op(OpAccessChain, ptrType(base.storage, typeId(e.type, base.layout, base.rowMajor)), {base.ptr, idx});
                 return true;
             }
             case EK::Field: {
@@ -1074,17 +1077,17 @@ private:
                 out.type = e.type;
                 out.storage = base.storage;
                 out.layout = base.layout;
-                out.ptr = op(OpAccessChain, ptrType(base.storage, typeId(e.type, base.layout, rowMajorOf(e))),
+                out.rowMajor = rowMajorOf(e, base);
+                out.ptr = op(OpAccessChain, ptrType(base.storage, typeId(e.type, base.layout, out.rowMajor)),
                              {base.ptr, constU(uint32_t(e.field))});
                 return true;
             }
             default: return false;
         }
     }
-    bool rowMajorOfPtr(const Expr& e) const { return e.k == EK::Field && rowMajorOf(e); }
-    bool rowMajorOf(const Expr& field) const {
+    bool rowMajorOf(const Expr& field, const Ptr& base) const {
         const Type& bt = field.a[0]->type;
-        if (bt.base == Base::Struct && bt.st) return bt.st->members[size_t(field.field)].rowMajor;
+        if (bt.base == Base::Struct && bt.st) return base.rowMajor || bt.st->members[size_t(field.field)].rowMajor;
         if (field.a[0]->k == EK::Var && field.a[0]->sym->block) return field.a[0]->sym->block->members[size_t(field.field)].rowMajor;
         if (field.a[0]->k == EK::Index && field.a[0]->a[0]->k == EK::Var && field.a[0]->a[0]->sym->block)
             return field.a[0]->a[0]->sym->block->members[size_t(field.field)].rowMajor;
@@ -1099,18 +1102,18 @@ private:
         if (!p.layout) return load(p.type, p.ptr);
         // Leaf types (scalars/vectors/matrices) are the same ids with or without layout.
         if (!p.type.isArray() && p.type.base != Base::Struct) return load(p.type, p.ptr);
-        uint32_t laid = op(OpLoad, typeId(p.type, p.layout), {p.ptr});
-        return relayout(laid, p.type, p.layout);
+        uint32_t laid = op(OpLoad, typeId(p.type, p.layout, p.rowMajor), {p.ptr});
+        return relayout(laid, p.type, p.layout, p.rowMajor);
     }
     // Rebuilds a value of a layout-decorated aggregate type as the undecorated type.
-    uint32_t relayout(uint32_t v, const Type& t, int layout) {
+    uint32_t relayout(uint32_t v, const Type& t, int layout, bool rowMajor = false) {
         if (t.isArray()) {
             std::vector<uint32_t> parts;
             Type el = t.element();
             for (int i = 0; i < t.dims[0]; ++i) {
                 const bool agg = el.isArray() || el.base == Base::Struct;
-                uint32_t x = op(OpCompositeExtract, typeId(el, agg ? layout : 0), {v, uint32_t(i)});
-                parts.push_back(agg ? relayout(x, el, layout) : x);
+                uint32_t x = op(OpCompositeExtract, typeId(el, agg ? layout : 0, rowMajor), {v, uint32_t(i)});
+                parts.push_back(agg ? relayout(x, el, layout, rowMajor) : x);
             }
             return opV(OpCompositeConstruct, typeId(t), parts);
         }
@@ -1119,8 +1122,9 @@ private:
             for (size_t i = 0; i < t.st->members.size(); ++i) {
                 const Type& mt = t.st->members[i].type;
                 const bool agg = mt.isArray() || mt.base == Base::Struct;
-                uint32_t x = op(OpCompositeExtract, typeId(mt, agg ? layout : 0, t.st->members[i].rowMajor), {v, uint32_t(i)});
-                parts.push_back(agg ? relayout(x, mt, layout) : x);
+                const bool rm = t.st->members[i].rowMajor || rowMajor;
+                uint32_t x = op(OpCompositeExtract, typeId(mt, agg ? layout : 0, rm), {v, uint32_t(i)});
+                parts.push_back(agg ? relayout(x, mt, layout, rm) : x);
             }
             return opV(OpCompositeConstruct, typeId(t), parts);
         }
@@ -1144,7 +1148,7 @@ private:
                 const Type& mt = t.st->members[i].type;
                 const bool agg = mt.isArray() || mt.base == Base::Struct;
                 uint32_t x = op(OpCompositeExtract, typeId(mt), {v, uint32_t(i)});
-                parts.push_back(agg ? applyLayout(x, mt, layout, t.st->members[i].rowMajor) : x);
+                parts.push_back(agg ? applyLayout(x, mt, layout, t.st->members[i].rowMajor || rowMajor) : x);
             }
             return opV(OpCompositeConstruct, typeId(t, layout, rowMajor), parts);
         }
@@ -1179,7 +1183,7 @@ private:
         }
         Ptr p;
         if (!pointer(e, p)) fail("assignment to a non-l-value");
-        if (p.layout && (p.type.isArray() || p.type.base == Base::Struct)) v = applyLayout(v, p.type, p.layout, rowMajorOfPtr(e));
+        if (p.layout && (p.type.isArray() || p.type.base == Base::Struct)) v = applyLayout(v, p.type, p.layout, p.rowMajor);
         store(p.ptr, v);
     }
 

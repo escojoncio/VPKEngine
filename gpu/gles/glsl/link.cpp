@@ -38,9 +38,9 @@ void flatten(const std::string& n, const Type& t, uint32_t offset, bool rowMajor
             return;
         }
         uint32_t size = 0;
-        auto off = std140Offsets(t.st->members, &size, s430);
+        auto off = std140Offsets(t.st->members, &size, s430, rowMajor);
         for (size_t i = 0; i < off.size(); ++i)
-            flatten(n + "." + t.st->members[i].name, t.st->members[i].type, offset + off[i], t.st->members[i].rowMajor, out, s430);
+            flatten(n + "." + t.st->members[i].name, t.st->members[i].type, offset + off[i], t.st->members[i].rowMajor || rowMajor, out, s430);
         return;
     }
     if (t.isArray() && t.dims.size() > 1) {  // arrays of arrays: one entry per outer element

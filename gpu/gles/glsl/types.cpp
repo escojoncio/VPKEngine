@@ -82,7 +82,7 @@ uint32_t std140Align(const Type& t, bool rowMajor, bool s430) {
     }
     if (t.base == Base::Struct) {
         uint32_t a = s430 ? 4 : 16;
-        for (const Member& m : t.st->members) a = std::max(a, std140Align(m.type, m.rowMajor, s430));
+        for (const Member& m : t.st->members) a = std::max(a, std140Align(m.type, m.rowMajor || rowMajor, s430));
         return s430 ? a : roundUp(a, 16);
     }
     if (t.cols) return s430 ? std140MatrixStride(t, rowMajor, true) : 16;  // columns (or rows) are vec4-aligned arrays
@@ -98,22 +98,24 @@ uint32_t std140Size(const Type& t, bool rowMajor, bool s430) {
     if (t.isArray()) return t.dims[0] == 0 ? 0 : std140ArrayStride(t, rowMajor, s430) * uint32_t(t.dims[0]);
     if (t.base == Base::Struct) {
         uint32_t size = 0;
-        std140Offsets(t.st->members, &size, s430);
+        std140Offsets(t.st->members, &size, s430, rowMajor);
         return size;
     }
     if (t.cols) return std140MatrixStride(t, rowMajor, s430) * (rowMajor ? t.vec : t.cols);
     return 4u * t.vec;
 }
 
-std::vector<uint32_t> std140Offsets(const std::vector<Member>& members, uint32_t* size, bool s430) {
+// `rowMajor`: the matrix layout inherited by members of a struct (a struct member carries no layout qualifier of its own).
+std::vector<uint32_t> std140Offsets(const std::vector<Member>& members, uint32_t* size, bool s430, bool rowMajor) {
     std::vector<uint32_t> off;
     uint32_t at = 0, maxAlign = s430 ? 4 : 16;
     for (const Member& m : members) {
-        const uint32_t al = std140Align(m.type, m.rowMajor, s430);
+        const bool rm = m.rowMajor || rowMajor;
+        const uint32_t al = std140Align(m.type, rm, s430);
         maxAlign = std::max(maxAlign, al);
         at = roundUp(at, al);
         off.push_back(at);
-        at += std140Size(m.type, m.rowMajor, s430);
+        at += std140Size(m.type, rm, s430);
         // std140: a struct or array member is padded to a multiple of 16 (std430 sizes already are multiples of their alignment).
         if (!s430 && (m.type.base == Base::Struct || m.type.isArray())) at = roundUp(at, 16);
     }

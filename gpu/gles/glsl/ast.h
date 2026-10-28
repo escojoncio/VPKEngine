@@ -225,7 +225,7 @@ uint32_t std140Size(const Type& t, bool rowMajor = false, bool s430 = false);
 uint32_t std140ArrayStride(const Type& t, bool rowMajor = false, bool s430 = false);  // stride of t's elements (t is an array)
 uint32_t std140MatrixStride(const Type& t, bool rowMajor = false, bool s430 = false);
 // Offsets of the members of a struct/block laid out with std140.
-std::vector<uint32_t> std140Offsets(const std::vector<Member>& members, uint32_t* size, bool s430 = false);
+std::vector<uint32_t> std140Offsets(const std::vector<Member>& members, uint32_t* size, bool s430 = false, bool rowMajor = false);
 
 uint32_t glTypeEnum(const Type& t);
 
