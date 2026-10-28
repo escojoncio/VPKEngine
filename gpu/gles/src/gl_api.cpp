@@ -708,9 +708,7 @@ void SampleCoverage(GLfloat v, GLboolean inv) {
     c->sampleCoverageValue = std::clamp(v, 0.0f, 1.0f), c->sampleCoverageInvert = inv;
 }
 // Enum validation of the state setters (INVALID_ENUM before any state changes).
-bool validBlendFactor(GLenum f, bool src) {
-    return f == 0 || f == 1 || (f >= 0x300 && f <= 0x307) || (src && f == 0x308) || (f >= 0x8001 && f <= 0x8004);
-}
+bool validBlendFactor(GLenum f) { return f == 0 || f == 1 || (f >= 0x300 && f <= 0x308) || (f >= 0x8001 && f <= 0x8004); }
 bool validBlendEq(GLenum e) { return e == 0x8006 || e == 0x8007 || e == 0x8008 || e == 0x800A || e == 0x800B; }
 bool validStencilOp(GLenum o) { return o == 0 || (o >= 0x1E00 && o <= 0x1E03) || o == 0x150A || o == 0x8507 || o == 0x8508; }
 bool validCompare(GLenum f) { return f >= 0x200 && f <= 0x207; }
@@ -725,23 +723,23 @@ void Hint(GLenum t, GLenum m) {
 }
 void BlendFunc(GLenum s, GLenum d) {
     CTX()
-    if (!validBlendFactor(s, true) || !validBlendFactor(d, false)) return c->setError(gl::INVALID_ENUM, s);
+    if (!validBlendFactor(s) || !validBlendFactor(d)) return c->setError(gl::INVALID_ENUM, s);
     for (auto& b : c->blend) b.srcRGB = b.srcA = s, b.dstRGB = b.dstA = d;
 }
 void BlendFuncSeparate(GLenum sr, GLenum dr, GLenum sa, GLenum da) {
     CTX()
-    if (!validBlendFactor(sr, true) || !validBlendFactor(dr, false) || !validBlendFactor(sa, true) || !validBlendFactor(da, false))
+    if (!validBlendFactor(sr) || !validBlendFactor(dr) || !validBlendFactor(sa) || !validBlendFactor(da))
         return c->setError(gl::INVALID_ENUM, sr);
     for (auto& b : c->blend) b.srcRGB = sr, b.dstRGB = dr, b.srcA = sa, b.dstA = da;
 }
 void BlendFunci(GLuint i, GLenum s, GLenum d) {
     CTX()
-    if (!validBlendFactor(s, true) || !validBlendFactor(d, false)) return c->setError(gl::INVALID_ENUM, s);
+    if (!validBlendFactor(s) || !validBlendFactor(d)) return c->setError(gl::INVALID_ENUM, s);
     if (i < kMaxDrawBuffers) c->blend[i].srcRGB = c->blend[i].srcA = s, c->blend[i].dstRGB = c->blend[i].dstA = d;
 }
 void BlendFuncSeparatei(GLuint i, GLenum sr, GLenum dr, GLenum sa, GLenum da) {
     CTX()
-    if (!validBlendFactor(sr, true) || !validBlendFactor(dr, false) || !validBlendFactor(sa, true) || !validBlendFactor(da, false))
+    if (!validBlendFactor(sr) || !validBlendFactor(dr) || !validBlendFactor(sa) || !validBlendFactor(da))
         return c->setError(gl::INVALID_ENUM, sr);
     if (i < kMaxDrawBuffers) c->blend[i].srcRGB = sr, c->blend[i].dstRGB = dr, c->blend[i].srcA = sa, c->blend[i].dstA = da;
 }
