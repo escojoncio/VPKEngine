@@ -240,10 +240,13 @@ int queryState(Context* c, GLenum p, double* out) {
             default: return f->stencilBits;
         }
     };
-    static const GLenum kCompressed[] = {gl::ETC1_RGB8_OES, gl::COMPRESSED_RGB8_ETC2, gl::COMPRESSED_SRGB8_ETC2,
-                                         gl::COMPRESSED_RGBA8_ETC2_EAC, gl::COMPRESSED_SRGB8_ALPHA8_ETC2_EAC,
-                                         gl::COMPRESSED_R11_EAC, gl::COMPRESSED_RG11_EAC, gl::COMPRESSED_RGB8_PUNCHTHROUGH_ALPHA1_ETC2,
-                                         0x93B0, 0x93B4, 0x93B7, 0x93D0, 0x93D4, 0x93D7};
+    // Every format formats.cpp can create: ETC1, ETC2/EAC, and ASTC LDR (14 block sizes, RGBA then sRGB).
+    static const GLenum kCompressed[] = {
+        gl::ETC1_RGB8_OES, gl::COMPRESSED_RGB8_ETC2, gl::COMPRESSED_SRGB8_ETC2, gl::COMPRESSED_RGB8_PUNCHTHROUGH_ALPHA1_ETC2,
+        gl::COMPRESSED_SRGB8_PUNCHTHROUGH_ALPHA1_ETC2, gl::COMPRESSED_RGBA8_ETC2_EAC, gl::COMPRESSED_SRGB8_ALPHA8_ETC2_EAC,
+        gl::COMPRESSED_R11_EAC, gl::COMPRESSED_SIGNED_R11_EAC, gl::COMPRESSED_RG11_EAC, gl::COMPRESSED_SIGNED_RG11_EAC,
+        0x93B0, 0x93B1, 0x93B2, 0x93B3, 0x93B4, 0x93B5, 0x93B6, 0x93B7, 0x93B8, 0x93B9, 0x93BA, 0x93BB, 0x93BC, 0x93BD,
+        0x93D0, 0x93D1, 0x93D2, 0x93D3, 0x93D4, 0x93D5, 0x93D6, 0x93D7, 0x93D8, 0x93D9, 0x93DA, 0x93DB, 0x93DC, 0x93DD};
     switch (p) {
         case gl::MAX_TEXTURE_SIZE: case gl::MAX_RENDERBUFFER_SIZE: case gl::MAX_CUBE_MAP_TEXTURE_SIZE: return one(16384);
         case gl::MAX_3D_TEXTURE_SIZE: return one(2048);
