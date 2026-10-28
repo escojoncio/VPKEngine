@@ -1378,7 +1378,8 @@ StageOut translateStage(Device* d, const PipelineObj::StageSrc& src, const Pipel
                         uint32_t viewCount, const std::vector<spirv::VertexAttribute>& attrs,
                         const std::vector<spirv::VertexBufferBinding>& vbs, const std::string& label,
                         uint32_t viewMask = 0, const std::vector<PipelineObj::TexelBinding>* texel = nullptr,
-                        uint16_t colorIntKinds = 0, int uiMaskSlot = -1, bool uiMaskAlpha = false, bool a2cTest = false) {
+                        uint16_t colorIntKinds = 0, int uiMaskSlot = -1, bool uiMaskAlpha = false, bool a2cTest = false,
+                        uint32_t sampleMask = ~0u) {
   StageOut o;
   if (!src.module) {
     logf("vk.err what=shader pipeline=%s stage=%u error=\"no module\"", label.c_str(), unsigned(src.stage));
@@ -1398,6 +1399,7 @@ StageOut translateStage(Device* d, const PipelineObj::StageSrc& src, const Pipel
     opt.colorIntKinds = colorIntKinds;
     opt.uiMaskSlot = int8_t(uiMaskSlot), opt.uiMaskAlpha = uiMaskAlpha;
     opt.alphaTest = a2cTest;
+    opt.sampleMask = sampleMask;
   }
   // Foveation: multiview stages of exactly two views (rate map layer = view) carry the viewport index / the
   // FragCoord mapping, in every pass they may run in (outside a foveated pass the backend binds an identity map
@@ -1641,7 +1643,7 @@ void finishGraphics(Device* d, PipelineObj* p, std::vector<PipelineObj::StageSrc
     p->sources.push_back(std::move(src));
     const VkShaderStageFlagBits stage = p->sources.back().stage;
     StageOut o = translateStage(d, p->sources.back(), *p->layout, p->viewCount, attrs, p->vertexBuffers, st.label,
-                                p->viewMask, nullptr, p->colorIntKinds, -1, false, p->a2cTest);
+                                p->viewMask, nullptr, p->colorIntKinds, -1, false, p->a2cTest, p->sampleMask);
     if (!o.ok) {
       if (ok) why = o.why;
       ok = false;
@@ -1777,6 +1779,12 @@ PipelineObj* createGraphics(Device* d, const VkGraphicsPipelineCreateInfo& ci) {
     p->gameSamples = std::max<uint8_t>(1, static_cast<uint8_t>(ms->rasterizationSamples));
     st.samples = effectiveSamples(p->gameSamples);
     st.alphaToCoverage = ms->alphaToCoverageEnable;
+    // VkSampleMask: Metal has no pipeline coverage mask; the fragment shader ANDs it into its [[sample_mask]] output.
+    // Only for the game's own sample count (forced counts have other sample positions) and when it clears a sample.
+    if (ms->pSampleMask && p->gameSamples > 1 && p->gameSamples <= 32 && st.samples == p->gameSamples) {
+      const uint32_t all = p->gameSamples >= 32 ? ~0u : (1u << p->gameSamples) - 1u;
+      if ((ms->pSampleMask[0] & all) != all) p->sampleMask = ms->pSampleMask[0] & all;
+    }
     // Native identity: also a pipeline the game made 1x (Alyx: alpha-to-coverage on a single-sample pass): Apple
     // hardware A2C with one sample dithers, the fragment stage tests alpha >= 0.5 as the Adreno does.
     if (st.alphaToCoverage && (p->gameSamples > 1 || nativeExtras()) && st.samples <= 1) {
@@ -2452,7 +2460,7 @@ PipelineObj::TexelVariant* texelVariant(Device* dev, const PipelineObj& p, const
   v.ok = true;
   for (const PipelineObj::StageSrc& src : p.sources) {
     StageOut o = translateStage(dev, src, *p.layout, p.viewCount, p.attrs, vbs, v.state.label, p.viewMask, &tb,
-                                p.colorIntKinds, -1, false, p.a2cTest);
+                                p.colorIntKinds, -1, false, p.a2cTest, p.sampleMask);
     if (!o.ok) {
       v.ok = false;
       break;
@@ -2514,7 +2522,7 @@ bool maskPipelineKey(Device* dev, const PipelineObj& p, PipelineObj::TexelVarian
     for (const PipelineObj::StageSrc& src : p.sources) {
       if (src.stage != VK_SHADER_STAGE_FRAGMENT_BIT) continue;
       StageOut o = translateStage(dev, src, *p.layout, p.viewCount, p.attrs, p.vertexBuffers, st.label + ".um", p.viewMask,
-                                  tv ? &tb : nullptr, p.colorIntKinds, slot, uiMaskUsesAlpha(base.blend[0]), p.a2cTest);
+                                  tv ? &tb : nullptr, p.colorIntKinds, slot, uiMaskUsesAlpha(base.blend[0]), p.a2cTest, p.sampleMask);
       if (o.ok) st.fragmentShader = o.id, inputs[1] = o.input, translated = true;
       break;
     }

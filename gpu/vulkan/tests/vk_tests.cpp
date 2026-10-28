@@ -212,6 +212,23 @@ void testPhysical() {
   CHECK(vkGetPhysicalDeviceImageFormatProperties(c.pd, VK_FORMAT_R8G8B8A8_SRGB, VK_IMAGE_TYPE_2D,
                                                  VK_IMAGE_TILING_OPTIMAL, VK_IMAGE_USAGE_STORAGE_BIT, 0,
                                                  &ip) == VK_ERROR_FORMAT_NOT_SUPPORTED);
+  // EXTENDED_USAGE + MUTABLE_FORMAT: storage is valid on the sRGB image through a compatible UNORM view (no format list);
+  // a format without a compatible one that supports the usage stays refused.
+  CHECK(vkGetPhysicalDeviceImageFormatProperties(c.pd, VK_FORMAT_R8G8B8A8_SRGB, VK_IMAGE_TYPE_2D, VK_IMAGE_TILING_OPTIMAL,
+                                                 VK_IMAGE_USAGE_STORAGE_BIT,
+                                                 VK_IMAGE_CREATE_EXTENDED_USAGE_BIT | VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT,
+                                                 &ip) == VK_SUCCESS);
+  CHECK(vkGetPhysicalDeviceImageFormatProperties(c.pd, VK_FORMAT_R8G8B8A8_SRGB, VK_IMAGE_TYPE_2D, VK_IMAGE_TILING_OPTIMAL,
+                                                 VK_IMAGE_USAGE_STORAGE_BIT, VK_IMAGE_CREATE_EXTENDED_USAGE_BIT,
+                                                 &ip) == VK_ERROR_FORMAT_NOT_SUPPORTED);
+  {
+    VkPhysicalDeviceImageFormatInfo2 info{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_FORMAT_INFO_2};
+    VkImageFormatProperties2 ip2{VK_STRUCTURE_TYPE_IMAGE_FORMAT_PROPERTIES_2};
+    info.format = VK_FORMAT_R8G8B8A8_SRGB, info.type = VK_IMAGE_TYPE_2D, info.tiling = VK_IMAGE_TILING_OPTIMAL;
+    info.usage = VK_IMAGE_USAGE_STORAGE_BIT;
+    info.flags = VK_IMAGE_CREATE_EXTENDED_USAGE_BIT | VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
+    CHECK(vkGetPhysicalDeviceImageFormatProperties2(c.pd, &info, &ip2) == VK_SUCCESS);
+  }
   // Extension enumeration and device creation with the VR set.
   uint32_t n = 0;
   vkEnumerateDeviceExtensionProperties(c.pd, nullptr, &n, nullptr);
@@ -5392,6 +5409,12 @@ void testStageKeys() {
   StageInput noRobust = in;
   noRobust.opt.robustBuffers = false;  // VPVK_ROBUST=0 / app: other MSL, so other key (the default one is unchanged, above)
   CHECK(noRobust.hash() != h && noRobust.hash() != other.hash());
+  StageInput masked = in;
+  masked.opt.sampleMask = 0x5u;  // the pipeline's VkSampleMask: other MSL, other key; survives the file, also with robustBuffers off
+  CHECK(masked.hash() != h && masked.hash() != noRobust.hash());
+  StageInput maskedNoRobust = masked;
+  maskedNoRobust.opt.robustBuffers = false;
+  CHECK(maskedNoRobust.hash() != masked.hash() && maskedNoRobust.hash() != noRobust.hash());
   {
     RecipeStore s(dir);
     ShaderBlob b;
@@ -5399,6 +5422,8 @@ void testStageKeys() {
     StageIface f;
     s.addStage(in, h, cull, 0x1234, b, &f);
     s.addStage(noRobust, noRobust.hash(), cull, 0x5678, b, &f);
+    s.addStage(masked, masked.hash(), cull, 0x9abc, b, &f);
+    s.addStage(maskedNoRobust, maskedNoRobust.hash(), cull, 0xdef0, b, &f);
   }
   {
     RecipeStore s(dir);
@@ -5408,7 +5433,10 @@ void testStageKeys() {
     CHECK(s.lookupStage(noRobust.hash(), hit, &miss, in.spirv) && hit.mslId == 0x5678);
     int off = 0;  // the option survives the file: a retranslation keeps it
     for (const StageInput& si : s.stageInputs()) off += !si.opt.robustBuffers;
-    CHECK(s.stageInputs().size() == 2 && off == 1);
+    CHECK(s.stageInputs().size() == 4 && off == 2);
+    int masks = 0;
+    for (const StageInput& si : s.stageInputs()) masks += si.opt.sampleMask == 0x5u ? 1 : si.opt.sampleMask == ~0u ? 0 : 100;
+    CHECK(masks == 2);
     CHECK(!s.lookupStage(other.hash(), hit, &miss, in.spirv) && miss.why == RecipeStore::StageMiss::NewOptions);
     CHECK(!s.lookupStage(h ^ 1, hit, &miss, in.spirv ^ 1) && miss.why == RecipeStore::StageMiss::NewContent);
   }

@@ -954,6 +954,23 @@ void subgroupMasks(const std::string& dir) {
     if (failures || std::getenv("VP_PRINT")) std::fprintf(stderr, "%s\n", src.c_str());
 }
 
+// The pipeline's VkSampleMask: the fragment shader gets a [[sample_mask]] output holding it (solid.frag declares none); without
+// a mask the MSL has none.
+void sampleMask(const std::string& dir) {
+    spirv::SpirvLowerOptions o;
+    o.entry = "main";
+    o.stage = vpir::Stage::Fragment;
+    Result plain = run(dir + "/solid.frag.spv", o);
+    CHECK(plain.ok && plain.msl.source.find("[[sample_mask]]") == std::string::npos);
+    o.sampleMask = 0x5u;
+    Result r = run(dir + "/solid.frag.spv", o);
+    CHECK(r.ok);
+    if (!r.ok) return;
+    CHECK(r.msl.source.find("[[sample_mask]]") != std::string::npos);
+    CHECK(r.msl.source.find("5u") != std::string::npos || r.msl.source.find("0x5") != std::string::npos);
+    if (failures || std::getenv("VP_PRINT")) std::fprintf(stderr, "%s\n", r.msl.source.c_str());
+}
+
 // shaderZeroInitializeWorkgroupMemory: a Workgroup variable with an OpConstantNull initializer is cleared by a
 // strided loop over the threadgroup array and a barrier before the body (zeroinit.comp.spvasm).
 void zeroInit(const std::string& dir) {
@@ -1623,6 +1640,7 @@ int main(int argc, char** argv) {
     else if (c == "f16_math") f16Math(dir);
     else if (c == "bitcast16") bitcast16(dir);
     else if (c == "submask") subgroupMasks(dir);
+    else if (c == "sample_mask") sampleMask(dir);
     else if (c == "ycbcr") ycbcr(dir);
     else if (c == "robust") robust(dir);
     else if (c == "correctness") correctness(dir);

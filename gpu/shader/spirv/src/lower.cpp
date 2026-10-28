@@ -212,6 +212,8 @@ private:
     vpir::Stage stage_ = vpir::Stage::Vertex;
 
     std::unordered_map<uint32_t, IoVarInfo> io_;          // interface variable -> leaves
+    int sampleMaskOutput_ = -1;                           // [[sample_mask]] output ANDed with SpirvLowerOptions::sampleMask
+    bool sampleMaskOwn_ = false;                          // ... added by the lowering (the shader declares none)
     int uiMaskOutput_ = -1;                               // VPKTAA UI mask output (SpirvLowerOptions::uiMaskSlot)
     std::vector<uint32_t> outputShadow_;                  // vpir output index -> variable
     std::map<uint32_t, int> packedColor_;                 // location | index << 8 -> packed colour output
@@ -1959,6 +1961,16 @@ private:
             iface_.colorOutputs |= uint8_t(1u << o_.uiMaskSlot);
             uiMaskOutput_ = addOutput(v);
         }
+        if (stage_ == vpir::Stage::Fragment && o_.sampleMask != ~0u) {
+            for (size_t i = 0; i < out_.outputs.size(); ++i)
+                if (out_.outputs[i].builtin == vpir::Builtin::SampleMask) sampleMaskOutput_ = int(i);
+            if (sampleMaskOutput_ < 0) {
+                vpir::IoVar v;
+                v.name = "sample_mask", v.type = vpir::kU32, v.builtin = vpir::Builtin::SampleMask;
+                sampleMaskOutput_ = addOutput(v);
+                sampleMaskOwn_ = true;
+            }
+        }
         for (size_t i = 0; i < out_.outputs.size(); ++i) {
             uint32_t var = newVar(out_.outputs[i].type);
             outputShadow_[i] = var;
@@ -2023,6 +2035,7 @@ private:
     }
     void flushOutputs() {
         if (o_.alphaTest && stage_ == vpir::Stage::Fragment) alphaTestDiscard();
+        if (sampleMaskOutput_ >= 0) out_.earlyFragmentTests = false;  // Metal: no early tests with a sample mask output
         for (size_t i = 0; i < out_.outputs.size(); ++i) {
             ValueId v = loadVar(outputShadow_[i]);
             const vpir::IoVar& o = out_.outputs[i];
@@ -2037,6 +2050,7 @@ private:
             if (int(i) == viewportOutput_) v = amp_ ? u32(0) : viewIndex();
             if (int(i) == viewOutput_) v = viewIndex();
             if (int(i) == uiMaskOutput_) v = uiMaskValue();
+            if (int(i) == sampleMaskOutput_) v = sampleMaskOwn_ ? u32(o_.sampleMask) : bin(Op::And, v, u32(o_.sampleMask), vpir::kU32);
             if (auto m = clipMirror_.find(int(i)); m != clipMirror_.end()) v = loadVar(outputShadow_[size_t(m->second)]);
             b_->storeOutput(uint32_t(i), v);
         }

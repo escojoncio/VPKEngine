@@ -133,13 +133,13 @@ void encodeInput(Writer& w, const StageInput& in) {
   // Flags byte: bit 0 multisampleAsSingle, bit 1 a viewMask (uint32) follows, bit 2 colorIntKinds
   // (uint16) follows, bit 3 the Y'CbCr conversions follow (count, then per binding its layout
   // index and fields), bit 4 uiMaskSlot (uint8) and uiMaskAlpha (uint8) follow, bit 5 alphaTest (no payload), bit 6
-  // viewportIndex, bit 7 rateMapPosition (no payload). After all payloads, one more byte only when robustBuffers is off.
+  // viewportIndex, bit 7 rateMapPosition (no payload). After all payloads, one more byte only when robustBuffers is off or a sampleMask is set (bit 1: its uint32 follows).
   uint32_t nYcbcr = 0;
   for (const spirv::SpirvBinding& b : o.layout) nYcbcr += b.ycbcr.planes != 0;
   const uint8_t ext =
       uint8_t((o.multisampleAsSingle ? 1 : 0) | (o.viewMask ? 2 : 0) | (o.colorIntKinds ? 4 : 0) | (nYcbcr ? 8 : 0) |
                 (o.uiMaskSlot >= 0 ? 16 : 0) | (o.alphaTest ? 32 : 0) | (o.viewportIndex ? 64 : 0) | (o.rateMapPosition ? 128 : 0));
-  if (ext || !o.robustBuffers) w.pod(ext);
+  if (ext || !o.robustBuffers || o.sampleMask != ~0u) w.pod(ext);
   if (o.viewMask) w.pod(uint32_t(o.viewMask));
   if (o.colorIntKinds) w.pod(uint16_t(o.colorIntKinds));
   if (nYcbcr) {
@@ -154,7 +154,9 @@ void encodeInput(Writer& w, const StageInput& in) {
     }
   }
   if (o.uiMaskSlot >= 0) w.pod(uint8_t(o.uiMaskSlot)), w.pod(uint8_t(o.uiMaskAlpha ? 1 : 0));
-  if (!o.robustBuffers) w.pod(uint8_t(1));  // last: emit flags, bit 0 robustBuffers off
+  // last: emit flags, bit 0 robustBuffers off, bit 1 a sampleMask (uint32) follows
+  if (!o.robustBuffers || o.sampleMask != ~0u) w.pod(uint8_t((o.robustBuffers ? 0 : 1) | (o.sampleMask != ~0u ? 2 : 0)));
+  if (o.sampleMask != ~0u) w.pod(uint32_t(o.sampleMask));
 }
 
 bool decodeInput(Reader& r, StageInput& in) {
@@ -219,7 +221,11 @@ bool decodeInput(Reader& r, StageInput& in) {
     o.viewportIndex = (ext & 64) != 0;
     o.rateMapPosition = (ext & 128) != 0;
   }
-  if (r.ok && r.p < r.end) o.robustBuffers = !(r.pod<uint8_t>() & 1);
+  if (r.ok && r.p < r.end) {
+    const uint8_t f = r.pod<uint8_t>();
+    o.robustBuffers = !(f & 1);
+    if (f & 2) o.sampleMask = r.pod<uint32_t>();
+  }
   return r.ok && in.spirv != 0;
 }
 

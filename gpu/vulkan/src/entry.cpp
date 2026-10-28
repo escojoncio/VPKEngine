@@ -991,9 +991,8 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkGetPhysicalDeviceFormatProperties2(VkPh
   }
 }
 
-VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkGetPhysicalDeviceImageFormatProperties(
-    VkPhysicalDevice, VkFormat f, VkImageType type, VkImageTiling tiling, VkImageUsageFlags usage,
-    VkImageCreateFlags flags, VkImageFormatProperties* out) {
+static VkResult imageFormatProperties(VkFormat f, VkImageType type, VkImageTiling tiling, VkImageUsageFlags usage,
+                                      VkImageCreateFlags flags, VkImageFormatProperties* out) {
   *out = {};  // every field 0 when the combination is refused (spec; the CTS checks it)
   // VK_EXT_host_image_copy: any image can be a vkCopyMemoryToImageEXT target (host transfers are staged copies).
   if (nativeExtras()) usage &= ~VkImageUsageFlags(VK_IMAGE_USAGE_HOST_TRANSFER_BIT_EXT);
@@ -1056,6 +1055,29 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkGetPhysicalDeviceImageFormatPropert
   out->sampleCounts = msaa ? l.framebufferColorSampleCounts : VkSampleCountFlags{VK_SAMPLE_COUNT_1_BIT};
   out->maxResourceSize = 1ull << 32;
   return VK_SUCCESS;
+}
+
+VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkGetPhysicalDeviceImageFormatProperties(
+    VkPhysicalDevice, VkFormat f, VkImageType type, VkImageTiling tiling, VkImageUsageFlags usage,
+    VkImageCreateFlags flags, VkImageFormatProperties* out) {
+  VkResult r = imageFormatProperties(f, type, tiling, usage, flags, out);
+  // VK_KHR_maintenance2 EXTENDED_USAGE on a mutable image: the usage is valid when some compatible uncompressed colour
+  // format (same texel size) supports it without the flags (an sRGB image used as storage through its UNORM view).
+  if (r == VK_ERROR_FORMAT_NOT_SUPPORTED && (flags & VK_IMAGE_CREATE_EXTENDED_USAGE_BIT) &&
+      (flags & VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT)) {
+    const vpgpu::FormatInfo& fi = vpgpu::formatInfo(toCoreFormat(f));
+    const VkImageCreateFlags plain = flags & ~VkImageCreateFlags(VK_IMAGE_CREATE_EXTENDED_USAGE_BIT);
+    if (fi.blockSize == 1 && !fi.depth() && !fi.stencil() && !multiPlane(f).planes)
+      for (int g = 1; g <= int(VK_FORMAT_ASTC_12x12_SRGB_BLOCK) && r != VK_SUCCESS; ++g) {
+        const VkFormat vf = VkFormat(g);
+        if (vf == f || !formatFeatures(vf, false)) continue;
+        const vpgpu::FormatInfo& gi = vpgpu::formatInfo(toCoreFormat(vf));
+        if (gi.blockSize != 1 || gi.depth() || gi.stencil() || multiPlane(vf).planes || gi.bytesPerBlock != fi.bytesPerBlock)
+          continue;
+        r = imageFormatProperties(vf, type, tiling, usage, plain, out);
+      }
+  }
+  return r;
 }
 
 VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkGetPhysicalDeviceImageFormatProperties2(

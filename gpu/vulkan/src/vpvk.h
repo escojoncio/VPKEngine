@@ -530,6 +530,7 @@ struct PipelineObj {
   };
   std::vector<StageSrc> sources;
   std::vector<spirv::VertexAttribute> attrs;
+  uint32_t sampleMask = ~0u;  // VkSampleMask of the pipeline (pSampleMask[0]) when it clears samples of the game's count, else ~0u
   bool a2cTest = false;  // alpha-to-coverage pipeline created at 1x (MSAA forced off): alpha test in the fragment shader
   uint16_t colorIntKinds = 0;  // SpirvLowerOptions::colorIntKinds of the fragment stage
   uint8_t fragmentOutputs = 0;  // colour outputs the fragment shader writes (a dynamic colour write mask never enables others)

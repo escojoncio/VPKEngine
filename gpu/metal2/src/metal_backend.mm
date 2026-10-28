@@ -420,6 +420,7 @@ MTLTextureDescriptor* textureDescriptor(const TextureDesc& d) {
       u |= MTLTextureUsagePixelFormatView;
   }
   if (d.usage & usage::formatView) u |= MTLTextureUsagePixelFormatView;  // mutable-format images
+  if (d.format == Format::RGB9E5Float) u |= MTLTextureUsagePixelFormatView;  // raw R32Uint view for copies
   if (d.usage & usage::storage) u |= MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
   // imageAtomic* (Vulkan STORAGE_IMAGE_ATOMIC, mandatory for R32_UINT/R32_SINT): Metal texture
   // atomics need this usage, and only these two 32-bit formats take it.
@@ -5512,6 +5513,7 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
         rp.visibilityResultType = MTLVisibilityResultTypeAccumulate;
       }
       bool visCounting = false;
+      uint64_t visLastOff = 0;  // offset of the last counting draw: disabling stays inside a range this encoder owns
       // Hang split (see InFlight): an encoder of more than kHangSplitMin draws (a shader warmup that
       // draws every pipeline once) runs as chunks of hangSplit draws, each in its own command buffer,
       // the attachments stored and loaded between chunks. Chunk cost with the GPU free: 26-136 ms
@@ -5861,13 +5863,14 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
           // Clears never count; a draw counts when it carries this encoder's visibility buffer.
           const bool counts = visBuf && !d.clear && d.visibility && d.visibility->buffer == visId;
           if (visBuf && (counts || visCounting)) {
-            const uint64_t off = counts ? visBase + d.visibility->offset : 0;
+            const uint64_t off = counts ? visBase + d.visibility->offset : visLastOff;
             if (counts && (off & 7)) {
               if (blitWarned.insert("visibility_align").second) err("what=visibility_unaligned off=%llu", (unsigned long long)off);
             } else {
               [open.render setVisibilityResultMode:counts ? MTLVisibilityResultModeCounting : MTLVisibilityResultModeDisabled
-                                            offset:counts ? NSUInteger(off) : 0];
+                                            offset:NSUInteger(off)];
               visCounting = counts;
+              visLastOff = off;
             }
           }
           if (visBuf && !d.clear && d.visibility && !(d.visibility->buffer == visId) &&
@@ -6272,6 +6275,13 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
       uint64_t so = 0, dO = 0;
       id<MTLBuffer> sb = buffer(c.srcBuffer, so), db = buffer(c.dstBuffer, dO);
       id<MTLTexture> st = texture(c.srcTexture.texture), dt = texture(c.dstTexture.texture);
+      // RGB9E5: Metal decodes and re-encodes (canonicalising) the texels a blit moves, but Vulkan copies are raw bits
+      // (the CTS compares them bitwise): they go through an R32Uint view of the same memory.
+      {
+        auto rawBits = [&](id<MTLTexture> t) { return t && t.pixelFormat == MTLPixelFormatRGB9E5Float ? formatViewOfPixel(t, MTLPixelFormatR32Uint) : t; };
+        st = rawBits(st);
+        dt = rawBits(dt);
+      }
       // Row pitch defaults to tightly packed (in blocks for compressed formats).
       auto pitch = [&](const BufferSpan& s, const TextureSpan& t, NSUInteger& row, NSUInteger& image) {
         const FormatInfo& fi = formatOf(t.texture);

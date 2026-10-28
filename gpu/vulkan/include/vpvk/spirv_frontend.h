@@ -108,6 +108,10 @@ struct SpirvLowerOptions {
   // test, every invocation whose colour output 0 alpha (float vec4) is < 0.5 is discarded at the end
   // of main. false = the MSL is byte-identical to before. Recipes: flags bit 5.
   bool alphaTest = false;
+  // Fragment: the pipeline's VkSampleMask (pSampleMask[0], limited to the sample count) when it clears samples: the shader's
+  // [[sample_mask]] output (added when it declares none) is ANDed with it. ~0u = none, the MSL is then byte-identical to
+  // before. Recipes: emit flags bit 1.
+  uint32_t sampleMask = ~0u;
   // Foveation (gpu/vulkan/src/foveation.h): a multiview vertex shader also writes [[viewport_array_index]] = the
   // view (a rasterization rate map's layer follows the viewport index, not the render target layer), and a multiview
   // fragment shader that reads FragCoord sees it mapped back from physical to screen space through the pass's
