@@ -574,7 +574,6 @@ private:
                 if (!r) break;
                 require(r->access == Access::ReadWrite, "image atomics need a read_write storage texture");
                 require(r->elem == Scalar::I32 || r->elem == Scalar::U32, "image atomics need i32/u32 texels");
-                require(r->dim != TexDim::Cube && r->dim != TexDim::CubeArray, "image atomics need a 1d, 2d or 3d texture");
                 require(a[0] == coordType(*r, Scalar::U32), "coordinate must be u32 vector");
                 require(t == Type(r->elem, 1), "result must be the texel scalar");
                 for (size_t i = 1; i < a.size(); ++i) require(a[i] == t, "value types must match the result");

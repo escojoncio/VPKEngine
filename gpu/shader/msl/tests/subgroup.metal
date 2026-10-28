@@ -18,7 +18,8 @@ struct VpArgs {
     const uint4 v8 = uint4(as_type<uint2>(simd_vote::vote_t(simd_ballot(v7))), 0u, 0u);
     const bool v9 = simd_any(v7);
     const bool v10 = simd_all(v7);
-    const float v11 = simd_broadcast_first(v5);
+    const uint2 vf11 = as_type<uint2>(simd_vote::vote_t(simd_active_threads_mask()));
+    const float v11 = simd_shuffle(v5, ushort(vf11.x ? ctz(vf11.x) : 32u + ctz(vf11.y)));
     const uint v13 = in_lane ^ 1u;
     const float v14 = simd_shuffle(v5, ushort(v13));
     const float v15 = simd_broadcast(v5, ushort(1u));

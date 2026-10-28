@@ -131,7 +131,7 @@ struct RPtr {
 
 struct IoLeaf {
     enum Kind : uint8_t { Io, Dropped, VertexAttr, ViewIndex, Helper, InstanceIndex, VertexIndex,
-                          SampleMaskIn, FrontFacing, BaseInstance } kind = Io;
+                          SampleMaskIn, FrontFacing, BaseInstance, SubgroupMask } kind = Io;
     int index = -1;       // vpir input/output index (Io)
     uint32_t location = 0;
     uint32_t type = 0;    // SPIR-V leaf type
@@ -1580,6 +1580,44 @@ private:
         if (o_.viewCount > 1 && !amp_) i = bin(Op::Div, i, u32(o_.viewCount), vpir::kU32);
         return i;
     }
+    // gl_SubgroupEq/Ge/Gt/Le/LtMask (kind 0..4): bit i of the 64-bit mask (uvec4 .xy) for lane i, only below the subgroup size.
+    ValueId subgroupMask(uint32_t kind) {
+        auto builtin = [&](vpir::Builtin bi) {
+            vpir::IoVar v;
+            v.builtin = bi, v.name = std::string(vpir::toString(bi)), v.type = vpir::builtinInfo(bi, true).type;
+            return cast(b_->loadInput(uint32_t(addInput(v)), v.type), vpir::kU32);
+        };
+        const ValueId lane = builtin(vpir::Builtin::SubgroupInvocation), size = builtin(vpir::Builtin::SubgroupSize);
+        const ValueId zero = u32(0), ones = u32(0xFFFFFFFFu), one = u32(1), c32 = u32(32);
+        auto lt = [&](ValueId n, ValueId base) {  // bits [base, base + 32) below n, as a 32-bit word: n >= base + 32 -> all
+            const ValueId rel = bin(Op::Sub, n, base, vpir::kU32);
+            const ValueId m = bin(Op::Sub, bin(Op::Shl, one, bin(Op::And, rel, u32(31), vpir::kU32), vpir::kU32), one, vpir::kU32);
+            const ValueId below = bin(Op::Lt, n, base, vpir::kBool);
+            return select(below, zero, select(bin(Op::Ge, rel, c32, vpir::kBool), ones, m));
+        };
+        auto eq = [&](ValueId base) {  // the bit of `lane` when it falls in [base, base + 32)
+            const ValueId rel = bin(Op::Sub, lane, base, vpir::kU32);
+            const ValueId in = select(bin(Op::Ge, lane, base, vpir::kBool), bin(Op::Lt, rel, c32, vpir::kBool), b_->constBool(false));
+            return select(in, bin(Op::Shl, one, bin(Op::And, rel, u32(31), vpir::kU32), vpir::kU32), zero);
+        };
+        const ValueId b0 = zero, b1 = c32;
+        ValueId w[2];
+        for (int i = 0; i < 2; ++i) {
+            const ValueId base = i ? b1 : b0;
+            const ValueId valid = lt(size, base);
+            const ValueId below = lt(lane, base), self = eq(base);
+            ValueId m;
+            switch (kind) {
+                case 0: m = self; break;
+                case 1: m = bin(Op::And, bin(Op::Xor, below, ones, vpir::kU32), valid, vpir::kU32); break;
+                case 2: m = bin(Op::And, bin(Op::Xor, bin(Op::Or, below, self, vpir::kU32), ones, vpir::kU32), valid, vpir::kU32); break;
+                case 3: m = bin(Op::Or, below, self, vpir::kU32); break;
+                default: m = below; break;
+            }
+            w[i] = m;
+        }
+        return vecOf({w[0], w[1], zero, zero}, Type(Scalar::U32, 4));
+    }
     ValueId inputValue(const IoLeaf& leaf) {
         Type want = vt(leaf.type);
         switch (leaf.kind) {
@@ -1596,6 +1634,7 @@ private:
             }
             case IoLeaf::VertexIndex: return cast(b_->loadInput(uint32_t(vertexInput_), vpir::kU32), want);
             case IoLeaf::SampleMaskIn: return cast(b_->loadInput(uint32_t(leaf.index), vpir::kU32), want);
+            case IoLeaf::SubgroupMask: return cast(subgroupMask(leaf.component), want);
             case IoLeaf::FrontFacing: return b_->loadInput(uint32_t(leaf.index), vpir::kBool);
             case IoLeaf::VertexAttr: {
                 if (!leaf.component) return fetchAttribute(leaf.location, want);
@@ -1658,6 +1697,13 @@ private:
             case BuiltIn::LocalInvocationIndex: return vpir::Builtin::LocalInvocationIndex;
             case BuiltIn::SubgroupLocalInvocationId: return vpir::Builtin::SubgroupInvocation;
             case BuiltIn::SubgroupSize: return vpir::Builtin::SubgroupSize;
+            case BuiltIn::SubgroupEqMask:
+            case BuiltIn::SubgroupGeMask:
+            case BuiltIn::SubgroupGtMask:
+            case BuiltIn::SubgroupLeMask:
+            case BuiltIn::SubgroupLtMask:
+                if (!input) return special = IoLeaf::Dropped, vpir::Builtin::None;
+                return special = IoLeaf::SubgroupMask, vpir::Builtin::None;
             // Clip and cull distances, and the rest: no VPIR builtin; writes are dropped.
             default: special = IoLeaf::Dropped; return vpir::Builtin::None;
         }
@@ -1751,6 +1797,7 @@ private:
                         vpir::Builtin vb = mapBuiltin(bi, input, special);
                         if (vb == vpir::Builtin::FragDepth && out_.earlyFragmentTests) special = IoLeaf::Dropped;
                         leaf.kind = special;
+                        if (special == IoLeaf::SubgroupMask) leaf.component = uint8_t(uint32_t(bi) - uint32_t(BuiltIn::SubgroupEqMask));
                         if (vb != vpir::Builtin::None && special != IoLeaf::Dropped) {
                             vpir::IoVar v;
                             v.builtin = vb;

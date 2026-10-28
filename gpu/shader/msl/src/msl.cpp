@@ -1269,7 +1269,14 @@ private:
                 return define(in, "uint4(as_type<uint2>(simd_vote::vote_t(simd_ballot(" + a(0) + "))), 0u, 0u)");
             case Op::SubgroupBroadcast: return define(in, "simd_broadcast(" + a(0) + ", ushort(" + a(1) + "))");
             case Op::SubgroupShuffle: return define(in, "simd_shuffle(" + a(0) + ", ushort(" + a(1) + "))");
-            case Op::SubgroupReadFirst: return define(in, call("simd_broadcast_first", in));
+            case Op::SubgroupReadFirst: {
+                // The lowest ACTIVE lane, taken from the active mask: simd_broadcast_first returned the value of an inactive lane 0
+                // in divergent code (CTS ballot_broadcast subgroupbroadcastfirst).
+                if (!uses_.contains(in.result)) return;
+                const std::string m = "vf" + std::to_string(in.result);
+                line("const uint2 ", m, " = as_type<uint2>(simd_vote::vote_t(simd_active_threads_mask()));");
+                return define(in, "simd_shuffle(" + a(0) + ", ushort(" + m + ".x ? ctz(" + m + ".x) : 32u + ctz(" + m + ".y)))");
+            }
             case Op::SubgroupAny: return define(in, call("simd_any", in));
             case Op::SubgroupAll: return define(in, call("simd_all", in));
             case Op::QuadShuffle: return define(in, "quad_shuffle(" + a(0) + ", ushort(" + a(1) + "))");

@@ -547,7 +547,7 @@ void fixes(const std::string& dir) {
     if (cr.ok) {
         const std::string& m = cr.msl.source;
         CHECK(m.find("log2") == std::string::npos && m.find("exp2") == std::string::npos);  // exact frexp/ldexp
-        CHECK(m.find("simd_broadcast_first(") != std::string::npos && m.find("simd_all(") != std::string::npos);
+        CHECK(m.find("simd_active_threads_mask(") != std::string::npos && m.find("simd_all(") != std::string::npos);
     }
     if (failures || std::getenv("VP_PRINT")) std::fprintf(stderr, "%s\n", cr.msl.source.c_str());
 }
@@ -668,9 +668,9 @@ void subgroupCube(const std::string& dir) {
     // Storage cubes are texture2d_array (the driver binds a 2D-array view): slice = layer * 6 + face.
     CHECK(src.find("texture2d_array<uint") != std::string::npos && src.find("texturecube") == std::string::npos);
     CHECK(src.find(" % ") != std::string::npos && src.find("* 6u + ") != std::string::npos);
-    CHECK(src.find("simd_broadcast_first(") != std::string::npos);
+    CHECK(src.find("simd_active_threads_mask(") != std::string::npos);
     CHECK(src.find("simd_all(") != std::string::npos);
-    CHECK(src.find("simd_broadcast_first(true") == std::string::npos);
+    CHECK(src.find("simd_shuffle(true") == std::string::npos);
     if (failures || std::getenv("VP_PRINT")) std::fprintf(stderr, "%s\n", src.c_str());
 }
 
@@ -938,6 +938,20 @@ void bitcast16(const std::string& dir) {
     uint32_t got[3] = {};
     if (inv.memory[1].size() >= 12) std::memcpy(got, inv.memory[1].data(), 12);
     CHECK(int32_t(got[0]) == -2 && int32_t(got[1]) == -32767 && got[2] == in);
+}
+
+// gl_Subgroup{Eq,Ge,Gt,Le,Lt}Mask are derived from the lane and the subgroup size (submask.comp.spvasm).
+void subgroupMasks(const std::string& dir) {
+    spirv::SpirvLowerOptions o;
+    o.entry = "main";
+    o.stage = vpir::Stage::Compute;
+    o.layout = {bind(0, 0, vpgpu::BindKind::Buffer, 0)};
+    Result r = run(dir + "/submask.comp.spv", o);
+    CHECK(r.ok);
+    if (!r.ok) return;
+    const std::string& src = r.msl.source;
+    CHECK(src.find("thread_index_in_simdgroup") != std::string::npos && src.find("threads_per_simdgroup") != std::string::npos);
+    if (failures || std::getenv("VP_PRINT")) std::fprintf(stderr, "%s\n", src.c_str());
 }
 
 // shaderZeroInitializeWorkgroupMemory: a Workgroup variable with an OpConstantNull initializer is cleared by a
@@ -1608,6 +1622,7 @@ int main(int argc, char** argv) {
     else if (c == "float_to_int") floatToInt(dir);
     else if (c == "f16_math") f16Math(dir);
     else if (c == "bitcast16") bitcast16(dir);
+    else if (c == "submask") subgroupMasks(dir);
     else if (c == "ycbcr") ycbcr(dir);
     else if (c == "robust") robust(dir);
     else if (c == "correctness") correctness(dir);
