@@ -1783,6 +1783,57 @@ Copy rectCopy(BufferId src, TextureId dst, uint32_t x, uint32_t y, uint32_t w = 
   return c;
 }
 
+// A GPU-driven chain (copy -> update -> copy -> sort -> copy -> args -> indirect draw), with render passes between:
+// every copy stays after the dispatch that writes its source and before the one that reads its destination, and a
+// barrier orders each dependent pair (a copy is never hoisted above the dispatch it depends on).
+void testGpuChain() {
+  Scene s;
+  const TextureId c = s.rt(), c2 = s.rt();
+  const BufferId up = s.buf(), a = s.buf(), b = s.buf(), d = s.buf(), e = s.buf(), args = s.buf();
+  auto bufCopy = [&](BufferId from, BufferId to) {
+    Copy k;
+    k.kind = CopyKind::BufferToBuffer;
+    k.srcBuffer = Scene::span(from, 0, 256);
+    k.dstBuffer = Scene::span(to, 0, 256);
+    return k;
+  };
+  auto rw = [&](BufferId r, BufferId w) {
+    return Scene::compute({read(ResourceRange::bytes(r, 0, 256), stage::compute), write(ResourceRange::bytes(w, 0, 256), stage::compute)});
+  };
+  for (int variant = 0; variant < 2; ++variant) {
+    Frame f;
+    std::vector<uint32_t> at;  // command index of each chain step
+    auto step = [&] { at.push_back(uint32_t(f.commands().size())); };
+    step(), f.copy(bufCopy(up, a));      // 0 upload
+    step(), f.dispatch(rw(a, b));        // 1 update
+    if (variant) Scene::passWithDraw(f, Scene::pass(c));  // a render pass between (open render encoder at the copy)
+    step(), f.copy(bufCopy(b, d));       // 2 copy of the update's output
+    step(), f.dispatch(rw(d, e));        // 3 sort
+    if (variant) Scene::passWithDraw(f, Scene::pass(c2));
+    step(), f.copy(bufCopy(e, args));    // 4 copy of the sort's output
+    step(), f.dispatch(rw(args, up));    // 5 args builder (reads the copy)
+    step();                              // 6 indirect draw reading what step 5 wrote
+    Scene::passWithDraw(f, Scene::pass(c), {Scene::vsRead(up)});
+    const CompiledFrame cf = compileFrame(f);
+    // execution position of every command
+    std::vector<int> pos(f.commands().size(), -1);
+    std::vector<std::pair<uint32_t, uint32_t>> where(f.commands().size());
+    int n = 0;
+    for (uint32_t en = 0; en < cf.encoders.size(); ++en)
+      for (uint32_t it = 0; it < cf.encoders[en].commands.size(); ++it) {
+        pos[cf.encoders[en].commands[it]] = n++;
+        where[cf.encoders[en].commands[it]] = {en, it};
+      }
+    for (size_t i = 1; i < at.size(); ++i) CHECK(pos[at[i - 1]] >= 0 && pos[at[i]] > pos[at[i - 1]]);
+    for (size_t i = 1; i < at.size(); ++i) {  // each step depends on the previous one: a barrier at its position
+      bool ordered = false;
+      for (const Barrier& br : cf.barriers) ordered |= br.encoder == where[at[i]].first && br.item == where[at[i]].second;
+      // the first command of an encoder the previous step precedes is ordered by the encoder boundary barrier too
+      CHECK(ordered);
+    }
+  }
+}
+
 void testCopyRects() {
   Scene s;
   const TextureId t = s.rt(256, 2);
@@ -3140,7 +3191,7 @@ int main(int argc, char** argv) {
       {"copies", testCopies},       {"hazards", testHazards},   {"subresources", testSubresources},
       {"cuts", testCuts},           {"diagnostics", testDiagnostics}, {"pipelines", testPipelines},
       {"device", testDevice},       {"tile", testTile},         {"bindings", testBindings},
-      {"astro", testAstroFrame},    {"fuzz", testFuzz},         {"copyrects", testCopyRects},
+      {"astro", testAstroFrame},    {"fuzz", testFuzz},         {"copyrects", testCopyRects}, {"gpuchain", testGpuChain},
       {"bigframe", testBigFrameLog}, {"rectenv", testRectEnv}, {"mipchain", testMipChain},
       {"deadstore", testDeadStore}, {"rtmemory", testRtMemory}, {"scopedpool", testScopedPool},
       {"background", testBackground}, {"viewsplit", testViewSplit}, {"tilehot", testTileHot}, {"activity", testActivity}, {"harvest", testHarvest},
