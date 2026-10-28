@@ -1,0 +1,3 @@
+=== dEQP-VK.spirv_assembly.instruction.graphics.float16.opcompositeinsert.v3f16_vert
+At 0:Error: expected zero but returned 0xffff (nan)
+<Result StatusCode="Fail">Resource returned doesn&apos;t match with expected</Result>

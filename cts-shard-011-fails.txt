@@ -1,0 +1,4 @@
+=== dEQP-VK.multiview.renderpass2.input_attachments.no_queries.8_1_1_8
+Image comparison failed: max difference = (0.4, 0.2, 0.301961, 1), threshold = (0.01, 0.01, 0.01, 0.01)
+Image comparison failed: max difference = (0.4, 0.2, 0.301961, 1), threshold = (0.01, 0.01, 0.01, 0.01)
+<Result StatusCode="Fail">Fail</Result>

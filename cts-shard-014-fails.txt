@@ -1,0 +1,39 @@
+=== dEQP-VK.pipeline.monolithic.multisample.misc.clear_attachments.r8g8b8a8_unorm_r16g16b16a16_sfloat_r32g32b32a32_uint_d32_sfloat_s8_uint.2x.ds_resolve_sample_zero.sub_framebuffer
+Verification passed for color attachment 1
+Verification passed for color attachment 2
+Verification passed for color attachment 3
+Verification failed for depth attachment for 391 pixel(s)
+Verification failed for stencil attachment for 643 pixel(s)
+<Result StatusCode="Fail">Incorrect multisampled rendering for depth attachment, stencil attachment</Result>
+=== dEQP-VK.pipeline.monolithic.multisample.misc.dynamic_rendering.clear_attachments.r8g8b8a8_unorm_r16g16b16a16_sfloat_r16g16b16a16_sint_d16_unorm.4x.ds_resolve_sample_zero.whole_framebuffer
+Verification passed for color attachment 1
+Verification passed for color attachment 2
+Verification passed for color attachment 3
+Verification failed for depth attachment for 1056 pixel(s)
+<Result StatusCode="Fail">Incorrect multisampled rendering for depth attachment</Result>
+=== dEQP-VK.pipeline.monolithic.multisample.misc.dynamic_rendering.multi_renderpass.r8g8b8a8_unorm_r16g16b16a16_sfloat_r16g16b16a16_sint_s8_uint.random_221
+Verification failed for color attachment 1 for 2211 pixel(s)
+Verification failed for color attachment 2 for 2358 pixel(s)
+Verification failed for color attachment 3 for 1943 pixel(s)
+Verification failed for stencil attachment for 2448 pixel(s)
+<Result StatusCode="Fail">Incorrect multisampled rendering for color attachment 1, color attachment 2, color attachment 3, stencil attachment</Result>
+=== dEQP-VK.pipeline.monolithic.multisample.misc.dynamic_rendering.multi_renderpass.r8g8b8a8_unorm_r16g16b16a16_sfloat_r32g32b32a32_uint_d24_unorm_s8_uint.random_62
+Verification passed for color attachment 1
+Verification passed for color attachment 2
+Verification passed for color attachment 3
+Verification failed for depth attachment for 2048 pixel(s)
+Verification failed for stencil attachment for 3072 pixel(s)
+<Result StatusCode="Fail">Incorrect multisampled rendering for depth attachment, stencil attachment</Result>
+=== dEQP-VK.pipeline.monolithic.multisample.misc.multi_renderpass.r8g8b8a8_unorm_r16g16b16a16_sfloat_r16g16b16a16_sint_d32_sfloat_s8_uint.random_207
+Verification passed for color attachment 1
+Verification passed for color attachment 2
+Verification passed for color attachment 3
+Verification failed for depth attachment for 3300 pixel(s)
+Verification failed for stencil attachment for 3300 pixel(s)
+<Result StatusCode="Fail">Incorrect multisampled rendering for depth attachment, stencil attachment</Result>
+=== dEQP-VK.pipeline.monolithic.sampler.border_swizzle.d32_sfloat.rg1a.opaque_white.gather_1.no_swizzle_hint
+Ref:(0, 0, 0, 0) Threshold:(0, 0, 0, 0) Color:(1, 1, 1, 1) at vktPipelineSamplerBorderSwizzleTests.cpp:1312
+<Result StatusCode="Fail">Ref:(0, 0, 0, 0) Threshold:(0, 0, 0, 0) Color:(1, 1, 1, 1) at vktPipelineSamplerBorderSwizzleTests.cpp:1312</Result>
+=== dEQP-VK.pipeline.monolithic.sampler.border_swizzle.d32_sfloat_s8_uint_stencil.rgb0.transparent_black.gather_3.no_swizzle_hint
+Ref:(0, 0, 0, 0) Threshold:(0, 0, 0, 0) Color:(1, 1, 1, 1) at vktPipelineSamplerBorderSwizzleTests.cpp:1312
+<Result StatusCode="Fail">Ref:(0, 0, 0, 0) Threshold:(0, 0, 0, 0) Color:(1, 1, 1, 1) at vktPipelineSamplerBorderSwizzleTests.cpp:1312</Result>

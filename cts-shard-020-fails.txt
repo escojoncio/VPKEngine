@@ -1,0 +1,9 @@
+=== dEQP-VK.rasterization.culling.front_triangles_reverse_point
+Sample count = VK_SAMPLE_COUNT_1_BIT
+SUBPIXEL_BITS = 8
+Setting front face to VK_FRONT_FACE_CLOCKWISE
+Setting cull face to 1
+Drawing test pattern (VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST)
+Verifying rasterization result.
+Invalid pixels found:
+<Result StatusCode="Fail">Incorrect rendering</Result>
