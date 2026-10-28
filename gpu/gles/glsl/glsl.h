@@ -80,6 +80,7 @@ inline constexpr uint32_t kImageBase = 224;       // image uniforms: 224 + image
 inline constexpr uint32_t kAttachmentBase = 240;  // framebuffer fetch input attachments: 240 + colour location (< 8)
 
 struct Reflection {
+    bool flatVaryings = false;  // a fragment input is `flat` (GL takes it from a primitive's LAST vertex, Vulkan/Metal from the first)
     std::vector<Variable> attributes;    // vertex inputs (location assigned)
     std::vector<Variable> uniforms;      // default block + samplers
     std::vector<UniformBlock> blocks;

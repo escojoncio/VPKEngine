@@ -340,6 +340,7 @@ LinkResult link(const std::shared_ptr<Shader>& vs, const std::shared_ptr<Shader>
             int n = (in->type.isArray() ? in->type.dims[0] : 1) * (el.cols ? el.cols : 1);
             if (el.base == Base::Struct) return error("struct varyings are not supported ('" + in->name + "')");
             pairs.push_back({in, out, in->location >= 0 ? in->location : out->location, n});
+            if (in->interp == Interp::Flat) r.reflection.flatVaryings = true;
         }
         std::map<int, const Symbol*> slotOwner;  // varying slot -> the fragment input that owns it
         for (const Pair& p : pairs) {

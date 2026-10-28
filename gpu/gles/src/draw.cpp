@@ -1377,6 +1377,8 @@ Program* Context::computeProgram() {
 
 bool Context::prepareDraw(GLenum mode, VkPrimitiveTopology& topo, uint32_t vertexCount, uint32_t firstVertex,
                           uint32_t instances, bool indexed, VkBuffer&) {
+    const bool provokeOk = provokeOk_;
+    provokeOk_ = false;
     Program* p = graphicsProgram();
     if (!p || !p->linked || !p->vsModule) {
         setError(gl::INVALID_OPERATION);
@@ -1391,6 +1393,19 @@ bool Context::prepareDraw(GLenum mode, VkPrimitiveTopology& topo, uint32_t verte
         case gl::TRIANGLE_STRIP: topo = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP; break;
         case gl::TRIANGLE_FAN: topo = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN; break;
         default: setError(gl::INVALID_ENUM); return false;
+    }
+    // `flat` varyings: GL takes the value from a primitive's LAST vertex, Vulkan/Metal from the FIRST. The draw becomes a
+    // triangle/line list whose primitives are rotated so the last vertex comes first (a cyclic rotation keeps the winding).
+    // (An indexed strip with primitive restart keeps its topology: the restart cannot be rotated here.)
+    provoke_ = false;
+    if (provokeOk && p->refl.flatVaryings) {
+        const bool strip = mode == gl::TRIANGLE_STRIP || mode == gl::TRIANGLE_FAN || mode == gl::LINE_STRIP || mode == gl::LINE_LOOP;
+        if (!(indexed && strip && primitiveRestart)) {
+            if (mode == gl::TRIANGLES || mode == gl::TRIANGLE_STRIP || mode == gl::TRIANGLE_FAN)
+                provoke_ = true, topo = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+            else if (mode == gl::LINES || mode == gl::LINE_STRIP || mode == gl::LINE_LOOP)
+                provoke_ = true, topo = VK_PRIMITIVE_TOPOLOGY_LINE_LIST;
+        }
     }
     drawFb_ = resolveFramebuffer(drawFbo, true);
     if (drawFb_.status != gl::FRAMEBUFFER_COMPLETE) {
@@ -1507,13 +1522,54 @@ bool Context::prepareDraw(GLenum mode, VkPrimitiveTopology& topo, uint32_t verte
     return true;
 }
 
+// The vertex list of `mode` as triangles/lines with each primitive's last vertex first (see prepareDraw).
+static void provokeList(GLenum mode, const std::vector<uint32_t>& in, std::vector<uint32_t>& out) {
+    const size_t n = in.size();
+    switch (mode) {
+        case gl::TRIANGLES:
+            for (size_t i = 0; i + 2 < n; i += 3) out.insert(out.end(), {in[i + 2], in[i], in[i + 1]});
+            break;
+        case gl::TRIANGLE_STRIP:
+            for (size_t i = 0; i + 2 < n; ++i) {
+                uint32_t a = in[i], b = in[i + 1];
+                if (i & 1) std::swap(a, b);  // odd triangles keep the winding
+                out.insert(out.end(), {in[i + 2], a, b});
+            }
+            break;
+        case gl::TRIANGLE_FAN:
+            for (size_t i = 1; i + 1 < n; ++i) out.insert(out.end(), {in[i + 1], in[0], in[i]});
+            break;
+        case gl::LINES:
+            for (size_t i = 0; i + 1 < n; i += 2) out.insert(out.end(), {in[i + 1], in[i]});
+            break;
+        case gl::LINE_STRIP: case gl::LINE_LOOP:
+            for (size_t i = 0; i + 1 < n; ++i) out.insert(out.end(), {in[i + 1], in[i]});
+            if (mode == gl::LINE_LOOP && n > 1) out.insert(out.end(), {in[0], in[n - 1]});
+            break;
+        default: break;
+    }
+}
+
 void Context::drawArrays(GLenum mode, GLint first, GLsizei count, GLsizei instances) {
     if (first < 0 || count < 0 || instances < 0) return setError(gl::INVALID_VALUE, mode);
     if (count == 0 || instances == 0) return;
     VkPrimitiveTopology topo;
     VkBuffer unused;
     indexMax_ = 0;
+    provokeOk_ = true;
     if (!prepareDraw(mode, topo, uint32_t(count), uint32_t(first), uint32_t(instances), false, unused)) return;
+    if (provoke_) {
+        std::vector<uint32_t> verts, list;
+        verts.resize(size_t(count));
+        for (GLsizei i = 0; i < count; ++i) verts[size_t(i)] = uint32_t(first + i);
+        provokeList(mode, verts, list);
+        if (list.empty()) return;
+        Alloc s = stream(list.size() * 4, 4);
+        std::memcpy(s.host, list.data(), list.size() * 4);
+        dev->vk.vkCmdBindIndexBuffer(cmd(), s.buffer, s.offset, VK_INDEX_TYPE_UINT32);
+        dev->vk.vkCmdDrawIndexed(cmd(), uint32_t(list.size()), uint32_t(instances), 0, 0, 0);
+        return;
+    }
     if (mode == gl::LINE_LOOP) {
         // A strip with the first vertex repeated at the end: an index list over the arrays.
         Alloc s = stream(size_t(count + 1) * 4, 4);
@@ -1567,7 +1623,20 @@ void Context::drawElements(GLenum mode, GLsizei count, GLenum type, const void* 
     indexMax_ = maxIdx + uint32_t(std::max(0, baseVertex));
     VkPrimitiveTopology topo;
     VkBuffer unused;
+    provokeOk_ = true;
     if (!prepareDraw(mode, topo, 0, 0, uint32_t(instances), true, unused)) return;
+    if (provoke_) {
+        std::vector<uint32_t> verts, list;
+        verts.resize(size_t(count));
+        for (GLsizei i = 0; i < count; ++i) verts[size_t(i)] = at(i);
+        provokeList(mode, verts, list);
+        if (list.empty()) return;
+        Alloc s = stream(list.size() * 4, 4);
+        std::memcpy(s.host, list.data(), list.size() * 4);
+        dev->vk.vkCmdBindIndexBuffer(cmd(), s.buffer, s.offset, VK_INDEX_TYPE_UINT32);
+        dev->vk.vkCmdDrawIndexed(cmd(), uint32_t(list.size()), uint32_t(instances), 0, baseVertex, 0);
+        return;
+    }
     // Indices are copied into the stream (8-bit widened to 16, line loops closed).
     const bool widen = isz == 1;
     const uint32_t osz = widen ? 2 : isz;

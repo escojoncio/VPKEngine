@@ -686,6 +686,8 @@ private:
     void setDynamicState(const FbInfo& fb);
     FbInfo drawFb_;
     uint32_t indexMax_ = 0;
+    bool provokeOk_ = false;  // set by drawArrays/drawElements, the draws that can run as a rotated list; read once by prepareDraw
+    bool provoke_ = false;  // this draw runs as an index list with each primitive's last vertex first (flat varyings, see prepareDraw)
     std::unique_ptr<Texture> black_;
     Texture& blackTexture();
 };
