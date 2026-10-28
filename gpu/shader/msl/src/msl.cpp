@@ -1294,8 +1294,7 @@ private:
             case Op::SubgroupBallot: return define(in, "uint4(" + activeWord(a(0)) + ", 0u, 0u, 0u)");
             case Op::SubgroupBroadcast: return define(in, "simd_broadcast(" + a(0) + ", ushort(" + a(1) + "))");
             case Op::SubgroupShuffle: return define(in, "simd_shuffle(" + a(0) + ", ushort(" + a(1) + "))");
-            // simd_broadcast_first: the value of the lowest ACTIVE lane (checked on device in divergent code, scalars and vectors).
-            case Op::SubgroupReadFirst: return define(in, "simd_broadcast_first(" + a(0) + ")");
+            case Op::SubgroupReadFirst: return readFirst(in);
             case Op::SubgroupAny: return define(in, call("simd_any", in));
             case Op::SubgroupAll: return define(in, call("simd_all", in));
             case Op::SubgroupArith: return subgroupArith(in);
@@ -1310,19 +1309,49 @@ private:
         }
     }
 
+    // Name of the lane-id parameter ([[thread_index_in_simdgroup]]), "" when the stage has none (vertex).
+    std::string laneParam() const {
+        for (const IoVar& v : m_.inputs)
+            if (v.builtin == Builtin::SubgroupInvocation) return builtinParam(v);
+        return {};
+    }
+
     // Lanes (bit i = lane i of the 32-wide SIMD-group) of the ACTIVE invocations whose `pred` is true (all active ones for
     // ""). Built with simd_or of one bit per lane: the Metal compiler treats simd_ballot() and simd_active_threads_mask()
     // as pure calls and merges two of them across a divergent branch (the second one in `if (odd lane)` returned the
     // mask of the whole SIMD-group on device: CTS subgroups arithmetic / ballot_broadcast); a simd_or reduction is not merged.
     // Without a lane id (vertex shaders) the plain calls stay.
     std::string activeWord(const std::string& pred) const {
-        std::string lane;
-        for (const IoVar& v : m_.inputs)
-            if (v.builtin == Builtin::SubgroupInvocation) lane = builtinParam(v);
+        const std::string lane = laneParam();
         const bool all = pred.empty() || pred == "true";
         if (lane.empty())
             return "as_type<uint2>(simd_vote::vote_t(" + (all ? std::string("simd_active_threads_mask()") : "simd_ballot(" + pred + ")") + ")).x";
         return all ? "simd_or(1u << " + lane + ")" : "simd_or((" + pred + ") ? (1u << " + lane + ") : 0u)";
+    }
+
+    // subgroup_read_first: the value of the lowest ACTIVE lane. Only that lane contributes its bits to a simd_or. Not
+    // simd_broadcast_first: on device it hung the GPU in a fragment shader when the value came from a comparison with the
+    // elected lane (CTS vote.graphics.subgroupallequal_bvec2, 2-wide; the isolated shader hangs with simd_broadcast_first
+    // and with simd_shuffle of the first lane, not with this).
+    void readFirst(const Inst& in) {
+        if (!uses_.contains(in.result)) return;
+        const std::string lane = laneParam();
+        if (lane.empty()) return define(in, "simd_broadcast_first(" + ex(in.args[0]) + ")");
+        const std::string id = std::to_string(in.result), f = "sf" + id, x = "sv" + id;
+        line("const bool ", f, " = ", lane, " == ctz(", activeWord(""), ");");
+        line("const ", typeName(in.type), " ", x, " = ", ex(in.args[0]), ";");
+        const Scalar sc = in.type.scalar;
+        std::string e = in.type.width > 1 ? typeName(in.type) + "(" : "";
+        for (unsigned k = 0; k < in.type.width; ++k) {
+            const std::string c = in.type.width > 1 ? x + "." + "xyzw"[k] : x;
+            std::string bits = sc == Scalar::U32 ? c : sc == Scalar::F16 ? "uint(as_type<ushort>(" + c + "))" : "as_type<uint>(" + c + ")";
+            std::string r = "simd_or(" + f + " ? " + bits + " : 0u)";
+            if (sc == Scalar::I32) r = "as_type<int>(" + r + ")";
+            else if (sc == Scalar::F32) r = "as_type<float>(" + r + ")";
+            else if (sc == Scalar::F16) r = "as_type<half>(ushort(" + r + "))";
+            e += std::string(k ? ", " : "") + r;
+        }
+        define(in, in.type.width > 1 ? e + ")" : e);
     }
 
     // subgroup_arith (ir.h): Metal's own simd_* reductions, simd_prefix_{inclusive,exclusive}_{sum,product} for the two scans
@@ -1438,9 +1467,11 @@ bool usesSubgroups(const Block& b) {
     });
 }
 
+// Ops that build the active mask (activeWord) and need the lane id.
 bool usesBallot(const Block& b) {
     return std::any_of(b.begin(), b.end(), [](const Node& n) {
-        return (n.kind == NodeKind::Inst && n.inst.op == Op::SubgroupBallot) || usesBallot(n.body) || usesBallot(n.elseBody);
+        return (n.kind == NodeKind::Inst && (n.inst.op == Op::SubgroupBallot || n.inst.op == Op::SubgroupReadFirst)) ||
+               usesBallot(n.body) || usesBallot(n.elseBody);
     });
 }
 

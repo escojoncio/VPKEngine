@@ -557,7 +557,7 @@ void fixes(const std::string& dir) {
     if (cr.ok) {
         const std::string& m = cr.msl.source;
         CHECK(m.find("log2") == std::string::npos && m.find("exp2") == std::string::npos);  // exact frexp/ldexp
-        CHECK(m.find("simd_broadcast_first(") != std::string::npos && m.find("simd_all(") != std::string::npos);
+        CHECK(m.find("== ctz(simd_or(1u << ") != std::string::npos && m.find("simd_all(") != std::string::npos);  // read-first
     }
     if (failures || std::getenv("VP_PRINT")) std::fprintf(stderr, "%s\n", cr.msl.source.c_str());
 }
@@ -678,7 +678,7 @@ void subgroupCube(const std::string& dir) {
     // Storage cubes are texture2d_array (the driver binds a 2D-array view): slice = layer * 6 + face.
     CHECK(src.find("texture2d_array<uint") != std::string::npos && src.find("texturecube") == std::string::npos);
     CHECK(src.find(" % ") != std::string::npos && src.find("* 6u + ") != std::string::npos);
-    CHECK(src.find("simd_broadcast_first(") != std::string::npos);
+    CHECK(src.find("== ctz(simd_or(1u << ") != std::string::npos);  // read-first: simd_or of the first lane's bits
     CHECK(src.find("simd_all(") != std::string::npos);
     CHECK(src.find("simd_shuffle(true") == std::string::npos);
     if (failures || std::getenv("VP_PRINT")) std::fprintf(stderr, "%s\n", src.c_str());

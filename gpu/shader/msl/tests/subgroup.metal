@@ -18,7 +18,9 @@ struct VpArgs {
     const uint4 v8 = uint4(simd_or((v7) ? (1u << in_lane) : 0u), 0u, 0u, 0u);
     const bool v9 = simd_any(v7);
     const bool v10 = simd_all(v7);
-    const float v11 = simd_broadcast_first(v5);
+    const bool sf11 = in_lane == ctz(simd_or(1u << in_lane));
+    const float sv11 = v5;
+    const float v11 = as_type<float>(simd_or(sf11 ? as_type<uint>(sv11) : 0u));
     const uint v13 = in_lane ^ 1u;
     const float v14 = simd_shuffle(v5, ushort(v13));
     const float v15 = simd_broadcast(v5, ushort(1u));
