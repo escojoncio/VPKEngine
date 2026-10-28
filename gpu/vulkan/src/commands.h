@@ -248,6 +248,7 @@ struct BoundState {
   const Buffer* index = nullptr;
   VkDeviceSize indexOffset = 0;
   bool indexWide = false;
+  bool index8 = false;  // VK_INDEX_TYPE_UINT8: widened to 16 bits for the draw (pipelines.cpp widenIndexU8)
   bool hasViewport = false, hasScissor = false;
   VkViewport viewport{};
   VkRect2D scissor{};
@@ -431,6 +432,11 @@ bool maskPipelineKey(Device*, const PipelineObj& p, PipelineObj::TexelVariant* t
 void awaitFreshVariants(Device*);
 // The indirect-argument patch kernel (pipelines.cpp): requested at vkCreateDevice; indirectPatchRef mirrors its MSL for the tests.
 void requestIndirectPatch(Device*);
+// The 8-bit index widening kernel (VK_EXT_index_type_uint8; pipelines.cpp); indexU8Ref mirrors its MSL for the tests.
+void requestIndexU8(Device*);
+bool indexU8Ready(Device*, vpgpu::PipelineKey&);
+uint16_t indexU8Ref(uint8_t index, bool restartEnabled);
+const char* indexU8Msl();
 bool indirectPatch(Device*, vpgpu::PipelineKey&);
 void indirectPatchRef(uint32_t i, const uint32_t* prm, const uint32_t* src, const uint32_t* count, uint32_t* out);
 const char* indirectPatchMsl();
@@ -438,8 +444,9 @@ const char* indirectPatchMsl();
 // Records a draw/dispatch with the current state (pipelines.cpp).
 size_t recordedOps(VkCommandBuffer);
 void setDrawIndexSince(VkCommandBuffer, size_t before, uint32_t index);
+// `widenIndex` false: the draw keeps the bound index buffer as is (an 8-bit one is widened by the caller: indirect draws).
 OpDraw makeDraw(Recorder&, uint32_t first, uint32_t count, uint32_t instances, uint32_t firstInstance,
-                int32_t baseVertex, bool indexed);
+                int32_t baseVertex, bool indexed, bool widenIndex = true);
 OpDispatch makeDispatch(Recorder&, uint32_t x, uint32_t y, uint32_t z);
 // One "vk.skip" line (the first 32 of the process) for a draw / dispatch that is not drawn; `fmt` adds details.
 void logSkip(const char* why, const PipelineObj* p, const char* fmt = nullptr, ...) __attribute__((format(printf, 3, 4)));

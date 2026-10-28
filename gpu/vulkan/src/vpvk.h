@@ -719,6 +719,9 @@ struct Device : Dispatchable {
   // buffers): a small compute kernel run before the render pass (pipelines.cpp indirectPatch).
   std::once_flag indirectPatchOnce;
   vpgpu::PipelineKey indirectPatchKey{};
+  std::once_flag indexU8Once;  // the 8-bit index widening kernel (pipelines.cpp)
+  vpgpu::PipelineKey indexU8Key{};
+  std::atomic<int64_t> indexU8BackoffNs{0};
   // A wait for the kernel that timed out arms a backoff: until the deadline (steady clock ns) no draw waits again, they take the
   // CPU path / skip at once (100 draws must not cost 100 waits). Budgets are fields so tests can shorten them.
   std::atomic<int64_t> indirectPatchBackoffNs{0};

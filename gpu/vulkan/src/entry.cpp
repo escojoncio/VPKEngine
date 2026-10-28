@@ -709,6 +709,10 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkGetPhysicalDeviceFeatures2(VkPhysicalDe
         f16->storageInputOutput16 = VK_FALSE;
         break;
       }
+      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_INDEX_TYPE_UINT8_FEATURES_EXT: {
+        reinterpret_cast<VkPhysicalDeviceIndexTypeUint8FeaturesEXT*>(s)->indexTypeUint8 = gate;  // widened to 16 bits per draw
+        break;
+      }
       case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_8BIT_STORAGE_FEATURES: {
         // Bytes 1 apart in buffers / push constants (spirv lower.cpp load16 / store16 with 1-byte leaves).
         auto* f8 = reinterpret_cast<VkPhysicalDevice8BitStorageFeatures*>(s);
@@ -1199,6 +1203,7 @@ bool featuresSupported(VkPhysicalDevice pd, const VkDeviceCreateInfo* ci, std::s
       {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_4_FEATURES, 1},
       {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGELESS_FRAMEBUFFER_FEATURES, 1},
       {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_FEATURES, 2},
+      {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_INDEX_TYPE_UINT8_FEATURES_EXT, 1},
       {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_8BIT_STORAGE_FEATURES, 3},
       {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT16_INT8_FEATURES, 2},
       {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_MEMORY_MODEL_FEATURES, 3},

@@ -426,6 +426,7 @@ std::vector<VkExtensionProperties> deviceExtensions() {
   v.push_back({VK_EXT_HOST_QUERY_RESET_EXTENSION_NAME, 1});  // vkResetQueryPool (pipelines.cpp)
   v.push_back({VK_KHR_UNIFORM_BUFFER_STANDARD_LAYOUT_EXTENSION_NAME, 1});
   v.push_back({VK_EXT_PRIVATE_DATA_EXTENSION_NAME, 1});              // ext.cpp
+  v.push_back({VK_EXT_INDEX_TYPE_UINT8_EXTENSION_NAME, 1});          // pipelines.cpp widenIndexU8
   v.push_back({VK_KHR_8BIT_STORAGE_EXTENSION_NAME, 1});              // lower.cpp load16 / store16 (bytes)
   v.push_back({VK_KHR_SHADER_FLOAT16_INT8_EXTENSION_NAME, 1});       // lower.cpp F16 / narrowInt
   v.push_back({VK_KHR_VULKAN_MEMORY_MODEL_EXTENSION_NAME, 3});       // lower.cpp semanticsFence

@@ -2245,6 +2245,7 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdBindIndexBuffer(VkCommandBuffer cb, 
   b.index = buf ? from<Buffer>(buf) : nullptr;
   b.indexOffset = off;
   b.indexWide = t == VK_INDEX_TYPE_UINT32;
+  b.index8 = t == VK_INDEX_TYPE_UINT8_EXT;
 }
 
 VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdSetViewport(VkCommandBuffer cb, uint32_t first, uint32_t n, const VkViewport* v) {
@@ -2663,8 +2664,117 @@ void awaitFreshVariants(Device* dev) {
   awaitPipelines(dev, keys, budget, "uimask_variant");
 }
 
+// VK_EXT_index_type_uint8: Metal has no 8-bit indices, so the indices a draw reads are widened to 16 bits first. The command
+// buffer's arena gets a 16-byte header (count, restart flag) and room for the widened indices; a compute dispatch recorded
+// before the render pass (`vk.index_u8`) fills it from the app's buffer, so indices written earlier in the same submission
+// count. Where that cannot run (a secondary command buffer: no pass to put it before; kernel not compiled) the indices are read
+// from host-visible memory now. The restart index 0xFF becomes 0xFFFF only while primitive restart is on (else 255 is an index).
+constexpr uint64_t kIndexU8Shader = 0x7650564b49555438ull;  // "vPVKIUT8"
+const char* kIndexU8Msl = R"(#include <metal_stdlib>
+using namespace metal;
+struct VpArgs {
+    const device uchar* src;
+    device uchar* dst;
+};
+[[max_total_threads_per_threadgroup(64)]] kernel void vp_main(constant VpArgs& a [[buffer(0)]],
+        uint2 g [[thread_position_in_grid]]) {
+    device uint* prm = (device uint*)a.dst;
+    const uint n = prm[0];
+    const uint i = g.y * 2097152u + g.x;
+    if (i >= n) return;
+    const uint v = a.src[i];
+    device ushort* out = (device ushort*)(a.dst + 16);
+    out[i] = (prm[1] != 0u && v == 255u) ? ushort(0xFFFF) : ushort(v);
+}
+)";
+constexpr uint32_t kIndexU8RowThreads = 2097152;  // 32768 groups of 64: the kernel's grid is 2-D past that
+
+uint16_t indexU8Ref(uint8_t index, bool restartEnabled) { return restartEnabled && index == 255 ? 0xFFFFu : uint16_t(index); }
+const char* indexU8Msl() { return kIndexU8Msl; }
+
+void requestIndexU8(Device* d) {
+  std::call_once(d->indexU8Once, [d] {
+    ShaderBlob blob;
+    blob.source = kIndexU8Msl;
+    blob.threadsPerGroup = {64, 1, 1};
+    blob.arguments = {{vpgpu::BindKind::Buffer, 0, 0}, {vpgpu::BindKind::Buffer, 1, 8}};
+    d->platform->addShader(kIndexU8Shader, std::move(blob));
+    vpgpu::PipelineState st;
+    st.computeShader = kIndexU8Shader;
+    st.label = "vk.index_u8";
+    d->indexU8Key = st.key();
+    d->gpu->pipelines().request(st, d->indexU8Key, vpgpu::Priority::Blocking);
+  });
+}
+
+// True when the kernel is compiled; waits (bounded, 2 s, with a backoff after a timeout) while it is queued or compiling.
+bool indexU8Ready(Device* d, vpgpu::PipelineKey& key) {
+  requestIndexU8(d);
+  key = d->indexU8Key;
+  using Status = vpgpu::PipelineCache::Status;
+  using Clock = std::chrono::steady_clock;
+  const auto nowNs = [] { return int64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now().time_since_epoch()).count()); };
+  vpgpu::PipelineCache& cache = d->gpu->pipelines();
+  Status st = cache.status(key);
+  if ((st == Status::Queued || st == Status::Compiling) && nowNs() >= d->indexU8BackoffNs.load(std::memory_order_relaxed)) {
+    cache.boost(key);
+    cache.waitReady({key}, std::chrono::milliseconds(2000));
+    st = cache.status(key);
+    if (st == Status::Queued || st == Status::Compiling) d->indexU8BackoffNs.store(nowNs() + 3'000'000'000, std::memory_order_relaxed);
+  }
+  if (st == Status::Ready) return true;
+  static std::atomic<unsigned> k{0};
+  if (k.fetch_add(1) < 4) logf("vk.index_u8 kernel_not_ready status=%d (0 missing 1 queued 2 compiling 3 ready 4 failed)", int(st));
+  return false;
+}
+
+// `n` 8-bit indices from byte `first` of the bound index buffer, as a 16-bit index buffer in `out` (n clipped to the buffer).
+// False when nothing can be read (the draw is skipped).
+static bool widenIndexU8(Recorder& r, uint64_t first, uint64_t n, bool restart, vpgpu::IndexBuffer& out) {
+  const Buffer* ib = r.bound.index;
+  const uint64_t avail = ib && ib->size > r.bound.indexOffset ? ib->size - r.bound.indexOffset : 0;
+  if (first >= avail) return false;
+  n = std::min(n, avail - first);
+  if (!n || n > 0xFFFFFFFFull) return false;
+  const uint64_t at = r.bound.indexOffset + first;
+  vpgpu::PipelineKey key{};
+  if (r.passBegin != SIZE_MAX && r.passBegin < r.ops.size() && ib->id && indexU8Ready(r.device, key)) {
+    std::vector<uint8_t> blob(16 + n * 2, 0);
+    const uint32_t head[2] = {uint32_t(n), restart ? 1u : 0u};
+    std::memcpy(blob.data(), head, sizeof head);
+    VkDeviceSize aoff = 0;
+    const vpgpu::BufferId arena = r.arena.put(r.device, blob.data(), blob.size(), aoff);
+    OpDispatch dp;
+    dp.dispatch.pipeline = key;
+    const uint64_t groups = (n + 63) / 64;
+    dp.dispatch.groups = {uint32_t(std::min<uint64_t>(groups, kIndexU8RowThreads / 64)),
+                          uint32_t((groups + kIndexU8RowThreads / 64 - 1) / (kIndexU8RowThreads / 64)), 1};
+    dp.dispatch.label = "vk.index_u8";
+    dp.dispatch.required = true;
+    auto acc = [](vpgpu::ResourceRange rr, bool w, uint16_t slot) {
+      vpgpu::Access a{rr, vpgpu::stage::compute, w};
+      a.kind = vpgpu::BindKind::Buffer, a.slot = slot;
+      return a;
+    };
+    dp.dispatch.bindings.push_back(acc(vpgpu::ResourceRange::bytes(ib->id, at, n), false, 0));
+    dp.dispatch.bindings.push_back(acc(vpgpu::ResourceRange::bytes(arena, aoff, blob.size()), true, 1));
+    r.ops.insert(r.ops.begin() + std::ptrdiff_t(r.passBegin), Op{std::move(dp)});
+    ++r.passBegin;
+    out = vpgpu::IndexBuffer{arena, aoff + 16, false};
+    return true;
+  }
+  if (!ib->memory || !ib->memory->host) return false;
+  const uint8_t* src = ib->memory->host + ib->offset + at;
+  std::vector<uint16_t> wide(n);
+  for (uint64_t i = 0; i < n; ++i) wide[i] = indexU8Ref(src[i], restart);
+  VkDeviceSize aoff = 0;
+  const vpgpu::BufferId arena = r.arena.put(r.device, wide.data(), wide.size() * 2, aoff);
+  out = vpgpu::IndexBuffer{arena, aoff, false};
+  return true;
+}
+
 OpDraw makeDraw(Recorder& r, uint32_t first, uint32_t count, uint32_t instances, uint32_t firstInstance,
-                int32_t baseVertex, bool indexed) {
+                int32_t baseVertex, bool indexed, bool widenIndex) {
   OpDraw op;
   const PipelineObj* p = r.bound.graphics;
   if (p && !resolvePipeline(r.device, *p)) {
@@ -2755,6 +2865,15 @@ OpDraw makeDraw(Recorder& r, uint32_t first, uint32_t count, uint32_t instances,
       return op;
     }
     d.index = vpgpu::IndexBuffer{r.bound.index->id, r.bound.indexOffset, r.bound.indexWide};
+    if (r.bound.index8 && widenIndex && topo != VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN) {  // fans read the indices themselves below
+      const bool restart = p->isDynamic(VK_DYNAMIC_STATE_PRIMITIVE_RESTART_ENABLE) && eds.restart >= 0 ? eds.restart != 0 : p->primitiveRestart;
+      if (!widenIndexU8(r, first, count, restart, *d.index)) {
+        op.ok = false, op.reason = SkipReason::NoIndex;
+        logSkip("index_u8_unreadable", p, "first=%u count=%u", first, count);
+        return op;
+      }
+      d.first = 0;
+    }
   }
   // Triangle fans (Metal has none): an indexed triangle list (v0, vk, vk+1) in the command
   // buffer's upload memory; an indexed fan reads its indices now (unified memory: the buffer the
@@ -2763,7 +2882,7 @@ OpDraw makeDraw(Recorder& r, uint32_t first, uint32_t count, uint32_t instances,
     const uint8_t* src = nullptr;
     if (indexed) {
       const Buffer* ib = r.bound.index;
-      const VkDeviceSize stride = r.bound.indexWide ? 4 : 2;
+      const VkDeviceSize stride = r.bound.indexWide ? 4 : r.bound.index8 ? 1 : 2;
       const VkDeviceSize avail = ib->size > r.bound.indexOffset ? (ib->size - r.bound.indexOffset) / stride : 0;
       if (ib->memory && ib->memory->host && uint64_t(first) + count <= avail)  // in bounds only
         src = ib->memory->host + ib->offset + r.bound.indexOffset;
@@ -2776,6 +2895,7 @@ OpDraw makeDraw(Recorder& r, uint32_t first, uint32_t count, uint32_t instances,
           std::memcpy(&v, src + size_t(first + i) * 4, 4);
           return v;
         }
+        if (r.bound.index8) return src[size_t(first + i)];
         uint16_t v;
         std::memcpy(&v, src + size_t(first + i) * 2, 2);
         return v;
@@ -2783,7 +2903,7 @@ OpDraw makeDraw(Recorder& r, uint32_t first, uint32_t count, uint32_t instances,
       std::vector<uint32_t> tri;
       tri.reserve(size_t(count - 2) * 3);
       // Primitive restart (indexed): the restart index ends a fan and the next one starts after it.
-      const uint32_t restart = r.bound.indexWide ? 0xFFFFFFFFu : 0xFFFFu;
+      const uint32_t restart = r.bound.indexWide ? 0xFFFFFFFFu : r.bound.index8 ? 0xFFu : 0xFFFFu;
       const bool splits = indexed && (p->isDynamic(VK_DYNAMIC_STATE_PRIMITIVE_RESTART_ENABLE) && eds.restart >= 0
                                           ? eds.restart != 0
                                           : p->primitiveRestart);
@@ -2990,7 +3110,7 @@ bool indirectPatch(Device* d, vpgpu::PipelineKey& key) {
 // counted by TranslateStats::indirectCpu / indirectCpuSecondary, vk.perf ind{cpu cpu_sec}).
 void recordIndirectDraw(Recorder& r, const Buffer* b, VkDeviceSize off, uint32_t n, uint32_t stride, bool indexed,
                         const Buffer* countBuf, VkDeviceSize countOff) {
-  OpDraw op = makeDraw(r, 0, 1, 1, 0, 0, indexed);
+  OpDraw op = makeDraw(r, 0, 1, 1, 0, 0, indexed, false);
   op.indirect = b, op.indirectOffset = off, op.indirectCount = n, op.indirectStride = stride;
   if (!op.ok || !b || !b->id || n == 0) {
     if (countBuf && op.ok) {  // no GPU count without the GPU path (logged by the skip)
@@ -3033,9 +3153,19 @@ void recordIndirectDraw(Recorder& r, const Buffer* b, VkDeviceSize off, uint32_t
     return;
   }
   const uint32_t words = indexed ? 5 : 4;
+  if (indexed && r.bound.index8 && op.ok && op.pipe) {  // the records' indices are unknown here: the whole bound range is widened
+    const PipelineObj& pp = *op.pipe;
+    const bool restart = pp.isDynamic(VK_DYNAMIC_STATE_PRIMITIVE_RESTART_ENABLE) && r.bound.eds.restart >= 0 ? r.bound.eds.restart != 0 : pp.primitiveRestart;
+    if (!widenIndexU8(r, 0, UINT64_MAX, restart, *op.draw.index)) {
+      op.ok = false, op.reason = SkipReason::NoIndex;
+      logSkip("index_u8_unreadable", op.pipe, "indirect");
+      r.ops.emplace_back(std::move(op));
+      return;
+    }
+  }
   if (indexed && r.bound.index) {  // hazards cover the whole bound index range
     const VkDeviceSize ib = r.bound.index->size > r.bound.indexOffset ? r.bound.index->size - r.bound.indexOffset : 0;
-    op.draw.first = 0, op.draw.count = uint32_t(std::min<VkDeviceSize>(ib / (r.bound.indexWide ? 4 : 2), 0xFFFFFFFFu));
+    op.draw.first = 0, op.draw.count = uint32_t(std::min<VkDeviceSize>(ib / (r.bound.indexWide ? 4 : r.bound.index8 ? 1 : 2), 0xFFFFFFFFu));
   } else {
     op.draw.first = 0, op.draw.count = 0xFFFF;  // unknown on the CPU: never a "fullscreen" pass to VPKTAA
   }
