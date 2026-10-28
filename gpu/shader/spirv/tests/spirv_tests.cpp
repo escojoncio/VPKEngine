@@ -557,7 +557,7 @@ void fixes(const std::string& dir) {
     if (cr.ok) {
         const std::string& m = cr.msl.source;
         CHECK(m.find("log2") == std::string::npos && m.find("exp2") == std::string::npos);  // exact frexp/ldexp
-        CHECK(m.find("simd_active_threads_mask(") != std::string::npos && m.find("simd_all(") != std::string::npos);
+        CHECK(m.find("simd_broadcast_first(") != std::string::npos && m.find("simd_all(") != std::string::npos);
     }
     if (failures || std::getenv("VP_PRINT")) std::fprintf(stderr, "%s\n", cr.msl.source.c_str());
 }
@@ -678,7 +678,7 @@ void subgroupCube(const std::string& dir) {
     // Storage cubes are texture2d_array (the driver binds a 2D-array view): slice = layer * 6 + face.
     CHECK(src.find("texture2d_array<uint") != std::string::npos && src.find("texturecube") == std::string::npos);
     CHECK(src.find(" % ") != std::string::npos && src.find("* 6u + ") != std::string::npos);
-    CHECK(src.find("simd_active_threads_mask(") != std::string::npos);
+    CHECK(src.find("simd_broadcast_first(") != std::string::npos);
     CHECK(src.find("simd_all(") != std::string::npos);
     CHECK(src.find("simd_shuffle(true") == std::string::npos);
     if (failures || std::getenv("VP_PRINT")) std::fprintf(stderr, "%s\n", src.c_str());
@@ -720,7 +720,9 @@ void subgroupArith(const std::string& dir) {
     CHECK(src.find("simd_xor(") != std::string::npos);                    // BitwiseXor reduce
     CHECK(src.find("simd_and(") != std::string::npos);                    // LogicalAnd reduce (0/1 integers)
     CHECK(src.find("simd_prefix_exclusive_") == std::string::npos);       // SMin exclusive: the loop, not a builtin
-    CHECK(src.find("simd_active_threads_mask()") != std::string::npos && src.find("for (uint sk = 0u; sk < 32u; ++sk)") != std::string::npos);
+    // The active mask is a simd_or of one bit per lane (simd_active_threads_mask() / simd_ballot() are merged across divergent branches).
+    CHECK(src.find("simd_or(1u << in_lane)") != std::string::npos && src.find("for (uint sk = 0u; sk < 32u; ++sk)") != std::string::npos);
+    CHECK(src.find("simd_active_threads_mask") == std::string::npos && src.find("simd_ballot") == std::string::npos);
     CHECK(src.find("min(") != std::string::npos && src.find("max(") != std::string::npos);
     CHECK(src.find("(sk >> 2u) == (") != std::string::npos);              // clustered by 4
     CHECK(src.find("sk < ") != std::string::npos);                        // exclusive: lanes below

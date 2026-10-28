@@ -22,7 +22,7 @@ struct VpArgs {
     const uint sx9 = v6;
     const uint v9 = simd_prefix_exclusive_product(sx9);
     const float sx10 = v5;
-    const uint sm10 = as_type<uint2>(simd_vote::vote_t(simd_active_threads_mask())).x;
+    const uint sm10 = simd_or(1u << in_lane);
     const uint sl10 = in_lane;
     float sa10_0 = as_type<float>(0x7f800000u);
     for (uint sk = 0u; sk < 32u; ++sk) {
@@ -31,7 +31,7 @@ struct VpArgs {
     }
     const float v10 = sa10_0;
     const uint sx11 = v6;
-    const uint sm11 = as_type<uint2>(simd_vote::vote_t(simd_active_threads_mask())).x;
+    const uint sm11 = simd_or(1u << in_lane);
     const uint sl11 = in_lane;
     uint sa11_0 = 0u;
     for (uint sk = 0u; sk < 32u; ++sk) {
@@ -43,7 +43,7 @@ struct VpArgs {
     const uint v12 = simd_and(sx12);
     const float2 v13 = float2(v5);
     const float2 sx14 = v13;
-    const uint sm14 = as_type<uint2>(simd_vote::vote_t(simd_active_threads_mask())).x;
+    const uint sm14 = simd_or(1u << in_lane);
     const uint sl14 = in_lane;
     float sa14_0 = as_type<float>(0x7f800000u);
     for (uint sk = 0u; sk < 32u; ++sk) {

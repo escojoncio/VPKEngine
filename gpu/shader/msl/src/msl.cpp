@@ -1291,28 +1291,11 @@ private:
             case Op::Barrier: return line("threadgroup_barrier(mem_flags::mem_threadgroup);");
             case Op::BarrierAll:
                 return line("threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup | mem_flags::mem_texture);");
-            case Op::SubgroupBallot:
-                return define(in, "uint4(as_type<uint2>(simd_vote::vote_t(simd_ballot(" + a(0) + "))), 0u, 0u)");
+            case Op::SubgroupBallot: return define(in, "uint4(" + activeWord(a(0)) + ", 0u, 0u, 0u)");
             case Op::SubgroupBroadcast: return define(in, "simd_broadcast(" + a(0) + ", ushort(" + a(1) + "))");
             case Op::SubgroupShuffle: return define(in, "simd_shuffle(" + a(0) + ", ushort(" + a(1) + "))");
-            case Op::SubgroupReadFirst: {
-                // The lowest ACTIVE lane, taken from the active mask: simd_broadcast_first returned the value of an inactive lane 0
-                // in divergent code (CTS ballot_broadcast subgroupbroadcastfirst).
-                if (!uses_.contains(in.result)) return;
-                const std::string m = "vf" + std::to_string(in.result);
-                line("const uint2 ", m, " = as_type<uint2>(simd_vote::vote_t(simd_active_threads_mask()));");
-                const std::string lane = "ushort(" + m + ".x ? ctz(" + m + ".x) : 32u + ctz(" + m + ".y))";
-                if (in.type.width == 1) return define(in, "simd_shuffle(" + a(0) + ", " + lane + ")");
-                // Vectors go lane by lane: a vector simd_shuffle with a lane computed in divergent code gave wrong
-                // values on device (CTS ballot_broadcast subgroupbroadcastfirst on vec2/ivec4/uvec3/f16vec3/u16vec4/bvec3).
-                const std::string l = "vl" + std::to_string(in.result), v = "vv" + std::to_string(in.result);
-                line("const ushort ", l, " = ", lane, ";");
-                line("const ", typeName(in.type), " ", v, " = ", a(0), ";");
-                std::string e = typeName(in.type) + "(";
-                for (unsigned k = 0; k < in.type.width; ++k)
-                    e += std::string(k ? ", " : "") + "simd_shuffle(" + v + "." + "xyzw"[k] + ", " + l + ")";
-                return define(in, e + ")");
-            }
+            // simd_broadcast_first: the value of the lowest ACTIVE lane (checked on device in divergent code, scalars and vectors).
+            case Op::SubgroupReadFirst: return define(in, "simd_broadcast_first(" + a(0) + ")");
             case Op::SubgroupAny: return define(in, call("simd_any", in));
             case Op::SubgroupAll: return define(in, call("simd_all", in));
             case Op::SubgroupArith: return subgroupArith(in);
@@ -1325,6 +1308,21 @@ private:
             case Op::MeshIndex: return line("vp_mesh.set_index(", a(0), ", uchar(", a(1), "));");
             case Op::MeshPrimitiveCount: return line("vp_mesh.set_primitive_count(", a(0), ");");
         }
+    }
+
+    // Lanes (bit i = lane i of the 32-wide SIMD-group) of the ACTIVE invocations whose `pred` is true (all active ones for
+    // ""). Built with simd_or of one bit per lane: the Metal compiler treats simd_ballot() and simd_active_threads_mask()
+    // as pure calls and merges two of them across a divergent branch (the second one in `if (odd lane)` returned the
+    // mask of the whole SIMD-group on device: CTS subgroups arithmetic / ballot_broadcast); a simd_or reduction is not merged.
+    // Without a lane id (vertex shaders) the plain calls stay.
+    std::string activeWord(const std::string& pred) const {
+        std::string lane;
+        for (const IoVar& v : m_.inputs)
+            if (v.builtin == Builtin::SubgroupInvocation) lane = builtinParam(v);
+        const bool all = pred.empty() || pred == "true";
+        if (lane.empty())
+            return "as_type<uint2>(simd_vote::vote_t(" + (all ? std::string("simd_active_threads_mask()") : "simd_ballot(" + pred + ")") + ")).x";
+        return all ? "simd_or(1u << " + lane + ")" : "simd_or((" + pred + ") ? (1u << " + lane + ") : 0u)";
     }
 
     // subgroup_arith (ir.h): Metal's own simd_* reductions, simd_prefix_{inclusive,exclusive}_{sum,product} for the two scans
@@ -1341,7 +1339,7 @@ private:
         const bool builtin = mode == 0 || ((mode == 1 || mode == 2) && kind <= 1);
         const std::string mask = "sm" + id, lane = "sl" + id;
         if (!builtin) {
-            line("const uint ", mask, " = as_type<uint2>(simd_vote::vote_t(simd_active_threads_mask())).x;");
+            line("const uint ", mask, " = ", activeWord(""), ";");
             line("const uint ", lane, " = ", ex(in.args[1]), ";");
         }
         // Identity element: integers carry their bits; floats 0, 1, +inf, -inf.
@@ -1440,6 +1438,12 @@ bool usesSubgroups(const Block& b) {
     });
 }
 
+bool usesBallot(const Block& b) {
+    return std::any_of(b.begin(), b.end(), [](const Node& n) {
+        return (n.kind == NodeKind::Inst && n.inst.op == Op::SubgroupBallot) || usesBallot(n.body) || usesBallot(n.elseBody);
+    });
+}
+
 // Lane ids and ballots of a wave-64 module cannot be expressed on 32-wide hardware.
 bool usesSubgroups(const Module& m) {
     bool builtin = std::any_of(m.inputs.begin(), m.inputs.end(), [](const IoVar& v) {
@@ -1458,6 +1462,13 @@ EmitResult emitMsl(const Module& module, const EmitOptions& options) {
         r.errors.push_back("wave_size 64: Apple SIMD groups are 32 lanes; lower subgroup ops to wave 32 first");
     if (!r.errors.empty()) return r;
     Module m = module;
+    if ((m.stage == Stage::Fragment || m.stage == Stage::Compute) &&
+        std::any_of(m.functions.begin(), m.functions.end(), [](const Function& f) { return usesBallot(f.body); }) &&
+        std::none_of(m.inputs.begin(), m.inputs.end(), [](const IoVar& v) { return v.builtin == Builtin::SubgroupInvocation; })) {
+        IoVar lane;  // activeWord() needs the lane id
+        lane.builtin = Builtin::SubgroupInvocation, lane.name = "lane", lane.type = vpir::kU32;
+        m.inputs.push_back(lane);
+    }
     if (options.robustBuffers) {
         // A BufferSize entry for every storage buffer the shader loads, stores or does atomics on.
         std::set<uint32_t> touched;
