@@ -8915,9 +8915,10 @@ void testCaptureUnhooked() {
     const auto dispatchBase = reinterpret_cast<PFN_vkCmdDispatchBase>(fn("vkCmdDispatchBase"));
     const auto drawMulti = reinterpret_cast<PFN_vkCmdDrawMultiEXT>(fn("vkCmdDrawMultiEXT"));
     const auto setEvent = reinterpret_cast<PFN_vkSetEvent>(fn("vkSetEvent"));
-    // The driver does not offer these: no game can call them, so there is nothing to record.
-    CHECK(vkGetInstanceProcAddr(r.inst, "vkCmdPushDescriptorSetKHR") == nullptr);
-    CHECK(vkGetInstanceProcAddr(r.inst, "vkCmdPushDescriptorSetWithTemplateKHR") == nullptr);
+    // Push descriptors are offered (counted as unhooked, the replay cannot reproduce them); the fragment shading rate is not:
+    // no game can call it, so there is nothing to record.
+    CHECK(vkGetInstanceProcAddr(r.inst, "vkCmdPushDescriptorSetKHR") != nullptr);
+    CHECK(vkGetInstanceProcAddr(r.inst, "vkCmdPushDescriptorSetWithTemplateKHR") != nullptr);
     CHECK(vkGetInstanceProcAddr(r.inst, "vkCmdSetFragmentShadingRateKHR") == nullptr);
 
     VkDescriptorUpdateTemplateEntry te{0, 0, 1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 0, sizeof(VkDescriptorBufferInfo)};
