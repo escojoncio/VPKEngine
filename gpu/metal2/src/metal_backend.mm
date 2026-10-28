@@ -1527,6 +1527,26 @@ CTSK(v_e, ball(), as_type<uint2>(simd_vote::vote_t(simd_ballot(d[100] != 0u))).x
 CTSK(v_f, ball(), as_type<uint2>(simd_vote::vote_t(simd_ballot((lane & 1u) == 1u))).x)
 CTSK(v_g, actv(), as_type<uint2>(simd_vote::vote_t(simd_ballot(d[100] != 0u))).x)
 CTSK(v_h, as_type<uint2>(simd_vote::vote_t(simd_ballot(d[100] != 0u))).x, as_type<uint2>(simd_vote::vote_t(simd_ballot(d[100] != 0u))).x)
+inline uint orm(uint lane) { return simd_or(1u << lane); }
+inline uint orb(uint lane, bool p) { return simd_or(p ? (1u << lane) : 0u); }
+CTSK(w_a, orm(lane), orm(lane))
+CTSK(w_b, orb(lane, true), orb(lane, true))
+CTSK(w_c, orb(lane, d[100] != 0u), orb(lane, d[100] != 0u))
+kernel void y_vote(device uint* out [[buffer(0)]], const device uint* d [[buffer(1)]],
+                   uint tid [[thread_position_in_grid]], uint lane [[thread_index_in_simdgroup]]) {
+  uint base = tid * 8u;
+  bool P = (d[lane] & 1u) != 0u;
+  out[base + 0] = simd_all(P) ? 1u : 0u;
+  out[base + 1] = simd_any(!P) ? 1u : 0u;
+  out[base + 2] = simd_prefix_exclusive_sum(d[lane]);
+  out[base + 3] = simd_min(d[lane]);
+  if ((lane & 1u) == 1u) {
+    out[base + 4] = simd_all(P) ? 1u : 0u;
+    out[base + 5] = simd_any(!P) ? 1u : 0u;
+    out[base + 6] = simd_prefix_exclusive_sum(d[lane]);
+    out[base + 7] = simd_min(d[lane]);
+  } else { out[base + 4] = 0xEEEEu; }
+}
 )MSL";
     NSError* e = nil;
     id<MTLLibrary> lib = [dev newLibraryWithSource:@(kSrc) options:nil error:&e];
@@ -1535,7 +1555,7 @@ CTSK(v_h, as_type<uint2>(simd_vote::vote_t(simd_ballot(d[100] != 0u))).x, as_typ
     for (uint32_t i = 0; i < 128; ++i) data[i] = (i + 1) * (i + 1) + 3;
     struct Shape { uint32_t x, y, z; };
     const Shape shapes[] = {{32, 1, 1}, {8, 1, 1}};
-    for (const char* kn : {"k_cts", "k_bf", "v_a", "v_b", "v_c", "v_d", "v_e", "v_f", "v_g", "v_h"}) {
+    for (const char* kn : {"w_a", "w_b", "w_c", "y_vote"}) {
       id<MTLFunction> fn = [lib newFunctionWithName:@(kn)];
       id<MTLComputePipelineState> ps = fn ? [dev newComputePipelineStateWithFunction:fn error:&e] : nil;
       if (!ps) { say(std::string("SGTEST pipeline_failed ") + kn); continue; }
