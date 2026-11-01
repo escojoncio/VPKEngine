@@ -332,7 +332,7 @@ struct GateResult {
   uint32_t draws = 0, skipped = 0, softPending = 0, hardPending = 0;
   double waitedMs = 0, hardWaitedMs = 0;
   // Draws with a pending pipeline / dropped, by destination class (pipelines.cpp DestClass: eye, no_color,
-  // transient_rt, persistent_rt, eye_sized_not_marked). Only "eye" is ever soft.
+  // transient_rt, persistent_rt, eye_sized_not_marked). A pass is soft when it is the eye or its target is redrawn every frame (pipelines.cpp redrawnEveryFrame).
   uint32_t pendingByClass[5] = {}, skippedByClass[5] = {};
 };
 GateResult gateFramePipelines(Device*, vpgpu::Frame&, uint64_t submitNo);

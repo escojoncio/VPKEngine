@@ -6123,11 +6123,11 @@ void testAsyncPipelines() {
     const GateResult r = gateFramePipelines(d, f, 2);
     CHECK(r.hardPending == 1 && r.softPending == 0 && r.skipped == 1);
   }
-  // 4c. VPVK_PIPELINE_EYE_HARD_WAIT_MS: the eye waits for its pipelines too. Default 0 (1500 for vpgles) leaves the soft
+  // 4c. VPVK_PIPELINE_EYE_HARD_WAIT_MS: the eye waits for its pipelines too. Default 0 (vpgles too) leaves the soft
   // behaviour; with a budget the wait counts as a demand waiter (the archive harvest steps aside), and a timeout drops the draws.
   {
     unsetenv("VPVK_PIPELINE_EYE_HARD_WAIT_MS");
-    CHECK(eyeHardWaitMs(false) == 0 && eyeHardWaitMs(true) == 1500);
+    CHECK(eyeHardWaitMs(false) == 0 && eyeHardWaitMs(true) == 0);
     setenv("VPVK_PIPELINE_EYE_HARD_WAIT_MS", "40", 1);
     CHECK(eyeHardWaitMs(false) == 40 && eyeHardWaitMs(true) == 40);
     setenv("VPVK_PIPELINE_EYE_HARD_WAIT_MS", "0", 1);
@@ -6175,6 +6175,91 @@ void testAsyncPipelines() {
       CHECK(r.softPending == 1 && r.skipped == 1 && r.waitedMs < 60);
     }
     unsetenv("VPVK_PIPELINE_EYE_HARD_WAIT_MS");
+    eyeWaitReset();
+  }
+  // 4d. vpgles (internalClient) follows the Vulkan soft path for the eye by default: dropped after the small soft wait
+  // (no 1500 ms eye wait), while a persistent non-eye pass still waits for its pipeline (persistWaitMs, 300 ms here).
+  {
+    unsetenv("VPVK_PIPELINE_EYE_HARD_WAIT_MS");
+    eyeWaitReset();
+    d->internalClient = true;
+    {
+      vpgpu::Frame f = frameOf(soft, p0->key, 2);
+      const GateResult r = gateFramePipelines(d, f, 9);
+      CHECK(r.softPending == 1 && r.hardPending == 0 && r.skipped == 2 && drawsIn(f) == 0 && r.waitedMs < 60);
+      CHECK(r.skippedByClass[0] == 2);
+    }
+    {
+      vpgpu::Frame f = frameOf(hard, p0->key, 1);
+      const GateResult r = gateFramePipelines(d, f, 10);
+      CHECK(r.hardPending == 1 && r.hardWaitedMs >= 250 && r.skipped == 1 && drawsIn(f) == 0);
+    }
+    d->internalClient = false;
+    eyeWaitReset();
+  }
+  // 4e. A render target cleared and drawn in each of the last 3 frames (a frame = a submit with an eye pass) is redrawn every
+  // frame: soft like the eye. One drawn once, or loaded (accumulating) instead of cleared, keeps the hard wait.
+  {
+    eyeWaitReset();
+    vpgpu::TextureDesc rtd = td;
+    rtd.persistent = true;
+    const vpgpu::TextureId rt = c.gpu().createTexture(rtd), rtOnce = c.gpu().createTexture(rtd), rtLoad = c.gpu().createTexture(rtd),
+                           rtGap = c.gpu().createTexture(rtd);
+    CHECK(rt && rtOnce && rtLoad && rtGap && !isEyeTexture(*d, rt));
+    // One submit: the eye pass, then `target`'s pass (k null = no draw; a null target = eye only).
+    auto eyeAndRt = [&](vpgpu::TextureId target, vpgpu::PipelineKey k, vpgpu::LoadAction load) {
+      vpgpu::Frame f;
+      vpgpu::RenderPassDesc eye;
+      eye.colors[0].texture = soft, eye.colors[0].store = vpgpu::StoreAction::Store;
+      f.beginRenderPass(eye);
+      f.endRenderPass();
+      if (!target) return f;
+      vpgpu::RenderPassDesc rd;
+      rd.colors[0].texture = target, rd.colors[0].store = vpgpu::StoreAction::Store, rd.colors[0].load = load;
+      f.beginRenderPass(rd);
+      if (k.value) {
+        vpgpu::Draw dr;
+        dr.pipeline = k, dr.count = 3;
+        f.draw(dr);
+      }
+      f.endRenderPass();
+      return f;
+    };
+    const vpgpu::LoadAction kClear = vpgpu::LoadAction::Clear, kLoad = vpgpu::LoadAction::Load;
+    uint64_t no = 20;
+    auto frames = [&](vpgpu::TextureId t, vpgpu::LoadAction ld, int n) {
+      for (int i = 0; i < n; ++i) {
+        vpgpu::Frame f = eyeAndRt(t, vpgpu::PipelineKey{}, ld);
+        gateFramePipelines(d, f, no++);
+      }
+    };
+    frames(rt, kClear, 3);
+    {  // frame 4: the pipeline is still compiling: dropped after the small soft wait, no hard wait
+      vpgpu::Frame f = eyeAndRt(rt, p0->key, kClear);
+      const GateResult r = gateFramePipelines(d, f, no++);
+      CHECK(r.softPending == 1 && r.hardPending == 0 && r.skipped == 1 && drawsIn(f) == 0);
+      CHECK(r.hardWaitedMs == 0 && r.waitedMs < 60);
+    }
+    {  // one tick without the target (one submit per eye) is tolerated
+      frames(rtGap, kClear, 2);
+      frames(vpgpu::TextureId{}, kClear, 1);
+      frames(rtGap, kClear, 1);
+      vpgpu::Frame f = eyeAndRt(rtGap, p0->key, kClear);
+      const GateResult r = gateFramePipelines(d, f, no++);
+      CHECK(r.softPending == 1 && r.hardPending == 0 && r.skipped == 1 && r.hardWaitedMs == 0);
+    }
+    {  // Load every frame (accumulates): hard
+      frames(rtLoad, kLoad, 3);
+      vpgpu::Frame f = eyeAndRt(rtLoad, p0->key, kLoad);
+      const GateResult r = gateFramePipelines(d, f, no++);
+      CHECK(r.hardPending == 1 && r.softPending == 0 && r.hardWaitedMs >= 250 && r.skipped == 1);
+    }
+    {  // rendered for the first time with a pending pipeline: hard
+      vpgpu::Frame f = eyeAndRt(rtOnce, p0->key, kClear);
+      const GateResult r = gateFramePipelines(d, f, no++);
+      CHECK(r.hardPending == 1 && r.softPending == 0 && r.hardWaitedMs >= 250 && r.skipped == 1);
+    }
+    for (vpgpu::TextureId t : {rt, rtOnce, rtLoad, rtGap}) c.gpu().destroy(t);
     eyeWaitReset();
   }
   // 5. The compile finishes while the hard wait runs: the draw stays, nothing skipped.

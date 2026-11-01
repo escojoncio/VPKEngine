@@ -779,6 +779,16 @@ struct Device : Dispatchable {
   std::unordered_set<uint64_t> eyeTextures;
   // Size of the latest image marked by vpvk_mark_eye_image (packEyeSize; written under submitMutex, read lock-free on the hot path).
   std::atomic<uint64_t> eyeSize{0};
+  // Render targets redrawn every frame (pipelines.cpp stampRedrawnTargets): a "frame" is a submit that has an eye pass, counted
+  // by eyeTick; per target view (texture, mip, layer) the last tick it was rendered in and how many ticks in a row. redrawMutex guards all three.
+  struct RedrawStamp {
+    uint64_t tick = 0;
+    uint32_t streak = 0;
+    bool seen = false;
+  };
+  std::mutex redrawMutex;
+  uint64_t eyeTick = 0, redrawPruneTick = 0;
+  std::unordered_map<uint64_t, RedrawStamp> redrawStamps;
   // Shader ids already handed to the platform (translateStage): a recipe hit registers each once.
   std::mutex shaderMutex;
   std::unordered_set<uint64_t> shadersAdded;
@@ -840,7 +850,7 @@ void markEyeTexture(Device&, vpgpu::TextureId);
 bool isEyeTexture(Device&, vpgpu::TextureId);
 // pipelines.cpp: how long a submit waits for the pipelines of its hard passes (VPVK_PIPELINE_PERSIST_WAIT_MS wins).
 uint32_t persistWaitMs(bool internalClient);
-// pipelines.cpp: the extra wait for the eye's passes (VPVK_PIPELINE_EYE_HARD_WAIT_MS wins; default 0, 1500 for vpgles).
+// pipelines.cpp: the extra wait for the eye's passes (VPVK_PIPELINE_EYE_HARD_WAIT_MS wins; default 0 for every client).
 uint32_t eyeHardWaitMs(bool internalClient);
 // pipelines.cpp (tests): forget which pipelines already had their eye wait and the per-second budget spent.
 void eyeWaitReset();

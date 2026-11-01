@@ -210,10 +210,15 @@ void retainKey(Device* dev, const PipelineObj& p, vpgpu::PipelineKey k) {
 //         the game redraws it every frame):
 //         wait at most VPVK_PIPELINE_FRAME_WAIT_MS (default 3) for all of them together, then drop the draws still
 //         pending from this frame (counted, `vk.pipeline_skip`). Never drawn with another shader.
-//         With VPVK_PIPELINE_EYE_HARD_WAIT_MS > 0 (default 0 = the above; 1500 for vpgles, eyeHardWaitMs) the eye is treated
+//         With VPVK_PIPELINE_EYE_HARD_WAIT_MS > 0 (default 0 = the above, vpgles included; eyeHardWaitMs) the eye is treated
 //         as hard: the frame waits up to that budget for its pipelines (already boosted), `vk.pipeline_wait what=eye_target`,
 //         and only what is still pending after it is dropped. Each pipeline gets that wait once (later frames drop its
 //         draws as before until it is ready) and all eye waits together take at most twice the budget per second.
+//       soft too: a render target redrawn every frame (the scene FBO a GL game blits to the eye). It is tracked per attachment
+//         view (texture, mip, layer): a "frame" is a submit with an eye pass, and the target counts for a frame when the
+//         first pass that writes it there clears it (load Clear / DontCare; a Load pass accumulates, so it resets the count).
+//         After more than 3 counted frames in a row (one skipped tick is tolerated) its draws are dropped like the eye's
+//         (redrawnEveryFrame). Without a marked eye image nothing is tracked; first frames and sporadic targets stay hard.
 //       hard passes (they store a texture that outlives the frame and is not the eye: a render-to-texture, a shadow
 //         map, a probe; and every dispatch): a draw dropped there can stay missing for good, so the frame waits for
 //         them, at most VPVK_PIPELINE_PERSIST_WAIT_MS (default 1500; 10000 for vpgles, persistWaitMs), `vk.pipeline_wait what=persistent_target`.
@@ -382,6 +387,77 @@ static DestClass classifyPass(Device* dev, const vpgpu::RenderPassDesc& rd) {
   return eyeSizedPass(w, h, &known, dev->eyeSize.load(std::memory_order_relaxed)) && rd.layerCount <= 2 ? DestClass::EyeSizedNotEye : DestClass::PersistentRT;
 }
 
+// A render target drawn in each of the last kRedrawFrames frames is redrawn every frame (the scene FBO a GL game blits to the
+// eye): a draw dropped there costs one frame, so its pass is soft like the eye's. A "frame" is a submit with an eye pass
+// (Device::eyeTick); without any marked eye image nothing is tracked and every non-eye pass stays hard. Targets rendered once
+// or now and then keep the hard wait. A target counts for a frame only when the first pass that writes it in that frame does
+// not load its old contents (load Clear / DontCare): a Load pass accumulates, a dropped draw there is lost for good.
+static constexpr uint32_t kRedrawFrames = 3;
+
+struct PassTarget {
+  uint64_t key = 0;  // 0 = no attachment; mixes the texture, mip and layer of the attachment view
+  vpgpu::LoadAction load = vpgpu::LoadAction::Load;
+};
+
+static PassTarget passTarget(const vpgpu::RenderPassDesc& rd) {
+  auto make = [](vpgpu::TextureId id, uint32_t mip, uint32_t layer, vpgpu::LoadAction load) {
+    uint64_t h = uint64_t{id.generation} << 32 | id.index;
+    h = (h ^ mip) * 0x9E3779B97F4A7C15ull;
+    h = (h ^ layer) * 0x9E3779B97F4A7C15ull;
+    return PassTarget{h | 1, load};
+  };
+  for (const vpgpu::Attachment& a : rd.colors)
+    if (a.texture)  // the resolve target when there is one (the msaa texture is a stand-in), the msaa attachment's load
+      return a.resolve ? make(a.resolve, a.resolveMip, a.resolveLayer, a.load) : make(a.texture, a.mip, a.layer, a.load);
+  return rd.depth.texture ? make(rd.depth.texture, rd.depth.mip, rd.depth.layer, rd.depth.load) : PassTarget{};
+}
+
+// Called once per submit, before the "nothing is compiling" early return. Stamps the passes' targets with the current frame
+// and returns its number (the tick the submit belongs to; an eye submit moves the counter on afterwards).
+static uint64_t stampRedrawnTargets(Device* dev, const vpgpu::Frame& frame) {
+  bool hasEye = false;
+  for (const vpgpu::Command& cmd : frame.commands()) {
+    const auto* rp = std::get_if<vpgpu::RenderPass>(&cmd);
+    if (!rp) continue;
+    for (const vpgpu::Attachment& a : rp->desc.colors)
+      if (a.texture && (isEyeTexture(*dev, a.texture) || (a.resolve && isEyeTexture(*dev, a.resolve)))) hasEye = true;
+    if (hasEye) break;
+  }
+  std::lock_guard<std::mutex> lock(dev->redrawMutex);
+  const uint64_t tick = dev->eyeTick;
+  if (hasEye || tick) {
+    for (const vpgpu::Command& cmd : frame.commands()) {
+      const auto* rp = std::get_if<vpgpu::RenderPass>(&cmd);
+      if (!rp) continue;
+      const PassTarget t = passTarget(rp->desc);
+      if (!t.key) continue;
+      Device::RedrawStamp& st = dev->redrawStamps[t.key];
+      if (st.seen && st.tick == tick) continue;  // the first pass of this frame decided
+      // One skipped tick is tolerated (a game with one submit per eye moves the counter twice per frame).
+      const bool next = st.streak && tick > st.tick && tick - st.tick <= 2;
+      st.streak = t.load == vpgpu::LoadAction::Load ? 0 : next ? st.streak + 1 : 1;
+      st.tick = tick, st.seen = true;
+    }
+    if (dev->redrawStamps.size() > 1024 && tick >= dev->redrawPruneTick) {  // drop what can no longer be part of a streak
+      dev->redrawPruneTick = tick + 64;
+      for (auto it = dev->redrawStamps.begin(); it != dev->redrawStamps.end();)
+        it = it->second.tick + 2 < tick ? dev->redrawStamps.erase(it) : std::next(it);
+    }
+  }
+  if (hasEye) ++dev->eyeTick;
+  return tick;
+}
+
+// True when the pass's target was rendered in each of the kRedrawFrames frames before `tick` (this frame is stamped already).
+static bool redrawnEveryFrame(Device* dev, const vpgpu::RenderPassDesc& rd, uint64_t tick) {
+  const PassTarget t = passTarget(rd);
+  if (!t.key) return false;
+  std::lock_guard<std::mutex> lock(dev->redrawMutex);
+  const auto it = dev->redrawStamps.find(t.key);
+  if (it == dev->redrawStamps.end()) return false;
+  return it->second.tick == tick && it->second.streak > kRedrawFrames;
+}
+
 uint32_t persistWaitMs(bool internalClient) {
   // Read once: 0 is a valid value (no wait), so "unset" is told apart from it.
   static const char* const env = std::getenv("VPVK_PIPELINE_PERSIST_WAIT_MS");
@@ -392,11 +468,12 @@ uint32_t persistWaitMs(bool internalClient) {
 }
 
 // How long a submit waits for the pipelines of the eye's passes (soft otherwise). 0 = no extra wait (the soft frame wait
-// alone). Read at every call that has eye draws pending, so a test can change it.
-uint32_t eyeHardWaitMs(bool internalClient) {
+// alone). Read at every call that has eye draws pending, so a test can change it. The eye is redrawn every frame, GL
+// games included, so a dropped eye draw costs one frame; a block of up to 1.5 s per new effect would cost more.
+uint32_t eyeHardWaitMs(bool) {
   const char* env = std::getenv("VPVK_PIPELINE_EYE_HARD_WAIT_MS");
   if (env && *env) return uint32_t(std::strtoul(env, nullptr, 10));
-  return internalClient ? 1500 : 0;
+  return 0;
 }
 
 // The eye's wait budget is spent once per pipeline key (`waited`: forgotten when the pipeline is no longer pending) and
@@ -422,6 +499,7 @@ GateResult gateFramePipelines(Device* dev, vpgpu::Frame& frame, uint64_t submitN
   if (!dev || !dev->gpu || !dev->translator) return r;  // legacy mode: the core's frame hold (VP_HOLD_MS) decides
   PipelineCounters& c = pipelineCounters();
   ++c.gateFrames;
+  const uint64_t tick = stampRedrawnTargets(dev, frame);
   vpgpu::PipelineCache& cache = dev->gpu->pipelines();
   if (cache.idle()) return r;  // the common case: nothing is queued or compiling
   static const uint32_t softMs = waitBudgetMs("VPVK_PIPELINE_FRAME_WAIT_MS", 3);
@@ -443,14 +521,15 @@ GateResult gateFramePipelines(Device* dev, vpgpu::Frame& frame, uint64_t submitN
   for (const vpgpu::Command& cmd : frame.commands()) {
     if (const auto* rp = std::get_if<vpgpu::RenderPass>(&cmd)) {
       const DestClass cls = classifyPass(dev, rp->desc);
-      const bool mustRun = cls != DestClass::Eye;
+      int redrawn = cls == DestClass::Eye ? 1 : -1;  // 1 = soft (the eye, or a target redrawn every frame); looked up at the first pending draw
       for (const vpgpu::Draw& d : rp->draws) {
         if (d.clear) continue;
         ++r.draws;
         classOfDraw.push_back(uint8_t(cls));
         if (!pending(d.pipeline)) continue;
         ++r.pendingByClass[size_t(cls)];
-        if (mustRun) {
+        if (redrawn < 0) redrawn = redrawnEveryFrame(dev, rp->desc, tick) ? 1 : 0;
+        if (!redrawn) {
           if (inHard.insert(d.pipeline.value).second) hard.push_back(d.pipeline);
         } else if (inSoft.insert(d.pipeline.value).second) {
           soft.push_back(d.pipeline);
