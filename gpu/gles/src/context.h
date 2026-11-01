@@ -643,6 +643,9 @@ public:
         bool implicit = false;
         GLuint tex = 0;  // the texture of such an attachment (its contents seed the twin)
         ImageP seedImage;  // ... or, with no texture (the default framebuffer), the image that seeds the twin
+        // A multisample renderbuffer: `image` is its single-sample image (the only one it has), the same twin scheme with
+        // `seedImage` = `image`. Its sample count (the application still sees a multisample attachment).
+        uint32_t msSamples = 0;
     };
     struct FbInfo {
         std::array<FbTarget, kMaxDrawBuffers> color{};
@@ -734,10 +737,16 @@ private:
         bool operator==(const PassKey& o) const;
     } pass_;
     PassKey passKeyFor(const FbInfo& fb);  // the attachments a pass on `fb` would have
-    // The transient multisample image an implicit-multisample attachment is rendered in: shared by format / size / layers /
-    // samples (every pass starts it anew: cleared, or seeded from the texture).
-    ImageP msTwin(const FormatInfo* f, uint32_t w, uint32_t h, uint32_t layers, uint32_t samples);
-    std::map<std::string, ImageP> msTwins_;
+    // The transient multisample image an implicit-multisample attachment is rendered in: shared by attachment slot (colour
+    // index; kMaxDrawBuffers = depth / stencil, one image) / format / size / layers / samples (every pass starts it anew:
+    // cleared, or seeded from the texture). Two attachments of one framebuffer never share a twin.
+    ImageP msTwin(uint32_t slot, const FormatInfo* f, uint32_t w, uint32_t h, uint32_t layers, uint32_t samples);
+    struct MsTwin {
+        ImageP image;
+        uint64_t use = 0;  // msTwinEpoch_ of the last passKeyFor that asked for it
+    };
+    std::map<std::string, MsTwin> msTwins_;
+    uint64_t msTwinEpoch_ = 0;
     // Streaming ring (per submission chunks).
     struct Chunk {
         StorageP storage;

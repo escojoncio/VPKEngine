@@ -446,6 +446,7 @@ void Context::copyImageSubData(GLuint srcName, GLenum srcTarget, GLint srcLevel,
         Image* image = nullptr;
         uint32_t levelW = 0, levelH = 0, levelD = 1;  // size of the chosen level; layers (not depth) for arrays / cubes
         bool is3D = false;
+        uint32_t msRbo = 0;  // samples of a multisample renderbuffer (its image is single-sample)
         std::shared_ptr<Image> hold;
     } side[2];
     const GLuint names[2] = {srcName, dstName};
@@ -459,6 +460,7 @@ void Context::copyImageSubData(GLuint srcName, GLenum srcTarget, GLint srcLevel,
             if (levels[i] != 0) return setError(gl::INVALID_VALUE, targets[i]);
             sd.image = r->image.get(), sd.hold = r->image;
             sd.levelW = uint32_t(r->width), sd.levelH = uint32_t(r->height);
+            sd.msRbo = r->samples > 1 ? uint32_t(r->samples) : 0;
             continue;
         }
         const bool known = targets[i] == gl::TEXTURE_2D || targets[i] == gl::TEXTURE_3D || targets[i] == gl::TEXTURE_2D_ARRAY ||
@@ -483,6 +485,12 @@ void Context::copyImageSubData(GLuint srcName, GLenum srcTarget, GLint srcLevel,
     const bool sameClass = sf.texelBytes == df.texelBytes && sf.depth == df.depth && sf.stencil == df.stencil &&
                            (mixed || (sf.blockW == df.blockW && sf.blockH == df.blockH));
     if (!sameClass) return setError(gl::INVALID_OPERATION);
+    // GL: the sample counts must match. A multisample renderbuffer holds no samples (only its resolved image), so it cannot be
+    // copied with a multisample texture either.
+    const uint32_t ns[2] = {side[0].msRbo ? side[0].msRbo : uint32_t(side[0].image->samples),
+                            side[1].msRbo ? side[1].msRbo : uint32_t(side[1].image->samples)};
+    if (ns[0] != ns[1] || ((side[0].msRbo || side[1].msRbo) && (side[0].image->samples > 1 || side[1].image->samples > 1)))
+        return setError(gl::INVALID_OPERATION);
     const uint32_t sbw = sf.compressed ? sf.blockW : 1, sbh = sf.compressed ? sf.blockH : 1;
     const GLint o[2][3] = {{sx, sy, sz}, {dx, dy, dz}};
     for (int i = 0; i < 2; ++i) {
@@ -575,7 +583,7 @@ void Context::copyTexImage(GLenum target, GLint level, GLenum internalFormat, GL
     int idx = 0;
     if (rf && readFbo && rf->readBuffer >= gl::COLOR_ATTACHMENT0) idx = int(rf->readBuffer - gl::COLOR_ATTACHMENT0);
     FbTarget src = fb.color[size_t(idx)];
-    if (src.image && src.image->samples > 1) return setError(gl::INVALID_OPERATION, target);
+    if (src.image && (src.image->samples > 1 || src.msSamples)) return setError(gl::INVALID_OPERATION, target);
     if (!src.image) return setError(gl::INVALID_OPERATION, target);
     if (!sub) {
         GLenum fmt = internalFormat;

@@ -114,6 +114,7 @@ bool Context::targetOf(const Attachment& a, FbTarget& out, uint32_t& w, uint32_t
         if (!r || !r->image) return false;
         out.image = r->image.get();
         out.level = 0, out.layer = 0, out.layers = 1;
+        if (r->samples > 1) out.implicit = true, out.seedImage = r->image, out.msSamples = uint32_t(r->samples);
         w = uint32_t(r->width), h = uint32_t(r->height);
         return true;
     }
@@ -172,7 +173,7 @@ Context::FbInfo Context::resolveFramebuffer(GLuint name, bool forDraw) {
             t.implicit = true;
             t.tex = a.name;
         }
-        const uint32_t n = t.implicit ? renderSamples(uint32_t(a.samples)) : uint32_t(t.image->samples);
+        const uint32_t n = t.msSamples ? t.msSamples : t.implicit ? renderSamples(uint32_t(a.samples)) : uint32_t(t.image->samples);
         if (first) fb.width = w, fb.height = h, views = v, samples = n, first = false;
         else {
             if (n != samples) {
@@ -228,12 +229,13 @@ Context::PassKey Context::passKeyFor(const FbInfo& fb) {
     } else {
         bufs = fbo(drawFbo)->drawBuffers;
     }
+    ++msTwinEpoch_;  // the twins asked for below are in use: msTwin never evicts them
     // The view a pass renders into: the attachment's own, or for an implicit-multisample one its twin (`resolve`: the
     // attachment's own view, what the pass resolves into).
-    auto view = [&](const FbTarget& t, VkImageView& resolve) -> VkImageView {
+    auto view = [&](const FbTarget& t, uint32_t slot, VkImageView& resolve) -> VkImageView {
         const VkImageView own = t.image->attachmentView(t.level, t.layer, layerCount);
         if (!t.implicit) return own;
-        ImageP twin = msTwin(t.image->format, std::max(1u, t.image->width >> t.level), std::max(1u, t.image->height >> t.level),
+        ImageP twin = msTwin(slot, t.image->format, std::max(1u, t.image->width >> t.level), std::max(1u, t.image->height >> t.level),
                              layerCount, fb.samples);
         if (!twin) return logf("gles.err what=ms_twin samples=%u", fb.samples), own;
         resolve = own;
@@ -243,10 +245,10 @@ Context::PassKey Context::passKeyFor(const FbInfo& fb) {
         // Draw buffer i writes colour attachment drawBuffers[i] (GLES: must be COLOR_ATTACHMENTi or NONE).
         if (bufs[size_t(i)] == gl::NONE) continue;
         const FbTarget& t = fb.color[size_t(i)];
-        if (t.image) key.color[size_t(i)] = view(t, key.colorResolve[size_t(i)]);
+        if (t.image) key.color[size_t(i)] = view(t, uint32_t(i), key.colorResolve[size_t(i)]);
     }
-    if (fb.depth.image) key.depth = view(fb.depth, key.depthResolve);
-    if (fb.stencil.image) key.stencil = view(fb.stencil, key.stencilResolve);
+    if (fb.depth.image) key.depth = view(fb.depth, kMaxDrawBuffers, key.depthResolve);
+    if (fb.stencil.image) key.stencil = view(fb.stencil, kMaxDrawBuffers, key.stencilResolve);
     return key;
 }
 
@@ -399,8 +401,11 @@ void Context::invalidateFramebuffer(GLenum target, GLsizei n, const GLenum* atts
         if (!t.image || t.image->external) return;
         const VkImageView v = t.image->attachmentView(t.level, t.layer, layerCount);
         t.image->invalid[v] |= bit;
-        if (passOpen_ && (idx < size_t(kMaxDrawBuffers) ? pass_.color[idx] : idx == size_t(kMaxDrawBuffers) ? pass_.depth : pass_.stencil) == v)
-            drop |= 1u << idx;
+        // (An implicit-multisample attachment's pass view is its twin: its own view is the pass's resolve target.)
+        const bool depthSlot = idx == size_t(kMaxDrawBuffers);
+        const VkImageView passView = idx < size_t(kMaxDrawBuffers) ? pass_.color[idx] : depthSlot ? pass_.depth : pass_.stencil;
+        const VkImageView passResolve = idx < size_t(kMaxDrawBuffers) ? pass_.colorResolve[idx] : depthSlot ? pass_.depthResolve : pass_.stencilResolve;
+        if (passOpen_ && (passView == v || passResolve == v)) drop |= 1u << idx;
     };
     GLenum bad = 0;
     for (GLsizei i = 0; i < n && !bad; ++i) {
@@ -2623,7 +2628,7 @@ void Context::readPixels(GLint x, GLint y, GLsizei w, GLsizei h, GLenum format, 
         idx = int(f->readBuffer - gl::COLOR_ATTACHMENT0);
     }
     FbTarget src = fb.color[size_t(idx)];
-    if (src.image && src.image->samples > 1) return setError(gl::INVALID_OPERATION, format);
+    if (src.image && (src.image->samples > 1 || src.msSamples)) return setError(gl::INVALID_OPERATION, format);
     if (!src.image) return setError(gl::INVALID_OPERATION, format);
     const uint32_t outPx = clientPixelBytes(format, type);
     if (!outPx) return setError(gl::INVALID_ENUM, format);
@@ -2699,7 +2704,7 @@ void Context::blitFramebuffer(GLint sx0, GLint sy0, GLint sx1, GLint sy1, GLint 
     if (readFbo) ri = int(fbo(readFbo)->readBuffer - gl::COLOR_ATTACHMENT0);
     FbTarget& rc = rf.color[size_t(std::clamp(ri, 0, kMaxDrawBuffers - 1))];
     const auto& bufs = drawFbo ? fbo(drawFbo)->drawBuffers : fbos[0]->drawBuffers;
-    auto multisampled = [](const FbTarget& t) { return t.image && t.image->samples > 1; };
+    auto multisampled = [](const FbTarget& t) { return t.image && (t.image->samples > 1 || t.msSamples); };
     // (The depth / stencil of a multisample default framebuffer is a single-sample image its twin resolves into.)
     auto multisampledDs = [&](const FbTarget& t) { return multisampled(t) || (t.implicit && t.seedImage); };
     bool dstMS = ((mask & gl::DEPTH_BUFFER_BIT) && multisampledDs(df.depth)) || ((mask & gl::STENCIL_BUFFER_BIT) && multisampledDs(df.stencil));
@@ -2718,6 +2723,7 @@ void Context::blitFramebuffer(GLint sx0, GLint sy0, GLint sx1, GLint sy1, GLint 
         if ((msDepth && df.depth.image && df.depth.image->format != rf.depth.image->format) ||
             (msStencil && df.stencil.image && df.stencil.image->format != rf.stencil.image->format))
             return setError(gl::INVALID_OPERATION);
+        filter = gl::NEAREST;  // 1:1 (checked above): the filter is moot, and a multisample read always clipped like NEAREST
     }
     barrier();
     int32_t blitDst[4] = {0, 0, 0, 0};  // the destination rectangle the last single-sample blit wrote (clipped)

@@ -270,14 +270,20 @@ ImageP createImage2D(Device* dev, const FormatInfo* f, uint32_t w, uint32_t h, u
     return img;
 }
 
-ImageP Context::msTwin(const FormatInfo* f, uint32_t w, uint32_t h, uint32_t layers, uint32_t samples) {
-    const std::string key = std::to_string(int(f->vk)) + ":" + std::to_string(w) + "x" + std::to_string(h) + "x" +
-                            std::to_string(layers) + "@" + std::to_string(samples);
+ImageP Context::msTwin(uint32_t slot, const FormatInfo* f, uint32_t w, uint32_t h, uint32_t layers, uint32_t samples) {
+    const std::string key = std::to_string(slot) + "#" + std::to_string(int(f->vk)) + ":" + std::to_string(w) + "x" + std::to_string(h) +
+                            "x" + std::to_string(layers) + "@" + std::to_string(samples);
     auto it = msTwins_.find(key);
-    if (it != msTwins_.end()) return it->second;
-    if (msTwins_.size() >= 16) {  // sizes that are no longer rendered to: recorded work may still use them
-        for (auto& [k, img] : msTwins_) keep(img);
-        msTwins_.clear();
+    if (it != msTwins_.end()) return it->second.use = msTwinEpoch_, it->second.image;
+    if (msTwins_.size() >= 32) {  // twins of sizes that are no longer rendered to (never one this passKeyFor asked for): recorded work may still use them
+        for (auto e = msTwins_.begin(); e != msTwins_.end();) {
+            if (e->second.use == msTwinEpoch_) {
+                ++e;
+                continue;
+            }
+            keep(e->second.image);
+            e = msTwins_.erase(e);
+        }
     }
     // Transient: the samples never reach memory (the pass resolves them and the next one is seeded), so the backend keeps them on the tile.
     ImageP img = createImage2D(dev, f, w, h, layers, samples,
@@ -285,7 +291,8 @@ ImageP Context::msTwin(const FormatInfo* f, uint32_t w, uint32_t h, uint32_t lay
                                    VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT);
     if (!img) return nullptr;
     imageInit(*img);
-    return msTwins_[key] = img;
+    msTwins_[key] = {img, msTwinEpoch_};
+    return img;
 }
 
 VkImageView Image::storageView(uint32_t level, uint32_t layer, uint32_t layerCount, VkImageViewType type, VkFormat fmt) {

@@ -1997,10 +1997,14 @@ void RenderbufferStorageMultisample(GLenum target, GLsizei samples, GLenum ifmt,
     if (!f || f->compressed || (!f->renderable && !(f->depth || f->stencil))) return c->setError(gl::INVALID_ENUM, target);
     if (r->image) c->keep(r->image);
     const uint32_t n = samples > 0 ? renderSamples(uint32_t(samples)) : 1;
-    ImageP img = createImage2D(c->dev, f, uint32_t(std::max(w, 1)), uint32_t(std::max(h, 1)), 1, n,
+    // Game MSAA is memoryless: a multisample renderbuffer stores only this single-sample image. Its passes render in a transient
+    // multisample twin (Context::msTwin) that resolves into it and is seeded from it (FbTarget::msSamples); the stencil plane of
+    // the seed is read through a stencil view (format views).
+    ImageP img = createImage2D(c->dev, f, uint32_t(std::max(w, 1)), uint32_t(std::max(h, 1)), 1, 1,
                                (f->depth || f->stencil ? VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT : VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) |
-                                   VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT);
-    if (!img) return c->setError(n > 1 ? gl::INVALID_OPERATION : gl::OUT_OF_MEMORY, target);
+                                   VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+                               f->stencil && n > 1 ? VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT : 0);
+    if (!img) return c->setError(gl::OUT_OF_MEMORY, target);
     c->imageInit(*img);
     r->image = img;
     r->internalFormat = ifmt, r->width = w, r->height = h, r->samples = GLsizei(n > 1 ? n : 0);

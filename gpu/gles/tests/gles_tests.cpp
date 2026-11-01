@@ -17,6 +17,7 @@
 #include <fstream>
 #include <functional>
 #include <map>
+#include <set>
 #include <sstream>
 #include <string>
 #include <chrono>
@@ -60,6 +61,8 @@ struct Counts {
     int draws = 0, drawsIndexed = 0, passes = 0, pipelines = 0, copiesToImage = 0, clears = 0, dispatches = 0,
         blits = 0, copiesToBuffer = 0, drawsIndirect = 0, drawsIndexedIndirect = 0, dispatchesIndirect = 0, copiesImage = 0,
         imagesWithStorage = 0, imagesCreated = 0, clearColorImages = 0, clearDepthImages = 0;
+    int passDrops = 0, lastDropDepth = -1;  // vpvk_cmd_pass_drop calls (glInvalidateFramebuffer with an open pass) and the last depth flag
+    int imagesStoredMS = 0, resolves = 0;  // multisample images created without TRANSIENT usage (samples that reach memory); vkCmdResolveImage calls
     uint32_t lastCopyRegions = 0;
     // Last image view created (format, type) and last image created (flags, samples).
     VkFormat lastViewFormat = VK_FORMAT_UNDEFINED;
@@ -78,6 +81,10 @@ struct Counts {
     // Load / store ops of the last pass (first colour attachment, depth attachment).
     VkAttachmentLoadOp colorLoad = VK_ATTACHMENT_LOAD_OP_MAX_ENUM, depthLoad = VK_ATTACHMENT_LOAD_OP_MAX_ENUM;
     VkAttachmentStoreOp colorStore = VK_ATTACHMENT_STORE_OP_MAX_ENUM, depthStore = VK_ATTACHMENT_STORE_OP_MAX_ENUM;
+    // Whether the last pass resolves its first colour attachment / its depth attachment (a resolve image view).
+    bool colorResolve = false, depthResolve = false;
+    // Image views of the colour attachments / the depth attachment of the last pass (the multisample twins for multisample renderbuffers).
+    VkImageView colorViews[8] = {}, depthView = VK_NULL_HANDLE;
 } counts;
 
 PFN_vkCmdDraw realDraw;
@@ -88,6 +95,7 @@ PFN_vkCmdCopyBufferToImage realCopyToImage;
 PFN_vkCmdClearAttachments realClear;
 PFN_vkCmdDispatch realDispatch;
 PFN_vkCmdBlitImage realBlit;
+PFN_vkCmdResolveImage realResolveImage;
 PFN_vkCmdCopyImageToBuffer realCopyToBuffer;
 PFN_vkCmdDrawIndirect realDrawIndirect;
 PFN_vkCmdDrawIndexedIndirect realDrawIndexedIndirect;
@@ -116,6 +124,10 @@ VKAPI_ATTR void VKAPI_CALL myBeginRendering(VkCommandBuffer c, const VkRendering
     counts.lastColorCount = ri->colorAttachmentCount;
     if (ri->colorAttachmentCount) counts.colorLoad = ri->pColorAttachments[0].loadOp, counts.colorStore = ri->pColorAttachments[0].storeOp;
     if (ri->pDepthAttachment) counts.depthLoad = ri->pDepthAttachment->loadOp, counts.depthStore = ri->pDepthAttachment->storeOp;
+    for (uint32_t i = 0; i < 8; ++i) counts.colorViews[i] = i < ri->colorAttachmentCount ? ri->pColorAttachments[i].imageView : VK_NULL_HANDLE;
+    counts.depthView = ri->pDepthAttachment ? ri->pDepthAttachment->imageView : VK_NULL_HANDLE;
+    counts.colorResolve = ri->colorAttachmentCount && ri->pColorAttachments[0].resolveImageView != VK_NULL_HANDLE;
+    counts.depthResolve = ri->pDepthAttachment && ri->pDepthAttachment->resolveImageView != VK_NULL_HANDLE;
     realBeginRendering(c, ri);
 }
 VKAPI_ATTR VkResult VKAPI_CALL myCreatePipelines(VkDevice d, VkPipelineCache pc, uint32_t n, const VkGraphicsPipelineCreateInfo* ci,
@@ -146,6 +158,8 @@ PFN_passDrop realPassDrop;
 VKAPI_ATTR void VKAPI_CALL myPassDrop(VkCommandBuffer c, uint32_t colorMask, int depth, int stencil) {
     counts.colorStore = (colorMask & 1) ? VK_ATTACHMENT_STORE_OP_DONT_CARE : VK_ATTACHMENT_STORE_OP_STORE;
     counts.depthStore = depth ? VK_ATTACHMENT_STORE_OP_DONT_CARE : VK_ATTACHMENT_STORE_OP_STORE;
+    ++counts.passDrops;
+    counts.lastDropDepth = depth;
     realPassDrop(c, colorMask, depth, stencil);
 }
 VKAPI_ATTR void VKAPI_CALL myDispatch(VkCommandBuffer c, uint32_t x, uint32_t y, uint32_t z) {
@@ -156,6 +170,11 @@ VKAPI_ATTR void VKAPI_CALL myBlit(VkCommandBuffer c, VkImage s, VkImageLayout sl
                                   const VkImageBlit* r, VkFilter f) {
     ++counts.blits;
     realBlit(c, s, sl, d, dl, n, r, f);
+}
+VKAPI_ATTR void VKAPI_CALL myResolveImage(VkCommandBuffer c, VkImage s, VkImageLayout sl, VkImage d, VkImageLayout dl, uint32_t n,
+                                          const VkImageResolve* r) {
+    ++counts.resolves;
+    realResolveImage(c, s, sl, d, dl, n, r);
 }
 VKAPI_ATTR void VKAPI_CALL myCopyToBuffer(VkCommandBuffer c, VkImage i, VkImageLayout l, VkBuffer b, uint32_t n, const VkBufferImageCopy* r) {
     ++counts.copiesToBuffer;
@@ -185,6 +204,7 @@ VKAPI_ATTR VkResult VKAPI_CALL myCreateImage(VkDevice d, const VkImageCreateInfo
     counts.lastImageFlags = ci->flags;
     counts.lastImageSamples = ci->samples;
     if (ci->samples != VK_SAMPLE_COUNT_1_BIT) ++counts.imagesMultisample;
+    if (ci->samples != VK_SAMPLE_COUNT_1_BIT && !(ci->usage & VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT)) ++counts.imagesStoredMS;
     VkResult r = realCreateImage(d, ci, a, out);
     if (r == VK_SUCCESS) imageTypes[*out] = ci->imageType;
     return r;
@@ -230,6 +250,7 @@ PFN_vkVoidFunction intercept(const char* name, PFN_vkVoidFunction real) {
     I("vpvk_cmd_pass_drop", myPassDrop, realPassDrop)
     I("vkCmdDispatch", myDispatch, realDispatch)
     I("vkCmdBlitImage", myBlit, realBlit)
+    I("vkCmdResolveImage", myResolveImage, realResolveImage)
     I("vkCmdCopyImageToBuffer", myCopyToBuffer, realCopyToBuffer)
     I("vkCmdDrawIndirect", myDrawIndirect, realDrawIndirect)
     I("vkCmdDrawIndexedIndirect", myDrawIndexedIndirect, realDrawIndexedIndirect)
@@ -1856,6 +1877,266 @@ void testInvalidate() {
 
 // GL_OES_EGL_image_external as Unity uses it for video: the texture is created with glGenTextures +
 // glBindTexture(GL_TEXTURE_EXTERNAL_OES) + glTexParameteri before the SurfaceTexture exists.
+// Game MSAA is always memoryless: a multisample renderbuffer stores only its single-sample image. Passes render in a transient
+// multisample twin that resolves into it (store DONT_CARE + resolve view) and the next pass is seeded from it; a blit with the
+// renderbuffer as source copies the already-resolved image (no vkCmdResolveImage of stored samples).
+void testMsRbo() {
+    Egl e;
+    CHECK(e.up());
+    GLuint p = program(kVs100, kFs100);
+    G(glUseProgram, void (*)(GLuint));
+    G(glGenBuffers, void (*)(GLsizei, GLuint*));
+    G(glBindBuffer, void (*)(GLenum, GLuint));
+    G(glBufferData, void (*)(GLenum, GLsizeiptr, const void*, GLenum));
+    G(glVertexAttribPointer, void (*)(GLuint, GLint, GLenum, GLboolean, GLsizei, const void*));
+    G(glEnableVertexAttribArray, void (*)(GLuint));
+    G(glGetAttribLocation, GLint (*)(GLuint, const char*));
+    G(glDrawArrays, void (*)(GLenum, GLint, GLsizei));
+    G(glGenFramebuffers, void (*)(GLsizei, GLuint*));
+    G(glBindFramebuffer, void (*)(GLenum, GLuint));
+    G(glFramebufferTexture2D, void (*)(GLenum, GLenum, GLenum, GLuint, GLint));
+    G(glFramebufferRenderbuffer, void (*)(GLenum, GLenum, GLenum, GLuint));
+    G(glCheckFramebufferStatus, GLenum (*)(GLenum));
+    G(glGenTextures, void (*)(GLsizei, GLuint*));
+    G(glBindTexture, void (*)(GLenum, GLuint));
+    G(glTexStorage2D, void (*)(GLenum, GLsizei, GLenum, GLsizei, GLsizei));
+    G(glGenRenderbuffers, void (*)(GLsizei, GLuint*));
+    G(glBindRenderbuffer, void (*)(GLenum, GLuint));
+    G(glRenderbufferStorageMultisample, void (*)(GLenum, GLsizei, GLenum, GLsizei, GLsizei));
+    G(glGetRenderbufferParameteriv, void (*)(GLenum, GLenum, GLint*));
+    G(glClear, void (*)(GLbitfield));
+    G(glClearColor, void (*)(GLfloat, GLfloat, GLfloat, GLfloat));
+    G(glEnable, void (*)(GLenum));
+    G(glBlitFramebuffer, void (*)(GLint, GLint, GLint, GLint, GLint, GLint, GLint, GLint, int64_t, int64_t));
+    G(glReadPixels, void (*)(GLint, GLint, GLsizei, GLsizei, GLenum, GLenum, void*));
+    G(glGetIntegerv, void (*)(GLenum, GLint*));
+    glUseProgram(p);
+    const float verts[] = {-1, -1, 0, 1, 0, 0, 1, -1, 0, 1, 1, 0, 0, 1, 0, 1, 0, 1};
+    GLuint vb;
+    glGenBuffers(1, &vb);
+    glBindBuffer(gl::ARRAY_BUFFER, vb);
+    glBufferData(gl::ARRAY_BUFFER, sizeof verts, verts, gl::STATIC_DRAW);
+    const GLint pos = glGetAttribLocation(p, "a_pos");
+    glVertexAttribPointer(GLuint(pos), 4, gl::FLOAT, 0, 24, nullptr);
+    glEnableVertexAttribArray(GLuint(pos));
+    const VkAttachmentLoadOp LOAD = VK_ATTACHMENT_LOAD_OP_LOAD, CLEAR = VK_ATTACHMENT_LOAD_OP_CLEAR, DONT = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    const VkAttachmentStoreOp DROP = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    glDrawArrays(gl::TRIANGLES, 0, 3);  // the first draw uploads the vertex data (ends its pass): later draws continue the clear's pass
+    settle();
+
+    // ---- colour: 4x RGBA8 renderbuffer, drawn, then blitted into a single-sample texture
+    GLuint msFb, rbC, resFb, resTex;
+    glGenFramebuffers(1, &msFb);
+    glGenRenderbuffers(1, &rbC);
+    glGenTextures(1, &resTex);
+    glGenFramebuffers(1, &resFb);
+    glBindTexture(gl::TEXTURE_2D, resTex);
+    glTexStorage2D(gl::TEXTURE_2D, 1, gl::RGBA8, 32, 32);
+    glBindFramebuffer(gl::FRAMEBUFFER, resFb);
+    glFramebufferTexture2D(gl::FRAMEBUFFER, gl::COLOR_ATTACHMENT0, gl::TEXTURE_2D, resTex, 0);
+    CHECK(glCheckFramebufferStatus(gl::FRAMEBUFFER) == gl::FRAMEBUFFER_COMPLETE);
+    counts = {};
+    glBindRenderbuffer(gl::RENDERBUFFER, rbC);
+    glRenderbufferStorageMultisample(gl::RENDERBUFFER, 4, gl::RGBA8, 32, 32);
+    CHECK(err() == gl::NO_ERROR);
+    CHECK(counts.imagesCreated == 1 && counts.imagesMultisample == 0 && counts.imagesStoredMS == 0);  // the backing image is 1x
+    GLint samples = 0;
+    glGetRenderbufferParameteriv(gl::RENDERBUFFER, gl::RENDERBUFFER_SAMPLES, &samples);
+    CHECK(samples == 4);  // the application still sees 4 samples
+    glBindFramebuffer(gl::FRAMEBUFFER, msFb);
+    glFramebufferRenderbuffer(gl::FRAMEBUFFER, gl::COLOR_ATTACHMENT0, gl::RENDERBUFFER, rbC);
+    CHECK(glCheckFramebufferStatus(gl::FRAMEBUFFER) == gl::FRAMEBUFFER_COMPLETE);
+    GLint n = 0, buffers = 0;
+    glGetIntegerv(gl::SAMPLES, &n);
+    glGetIntegerv(gl::SAMPLE_BUFFERS, &buffers);
+    CHECK(n == 4 && buffers == 1);
+    glClearColor(0, 1, 0, 1);
+    counts = {};
+    glClear(gl::COLOR_BUFFER_BIT);
+    glDrawArrays(gl::TRIANGLES, 0, 3);
+    settle();
+    // The pass renders in a transient twin (the only multisample image) and resolves into the renderbuffer's own image.
+    CHECK(err() == gl::NO_ERROR && counts.colorLoad == CLEAR && counts.imagesStoredMS == 0 && counts.colorStore == DROP && counts.colorResolve);
+    counts = {};
+    glBindFramebuffer(gl::READ_FRAMEBUFFER, msFb);
+    glBindFramebuffer(gl::DRAW_FRAMEBUFFER, resFb);
+    glBlitFramebuffer(0, 0, 32, 32, 0, 0, 32, 32, gl::COLOR_BUFFER_BIT, gl::NEAREST);
+    CHECK(err() == gl::NO_ERROR);
+    CHECK(counts.blits == 1 && counts.resolves == 0 && counts.imagesStoredMS == 0);  // copies the resolved image
+    // GLES rules for a multisample read: same rectangle size, same format, no multisample destination, no direct read.
+    glBlitFramebuffer(0, 0, 32, 32, 0, 0, 16, 16, gl::COLOR_BUFFER_BIT, gl::NEAREST);
+    CHECK(err() == gl::INVALID_OPERATION);
+    glBlitFramebuffer(0, 0, 32, 32, 0, 0, 32, 32, gl::COLOR_BUFFER_BIT, gl::NEAREST);
+    CHECK(err() == gl::NO_ERROR);
+    {
+        GLuint fb16, tex16;
+        glGenFramebuffers(1, &fb16);
+        glGenTextures(1, &tex16);
+        glBindTexture(gl::TEXTURE_2D, tex16);
+        glTexStorage2D(gl::TEXTURE_2D, 1, gl::RGBA16F, 32, 32);
+        glBindFramebuffer(gl::DRAW_FRAMEBUFFER, fb16);
+        glFramebufferTexture2D(gl::DRAW_FRAMEBUFFER, gl::COLOR_ATTACHMENT0, gl::TEXTURE_2D, tex16, 0);
+        glBlitFramebuffer(0, 0, 32, 32, 0, 0, 32, 32, gl::COLOR_BUFFER_BIT, gl::NEAREST);
+        CHECK(err() == gl::INVALID_OPERATION);  // format mismatch
+    }
+    glBindFramebuffer(gl::DRAW_FRAMEBUFFER, msFb);
+    glBindFramebuffer(gl::READ_FRAMEBUFFER, resFb);
+    glBlitFramebuffer(0, 0, 32, 32, 0, 0, 32, 32, gl::COLOR_BUFFER_BIT, gl::NEAREST);
+    CHECK(err() == gl::INVALID_OPERATION);  // multisample destination
+    glBindFramebuffer(gl::FRAMEBUFFER, msFb);
+    uint8_t px[4] = {};
+    glReadPixels(0, 0, 1, 1, gl::RGBA, gl::UNSIGNED_BYTE, px);
+    CHECK(err() == gl::INVALID_OPERATION);
+    // The next pass on it continues the picture: it is seeded from the single-sample image (the twin's LOAD becomes DONT_CARE,
+    // a seed draw precedes the triangle) and still stores no samples.
+    counts = {};
+    glDrawArrays(gl::TRIANGLES, 0, 3);
+    settle();
+    CHECK(err() == gl::NO_ERROR && counts.colorLoad == DONT && counts.draws == 2 && counts.colorStore == DROP && counts.colorResolve &&
+          counts.imagesStoredMS == 0);
+
+    // ---- depth / stencil: 4x renderbuffer used across two passes, contents carried by the seed
+    GLuint rbD, rbC2, fbD, resDs, resDsFb;
+    glGenRenderbuffers(1, &rbD);
+    glGenRenderbuffers(1, &rbC2);
+    glGenFramebuffers(1, &fbD);
+    counts = {};
+    glBindRenderbuffer(gl::RENDERBUFFER, rbD);
+    glRenderbufferStorageMultisample(gl::RENDERBUFFER, 4, gl::DEPTH24_STENCIL8, 32, 32);
+    glBindRenderbuffer(gl::RENDERBUFFER, rbC2);
+    glRenderbufferStorageMultisample(gl::RENDERBUFFER, 4, gl::RGBA8, 32, 32);
+    CHECK(err() == gl::NO_ERROR && counts.imagesCreated == 2 && counts.imagesMultisample == 0 && counts.imagesStoredMS == 0);
+    glBindFramebuffer(gl::FRAMEBUFFER, fbD);
+    glFramebufferRenderbuffer(gl::FRAMEBUFFER, gl::COLOR_ATTACHMENT0, gl::RENDERBUFFER, rbC2);
+    glFramebufferRenderbuffer(gl::FRAMEBUFFER, gl::DEPTH_STENCIL_ATTACHMENT, gl::RENDERBUFFER, rbD);
+    CHECK(glCheckFramebufferStatus(gl::FRAMEBUFFER) == gl::FRAMEBUFFER_COMPLETE);
+    glEnable(gl::DEPTH_TEST);
+    counts = {};
+    glClear(gl::COLOR_BUFFER_BIT | gl::DEPTH_BUFFER_BIT | gl::STENCIL_BUFFER_BIT);
+    glDrawArrays(gl::TRIANGLES, 0, 3);
+    settle();
+    CHECK(err() == gl::NO_ERROR && counts.depthLoad == CLEAR && counts.depthStore == DROP && counts.depthResolve && counts.imagesStoredMS == 0);
+    counts = {};
+    glDrawArrays(gl::TRIANGLES, 0, 3);  // second pass, no clear: the depth is loaded (the backend seeds the twin from the resolved image)
+    settle();
+    CHECK(err() == gl::NO_ERROR && counts.depthLoad == LOAD && counts.depthStore == DROP && counts.depthResolve &&
+          counts.colorLoad == DONT && counts.imagesStoredMS == 0);
+    // A cleared pass starts from CLEAR (nothing to seed).
+    counts = {};
+    glClear(gl::COLOR_BUFFER_BIT | gl::DEPTH_BUFFER_BIT | gl::STENCIL_BUFFER_BIT);
+    glDrawArrays(gl::TRIANGLES, 0, 3);
+    settle();
+    CHECK(counts.depthLoad == CLEAR && counts.colorLoad == CLEAR && counts.draws == 1);
+    // glInvalidateFramebuffer on an open pass marks the attachments to drop even though the pass renders in a twin: the hook sees
+    // them by their own (resolve target) views. Depth, then colour.
+    {
+        G(glInvalidateFramebuffer, void (*)(GLenum, GLsizei, const GLenum*));
+        const GLenum depthOnly[1] = {gl::DEPTH_ATTACHMENT}, colorOnly[1] = {gl::COLOR_ATTACHMENT0};
+        counts = {};
+        glDrawArrays(gl::TRIANGLES, 0, 3);
+        glInvalidateFramebuffer(gl::FRAMEBUFFER, 1, depthOnly);
+        settle();
+        CHECK(err() == gl::NO_ERROR && counts.passes == 1 && counts.passDrops == 1 && counts.lastDropDepth == 1);
+        counts = {};
+        glDrawArrays(gl::TRIANGLES, 0, 3);
+        glInvalidateFramebuffer(gl::FRAMEBUFFER, 1, colorOnly);
+        settle();
+        CHECK(err() == gl::NO_ERROR && counts.passes == 1 && counts.passDrops == 1 && counts.lastDropDepth == 0 && counts.colorStore == DROP);
+    }
+    // Depth blit out of the multisample renderbuffer into a single-sample one of the same format.
+    glGenRenderbuffers(1, &resDs);
+    glBindRenderbuffer(gl::RENDERBUFFER, resDs);
+    glRenderbufferStorageMultisample(gl::RENDERBUFFER, 0, gl::DEPTH24_STENCIL8, 32, 32);
+    glGenFramebuffers(1, &resDsFb);
+    glBindFramebuffer(gl::FRAMEBUFFER, resDsFb);
+    glFramebufferRenderbuffer(gl::FRAMEBUFFER, gl::DEPTH_STENCIL_ATTACHMENT, gl::RENDERBUFFER, resDs);
+    CHECK(glCheckFramebufferStatus(gl::FRAMEBUFFER) == gl::FRAMEBUFFER_COMPLETE);
+    glBindFramebuffer(gl::READ_FRAMEBUFFER, fbD);
+    glBindFramebuffer(gl::DRAW_FRAMEBUFFER, resDsFb);
+    counts = {};
+    glBlitFramebuffer(0, 0, 32, 32, 0, 0, 32, 32, gl::DEPTH_BUFFER_BIT | gl::STENCIL_BUFFER_BIT, gl::NEAREST);
+    CHECK(err() == gl::NO_ERROR && counts.imagesStoredMS == 0 && counts.resolves == 0 && counts.blits >= 1);
+    glBlitFramebuffer(0, 0, 32, 32, 0, 0, 16, 16, gl::DEPTH_BUFFER_BIT, gl::NEAREST);
+    CHECK(err() == gl::INVALID_OPERATION);  // size mismatch
+
+    // ---- MRT: same-size, same-format multisample renderbuffers each get a twin of their own (colour slot 0..7, one for depth/stencil)
+    {
+        G(glDrawBuffers, void (*)(GLsizei, const GLenum*));
+        G(glCopyImageSubData, void (*)(GLuint, GLenum, GLint, GLint, GLint, GLint, GLuint, GLenum, GLint, GLint, GLint, GLint, GLsizei, GLsizei, GLsizei));
+        GLuint mrtFb, mrtRb[8], mrtDs;
+        glGenFramebuffers(1, &mrtFb);
+        glGenRenderbuffers(8, mrtRb);
+        glGenRenderbuffers(1, &mrtDs);
+        glBindFramebuffer(gl::FRAMEBUFFER, mrtFb);
+        GLenum bufs[8];
+        for (int i = 0; i < 8; ++i) {
+            glBindRenderbuffer(gl::RENDERBUFFER, mrtRb[i]);
+            glRenderbufferStorageMultisample(gl::RENDERBUFFER, 4, gl::RGBA8, 32, 32);
+            glFramebufferRenderbuffer(gl::FRAMEBUFFER, gl::COLOR_ATTACHMENT0 + GLenum(i), gl::RENDERBUFFER, mrtRb[i]);
+            bufs[i] = gl::COLOR_ATTACHMENT0 + GLenum(i);
+        }
+        glBindRenderbuffer(gl::RENDERBUFFER, mrtDs);
+        glRenderbufferStorageMultisample(gl::RENDERBUFFER, 4, gl::DEPTH24_STENCIL8, 32, 32);
+        glFramebufferRenderbuffer(gl::FRAMEBUFFER, gl::DEPTH_STENCIL_ATTACHMENT, gl::RENDERBUFFER, mrtDs);
+        CHECK(glCheckFramebufferStatus(gl::FRAMEBUFFER) == gl::FRAMEBUFFER_COMPLETE);
+        glDrawBuffers(8, bufs);
+        counts = {};
+        glDrawArrays(gl::TRIANGLES, 0, 3);
+        settle();
+        CHECK(err() == gl::NO_ERROR && counts.imagesStoredMS == 0 && counts.lastColorCount == 8);
+        std::set<VkImageView> views;
+        for (int i = 0; i < 8; ++i) views.insert(counts.colorViews[i]);
+        views.insert(counts.depthView);
+        CHECK(views.size() == 9 && !views.count(VK_NULL_HANDLE));  // 8 colour twins + the depth/stencil one, all different
+        const VkImageView first[8] = {counts.colorViews[0], counts.colorViews[1], counts.colorViews[2], counts.colorViews[3],
+                                      counts.colorViews[4], counts.colorViews[5], counts.colorViews[6], counts.colorViews[7]};
+        // The next pass on it asks for the same twins (nothing evicted mid-framebuffer): the same views.
+        counts = {};
+        glDrawArrays(gl::TRIANGLES, 0, 3);
+        settle();
+        bool same = true;
+        for (int i = 0; i < 8; ++i) same = same && counts.colorViews[i] == first[i];
+        CHECK(same);
+        // Many other sizes in between (more twins than the cache keeps) do not evict a framebuffer's own twins while it is drawn to.
+        for (int k = 0; k < 40; ++k) {
+            GLuint rb, fb;
+            glGenRenderbuffers(1, &rb);
+            glGenFramebuffers(1, &fb);
+            glBindRenderbuffer(gl::RENDERBUFFER, rb);
+            glRenderbufferStorageMultisample(gl::RENDERBUFFER, 4, gl::RGBA8, 8 + k, 8);
+            glBindFramebuffer(gl::FRAMEBUFFER, fb);
+            glFramebufferRenderbuffer(gl::FRAMEBUFFER, gl::COLOR_ATTACHMENT0, gl::RENDERBUFFER, rb);
+            glDrawArrays(gl::TRIANGLES, 0, 3);
+        }
+        settle();
+        glBindFramebuffer(gl::FRAMEBUFFER, mrtFb);
+        glDrawBuffers(8, bufs);
+        counts = {};
+        glDrawArrays(gl::TRIANGLES, 0, 3);
+        settle();
+        views.clear();
+        for (int i = 0; i < 8; ++i) views.insert(counts.colorViews[i]);
+        views.insert(counts.depthView);
+        CHECK(err() == gl::NO_ERROR && views.size() == 9 && !views.count(VK_NULL_HANDLE));
+        // glCopyImageSubData: sample counts must match, and a multisample renderbuffer has no samples to copy.
+        glBindTexture(gl::TEXTURE_2D, resTex);
+        counts = {};
+        glCopyImageSubData(mrtRb[0], gl::RENDERBUFFER, 0, 0, 0, 0, resTex, gl::TEXTURE_2D, 0, 0, 0, 0, 32, 32, 1);
+        CHECK(err() == gl::INVALID_OPERATION && counts.copiesImage == 0);
+        glCopyImageSubData(resTex, gl::TEXTURE_2D, 0, 0, 0, 0, mrtRb[0], gl::RENDERBUFFER, 0, 0, 0, 0, 32, 32, 1);
+        CHECK(err() == gl::INVALID_OPERATION && counts.copiesImage == 0);
+        glCopyImageSubData(mrtRb[0], gl::RENDERBUFFER, 0, 0, 0, 0, mrtRb[1], gl::RENDERBUFFER, 0, 0, 0, 0, 32, 32, 1);
+        CHECK(err() == gl::NO_ERROR && counts.copiesImage == 1);  // same sample counts: the resolved images
+        GLuint plain;
+        glGenRenderbuffers(1, &plain);
+        glBindRenderbuffer(gl::RENDERBUFFER, plain);
+        glRenderbufferStorageMultisample(gl::RENDERBUFFER, 0, gl::RGBA8, 32, 32);
+        glCopyImageSubData(mrtRb[0], gl::RENDERBUFFER, 0, 0, 0, 0, plain, gl::RENDERBUFFER, 0, 0, 0, 0, 32, 32, 1);
+        CHECK(err() == gl::INVALID_OPERATION);
+    }
+    e.down();
+}
+
 void testExternal() {
     Egl e;
     CHECK(e.up());
@@ -4158,7 +4439,7 @@ int main(int argc, char** argv) {
     const int ok = vpgles_init(reinterpret_cast<void*>(&myGipa));
     const std::map<std::string, std::function<void()>> tests = {
         {"egl", testEgl}, {"eglthreads", testEglThreads}, {"formats", testFormats}, {"buffers", testBuffers}, {"textures", testTextures},
-        {"fbo", testFbo}, {"program", testProgram}, {"draw", testDraw}, {"invalidate", testInvalidate}, {"multiview", testMultiview},
+        {"fbo", testFbo}, {"msrbo", testMsRbo}, {"program", testProgram}, {"draw", testDraw}, {"invalidate", testInvalidate}, {"multiview", testMultiview},
         {"errors", testErrors}, {"ubo", testUbo}, {"readback", testReadback}, {"external", testExternal}, {"es31", testEs31},
         {"progbin", testProgramBinary}, {"recipe", testRecipe}, {"recipe_session", testRecipeSession}, {"xfb", testXfb},
         {"uniform_raw", testUniformRaw}, {"uniform_strict", testUniformStrict},
