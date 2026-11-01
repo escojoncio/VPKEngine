@@ -4811,6 +4811,80 @@ void testMsaaForce() {
   vpvk_taa_set_jitter(&none);
 }
 
+// Forced MSAA finds the eye pass by the size of the image the host marked (vpvk_mark_eye_image) when no jitter size is set
+// (VPKTAA gone from the client): an eye-sized depth pass is forced, a quarter-size one is not.
+void testMsaaForceMarkedEye() {
+  vpvk_taa_jitter none{0, 0, 0, 0, 0, 0};
+  vpvk_taa_set_jitter(&none);
+  vpvk_config_set_msaa_force(4);
+  {
+    Ctx c;
+    Device* d = from<Device>(c.dev);
+    CHECK(d->eyeSize.load() == 0);
+    VkImageCreateInfo ii{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+    ii.imageType = VK_IMAGE_TYPE_2D, ii.format = VK_FORMAT_R8G8B8A8_UNORM, ii.extent = {256, 256, 1}, ii.mipLevels = 1;
+    ii.arrayLayers = 2, ii.samples = VK_SAMPLE_COUNT_1_BIT, ii.tiling = VK_IMAGE_TILING_OPTIMAL;
+    ii.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+    VkImage eye = VK_NULL_HANDLE;
+    CHECK(vkCreateImage(c.dev, &ii, nullptr, &eye) == VK_SUCCESS && eye);
+    vpvk_mark_eye_image(eye);  // (unbound: 0, the size is recorded all the same)
+    CHECK(d->eyeSize.load() == packEyeSize(256, 256, 2));
+    CHECK(eyeSizeW(d->eyeSize.load()) == 256 && eyeSizeH(d->eyeSize.load()) == 256);
+    auto mk = [&](vpgpu::Format f, uint32_t w, uint32_t h) {
+      vpgpu::TextureDesc td;
+      td.format = f, td.width = w, td.height = h;
+      td.usage = vpgpu::formatInfo(f).depth() ? vpgpu::usage::depthTarget : vpgpu::usage::colorTarget | vpgpu::usage::sampled;
+      return c.gpu().createTexture(td);
+    };
+    PipelineObj po;
+    po.ok = false;
+    po.state.samples = 1;
+    po.state.label = "game";
+    po.key = po.state.key();
+    OpDraw geo;
+    geo.ok = true;
+    geo.pipe = &po;
+    geo.draw.pipeline = po.key;
+    geo.draw.count = 300, geo.draw.index = vpgpu::IndexBuffer{};
+    geo.depthTested = geo.vertexBuffers = true;
+    auto run = [&](uint32_t w, uint32_t h, uint32_t viewMask = 0) {
+      OpBeginRendering b;
+      b.viewMask = viewMask;
+      b.area = {{0, 0}, {w, h}};
+      b.depthWidth = w, b.depthHeight = h;
+      b.desc.colors[0].texture = mk(vpgpu::Format::RGBA8Unorm, w, h);
+      b.desc.depth.texture = mk(vpgpu::Format::D32Float, w, h);
+      b.desc.colors[0].store = vpgpu::StoreAction::Store;
+      Recorder rec;
+      rec.ops.emplace_back(b), rec.ops.emplace_back(geo), rec.ops.emplace_back(OpEndPass{});
+      vpgpu::Frame f;
+      TranslateStats st;
+      translate(rec, f, st, nullptr, nullptr, nullptr, nullptr, d);
+    };
+    run(256, 256);
+    CHECK(d->msaaTwins.passes == 1 && d->msaaTwins.rejEye == 0);
+    run(128, 128);  // not the eye size: a non-multiview pass must match it exactly
+    CHECK(d->msaaTwins.passes == 1 && d->msaaTwins.rejEye == 1);
+    // The marked size only adds detections: a multiview pass of any size is still an eye pass, as without it.
+    run(1024, 1024, 0x3);
+    CHECK(d->msaaTwins.passes == 2 && d->msaaTwins.rejEye == 1);
+    // The same size rules for the pipeline gate's eye-sized test (config.cpp eyeSizedPass): the marked size, the 50-200 % band.
+    bool known = false;
+    const uint64_t mark = d->eyeSize.load();
+    CHECK(eyeSizedPass(256, 256, &known, mark) && known && eyeSizedPass(128, 128, nullptr, mark) && eyeSizedPass(512, 512, nullptr, mark));
+    CHECK(!eyeSizedPass(64, 64, &known, mark) && known && !eyeSizedPass(1024, 1024, nullptr, mark));
+    // The MSAA eye detection (msaaObservePass) uses the marked size too: a 1024x1024 pass is outside the band, a 256x256 one is the eye.
+    msaaObservePass(2, 1024, 1024, 0, true, true, mark);
+    CHECK(vpvk_msaa_detected() == 0);
+    msaaObservePass(4, 1024, 1024, 0x3, true, true, mark);  // multiview keeps its rank whatever the marked size says
+    CHECK(vpvk_msaa_detected() == 4);
+    msaaObservePass(2, 256, 256, 0, true, true, mark);  // the eye-size rule outranks it
+    CHECK(vpvk_msaa_detected() == 2);
+    vkDestroyImage(c.dev, eye, nullptr);
+  }
+  vpvk_config_set_msaa_force(0);
+}
+
 void testTaaUiMask() {
   auto near = [](float a, float b, float eps = 1e-6f) { return std::fabs(a - b) <= eps; };
   using taa::DrawClass;
@@ -10817,7 +10891,7 @@ int main(int argc, char** argv) {
       {"timeline", testTimeline}, {"queues", testQueues}, {"pending", testPending}, {"renderpass_ops", testRenderPassOps}, {"linear", testLinear}, {"images", testImages}, {"image_lifetime", testImageLifetime},
       {"vertex_stores", testVertexStores}, {"profile", testProfile}, {"profile13", testProfile13}, {"quest_extras", testQuestExtras}, {"push_descriptor", testPushDescriptor}, {"report_geom", testReportGeomInterpolators}, {"pipeline_policy", testPipelinePolicy}, {"eds", testExtendedDynamicState},
       {"native_identity", testNativeIdentity}, {"inline_uniform", testInlineUniformBlock}, {"bda", testBufferDeviceAddress}, {"ycbcr", testYcbcr},
-      {"taa_native", testTaaNative}, {"taa_eye_depth", testTaaEyeDepth}, {"taa_uimask", testTaaUiMask}, {"msaa_force", testMsaaForce}, {"aot", testAot}, {"aniso", testAniso}, {"zeroinit", testZeroInit}, {"archive_index", testArchiveIndex}, {"foveation", testFoveation},
+      {"taa_native", testTaaNative}, {"taa_eye_depth", testTaaEyeDepth}, {"taa_uimask", testTaaUiMask}, {"msaa_force", testMsaaForce}, {"msaa_force_marked", testMsaaForceMarkedEye}, {"aot", testAot}, {"aniso", testAniso}, {"zeroinit", testZeroInit}, {"archive_index", testArchiveIndex}, {"foveation", testFoveation},
       {"stage_keys", testStageKeys}, {"async_pipelines", testAsyncPipelines}, {"sync_pipelines", testSyncPipelines}, {"pso_census", testPsoCensus}, {"pass_drop", testPassDrop}, {"skip_reasons", testSkipReasons}, {"indirect_patch", testIndirectPatch}, {"astc3d", testAstc3d},
       {"perf", testPerf}, {"phase1b", testPhase1b}, {"suspend_resume", testSuspendResume}, {"translator_modes", testTranslatorModes}, {"capture", testCapture}, {"capture_images", testCaptureImages}, {"capture_hooks", testCaptureHooks}, {"capture_codec", testCaptureCodec}, {"capture_env", testCaptureEnv}, {"capture_pools", testCapturePools}, {"capture_host_frames", testCaptureHostFrames}, {"capture_corrupt", testCaptureCorrupt}, {"capture_env_host", testCaptureEnvHost}, {"capture_env_dir", testCaptureEnvDir}, {"capture_devices", testCaptureDevices}, {"capture_unhooked", testCaptureUnhooked}, {"capture_budget", testCaptureBudget}, {"capture_locks", testCaptureLocks}, {"png", testPng}, {"imgdiff", testImgDiff}, {"replay", testReplay}, {"replay_lvp", testReplayLvp}, {"refcaps", testRefCaps}};
   bool ran = false;

@@ -55,8 +55,16 @@ int appRobustBufferAccess();
 bool robustBuffersEffective();
 // config.cpp: harness dump (VPVK_DUMP_MSL / VPVK_DUMP_MSL_FILTER, read at every call): true = write shader `id` into `dir`.
 bool dumpDirFor(uint64_t id, std::string& dir);
-// config.cpp: the pass size is the game's eye target (band of msaaObservePass); false while the eye is unknown.
-bool eyeSizedPass(uint32_t w, uint32_t h, bool* known = nullptr);
+// Size of the most recent eye image the host marked (Device::eyeSize, vpvk_mark_eye_image): width << 40 | height << 16 | layers
+// (width and height 24 bits each); 0 = none marked.
+constexpr uint64_t packEyeSize(uint32_t w, uint32_t h, uint32_t layers) {
+  return uint64_t(w & 0xffffffu) << 40 | uint64_t(h & 0xffffffu) << 16 | (layers & 0xffffu);
+}
+constexpr uint32_t eyeSizeW(uint64_t p) { return uint32_t(p >> 40); }
+constexpr uint32_t eyeSizeH(uint64_t p) { return uint32_t(p >> 16 & 0xffffffu); }
+// config.cpp: the pass size is the game's eye target (band of msaaObservePass); false while the eye is unknown. The eye size is
+// the VPKTAA jitter's, else `markedEye` (packEyeSize of the host-marked eye image), else the detected MSAA eye pass.
+bool eyeSizedPass(uint32_t w, uint32_t h, bool* known = nullptr, uint64_t markedEye = 0);
 bool forceSingleSample();  // config.cpp: vpvk_config_set_force_single_sample; frozen while a device lives
 bool forceSingleSampleLive();
 void holdForceSingleSample(bool acquire);  // vkCreateDevice / vkDestroyDevice (also freezes msaaForce)
@@ -89,7 +97,8 @@ int msaaOverride();
 // A pass the game began: its ORIGINAL sample count (before forcing/override), the size of its
 // colour attachment, multiview mask, and whether it has colour and depth. The largest qualifying
 // one is the eye pass (vpvk_msaa_detected, log "vk.msaa detected eye=Nx").
-void msaaObservePass(uint8_t gameSamples, uint32_t w, uint32_t h, uint32_t viewMask, bool hasColor, bool hasDepth);
+void msaaObservePass(uint8_t gameSamples, uint32_t w, uint32_t h, uint32_t viewMask, bool hasColor, bool hasDepth,
+                     uint64_t markedEye = 0);  // markedEye (packEyeSize): the eye size while the VPKTAA jitter has none
 // After each vkQueueSubmit: without eye size or multiview, the largest pass decides after 120.
 void msaaSubmitTick(uint64_t submits);
 
@@ -768,6 +777,8 @@ struct Device : Dispatchable {
   // submitMutex, then eyeMutex. The pipeline gate (pipelines.cpp) soft-gates a pass only when it draws into one.
   std::mutex eyeMutex;
   std::unordered_set<uint64_t> eyeTextures;
+  // Size of the latest image marked by vpvk_mark_eye_image (packEyeSize; written under submitMutex, read lock-free on the hot path).
+  std::atomic<uint64_t> eyeSize{0};
   // Shader ids already handed to the platform (translateStage): a recipe hit registers each once.
   std::mutex shaderMutex;
   std::unordered_set<uint64_t> shadersAdded;
@@ -798,6 +809,7 @@ struct Device : Dispatchable {
   } visibility;
 };
 void releaseVisibility(Device*);  // vkDestroyDevice
+inline uint64_t markedEyeOf(const Device* d) { return d ? d->eyeSize.load(std::memory_order_relaxed) : 0; }  // (packEyeSize)
 // VPVK_ZERO_NEW_IMAGES (default 1): a new image reads as zeros until first written, as on Android.
 bool zeroNewImagesOn();
 // True while the image's texture is zero-init pending (shared by images aliasing one texture). Read

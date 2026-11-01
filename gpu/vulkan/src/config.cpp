@@ -179,15 +179,17 @@ bool dumpDirFor(uint64_t id, std::string& dir) {
   return true;
 }
 
-// A pass of this size is (a band around) the game's eye target: the eye size from VPKTAA when known, else the
-// detected MSAA eye pass. Same band as msaaObservePass. Unknown eye = false (`known` says which).
-bool eyeSizedPass(uint32_t w, uint32_t h, bool* known) {
+// A pass of this size is (a band around) the game's eye target: the eye size from VPKTAA when known, else the size of the
+// host-marked eye image (`markedEye`), else the detected MSAA eye pass. Same band as msaaObservePass. Unknown eye = false
+// (`known` says which).
+bool eyeSizedPass(uint32_t w, uint32_t h, bool* known, uint64_t markedEye) {
   if (known) *known = false;
   uint32_t eyeW = 0, eyeH = 0;
   {
     std::lock_guard<std::mutex> l(gTaaMutex);
     eyeW = gTaa.width, eyeH = gTaa.height;
   }
+  if (!eyeW || !eyeH) eyeW = eyeSizeW(markedEye), eyeH = eyeSizeH(markedEye);
   if (eyeW && eyeH) {
     if (known) *known = true;
     return w * 2 >= eyeW && h * 2 >= eyeH && w <= eyeW * 2 && h <= eyeH * 2;
@@ -446,7 +448,7 @@ uint8_t effectiveSamples(uint8_t game) {
   return eff;
 }
 
-void msaaObservePass(uint8_t gameSamples, uint32_t w, uint32_t h, uint32_t viewMask, bool hasColor, bool hasDepth) {
+void msaaObservePass(uint8_t gameSamples, uint32_t w, uint32_t h, uint32_t viewMask, bool hasColor, bool hasDepth, uint64_t markedEye) {
   if (!hasColor || !hasDepth || w < 256 || h < 256) return;  // shadow maps (depth only), probes, UI bits
   if (gameSamples < 1) gameSamples = 1;
   uint32_t eyeW = 0, eyeH = 0;
@@ -454,14 +456,19 @@ void msaaObservePass(uint8_t gameSamples, uint32_t w, uint32_t h, uint32_t viewM
     std::lock_guard<std::mutex> l(gTaaMutex);
     eyeW = gTaa.width, eyeH = gTaa.height;
   }
+  const bool jitterSize = eyeW && eyeH;
+  if (!jitterSize) eyeW = eyeSizeW(markedEye), eyeH = eyeSizeH(markedEye);
   const bool mv = std::popcount(viewMask) >= 2;
   const uint64_t area = uint64_t(w) * h;
   MsaaDetect& g = gMsaa;
   std::lock_guard<std::mutex> l(g.m);
   int rank;  // how the pass qualifies: 2 eye size, 1 multiview, 0 only a candidate
-  if (eyeW && eyeH) {
-    // >= 50 % of the eye per axis (render scale), up to a double-wide target of both eyes.
-    if (!(w * 2 >= eyeW && h * 2 >= eyeH && w <= eyeW * 2 && h <= eyeH * 2)) return;
+  // >= 50 % of the eye per axis (render scale), up to a double-wide target of both eyes.
+  const bool inBand = eyeW && eyeH && w * 2 >= eyeW && h * 2 >= eyeH && w <= eyeW * 2 && h <= eyeH * 2;
+  if (jitterSize) {
+    if (!inBand) return;
+    rank = 2;
+  } else if (inBand) {  // the host-marked eye size only adds detections: outside its band the pass is judged as without it
     rank = 2;
   } else if (mv) {
     rank = 1;

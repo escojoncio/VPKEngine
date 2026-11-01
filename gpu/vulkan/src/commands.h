@@ -293,10 +293,10 @@ struct PassSamples {
   bool mismatch = false, hasColor = false, hasDepth = false;
   uint32_t w = 0, h = 0;
   void add(const ImageView* v, bool depth);
-  void finish(uint32_t viewMask, const char* what);  // logs a mismatch, feeds the detection
+  void finish(uint32_t viewMask, const char* what, uint64_t markedEye = 0);  // logs a mismatch, feeds the detection
 };
 // Effective sample count of subpass `sub` (0 = no attachments); `observe` feeds the detection.
-uint8_t subpassSamples(const RenderPassObj&, const Framebuffer&, uint32_t sub, bool observe = true);
+uint8_t subpassSamples(const RenderPassObj&, const Framebuffer&, uint32_t sub, bool observe = true, uint64_t markedEye = 0);
 // Pipeline key for a draw into a pass of `passSamples` (variant with that count if it differs).
 vpgpu::PipelineKey pipelineFor(Device*, const PipelineObj&, uint8_t passSamples, PipelineObj::TexelVariant* tv = nullptr,
                                const BoundState::Eds* eds = nullptr);

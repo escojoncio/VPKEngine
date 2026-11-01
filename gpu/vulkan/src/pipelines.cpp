@@ -49,17 +49,17 @@ void PassSamples::add(const ImageView* v, bool depth) {
   }
 }
 
-void PassSamples::finish(uint32_t viewMask, const char* what) {
+void PassSamples::finish(uint32_t viewMask, const char* what, uint64_t markedEye) {
   if (mismatch) {
     // Images created with different counts (the override changed between them): Metal refuses
     // the pass. Logged; the frame compiler / backend report the failure itself.
     static std::atomic<unsigned> n{0};
     if (n.fetch_add(1) < 8) logf("vk.err what=msaa_mismatch pass=%s size=%ux%u", what, w, h);
   }
-  msaaObservePass(game, w, h, viewMask, hasColor, hasDepth);
+  msaaObservePass(game, w, h, viewMask, hasColor, hasDepth, markedEye);
 }
 
-uint8_t subpassSamples(const RenderPassObj& rp, const Framebuffer& fb, uint32_t sub, bool observe) {
+uint8_t subpassSamples(const RenderPassObj& rp, const Framebuffer& fb, uint32_t sub, bool observe, uint64_t markedEye) {
   if (sub >= rp.subpasses.size()) return 0;
   const RenderPassObj::Subpass& sp = rp.subpasses[sub];
   PassSamples ps;
@@ -72,7 +72,7 @@ uint8_t subpassSamples(const RenderPassObj& rp, const Framebuffer& fb, uint32_t 
   for (const auto& c : sp.colors)
     if (c.attachment != VK_ATTACHMENT_UNUSED && c.attachment < rp.attachments.size())
       ps.game = std::max<uint8_t>(ps.game, uint8_t(rp.attachments[c.attachment].samples));
-  if (observe) ps.finish(sp.viewMask, "render_pass");
+  if (observe) ps.finish(sp.viewMask, "render_pass", markedEye);
   return ps.effective;
 }
 
@@ -379,7 +379,7 @@ static DestClass classifyPass(Device* dev, const vpgpu::RenderPassDesc& rd) {
   if (!anyColor) return DestClass::NoColor;
   if (!persists) return DestClass::TransientRT;
   bool known = false;
-  return eyeSizedPass(w, h, &known) && rd.layerCount <= 2 ? DestClass::EyeSizedNotEye : DestClass::PersistentRT;
+  return eyeSizedPass(w, h, &known, dev->eyeSize.load(std::memory_order_relaxed)) && rd.layerCount <= 2 ? DestClass::EyeSizedNotEye : DestClass::PersistentRT;
 }
 
 uint32_t persistWaitMs(bool internalClient) {
@@ -3322,7 +3322,7 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdNextSubpass(VkCommandBuffer cb, VkSu
   Recorder& r = rec(cb);
   r.ops.emplace_back(OpNextSubpass{});
   ++r.bound.subpass;
-  if (r.bound.pass && r.bound.framebuffer) r.bound.passSamples = subpassSamples(*r.bound.pass, *r.bound.framebuffer, r.bound.subpass);
+  if (r.bound.pass && r.bound.framebuffer) r.bound.passSamples = subpassSamples(*r.bound.pass, *r.bound.framebuffer, r.bound.subpass, true, markedEyeOf(r.device));
 }
 VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdNextSubpass2(VkCommandBuffer cb, const VkSubpassBeginInfo*, const VkSubpassEndInfo*) {
   vkCmdNextSubpass(cb, VK_SUBPASS_CONTENTS_INLINE);
@@ -3522,7 +3522,7 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdBeginRendering(VkCommandBuffer cb, c
       ps.add(ri->pColorAttachments[i].imageView ? from<ImageView>(ri->pColorAttachments[i].imageView) : nullptr, false);
     if (ri->pDepthAttachment) ps.add(ri->pDepthAttachment->imageView ? from<ImageView>(ri->pDepthAttachment->imageView) : nullptr, true);
     if (ri->pStencilAttachment) ps.add(ri->pStencilAttachment->imageView ? from<ImageView>(ri->pStencilAttachment->imageView) : nullptr, true);
-    ps.finish(ri->viewMask, "rendering");
+    ps.finish(ri->viewMask, "rendering", markedEyeOf(r.device));
     r.bound.passSamples = ps.effective;
   }
   for (const auto& [src, dst] : forcedPairs) op.resolveCopies.push_back(forcedResolveCopy(src, dst, std::max<uint16_t>(d.layerCount, 1)));

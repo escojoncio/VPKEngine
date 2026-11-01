@@ -497,9 +497,13 @@ uint32_t layersOf(const Image* im, const VkImageSubresourceRange& r) {
 // VPKTAA jitter: does the pass draw the eye's geometry? It must have a depth attachment and either
 // be multiview (both eyes in one layered pass) or match the eye size the caller gave, by its render
 // area or by its attachments. Shadow maps, UI layers and post-process targets of other sizes fail.
-// Returns the size of the target (texels) through w/h when it qualifies.
-bool taaEyePass(const TaaJitter& j, bool hasDepth, uint32_t viewMask, const VkRect2D& area, uint32_t fbW, uint32_t fbH,
-                uint32_t depthW, uint32_t depthH, uint32_t& w, uint32_t& h) {
+// Returns the size of the target (texels) through w/h when it qualifies. The eye size is the jitter's; when that is 0 it is
+// the size of the eye image the host marked (markedEye, packEyeSize), so eye detection does not depend on VPKTAA.
+bool taaEyePass(const TaaJitter& jit, bool hasDepth, uint32_t viewMask, const VkRect2D& area, uint32_t fbW, uint32_t fbH,
+                uint32_t depthW, uint32_t depthH, uint32_t& w, uint32_t& h, uint64_t markedEye = 0) {
+  struct { uint32_t width, height; } j{jit.width, jit.height};
+  const bool jitterSize = j.width && j.height;
+  if (!jitterSize) j = {eyeSizeW(markedEye), eyeSizeH(markedEye)};
   if (!hasDepth) return false;
   w = depthW ? depthW : fbW ? fbW : area.extent.width;
   h = depthW ? depthH : fbW ? fbH : area.extent.height;
@@ -510,7 +514,8 @@ bool taaEyePass(const TaaJitter& j, bool hasDepth, uint32_t viewMask, const VkRe
   // A multiview pass of another size is still the eye's scene when it is a render-scaled copy of
   // it (50-100 % per axis); multiview shadow/probe passes of other sizes are not, and would also
   // misreport the target size the resolve scales the jitter by.
-  return multiview && w * 2 >= j.width && w <= j.width && h * 2 >= j.height && h <= j.height;
+  // (The marked size only adds detections: without a jitter size a multiview pass is an eye pass at any size, as before.)
+  return multiview && (!jitterSize || (w * 2 >= j.width && w <= j.width && h * 2 >= j.height && h <= j.height));
 }
 
 // Indirect arguments past these are not a real draw but garbage (an uninitialised or stale buffer): it would run for seconds
@@ -531,6 +536,7 @@ struct Translator {
   // (sub)pass about to open passes taaEyePass with it (taaPass additionally needs the jitter enabled); forceN > 0: the open pass
   // renders into Attachment::autoMsaa twins of that many samples and its draws use pipelines of that count.
   const TaaJitter* eye = nullptr;
+  uint64_t markedEye = 0;  // packEyeSize of the host-marked eye image (Device::eyeSize), read once per translate
   bool eyeScene = false;
   uint8_t forceN = 0;
   // VPKTAA UI mask. uiOn: classify the draws of eye passes (taa::DrawClassifier) and leave the UI
@@ -770,7 +776,7 @@ struct Translator {
         fovArea = br->areaClear && !br->areaClear->rects.empty();
         pendingResolves = br->resolveCopies;
         eyeScene = eye && taaEyePass(*eye, br->depthWidth != 0, br->viewMask, br->area, 0, 0, br->depthWidth, br->depthHeight,
-                                     taaW, taaH);
+                                     taaW, taaH, markedEye);
         taaPass = taa && eyeScene;
         vpgpu::RenderPassDesc bd = br->desc;
         localCopies.clear();
@@ -1079,7 +1085,7 @@ struct Translator {
         dh = std::max(1u, v->image->desc.height >> v->range.baseMipLevel);
       }
     }
-    eyeScene = taaEyePass(*eye, depth, sp.viewMask, b.area, b.framebuffer->width, b.framebuffer->height, dw, dh, taaW, taaH);
+    eyeScene = taaEyePass(*eye, depth, sp.viewMask, b.area, b.framebuffer->width, b.framebuffer->height, dw, dh, taaW, taaH, markedEye);
     taaPass = taa && eyeScene;
   }
 
@@ -2043,6 +2049,7 @@ void translate(const Recorder& rec, vpgpu::Frame& frame, TranslateStats& st, con
   t.um = t.uiOn ? um : nullptr;
   TaaJitter eyeSnap;  // forced MSAA finds the eye passes by eye size / multiview also with the VPKTAA jitter off
   t.eye = t.taa;
+  if (const Device* dv = t.devForce()) t.markedEye = dv->eyeSize.load(std::memory_order_relaxed);
   if (!t.eye && msaaForce() > 0) eyeSnap = taaJitter(), t.eye = &eyeSnap;
   t.run(rec);
   t.close();
