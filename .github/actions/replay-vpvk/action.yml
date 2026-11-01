@@ -86,17 +86,60 @@ runs:
                VPIMGDIFF="$PWD/build/gpu-host/vulkan/vpimgdiff" RUNNER="$PWD/gpu/metal/ci/simctl-run.sh"
         LOG=build/logs/replay-compare.txt
         : > "$LOG"
+        START=$(mktemp)  # crash reports newer than this belong to this run
         status=0
+        failed=""
         n=0
         for cap in "$REPLAY_DIR"/*.vpcap; do
           [ -f "$cap" ] || continue
           name=$(basename "$cap" .vpcap)
           n=$((n + 1))
           echo "=== $name" >> "$LOG"
-          { tools/replay/compare.sh vpvk "$cap" "$REPLAY_DIR/vpvk/$name" \
-              && tools/replay/compare.sh diff "$REPLAY_DIR/ref/$name" "$REPLAY_DIR/vpvk/$name"; } >> "$LOG" 2>&1 || status=1
+          tools/replay/compare.sh vpvk "$cap" "$REPLAY_DIR/vpvk/$name" >> "$LOG" 2>&1 || { status=1; failed="$failed $name"; continue; }
+          tools/replay/compare.sh diff "$REPLAY_DIR/ref/$name" "$REPLAY_DIR/vpvk/$name" >> "$LOG" 2>&1 || status=1
         done
         cat "$LOG"
+        if [ -n "$failed" ]; then
+          # The vpvk leg itself failed (compare.sh already printed the tail of its replay.log): crash report and logs into the artifact.
+          mkdir -p "$REPLAY_DIR/vpvk/crash"
+          for name in $failed; do
+            cp "$REPLAY_DIR/vpvk/$name/replay.log" "$REPLAY_DIR/vpvk/crash/$name.replay.log" 2>/dev/null || true
+          done
+          ips=""
+          for _ in $(seq 1 15); do  # macOS writes the report a few seconds after the process dies
+            for f in $(ls -t "$HOME"/Library/Logs/DiagnosticReports/*.ips 2>/dev/null); do
+              if [ "$f" -nt "$START" ]; then ips=$f; fi
+              break
+            done
+            [ -n "$ips" ] && break
+            sleep 2
+          done
+          if [ -n "$ips" ]; then
+            echo "=== crash report $ips (crashed thread)"
+            python3 -I -c '
+        import json, sys
+        t = open(sys.argv[1], errors="replace").read()
+        try:
+            head, _, body = t.partition("\n")
+            d = json.loads(body)
+            print(head[:300])
+            print("exception:", d.get("exception"), "termination:", d.get("termination"), "asi:", d.get("asi"))
+            imgs = d.get("usedImages", [])
+            for th in d.get("threads", []):
+                if th.get("triggered"):
+                    print("thread", th.get("id"), th.get("name", ""), th.get("queue", ""))
+                    for i, f in enumerate(th.get("frames", [])[:60]):
+                        k = f.get("imageIndex", -1)
+                        im = imgs[k].get("name", "?") if 0 <= k < len(imgs) else "?"
+                        print(" ", i, im, f.get("symbol", "?"), "+", f.get("symbolLocation", f.get("imageOffset")), f.get("sourceFile", ""), f.get("sourceLine", ""))
+        except Exception:
+            print("\n".join(t.splitlines()[:150]))
+        ' "$ips" | head -n 150 || true
+            cp "$ips" "$REPLAY_DIR/vpvk/crash/" || true
+          else
+            echo "no crash report (*.ips) newer than the replay in ~/Library/Logs/DiagnosticReports"
+          fi
+        fi
         { echo '```'; cat "$REPLAY_DIR"/vpvk/*.report.txt 2>/dev/null; echo '```'; } >> "$GITHUB_STEP_SUMMARY" || true
         [ "$n" -gt 0 ] || { echo "no .vpcap in $REPLAY_DIR"; exit 1; }
         exit $status
