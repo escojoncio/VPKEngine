@@ -4,6 +4,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <map>
 #include <set>
 
 #include "context.h"
@@ -857,42 +858,57 @@ static std::string callTypeName(int comps, int cols, bool isInt, bool isUint) {
     return std::string(isInt ? "i" : isUint ? "u" : "") + "vec" + std::to_string(comps);
 }
 
+// Repetition counter behind the two uniform diagnostics below: counts every sighting of `key` (at most 512 keys) and says
+// whether its line is due: the first one, then again at the 100th, 1000th and 10000th (`n` = sightings so far).
+static bool uniformLogDue(std::map<std::string, uint32_t>& seen, const std::string& key, uint32_t& n) {
+    auto it = seen.find(key);
+    if (it == seen.end()) {
+        if (seen.size() >= 512) return false;
+        it = seen.emplace(key, 0u).first;
+    }
+    n = ++it->second;
+    return n == 1 || n == 100 || n == 1000 || n == 10000;
+}
+
 // Diagnostics: a glUniform* the layer rejected, with the uniform that was addressed (gles.diag only says which source
-// line rejected it). At most 512 lines per process, one per (program, uniform name, called type) (per reason and location
-// when the uniform is unknown).
+// line rejected it). At most 512 keys per process, one line per (program, uniform name, called type) (per reason and location
+// when the uniform is unknown), repeated with n= at the 100th, 1000th and 10000th repetition.
 static void logUniformErr(const Program* p, const vpglsl::Variable* u, GLint location, GLsizei count, int comps, int cols,
                           bool isInt, bool isUint, const char* reason, int element = -1) {
     static std::mutex mu;
-    static std::set<std::string> seen;
+    static std::map<std::string, uint32_t> seen;
     const std::string name = u ? u->name : std::string("?");
     const std::string callType = callTypeName(comps, cols, isInt, isUint);
     const unsigned prog = p ? unsigned(p->name) : 0u;
     std::lock_guard<std::mutex> g(mu);
-    if (seen.size() >= 512 ||
-        !seen.insert(std::to_string(prog) + ":" + name + ":" + callType + (u ? "" : std::string(reason) + std::to_string(location))).second)
+    uint32_t n = 0;
+    if (!uniformLogDue(seen, std::to_string(prog) + ":" + name + ":" + callType + (u ? "" : std::string(reason) + std::to_string(location)), n))
         return;
-    logf("gles.uniform_err name=%s decl_type=%s call_type=%s count=%d arraySize=%d loc=%d reason=%s element=%d base=%d prog=%u", name.c_str(),
+    logf("gles.uniform_err name=%s decl_type=%s call_type=%s count=%d arraySize=%d loc=%d reason=%s element=%d base=%d prog=%u%s", name.c_str(),
          u ? uniformTypeName(u->glType).c_str() : "?", callType.c_str(), int(count), u ? u->arraySize : 0, int(location), reason,
-         element, element >= 0 ? int(location) - element : -1, prog);
+         element, element >= 0 ? int(location) - element : -1, prog, n > 1 ? (" n=" + std::to_string(n)).c_str() : "");
 }
 
 // Diagnostics: a glUniform* the layer let through as Adreno does in lenient mode: a base type that differs from the declared one
 // (UE4 uploads packed ints with glUniform4iv onto `highp vec4 x[N]`, stored raw), a count > 1 on a non-array (`reason`: only the first
 // element is applied) or a location past the program's range (`u` null, `reason`: ignored). One line per (program, uniform name,
-// called type, reason) (per location when the uniform is unknown), at most 512.
+// called type, reason) (per location when the uniform is unknown), at most 512 keys, repeated with n= at the 100th, 1000th and
+// 10000th repetition. A sampler set through a call that is not glUniform1i (UE4 sends glUniform4* with the unit as first
+// component) takes that first component as its unit (`reason`: sampler_first_component).
 static void logUniformLenient(const Program* p, const vpglsl::Variable* u, int comps, bool isInt, bool isUint, const char* reason = nullptr,
                               GLint location = -1) {
     static std::mutex mu;
-    static std::set<std::string> seen;
+    static std::map<std::string, uint32_t> seen;
     const std::string callType = callTypeName(comps, 0, isInt, isUint);
     const unsigned prog = p ? unsigned(p->name) : 0u;
     const std::string name = u ? u->name : std::string("?");
     std::lock_guard<std::mutex> g(mu);
-    if (seen.size() >= 512 ||
-        !seen.insert(std::to_string(prog) + ":" + name + ":" + callType + (reason ? reason : "") + (u ? "" : std::to_string(location))).second)
+    uint32_t n = 0;
+    if (!uniformLogDue(seen, std::to_string(prog) + ":" + name + ":" + callType + (reason ? reason : "") + (u ? "" : std::to_string(location)), n))
         return;
     std::string extra = reason ? std::string(" reason=") + reason : std::string();
     if (!u) extra += " loc=" + std::to_string(location);
+    if (n > 1) extra += " n=" + std::to_string(n);
     logf("gles.uniform_lenient prog=%u name=%s decl=%s call=%s%s", prog, name.c_str(), u ? uniformTypeName(u->glType).c_str() : "?", callType.c_str(),
          extra.c_str());
 }
@@ -925,15 +941,26 @@ void Context::setUniform(GLint location, int comps, Kind kind, GLsizei count, co
         count = 1;
     }
     const int n = std::min<int>(count, u.arraySize - loc.element);
-    // Samplers: glUniform1i(v) sets the texture unit.
+    // Samplers: glUniform1i(v) sets the texture unit. Lenient mode (Adreno) also takes any other vector call (UE4: glUniform4*)
+    // and reads its first component per element as the unit (a float is converted to int, int/uint words are used as they are).
     if (u.binding >= 0) {
-        if (kind != Kind::Int || comps != 1 || cols) return note("sampler_needs_1i"), setError(gl::INVALID_OPERATION);
-        const GLint* iv = static_cast<const GLint*>(v);
+        const bool exact = kind == Kind::Int && comps == 1;
+        if (cols || (!exact && (vpglsl::strictMode() || comps == 1))) return note("sampler_needs_1i"), setError(gl::INVALID_OPERATION);
         for (int i = 0; i < n; ++i) {
-            if (iv[i] < 0 || iv[i] >= (isImageType(u.glType) ? kMaxImageUnits : kMaxTextureUnits))
+            const uint8_t* src = static_cast<const uint8_t*>(v) + size_t(i) * size_t(comps) * 4;
+            GLint unit;
+            if (kind == Kind::Float) {
+                float f;
+                std::memcpy(&f, src, 4);
+                unit = f >= 0.0f && f < 65536.0f ? GLint(f) : -1;  // NaN / out of range: rejected below
+            } else {
+                std::memcpy(&unit, src, 4);
+            }
+            if (unit < 0 || unit >= (isImageType(u.glType) ? kMaxImageUnits : kMaxTextureUnits))
                 return note("sampler_unit_out_of_range"), setError(gl::INVALID_VALUE);
-            p->samplerUnits[size_t(loc.uniform)][size_t(loc.element + i)] = iv[i];
+            p->samplerUnits[size_t(loc.uniform)][size_t(loc.element + i)] = unit;
         }
+        if (!exact) logUniformLenient(p, &u, comps, isInt, isUint, "sampler_first_component");
         return;
     }
     // Type check: components and base type (bool accepts any of float/int/uint).

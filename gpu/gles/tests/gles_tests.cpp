@@ -1223,6 +1223,51 @@ void uniformRaw(bool strict) {
     const GLint lh = glGetUniformLocation(q, "vc0_h"), li = glGetUniformLocation(q, "vi"), lm = glGetUniformLocation(q, "vm");
     CHECK(lh >= 0 && li >= 0 && lm >= 0);
     glUseProgram(q);
+    {
+        // A sampler set with a vector call (UE4: glUniform4fv with the unit as first component): lenient mode takes the first
+        // component as the unit (gles.uniform_lenient reason=sampler_first_component, repeated with n=100 at the 100th call);
+        // strict mode rejects it (gles.uniform_err reason=sampler_needs_1i). Matrices stay rejected in both.
+        const char* fsS = "#version 300 es\nprecision mediump float; uniform sampler2D ts; out vec4 o; void main() { o = texture(ts, vec2(0.5)); }\n";
+        GLuint qs = program(vs, fsS);
+        const GLint ls = glGetUniformLocation(qs, "ts");
+        CHECK(ls >= 0);
+        glUseProgram(qs);
+        const float f4[4] = {3.0f, 9.0f, 9.0f, 9.0f};
+        GLint unit = -1;
+        glUniform4fv(ls, 1, f4);
+        if (strict) {
+            CHECK(err() == gl::INVALID_OPERATION);
+            glGetUniformiv(qs, ls, &unit);
+            CHECK(unit == 0);
+            for (int i = 1; i < 100; ++i) glUniform4fv(ls, 1, f4);
+            CHECK(err() == gl::INVALID_OPERATION);
+            expectLines.push_back("gles.uniform_err name=ts decl_type=0x8b5e call_type=vec4 count=1 arraySize=1 loc=" + std::to_string(ls) +
+                                  " reason=sampler_needs_1i element=0 base=" + std::to_string(ls) + " prog=" + std::to_string(qs) + "\n");
+            expectLines.push_back("reason=sampler_needs_1i element=0 base=" + std::to_string(ls) + " prog=" + std::to_string(qs) + " n=100");
+        } else {
+            CHECK(err() == gl::NO_ERROR);
+            glGetUniformiv(qs, ls, &unit);
+            CHECK(unit == 3);
+            const GLint i4[4] = {2, 9, 9, 9};
+            glUniform4iv(ls, 1, i4);
+            CHECK(err() == gl::NO_ERROR);
+            glGetUniformiv(qs, ls, &unit);
+            CHECK(unit == 2);
+            const float nan4[4] = {std::numeric_limits<float>::quiet_NaN(), 0.0f, 0.0f, 0.0f};
+            glUniform4fv(ls, 1, nan4);
+            CHECK(err() == gl::INVALID_VALUE);
+            for (int i = 1; i < 100; ++i) glUniform4fv(ls, 1, f4);  // with the first call above: the 100th vec4 sighting
+            CHECK(err() == gl::NO_ERROR);
+            glGetUniformiv(qs, ls, &unit);
+            CHECK(unit == 3);
+            expectLines.push_back("gles.uniform_lenient prog=" + std::to_string(qs) + " name=ts decl=0x8b5e call=vec4 reason=sampler_first_component\n");
+            expectLines.push_back("name=ts decl=0x8b5e call=vec4 reason=sampler_first_component n=100");
+        }
+        const float m4[16] = {};
+        glUniformMatrix4fv(ls, 1, 0, m4);
+        CHECK(err() == gl::INVALID_OPERATION);
+        glUseProgram(q);
+    }
     const GLint iv[12] = {0x3f800000, -1, 0x7fc00001, 0x40490fdb, 5, 6, 7, 8, 9, 9, 9, 9};  // 1.0f, -1, a NaN payload, pi
     glUniform4iv(lh, 5, iv);  // clamps to the 2 elements
     if (strict) {
