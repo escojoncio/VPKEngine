@@ -1126,15 +1126,16 @@ void testProgram() {
         CHECK(err() == gl::NO_ERROR);
         glGetUniformfv(q, lm + 1, back);
         CHECK(back[5] == 5.0f);
-        glUniform4fv(li, 1, h);  // vec4 call on an ivec4: base type mismatch
+        G(glUniform3fv, void (*)(GLint, GLsizei, const GLfloat*));
+        glUniform3fv(li, 1, h);  // vec3 call on an ivec4: size mismatch (a base type mismatch alone is lenient, see testUniformRaw)
         CHECK(err() == gl::INVALID_OPERATION);
         const GLuint uv[8] = {};
         glUniform4uiv(lu, 2, uv);  // count > 1 on a non-array
         CHECK(err() == gl::INVALID_OPERATION);
         glUniform4fv(9999, 1, h);
         CHECK(err() == gl::INVALID_OPERATION);
-        expectLines.push_back("gles.uniform_err name=pu_i[0] decl_type=ivec4 call_type=vec4 count=1 arraySize=2 loc=" +
-                              std::to_string(li) + " reason=base_type_mismatch");
+        expectLines.push_back("gles.uniform_err name=pu_i[0] decl_type=ivec4 call_type=vec3 count=1 arraySize=2 loc=" +
+                              std::to_string(li) + " reason=size_mismatch");
         expectLines.push_back("gles.uniform_err name=pu_u decl_type=uvec4 call_type=uvec4 count=2 arraySize=1 loc=" +
                               std::to_string(lu) + " reason=count_on_non_array");
         expectLines.push_back("gles.uniform_err name=? decl_type=? call_type=vec4 count=1 arraySize=0 loc=9999 reason=location_out_of_range");
@@ -1170,6 +1171,73 @@ void testProgram() {
     }
     e.down();
 }
+
+// UE4 packed uniforms: glUniform4iv/4uiv onto `highp vec4 x[N]` (the shader reads floatBitsToInt) keeps the raw 32-bit words
+// in lenient mode (default; gles.uniform_lenient); strict mode (VPGLES_STRICT_GLSL=1, the `uniform_strict` run) rejects it.
+void uniformRaw(bool strict) {
+    Egl e;
+    CHECK(e.up());
+    G(glGetUniformLocation, GLint (*)(GLuint, const char*));
+    G(glUseProgram, void (*)(GLuint));
+    G(glUniform4iv, void (*)(GLint, GLsizei, const GLint*));
+    G(glUniform4uiv, void (*)(GLint, GLsizei, const GLuint*));
+    G(glUniform4fv, void (*)(GLint, GLsizei, const GLfloat*));
+    G(glUniformMatrix4fv, void (*)(GLint, GLsizei, GLboolean, const GLfloat*));
+    G(glGetUniformfv, void (*)(GLuint, GLint, GLfloat*));
+    G(glGetUniformiv, void (*)(GLuint, GLint, GLint*));
+    const char* vs = "#version 300 es\nin vec4 a; uniform highp vec4 vc0_h[2]; uniform highp ivec4 vi; uniform highp mat4 vm;\n"
+                     "void main() { gl_Position = a + vc0_h[0] + vc0_h[1] + vec4(vi) + vm[0]; }\n";
+    const char* fs = "#version 300 es\nprecision mediump float; out vec4 o; void main() { o = vec4(1.0); }\n";
+    GLuint q = program(vs, fs);
+    const GLint lh = glGetUniformLocation(q, "vc0_h"), li = glGetUniformLocation(q, "vi"), lm = glGetUniformLocation(q, "vm");
+    CHECK(lh >= 0 && li >= 0 && lm >= 0);
+    glUseProgram(q);
+    const GLint iv[12] = {0x3f800000, -1, 0x7fc00001, 0x40490fdb, 5, 6, 7, 8, 9, 9, 9, 9};  // 1.0f, -1, a NaN payload, pi
+    glUniform4iv(lh, 5, iv);  // clamps to the 2 elements
+    if (strict) {
+        CHECK(err() == gl::INVALID_OPERATION);
+        float back[4] = {1.0f, 1.0f, 1.0f, 1.0f};
+        glGetUniformfv(q, lh, back);
+        CHECK(back[0] == 0.0f);  // dropped
+        return;
+    }
+    CHECK(err() == gl::NO_ERROR);
+    GLint back[4] = {};
+    glGetUniformiv(q, lh, back);  // raw words of element 0 (glGetUniformiv on a float uniform converts, so read through the float bits)
+    float f[4] = {};
+    glGetUniformfv(q, lh, f);
+    uint32_t bits[4];
+    std::memcpy(bits, f, sizeof bits);
+    CHECK(bits[0] == 0x3f800000u && bits[1] == 0xffffffffu && bits[2] == 0x7fc00001u && bits[3] == 0x40490fdbu);
+    glGetUniformfv(q, lh + 1, f);
+    std::memcpy(bits, f, sizeof bits);
+    CHECK(bits[0] == 5u && bits[3] == 8u);
+    const GLuint uv[4] = {0xdeadbeefu, 1u, 2u, 3u};
+    glUniform4uiv(lh, 1, uv);  // uint call: same
+    CHECK(err() == gl::NO_ERROR);
+    glGetUniformfv(q, lh, f);
+    std::memcpy(bits, f, sizeof bits);
+    CHECK(bits[0] == 0xdeadbeefu && bits[1] == 1u);
+    const float fv[4] = {1.5f, 2.5f, 3.5f, 4.5f};
+    glUniform4fv(li, 1, fv);  // float call on an ivec4: raw too
+    CHECK(err() == gl::NO_ERROR);
+    glGetUniformiv(q, li, back);
+    uint32_t w;
+    std::memcpy(&w, &fv[0], 4);
+    CHECK(uint32_t(back[0]) == w);
+    glUniform4iv(lm, 1, iv);  // matrices stay strict
+    CHECK(err() == gl::INVALID_OPERATION);
+    glUniform4uiv(li, 1, uv);  // int<->uint mismatch: raw
+    CHECK(err() == gl::NO_ERROR);
+    glGetUniformiv(q, li, back);
+    CHECK(uint32_t(back[0]) == 0xdeadbeefu);
+    expectLines.push_back(strict ? "gles.uniform_err name=vc0_h[0] decl_type=vec4 call_type=ivec4 count=5 arraySize=2 loc=" + std::to_string(lh) +
+                                       " reason=base_type_mismatch"
+                                 : "gles.uniform_lenient prog=" + std::to_string(q) + " name=vc0_h[0] decl=vec4 call=ivec4");
+    e.down();
+}
+void testUniformRaw() { uniformRaw(false); }
+void testUniformStrict() { uniformRaw(true); }
 
 // Program binaries (ES 3.0): one vendor format; a blob re-links to the same locations; a bad blob or format
 // is a failed link (app recompiles from source), never a GL error.
@@ -4085,6 +4153,7 @@ int main(int argc, char** argv) {
         std::printf("libVPVulkan has no vpgles_* exports\n");
         return 1;
     }
+    if (std::string(argv[1]) == "uniform_strict") setenv("VPGLES_STRICT_GLSL", "1", 1);  // read once by the driver, before its first use
     captureStderr();
     const int ok = vpgles_init(reinterpret_cast<void*>(&myGipa));
     const std::map<std::string, std::function<void()>> tests = {
@@ -4092,6 +4161,7 @@ int main(int argc, char** argv) {
         {"fbo", testFbo}, {"program", testProgram}, {"draw", testDraw}, {"invalidate", testInvalidate}, {"multiview", testMultiview},
         {"errors", testErrors}, {"ubo", testUbo}, {"readback", testReadback}, {"external", testExternal}, {"es31", testEs31},
         {"progbin", testProgramBinary}, {"recipe", testRecipe}, {"recipe_session", testRecipeSession}, {"xfb", testXfb},
+        {"uniform_raw", testUniformRaw}, {"uniform_strict", testUniformStrict},
     };
     auto it = tests.find(argv[1]);
     if (ok && it != tests.end()) it->second();

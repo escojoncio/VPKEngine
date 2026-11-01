@@ -871,6 +871,18 @@ static void logUniformErr(const Program* p, const vpglsl::Variable* u, GLint loc
          element, element >= 0 ? int(location) - element : -1, prog);
 }
 
+// Diagnostics: a glUniform* whose base type differs from the declared one (UE4 uploads packed ints with glUniform4iv onto
+// `highp vec4 x[N]`) that lenient mode stored raw, as Adreno does. One line per (program, uniform name, called type), at most 512.
+static void logUniformLenient(const Program* p, const vpglsl::Variable& u, int comps, bool isInt, bool isUint) {
+    static std::mutex mu;
+    static std::set<std::string> seen;
+    const std::string callType = callTypeName(comps, 0, isInt, isUint);
+    const unsigned prog = p ? unsigned(p->name) : 0u;
+    std::lock_guard<std::mutex> g(mu);
+    if (seen.size() >= 512 || !seen.insert(std::to_string(prog) + ":" + u.name + ":" + callType).second) return;
+    logf("gles.uniform_lenient prog=%u name=%s decl=%s call=%s", prog, u.name.c_str(), uniformTypeName(u.glType).c_str(), callType.c_str());
+}
+
 void Context::setUniform(GLint location, int comps, Kind kind, GLsizei count, const void* v, int cols, bool transpose,
                          Program* target) {
     Program* p = target ? target : uniformProgram();
@@ -937,7 +949,10 @@ void Context::setUniform(GLint location, int comps, Kind kind, GLsizei count, co
         default: return note("uniform_type_not_settable"), setError(gl::INVALID_OPERATION);
     }
     if (ucols != cols || ucomps != comps) return note("size_mismatch"), setError(gl::INVALID_OPERATION);
-    if (ukind != Kind::Bool && ukind != kind) return note("base_type_mismatch"), setError(gl::INVALID_OPERATION);
+    if (ukind != Kind::Bool && ukind != kind) {
+        if (cols || vpglsl::strictMode()) return note("base_type_mismatch"), setError(gl::INVALID_OPERATION);
+        logUniformLenient(p, u, comps, isInt, isUint);
+    }
     if (ukind == Kind::Bool && cols) return note("matrix_on_bool"), setError(gl::INVALID_OPERATION);
     const uint32_t stride = u.arrayStride ? u.arrayStride : 16;
     for (int i = 0; i < n; ++i) {
