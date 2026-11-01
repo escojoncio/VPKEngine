@@ -35,7 +35,8 @@ class MetalPlatform final : public Platform {
     { std::lock_guard<std::mutex> l(livePlatformsMutex()); livePlatforms().erase(this); }
     backend_.saveArchive();
   }
-  void flushCaches(bool complete, const std::function<void(uint32_t, uint32_t)>& progress) override {
+  // Defaults repeated: they do not carry over to an override, and livePlatforms() holds this type (vpvk_flush_caches).
+  void flushCaches(bool complete = false, const std::function<void(uint32_t, uint32_t)>& progress = nullptr) override {
     backend_.saveArchive(complete, progress);
   }  // pipeline binary archive, if any is pending
   void drainCompiles() override { backend_.drainShaderPrewarm(); }
