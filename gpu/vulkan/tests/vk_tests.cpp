@@ -2794,6 +2794,133 @@ void testQueues() {
   vkFreeMemory(c.dev, m, nullptr);
 }
 
+// A platform whose GPU has finished exactly the frames below `done`.
+struct GatedGpu final : Platform {
+  std::unique_ptr<Platform> inner;
+  uint64_t done = 0;
+  vpgpu::Backend& backend() override { return inner->backend(); }
+  WaitResult waitFrames(uint64_t frames, uint64_t) override { return frames <= done ? WaitResult::Done : WaitResult::Timeout; }
+};
+
+// CTS synchronization2.signal_order.timeline_semaphore: batches of one queue run in submission order (a batch held on an
+// unsignaled wait holds every later batch of that queue, so its later timeline signal cannot overtake it), other queues
+// may overtake; a semaphore's counter never passes the value of a signal whose GPU work has not finished (values
+// complete in order even when the batches ran in another one).
+void testTimelineOrder() {
+  Ctx c;
+  Device* dev = from<Device>(c.dev);
+  auto gatedOwner = std::make_unique<GatedGpu>();
+  GatedGpu* gpu = gatedOwner.get();
+  gpu->inner = std::move(dev->platform);
+  dev->platform = std::move(gatedOwner);
+  gpu->done = c.gpu().submittedFrames();  // everything so far is finished
+  VkQueue q[2];
+  for (uint32_t i = 0; i < 2; ++i) vkGetDeviceQueue(c.dev, 0, i, &q[i]);
+  VkCommandPoolCreateInfo pi{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+  VkCommandPool pool;
+  vkCreateCommandPool(c.dev, &pi, nullptr, &pool);
+  VkCommandBufferAllocateInfo ai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+  ai.commandPool = pool;
+  ai.commandBufferCount = 1;
+  VkDeviceMemory m = alloc(c, 1 << 16, 1);
+  VkBuffer b = buffer(c, 4096, m, 0);
+  VkCommandBuffer cb[2];
+  for (VkCommandBuffer& x : cb) {
+    vkAllocateCommandBuffers(c.dev, &ai, &x);
+    VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    vkBeginCommandBuffer(x, &bi);
+    vkCmdFillBuffer(x, b, 0, 256, 7);
+    vkEndCommandBuffer(x);
+  }
+  VkSemaphoreTypeCreateInfo ti{VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO};
+  ti.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
+  VkSemaphoreCreateInfo sci{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
+  sci.pNext = &ti;
+  VkSemaphore a, bs;
+  vkCreateSemaphore(c.dev, &sci, nullptr, &a);
+  vkCreateSemaphore(c.dev, &sci, nullptr, &bs);
+  const VkPipelineStageFlags stage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+  // A null semaphore means no wait / no signal.
+  auto submit = [&](VkQueue queue, VkCommandBuffer cmd, VkSemaphore ws, uint64_t wait, VkSemaphore ss, uint64_t signal) {
+    VkTimelineSemaphoreSubmitInfo t{VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO};
+    t.waitSemaphoreValueCount = ws ? 1 : 0, t.pWaitSemaphoreValues = &wait;
+    t.signalSemaphoreValueCount = ss ? 1 : 0, t.pSignalSemaphoreValues = &signal;
+    VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+    si.pNext = &t, si.waitSemaphoreCount = ws ? 1 : 0, si.pWaitSemaphores = &ws, si.pWaitDstStageMask = &stage;
+    si.commandBufferCount = 1, si.pCommandBuffers = &cmd, si.signalSemaphoreCount = ss ? 1 : 0, si.pSignalSemaphores = &ss;
+    return vkQueueSubmit(queue, 1, &si, VK_NULL_HANDLE);
+  };
+  auto value = [&](VkSemaphore s) {
+    uint64_t v = ~0ull;
+    vkGetSemaphoreCounterValue(c.dev, s, &v);
+    return v;
+  };
+  auto hostSignal = [&](VkSemaphore s, uint64_t v) {
+    VkSemaphoreSignalInfo sig{VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO};
+    sig.semaphore = s, sig.value = v;
+    return vkSignalSemaphore(c.dev, &sig);
+  };
+  auto drain = [&] {
+    gpu->done = c.gpu().submittedFrames();
+    CHECK(vkDeviceWaitIdle(c.dev) == VK_SUCCESS);
+  };
+
+  // Same queue: the first batch waits on A=1 (unsignaled), the second signals B=5. B must not reach 5 before the first
+  // batch has run.
+  uint64_t frames0 = c.gpu().submittedFrames();
+  CHECK(submit(q[0], cb[0], a, 1, nullptr, 0) == VK_SUCCESS);
+  CHECK(submit(q[0], cb[1], nullptr, 0, bs, 5) == VK_SUCCESS);
+  CHECK(dev->deferred.size() == 2 && c.gpu().submittedFrames() == frames0);
+  gpu->done = c.gpu().submittedFrames();
+  CHECK(value(bs) == 0);
+  CHECK(hostSignal(a, 1) == VK_SUCCESS);
+  CHECK(dev->deferred.empty() && c.gpu().submittedFrames() == frames0 + 1);  // both, in one frame, first one first
+  gpu->done = c.gpu().submittedFrames();
+  CHECK(value(a) == 1 && value(bs) == 5);
+
+  // Two queues: the second batch is on another queue and goes ahead of the held one.
+  frames0 = c.gpu().submittedFrames();
+  CHECK(submit(q[0], cb[0], a, 2, nullptr, 0) == VK_SUCCESS);
+  CHECK(submit(q[1], cb[1], nullptr, 0, bs, 9) == VK_SUCCESS);
+  CHECK(dev->deferred.size() == 1 && c.gpu().submittedFrames() == frames0 + 1);
+  gpu->done = c.gpu().submittedFrames();
+  CHECK(value(bs) == 9);
+  CHECK(hostSignal(a, 2) == VK_SUCCESS);
+  CHECK(dev->deferred.empty());
+  drain();
+
+  // Out-of-order execution across queues: q0 waits on W=1 (host) and signals T=2 (submitted first); q1 signals T=3
+  // (submitted second) and runs first. While the T=2 frame is unfinished the counter must stay below 2, though the T=3 frame is done.
+  VkSemaphore t, w;
+  vkCreateSemaphore(c.dev, &sci, nullptr, &t);
+  vkCreateSemaphore(c.dev, &sci, nullptr, &w);
+  CHECK(submit(q[0], cb[0], w, 1, t, 2) == VK_SUCCESS);
+  CHECK(submit(q[1], cb[1], nullptr, 0, t, 3) == VK_SUCCESS);
+  const uint64_t fY = c.gpu().submittedFrames();  // the T=3 frame
+  CHECK(dev->deferred.size() == 1);
+  CHECK(hostSignal(w, 1) == VK_SUCCESS);  // q0's batch runs now, after the T=3 one
+  CHECK(dev->deferred.empty() && c.gpu().submittedFrames() == fY + 1);
+  gpu->done = fY;  // T=3 finished, T=2 not
+  CHECK(value(t) == 0);
+  VkSemaphoreWaitInfo wi{VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO};
+  uint64_t want = 2;
+  wi.semaphoreCount = 1, wi.pSemaphores = &t, wi.pValues = &want;
+  CHECK(vkWaitSemaphores(c.dev, &wi, 0) == VK_TIMEOUT);
+  gpu->done = fY + 1;
+  CHECK(vkWaitSemaphores(c.dev, &wi, 0) == VK_SUCCESS);
+  CHECK(value(t) == 3);
+
+  drain();
+  vkDestroySemaphore(c.dev, t, nullptr);
+  vkDestroySemaphore(c.dev, w, nullptr);
+  vkDestroySemaphore(c.dev, a, nullptr);
+  vkDestroySemaphore(c.dev, bs, nullptr);
+  vkDestroyCommandPool(c.dev, pool, nullptr);
+  vkDestroyBuffer(c.dev, b, nullptr);
+  vkFreeMemory(c.dev, m, nullptr);
+  dev->platform = std::move(gpu->inner);  // the stand-in goes before the device does
+}
+
 // Render-pass load/store rules Metal's whole-attachment actions cannot express directly (CTS
 // renderpasses.attachment.*, multiview.*clear*): partial render areas keep the outside, multiview
 // load ops apply per view at its first subpass, one store for both depth/stencil aspects, and a
@@ -10973,7 +11100,7 @@ int main(int argc, char** argv) {
       {"exports", testExports}, {"physical", testPhysical}, {"memory", testMemory}, {"msaa_tile_off", testMsaaTileOff},
       {"passes", testPasses},   {"submit", testSubmit}, {"pipeline", testPipeline},
       {"recipes", testRecipes}, {"taa", testTaa}, {"msaa", testMsaa}, {"queries", testQueries},
-      {"timeline", testTimeline}, {"queues", testQueues}, {"pending", testPending}, {"renderpass_ops", testRenderPassOps}, {"linear", testLinear}, {"images", testImages}, {"image_lifetime", testImageLifetime},
+      {"timeline", testTimeline}, {"queues", testQueues}, {"timeline_order", testTimelineOrder}, {"pending", testPending}, {"renderpass_ops", testRenderPassOps}, {"linear", testLinear}, {"images", testImages}, {"image_lifetime", testImageLifetime},
       {"vertex_stores", testVertexStores}, {"profile", testProfile}, {"profile13", testProfile13}, {"quest_extras", testQuestExtras}, {"push_descriptor", testPushDescriptor}, {"report_geom", testReportGeomInterpolators}, {"pipeline_policy", testPipelinePolicy}, {"eds", testExtendedDynamicState},
       {"native_identity", testNativeIdentity}, {"inline_uniform", testInlineUniformBlock}, {"bda", testBufferDeviceAddress}, {"ycbcr", testYcbcr},
       {"taa_native", testTaaNative}, {"taa_eye_depth", testTaaEyeDepth}, {"taa_uimask", testTaaUiMask}, {"msaa_force", testMsaaForce}, {"msaa_force_marked", testMsaaForceMarkedEye}, {"aot", testAot}, {"aniso", testAniso}, {"zeroinit", testZeroInit}, {"archive_index", testArchiveIndex}, {"foveation", testFoveation},

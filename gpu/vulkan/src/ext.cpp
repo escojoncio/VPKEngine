@@ -51,14 +51,16 @@ bool nativeExtras() {
 }
 
 namespace {
-// Moves the semaphore's finished submissions into `completed` (non-blocking).
+// Moves the semaphore's finished submissions into `completed` (non-blocking). In value order, smallest first, stopping at
+// the first unfinished one: batches of different queues can run (and so be appended) out of value order, and a counter
+// value promises that the work signaling it or any smaller value has finished.
 void advance(Platform& p, Semaphore& s) {
-  auto it = s.pending.begin();
-  while (it != s.pending.end()) {
-    // Submissions append in order, so their frames only grow: the first unfinished one ends it.
+  while (!s.pending.empty()) {
+    const auto it = std::min_element(s.pending.begin(), s.pending.end(),
+                                     [](const auto& a, const auto& b) { return a.first < b.first; });
     if (p.waitFrames(it->second, 0) != Platform::WaitResult::Done) break;
     s.completed = std::max(s.completed, it->first);
-    it = s.pending.erase(it);
+    s.pending.erase(it);
   }
 }
 }  // namespace
@@ -109,10 +111,16 @@ static VkResult waitSemaphores(VkDevice dv, const VkSemaphoreWaitInfo* info, uin
         ++done;
         continue;
       }
-      // The earliest pending submission that reaches the value.
+      // The earliest frame after which the counter reaches the value: some pending signal v >= value completes once the
+      // frames of every pending signal up to v have (advance completes in value order).
       uint64_t best = UINT64_MAX;
-      for (const auto& [v, f] : s->pending)
-        if (v >= info->pValues[i]) best = std::min(best, f);
+      for (const auto& [v, f] : s->pending) {
+        if (v < info->pValues[i]) continue;
+        uint64_t need = f;
+        for (const auto& [v2, f2] : s->pending)
+          if (v2 <= v) need = std::max(need, f2);
+        best = std::min(best, need);
+      }
       if (best != UINT64_MAX) {
         needFrames = frameWait ? (any ? std::min(needFrames, best) : std::max(needFrames, best)) : best;
         frameWait = true;
