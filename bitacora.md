@@ -5,6 +5,8 @@ Motor propio para Apple Vision Pro: Vulkan/SPIR-V → VPIR → MSL → Metal (`g
 Clientes: VisionQuestPro (foco), AVP, AstroVisionPro. Licencia PolyForm Noncommercial 1.0.0.
 
 ## Last done
+- 2026-11-01 `122fdb3`: harvest de MTLBinaryArchive cede con backlog de compilación (`compileBacklog()`, pipeline_cache.cpp) o memoria libre < `VPVK_HARVEST_MIN_FREE_MB` (512); válvula 512 entradas/20 s solo anula el backlog. `trimMemory(>=2)` vacía `archiveQueue` (`archive_trim_dropped` en `vk.pso.census`). Función pura `archiveHarvestShouldYield` (archive_harvest.h) con tests. metal_backend.mm sin compilar en Linux (unverified hasta CI).
+- 2026-11-01 `4b44477`: GLES `setUniform` (draw.cpp ~952): tipo base distinto (float/int/uint, mismo nº de componentes, no matriz) copia bits crudos fuera de modo estricto (`gles.uniform_lenient`); `VPGLES_STRICT_GLSL=1` mantiene INVALID_OPERATION. Causa: UE4 sube `glUniform4iv` sobre `vec4 vc0_h[]` (Maestro morado; unverified en visor). Tests `uniform_raw`, `uniform_strict`.
 - 2026-10-28 `gpu/vulkan/src/commands.cpp`+`vpvk.h`: forceMsaa cuenta las salidas silenciosas (`vk.msaa force=... rej{n,eye,cd,smp,res,desc}`) y `vk.msaa rej <motivo> WxHxL color= depth=` (12+12 combinaciones). No cambia qué pasadas se convierten. AoT: 6 twins s4 de 1116x1129; la pasada al ojo 3552x2258 s1 no aparece como twin ni rechazo (unverified por qué).
 - 2026-10-28 Logging permanente GLES: `gles.uloc` tope 1024 y `gles.uniform_err` dedupe por (prog,nombre,tipo) con `prog=` (`gpu/gles/src/{gl_api,draw}.cpp`). Solo logging. Sin probar en visor.
 - 2026-10-28 `frame_compiler.cpp` (~1054-1059): Load sobre TRANSIENT con memoria indefinida (`!memValid`) en su primer attach ya no marca `transient_violation` (queda tile-local con DontCare) → MSAA de ITR2 sigue memoryless (antes 49 materializados, 1249M). Tests `rtmemory` reescritos. Riesgo conocido: un guest que use un transient como acumulador entre frames pierde contenido (igual que en Quest). Sin probar en visor.
@@ -17,15 +19,9 @@ Clientes: VisionQuestPro (foco), AVP, AstroVisionPro. Licencia PolyForm Noncomme
   `sourceView` comprueba `PixelFormatView`; TF de GLES por copia GPU sin espera si el orden coincide;
   color MS de EGL y `msTwin` transient; `floatToInt` barato con rango acotado (`kLowerVersion` 12); index_u8 cacheado,
   sin insert O(n) ni esperas de 2 s en ruta caliente.
-- 2026-10-28 GLES `c38fc60..3e8338d`: copy_image, completeness, MSAA real (capas A/B, `EXT_multisampled_render_to_texture`),
-  separate_shader (uniformes homónimos con prefijo `vpgl_fs_`), primitive restart, `glGetUniform` matrices no cuadradas,
-  blit D/S por planos y MS vía imagen 1x temporal si cambia tamaño, stencil texturing.
-- 2026-10-27/28 Vulkan perfil Quest 3 real (gpuinfo): 4 colas, subgroup arith/clustered, uint8 index, F16 constantes,
-  ballot por `simd_or`, lodBias en shader; harvest de archive continuo (cola hasta 32768); `VPVK_MSAA_FORCE`,
-  `VPVK_GAME_MSAA_AUTO`, `VPVK_PIPELINE_EYE_HARD_WAIT_MS`.
 
 ## Current state
-- Verde: ctest 318/318; CTS rápida según arriba. Todo lo de 2026-10-27/28 sin probar en visor.
+- Verde: ctest 320/320 (Linux, backend nulo); CTS rápida según arriba. Todo lo de 2026-10-27/28 sin probar en visor.
 - Pendiente:
   1. Probar en visor (VQP): MSAA memoryless sin `memorylessFailure`/`msaa_materialized`, stencil tras seed, tirones por seed PSO.
   2. Renderbuffers MS de juego en GLES (`gl_api.cpp RenderbufferStorageMultisample`) siguen siendo imágenes MS almacenadas.
@@ -34,6 +30,7 @@ Clientes: VisionQuestPro (foco), AVP, AstroVisionPro. Licencia PolyForm Noncomme
   5. `eyeHardWaitMs` de vpgles hasta 1500 ms por pipeline nuevo: puede bloquear el hilo de render al estrenar efectos.
   6. Intermitentes de Vulkan (`notas/cts.md`): el de sync2 puede ser carrera real.
   7. Sin int64 en VPIR (atómicos 64, `shaderInt64`, f64).
+  8. MSAA forzado: el pase de ojo solo se detecta por `taaEyePass` (tamaño de `gTaa`, que Klepton sigue enviando vía `vpvk_taa_set_jitter` con `klvk_eye_wh()`); si eye_wh=0 solo cuentan pases multivista. Mirar `rej{eye=}` y `vk.taa set` en el próximo log. Pases ya multisample no se cuentan.
 - Riesgos: seed restaura depth de la muestra 0 en todas las muestras (halos en siluetas); un draw que supere solo los límites de tile no se puede partir.
 
 ## Decisions
