@@ -35,7 +35,9 @@ class MetalPlatform final : public Platform {
     { std::lock_guard<std::mutex> l(livePlatformsMutex()); livePlatforms().erase(this); }
     backend_.saveArchive();
   }
-  void flushCaches() override { backend_.saveArchive(); }  // pipeline binary archive, if any is pending
+  void flushCaches(bool complete, const std::function<void(uint32_t, uint32_t)>& progress) override {
+    backend_.saveArchive(complete, progress);
+  }  // pipeline binary archive, if any is pending
   void drainCompiles() override { backend_.drainShaderPrewarm(); }
   vpgpu::Backend& backend() override { return backend_; }
   WaitResult waitIdle(uint64_t timeoutNs) override { return map(backend_.waitIdle(timeoutNs)); }

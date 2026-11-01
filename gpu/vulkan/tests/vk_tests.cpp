@@ -2008,6 +2008,244 @@ void testRecipes() {
   std::filesystem::remove_all(dir, ec);
 }
 
+// The keys a game gets back from vkGetPipelineCacheData (Unreal passes the blob to the next launch) must still name
+// recipes then: the same graphics pipeline made by a later launch, whose shader modules / layouts / render passes
+// have other handle values and are created in another order, has the same key, and the stored recipe resolves with
+// its shaders. (Device log, Into The Radius 2: 6998 keys in the blob, 1 of them found.)
+void recipeKeysScenario(bool async) {
+  char tmpl[] = "/tmp/vpvk_recipekeys_XXXXXX";
+  const char* dir = mkdtemp(tmpl);
+  CHECK(dir != nullptr);
+  if (!dir) return;
+  setenv("VP_PIPELINE_CACHE_DIR", dir, 1);
+  setenv("VPVK_ASYNC_PIPELINES", async ? "1" : "0", 1);
+  unsetenv("VPVK_REPORT_GEOM");
+  struct Run {
+    std::vector<uint64_t> keys;  // one per pipeline, in creation order
+    std::vector<uint8_t> blob;   // vkGetPipelineCacheData at the end
+    std::vector<uint64_t> shaderIds;
+    unsigned resolved = 0, withShaders = 0;  // blob keys the next launch's store resolves (stateFor, with the MSL)
+    bool allOk = true;
+  };
+  auto launch = [&](unsigned skew, const std::vector<uint8_t>* prevBlob) {
+    Run r;
+    Ctx c;
+    Device* d = from<Device>(c.dev);
+    if (prevBlob) {  // what the game does at startup: hands the saved blob back
+      VkPipelineCacheCreateInfo pci{VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO};
+      pci.initialDataSize = prevBlob->size(), pci.pInitialData = prevBlob->data();
+      VkPipelineCache pc;
+      CHECK(vkCreatePipelineCache(c.dev, &pci, nullptr, &pc) == VK_SUCCESS);
+      const uint32_t count = *reinterpret_cast<const uint32_t*>(prevBlob->data() + 36);
+      for (uint32_t i = 0; i < count; ++i) {
+        uint64_t k;
+        std::memcpy(&k, prevBlob->data() + 40 + size_t(i) * 8, 8);
+        vpgpu::PipelineState s;
+        std::vector<std::pair<uint64_t, ShaderBlob>> shaders;
+        uint64_t key = 0;
+        if (!d->recipes->resolve(k, key)) continue;
+        r.resolved += d->recipes->stateFor(key, s);
+        r.withShaders += d->recipes->stateFor(key, s, &shaders);
+      }
+      vkDestroyPipelineCache(c.dev, pc, nullptr);
+    }
+    // Objects the game made first: later handles / ids / counters differ from the previous launch.
+    std::vector<VkShaderModule> junkModules;
+    std::vector<VkRenderPass> junkPasses;
+    std::vector<VkPipelineLayout> junkLayouts;
+    for (unsigned i = 0; i < skew; ++i) {
+      junkModules.push_back(module(c, i % 2 ? "solid.frag.spv" : "uimask.frag.spv"));
+      VkPipelineLayoutCreateInfo jl{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+      VkPipelineLayout l;
+      vkCreatePipelineLayout(c.dev, &jl, nullptr, &l);
+      junkLayouts.push_back(l);
+    }
+    auto makePass = [&](VkFormat fmt) {
+      VkAttachmentDescription att{};
+      att.format = fmt, att.samples = VK_SAMPLE_COUNT_1_BIT;
+      att.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR, att.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+      VkAttachmentReference cref{0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
+      VkSubpassDescription sp{};
+      sp.colorAttachmentCount = 1, sp.pColorAttachments = &cref;
+      VkRenderPassCreateInfo rpi{VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO};
+      rpi.attachmentCount = 1, rpi.pAttachments = &att, rpi.subpassCount = 1, rpi.pSubpasses = &sp;
+      VkRenderPass rp;
+      vkCreateRenderPass(c.dev, &rpi, nullptr, &rp);
+      return rp;
+    };
+    for (unsigned i = 0; i < skew; ++i) junkPasses.push_back(makePass(VK_FORMAT_R16G16B16A16_SFLOAT));
+    VkRenderPass rp[2] = {makePass(VK_FORMAT_R8G8B8A8_UNORM), makePass(VK_FORMAT_B8G8R8A8_SRGB)};
+    VkPipelineLayoutCreateInfo plci{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    VkPipelineLayout pl;
+    vkCreatePipelineLayout(c.dev, &plci, nullptr, &pl);
+    VkShaderModule vs = module(c, "uimask.vert.spv"), fs = module(c, "uimask.frag.spv");
+    VkPipelineShaderStageCreateInfo stg[2]{{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO},
+                                           {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO}};
+    stg[0].stage = VK_SHADER_STAGE_VERTEX_BIT, stg[0].module = vs, stg[0].pName = "main";
+    stg[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT, stg[1].module = fs, stg[1].pName = "main";
+    VkPipelineVertexInputStateCreateInfo vis{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+    VkPipelineInputAssemblyStateCreateInfo ias{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
+    ias.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    VkPipelineRasterizationStateCreateInfo rs{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
+    rs.lineWidth = 1;
+    VkPipelineMultisampleStateCreateInfo ms{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
+    ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+    VkPipelineColorBlendAttachmentState cba{};
+    cba.colorWriteMask = 0xF;
+    VkPipelineColorBlendStateCreateInfo cbs{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
+    cbs.attachmentCount = 1, cbs.pAttachments = &cba;
+    VkViewport vp{0, 0, 64, 64, 0, 1};
+    VkRect2D sc{{0, 0}, {64, 64}};
+    VkPipelineViewportStateCreateInfo vps{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
+    vps.viewportCount = 1, vps.pViewports = &vp, vps.scissorCount = 1, vps.pScissors = &sc;
+    VkGraphicsPipelineCreateInfo gp{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
+    gp.stageCount = 2, gp.pStages = stg, gp.pVertexInputState = &vis, gp.pInputAssemblyState = &ias;
+    gp.pViewportState = &vps, gp.pRasterizationState = &rs, gp.pMultisampleState = &ms, gp.pColorBlendState = &cbs;
+    gp.layout = pl;
+    std::vector<VkPipeline> pipes;
+    for (int variant = 0; variant < 4; ++variant) {  // render pass format x blend
+      gp.renderPass = rp[variant & 1];
+      cba.blendEnable = variant >> 1;
+      cba.srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA, cba.dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+      VkPipeline p;
+      CHECK(vkCreateGraphicsPipelines(c.dev, VK_NULL_HANDLE, 1, &gp, nullptr, &p) == VK_SUCCESS);
+      const PipelineObj* po = from<PipelineObj>(p);
+      while (!po->resolved.load(std::memory_order_acquire)) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      r.allOk = r.allOk && po->ok;
+      r.keys.push_back(po->key.value);
+      r.shaderIds.push_back(po->state.vertexShader), r.shaderIds.push_back(po->state.fragmentShader);
+      pipes.push_back(p);
+    }
+    // A game-like pipeline: two descriptor sets, push constants, two vertex buffers, multiview, depth-less, dynamic viewport.
+    VkDescriptorSetLayoutBinding b0[7] = {
+        {0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_VERTEX_BIT, nullptr},
+        {1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr},
+        {2, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr},
+        {3, VK_DESCRIPTOR_TYPE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr},
+        {4, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr},
+        {5, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr},
+        {6, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr}};
+    VkDescriptorSetLayoutBinding b1 = {0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 1, VK_SHADER_STAGE_VERTEX_BIT, nullptr};
+    VkDescriptorSetLayoutCreateInfo lci{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+    VkDescriptorSetLayout sl[2];
+    lci.bindingCount = 7, lci.pBindings = b0;
+    vkCreateDescriptorSetLayout(c.dev, &lci, nullptr, &sl[0]);
+    lci.bindingCount = 1, lci.pBindings = &b1;
+    vkCreateDescriptorSetLayout(c.dev, &lci, nullptr, &sl[1]);
+    VkPushConstantRange pcr{VK_SHADER_STAGE_VERTEX_BIT, 0, 20};
+    VkPipelineLayoutCreateInfo plci2{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    plci2.setLayoutCount = 2, plci2.pSetLayouts = sl, plci2.pushConstantRangeCount = 1, plci2.pPushConstantRanges = &pcr;
+    VkPipelineLayout pl2;
+    vkCreatePipelineLayout(c.dev, &plci2, nullptr, &pl2);
+    const uint32_t mask = 0b11;
+    VkAttachmentDescription att{};
+    att.format = VK_FORMAT_R8G8B8A8_SRGB, att.samples = VK_SAMPLE_COUNT_1_BIT;
+    att.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR, att.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    VkAttachmentReference cref{0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
+    VkSubpassDescription sp{};
+    sp.colorAttachmentCount = 1, sp.pColorAttachments = &cref;
+    VkRenderPassMultiviewCreateInfo mv{VK_STRUCTURE_TYPE_RENDER_PASS_MULTIVIEW_CREATE_INFO};
+    mv.subpassCount = 1, mv.pViewMasks = &mask;
+    VkRenderPassCreateInfo rpi{VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO, &mv};
+    rpi.attachmentCount = 1, rpi.pAttachments = &att, rpi.subpassCount = 1, rpi.pSubpasses = &sp;
+    VkRenderPass rpMv;
+    vkCreateRenderPass(c.dev, &rpi, nullptr, &rpMv);
+    VkShaderModule vs2 = module(c, "mesh_multiview.vert.opt.spv"), fs2 = module(c, "lit.frag.opt.spv");
+    VkPipelineShaderStageCreateInfo stages[2] = {{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO},
+                                                 {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO}};
+    stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT, stages[0].module = vs2, stages[0].pName = "main";
+    stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT, stages[1].module = fs2, stages[1].pName = "main";
+    VkVertexInputBindingDescription vbd[2] = {{0, 32, VK_VERTEX_INPUT_RATE_VERTEX}, {1, 16, VK_VERTEX_INPUT_RATE_INSTANCE}};
+    VkVertexInputAttributeDescription vad[4] = {{0, 0, VK_FORMAT_R32G32B32_SFLOAT, 0},
+                                                {1, 0, VK_FORMAT_R8G8B8A8_SNORM, 12},
+                                                {2, 0, VK_FORMAT_R16G16_SFLOAT, 16},
+                                                {3, 1, VK_FORMAT_R32G32B32A32_SFLOAT, 0}};
+    VkPipelineVertexInputStateCreateInfo vis2{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+    vis2.vertexBindingDescriptionCount = 2, vis2.pVertexBindingDescriptions = vbd;
+    vis2.vertexAttributeDescriptionCount = 4, vis2.pVertexAttributeDescriptions = vad;
+    VkDynamicState dyn[2] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
+    VkPipelineDynamicStateCreateInfo dys{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
+    dys.dynamicStateCount = 2, dys.pDynamicStates = dyn;
+    VkGraphicsPipelineCreateInfo gp2 = gp;
+    gp2.pStages = stages, gp2.pVertexInputState = &vis2, gp2.pDynamicState = &dys, gp2.layout = pl2, gp2.renderPass = rpMv;
+    cba.blendEnable = VK_TRUE;
+    {
+      VkPipeline p;
+      CHECK(vkCreateGraphicsPipelines(c.dev, VK_NULL_HANDLE, 1, &gp2, nullptr, &p) == VK_SUCCESS);
+      const PipelineObj* po = from<PipelineObj>(p);
+      while (!po->resolved.load(std::memory_order_acquire)) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      r.allOk = r.allOk && po->ok;
+      r.keys.push_back(po->key.value);
+      r.shaderIds.push_back(po->state.vertexShader), r.shaderIds.push_back(po->state.fragmentShader);
+      pipes.push_back(p);
+    }
+    c.gpu().pipelines().waitIdle();
+    vkDestroyPipelineLayout(c.dev, pl2, nullptr);
+    vkDestroyDescriptorSetLayout(c.dev, sl[0], nullptr);
+    vkDestroyDescriptorSetLayout(c.dev, sl[1], nullptr);
+    vkDestroyRenderPass(c.dev, rpMv, nullptr);
+    vkDestroyShaderModule(c.dev, vs2, nullptr);
+    vkDestroyShaderModule(c.dev, fs2, nullptr);
+    size_t n = 0;
+    vkGetPipelineCacheData(c.dev, VK_NULL_HANDLE, &n, nullptr);
+    r.blob.resize(n);
+    vkGetPipelineCacheData(c.dev, VK_NULL_HANDLE, &n, r.blob.data());
+    for (VkPipeline p : pipes) vkDestroyPipeline(c.dev, p, nullptr);
+    vkDestroyShaderModule(c.dev, vs, nullptr);
+    vkDestroyShaderModule(c.dev, fs, nullptr);
+    vkDestroyPipelineLayout(c.dev, pl, nullptr);
+    for (VkRenderPass p : rp) vkDestroyRenderPass(c.dev, p, nullptr);
+    for (VkRenderPass p : junkPasses) vkDestroyRenderPass(c.dev, p, nullptr);
+    for (VkPipelineLayout l : junkLayouts) vkDestroyPipelineLayout(c.dev, l, nullptr);
+    for (VkShaderModule m : junkModules) vkDestroyShaderModule(c.dev, m, nullptr);
+    return r;
+  };
+  const Run first = launch(0, nullptr);
+  CHECK(first.allOk && first.keys.size() == 5);
+  const Run second = launch(5, &first.blob);
+  CHECK(second.allOk && second.keys == first.keys && second.shaderIds == first.shaderIds);
+  CHECK(second.resolved == first.keys.size() && second.withShaders == first.keys.size());
+  const Run third = launch(1, &second.blob);  // the file grew by nothing: the same recipes again
+  CHECK(third.keys == first.keys && third.resolved == first.keys.size() && third.withShaders == first.keys.size());
+  {  // a blob written before the identity existed holds pipeline keys: still resolved
+    std::vector<uint8_t> legacy(first.blob.begin(), first.blob.begin() + 40);
+    for (uint64_t k : first.keys) legacy.insert(legacy.end(), reinterpret_cast<const uint8_t*>(&k), reinterpret_cast<const uint8_t*>(&k) + 8);
+    const Run old = launch(0, &legacy);
+    CHECK(old.resolved == first.keys.size() && old.withShaders == first.keys.size());
+  }
+  {  // a translator bump retranslates the stored inputs: the MSL is the same, so every key still resolves
+    RecipeStore s(dir, kTranslatorVersion + 1);
+    CHECK(s.needsRefresh());
+    const RecipeStore::RefreshResult rr = s.refresh(2);
+    CHECK(rr.retranslated == 4 && rr.failed == 0 && rr.droppedPipelines == 0 && rr.sameMsl == 4);
+    vpgpu::PipelineState st;
+    for (uint64_t k : first.keys) CHECK(s.stateFor(k, st));
+    uint64_t key = 0;
+    for (const uint8_t* q = first.blob.data() + 40; q < first.blob.data() + first.blob.size(); q += 8) {
+      uint64_t id;
+      std::memcpy(&id, q, 8);
+      CHECK(s.resolve(id, key) && s.stateFor(key, st));
+    }
+  }
+  {  // a translator mode (VPVK_AMPLIFY) changes the MSL of the stored multiview vertex shader: the refresh re-keys that
+     // recipe, and the blob of the earlier launch still resolves every recipe, that one included
+    setenv("VPVK_AMPLIFY", "1", 1);
+    const Run amp = launch(2, &first.blob);
+    unsetenv("VPVK_AMPLIFY");
+    CHECK(amp.allOk && amp.keys.size() == 5);
+    CHECK(amp.keys[4] != first.keys[4]);  // the pipeline itself has another key now (another vertex shader)
+    CHECK(amp.resolved == first.keys.size() && amp.withShaders == first.keys.size());
+  }
+  unsetenv("VP_PIPELINE_CACHE_DIR");
+  setenv("VPVK_ASYNC_PIPELINES", "0", 1);
+  std::error_code ec;
+  std::filesystem::remove_all(dir, ec);
+}
+void testRecipeKeys() {
+  recipeKeysScenario(false);
+  recipeKeysScenario(true);
+}
+
 // Translator modes (VPVK_AMPLIFY, VPVK_FETCH_NATIVE): read from the environment, part of the recipe store's translator id
 // (a mode change retranslates the stored stages), and the stage interface keeps whether a vertex stage is amplified.
 void testTranslatorModes() {
@@ -6782,9 +7020,156 @@ void testSyncPipelines() {
   setenv("VPVK_ASYNC_PIPELINES", "0", 1);
 }
 
+// ---- Quest-faithful creation (VPVK_ASYNC_PIPELINES=0, what VisionQuestPro sets): vkCreate*Pipelines returns with the pipeline ready ----
+// A real driver compiles inside the call, so an engine counting returned creates (Unreal's PSO precache) is told "warm" only when
+// it is. VPVK_CREATE_WAIT_MS bounds the wait; past it the call still succeeds (the draw gate protects).
+namespace vpvk {
+uint32_t createWaitMs();   // pipelines.cpp
+void resetCreateWaitMs();  // pipelines.cpp (tests)
+}
+void testCreateDefault() {
+  unsetenv("VPVK_GLES_SYNC_PIPELINES");
+  unsetenv("VPVK_PIPELINE_CREATE_WAIT_MS");
+  unsetenv("VPVK_REPORT_GEOM");
+  unsetenv("VP_PIPELINE_CACHE_DIR");
+  unsetenv("VPVK_ASYNC_PIPELINES");
+  CHECK(asyncPipelinesOn());  // the engine default stays asynchronous (AVP / Source 2)
+  setenv("VPVK_ASYNC_PIPELINES", "0", 1);
+  CHECK(!asyncPipelinesOn());
+  // The wait is read once (a create is hot): later changes of the environment do not move it until it is reset.
+  resetCreateWaitMs();
+  setenv("VPVK_CREATE_WAIT_MS", "700", 1);
+  CHECK(createWaitMs() == 700);
+  setenv("VPVK_CREATE_WAIT_MS", "1234", 1);
+  CHECK(createWaitMs() == 700);
+  resetCreateWaitMs();
+  CHECK(createWaitMs() == 1234);
+  unsetenv("VPVK_CREATE_WAIT_MS");
+  setenv("VPVK_PIPELINE_CREATE_WAIT_MS", "77", 1);  // the older name still works
+  resetCreateWaitMs();
+  CHECK(createWaitMs() == 77);
+  unsetenv("VPVK_PIPELINE_CREATE_WAIT_MS");
+  resetCreateWaitMs();
+  CHECK(createWaitMs() == 60000);
+  setenv("VPVK_CREATE_WAIT_MS", "700", 1);
+  resetCreateWaitMs();
+  Ctx c;
+  Device* d = from<Device>(c.dev);
+  CHECK(d->translator == nullptr);
+  VkAttachmentDescription att{};
+  att.format = VK_FORMAT_R8G8B8A8_UNORM, att.samples = VK_SAMPLE_COUNT_1_BIT;
+  att.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR, att.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+  VkAttachmentReference cref{0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
+  VkSubpassDescription sp{};
+  sp.colorAttachmentCount = 1, sp.pColorAttachments = &cref;
+  VkRenderPassCreateInfo rpi{VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO};
+  rpi.attachmentCount = 1, rpi.pAttachments = &att, rpi.subpassCount = 1, rpi.pSubpasses = &sp;
+  VkRenderPass rp;
+  vkCreateRenderPass(c.dev, &rpi, nullptr, &rp);
+  VkPipelineLayoutCreateInfo plci{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+  VkPipelineLayout pl;
+  vkCreatePipelineLayout(c.dev, &plci, nullptr, &pl);
+  VkShaderModule vs = module(c, "uimask.vert.spv"), fs = module(c, "uimask.frag.spv");
+  VkPipelineShaderStageCreateInfo stg[2]{{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO},
+                                         {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO}};
+  stg[0].stage = VK_SHADER_STAGE_VERTEX_BIT, stg[0].module = vs, stg[0].pName = "main";
+  stg[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT, stg[1].module = fs, stg[1].pName = "main";
+  VkPipelineVertexInputStateCreateInfo vis{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+  VkPipelineInputAssemblyStateCreateInfo ias{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
+  ias.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+  VkPipelineRasterizationStateCreateInfo rs[3];  // cull none / back / front: three distinct keys
+  const VkCullModeFlags cull[3] = {VK_CULL_MODE_NONE, VK_CULL_MODE_BACK_BIT, VK_CULL_MODE_FRONT_BIT};
+  for (int i = 0; i < 3; ++i) {
+    rs[i] = {VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
+    rs[i].lineWidth = 1, rs[i].cullMode = cull[i];
+  }
+  VkPipelineMultisampleStateCreateInfo ms{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
+  ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+  VkPipelineColorBlendAttachmentState cba{};
+  cba.colorWriteMask = 0xF;
+  VkPipelineColorBlendStateCreateInfo cbs{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
+  cbs.attachmentCount = 1, cbs.pAttachments = &cba;
+  VkViewport vp{0, 0, 64, 64, 0, 1};
+  VkRect2D sc{{0, 0}, {64, 64}};
+  VkPipelineViewportStateCreateInfo vps{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
+  vps.viewportCount = 1, vps.pViewports = &vp, vps.scissorCount = 1, vps.pScissors = &sc;
+  VkGraphicsPipelineCreateInfo gp[3];
+  for (int i = 0; i < 3; ++i) {
+    gp[i] = {VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
+    gp[i].stageCount = 2, gp[i].pStages = stg, gp[i].pVertexInputState = &vis, gp[i].pInputAssemblyState = &ias;
+    gp[i].pViewportState = &vps, gp[i].pRasterizationState = &rs[i], gp[i].pMultisampleState = &ms;
+    gp[i].pColorBlendState = &cbs, gp[i].layout = pl, gp[i].renderPass = rp;
+  }
+  vpgpu::NullBackend& nb = static_cast<vpgpu::NullBackend&>(d->platform->backend());
+  vpgpu::PipelineCache& cache = c.gpu().pipelines();
+  PipelineCounters& pc = pipelineCounters();
+
+  // 1. The compile takes 80 ms: the call returns only after it, translated, resolved and Ready.
+  std::atomic<bool> gate{false};
+  nb.onCompile = [&] {
+    while (!gate) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  };
+  std::thread opener([&] {
+    std::this_thread::sleep_for(std::chrono::milliseconds(30));
+    gate = true;
+  });
+  const auto t0 = std::chrono::steady_clock::now();
+  VkPipeline ready = VK_NULL_HANDLE;
+  CHECK(vkCreateGraphicsPipelines(c.dev, VK_NULL_HANDLE, 1, &gp[0], nullptr, &ready) == VK_SUCCESS);
+  CHECK(std::chrono::steady_clock::now() - t0 >= std::chrono::milliseconds(25));
+  opener.join();
+  const PipelineObj* po = ready ? from<PipelineObj>(ready) : nullptr;
+  CHECK(po && po->ok && po->resolved.load() && !po->job);
+  if (po) CHECK(cache.status(po->key) == vpgpu::PipelineCache::Status::Ready);
+  nb.onCompile = nullptr;
+
+  // 2. A compile that outlasts VPVK_CREATE_WAIT_MS (700 ms): the call still returns VK_SUCCESS, counted as timed out. The next
+  // create waits its full budget too: no 500 ms backoff window after a timeout (a draw / variant wait would still get one).
+  const uint64_t timed0 = pc.createTimedOut.load();
+  std::atomic<bool> release{false};
+  nb.onCompile = [&] {
+    while (!release) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  };
+  VkPipeline slow[2] = {VK_NULL_HANDLE, VK_NULL_HANDLE};
+  for (int i = 0; i < 2; ++i) {
+    const auto t1 = std::chrono::steady_clock::now();
+    CHECK(vkCreateGraphicsPipelines(c.dev, VK_NULL_HANDLE, 1, &gp[i + 1], nullptr, &slow[i]) == VK_SUCCESS);
+    const auto waited = std::chrono::steady_clock::now() - t1;
+    CHECK(waited >= std::chrono::milliseconds(650) && waited < std::chrono::milliseconds(5000));
+    CHECK(slow[i] != VK_NULL_HANDLE && pc.createTimedOut.load() == timed0 + uint64_t(i) + 1);
+    if (slow[i]) CHECK(cache.status(from<PipelineObj>(slow[i])->key) != vpgpu::PipelineCache::Status::Ready);
+  }
+  CHECK(d->pipelineBackoffUntilNs.load() == 0);  // creates neither start nor honour the backoff window
+
+  // 3. FAIL_ON_PIPELINE_COMPILE_REQUIRED for a pipeline nobody has compiled (blending on): refused at once, even with the compiler stuck.
+  VkPipelineColorBlendAttachmentState cbaBlend = cba;
+  cbaBlend.blendEnable = VK_TRUE, cbaBlend.srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA;
+  cbaBlend.dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+  VkPipelineColorBlendStateCreateInfo cbsBlend = cbs;
+  cbsBlend.pAttachments = &cbaBlend;
+  VkGraphicsPipelineCreateInfo fail = gp[0];
+  fail.pColorBlendState = &cbsBlend;
+  fail.flags = VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT;
+  VkPipeline refused = ready;
+  const auto t2 = std::chrono::steady_clock::now();
+  CHECK(vkCreateGraphicsPipelines(c.dev, VK_NULL_HANDLE, 1, &fail, nullptr, &refused) == VK_PIPELINE_COMPILE_REQUIRED);
+  CHECK(refused == VK_NULL_HANDLE && std::chrono::steady_clock::now() - t2 < std::chrono::milliseconds(50));
+  release = true;
+  nb.onCompile = nullptr;
+  cache.waitIdle();
+  for (VkPipeline p : {ready, slow[0], slow[1]}) vkDestroyPipeline(c.dev, p, nullptr);
+  vkDestroyShaderModule(c.dev, vs, nullptr);
+  vkDestroyShaderModule(c.dev, fs, nullptr);
+  vkDestroyPipelineLayout(c.dev, pl, nullptr);
+  vkDestroyRenderPass(c.dev, rp, nullptr);
+  unsetenv("VPVK_CREATE_WAIT_MS");
+  resetCreateWaitMs();
+}
+
 // vk.pso.census: the counters the creation calls and awaitPipelines move (created, translation failures, timeouts).
 namespace vpvk {
-unsigned awaitPipelines(Device*, const std::vector<vpgpu::PipelineKey>&, uint32_t, const char*);  // pipelines.cpp
+unsigned awaitPipelines(Device*, const std::vector<vpgpu::PipelineKey>&, uint32_t, const char*, bool backoff);  // pipelines.cpp
+
 }
 void testPsoCensus() {
   Ctx c;
@@ -6850,11 +7235,11 @@ void testPsoCensus() {
   held.cull = vpgpu::CullMode::Front;  // a state nobody compiled yet
   const vpgpu::PipelineKey k = held.key();
   c.gpu().pipelines().request(held, k, vpgpu::Priority::Visible);
-  CHECK(awaitPipelines(d, {k}, 40, "test") == 1);
+  CHECK(awaitPipelines(d, {k}, 40, "test", true) == 1);
   gate = true;
   c.gpu().pipelines().waitIdle();
   nb.onCompile = nullptr;
-  CHECK(awaitPipelines(d, {k}, 40, "test") == 0);
+  CHECK(awaitPipelines(d, {k}, 40, "test", true) == 0);
 
   Platform::ArchiveCensus a;
   CHECK(!d->platform->archiveCensus(a));  // the null platform has no archive
@@ -11288,12 +11673,12 @@ int main(int argc, char** argv) {
   const std::vector<std::pair<const char*, std::function<void()>>> groups = {
       {"exports", testExports}, {"physical", testPhysical}, {"memory", testMemory}, {"msaa_tile_off", testMsaaTileOff},
       {"passes", testPasses},   {"submit", testSubmit}, {"pipeline", testPipeline},
-      {"recipes", testRecipes}, {"taa", testTaa}, {"msaa", testMsaa}, {"queries", testQueries},
+      {"recipes", testRecipes}, {"recipe_keys", testRecipeKeys}, {"taa", testTaa}, {"msaa", testMsaa}, {"queries", testQueries},
       {"timeline", testTimeline}, {"queues", testQueues}, {"timeline_order", testTimelineOrder}, {"pending", testPending}, {"renderpass_ops", testRenderPassOps}, {"linear", testLinear}, {"images", testImages}, {"image_lifetime", testImageLifetime},
       {"vertex_stores", testVertexStores}, {"profile", testProfile}, {"profile13", testProfile13}, {"quest_extras", testQuestExtras}, {"push_descriptor", testPushDescriptor}, {"report_geom", testReportGeomInterpolators}, {"pipeline_policy", testPipelinePolicy}, {"eds", testExtendedDynamicState},
       {"native_identity", testNativeIdentity}, {"inline_uniform", testInlineUniformBlock}, {"bda", testBufferDeviceAddress}, {"ycbcr", testYcbcr},
       {"taa_native", testTaaNative}, {"taa_eye_depth", testTaaEyeDepth}, {"taa_uimask", testTaaUiMask}, {"msaa_force", testMsaaForce}, {"msaa_force_marked", testMsaaForceMarkedEye}, {"aot", testAot}, {"aniso", testAniso}, {"zeroinit", testZeroInit}, {"archive_index", testArchiveIndex}, {"foveation", testFoveation},
-      {"stage_keys", testStageKeys}, {"async_pipelines", testAsyncPipelines}, {"sync_pipelines", testSyncPipelines}, {"pso_census", testPsoCensus}, {"pass_drop", testPassDrop}, {"skip_reasons", testSkipReasons}, {"indirect_patch", testIndirectPatch}, {"astc3d", testAstc3d},
+      {"stage_keys", testStageKeys}, {"async_pipelines", testAsyncPipelines}, {"sync_pipelines", testSyncPipelines}, {"create_default", testCreateDefault}, {"pso_census", testPsoCensus}, {"pass_drop", testPassDrop}, {"skip_reasons", testSkipReasons}, {"indirect_patch", testIndirectPatch}, {"astc3d", testAstc3d},
       {"perf", testPerf}, {"phase1b", testPhase1b}, {"suspend_resume", testSuspendResume}, {"translator_modes", testTranslatorModes}, {"capture", testCapture}, {"capture_images", testCaptureImages}, {"capture_hooks", testCaptureHooks}, {"capture_codec", testCaptureCodec}, {"capture_env", testCaptureEnv}, {"capture_pools", testCapturePools}, {"capture_host_frames", testCaptureHostFrames}, {"capture_corrupt", testCaptureCorrupt}, {"capture_env_host", testCaptureEnvHost}, {"capture_env_dir", testCaptureEnvDir}, {"capture_devices", testCaptureDevices}, {"capture_unhooked", testCaptureUnhooked}, {"capture_budget", testCaptureBudget}, {"capture_locks", testCaptureLocks}, {"png", testPng}, {"imgdiff", testImgDiff}, {"replay", testReplay}, {"replay_lvp", testReplayLvp}, {"refcaps", testRefCaps}};
   bool ran = false;
   for (const auto& [name, fn] : groups) {

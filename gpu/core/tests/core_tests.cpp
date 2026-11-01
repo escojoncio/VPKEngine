@@ -2911,6 +2911,26 @@ void testHarvest() {
   CHECK(archiveHarvestShouldYield(1, 0, 0, 0ms, 4096, 1024));  // demand wait rule unchanged
   CHECK(!archiveHarvestShouldYield(1, 0, 4000, 25s, 4096, 1024));
   CHECK_EQ(kHarvestBatch, size_t(16));
+  // Flush budget: the end of the process stays bounded (8 s), the explicit prepare step gets room for thousands of adds
+  // (~80 ms each): the flush that is the only archiver must be able to empty a 2500-entry queue.
+  CHECK(archiveFlushBudget(false) == 8000ms);
+  CHECK(archiveFlushBudget(true) >= 2500 * 80ms);
+  CHECK(archiveFlushContinues(16, 0ms, archiveFlushBudget(false)));
+  CHECK(!archiveFlushContinues(16, 8000ms, archiveFlushBudget(false)));  // budget spent: cut
+  CHECK(archiveFlushContinues(16, 8000ms, archiveFlushBudget(true)));
+  CHECK(!archiveFlushContinues(0, 0ms, archiveFlushBudget(true)));  // queue empty: done
+  // A complete flush waits 200 ms per step while free memory is under the threshold (never skips); the exit flush does not pause.
+  CHECK(archiveFlushPause(true, 100, 512) == 200ms);
+  CHECK(archiveFlushPause(true, 512, 512) == 0ms);
+  CHECK(archiveFlushPause(true, 0, 0) == 0ms);  // threshold 0 disables the check
+  CHECK(archiveFlushPause(false, 100, 512) == 0ms);
+  // A sealed pack (the session file full) is serialized at once, 32 additions or 30 s otherwise; nothing added, nothing due.
+  CHECK(!archiveSerializeDue(0, 32, 32, 1h));
+  CHECK(archiveSerializeDue(1, 32, 32, 0ms));
+  CHECK(!archiveSerializeDue(1, 5, 32, 29s));
+  CHECK(archiveSerializeDue(1, 5, 32, 30s));
+  CHECK(archiveSerializeDue(kSerializeEvery, 5, 64, 0ms));
+  CHECK(!archiveSerializeDue(kSerializeEvery - 1, 5, 64, 0ms));
 }
 
 // Attachment::autoMsaa (VPVulkan forced MSAA): the N-sample twin of a 1x image never gets memory or a sample store, a Load

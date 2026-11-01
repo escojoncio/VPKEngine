@@ -41,9 +41,9 @@ void logf(const char* fmt, ...) __attribute__((format(printf, 1, 2)));
 bool prewarmEnabled();  // config.cpp: vpvk_config_set_prewarm
 // VPVK_ASYNC_PIPELINES: default (unset, or 1) = asynchronous: vkCreate*Pipelines returns at once, translation + compile
 // run in the background and draws whose pipeline is not ready are skipped within a small budget (pipelines.cpp
-// "Asynchronous creation"). =0 is the opt-in synchronous mode: vkCreate*Pipelines returns with the pipelines compiled
-// (pipelines.cpp "Synchronous creation"). The internal GLES device (internalClient()) ignores it: asynchronous unless
-// VPVK_GLES_SYNC_PIPELINES=1. Decided at vkCreateDevice.
+// "Asynchronous creation"). =0 is the opt-in synchronous mode, as a real driver (VQP): vkCreate*Pipelines returns with the
+// pipelines compiled (pipelines.cpp "Synchronous creation"; VPVK_CREATE_WAIT_MS bounds the wait). The internal GLES device
+// (internalClient()) ignores it: asynchronous unless VPVK_GLES_SYNC_PIPELINES=1. Decided at vkCreateDevice.
 bool asyncPipelinesOn();
 // config.cpp: robustBufferAccess in the translated shaders (VPVK_ROBUST: unset = on, "0" = off, "app" = what the app
 // enabled at vkCreateDevice, on while there is no device). robustMode() is "default", "0" or "app" as of the last

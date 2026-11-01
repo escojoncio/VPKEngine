@@ -3549,7 +3549,7 @@ VPVK_EXPORT uint32_t vpvk_device_wait_compiles(VkDevice dv) {
   d->platform->drainCompiles();
   d->gpu->pipelines().waitIdle();
   d->platform->drainCompiles();  // libraries the last pipelines asked for
-  d->platform->flushCaches();
+  d->platform->flushCaches(true);  // the host's replay drain: nobody waits, the archive must be complete
   psoCensus(d, true);
   const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
   const vpgpu::PipelineStats t = d->gpu->pipelines().totals();

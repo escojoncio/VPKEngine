@@ -555,7 +555,9 @@ bool RecipeStore::remapLocked(PipeRec& p) const {
 
 void RecipeStore::insertPipelineLocked(PipeRec p) {
   const uint64_t key = p.state.key().value;
+  const uint64_t id = recipeId(p.state, p.inputs);
   if (!pipelines_.emplace(key, std::move(p)).second) ++deadRecords_;
+  else byId_[id] = key;
 }
 
 void RecipeStore::write(uint8_t tag, const std::vector<uint8_t>& payload, uint64_t* payloadOffset) {
@@ -706,6 +708,7 @@ void RecipeStore::addPipeline(const vpgpu::PipelineState& s, const std::array<ui
   encodePipeline(w, s, inputs);
   write(kTagPipeline, w.b);
   pipelines_[key] = PipeRec{s, inputs};
+  byId_[recipeId(s, inputs)] = key;
   ++storedThisRun_;
 }
 
@@ -815,6 +818,7 @@ RecipeStore::RefreshResult RecipeStore::refresh(unsigned threads) {
   // Pipelines follow their inputs to the new MSL ids (new keys); those that lost an input go.
   std::unordered_map<uint64_t, PipeRec> old = std::move(pipelines_);
   pipelines_.clear();
+  byId_.clear();
   for (auto& [key, p] : old) {
     if (!remapLocked(p)) {
       ++r.droppedPipelines;
@@ -983,6 +987,27 @@ std::vector<uint64_t> RecipeStore::keys() const {
   return k;
 }
 
+uint64_t RecipeStore::recipeId(const vpgpu::PipelineState& s, const std::array<uint64_t, 3>& inputs) {
+  vpgpu::PipelineState bare = s;
+  bare.vertexShader = bare.fragmentShader = bare.computeShader = 0;
+  const uint64_t parts[4] = {bare.key().value, inputs[0], inputs[1], inputs[2]};
+  return fnvBytes(reinterpret_cast<const uint8_t*>(parts), sizeof parts);
+}
+
+std::vector<uint64_t> RecipeStore::ids() const {
+  std::lock_guard lock(mutex_);
+  std::vector<uint64_t> k;
+  k.reserve(byId_.size());
+  for (const auto& [id, key] : byId_) k.push_back(id);
+  return k;
+}
+
+bool RecipeStore::resolve(uint64_t idOrKey, uint64_t& key) const {
+  std::lock_guard lock(mutex_);
+  if (auto it = byId_.find(idOrKey); it != byId_.end()) return key = it->second, true;
+  return pipelines_.count(idOrKey) != 0 && (key = idOrKey, true);
+}
+
 bool RecipeStore::stateFor(uint64_t key, vpgpu::PipelineState& out,
                            std::vector<std::pair<uint64_t, ShaderBlob>>* shaders) const {
   std::lock_guard lock(mutex_);
@@ -1131,6 +1156,12 @@ __attribute__((visibility("default"))) const char* vpvk_translator_tag() {
   return tag.c_str();
 }
 
+namespace {
+std::atomic<uint32_t> gPrewarmPhase{0};
+}
+// 0 = compiling the recipes, 1 = saving the pipeline archive (the progress callback of vpvk_prewarm counts entries archived).
+__attribute__((visibility("default"))) uint32_t vpvk_prewarm_phase(void) { return gPrewarmPhase.load(); }
+
 __attribute__((visibility("default"))) uint32_t vpvk_prewarm(vpvk_prewarm_progress progress, void* user) {
   const std::string dir = vpvk::RecipeStore::defaultDir();
   if (dir.empty()) {
@@ -1153,10 +1184,15 @@ __attribute__((visibility("default"))) uint32_t vpvk_prewarm(vpvk_prewarm_progre
       if (progress) progress(done, total, user);
     });
   }
-  // Workers are gone: the harvest (which never yields here, no frame waits for a pipeline) is flushed in full and the archive
+  // Workers are gone: the harvest (which never yields here, no frame waits for a pipeline) is flushed in full (`complete`: not
+  // the 8 s of the end of a process, ~100 entries, which left ~2400 misses to compile again at every launch) and the archive
   // written before the platform goes, so the line below shows what became of every miss.
   const auto tf = std::chrono::steady_clock::now();
-  platform->flushCaches();
+  gPrewarmPhase = 1;  // the progress callback now counts archived entries (vpvk_prewarm_phase)
+  platform->flushCaches(true, [&](uint32_t done, uint32_t total) {
+    if (progress) progress(done, total, user);
+  });
+  gPrewarmPhase = 0;
   vpvk::logf("gpu.prewarm archive_saved ms=%.0f %s",
              std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tf).count(),
              platform->archiveSummary().c_str());

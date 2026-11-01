@@ -52,4 +52,35 @@ inline bool archiveHarvestShouldYield(uint32_t waiters, uint32_t backlog, size_t
   return archiveHarvestYields(waiters + backlog, pending, oldestAge);
 }
 
+// ---- flush and serialize policy (the Metal backend's saveArchive / archiveSaveDue use these) ---------------------------------
+// A flush adds the queue step by step (each add recompiles the pipeline in Metal's compiler service, ~80 ms) and serializes as it
+// goes. At the end of the process or in the background it is bounded (the app may be killed, and what is left stays queued: the
+// recipes bring it back next run) but ~100 entries fit in that budget, so a flush that is the only thing archiving (the harvest
+// steps aside the whole session) leaves thousands of misses to compile again at every launch. The explicit "prepare the game"
+// step (vpvk_prewarm, the host's replay drain) has nobody waiting and must leave the archive complete: a generous bound.
+inline constexpr std::chrono::milliseconds kFlushBudgetExit{8000};
+inline constexpr std::chrono::milliseconds kFlushBudgetComplete{600000};
+inline constexpr std::chrono::milliseconds archiveFlushBudget(bool complete) {
+  return complete ? kFlushBudgetComplete : kFlushBudgetExit;
+}
+// Another flush step: the last one added something and the budget is not spent.
+inline bool archiveFlushContinues(size_t lastStepAdded, std::chrono::milliseconds elapsed, std::chrono::milliseconds budget) {
+  return lastStepAdded != 0 && elapsed < budget;
+}
+
+// A complete flush under memory pressure (free memory under the harvest's threshold; 0 disables) waits this long before its next
+// step instead of skipping entries or running flat out; 0 = no pause.
+inline constexpr std::chrono::milliseconds kFlushLowMemoryPause{200};
+inline constexpr std::chrono::milliseconds archiveFlushPause(bool complete, uint64_t freeMB, uint64_t minFreeMB) {
+  return complete && minFreeMB && freeMB < minFreeMB ? kFlushLowMemoryPause : std::chrono::milliseconds{0};
+}
+
+inline constexpr uint32_t kSerializeEvery = 32;                    // serialize after this many additions
+inline constexpr std::chrono::seconds kSerializeMaxAge{30};        // or when the oldest unsaved addition is this old
+// A serialize is due: entries were added since the last one and 32 of them are waiting, the session file is full
+// (archivePackCap: a sealed pack is written at once), or 30 s passed.
+inline bool archiveSerializeDue(uint32_t unsaved, size_t fileEntries, size_t packCap, std::chrono::nanoseconds sinceSave) {
+  return unsaved != 0 && (unsaved >= kSerializeEvery || fileEntries >= packCap || sinceSave >= kSerializeMaxAge);
+}
+
 }  // namespace vpgpu

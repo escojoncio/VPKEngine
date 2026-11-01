@@ -1103,7 +1103,10 @@ struct MetalBackend::Impl {
   size_t drainArchiveLocked(bool yield, size_t max, bool* yielded = nullptr);
   size_t drainStepLocked(bool yield, bool* yielded);  // drainArchiveLocked for one harvest step (fits the session file)
   bool archiveSaveDue() const;
-  bool flushArchiveLocked(std::chrono::milliseconds budget);  // final / background flush, bounded by `budget`
+  // final / background flush, bounded by `budget`. `complete`: the explicit prepare step: pauses while memory is low, reports `progress`.
+  bool flushArchiveLocked(std::chrono::milliseconds budget, bool complete = false,
+                          const std::function<void(uint32_t, uint32_t)>& progress = nullptr);
+  uint64_t availableMB() const;
   void harvestEntryLocked(ArchiveEntry& q);  // one queued entry into the archive (or counted as skipped)
   bool harvestShouldYield(std::chrono::steady_clock::time_point oldest, size_t inHand);
   id<MTLBinaryArchive> buildArchiveLocked(size_t begin, size_t end, bool dropFailures);
@@ -8536,12 +8539,18 @@ void MetalBackend::Impl::queueArchive(id desc, bool compute, const std::string& 
 // True when the harvest must step aside for a game thread that is blocked on a pipeline (vpgpu::demandWaiters). `oldest`
 // is the queue time of the entry about to be added (the queue is FIFO) and `inHand` the entries of its batch still to add.
 // Never in the background (the flush must finish) and never when the queue is starving (archiveHarvestYields).
-bool MetalBackend::Impl::harvestShouldYield(std::chrono::steady_clock::time_point oldest, size_t inHand) {
-  if (vpgpu::backgroundGate().active()) return false;
+// Free memory of the process in MB (UINT64_MAX where the OS gives no limit).
+uint64_t MetalBackend::Impl::availableMB() const {
   uint64_t freeMB = UINT64_MAX;
 #if __has_include(<os/proc.h>) && (TARGET_OS_VISION || TARGET_OS_IOS)
   if (__builtin_available(iOS 13.0, visionOS 1.0, *)) freeMB = uint64_t(os_proc_available_memory()) >> 20;
 #endif
+  return freeMB;
+}
+
+bool MetalBackend::Impl::harvestShouldYield(std::chrono::steady_clock::time_point oldest, size_t inHand) {
+  if (vpgpu::backgroundGate().active()) return false;
+  const uint64_t freeMB = availableMB();
   const uint32_t waiters = vpgpu::demandWaiters().load(std::memory_order_acquire);
   const uint32_t backlog = vpgpu::compileBacklog().load(std::memory_order_relaxed);
   size_t pending = inHand;
@@ -9040,25 +9049,34 @@ size_t MetalBackend::Impl::drainStepLocked(bool yield, bool* yielded) {
 
 // A serialize is due: 32 added since the last one, the session file full, or 30 s.
 bool MetalBackend::Impl::archiveSaveDue() const {
-  return archiveUnsaved &&
-         (archiveUnsaved >= 32 || archiveEntries.size() >= archivePackCap ||
-          std::chrono::steady_clock::now() - archiveSavedAt >= std::chrono::seconds(30));
+  return vpgpu::archiveSerializeDue(archiveUnsaved, archiveEntries.size(), archivePackCap,
+                                    std::chrono::steady_clock::now() - archiveSavedAt);
 }
 
 // Final / background flush: adds the queue and serializes as it goes (a step, then a save when due), never yielding, until it is
 // empty or `budget` is spent (what is left stays queued; the recipes bring it back next run). Everything added is serialized
 // before it returns. True when nothing failed.
-bool MetalBackend::Impl::flushArchiveLocked(std::chrono::milliseconds budget) {
+bool MetalBackend::Impl::flushArchiveLocked(std::chrono::milliseconds budget, bool complete,
+                                            const std::function<void(uint32_t, uint32_t)>& progress) {
   if (!archiveOn) return false;
   Inflight guard(this, "flush");
   const auto t0 = std::chrono::steady_clock::now();
   bool ok = true, cut = false;
+  const uint32_t total = archivePendingN.load(std::memory_order_relaxed);
+  uint32_t done = 0;
+  if (progress) progress(0, total);
   for (;;) {
+    // Low memory: wait a moment and go on (the entries stay queued, none is skipped); the serialize of every pack stays.
+    if (archivePendingN.load(std::memory_order_relaxed))
+      if (const auto pause = vpgpu::archiveFlushPause(complete, availableMB(), harvestMinFreeMB); pause.count())
+        std::this_thread::sleep_for(pause);
     const size_t n = drainStepLocked(false, nullptr);
+    done += uint32_t(n);
+    if (progress && n) progress(std::min(done, total), std::max(total, done));
     if (archiveSaveDue()) ok = saveArchiveLocked(false) && ok;
     saveDepthLocked(false);
     if (!n) break;
-    if (std::chrono::steady_clock::now() - t0 >= budget) {
+    if (!vpgpu::archiveFlushContinues(n, std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0), budget)) {
       cut = true;
       break;
     }
@@ -9171,7 +9189,7 @@ MetalBackend::MemStats MetalBackend::memStats() const {
 }
 
 // Final / background flush: adds everything still queued (never yielding to demand waits) and serializes it.
-bool MetalBackend::saveArchive() {
+bool MetalBackend::saveArchive(bool complete, const std::function<void(uint32_t, uint32_t)>& progress) {
   @autoreleasepool {
     // The harvest job lets this in: it stops between its batches while a flush waits for archiveMutex.
     impl_->archiveFlushWaiters.fetch_add(1, std::memory_order_acq_rel);
@@ -9179,8 +9197,9 @@ bool MetalBackend::saveArchive() {
     impl_->archiveFlushWaiters.fetch_sub(1, std::memory_order_acq_rel);
     const auto t0 = std::chrono::steady_clock::now();
     const uint32_t pending = impl_->archivePendingN.load(std::memory_order_relaxed);
-    // Step by step (add, serialize when due), 8 s at most: what is left stays queued and the recipes bring it back next run.
-    const bool saved = impl_->flushArchiveLocked(std::chrono::seconds(8));
+    // Step by step (add, serialize when due), vpgpu::archiveFlushBudget at most: 8 s at the end of the process / in the background
+    // (what is left stays queued and the recipes bring it back next run), 10 min for the explicit prepare step (`complete`).
+    const bool saved = impl_->flushArchiveLocked(vpgpu::archiveFlushBudget(complete), complete, progress);
     if (pending)
       impl_->info("gpu.archive.flush pending=" + std::to_string(pending) + " ms=" +
                   std::to_string(int64_t(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count())));

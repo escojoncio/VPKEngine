@@ -193,7 +193,7 @@ void retainKey(Device* dev, const PipelineObj& p, vpgpu::PipelineKey k) {
 // ---- compile policy -------------------------------------------------------------------------------
 // Two modes, chosen per device (Device::translator, asyncPipelinesOn()):
 //
-// * Asynchronous creation (default; VPVK_ASYNC_PIPELINES=0 turns it off). Games create thousands of pipelines in a burst (AC Nexus ShaderWarmup: 3313
+// * Asynchronous creation (default; VPVK_ASYNC_PIPELINES=0 turns it off; AVP / Source 2). Games create thousands of pipelines in a burst (AC Nexus ShaderWarmup: 3313
 //   stages / 4101 pipelines) and draw with them in the same breath; translating or compiling on the calling thread
 //   froze it for seconds. So:
 //   - vkCreate{Graphics,Compute}Pipelines gathers the state the create info decides, queues the rest (SPIR-V -> MSL
@@ -237,12 +237,13 @@ void retainKey(Device* dev, const PipelineObj& p, vpgpu::PipelineKey k) {
 // * Synchronous creation (opt-in: VPVK_ASYNC_PIPELINES=0, VQP's games and the CTS run): the convention of every desktop / mobile driver (Quest's compiles
 //   inside the call): vkCreate*Pipelines returns with the pipelines translated and compiled. An engine that counts a
 //   created pipeline as warm (UE4's PSO precache, >8000 of them) is told so only when it is. It waits for the whole
-//   call (every pipeline of the batch, boosted to Urgent while it waits), at most VPVK_PIPELINE_CREATE_WAIT_MS
-//   (default 60000, a safety valve; the pipelines still pending then count in vk.pso.census timed_out), and variants
+//   call (every pipeline of the batch, boosted to Urgent while it waits), at most VPVK_CREATE_WAIT_MS (older name
+//   VPVK_PIPELINE_CREATE_WAIT_MS; default 60000, a safety valve: the call still returns VK_SUCCESS, the draw gate protects the
+//   pipeline, `vk.pipeline_create_slow` is logged and the pipelines still pending count in vk.pso.census timed_out), and variants
 //   made at the first draw wait for their compile once (VPVK_PIPELINE_DRAW_WAIT_MS, default 2000; the VPKTAA UI-mask
 //   variants, built while a submission is translated under submitMutex, are collected and awaited once before the frame
 //   is sent, awaitFreshVariants). No wait while the device is lost or the app is in the background, and after a wait
-//   timed out the next ones are capped at 500 ms for 5 s (awaitPipelines). A pipeline the
+//   timed out the next draw / variant waits are capped at 500 ms for 5 s (awaitPipelines; the creates never: each waits its full budget). A pipeline the
 //   recipe store / disk cache already holds costs no wait. Game threads translate on their own and the Metal compiles run
 //   in parallel on the core's workers (PipelineCache::workerLoop compiles outside its mutex; the waiters sleep on a
 //   condition variable): no lock is held across the wait. With VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT a
@@ -252,6 +253,19 @@ uint32_t waitBudgetMs(const char* name, uint32_t fallback) {
   const char* e = std::getenv(name);
   return e && *e ? uint32_t(std::strtoul(e, nullptr, 10)) : fallback;
 }
+
+// vkCreate*Pipelines in the synchronous mode: VPVK_CREATE_WAIT_MS (older name VPVK_PIPELINE_CREATE_WAIT_MS), default 60000.
+// Read once (a create is hot: thousands of them); resetCreateWaitMs() is for tests.
+std::atomic<int64_t> gCreateWaitMs{-1};
+uint32_t createWaitMs() {
+  int64_t v = gCreateWaitMs.load(std::memory_order_relaxed);
+  if (v < 0) {
+    v = waitBudgetMs("VPVK_CREATE_WAIT_MS", waitBudgetMs("VPVK_PIPELINE_CREATE_WAIT_MS", 60000));
+    gCreateWaitMs.store(v, std::memory_order_relaxed);
+  }
+  return uint32_t(v);
+}
+void resetCreateWaitMs() { gCreateWaitMs.store(-1, std::memory_order_relaxed); }
 
 // Per-boot counters (struct in commands.h), all threads: the "vk.boot_summary" line, pipelineSummary().
 PipelineCounters& pipelineCounters() {
@@ -279,7 +293,9 @@ void noteTranslateFail(const std::string& why, uint64_t key, const std::string& 
 // Returns how many of them are still queued or compiling when it gives up (0 when all came back). Does not wait at all
 // while the device is lost or the app is in the background (nothing compiles that anyone could use, the thread would only
 // sit out the whole budget); after a wait timed out the next ones are capped at kBackoffWaitMs for kBackoffMs.
-unsigned awaitPipelines(Device* dev, const std::vector<vpgpu::PipelineKey>& keys, uint32_t budgetMs, const char* what) {
+// `backoff` false (vkCreate*Pipelines: Quest's driver waits for every create): neither capped by an earlier timeout nor starting a window.
+unsigned awaitPipelines(Device* dev, const std::vector<vpgpu::PipelineKey>& keys, uint32_t budgetMs, const char* what,
+                        bool backoff = true) {
   if (!dev || !dev->gpu || !budgetMs || dev->translator) return 0;
   if ((dev->platform && dev->platform->lost()) || vpgpu::backgroundGate().active()) return 0;
   constexpr uint32_t kBackoffWaitMs = 500;
@@ -287,7 +303,7 @@ unsigned awaitPipelines(Device* dev, const std::vector<vpgpu::PipelineKey>& keys
   auto nowNs = [] {
     return int64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
   };
-  if (nowNs() < dev->pipelineBackoffUntilNs.load(std::memory_order_relaxed)) budgetMs = std::min(budgetMs, kBackoffWaitMs);
+  if (backoff && nowNs() < dev->pipelineBackoffUntilNs.load(std::memory_order_relaxed)) budgetMs = std::min(budgetMs, kBackoffWaitMs);
   std::vector<vpgpu::PipelineKey> pending;
   for (vpgpu::PipelineKey k : keys) {
     if (!k.value) continue;
@@ -326,12 +342,28 @@ unsigned awaitPipelines(Device* dev, const std::vector<vpgpu::PipelineKey>& keys
   }
   unsigned left = 0;
   if (!complete) {
-    dev->pipelineBackoffUntilNs.store(nowNs() + kBackoffMs * 1'000'000, std::memory_order_relaxed);
+    if (backoff) dev->pipelineBackoffUntilNs.store(nowNs() + kBackoffMs * 1'000'000, std::memory_order_relaxed);
     for (vpgpu::PipelineKey k : pending) {
       const auto st = dev->gpu->pipelines().status(k);
       if (st == vpgpu::PipelineCache::Status::Queued || st == vpgpu::PipelineCache::Status::Compiling) ++left;
     }
   }
+  return left;
+}
+
+// A vkCreate*Pipelines call returned with pipelines of its batch still queued or compiling (the wait ran out, or none was made: device
+// lost, background, budget 0): it returns VK_SUCCESS anyway, the draw gate covers them. Returns how many.
+unsigned noteCreateUnready(Device* dev, const std::vector<vpgpu::PipelineKey>& keys, uint32_t budgetMs, const char* what) {
+  unsigned left = 0;
+  if (dev && dev->gpu && !dev->translator)
+    for (vpgpu::PipelineKey k : keys) {
+      const auto st = dev->gpu->pipelines().status(k);
+      left += st == vpgpu::PipelineCache::Status::Queued || st == vpgpu::PipelineCache::Status::Compiling;
+    }
+  static std::atomic<unsigned> lines{0};
+  if (left && lines.fetch_add(1) < 64)
+    logf("vk.pipeline_create_slow what=%s pending=%u of=%zu budget_ms=%u (returned unready; the draw gate covers it)", what, left,
+         keys.size(), budgetMs);
   return left;
 }
 
@@ -2057,8 +2089,9 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkCreateGraphicsPipelines(VkDevice dv
     out[i] = to<VkPipeline>(p);
     if (!d->translator && p->ok) keys.push_back(p->key);  // synchronous mode: translated already
   }
-  static const uint32_t budget = waitBudgetMs("VPVK_PIPELINE_CREATE_WAIT_MS", 60000);
-  pipelineCounters().createTimedOut += awaitPipelines(d, keys, budget, "create_graphics");  // see "compile policy"
+  const uint32_t budget = createWaitMs();
+  pipelineCounters().createTimedOut += awaitPipelines(d, keys, budget, "create_graphics", false);  // see "compile policy"
+  noteCreateUnready(d, keys, budget, "create_graphics");
   psoCensus(d, false);
   return result;
 }
@@ -2087,8 +2120,9 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkCreateComputePipelines(VkDevice dv,
     out[i] = to<VkPipeline>(p);
     if (!d->translator && p->ok) keys.push_back(p->key);
   }
-  static const uint32_t budget = waitBudgetMs("VPVK_PIPELINE_CREATE_WAIT_MS", 60000);
-  pipelineCounters().createTimedOut += awaitPipelines(d, keys, budget, "create_compute");
+  const uint32_t budget = createWaitMs();
+  pipelineCounters().createTimedOut += awaitPipelines(d, keys, budget, "create_compute", false);
+  noteCreateUnready(d, keys, budget, "create_compute");
   psoCensus(d, false);
   return result;
 }
@@ -2107,8 +2141,9 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkDestroyPipeline(VkDevice dv, VkPipeline
 
 // Pipeline caches: the core keeps its own (compiled pipelines + binary archive + recipe store).
 // The Vulkan object is a key list: vkGetPipelineCacheData returns a VkPipelineCacheHeaderVersionOne
-// header (our vendor/device/UUID) followed by "VQPC", a count and the recipe keys, so a game that
-// saves and reloads it (Unity) hands the keys back; vkCreatePipelineCache then queues those recipes.
+// header (our vendor/device/UUID) followed by "VQPC", a count and the recipe identities (RecipeStore::recipeId: not the
+// pipeline keys, which move when a translator change makes refresh() re-key the recipes), so a game that saves and
+// reloads it (Unity, Unreal) hands them back; vkCreatePipelineCache then queues those recipes.
 namespace {
 constexpr uint32_t kCacheMagic = 0x43505156;  // "VQPC"
 struct PipelineCacheObj {
@@ -2164,7 +2199,7 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkCreatePipelineCache(VkDevice dv, co
     std::memcpy(&k, b + 40 + size_t(i) * 8, 8);
     vpgpu::PipelineState s;
     if (!d->recipes) break;
-    if (!d->recipes->stateFor(k, s)) continue;
+    if (!d->recipes->resolve(k, k) || !d->recipes->stateFor(k, s)) continue;  // k: the identity, then the recipe's current key
     ++known;
     if (d->gpu->pipelines().status({k}) != vpgpu::PipelineCache::Status::Missing) continue;
     if (!d->recipes->stateFor(k, s, &shaders)) {  // the MSL only for what will be queued
@@ -2177,7 +2212,8 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkCreatePipelineCache(VkDevice dv, co
     ++queued;
   }
   if (noShader) logf("vk.pipelinecache recipes_without_shaders=%u (not queued)", noShader);
-  logf("vk.pipelinecache initial size=%zu keys=%u known=%u queued=%u", n, count, known, queued);
+  logf("vk.pipelinecache initial size=%zu keys=%u known=%u queued=%u recipes=%zu", n, count, known, queued,
+       d->recipes ? d->recipes->pipelineCount() : size_t(0));
   return VK_SUCCESS;
 }
 VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkDestroyPipelineCache(VkDevice, VkPipelineCache c, const VkAllocationCallbacks*) {
@@ -2186,7 +2222,7 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkDestroyPipelineCache(VkDevice, VkPipeli
 VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkGetPipelineCacheData(VkDevice dv, VkPipelineCache, size_t* size, void* data) {
   Device* d = from<Device>(dv);
   std::vector<uint64_t> keys;
-  if (d && d->recipes) keys = d->recipes->keys();
+  if (d && d->recipes) keys = d->recipes->ids();
   const size_t total = 40 + keys.size() * 8;
   if (!data) {
     *size = total;

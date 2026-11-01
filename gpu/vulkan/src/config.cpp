@@ -113,7 +113,7 @@ bool questIdentity() {
 }
 bool asyncPipelinesOn() {
   // Default (and =1): asynchronous creation, shared by AVP (Source 2) and VQP. VPVK_ASYNC_PIPELINES=0 is the synchronous
-  // opt-in (VQP sets it for its games, the CTS run too). vpgles has no PSO precache and its GL thread would serialize every
+  // opt-in (VQP sets it for its games: Quest-faithful create, the call returns with the pipeline compiled; the CTS run too). vpgles has no PSO precache and its GL thread would serialize every
   // compile under the device lock (draw.cpp), so its internal device ignores =0 and is synchronous only with
   // VPVK_GLES_SYNC_PIPELINES=1. Called at vkCreateDevice: internalClient() is that thread's.
   if (internalClient()) {

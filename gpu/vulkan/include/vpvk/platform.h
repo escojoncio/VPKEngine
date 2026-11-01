@@ -3,6 +3,7 @@
 #pragma once
 
 #include <array>
+#include <functional>
 #include <memory>
 #include <string>
 #include <utility>
@@ -54,8 +55,12 @@ class Platform {
   }
   // Blocks until the speculative shader-library compiles queued so far (addShader) have run.
   virtual void drainCompiles() {}
-  // Writes pending on-disk caches (pipeline binary archive).
-  virtual void flushCaches() {}
+  // Writes pending on-disk caches (pipeline binary archive). `complete`: the explicit prepare step (vpvk_prewarm, the host's
+  // replay drain), which has nobody waiting and leaves nothing queued; the default is bounded to 8 s (end of process).
+  // `progress(done, total)` (complete flushes only): entries archived so far of those queued when it started, from this thread.
+  virtual void flushCaches(bool complete = false, const std::function<void(uint32_t, uint32_t)>& progress = nullptr) {
+    (void)complete, (void)progress;
+  }
   // Texture views (VkImageView with another type, format or subresource range). Null: unsupported,
   // the image itself is bound.
   struct ViewInfo {

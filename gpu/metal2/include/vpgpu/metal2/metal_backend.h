@@ -192,7 +192,11 @@ class MetalBackend final : public Backend {
   void* nativeQueue() const;
   void* nativeTexture(TextureId);
   // Writes the pipeline binary archive under cacheRoot; false (and a gpu.err line) on failure.
-  bool saveArchive();
+  // `complete`: the explicit prepare step (nobody waits, the archive must end up complete): adds the whole queue (10 min at most)
+  // instead of the 8 s the end of the process and the background get.
+  // `progress(done, total)`: entries added of those queued at the start, after every step (calling thread); a complete flush also
+  // pauses 200 ms per step while free memory is under the harvest's threshold (it never skips entries).
+  bool saveArchive(bool complete = false, const std::function<void(uint32_t, uint32_t)>& progress = nullptr);
   // Compiles the MTLLibrary/MTLFunction of a shader already in the ShaderProvider on a background
   // queue, so pipeline creation later finds it compiled. Deduplicated by shader id (= MSL hash).
   void prewarmShader(uint64_t shaderId);

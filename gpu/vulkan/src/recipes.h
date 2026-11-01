@@ -199,6 +199,14 @@ class RecipeStore {
   };
   Snapshot snapshot() const;
   std::vector<uint64_t> keys() const;
+  // Identity of a recipe that survives a translator change. The pipeline key hashes the shader ids (MSL content hashes), so it
+  // changes whenever refresh() retranslates to other MSL; the identity hashes the pipeline state without its shader ids plus
+  // the stage inputs (SPIR-V + lowering options) the shaders come from, which no translator change moves. It is what
+  // vkGetPipelineCacheData hands the game: the blob of an earlier launch still names the recipes afterwards.
+  static uint64_t recipeId(const vpgpu::PipelineState&, const std::array<uint64_t, 3>& inputs);
+  std::vector<uint64_t> ids() const;  // recipeId of every stored recipe
+  // The pipeline key of the recipe `idOrKey` names: a recipeId, or (blobs written before the identity existed) a pipeline key.
+  bool resolve(uint64_t idOrKey, uint64_t& key) const;
   // The recipe's state. With `shaders`, also the MSL of each of its stages, and false when one of
   // them is missing (the pipeline could not be built: its shader was never registered).
   bool stateFor(uint64_t key, vpgpu::PipelineState& out,
@@ -264,6 +272,7 @@ class RecipeStore {
   std::unordered_map<uint64_t, IfaceRec> ifaces_;  // by input hash ('F' records)
   std::unordered_map<uint64_t, SpirvRec> spirv_;
   std::unordered_map<uint64_t, PipeRec> pipelines_;
+  std::unordered_map<uint64_t, uint64_t> byId_;  // recipeId -> key in pipelines_
   size_t storedThisRun_ = 0, records_ = 0, deadRecords_ = 0;
   bool drift_ = false;        // a run saw the same input give another MSL under the same version
   bool driftWritten_ = false; // drift record appended this run

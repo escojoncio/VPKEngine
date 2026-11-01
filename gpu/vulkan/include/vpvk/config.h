@@ -106,6 +106,9 @@ uint32_t vpvk_prewarm_count(void);
 // called from the calling thread. Returns the number of recipes (0 = nothing to do).
 typedef void (*vpvk_prewarm_progress)(uint32_t done, uint32_t total, void* user);
 uint32_t vpvk_prewarm(vpvk_prewarm_progress progress, void* user);
+// Phase of the running vpvk_prewarm, read from its progress callback: 0 = compiling recipes (done/total = pipelines ready),
+// 1 = saving the pipeline archive (done/total = entries archived; minutes on a first run).
+uint32_t vpvk_prewarm_phase(void);
 // Ahead-of-time build (gate: env VPVK_AOT=1, off by default; else returns 0): translates every
 // <spirv_dir>/*.spv to MSL and Metal libraries, compiles every stored recipe and every compute
 // variant, and serializes them all into the MTLBinaryArchive of VP_PIPELINE_CACHE_DIR, plus
