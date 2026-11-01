@@ -361,7 +361,7 @@ VkImageView Texture::sampledView() {
     if (aspect == (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT))
         aspect = depthStencilMode == gl::STENCIL_INDEX ? VK_IMAGE_ASPECT_STENCIL_BIT : VK_IMAGE_ASPECT_DEPTH_BIT;
     const uint32_t base0 = uint32_t(std::min<GLint>(baseLevel, GLint(image->levels) - 1));
-    const uint32_t top = uint32_t(std::min<GLint>(maxLevel, GLint(image->levels) - 1));
+    const uint32_t top = std::max(base0, uint32_t(std::min<GLint>(maxLevel, GLint(image->levels) - 1)));  // max < base: the base level alone, never an unsigned wrap
     ci.subresourceRange = {aspect, base0, std::max<uint32_t>(1, top - base0 + 1), 0, image->layers};
     VkImageView v = VK_NULL_HANDLE;
     image->dev->vk.vkCreateImageView(image->dev->device, &ci, nullptr, &v);

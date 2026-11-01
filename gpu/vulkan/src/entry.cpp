@@ -1408,6 +1408,7 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkDestroyDevice(VkDevice dv, const VkAllo
     d->uiMask.release();
     d->msaaTwins.release(d);
     if (d->zeroBuffer) d->gpu->destroy(d->zeroBuffer);
+    if (d->zeroAstcBuffer) d->gpu->destroy(d->zeroAstcBuffer);
   }
   d->translator.reset();  // after every pipeline job it could still hold ran or was dropped (jobs touch d->gpu)
   d->gpu.reset();
@@ -2975,6 +2976,24 @@ size_t zeroInitResolve(Device& d, const ZeroLog& log, vpgpu::Frame& pre) {
         if (!d.zeroBuffer) continue;
         pre.fillBuffer({d.zeroBuffer, 0, kZeroBufferBytes}, 0);  // new buffers are not guaranteed zero
       }
+      // An all-zero ASTC block has a reserved block mode: it decodes to the error colour (magenta). The void-extent block of
+      // colour (0, 0, 0, 0) is what zeroed memory should read as; ETC2 / EAC / BC blocks of zeros are valid already.
+      const bool astc = astcFormat(p.desc.format);
+      if (astc && !d.zeroAstcBuffer) {
+        vpgpu::BufferDesc bd;
+        bd.size = kZeroBufferBytes;
+        bd.label = "vk.zeros_astc";
+        d.zeroAstcBuffer = d.gpu->createBuffer(std::move(bd));
+        if (!d.zeroAstcBuffer) continue;
+        // Block: FC FD, six FF (void extent, LDR, no extent given), eight 0 (R, G, B, A = 0). Then doubled up to the whole buffer.
+        const vpgpu::BufferId z = d.zeroAstcBuffer;
+        pre.fillBuffer({z, 0, 1}, 0xFC);
+        pre.fillBuffer({z, 1, 1}, 0xFD);
+        pre.fillBuffer({z, 2, 6}, 0xFF);
+        pre.fillBuffer({z, 8, 8}, 0);
+        for (uint64_t n = 16; n < kZeroBufferBytes; n *= 2) pre.copyBuffer({z, 0, n}, {z, n, n});
+      }
+      const vpgpu::BufferId zeros = astc ? d.zeroAstcBuffer : d.zeroBuffer;
       const uint32_t bw = std::max<uint32_t>(1, fi.blockSize), bh = std::max<uint32_t>(1, fi.blockHeight);
       for (uint32_t m = 0; m < p.desc.mips; ++m) {
         const uint32_t w = std::max(1u, p.desc.width >> m), h = std::max(1u, p.desc.height >> m);
@@ -2985,7 +3004,7 @@ size_t zeroInitResolve(Device& d, const ZeroLog& log, vpgpu::Frame& pre) {
           for (uint32_t y = 0; y < h; y += bandBlocks * bh) {
             vpgpu::Copy c;
             c.kind = vpgpu::CopyKind::BufferToTexture;
-            c.srcBuffer = {d.zeroBuffer, 0, kZeroBufferBytes, uint32_t(rowBytes), 0};
+            c.srcBuffer = {zeros, 0, kZeroBufferBytes, uint32_t(rowBytes), 0};
             vpgpu::TextureSpan& t = c.dstTexture;
             t.texture = p.id, t.mip = uint16_t(m), t.layer = is3d ? 0 : uint16_t(l), t.layerCount = 1;
             t.y = y, t.z = is3d ? l : 0;

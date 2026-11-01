@@ -876,16 +876,25 @@ static void logUniformErr(const Program* p, const vpglsl::Variable* u, GLint loc
          element, element >= 0 ? int(location) - element : -1, prog);
 }
 
-// Diagnostics: a glUniform* whose base type differs from the declared one (UE4 uploads packed ints with glUniform4iv onto
-// `highp vec4 x[N]`) that lenient mode stored raw, as Adreno does. One line per (program, uniform name, called type), at most 512.
-static void logUniformLenient(const Program* p, const vpglsl::Variable& u, int comps, bool isInt, bool isUint) {
+// Diagnostics: a glUniform* the layer let through as Adreno does in lenient mode: a base type that differs from the declared one
+// (UE4 uploads packed ints with glUniform4iv onto `highp vec4 x[N]`, stored raw), a count > 1 on a non-array (`reason`: only the first
+// element is applied) or a location past the program's range (`u` null, `reason`: ignored). One line per (program, uniform name,
+// called type, reason) (per location when the uniform is unknown), at most 512.
+static void logUniformLenient(const Program* p, const vpglsl::Variable* u, int comps, bool isInt, bool isUint, const char* reason = nullptr,
+                              GLint location = -1) {
     static std::mutex mu;
     static std::set<std::string> seen;
     const std::string callType = callTypeName(comps, 0, isInt, isUint);
     const unsigned prog = p ? unsigned(p->name) : 0u;
+    const std::string name = u ? u->name : std::string("?");
     std::lock_guard<std::mutex> g(mu);
-    if (seen.size() >= 512 || !seen.insert(std::to_string(prog) + ":" + u.name + ":" + callType).second) return;
-    logf("gles.uniform_lenient prog=%u name=%s decl=%s call=%s", prog, u.name.c_str(), uniformTypeName(u.glType).c_str(), callType.c_str());
+    if (seen.size() >= 512 ||
+        !seen.insert(std::to_string(prog) + ":" + name + ":" + callType + (reason ? reason : "") + (u ? "" : std::to_string(location))).second)
+        return;
+    std::string extra = reason ? std::string(" reason=") + reason : std::string();
+    if (!u) extra += " loc=" + std::to_string(location);
+    logf("gles.uniform_lenient prog=%u name=%s decl=%s call=%s%s", prog, name.c_str(), u ? uniformTypeName(u->glType).c_str() : "?", callType.c_str(),
+         extra.c_str());
 }
 
 void Context::setUniform(GLint location, int comps, Kind kind, GLsizei count, const void* v, int cols, bool transpose,
@@ -897,6 +906,8 @@ void Context::setUniform(GLint location, int comps, Kind kind, GLsizei count, co
         return setError(gl::INVALID_OPERATION);
     }
     if (location == -1) return;
+    if (location >= 0 && size_t(location) >= p->locations.size() && !vpglsl::strictMode())
+        return logUniformLenient(p, nullptr, comps, isInt, isUint, "location_out_of_range", location);  // Adreno ignores it (UE4 sets uniforms of other permutations)
     if (location < 0 || size_t(location) >= p->locations.size()) {
         logUniformErr(p, nullptr, location, count, comps, cols, isInt, isUint, "location_out_of_range");
         return setError(gl::INVALID_OPERATION);
@@ -908,7 +919,11 @@ void Context::setUniform(GLint location, int comps, Kind kind, GLsizei count, co
     }
     const vpglsl::Variable& u = p->refl.uniforms[size_t(loc.uniform)];
     auto note = [&](const char* reason) { logUniformErr(p, &u, location, count, comps, cols, isInt, isUint, reason, loc.element); };
-    if (count > 1 && !u.isArray) return note("count_on_non_array"), setError(gl::INVALID_OPERATION);
+    if (count > 1 && !u.isArray) {
+        if (vpglsl::strictMode()) return note("count_on_non_array"), setError(gl::INVALID_OPERATION);
+        logUniformLenient(p, &u, comps, isInt, isUint, "count_on_non_array");  // Adreno applies the first element
+        count = 1;
+    }
     const int n = std::min<int>(count, u.arraySize - loc.element);
     // Samplers: glUniform1i(v) sets the texture unit.
     if (u.binding >= 0) {
@@ -956,7 +971,7 @@ void Context::setUniform(GLint location, int comps, Kind kind, GLsizei count, co
     if (ucols != cols || ucomps != comps) return note("size_mismatch"), setError(gl::INVALID_OPERATION);
     if (ukind != Kind::Bool && ukind != kind) {
         if (cols || vpglsl::strictMode()) return note("base_type_mismatch"), setError(gl::INVALID_OPERATION);
-        logUniformLenient(p, u, comps, isInt, isUint);
+        logUniformLenient(p, &u, comps, isInt, isUint);
     }
     if (ukind == Kind::Bool && cols) return note("matrix_on_bool"), setError(gl::INVALID_OPERATION);
     const uint32_t stride = u.arrayStride ? u.arrayStride : 16;
@@ -1251,10 +1266,13 @@ static GLenum samplerTarget(const vpglsl::Variable& v) {
 // Texture completeness (GLES 3.0 §8.17): an incomplete texture samples as (0, 0, 0, 1). `sp` are the sampling parameters
 // the unit really uses (a sampler object bound to the unit replaces the texture's own).
 static bool complete(const Texture& t, const SamplerParams& sp) {
-    if (!t.image || t.levels.empty() || !t.levels[0].format) return false;
+    if (!t.image || t.levels.empty()) return false;
     const bool mip = sp.minFilter != gl::NEAREST && sp.minFilter != gl::LINEAR;
-    if (t.immutable) return true;
+    if (mip && t.maxLevel < t.baseLevel) return false;  // no level in [base, max]
+    if (t.immutable) return t.levels[0].format != nullptr;
+    // The base level array must be defined (level 0 may not be: UE4 mip streaming moves GL_TEXTURE_BASE_LEVEL up).
     const uint32_t base = uint32_t(std::max(0, t.baseLevel));
+    if (base >= t.levels.size() || !t.levels[base].format) return false;
     const uint32_t last = mip ? std::min<uint32_t>(uint32_t(t.maxLevel), t.image->levels - 1) : base;
     if (t.target == gl::TEXTURE_CUBE_MAP) {
         // Every face has the same size and format at the base level, and (mipmapped) at every level up to the last.
@@ -1384,6 +1402,8 @@ bool Context::bindResources(Program& p, const StorageP& xfbScratch) {
             const Unit& un = units[size_t(unit)];
             GLuint name = unitTexture(un, u);
             Texture* t = name ? texture(name) : defaultTexture(samplerTarget(u));  // name 0: the target's default texture object
+            // Levels defined from BASE_LEVEL up without level 0 (mip streaming): the image is made from them now.
+            if (t && !t->image && !t->immutable && !t->levels.empty() && !t->levels[0].format && realizeTexture(*t)) flushPending(*t);
             VkDescriptorImageInfo ii{};
             ii.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
             SamplerParams sp;

@@ -70,26 +70,35 @@ static bool storageCapable(VkFormat f) {
 }
 
 bool Context::realizeTexture(Texture& t) {
-    if (t.levels.empty() || !t.levels[0].format) return false;
-    const Texture::Level& l0 = t.levels[0];
-    if (!l0.w || !l0.h || !l0.d) return false;  // an empty base level: no image, the texture is incomplete
+    // The image is sized from level 0. When level 0 is not defined (UE4 mip streaming: levels 3.. with GL_TEXTURE_BASE_LEVEL 3) it is
+    // sized from the lowest defined level `a`, as if level 0 were that level's size << a (exact for power-of-two chains): GL level L
+    // stays image level L, and the levels below `a` are allocated but never sampled (the base level is >= a).
+    uint32_t a = 0;
+    while (a < t.levels.size() && !(t.levels[a].format && t.levels[a].w && t.levels[a].h && t.levels[a].d)) {
+        if (a == 0 && t.levels[0].format) return false;  // an empty base level: no image, the texture is incomplete
+        ++a;
+    }
+    if (a == t.levels.size() || a > 16) return false;
+    const Texture::Level& l0 = t.levels[a];
+    const uint32_t imgW = l0.w << a, imgH = l0.h << a;
+    if (imgW > 16384 || imgH > 16384) return false;
     const bool cube = t.target == gl::TEXTURE_CUBE_MAP;
     const bool is3D = t.target == gl::TEXTURE_3D;
     const bool array = t.target == gl::TEXTURE_2D_ARRAY || t.target == gl::TEXTURE_2D_MULTISAMPLE_ARRAY;
     const uint32_t samples = (t.target == gl::TEXTURE_2D_MULTISAMPLE || t.target == gl::TEXTURE_2D_MULTISAMPLE_ARRAY) && t.samples > 1
                                  ? renderSamples(uint32_t(t.samples)) : 1;
     const uint32_t layers = cube ? 6 : array ? l0.d : 1;
-    const uint32_t depth = is3D ? l0.d : 1;
-    const uint32_t levels = t.immutable ? uint32_t(t.immutableLevels) : mipCount(l0.w, l0.h, depth);
+    const uint32_t depth = is3D ? l0.d << a : 1;
+    const uint32_t levels = t.immutable ? uint32_t(t.immutableLevels) : mipCount(imgW, imgH, depth);
     const bool storage = t.wantStorage && storageCapable(l0.format->vk);
-    if (t.image && t.image->format == l0.format && t.image->width == l0.w && t.image->height == l0.h &&
+    if (t.image && t.image->format == l0.format && t.image->width == imgW && t.image->height == imgH &&
         t.image->depth == depth && t.image->layers == layers && t.image->levels == levels && t.image->storage == storage &&
         uint32_t(t.image->samples) == samples)
         return true;
     auto img = std::make_shared<Image>();
     img->dev = dev;
     img->format = l0.format;
-    img->width = l0.w, img->height = l0.h, img->depth = depth, img->layers = layers, img->levels = levels;
+    img->width = imgW, img->height = imgH, img->depth = depth, img->layers = layers, img->levels = levels;
     img->cube = cube;
     img->storage = storage;
     img->samples = VkSampleCountFlagBits(samples);
@@ -103,7 +112,7 @@ bool Context::realizeTexture(Texture& t) {
         ci.flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;  // sRGB decode skip / sRGB writes
     ci.imageType = img->type;
     ci.format = l0.format->vk;
-    ci.extent = {l0.w, l0.h, depth};
+    ci.extent = {imgW, imgH, depth};
     ci.mipLevels = levels, ci.arrayLayers = layers, ci.samples = VkSampleCountFlagBits(samples);
     ci.tiling = VK_IMAGE_TILING_OPTIMAL;
     ci.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;

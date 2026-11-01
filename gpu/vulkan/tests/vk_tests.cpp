@@ -5906,6 +5906,168 @@ void testArchiveIndex() {
   fs::remove_all(dir);
 }
 
+// A pending image is zeroed whole (every mip and layer / 3D slice) before the first read of any one subresource, with a
+// valid "black" for every format: an all-zero ASTC block is not one (reserved block mode -> the decoder's error colour,
+// magenta), so ASTC images are cleared from a buffer of void-extent blocks (transparent black, what zeroed memory shows
+// on Android); ETC2 / EAC blocks of zeros are valid.
+void testZeroInitWhole() {
+  Ctx c;
+  Device* d = from<Device>(c.dev);
+  VkDeviceMemory m = alloc(c, 64 << 20, 1);
+  VkBuffer buf = buffer(c, 1 << 20, m, 32 << 20);
+  auto mk = [&](VkFormat f, VkImageType type, uint32_t w, uint32_t depth, uint32_t mips, uint32_t layers, VkImageUsageFlags usage) {
+    VkImageCreateInfo ii{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+    ii.imageType = type, ii.format = f, ii.extent = {w, w, depth}, ii.mipLevels = mips, ii.arrayLayers = layers;
+    ii.samples = VK_SAMPLE_COUNT_1_BIT, ii.tiling = VK_IMAGE_TILING_OPTIMAL, ii.usage = usage;
+    VkImage i = VK_NULL_HANDLE;
+    CHECK(vkCreateImage(c.dev, &ii, nullptr, &i) == VK_SUCCESS);
+    CHECK(vkBindImageMemory(c.dev, i, alloc(c, 1 << 20, 1), 0) == VK_SUCCESS);
+    return i;
+  };
+  const VkImageUsageFlags xfer = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+  const VkImageUsageFlags rt = xfer | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+  VkImage arr = mk(VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_TYPE_2D, 8, 1, 4, 20, xfer);    // 80 subresources: not trackable
+  VkImage arrRt = mk(VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_TYPE_2D, 8, 1, 4, 20, rt);    // the same, cleared by passes
+  VkImage vol = mk(VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_TYPE_3D, 8, 4, 3, 1, xfer);     // 3D: not trackable
+  VkImage few = mk(VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_TYPE_2D, 8, 1, 3, 2, xfer);     // 6 subresources: tracked
+  VkImage astc = mk(VK_FORMAT_ASTC_4x4_UNORM_BLOCK, VK_IMAGE_TYPE_2D, 16, 1, 3, 1, xfer);
+  VkImage astcS = mk(VK_FORMAT_ASTC_8x8_SRGB_BLOCK, VK_IMAGE_TYPE_2D, 16, 1, 2, 1, xfer);
+  VkImage etc = mk(VK_FORMAT_ETC2_R8G8B8A8_UNORM_BLOCK, VK_IMAGE_TYPE_2D, 16, 1, 3, 1, xfer);
+  CHECK(arr && arrRt && vol && few && astc && astcS && etc);
+  auto tex = [&](VkImage i) { return from<Image>(i)->id; };
+
+  VkCommandPoolCreateInfo pi{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+  VkCommandPool pool;
+  vkCreateCommandPool(c.dev, &pi, nullptr, &pool);
+  VkCommandBufferAllocateInfo ai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+  ai.commandPool = pool;
+  ai.commandBufferCount = 1;
+  VkCommandBuffer cb;
+  vkAllocateCommandBuffers(c.dev, &ai, &cb);
+  VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+  vkBeginCommandBuffer(cb, &bi);
+  auto readTop = [&](VkImage i, uint32_t extent, uint32_t mip = 0, uint32_t layer = 0) {  // reads ONE subresource
+    VkBufferImageCopy r{};
+    r.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, mip, layer, 1};
+    r.imageExtent = {extent, extent, 1};
+    vkCmdCopyImageToBuffer(cb, i, VK_IMAGE_LAYOUT_GENERAL, buf, 1, &r);
+  };
+  readTop(arr, 8), readTop(arrRt, 8), readTop(vol, 8), readTop(astc, 16), readTop(astcS, 16), readTop(etc, 16);
+  {  // few: both layers of mip 0 overwritten, then a never-written subresource (mip 2, layer 1) is read
+    VkBufferImageCopy w{};
+    w.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 2};
+    w.imageExtent = {8, 8, 1};
+    vkCmdCopyBufferToImage(cb, buf, few, VK_IMAGE_LAYOUT_GENERAL, 1, &w);
+    readTop(few, 2, 2, 1);
+  }
+  vkEndCommandBuffer(cb);
+
+  vpgpu::Frame frame, pre;
+  TranslateStats st;
+  ZeroLog zl;
+  zl.dev = d;
+  translate(*from<CommandBuffer>(cb)->rec, frame, st, nullptr, nullptr, &zl);
+  CHECK(zeroInitResolve(*d, zl, pre) == 7);
+
+  // What the clears write: (texture, mip, layer or 3D slice) of every pass / copy, and the bytes the copies read.
+  std::map<uint32_t, std::vector<uint8_t>> mem;  // pre's buffer contents, by buffer index (0xEE: nothing wrote it)
+  auto bytesOf = [&](vpgpu::BufferId b) -> std::vector<uint8_t>& {
+    auto& v = mem[b.index];
+    if (v.empty()) v.assign(9u << 20, 0xEE);
+    return v;
+  };
+  std::map<uint32_t, std::set<std::tuple<uint32_t, uint32_t>>> cleared;  // texture index -> (mip, layer / slice)
+  std::map<uint32_t, std::vector<uint8_t>> sourced;  // texture index -> every byte its copies read
+  for (const vpgpu::Command& cmd : pre.commands()) {
+    if (const auto* rp = std::get_if<vpgpu::RenderPass>(&cmd)) {
+      const vpgpu::Attachment& a = rp->desc.colors[0];
+      cleared[a.texture.index].insert({a.mip, a.layer});
+    } else if (const auto* cp = std::get_if<vpgpu::Copy>(&cmd)) {
+      if (cp->kind == vpgpu::CopyKind::FillBuffer) {
+        std::memset(bytesOf(cp->dstBuffer.buffer).data() + cp->dstBuffer.offset, cp->fillByte, cp->dstBuffer.size);
+      } else if (cp->kind == vpgpu::CopyKind::BufferToBuffer) {
+        CHECK(cp->srcBuffer.size == cp->dstBuffer.size);
+        std::memmove(bytesOf(cp->dstBuffer.buffer).data() + cp->dstBuffer.offset, bytesOf(cp->srcBuffer.buffer).data() + cp->srcBuffer.offset,
+                     cp->srcBuffer.size);
+      } else if (cp->kind == vpgpu::CopyKind::BufferToTexture) {
+        const vpgpu::TextureSpan& t = cp->dstTexture;
+        cleared[t.texture.index].insert({t.mip, t.z ? t.z : t.layer});
+        const uint8_t* p = bytesOf(cp->srcBuffer.buffer).data() + cp->srcBuffer.offset;
+        auto& s = sourced[t.texture.index];
+        s.insert(s.end(), p, p + size_t(cp->srcBuffer.bytesPerRow) * cp->srcBuffer.rowsPerImage);
+      }
+    }
+  }
+  CHECK(cleared[tex(arr).index].size() == 80);    // 4 mips x 20 layers, though only mip 0 / layer 0 was read
+  CHECK(cleared[tex(arrRt).index].size() == 80);
+  CHECK(cleared[tex(vol).index].size() == 7);     // 4 + 2 + 1 slices
+  CHECK(cleared[tex(few).index].size() == 6);     // 3 mips x 2 layers: the whole image, not just the subresource read
+  CHECK(cleared[tex(astc).index].size() == 3 && cleared[tex(astcS).index].size() == 2 && cleared[tex(etc).index].size() == 3);
+  // ASTC: every block read is the void-extent block of colour (0, 0, 0, 0); ETC2: zeros (valid).
+  auto allBlocks = [&](VkImage i, auto&& ok) {
+    const auto& s = sourced[tex(i).index];
+    bool good = !s.empty() && s.size() % 16 == 0;
+    for (size_t o = 0; good && o + 16 <= s.size(); o += 16) good = ok(&s[o]);
+    return good;
+  };
+  auto voidBlock = [](const uint8_t* b) {
+    if (b[0] != 0xFC || b[1] != 0xFD) return false;
+    for (int k = 2; k < 8; ++k) if (b[k] != 0xFF) return false;
+    for (int k = 8; k < 16; ++k) if (b[k] != 0) return false;
+    return true;
+  };
+  CHECK(allBlocks(astc, voidBlock) && allBlocks(astcS, voidBlock));
+  CHECK(allBlocks(etc, [](const uint8_t* b) { for (int k = 0; k < 16; ++k) if (b[k]) return false; return true; }));
+  {  // and the decoder agrees that block is a valid transparent black (not the error colour)
+    const auto& s = sourced[tex(astc).index];
+    uint8_t px[16 * 4];
+    CHECK(s.size() >= 16 && astcDecodeBlock(s.data(), 4, 4, false, px));
+    bool zero = true;
+    for (uint8_t v : px) zero = zero && v == 0;
+    CHECK(zero);
+  }
+  CHECK(d->zeroPending.empty());
+  vkDestroyCommandPool(c.dev, pool, nullptr);
+}
+
+// Host side of the zero-init (Klepton's compositor reads the eye image outside the Vulkan flow): the eye image stays pending, so
+// vpvk_image_zero_pending keeps saying 1 and the host keeps skipping it, until vpvk_image_zero_clear has really cleared it; a
+// clear that finds the submit lock taken returns -1 and leaves it pending.
+struct NativeIds final : Platform {
+  std::unique_ptr<Platform> inner;
+  vpgpu::Backend& backend() override { return inner->backend(); }
+  void* nativeTexture(vpgpu::TextureId t) override { return reinterpret_cast<void*>(uintptr_t{0x1000} + uintptr_t{t.index} * 16); }
+};
+void testZeroInitHost() {
+  Ctx c;
+  Device* d = from<Device>(c.dev);
+  auto owner = std::make_unique<NativeIds>();
+  NativeIds* plat = owner.get();
+  plat->inner = std::move(d->platform);
+  d->platform = std::move(owner);
+  const VkImageUsageFlags usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+  VkImageCreateInfo ii{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+  ii.imageType = VK_IMAGE_TYPE_2D, ii.format = VK_FORMAT_R8G8B8A8_UNORM, ii.extent = {16, 16, 1}, ii.mipLevels = 1, ii.arrayLayers = 2;
+  ii.samples = VK_SAMPLE_COUNT_1_BIT, ii.tiling = VK_IMAGE_TILING_OPTIMAL, ii.usage = usage;
+  VkImage eye = VK_NULL_HANDLE;
+  CHECK(vkCreateImage(c.dev, &ii, nullptr, &eye) == VK_SUCCESS);
+  CHECK(vkBindImageMemory(c.dev, eye, alloc(c, 1 << 20, 1), 0) == VK_SUCCESS);
+  CHECK(vpvk_mark_eye_image(eye) == 1);
+  void* mtl = from<Image>(eye)->native;
+  CHECK(mtl && vpvk_image_zero_pending(mtl) == 1);
+  {  // a submit holds the lock: the clear does not wait, and the image is still pending (the host must not present it)
+    int r = 0;
+    std::lock_guard<std::mutex> lock(d->submitMutex);
+    std::thread([&] { r = vpvk_image_zero_clear(mtl); }).join();
+    CHECK(r == -1 && vpvk_image_zero_pending(mtl) == 1);
+  }
+  const uint64_t before = d->zeroCleared;
+  CHECK(vpvk_image_zero_clear(mtl) == 1);
+  CHECK(vpvk_image_zero_pending(mtl) == 0 && d->zeroPending.empty() && d->zeroCleared == before + 1);
+  CHECK(vpvk_image_zero_clear(mtl) == 0);  // settled: nothing left to clear
+  d->platform = std::move(plat->inner);  // the stand-in goes before the device does
+}
+
 // New images read as zeros until first written (Android's zeroed memory): bind marks the texture
 // pending; the submit's frame decides which pending images need a clear pass (null backend: the
 // frame the clears go in is inspected).
@@ -5989,9 +6151,10 @@ void testZeroInit() {
       clearsP = clearsP || at.texture == from<Image>(p)->id;
     }
     else if (const auto* cp = std::get_if<vpgpu::Copy>(&cmd)) {
-      if (cp->kind == vpgpu::CopyKind::FillBuffer) fillsZeros = cp->fillByte == 0 && cp->dstBuffer.buffer == d->zeroBuffer;
+      if (cp->kind == vpgpu::CopyKind::FillBuffer) fillsZeros = fillsZeros || (cp->fillByte == 0 && cp->dstBuffer.buffer == d->zeroBuffer);
       if (cp->kind != vpgpu::CopyKind::BufferToTexture) continue;
-      CHECK(cp->srcBuffer.buffer == d->zeroBuffer && cp->dstTexture.width == 16 && cp->dstTexture.height == 16);
+      CHECK(cp->srcBuffer.buffer == (cp->dstTexture.texture == from<Image>(bc)->id ? d->zeroAstcBuffer : d->zeroBuffer) &&
+            cp->dstTexture.width == 16 && cp->dstTexture.height == 16);  // ASTC: void-extent blocks, not zeros (testZeroInitWhole)
       if (cp->dstTexture.texture == from<Image>(so)->id) {  // RGBA8: 16 texels x 4 bytes, 16 rows
         copiesSo = true;
         CHECK(cp->srcBuffer.bytesPerRow == 64 && cp->srcBuffer.rowsPerImage == 16);
@@ -6019,6 +6182,8 @@ void testZeroInit() {
   vkDestroyImage(c.dev, z, nullptr);  // destroying a pending image forgets it
   CHECK(d->zeroPending.empty());
   vkDestroyCommandPool(c.dev, pool, nullptr);
+  testZeroInitWhole();
+  testZeroInitHost();
 }
 
 // Foveado propio: matemática del perfil, interruptor, pases de ojo con mapa en el traductor, separación de la UI.

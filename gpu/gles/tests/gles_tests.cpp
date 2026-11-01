@@ -209,7 +209,9 @@ VKAPI_ATTR VkResult VKAPI_CALL myCreateImage(VkDevice d, const VkImageCreateInfo
     if (r == VK_SUCCESS) imageTypes[*out] = ci->imageType;
     return r;
 }
+VkImageSubresourceRange gLastViewRange{};  // subresource range of the last image view created
 VKAPI_ATTR VkResult VKAPI_CALL myCreateImageView(VkDevice d, const VkImageViewCreateInfo* ci, const VkAllocationCallbacks* a, VkImageView* out) {
+    gLastViewRange = ci->subresourceRange;
     counts.lastViewFormat = ci->format;
     counts.lastViewType = ci->viewType;
     auto it = imageTypes.find(ci->image);
@@ -1150,16 +1152,24 @@ void testProgram() {
         G(glUniform3fv, void (*)(GLint, GLsizei, const GLfloat*));
         glUniform3fv(li, 1, h);  // vec3 call on an ivec4: size mismatch (a base type mismatch alone is lenient, see testUniformRaw)
         CHECK(err() == gl::INVALID_OPERATION);
-        const GLuint uv[8] = {};
-        glUniform4uiv(lu, 2, uv);  // count > 1 on a non-array
-        CHECK(err() == gl::INVALID_OPERATION);
+        // Adreno leniency (default mode; the `uniform_strict` run checks the rejections): a count > 1 on a non-array applies
+        // the first element and ignores the rest, a location past the program's range is ignored; neither is a GL error.
+        const GLuint uv[8] = {11u, 12u, 13u, 14u, 21u, 22u, 23u, 24u};
+        glUniform4uiv(lu, 2, uv);
+        CHECK(err() == gl::NO_ERROR);
+        G(glGetUniformuiv, void (*)(GLuint, GLint, GLuint*));
+        GLuint ub[4] = {};
+        glGetUniformuiv(q, lu, ub);
+        CHECK(ub[0] == 11u && ub[3] == 14u);
         glUniform4fv(9999, 1, h);
+        CHECK(err() == gl::NO_ERROR);
+        glUniform4fv(-5, 1, h);  // only -1 is silently skipped by the spec: other negatives stay errors
         CHECK(err() == gl::INVALID_OPERATION);
         expectLines.push_back("gles.uniform_err name=pu_i[0] decl_type=ivec4 call_type=vec3 count=1 arraySize=2 loc=" +
                               std::to_string(li) + " reason=size_mismatch");
-        expectLines.push_back("gles.uniform_err name=pu_u decl_type=uvec4 call_type=uvec4 count=2 arraySize=1 loc=" +
-                              std::to_string(lu) + " reason=count_on_non_array");
-        expectLines.push_back("gles.uniform_err name=? decl_type=? call_type=vec4 count=1 arraySize=0 loc=9999 reason=location_out_of_range");
+        expectLines.push_back("gles.uniform_lenient prog=" + std::to_string(q) + " name=pu_u decl=uvec4 call=uvec4 reason=count_on_non_array");
+        expectLines.push_back("gles.uniform_lenient prog=" + std::to_string(q) + " name=? decl=? call=vec4 reason=location_out_of_range loc=9999");
+        expectLines.push_back("gles.uniform_err name=? decl_type=? call_type=vec4 count=1 arraySize=0 loc=-5 reason=location_out_of_range");
     }
     {
         // glGetUniform of the non-square matrices (mat4x3: 4 columns of 3).
@@ -1220,6 +1230,13 @@ void uniformRaw(bool strict) {
         float back[4] = {1.0f, 1.0f, 1.0f, 1.0f};
         glGetUniformfv(q, lh, back);
         CHECK(back[0] == 0.0f);  // dropped
+        // Strict: a count > 1 on a non-array and a location past the range are errors (lenient mode applies / ignores them).
+        glUniform4iv(li, 2, iv);
+        CHECK(err() == gl::INVALID_OPERATION);
+        glUniform4fv(9999, 1, reinterpret_cast<const float*>(iv));
+        CHECK(err() == gl::INVALID_OPERATION);
+        expectLines.push_back("reason=count_on_non_array");
+        expectLines.push_back("loc=9999 reason=location_out_of_range");
         return;
     }
     CHECK(err() == gl::NO_ERROR);
@@ -1575,6 +1592,73 @@ void testDraw() {
             glTexImage2D(gl::TEXTURE_2D, 7, gl::RGBA, 1, 1, 0, gl::RGBA, gl::UNSIGNED_BYTE, big.data());
             const VkImageView full = sampledView();
             CHECK(missing == black && full != black && err() == gl::NO_ERROR);
+        }
+        // UE4 streams mips and moves GL_TEXTURE_BASE_LEVEL / GL_TEXTURE_MAX_LEVEL on an immutable texture: each range is its own
+        // view (a view cached for the old range must not be reused), and going back to a range finds its cached view again.
+        {
+            G(glTexStorage2D, void (*)(GLenum, GLsizei, GLenum, GLsizei, GLsizei));
+            GLuint ts;
+            glGenTextures(1, &ts);
+            glBindTexture(gl::TEXTURE_2D, ts);
+            glTexStorage2D(gl::TEXTURE_2D, 4, gl::RGBA8, 16, 16);
+            glTexParameteri(gl::TEXTURE_2D, gl::TEXTURE_MIN_FILTER, gl::LINEAR_MIPMAP_LINEAR);
+            const VkImageView all = sampledView();
+            glTexParameteri(gl::TEXTURE_2D, gl::TEXTURE_BASE_LEVEL, 2);
+            const VkImageView from2 = sampledView();
+            glTexParameteri(gl::TEXTURE_2D, gl::TEXTURE_MAX_LEVEL, 2);
+            const VkImageView only2 = sampledView();
+            glTexParameteri(gl::TEXTURE_2D, gl::TEXTURE_BASE_LEVEL, 0);
+            const VkImageView to2 = sampledView();
+            glTexParameteri(gl::TEXTURE_2D, gl::TEXTURE_MAX_LEVEL, 3);  // glTexStorage clamped the default 1000 to levels - 1
+            CHECK(sampledView() == all);
+            CHECK(all && from2 && only2 && to2 && err() == gl::NO_ERROR);
+            CHECK(all != from2 && from2 != only2 && only2 != to2 && all != to2 && all != only2 && from2 != to2);
+        }
+        // Mip streaming on a mutable texture: levels 3..5 defined, level 0 never is, GL_TEXTURE_BASE_LEVEL 3 -> complete, sampled
+        // from levels 3..5 (the image is made from the lowest defined level), its data uploaded. Without the base it is incomplete.
+        {
+            GLuint tm;
+            glGenTextures(1, &tm);
+            glBindTexture(gl::TEXTURE_2D, tm);
+            glTexParameteri(gl::TEXTURE_2D, gl::TEXTURE_MIN_FILTER, gl::NEAREST_MIPMAP_NEAREST);
+            const std::vector<uint8_t> d3(8 * 8 * 4, 7), d4(4 * 4 * 4, 8), d5(2 * 2 * 4, 9);
+            counts = {};
+            glTexImage2D(gl::TEXTURE_2D, 5, gl::RGBA, 2, 2, 0, gl::RGBA, gl::UNSIGNED_BYTE, d5.data());
+            glTexImage2D(gl::TEXTURE_2D, 4, gl::RGBA, 4, 4, 0, gl::RGBA, gl::UNSIGNED_BYTE, d4.data());
+            glTexImage2D(gl::TEXTURE_2D, 3, gl::RGBA, 8, 8, 0, gl::RGBA, gl::UNSIGNED_BYTE, d3.data());
+            CHECK(err() == gl::NO_ERROR && counts.copiesToImage == 0);
+            const VkImageView incomplete = sampledView();  // BASE_LEVEL 0: level 0 is not defined
+            CHECK(incomplete == black && counts.copiesToImage == 3);  // the image exists now, with the kept levels uploaded
+            glTexParameteri(gl::TEXTURE_2D, gl::TEXTURE_BASE_LEVEL, 3);
+            glTexParameteri(gl::TEXTURE_2D, gl::TEXTURE_MAX_LEVEL, 5);
+            const VkImageView streamed = sampledView();
+            CHECK(streamed && streamed != black && gLastViewRange.baseMipLevel == 3 && gLastViewRange.levelCount == 3);
+            glTexParameteri(gl::TEXTURE_2D, gl::TEXTURE_MAX_LEVEL, 6);  // level 6 (1x1) is not defined
+            CHECK(sampledView() == black);
+            // The level that arrives later (mip 2, 16x16) fits the chain and lands in the same image.
+            const std::vector<uint8_t> d2(16 * 16 * 4, 6);
+            counts = {};
+            glTexImage2D(gl::TEXTURE_2D, 2, gl::RGBA, 16, 16, 0, gl::RGBA, gl::UNSIGNED_BYTE, d2.data());
+            CHECK(counts.copiesToImage == 1 && err() == gl::NO_ERROR);
+            glTexParameteri(gl::TEXTURE_2D, gl::TEXTURE_MAX_LEVEL, 5);
+            glTexParameteri(gl::TEXTURE_2D, gl::TEXTURE_BASE_LEVEL, 2);
+            CHECK(sampledView() != black && gLastViewRange.baseMipLevel == 2 && gLastViewRange.levelCount == 4);
+        }
+        // GL_TEXTURE_MAX_LEVEL < GL_TEXTURE_BASE_LEVEL: a mipmapped filter is incomplete (black); a non-mipmapped one still samples
+        // the base level, and the view never wraps to VK_REMAINING_MIP_LEVELS.
+        {
+            G(glTexStorage2D, void (*)(GLenum, GLsizei, GLenum, GLsizei, GLsizei));
+            GLuint tx;
+            glGenTextures(1, &tx);
+            glBindTexture(gl::TEXTURE_2D, tx);
+            glTexStorage2D(gl::TEXTURE_2D, 4, gl::RGBA8, 16, 16);
+            glTexParameteri(gl::TEXTURE_2D, gl::TEXTURE_MIN_FILTER, gl::LINEAR_MIPMAP_LINEAR);
+            glTexParameteri(gl::TEXTURE_2D, gl::TEXTURE_BASE_LEVEL, 2);
+            glTexParameteri(gl::TEXTURE_2D, gl::TEXTURE_MAX_LEVEL, 1);
+            CHECK(sampledView() == black);
+            glTexParameteri(gl::TEXTURE_2D, gl::TEXTURE_MIN_FILTER, gl::LINEAR);
+            const VkImageView v = sampledView();
+            CHECK(v && v != black && gLastViewRange.baseMipLevel == 2 && gLastViewRange.levelCount == 1 && err() == gl::NO_ERROR);
         }
     }
     // Client-side arrays + client indices, triangle fans, line loops, unsigned byte indices.
@@ -2704,10 +2788,12 @@ void testEs31() {
     glProgramUniform1i(9999, lt, 1);
     CHECK(err() == gl::INVALID_VALUE);
     glProgramUniform1i(p3, 9999, 1);
-    CHECK(err() == gl::INVALID_OPERATION);
+    CHECK(err() == gl::NO_ERROR);  // lenient (Adreno): a location past the range is ignored (strict: INVALID_OPERATION, see uniform_strict)
     const GLint two[2] = {1, 2};
     glProgramUniform1iv(p3, lt, 2, two);
-    CHECK(err() == gl::INVALID_OPERATION);  // count > array size
+    CHECK(err() == gl::NO_ERROR);  // lenient: count > array size on a non-array applies the first element only
+    glGetUniformiv(p3, lt, &iv);
+    CHECK(iv == 1);
     glProgramUniform1i(p3, -1, 3);  // location -1 is silently ignored
     CHECK(err() == gl::NO_ERROR);
     {

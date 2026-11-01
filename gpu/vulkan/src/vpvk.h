@@ -771,6 +771,7 @@ struct Device : Dispatchable {
     std::weak_ptr<int> flag;  // Image::idOwners (weak: its use_count decides who destroys the texture): nonzero while pending (record time reads it, see zeroPendingImage)
   };
   vpgpu::BufferId zeroBuffer;  // lazily created, submitMutex
+  vpgpu::BufferId zeroAstcBuffer;  // same size, filled with void-extent blocks (transparent black): an all-zero ASTC block is invalid (magenta)
   std::unordered_map<uint64_t, ZeroPending> zeroPending;
   // Host-visible view of the pending set (vpvk_image_zero_pending/_clear): MTLTexture -> zeroPending
   // key, only for textures the host asked for. Own mutex so the query never waits for a submit.
