@@ -5,32 +5,25 @@ Motor propio para Apple Vision Pro: Vulkan/SPIR-V → VPIR → MSL → Metal (`g
 Clientes: VisionQuestPro (foco), AVP, AstroVisionPro. Licencia PolyForm Noncommercial 1.0.0.
 
 ## Last done
+- 2026-11-01 `5ebfa3a`: timeline `advance` (ext.cpp:53-65) completa en orden de valor y para en la primera señal sin terminar; `waitSemaphores` elige frame acorde. drainDeferred ya era FIFO por cola. Test `timeline_order`.
+- 2026-11-01 `ce0b08b`: `eyeHardWaitMs` 0 por defecto (también vpgles). Targets no-ojo redibujados >3 ticks de ojo seguidos (por vista textura+mip+capa, tolerancia 1 tick) con primer pase Clear/DontCare → espera blanda (skip); con Load o esporádicos siguen duros (`persistWaitMs`). `Device::redrawStamps` (pipelines.cpp).
+- 2026-11-01 `303c644`: GLES renderbuffers MS memoryless: imagen 1x + gemelo TRANSIENT (`msTwin` con clave por slot, caché 32 protegiendo el pase actual), seed/resolve como EXT_msrtt; blit desde la 1x; invalidate sobre adjuntos implícitos marca drop (el backend no elimina resolves `Resolve`); CopyImageSubData con muestras distintas = INVALID_OPERATION. Test `msrbo`.
+- 2026-11-01 `057cd69`: detección de ojo sin TAA: `Device::eyeSize` (última imagen marcada con `vpvk_mark_eye_image`) como respaldo en `taaEyePass`, `eyeSizedPass`, `msaaObservePass`; multivista sin tamaño de jitter se sigue aceptando. Test `msaa_force_marked`.
 - 2026-11-01 `122fdb3`: harvest de MTLBinaryArchive cede con backlog de compilación (`compileBacklog()`, pipeline_cache.cpp) o memoria libre < `VPVK_HARVEST_MIN_FREE_MB` (512); válvula 512 entradas/20 s solo anula el backlog. `trimMemory(>=2)` vacía `archiveQueue` (`archive_trim_dropped` en `vk.pso.census`). Función pura `archiveHarvestShouldYield` (archive_harvest.h) con tests. metal_backend.mm sin compilar en Linux (unverified hasta CI).
 - 2026-11-01 `4b44477`: GLES `setUniform` (draw.cpp ~952): tipo base distinto (float/int/uint, mismo nº de componentes, no matriz) copia bits crudos fuera de modo estricto (`gles.uniform_lenient`); `VPGLES_STRICT_GLSL=1` mantiene INVALID_OPERATION. Causa: UE4 sube `glUniform4iv` sobre `vec4 vc0_h[]` (Maestro morado; unverified en visor). Tests `uniform_raw`, `uniform_strict`.
 - 2026-10-28 `gpu/vulkan/src/commands.cpp`+`vpvk.h`: forceMsaa cuenta las salidas silenciosas (`vk.msaa force=... rej{n,eye,cd,smp,res,desc}`) y `vk.msaa rej <motivo> WxHxL color= depth=` (12+12 combinaciones). No cambia qué pasadas se convierten. AoT: 6 twins s4 de 1116x1129; la pasada al ojo 3552x2258 s1 no aparece como twin ni rechazo (unverified por qué).
-- 2026-10-28 Logging permanente GLES: `gles.uloc` tope 1024 y `gles.uniform_err` dedupe por (prog,nombre,tipo) con `prog=` (`gpu/gles/src/{gl_api,draw}.cpp`). Solo logging. Sin probar en visor.
 - 2026-10-28 `frame_compiler.cpp` (~1054-1059): Load sobre TRANSIENT con memoria indefinida (`!memValid`) en su primer attach ya no marca `transient_violation` (queda tile-local con DontCare) → MSAA de ITR2 sigue memoryless (antes 49 materializados, 1249M). Tests `rtmemory` reescritos. Riesgo conocido: un guest que use un transient como acumulador entre frames pierde contenido (igual que en Quest). Sin probar en visor.
-- 2026-10-28 `6f03495`: CTS rápida Vulkan 26 Fail / 0 crash (24 + 2 intermitentes), GLES 64 Fail / 0 crash. Detalle y aparcados: `notas/cts.md`.
-- 2026-10-28 `69d1a00`+`f7d050f`: depth/stencil MS del framebuffer por defecto EGL memoryless (1x compañero + seed);
-  regla `gameAuto` "Load de MS transient = autoMsaa" solo con `dev->internalClient` (vpgles) en `vulkan/commands.cpp`.
-- 2026-10-28 `e4a81b7` (revisión adversarial): `splitHeavyAuto` parte también con stencil y depth sin resolve
-  (`frame_compiler.cpp`, `kMaxTileChunks`=1024, chunks no finales resuelven D/S con Sample0); seed restaura stencil
-  (8 planos de bits) y `gameAuto` mira todos los pases; seed PSO async (primer frame de firma nueva sin seed);
-  `sourceView` comprueba `PixelFormatView`; TF de GLES por copia GPU sin espera si el orden coincide;
-  color MS de EGL y `msTwin` transient; `floatToInt` barato con rango acotado (`kLowerVersion` 12); index_u8 cacheado,
-  sin insert O(n) ni esperas de 2 s en ruta caliente.
 
 ## Current state
-- Verde: ctest 320/320 (Linux, backend nulo); CTS rápida según arriba. Todo lo de 2026-10-27/28 sin probar en visor.
+- Verde: ctest 323/323 (Linux, backend nulo); CTS rápida según arriba. Todo lo de 2026-10-27/28 sin probar en visor.
 - Pendiente:
   1. Probar en visor (VQP): MSAA memoryless sin `memorylessFailure`/`msaa_materialized`, stencil tras seed, tirones por seed PSO.
-  2. Renderbuffers MS de juego en GLES (`gl_api.cpp RenderbufferStorageMultisample`) siguen siendo imágenes MS almacenadas.
   3. `bias(vp_args.sbN)` en todo muestreo implícito aunque bias = 0 (falta especialización por estado de sampler).
   4. Harvest continuo casi nunca cede con pipelines async (espera ~3 ms); vigilar `draws_skipped` y tirones.
-  5. `eyeHardWaitMs` de vpgles hasta 1500 ms por pipeline nuevo: puede bloquear el hilo de render al estrenar efectos.
-  6. Intermitentes de Vulkan (`notas/cts.md`): el de sync2 puede ser carrera real.
-  7. Sin int64 en VPIR (atómicos 64, `shaderInt64`, f64).
-  8. MSAA forzado: el pase de ojo solo se detecta por `taaEyePass` (tamaño de `gTaa`, que Klepton sigue enviando vía `vpvk_taa_set_jitter` con `klvk_eye_wh()`); si eye_wh=0 solo cuentan pases multivista. Mirar `rej{eye=}` y `vk.taa set` en el próximo log. Pases ya multisample no se cuentan.
+  5. Intermitente CTS `multisample.misc.clear_attachments...ds_resolve_sample_zero.sub_framebuffer` sin causa (sync2: corregido `advance`, unverified sin CTS).
+  6. Sin int64 en VPIR; `shaderInt64=0` anunciado. Quest 3 real: unverified (perfil marca "1?"); aparcado hasta confirmar.
+  7. `textureCompressionBC` con identidad Quest = `platformSupportsBC()` (código/tests) vs `perfil-adreno740.md:59` = 0: discrepancia unverified (no hay vulkaninfo real de Quest 3).
+  8. El backend no elimina el resolve de adjuntos `Resolve` al invalidar (solo `Store`).
 - Riesgos: seed restaura depth de la muestra 0 en todas las muestras (halos en siluetas); un draw que supere solo los límites de tile no se puede partir.
 
 ## Decisions
