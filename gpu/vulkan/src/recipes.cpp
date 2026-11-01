@@ -9,6 +9,7 @@
 #include <memory>
 #include <thread>
 
+#include "taa_native.h"
 #include "vpvk.h"
 #include "vpmsl/msl.h"
 #include "vpvk/config.h"
@@ -528,6 +529,53 @@ void degradeSrc1Blend(vpgpu::PipelineState& st, bool dualSource) {
     };
     vpgpu::BlendState& b = st.blend[c];
     fix(b.srcColor), fix(b.dstColor), fix(b.srcAlpha), fix(b.dstAlpha);
+  }
+}
+
+vpgpu::PipelineState msaaVariantState(const vpgpu::PipelineState& base, uint8_t samples) {
+  vpgpu::PipelineState st = base;
+  st.samples = samples;
+  st.label += ".ms" + std::to_string(samples);
+  return st;
+}
+
+void applyUiMaskTarget(vpgpu::PipelineState& st, bool writes) {
+  constexpr int slot = taa::kUiMaskSlot;
+  st.colorFormats[slot] = vpgpu::Format::R8Unorm;
+  vpgpu::BlendState& b = st.blend[slot];
+  b = vpgpu::BlendState{};
+  if (writes) {  // coverage accumulates: the largest value over the draws that touch the pixel
+    b.enabled = true;
+    b.colorOp = b.alphaOp = vpgpu::BlendOp::Max;
+    b.srcColor = b.srcAlpha = b.dstColor = b.dstAlpha = vpgpu::BlendFactor::One;
+    b.writeMask = 1;
+  } else {
+    b.writeMask = 0;
+  }
+  st.label += writes ? ".umu" : ".ums";
+}
+
+void forcedMsaaVariants(const vpgpu::PipelineState& s, int n, bool masks, std::vector<vpgpu::PipelineState>& out) {
+  constexpr int slot = taa::kUiMaskSlot;
+  if (n < 2 || s.computeShader || s.samples >= n) return;
+  if (s.colorFormats[slot] != vpgpu::Format::Undefined) {  // a mask variant of a recorded run: the runtime wants it at n samples
+    if (!masks) return;
+    out.push_back(s);
+    out.back().samples = uint8_t(n);
+    return;
+  }
+  // forceMsaa serves colour 0 + depth passes only (no other colour attachment, no integer / depth colour 0).
+  if (s.colorFormats[0] == vpgpu::Format::Undefined || s.depthFormat == vpgpu::Format::Undefined) return;
+  for (int i = 1; i < vpgpu::kMaxColorAttachments; ++i)
+    if (s.colorFormats[i] != vpgpu::Format::Undefined) return;
+  const vpgpu::FormatInfo& fc = vpgpu::formatInfo(s.colorFormats[0]);
+  if (fc.integer() || fc.depth()) return;
+  out.push_back(msaaVariantState(s, uint8_t(n)));
+  if (masks) {
+    vpgpu::PipelineState m = s;
+    m.samples = uint8_t(n);
+    applyUiMaskTarget(m, false);
+    out.push_back(std::move(m));
   }
 }
 
@@ -1100,17 +1148,43 @@ PrewarmResult prewarm(Platform& platform, vpgpu::PipelineCache& cache, RecipeSto
     keys.push_back(k.value);
     if (cache.request(s, k, vpgpu::Priority::Prefetch) == vpgpu::PipelineCache::Status::Ready) ++r.hits;
   }
+  // Forced MSAA: the variants the runtime will ask for on top of the recipes (pipelines.cpp pipelineFor / maskPipelineKey build
+  // the same states through msaaVariantState / applyUiMaskTarget, so the keys agree). Without forcing nothing is added.
+  uint32_t variantHits = 0;
+  if (const int force = msaaForce(); force >= 2) {
+    const bool masks = taaUiMaskOn();
+    std::unordered_set<uint64_t> seen(keys.begin(), keys.end());
+    std::vector<vpgpu::PipelineState> extra;
+    for (const auto& s : snap.pipelines) forcedMsaaVariants(s, force, masks, extra);
+    // Every variant stays resident with no owner: at most `cap`, in recipe order (the rest is only counted).
+    const size_t cap = hooks.maxVariants ? hooks.maxVariants : kPrewarmMaxVariants;
+    size_t total = 0;
+    for (const auto& v : extra) {
+      const vpgpu::PipelineKey k = v.key();
+      if (!seen.insert(k.value).second) continue;
+      if (++total > cap) continue;
+      keys.push_back(k.value);
+      if (cache.request(v, k, vpgpu::Priority::Prefetch) == vpgpu::PipelineCache::Status::Ready) ++variantHits;
+    }
+    r.variants = uint32_t(keys.size() - snap.pipelines.size());
+    if (total > cap) logf("gpu.prewarm variants_capped=%u of %zu", r.variants, total);
+    logf("gpu.prewarm variants=%u msaa=%d masks=%d hits=%u", r.variants, force, masks ? 1 : 0, variantHits);
+  }
   for (;;) {
-    uint32_t done = 0, failed = 0;
-    for (uint64_t k : keys) {
-      const auto st = cache.status({k});
-      if (st == vpgpu::PipelineCache::Status::Ready) ++done;
-      else if (st == vpgpu::PipelineCache::Status::Failed) ++done, ++failed;
-      else if (st == vpgpu::PipelineCache::Status::Missing) ++done;  // compiled, then released by the game: no longer ours to wait for
+    uint32_t done = 0, failed = 0, doneV = 0, failedV = 0;
+    for (size_t i = 0; i < keys.size(); ++i) {
+      const bool variant = i >= r.recipes;
+      uint32_t& d = variant ? doneV : done;
+      uint32_t& f = variant ? failedV : failed;
+      const auto st = cache.status({keys[i]});
+      if (st == vpgpu::PipelineCache::Status::Ready) ++d;
+      else if (st == vpgpu::PipelineCache::Status::Failed) ++d, ++f;
+      else if (st == vpgpu::PipelineCache::Status::Missing) ++d;  // compiled, then released by the game: no longer ours to wait for
     }
     if (progress) progress(done, r.recipes);
     r.ready = done - failed;
-    if (done == r.recipes) {
+    r.variantsFailed = failedV;
+    if (done == r.recipes && doneV == r.variants) {
       r.failed = failed;
       break;
     }
@@ -1120,7 +1194,8 @@ PrewarmResult prewarm(Platform& platform, vpgpu::PipelineCache& cache, RecipeSto
     }
     // Bounded wait (game boot / watchdog): the rest keeps compiling on the workers.
     if (maxSeconds > 0 && std::chrono::duration<double>(Clock::now() - start).count() > maxSeconds) {
-      logf("gpu.prewarm timeout done=%u of %u after %.0f s (rest continues in background)", done, r.recipes, maxSeconds);
+      logf("gpu.prewarm timeout done=%u of %u after %.0f s (rest continues in background)", done + doneV, r.recipes + r.variants,
+           maxSeconds);
       r.failed = failed;
       break;
     }
@@ -1131,6 +1206,7 @@ PrewarmResult prewarm(Platform& platform, vpgpu::PipelineCache& cache, RecipeSto
   // hits = already compiled in memory; ar_* = the Metal binary archive (hits there skip the compile).
   logf("gpu.prewarm recipes=%u compiled=%u hits=%u failed=%u retranslated=%u ms=%.0f %s", r.recipes, r.compiled, r.hits,
        r.failed, r.retranslated, r.ms, platform.archiveSummary().c_str());
+  if (r.variants) logf("gpu.prewarm variants_failed=%u of %u", r.variantsFailed, r.variants);
   return r;
 }
 

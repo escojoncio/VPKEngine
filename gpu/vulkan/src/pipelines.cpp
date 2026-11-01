@@ -771,9 +771,7 @@ vpgpu::PipelineKey pipelineFor(Device* dev, const PipelineObj& p, uint8_t passSa
     for (const auto& [n, k] : list)
       if (n == passSamples) baseKey = k, found = true;
     if (!found) {
-      vpgpu::PipelineState st = base;
-      st.samples = passSamples;
-      st.label += ".ms" + std::to_string(passSamples);
+      const vpgpu::PipelineState st = msaaVariantState(base, passSamples);  // (the prewarm builds it the same way)
       const vpgpu::PipelineKey k = st.key();
       list.push_back({passSamples, k});
       static std::atomic<unsigned> n{0};
@@ -2744,18 +2742,7 @@ bool maskPipelineKey(Device* dev, const PipelineObj& p, PipelineObj::TexelVarian
     }
   }
   const bool writes = ui && translated;
-  st.colorFormats[slot] = vpgpu::Format::R8Unorm;
-  vpgpu::BlendState& b = st.blend[slot];
-  b = vpgpu::BlendState{};
-  if (writes) {  // coverage accumulates: the largest value over the draws that touch the pixel
-    b.enabled = true;
-    b.colorOp = b.alphaOp = vpgpu::BlendOp::Max;
-    b.srcColor = b.srcAlpha = b.dstColor = b.dstAlpha = vpgpu::BlendFactor::One;
-    b.writeMask = 1;
-  } else {
-    b.writeMask = 0;
-  }
-  st.label += writes ? ".umu" : ".ums";
+  applyUiMaskTarget(st, writes);  // (the prewarm builds the '.ums' variant the same way)
   mv.key = st.key();
   mv.ok = true;
   mv.fragment = st.fragmentShader;

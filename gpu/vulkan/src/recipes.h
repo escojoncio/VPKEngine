@@ -139,6 +139,17 @@ struct StageIface {
 // createGraphics and by the recipe store, so a prewarmed pipeline has the key the runtime computes.
 void degradeSrc1Blend(vpgpu::PipelineState& st, bool dualSource);
 
+// The variants of a pipeline the runtime asks for under forced MSAA, derived in one place so the prewarm and the runtime
+// (pipelines.cpp pipelineFor / maskPipelineKey) get the same state and therefore the same key. msaaVariantState: the
+// pipeline with the pass's sample count ('.msN'). applyUiMaskTarget: the R8 mask target at taa::kUiMaskSlot on a mask
+// variant ('.ums': the draw leaves it untouched; writes: '.umu', the fragment shader also writes it).
+vpgpu::PipelineState msaaVariantState(const vpgpu::PipelineState& base, uint8_t samples);
+void applyUiMaskTarget(vpgpu::PipelineState& st, bool writes);
+// What the runtime would add to `s` (a recipe) with forced MSAA of `n` (>= 2) samples, appended to `out`: its '.msN' variant,
+// and with `masks` (VPKTAA UI mask on) its '.ums' variant; a recipe that already is a mask variant ('.ums' / '.umu') comes
+// again with n samples. Only pipelines of a pass forceMsaa can serve (colour 0 + depth, nothing else) and below n samples.
+void forcedMsaaVariants(const vpgpu::PipelineState& s, int n, bool masks, std::vector<vpgpu::PipelineState>& out);
+
 // Translation used by refresh() (pipelines.cpp: same code path as vkCreate*Pipelines, quiet).
 bool translateRecipeStage(const spirv::SpirvModule&, const spirv::SpirvLowerOptions&, uint64_t& mslId, ShaderBlob& blob,
                           std::string& error, StageIface* iface = nullptr);
@@ -284,6 +295,7 @@ class RecipeStore {
 struct PrewarmResult {
   uint32_t recipes = 0, compiled = 0, hits = 0, failed = 0, retranslated = 0;
   uint32_t ready = 0;  // recipes whose pipeline was ready (or already released by the game) when the prewarm ended
+  uint32_t variants = 0, variantsFailed = 0;  // forced MSAA: variants added to the recipes (forcedMsaaVariants), and those that failed
   double ms = 0;
 };
 // precompile.cpp: ahead-of-time build into the Metal binary archive (VPVK_AOT=1, see aotBuild).
@@ -301,11 +313,13 @@ void addShaderLibRecipes(const std::vector<uint64_t>& sourceHashes);
 // Platform::addShader (the device registers every shader once, under its shader mutex, shared with the translate
 // jobs), `refreshThreads` bounds the retranslation of stale recipes (0 = every core), `pollMs` is how often it looks
 // at the compiles. The pipelines are requested at Prefetch priority: whatever the game asks for goes first.
+constexpr uint32_t kPrewarmMaxVariants = 3072;  // forced-MSAA variants a prewarm compiles at most (they stay resident, ownerless)
 struct PrewarmHooks {
   const std::atomic<bool>* cancel = nullptr;
   std::function<void(uint64_t, ShaderBlob)> addShader;
   unsigned refreshThreads = 0;
   uint32_t pollMs = 15;
+  uint32_t maxVariants = 0;  // cap of forced-MSAA variants (0 = kPrewarmMaxVariants)
 };
 PrewarmResult prewarm(Platform&, vpgpu::PipelineCache&, RecipeStore&,
                       const std::function<void(uint32_t, uint32_t)>& progress, double maxSeconds = 0,

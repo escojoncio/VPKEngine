@@ -704,6 +704,9 @@ struct MsaaTwins {
   // / depth, rejSmp the game's own samples, rejStore a game MSAA pass that keeps / loads its samples (not upgradable), rejSmask a pipeline of the pass with a partial sample mask / SampleId / SampleMask (not upgraded), rejRes the
   // game's own resolve, rejDesc a texture description unavailable.
   uint32_t rejN = 0, rejEye = 0, rejCd = 0, rejSmp = 0, rejStore = 0, rejSmask = 0, rejRes = 0, rejDesc = 0;
+  // ... rejEye by why taaEyePass said no: no depth attachment, no eye size known (and not multiview), size differs from the
+  // eye's, other (no jitter snapshot / subpass out of range).
+  uint32_t rejEyeBy[4] = {0, 0, 0, 0};
   // Rejected passes logged ("vk.msaa rej"): up to 12 distinct (size, layers, reason) under 1 Mpx, and 12 at or above it.
   struct RejSeen { uint32_t w = 0, h = 0; uint16_t layers = 0; const char* why = nullptr; };
   RejSeen rejSeen[2][12];

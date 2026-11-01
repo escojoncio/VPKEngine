@@ -145,11 +145,32 @@ void* findNextOut(void* chain, VkStructureType t) {
   return nullptr;
 }
 
+// "vk.imgzero fmt=<core format> vkfmt=<n> w= h= mips= layers= usage=0x.. why=..": an image that ends with zeroed contents
+// (zeroInitResolve) or whose format was converted / has no core format (imageDesc). Once per (why, format), 16 lines at most.
+// vkfmt is -1 where the Vulkan format is not at hand; usage is the Vulkan flags (imageDesc) or the core ones (zeroInitResolve).
+void noteImgZero(const char* why, int vkFmt, vpgpu::Format fmt, uint32_t w, uint32_t h, uint32_t mips, uint32_t layers, uint32_t usage) {
+  static std::atomic<size_t> count{0};
+  if (count.load(std::memory_order_relaxed) >= 16) return;  // the limit is reached: no string, no mutex
+  static std::mutex m;
+  static std::set<std::string> seen;
+  const std::string key = std::string(why) + "/" + std::to_string(vkFmt >= 0 ? vkFmt : -1 - int(fmt));
+  std::lock_guard<std::mutex> lock(m);
+  if (seen.size() >= 16 || !seen.insert(key).second) return;
+  count.store(seen.size(), std::memory_order_relaxed);
+  logf("vk.imgzero fmt=%s vkfmt=%d w=%u h=%u mips=%u layers=%u usage=0x%x why=%s", vpgpu::formatInfo(fmt).name, vkFmt, w, h, mips,
+       layers, usage, why);
+}
+
 vpgpu::TextureDesc imageDesc(const VkImageCreateInfo& ci) {
   vpgpu::TextureDesc d;
   d.format = toCoreFormat(ci.format);
+  if (d.format == vpgpu::Format::Undefined && ci.format != VK_FORMAT_UNDEFINED)
+    noteImgZero("unsupported", int(ci.format), d.format, ci.extent.width, ci.extent.height, ci.mipLevels, ci.arrayLayers, ci.usage);
   // Metal has no 3D ASTC: the volume is RGBA8 and its uploads are decoded on the CPU (texdecode.h, commands.cpp).
-  if (ci.imageType == VK_IMAGE_TYPE_3D && astcFormat(d.format)) d.format = astcDecodedFormat(d.format);
+  if (ci.imageType == VK_IMAGE_TYPE_3D && astcFormat(d.format)) {
+    d.format = astcDecodedFormat(d.format);
+    noteImgZero("astc3d_decoded", int(ci.format), d.format, ci.extent.width, ci.extent.height, ci.mipLevels, ci.arrayLayers, ci.usage);
+  }
   d.width = ci.extent.width;
   d.height = ci.extent.height;
   d.depth = ci.extent.depth;
@@ -1371,7 +1392,8 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkCreateDevice(VkPhysicalDevice pd,
       });
     }
   } else if (doPrewarm) {
-    // Bounded (8 s): vkCreateDevice must not sit through a whole cold prewarm; what is left keeps compiling on the workers.
+    // Bounded (8 s from the prewarm's start, recipes and forced-MSAA variants alike): vkCreateDevice must not sit through a whole
+    // cold prewarm; what is left (variants included) keeps compiling on the workers.
     d->recipesPrewarmed = prewarm(*d->platform, d->gpu->pipelines(), *d->recipes, nullptr, 8.0).ready;
   }
   logf("vk.device exts=%u multiview=%d fdm=%d metal_objects=%d", ci->enabledExtensionCount,
@@ -2965,6 +2987,8 @@ size_t zeroInitResolve(Device& d, const ZeroLog& log, vpgpu::Frame& pre) {
     const vpgpu::FormatInfo& fi = vpgpu::formatInfo(p.desc.format);
     const bool depth = fi.depth() || fi.stencil();
     const bool is3d = p.desc.type == vpgpu::TextureType::Tex3D;
+    noteImgZero(!p.viaCopy ? "zero_clear" : astcFormat(p.desc.format) ? "zero_astc_void" : "zero_copy", -1, p.desc.format,
+                p.desc.width, p.desc.height, p.desc.mips, p.desc.layers, p.desc.usage);
     if (p.viaCopy) {
       // Row bands of at most kZeroBufferBytes per copy, one layer (3D: one slice) at a time.
       constexpr uint64_t kZeroBufferBytes = 8u << 20;

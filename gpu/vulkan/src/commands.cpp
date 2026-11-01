@@ -499,23 +499,38 @@ uint32_t layersOf(const Image* im, const VkImageSubresourceRange& r) {
 // area or by its attachments. Shadow maps, UI layers and post-process targets of other sizes fail.
 // Returns the size of the target (texels) through w/h when it qualifies. The eye size is the jitter's; when that is 0 it is
 // the size of the eye image the host marked (markedEye, packEyeSize), so eye detection does not depend on VPKTAA.
+// `ew` (diagnostics, forced MSAA rejection "eye"): when the answer is no, why, with what the pass was judged by.
+struct EyeWhy {
+  enum Why : uint8_t { NoDepth, NoSize, Size, Other } why = Other;  // Other: set by the caller (no jitter snapshot, subpass out of range)
+  uint32_t w = 0, h = 0, fbW = 0, fbH = 0, depthW = 0, depthH = 0, viewMask = 0, eyeW = 0, eyeH = 0;
+  bool jit = false;  // eyeW x eyeH is the jitter's size (else the host-marked eye image's)
+};
 bool taaEyePass(const TaaJitter& jit, bool hasDepth, uint32_t viewMask, const VkRect2D& area, uint32_t fbW, uint32_t fbH,
-                uint32_t depthW, uint32_t depthH, uint32_t& w, uint32_t& h, uint64_t markedEye = 0) {
+                uint32_t depthW, uint32_t depthH, uint32_t& w, uint32_t& h, uint64_t markedEye = 0, EyeWhy* ew = nullptr) {
   struct { uint32_t width, height; } j{jit.width, jit.height};
   const bool jitterSize = j.width && j.height;
   if (!jitterSize) j = {eyeSizeW(markedEye), eyeSizeH(markedEye)};
-  if (!hasDepth) return false;
+  if (ew) {
+    ew->w = depthW ? depthW : fbW ? fbW : area.extent.width, ew->h = depthW ? depthH : fbW ? fbH : area.extent.height;
+    ew->fbW = fbW, ew->fbH = fbH, ew->depthW = depthW, ew->depthH = depthH, ew->viewMask = viewMask;
+    ew->eyeW = j.width, ew->eyeH = j.height, ew->jit = jitterSize;
+  }
+  auto no = [&](EyeWhy::Why why) {
+    if (ew) ew->why = why;
+    return false;
+  };
+  if (!hasDepth) return no(EyeWhy::NoDepth);
   w = depthW ? depthW : fbW ? fbW : area.extent.width;
   h = depthW ? depthH : fbW ? fbH : area.extent.height;
   const bool multiview = std::popcount(viewMask) >= 2;
-  if (!j.width || !j.height) return multiview;
+  if (!j.width || !j.height) return multiview || no(EyeWhy::NoSize);
   auto is = [&](uint32_t x, uint32_t y) { return x == j.width && y == j.height; };
   if (is(area.extent.width, area.extent.height) || is(fbW, fbH) || is(depthW, depthH)) return true;
   // A multiview pass of another size is still the eye's scene when it is a render-scaled copy of
   // it (50-100 % per axis); multiview shadow/probe passes of other sizes are not, and would also
   // misreport the target size the resolve scales the jitter by.
   // (The marked size only adds detections: without a jitter size a multiview pass is an eye pass at any size, as before.)
-  return multiview && (!jitterSize || (w * 2 >= j.width && w <= j.width && h * 2 >= j.height && h <= j.height));
+  return (multiview && (!jitterSize || (w * 2 >= j.width && w <= j.width && h * 2 >= j.height && h <= j.height))) || no(EyeWhy::Size);
 }
 
 // Indirect arguments past these are not a real draw but garbage (an uninitialised or stale buffer): it would run for seconds
@@ -538,6 +553,7 @@ struct Translator {
   const TaaJitter* eye = nullptr;
   uint64_t markedEye = 0;  // packEyeSize of the host-marked eye image (Device::eyeSize), read once per translate
   bool eyeScene = false;
+  EyeWhy eyeWhy;  // why eyeScene is false (forceMsaa's "eye" rejection diagnostics)
   uint8_t forceN = 0;
   // VPKTAA UI mask. uiOn: classify the draws of eye passes (taa::DrawClassifier) and leave the UI
   // unjittered; `um` also lets the pass carry the R8 mask (maskPass) the UI draws mark.
@@ -775,8 +791,9 @@ struct Translator {
         fovSuppressed = false;
         fovArea = br->areaClear && !br->areaClear->rects.empty();
         pendingResolves = br->resolveCopies;
+        eyeWhy = EyeWhy{};
         eyeScene = eye && taaEyePass(*eye, br->depthWidth != 0, br->viewMask, br->area, 0, 0, br->depthWidth, br->depthHeight,
-                                     taaW, taaH, markedEye);
+                                     taaW, taaH, markedEye, &eyeWhy);
         taaPass = taa && eyeScene;
         vpgpu::RenderPassDesc bd = br->desc;
         localCopies.clear();
@@ -1073,6 +1090,7 @@ struct Translator {
   void taaSubpass(const OpBeginPass& b, uint32_t sub) {
     taaPass = false;
     eyeScene = false;
+    eyeWhy = EyeWhy{};
     if (!eye || !b.pass || !b.framebuffer || sub >= b.pass->subpasses.size()) return;
     const RenderPassObj::Subpass& sp = b.pass->subpasses[sub];
     uint32_t dw = 0, dh = 0;
@@ -1085,11 +1103,31 @@ struct Translator {
         dh = std::max(1u, v->image->desc.height >> v->range.baseMipLevel);
       }
     }
-    eyeScene = taaEyePass(*eye, depth, sp.viewMask, b.area, b.framebuffer->width, b.framebuffer->height, dw, dh, taaW, taaH, markedEye);
+    eyeScene = taaEyePass(*eye, depth, sp.viewMask, b.area, b.framebuffer->width, b.framebuffer->height, dw, dh, taaW, taaH, markedEye,
+                          &eyeWhy);
     taaPass = taa && eyeScene;
   }
 
   Device* devForce() const { return const_cast<Device*>(anyDevice()); }  // (the device is not const: ZeroLog only promises not to change it)
+
+  // "vk.msaa rej_detail reason=.. w= h= ...": the 'eye' rejection with what taaEyePass judged the pass by (eyeWhy). At most 3 lines
+  // per session: the first rejected pass, then only passes of a larger area (the eye's scene is among the biggest). Decision unchanged.
+  void eyeRejDetail(Device* dev, const vpgpu::RenderPassDesc& d) const {
+    static std::atomic<unsigned> logged{0};
+    static std::atomic<uint64_t> best{0};
+    const unsigned n = logged.load(std::memory_order_relaxed);
+    const uint64_t area = uint64_t(eyeWhy.w) * eyeWhy.h;
+    if (n >= 3 || (n && area <= best.load(std::memory_order_relaxed))) return;
+    best.store(area, std::memory_order_relaxed);
+    logged.fetch_add(1, std::memory_order_relaxed);
+    vpgpu::TextureDesc gc, gz;
+    const bool hc = d.colors[0].texture && dev->gpu->textureDesc(d.colors[0].texture, gc);
+    const bool hz = d.depth.texture && dev->gpu->textureDesc(d.depth.texture, gz);
+    static const char* const kWhy[] = {"no_depth", "no_eye_size", "size", "other"};
+    logf("vk.msaa rej_detail reason=%s w=%u h=%u fbW=%u fbH=%u depthW=%u depthH=%u viewMask=0x%x eyeW=%u eyeH=%u jit=%d fmt=%s/%s",
+         kWhy[eyeWhy.why], eyeWhy.w, eyeWhy.h, eyeWhy.fbW, eyeWhy.fbH, eyeWhy.depthW, eyeWhy.depthH, eyeWhy.viewMask, eyeWhy.eyeW,
+         eyeWhy.eyeH, eyeWhy.jit ? 1 : 0, hc ? vpgpu::formatInfo(gc.format).name : "none", hz ? vpgpu::formatInfo(gz.format).name : "none");
+  }
 
   // Does a draw of the pass about to open (ops after `at` up to its end, secondary buffers included) keep the pass at 1x?
   // 0 = none does, else the reason: 1 input attachment / pixel-local read, 2 dual-source blending, 3 extended dynamic state
@@ -1203,7 +1241,11 @@ struct Translator {
       ++counter;
       mt.noteRej(dev, d, why);
     };
-    if (!eyeScene) return rej(mt.rejEye, "eye");
+    if (!eyeScene) {
+      ++mt.rejEyeBy[eyeWhy.why];
+      eyeRejDetail(dev, d);
+      return rej(mt.rejEye, "eye");
+    }
     vpgpu::Attachment& c = d.colors[0];
     vpgpu::Attachment& z = d.depth;
     if (!c.texture || !z.texture) return rej(mt.rejCd, "cd");
@@ -2023,9 +2065,10 @@ static void logMsaaForce(MsaaTwins& mt) {
   const uint32_t skipped = mt.skipLoad + mt.skipInput + mt.skipDsb + mt.skipEds + mt.skipFmt + mt.skipSamples + mt.skipArea + mt.skipShape;
   const uint32_t rejected = mt.rejEye + mt.rejCd + mt.rejSmp + mt.rejStore + mt.rejSmask + mt.rejRes + mt.rejDesc;  // (rejN counts every pass while forcing is off)
   if (!mt.passes && !skipped && !rejected && !mt.gameAuto && !mt.skipUnreadable) return;
-  logf("vk.msaa force=%d passes=%u up=%u skip{load=%u,input=%u,dsb=%u,eds=%u,fmt=%u,samples=%u,area=%u,shape=%u} twins=%zu game_auto=%u skip_unreadable=%u rej{n=%u,eye=%u,cd=%u,smp=%u,msstore=%u,smask=%u,res=%u,desc=%u}",
+  logf("vk.msaa force=%d passes=%u up=%u skip{load=%u,input=%u,dsb=%u,eds=%u,fmt=%u,samples=%u,area=%u,shape=%u} twins=%zu game_auto=%u skip_unreadable=%u rej{n=%u,eye=%u,cd=%u,smp=%u,msstore=%u,smask=%u,res=%u,desc=%u} eye_why{no_depth=%u,no_eye_size=%u,size=%u,other=%u}",
        msaaForce(), mt.passes, mt.up, mt.skipLoad, mt.skipInput, mt.skipDsb, mt.skipEds, mt.skipFmt, mt.skipSamples, mt.skipArea,
-       mt.skipShape, mt.twins.size(), mt.gameAuto, mt.skipUnreadable, mt.rejN, mt.rejEye, mt.rejCd, mt.rejSmp, mt.rejStore, mt.rejSmask, mt.rejRes, mt.rejDesc);
+       mt.skipShape, mt.twins.size(), mt.gameAuto, mt.skipUnreadable, mt.rejN, mt.rejEye, mt.rejCd, mt.rejSmp, mt.rejStore, mt.rejSmask, mt.rejRes, mt.rejDesc,
+       mt.rejEyeBy[0], mt.rejEyeBy[1], mt.rejEyeBy[2], mt.rejEyeBy[3]);
 }
 
 vpgpu::TextureId UiMaskState::acquire(uint32_t slot, uint32_t w, uint32_t h, uint16_t layers, uint8_t samples) {

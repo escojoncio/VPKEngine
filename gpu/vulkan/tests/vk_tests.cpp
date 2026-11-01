@@ -4734,6 +4734,82 @@ void testTaaEyeDepth() {
   vpvk_config_set_taa_native(0);
 }
 
+// Prewarm with forced MSAA: besides the recipes it compiles the variants the runtime asks for ('.msN', '.ums', '.umu' of
+// a recorded mask variant) under the keys pipelineFor / maskPipelineKey compute; without forcing nothing is added.
+void testPrewarmVariants() {
+  char tmpl[] = "/tmp/vpvk_prewarmv_XXXXXX";
+  const char* dir = mkdtemp(tmpl);
+  CHECK(dir != nullptr);
+  if (!dir) return;
+  const std::string recipeDir = std::string(dir) + "/store", ctxDir = std::string(dir) + "/ctx";
+  std::filesystem::create_directories(ctxDir);
+  setenv("VP_PIPELINE_CACHE_DIR", ctxDir.c_str(), 1);  // (the device of the runtime half records its own recipes here)
+  vpvk_config_set_taa_native(1);
+  vpgpu::PipelineState eye;  // colour 0 + depth at 1x: what forceMsaa can serve
+  eye.colorFormats[0] = vpgpu::Format::RGBA8Unorm, eye.depthFormat = vpgpu::Format::D32Float;
+  eye.depthTest = eye.depthWrite = true, eye.label = "test.eye";
+  vpgpu::PipelineState shadow = eye;  // depth only: no colour 0, never a forced pass
+  shadow.colorFormats[0] = vpgpu::Format::Undefined, shadow.label = "test.shadow";
+  vpgpu::PipelineState gbuf = eye;  // two colour attachments: forceMsaa rejects the pass ("shape")
+  gbuf.colorFormats[1] = vpgpu::Format::RGBA8Unorm, gbuf.label = "test.gbuf";
+  vpgpu::PipelineState ui = eye;  // a recorded '.umu' (the fragment shader writes the mask) of another pipeline, at 1x
+  ui.depthTest = false, ui.label = "test.ui";
+  applyUiMaskTarget(ui, true);
+  RecipeStore store(recipeDir);
+  for (const vpgpu::PipelineState* s : {&eye, &shadow, &gbuf, &ui}) store.addPipeline(*s, {0, 0, 0});
+  CHECK(store.pipelineCount() == 4);
+  auto run = [&](std::vector<uint64_t> watch, std::vector<vpgpu::PipelineCache::Status>& status, uint32_t maxVariants = 0) {
+    std::unique_ptr<Platform> platform = createPlatform();
+    vpgpu::Device gpu(platform->backend(), 2, [](const std::string&) {});
+    PrewarmHooks hooks;
+    hooks.maxVariants = maxVariants;
+    const PrewarmResult r = prewarm(*platform, gpu.pipelines(), store, nullptr, 0.0, hooks);
+    for (uint64_t k : watch) status.push_back(gpu.pipelines().status({k}));
+    return r;
+  };
+  const uint8_t N = 4;
+  vpgpu::PipelineState ms = msaaVariantState(eye, N), ums = eye, umu = ui;
+  ums.samples = N, applyUiMaskTarget(ums, false);
+  umu.samples = N;
+  const std::vector<uint64_t> watch = {eye.key().value, ms.key().value, ums.key().value, umu.key().value,
+                                       msaaVariantState(shadow, N).key().value, msaaVariantState(gbuf, N).key().value};
+  using St = vpgpu::PipelineCache::Status;
+  std::vector<St> st;
+  vpvk_config_set_msaa_force(0);
+  PrewarmResult r = run(watch, st);  // no forcing: only the recipes
+  CHECK(r.recipes == 4 && r.variants == 0 && r.failed == 0);
+  CHECK(st[0] == St::Ready && st[1] == St::Missing && st[2] == St::Missing && st[3] == St::Missing);
+  vpvk_config_set_msaa_force(N);
+  st.clear();
+  r = run(watch, st);  // forced 4x: eye -> .ms4 + .ums, the recorded .umu -> its 4x; shadow and the two-attachment pass add nothing
+  CHECK(r.recipes == 4 && r.variants == 3 && r.variantsFailed == 0 && r.failed == 0);
+  CHECK(st[0] == St::Ready && st[1] == St::Ready && st[2] == St::Ready && st[3] == St::Ready);
+  CHECK(st[4] == St::Missing && st[5] == St::Missing);
+  CHECK(store.pipelineCount() == 4);  // the prewarm adds no recipe to the store: the variants do not accumulate across runs
+  st.clear();
+  r = run(watch, st, 1);  // cap of 1 variant (the first in snapshot order): exactly one of the three is compiled, the rest is left out
+  CHECK(r.recipes == 4 && r.variants == 1 && r.variantsFailed == 0 && r.failed == 0);
+  CHECK(st[0] == St::Ready && int(st[1] == St::Ready) + int(st[2] == St::Ready) + int(st[3] == St::Ready) == 1);
+  CHECK(store.pipelineCount() == 4);
+  {
+    // The runtime's keys for the same pipeline under forced 4x are the ones the prewarm compiled.
+    Ctx c;
+    Device* d = from<Device>(c.dev);
+    PipelineObj p;
+    p.ok = true, p.state = eye, p.key = eye.key();
+    CHECK(pipelineFor(d, p, N).value == watch[1]);
+    vpgpu::PipelineKey k;
+    CHECK(maskPipelineKey(d, p, nullptr, N, false, k) && k.value == watch[2]);
+    c.gpu().pipelines().waitIdle();
+    for (uint64_t key : p.ownedKeys) c.gpu().pipelines().release({key});
+  }
+  vpvk_config_set_msaa_force(0);
+  vpvk_config_set_taa_native(0);
+  unsetenv("VP_PIPELINE_CACHE_DIR");
+  std::error_code ec;
+  std::filesystem::remove_all(dir, ec);
+}
+
 // Forced MSAA (VPVK_MSAA_FORCE / vpvk_config_set_msaa_force): the eye / scene pass the game renders at 1x draws into N-sample
 // autoMsaa twins resolved into the game's images; what it cannot serve stays at 1x and is counted. Host side only (null backend).
 void testMsaaForce() {
@@ -11842,7 +11918,7 @@ int main(int argc, char** argv) {
       {"timeline", testTimeline}, {"queues", testQueues}, {"timeline_order", testTimelineOrder}, {"pending", testPending}, {"renderpass_ops", testRenderPassOps}, {"linear", testLinear}, {"images", testImages}, {"image_lifetime", testImageLifetime},
       {"vertex_stores", testVertexStores}, {"profile", testProfile}, {"profile13", testProfile13}, {"quest_extras", testQuestExtras}, {"push_descriptor", testPushDescriptor}, {"report_geom", testReportGeomInterpolators}, {"pipeline_policy", testPipelinePolicy}, {"eds", testExtendedDynamicState},
       {"native_identity", testNativeIdentity}, {"inline_uniform", testInlineUniformBlock}, {"bda", testBufferDeviceAddress}, {"ycbcr", testYcbcr},
-      {"taa_native", testTaaNative}, {"taa_eye_depth", testTaaEyeDepth}, {"taa_uimask", testTaaUiMask}, {"msaa_force", testMsaaForce}, {"msaa_force_marked", testMsaaForceMarkedEye}, {"aot", testAot}, {"aniso", testAniso}, {"zeroinit", testZeroInit}, {"archive_index", testArchiveIndex}, {"foveation", testFoveation},
+      {"taa_native", testTaaNative}, {"taa_eye_depth", testTaaEyeDepth}, {"taa_uimask", testTaaUiMask}, {"msaa_force", testMsaaForce}, {"prewarm_variants", testPrewarmVariants}, {"msaa_force_marked", testMsaaForceMarkedEye}, {"aot", testAot}, {"aniso", testAniso}, {"zeroinit", testZeroInit}, {"archive_index", testArchiveIndex}, {"foveation", testFoveation},
       {"stage_keys", testStageKeys}, {"async_pipelines", testAsyncPipelines}, {"sync_pipelines", testSyncPipelines}, {"create_default", testCreateDefault}, {"pso_census", testPsoCensus}, {"pass_drop", testPassDrop}, {"skip_reasons", testSkipReasons}, {"indirect_patch", testIndirectPatch}, {"astc3d", testAstc3d},
       {"perf", testPerf}, {"phase1b", testPhase1b}, {"suspend_resume", testSuspendResume}, {"translator_modes", testTranslatorModes}, {"capture", testCapture}, {"capture_images", testCaptureImages}, {"capture_hooks", testCaptureHooks}, {"capture_codec", testCaptureCodec}, {"capture_env", testCaptureEnv}, {"capture_pools", testCapturePools}, {"capture_host_frames", testCaptureHostFrames}, {"capture_corrupt", testCaptureCorrupt}, {"capture_env_host", testCaptureEnvHost}, {"capture_env_dir", testCaptureEnvDir}, {"capture_devices", testCaptureDevices}, {"capture_unhooked", testCaptureUnhooked}, {"capture_budget", testCaptureBudget}, {"capture_locks", testCaptureLocks}, {"png", testPng}, {"imgdiff", testImgDiff}, {"replay", testReplay}, {"replay_lvp", testReplayLvp}, {"refcaps", testRefCaps}};
   bool ran = false;
