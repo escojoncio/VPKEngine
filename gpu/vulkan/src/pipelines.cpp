@@ -587,16 +587,16 @@ void pipelineSummary(Device* dev, bool final) {
 }
 
 // The body of the vk.pso.census line. archived = serialized to disk; archive_pending = queued or added but not on disk yet;
-// archive_spilled = refused at the harvest queue's fuse.
+// archive_spilled = refused at the harvest queue's fuse; archive_trim_dropped = queued entries dropped by a critical trim.
 std::string psoCensusLine(const PipelineCounters& c, const vpgpu::PipelineStats& t, const Platform::ArchiveCensus& a) {
-  char b[448];
+  char b[480];
   std::snprintf(b, sizeof b,
                 "created=%llu compiled=%u failed=%llu timed_out=%llu archived=%u not_archived_depth_only=%u "
                 "not_archived_other=%u archive_hits=%u compiled_in_session=%u archive_dup=%u archive_pending=%u "
-                "archive_spilled=%u",
+                "archive_spilled=%u archive_trim_dropped=%u",
                 (unsigned long long)c.pipelinesCreated.load(), t.compiled, (unsigned long long)(t.failed + c.translateFailed.load()),
                 (unsigned long long)c.createTimedOut.load(), a.archived, a.depthOnly, a.other, a.hits, a.compiled, a.dup,
-                a.pending, a.spilled);
+                a.pending, a.spilled, a.trimDropped);
   return b;
 }
 

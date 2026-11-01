@@ -182,6 +182,8 @@ class PipelineCache {
   std::unordered_map<uint64_t, uint32_t> owners_;  // retain() counts
   uint64_t nextOrder_ = 0;
   unsigned busy_ = 0;
+  uint32_t backlogReported_ = 0;  // queue_.size() + busy_ as last added to vpgpu::compileBacklog() (guarded by mutex_)
+  void syncBacklogLocked();
   bool stop_ = false;
   PipelineStats frame_, total_;
   std::vector<std::thread> workers_;

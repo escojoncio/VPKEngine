@@ -224,6 +224,7 @@ class MetalBackend final : public Backend {
     // Of archiveAdded, those already serialized to disk (archiveSerialized); queued and added but not on disk yet
     // (archivePending); refused at the queue's fuse, 32768 entries (archiveSpilled).
     uint32_t archiveSerialized = 0, archivePending = 0, archiveSpilled = 0;
+    uint32_t archiveTrimDropped = 0;  // queued entries dropped by a critical trim (cumulative)
     uint64_t libCompiled = 0;       // libraries compiled this process (cumulative)
     uint64_t tileRejected = 0;      // attachments that could not stay tile-local (cumulative)
     uint64_t msaaMemoryless = 0;    // MSAA targets (colour or depth) with no memory now (tile only): size had they been resident

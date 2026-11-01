@@ -106,7 +106,7 @@ class Platform {
   // were refused or lost. `archived` counts the entries already serialized to disk; `pending` those queued or added but
   // not on disk yet; `spilled` those refused at the queue's fuse. False (out untouched) where there is no archive.
   struct ArchiveCensus {
-    uint32_t hits = 0, compiled = 0, archived = 0, depthOnly = 0, dup = 0, other = 0, pending = 0, spilled = 0;
+    uint32_t hits = 0, compiled = 0, archived = 0, depthOnly = 0, dup = 0, other = 0, pending = 0, spilled = 0, trimDropped = 0;
   };
   virtual bool archiveCensus(ArchiveCensus&) { return false; }
   // vpvk_native_submit: a native command buffer (id<MTLCommandBuffer>, unretained) on the queue of

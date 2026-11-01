@@ -71,7 +71,7 @@ class MetalPlatform final : public Platform {
     const auto s = backend_.memStats();
     out.hits = s.archiveHits, out.compiled = s.archiveMisses, out.archived = s.archiveSerialized;
     out.depthOnly = s.archiveSkipDepth, out.dup = s.archiveDup, out.other = s.archiveSkipOther;
-    out.pending = s.archivePending, out.spilled = s.archiveSpilled;
+    out.pending = s.archivePending, out.spilled = s.archiveSpilled, out.trimDropped = s.archiveTrimDropped;
     return true;
   }
   std::string memStats() override {

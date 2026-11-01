@@ -6386,11 +6386,11 @@ void testPsoCensus() {
   CHECK(a.pending == 0 && a.spilled == 0);
   psoCensus(d, true);                     // prints one vk.pso.census line
   // The archive fields: archived = serialized, plus how many are still pending and how many spilled at the queue's fuse.
-  a.archived = 1696, a.pending = 5000, a.spilled = 7, a.other = 2, a.dup = 3;
+  a.archived = 1696, a.pending = 5000, a.spilled = 7, a.trimDropped = 9, a.other = 2, a.dup = 3;
   const std::string line = psoCensusLine(pc, c.gpu().pipelines().totals(), a);
   CHECK(line.find(" archived=1696 ") != std::string::npos);
   CHECK(line.find("not_archived_other=2 ") != std::string::npos && line.find("archive_dup=3 ") != std::string::npos);
-  CHECK(line.find(" archive_pending=5000 archive_spilled=7") != std::string::npos);
+  CHECK(line.find(" archive_pending=5000 archive_spilled=7 archive_trim_dropped=9") != std::string::npos);
   vkDestroyPipeline(c.dev, good, nullptr);
   vkDestroyPipeline(c.dev, bad, nullptr);
 }

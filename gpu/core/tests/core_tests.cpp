@@ -2898,6 +2898,18 @@ void testHarvest() {
   CHECK(!archiveHarvestYields(1, kHarvestStarvePending + 1, 0ms));
   CHECK(!archiveHarvestYields(1, 0, kHarvestStarveAge + 1ms));
   CHECK(!archiveHarvestYields(1, 4000, 25s));
+  // Compile backlog / low memory (archiveHarvestShouldYield): yields regardless of starvation; idle and roomy: runs.
+  CHECK(!archiveHarvestShouldYield(0, 0, 0, 0ms, 4096, 1024));
+  CHECK(archiveHarvestShouldYield(0, 1, 0, 0ms, 4096, 1024));
+  CHECK(archiveHarvestShouldYield(0, 356, 16, 5s, 4096, 1024));
+  CHECK(!archiveHarvestShouldYield(0, 356, kHarvestStarvePending + 1, 0ms, 4096, 1024));  // starving: backlog no longer yields
+  CHECK(!archiveHarvestShouldYield(0, 356, 0, kHarvestStarveAge + 1ms, 4096, 1024));
+  CHECK(archiveHarvestShouldYield(0, 356, 4000, 25s, 0, 1024));  // low memory still yields when starving
+  CHECK(archiveHarvestShouldYield(0, 0, 0, 0ms, 1023, 1024));
+  CHECK(!archiveHarvestShouldYield(0, 0, 0, 0ms, 1024, 1024));
+  CHECK(!archiveHarvestShouldYield(0, 0, 0, 0ms, 0, 0));  // threshold 0 disables the memory check
+  CHECK(archiveHarvestShouldYield(1, 0, 0, 0ms, 4096, 1024));  // demand wait rule unchanged
+  CHECK(!archiveHarvestShouldYield(1, 0, 4000, 25s, 4096, 1024));
   CHECK_EQ(kHarvestBatch, size_t(16));
 }
 

@@ -10,6 +10,7 @@
 #include <pthread/qos.h>
 #endif
 
+#include "vpgpu/core/archive_harvest.h"
 #include "vpgpu/core/backend.h"
 
 namespace vpgpu {
@@ -76,6 +77,14 @@ PipelineCache::~PipelineCache() {
   }
   wake_.notify_all();
   for (std::thread& t : workers_) t.join();
+  compileBacklog().fetch_sub(backlogReported_, std::memory_order_relaxed);
+}
+
+// Adds the change of queued + running jobs since the last call to the global backlog the archive harvest reads.
+void PipelineCache::syncBacklogLocked() {
+  const uint32_t n = uint32_t(queue_.size()) + busy_;
+  compileBacklog().fetch_add(n - backlogReported_, std::memory_order_relaxed);  // unsigned wrap-around adds the delta
+  backlogReported_ = n;
 }
 
 PipelineCache::Status PipelineCache::request(const PipelineState& state, Priority priority) {
@@ -105,6 +114,7 @@ PipelineCache::Status PipelineCache::request(const PipelineState& state, Pipelin
       e.status = Status::Queued;
       e.queuedAt = Clock::now();
       queue_.push({priority, nextOrder_++, state});
+      syncBacklogLocked();
       wake_.notify_one();
       return Status::Queued;
     }
@@ -193,6 +203,7 @@ void PipelineCache::boost(PipelineKey key) {
   if (it == entries_.end() || it->second.status != Status::Queued || it->second.boosted || workers_.empty()) return;
   it->second.boosted = true;
   queue_.push({Priority::Urgent, nextOrder_++, it->second.state});
+  syncBacklogLocked();
   wake_.notify_one();
 }
 
@@ -229,16 +240,19 @@ void PipelineCache::workerLoop() {
     queue_.pop();
     auto entry = entries_.find(job.state.key().value);  // absent: released while queued
     if (entry == entries_.end() || entry->second.status != Status::Queued) {  // a duplicate job already claimed by another worker
+      syncBacklogLocked();
       if (queue_.empty() && !busy_) idle_.notify_all();  // it may have been the last job (waitIdle)
       continue;
     }
     entry->second.status = Status::Compiling;
     entry->second.boosted = false;
     ++busy_;
+    syncBacklogLocked();
     lock.unlock();
     compile(job.state, job.priority);
     lock.lock();
     --busy_;
+    syncBacklogLocked();
     if (queue_.empty() && !busy_) idle_.notify_all();
   }
 }

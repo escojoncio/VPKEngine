@@ -1038,7 +1038,7 @@ struct MetalBackend::Impl {
   // those of them already written to disk; archiveSpilled the ones queueArchive refused at its fuse; archivePendingN the
   // queue length (written under archiveQueueMutex, read lock free).
   std::atomic<uint32_t> archiveAdded{0}, archiveSkipDepth{0}, archiveSkipOther{0}, archiveDup{0};
-  std::atomic<uint32_t> archiveSerialized{0}, archiveSpilled{0}, archivePendingN{0};
+  std::atomic<uint32_t> archiveSerialized{0}, archiveSpilled{0}, archivePendingN{0}, archiveTrimDropped{0};
   std::atomic<uint32_t> psoFailLogged{0};  // vk.pso.fail lines written (capped at 64)
   NSArray<id<MTLBinaryArchive>>* archivesFor(uint64_t key) const {
     const auto it = keyFile.find(key);
@@ -1055,6 +1055,7 @@ struct MetalBackend::Impl {
   // (the descriptors keep their functions alive): beyond kArchiveFuse entries queueArchive counts archiveSpilled.
   std::deque<ArchiveEntry> archiveQueue;
   static constexpr size_t kArchiveFuse = 32768;
+  uint64_t harvestMinFreeMB = 512;  // VPVK_HARVEST_MIN_FREE_MB: the harvest yields under this much free memory (0 = off)
   std::atomic<uint32_t> archiveYields{0};  // times the harvest stepped aside for a demand wait
   std::atomic<uint32_t> archiveFlushWaiters{0};  // saveArchive() calls waiting for archiveMutex: the harvest job lets them in
   uint64_t pauseHook = 0;  // BackgroundGate pause hook id (0 = none): the app went to the background, flush
@@ -1529,6 +1530,7 @@ void MetalBackend::Impl::init() {
   }
   if (const char* d = std::getenv("VP_DUMP_DIR")) dumpDir = d;
   if (const char* e = std::getenv("VPVK_DEVICE_LOST_STRICT")) strictLost = *e == '1';
+  if (const char* e = std::getenv("VPVK_HARVEST_MIN_FREE_MB")) harvestMinFreeMB = std::strtoull(e, nullptr, 10);
   if (const char* e = std::getenv("VPVK_HANG_SPLIT")) hangSplit = uint32_t(std::strtoul(e, nullptr, 10));
   if (const char* e = std::getenv("VPVK_MAX_DRAWS_PER_CB")) maxDrawsPerCb = uint32_t(std::strtoul(e, nullptr, 10));
   if (const char* e = std::getenv("VPVK_MAX_ENCODERS_PER_CB")) maxEncodersPerCb = uint32_t(std::strtoul(e, nullptr, 10));
@@ -7808,6 +7810,7 @@ size_t MetalBackend::trimMemory(int level, std::string& report) {
   if (!ok()) return 0;
   Impl& m = *impl_;
   size_t freed = 0;
+  uint32_t archqDropped = 0;
   char b[512];
   @autoreleasepool {
     const uint64_t before = m.device.currentAllocatedSize;
@@ -7830,6 +7833,16 @@ size_t MetalBackend::trimMemory(int level, std::string& report) {
     freed += delta;
     std::snprintf(b, sizeof b, "libs_dropped=%zu libs_kept=%zu libs=%.1f", dropped, total - dropped, double(delta) / 1048576.0);
     report += b;
+    if (level >= 2) {  // critical: the queued harvest entries hold descriptors (and their functions); they are re-harvested next run
+      std::deque<Impl::ArchiveEntry> drop;
+      {
+        std::lock_guard lock(m.archiveQueueMutex);
+        drop.swap(m.archiveQueue);
+        m.archivePendingN.store(0, std::memory_order_relaxed);
+      }
+      archqDropped = uint32_t(drop.size());
+      m.archiveTrimDropped.fetch_add(archqDropped, std::memory_order_relaxed);
+    }
   }
   std::snprintf(b, sizeof b, " msaa_queued=%.1f args_queued=%.1f msaa_freed_total=%.1f args_freed_total=%.1f",
                 double(m.texBytes[Impl::kTexMsaa].load()) / 1048576.0, double(m.argsMoreBytes.load()) / 1048576.0,
@@ -7837,6 +7850,8 @@ size_t MetalBackend::trimMemory(int level, std::string& report) {
   report += b;
   m.trimSlotsLeft.store(uint32_t(m.slots.size()));
   m.trimLevel.store(level < 1 ? 1 : level);
+  std::snprintf(b, sizeof b, " archq_dropped=%u", archqDropped);
+  report += b;
   m.info("gpu.metal.info what=trim level=" + std::to_string(level) + " " + report);
   return freed;
 }
@@ -8522,14 +8537,20 @@ void MetalBackend::Impl::queueArchive(id desc, bool compute, const std::string& 
 // is the queue time of the entry about to be added (the queue is FIFO) and `inHand` the entries of its batch still to add.
 // Never in the background (the flush must finish) and never when the queue is starving (archiveHarvestYields).
 bool MetalBackend::Impl::harvestShouldYield(std::chrono::steady_clock::time_point oldest, size_t inHand) {
+  if (vpgpu::backgroundGate().active()) return false;
+  uint64_t freeMB = UINT64_MAX;
+#if __has_include(<os/proc.h>) && (TARGET_OS_VISION || TARGET_OS_IOS)
+  if (__builtin_available(iOS 13.0, visionOS 1.0, *)) freeMB = uint64_t(os_proc_available_memory()) >> 20;
+#endif
   const uint32_t waiters = vpgpu::demandWaiters().load(std::memory_order_acquire);
-  if (!waiters || vpgpu::backgroundGate().active()) return false;
+  const uint32_t backlog = vpgpu::compileBacklog().load(std::memory_order_relaxed);
   size_t pending = inHand;
   {
     std::lock_guard lock(archiveQueueMutex);
     pending += archiveQueue.size();
   }
-  return vpgpu::archiveHarvestYields(waiters, pending, std::chrono::steady_clock::now() - oldest);
+  return vpgpu::archiveHarvestShouldYield(waiters, backlog, pending, std::chrono::steady_clock::now() - oldest, freeMB,
+                                          harvestMinFreeMB);
 }
 
 size_t MetalBackend::Impl::drainArchiveLocked(bool yield, size_t max, bool* yielded) {
@@ -9143,6 +9164,7 @@ MetalBackend::MemStats MetalBackend::memStats() const {
   s.archiveAdded = m.archiveAdded, s.archiveSkipDepth = m.archiveSkipDepth;
   s.archiveSkipOther = m.archiveSkipOther, s.archiveDup = m.archiveDup;
   s.archiveSerialized = m.archiveSerialized, s.archiveSpilled = m.archiveSpilled;
+  s.archiveTrimDropped = m.archiveTrimDropped;
   s.archivePending = m.archivePendingN + (s.archiveAdded > s.archiveSerialized ? s.archiveAdded - s.archiveSerialized : 0);
   s.archiveKeyed = uint32_t(m.keyedArchives.count), s.archiveEvicted = m.archiveEvicted;
   return s;

@@ -26,6 +26,13 @@ class DemandWait {
   DemandWait& operator=(const DemandWait&) = delete;
 };
 
+// Pipeline compiles queued or running in the PipelineCache workers (all caches). The harvest steps aside while it is
+// non-zero: both recompile in the same compiler service and hold descriptors in memory (startup burst).
+inline std::atomic<uint32_t>& compileBacklog() {
+  static std::atomic<uint32_t> n{0};
+  return n;
+}
+
 inline constexpr size_t kHarvestBatch = 16;         // entries added per step
 inline constexpr size_t kHarvestStarvePending = 512;  // above this many queued entries the harvest never yields
 inline constexpr std::chrono::seconds kHarvestStarveAge{20};  // nor when the oldest queued entry is older than this
@@ -34,6 +41,15 @@ inline constexpr std::chrono::seconds kHarvestStarveAge{20};  // nor when the ol
 inline bool archiveHarvestYields(uint32_t waiters, size_t pending, std::chrono::nanoseconds oldestAge) {
   if (!waiters) return false;
   return pending <= kHarvestStarvePending && oldestAge <= kHarvestStarveAge;
+}
+
+// The full decision: yield while compiles are queued (compileBacklog), while free memory is under minFreeMB (0 disables
+// the check), or for a demand wait (archiveHarvestYields). Low memory always yields; the backlog and the demand wait step
+// aside only while the queue is not starving (pending <= kHarvestStarvePending and oldestAge <= kHarvestStarveAge).
+inline bool archiveHarvestShouldYield(uint32_t waiters, uint32_t backlog, size_t pending, std::chrono::nanoseconds oldestAge,
+                                      uint64_t freeMB, uint64_t minFreeMB) {
+  if (minFreeMB && freeMB < minFreeMB) return true;
+  return archiveHarvestYields(waiters + backlog, pending, oldestAge);
 }
 
 }  // namespace vpgpu
