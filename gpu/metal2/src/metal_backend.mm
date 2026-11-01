@@ -5602,7 +5602,11 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
       }
       if (visBuf) {
         rp.visibilityResultBuffer = visBuf;
-        rp.visibilityResultType = MTLVisibilityResultTypeAccumulate;
+        // Not declared in every SDK (XRSimulator 26.5): set at runtime. 1 == MTLVisibilityResultTypeAccumulate.
+        if ([rp respondsToSelector:NSSelectorFromString(@"setVisibilityResultType:")])
+          [rp setValue:@(1) forKey:@"visibilityResultType"];
+        else if (blitWarned.insert("visibility_accumulate_unsupported").second)
+          err("what=visibility_accumulate_unsupported");
       }
       bool visCounting = false;
       uint64_t visLastOff = 0;  // offset of the last counting draw: disabling stays inside a range this encoder owns
