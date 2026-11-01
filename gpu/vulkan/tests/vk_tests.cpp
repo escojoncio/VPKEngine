@@ -4666,6 +4666,195 @@ void testMsaaForce() {
       CHECK(!c.gpu().textureDesc(ta, gone) && c.gpu().textureDesc(tb, gone));
       c.gpu().destroy(b);
     }
+    // 6b. The game's own MSAA below the forced N (2x eye pass, forced 4): upgraded. The 4-sample twins resolve into the game's own
+    // 1x targets, the game's 2x images are not touched, the draw uses the 4-sample pipeline variant of the 2x game pipeline.
+    {
+      MsaaTwins& mt = d->msaaTwins;
+      const uint32_t passes0 = mt.passes, up0 = mt.up, store0 = mt.rejStore, smp0 = mt.rejSmp;
+      const vpgpu::TextureId mc = mk(vpgpu::Format::RGBA8Unorm, 2, true), md = mk(vpgpu::Format::D32Float, 2, true);
+      auto mkx = [&](vpgpu::Format f, uint8_t samples, uint16_t layers, uint16_t mips, uint8_t extra) {
+        vpgpu::TextureDesc td;
+        td.format = f, td.width = 1920, td.height = 1824, td.samples = samples, td.layers = layers, td.mips = mips;
+        td.transient = samples > 1;
+        td.usage = (vpgpu::formatInfo(f).depth() ? vpgpu::usage::depthTarget : vpgpu::usage::colorTarget) | extra;
+        return c.gpu().createTexture(td);
+      };
+      const vpgpu::TextureId rd = mkx(vpgpu::Format::D32Float, 1, 1, 1, vpgpu::usage::sampled);  // the game's depth resolve target
+      PipelineObj p2;
+      p2.ok = false;
+      p2.state.samples = 2;
+      p2.state.label = "game2";
+      p2.key = p2.state.key();
+      OpDraw g2 = geo;
+      g2.pipe = &p2, g2.draw.pipeline = p2.key;
+      vpgpu::PipelineState v4 = p2.state;
+      v4.samples = 4, v4.label += ".ms4";
+      auto msPass = [&](vpgpu::StoreAction cstore, vpgpu::StoreAction dstore, bool depthResolve, vpgpu::LoadAction load) {
+        OpBeginRendering b = scene(load, cstore, dstore);
+        b.desc.colors[0].texture = mc, b.desc.colors[0].resolve = color;
+        b.desc.depth.texture = md;
+        if (depthResolve) b.desc.depth.resolve = rd;
+        return b;
+      };
+      {  // colour: memoryless Resolve into the game's 1x; depth: DONT_CARE (gets a 1x partner of ours as resolve target)
+        vpgpu::Frame f;
+        run(msPass(vpgpu::StoreAction::Resolve, vpgpu::StoreAction::DontCare, false, vpgpu::LoadAction::Clear), g2, f);
+        const vpgpu::RenderPass rp = pass(f);
+        const vpgpu::Attachment &c0 = rp.desc.colors[0], &z = rp.desc.depth;
+        CHECK(c0.autoMsaa && z.autoMsaa && c0.texture != mc && z.texture != md && !c0.keepSamples && !z.keepSamples);
+        CHECK(c0.resolve == color && c0.store == vpgpu::StoreAction::Resolve && z.store == vpgpu::StoreAction::DontCare);
+        const vpgpu::TextureDesc *tc = c.gpu().resources().get(c0.texture), *tz = c.gpu().resources().get(z.texture);
+        const vpgpu::TextureDesc* pz = c.gpu().resources().get(z.resolve);
+        CHECK(tc && tz && tc->samples == 4 && tz->samples == 4 && tc->transient && tz->transient && !tc->persistent);
+        CHECK(pz && pz->samples == 1 && z.resolve != rd && z.resolve != md);
+        CHECK(rp.draws.size() == 1 && rp.draws[0].pipeline == v4.key() && rp.draws[0].pipeline != p2.key);
+        CHECK(mt.passes == passes0 + 1 && mt.up == up0 + 1 && mt.rejStore == store0 && mt.rejSmp == smp0);
+      }
+      {  // depth the game resolves: the twin resolves into the game's own depth resolve target
+        vpgpu::Frame f;
+        run(msPass(vpgpu::StoreAction::Resolve, vpgpu::StoreAction::Resolve, true, vpgpu::LoadAction::Clear), g2, f);
+        const vpgpu::RenderPass rp = pass(f);
+        CHECK(rp.desc.depth.autoMsaa && rp.desc.depth.resolve == rd && rp.desc.depth.store == vpgpu::StoreAction::Resolve);
+        CHECK(rp.desc.colors[0].resolve == color && mt.passes == passes0 + 2 && mt.up == up0 + 2);
+      }
+      auto untouched2 = [&](const vpgpu::Frame& f) {
+        const vpgpu::RenderPass rp = pass(f);
+        return !rp.desc.colors[0].autoMsaa && !rp.desc.depth.autoMsaa && rp.desc.colors[0].texture == mc &&
+               rp.desc.depth.texture == md && rp.draws[0].pipeline == p2.key;
+      };
+      {  // the game stores its MS colour (StoreAndResolve), or its MS depth: its samples are read later, not upgraded
+        vpgpu::Frame f1, f2, f3;
+        run(msPass(vpgpu::StoreAction::StoreAndResolve, vpgpu::StoreAction::DontCare, false, vpgpu::LoadAction::Clear), g2, f1);
+        CHECK(untouched2(f1) && mt.rejStore == store0 + 1);
+        run(msPass(vpgpu::StoreAction::Resolve, vpgpu::StoreAction::Store, false, vpgpu::LoadAction::Clear), g2, f2);
+        CHECK(untouched2(f2) && mt.rejStore == store0 + 2);
+        run(msPass(vpgpu::StoreAction::Resolve, vpgpu::StoreAction::DontCare, false, vpgpu::LoadAction::Load), g2, f3);  // continues stored samples
+        CHECK(untouched2(f3) && mt.rejStore == store0 + 3);
+        CHECK(mt.passes == passes0 + 2 && mt.up == up0 + 2 && mt.rejSmp == smp0);
+      }
+      {  // already at the forced count: the game's own
+        vpgpu::Frame f;
+        const vpgpu::TextureId qc = mk(vpgpu::Format::RGBA8Unorm, 4, true), qd = mk(vpgpu::Format::D32Float, 4, true);
+        OpBeginRendering qb = msPass(vpgpu::StoreAction::Resolve, vpgpu::StoreAction::DontCare, false, vpgpu::LoadAction::Clear);
+        qb.desc.colors[0].texture = qc, qb.desc.depth.texture = qd;
+        run(qb, g2, f);
+        CHECK(pass(f).desc.colors[0].texture == qc && !pass(f).desc.colors[0].autoMsaa && mt.rejSmp == smp0 + 1 && mt.up == up0 + 2);
+        c.gpu().destroy(qc);
+        c.gpu().destroy(qd);
+      }
+      {  // a resolve target the later seed could not read (no sampled usage): not upgraded, counted
+        vpgpu::Frame f;
+        const uint32_t un0 = mt.skipUnreadable;
+        const vpgpu::TextureId ru = mkx(vpgpu::Format::RGBA8Unorm, 1, 1, 1, 0);
+        OpBeginRendering ub = msPass(vpgpu::StoreAction::Resolve, vpgpu::StoreAction::DontCare, false, vpgpu::LoadAction::Clear);
+        ub.desc.colors[0].resolve = ru;
+        run(ub, g2, f);
+        CHECK(untouched2(f) && mt.skipUnreadable == un0 + 1 && mt.passes == passes0 + 2);
+        c.gpu().destroy(ru);
+      }
+      {  // a pipeline with a baked partial sample mask, or a fragment shader on SampleId / SampleMask: the game's count matters
+        const uint32_t sm0 = mt.rejSmask;
+        PipelineObj pm, ps;  // (not copyable)
+        for (PipelineObj* q : {&pm, &ps}) q->ok = false, q->state = p2.state, q->key = p2.key;
+        pm.sampleMask = 0x1;
+        ps.sampleBuiltin = true;
+        OpDraw dm = g2, ds = g2;
+        dm.pipe = &pm, ds.pipe = &ps;
+        vpgpu::Frame f1, f2;
+        run(msPass(vpgpu::StoreAction::Resolve, vpgpu::StoreAction::DontCare, false, vpgpu::LoadAction::Clear), dm, f1);
+        CHECK(untouched2(f1) && mt.rejSmask == sm0 + 1);
+        run(msPass(vpgpu::StoreAction::Resolve, vpgpu::StoreAction::DontCare, false, vpgpu::LoadAction::Clear), ds, f2);
+        CHECK(untouched2(f2) && mt.rejSmask == sm0 + 2 && mt.passes == passes0 + 2 && mt.up == up0 + 2);
+      }
+      {  // stencil format: the game's resolve modes stay (stencil None included), the stencil plane needs a format-view resolve target
+        const vpgpu::TextureId sd = mkx(vpgpu::Format::D32FloatS8, 2, 1, 1, 0);
+        const vpgpu::TextureId sr = mkx(vpgpu::Format::D32FloatS8, 1, 1, 1, vpgpu::usage::sampled | vpgpu::usage::formatView);
+        const vpgpu::TextureId sn = mkx(vpgpu::Format::D32FloatS8, 1, 1, 1, vpgpu::usage::sampled);
+        auto stencilPass = [&](vpgpu::TextureId target) {
+          OpBeginRendering b = msPass(vpgpu::StoreAction::Resolve, vpgpu::StoreAction::Resolve, true, vpgpu::LoadAction::Clear);
+          b.desc.depth.texture = sd, b.desc.depth.resolve = target;
+          b.desc.depth.depthResolve = vpgpu::ResolveMode::Max, b.desc.depth.stencilResolve = vpgpu::ResolveMode::None;
+          return b;
+        };
+        vpgpu::Frame f1, f2;
+        run(stencilPass(sr), g2, f1);
+        const vpgpu::Attachment& z = pass(f1).desc.depth;
+        CHECK(z.autoMsaa && z.texture != sd && z.resolve == sr && z.depthResolve == vpgpu::ResolveMode::Max &&
+              z.stencilResolve == vpgpu::ResolveMode::None && mt.up == up0 + 3);
+        const uint32_t un0 = mt.skipUnreadable;
+        run(stencilPass(sn), g2, f2);
+        CHECK(!pass(f2).desc.depth.autoMsaa && pass(f2).desc.depth.texture == sd && mt.skipUnreadable == un0 + 1 && mt.up == up0 + 3);
+        c.gpu().destroy(sd);
+        c.gpu().destroy(sr);
+        c.gpu().destroy(sn);
+      }
+      {  // two layers (multiview eye): twins of 2 layers; the game's resolve mip / layer are kept
+        const uint32_t up1 = mt.up;
+        const vpgpu::TextureId lc = mkx(vpgpu::Format::RGBA8Unorm, 2, 2, 1, 0), ld = mkx(vpgpu::Format::D32Float, 2, 2, 1, 0);
+        const vpgpu::TextureId lrc = mkx(vpgpu::Format::RGBA8Unorm, 1, 3, 2, vpgpu::usage::sampled);
+        const vpgpu::TextureId lrd = mkx(vpgpu::Format::D32Float, 1, 3, 2, vpgpu::usage::sampled);
+        OpBeginRendering lb = msPass(vpgpu::StoreAction::Resolve, vpgpu::StoreAction::Resolve, true, vpgpu::LoadAction::Clear);
+        lb.desc.layerCount = 2;
+        lb.desc.colors[0].texture = lc, lb.desc.colors[0].resolve = lrc, lb.desc.colors[0].resolveLayer = 1, lb.desc.colors[0].resolveMip = 1;
+        lb.desc.depth.texture = ld, lb.desc.depth.resolve = lrd, lb.desc.depth.resolveLayer = 1, lb.desc.depth.resolveMip = 1;
+        vpgpu::Frame f;
+        run(lb, g2, f);
+        const vpgpu::RenderPass rp = pass(f);
+        const vpgpu::Attachment &c0 = rp.desc.colors[0], &z = rp.desc.depth;
+        CHECK(c0.autoMsaa && z.autoMsaa && c0.resolve == lrc && z.resolve == lrd && c0.resolveLayer == 1 && z.resolveLayer == 1 &&
+              c0.resolveMip == 1 && z.resolveMip == 1 && mt.up == up1 + 1);
+        const vpgpu::TextureDesc *tc = c.gpu().resources().get(c0.texture), *tz = c.gpu().resources().get(z.texture);
+        CHECK(tc && tz && tc->layers == 2 && tz->layers == 2 && tc->samples == 4 && tz->samples == 4);
+        c.gpu().destroy(lc);
+        c.gpu().destroy(ld);
+        c.gpu().destroy(lrc);
+        c.gpu().destroy(lrd);
+      }
+      c.gpu().destroy(mc);
+      c.gpu().destroy(md);
+      c.gpu().destroy(rd);
+    }
+  }
+  // 6c. Forced 2 with the game at 4x: untouched (the game already has more).
+  {
+    vpvk_config_set_msaa_force(2);
+    Ctx c;
+    Device* d = from<Device>(c.dev);
+    CHECK(msaaForce() == 2);
+    auto mk = [&](vpgpu::Format f, uint8_t samples) {
+      vpgpu::TextureDesc td;
+      td.format = f, td.width = 1920, td.height = 1824, td.samples = samples, td.transient = samples > 1;
+      td.usage = vpgpu::formatInfo(f).depth() ? vpgpu::usage::depthTarget : vpgpu::usage::colorTarget | vpgpu::usage::sampled;
+      return c.gpu().createTexture(td);
+    };
+    const vpgpu::TextureId mc = mk(vpgpu::Format::RGBA8Unorm, 4), md = mk(vpgpu::Format::D32Float, 4), rc = mk(vpgpu::Format::RGBA8Unorm, 1);
+    PipelineObj p4;
+    p4.ok = false;
+    p4.state.samples = 4;
+    p4.state.label = "game4";
+    p4.key = p4.state.key();
+    OpDraw g4;
+    g4.ok = true;
+    g4.pipe = &p4;
+    g4.draw.pipeline = p4.key;
+    g4.draw.count = 300, g4.draw.index = vpgpu::IndexBuffer{};
+    g4.draw.viewport = {0, 0, 1920, 1824, 0, 1};
+    g4.depthTested = g4.vertexBuffers = true;
+    OpBeginRendering b;
+    b.area = {{0, 0}, {1920, 1824}};
+    b.depthWidth = 1920, b.depthHeight = 1824;
+    b.desc.colors[0].texture = mc, b.desc.colors[0].resolve = rc, b.desc.colors[0].load = vpgpu::LoadAction::Clear;
+    b.desc.colors[0].store = vpgpu::StoreAction::Resolve;
+    b.desc.depth.texture = md, b.desc.depth.load = vpgpu::LoadAction::Clear, b.desc.depth.store = vpgpu::StoreAction::DontCare;
+    Recorder rec;
+    rec.ops.emplace_back(b), rec.ops.emplace_back(g4), rec.ops.emplace_back(OpEndPass{});
+    vpgpu::Frame f;
+    TranslateStats st;
+    translate(rec, f, st, nullptr, nullptr, nullptr, nullptr, d);
+    const vpgpu::RenderPass rp = std::get<vpgpu::RenderPass>(f.commands().at(0));
+    CHECK(rp.desc.colors[0].texture == mc && rp.desc.depth.texture == md && !rp.desc.colors[0].autoMsaa && !rp.desc.depth.autoMsaa);
+    CHECK(rp.draws[0].pipeline == p4.key && d->msaaTwins.passes == 0 && d->msaaTwins.up == 0 && d->msaaTwins.rejSmp == 1);
+    vpvk_config_set_msaa_force(0);
   }
   // 7. Off (the default): a game's 1x pass is not touched at all.
   {

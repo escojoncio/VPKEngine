@@ -356,4 +356,17 @@ bool declaresLayer(const SpirvModule& m) {
     return false;
 }
 
+bool declaresSampleBuiltin(const SpirvModule& m) {
+    auto isSample = [](const Decorations& d) {
+        if (!d.has(spv::Deco::BuiltIn)) return false;
+        const uint32_t b = d.get(spv::Deco::BuiltIn);
+        return b == uint32_t(spv::BuiltIn::SampleId) || b == uint32_t(spv::BuiltIn::SampleMask);
+    };
+    for (const auto& [id, d] : m.decorations)
+        if (isSample(d)) return true;
+    for (const auto& [member, d] : m.memberDecorations)
+        if (isSample(d)) return true;
+    return false;
+}
+
 }  // namespace spirv

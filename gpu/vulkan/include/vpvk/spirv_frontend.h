@@ -50,6 +50,9 @@ void release(SpirvModule*);
 // Does the module decorate a variable or a member BuiltIn Layer? A vertex shader that does cannot use vertex amplification
 // (SpirvInterface::amplified): the reason a multiview draw is not amplified is "layer" then, else the ClipDistance it writes.
 bool declaresLayer(const SpirvModule&);
+// Does the module decorate a variable or a member BuiltIn SampleId or SampleMask? (A fragment shader that reads / writes
+// per-sample state: its result depends on the sample count and positions, which forced MSAA changes.)
+bool declaresSampleBuiltin(const SpirvModule&);
 
 // Set value for vertex-buffer bindings in SpirvBinding::set.
 inline constexpr uint32_t kVertexBufferSet = 0xFFFFFFFFu;

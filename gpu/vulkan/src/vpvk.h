@@ -553,6 +553,7 @@ struct PipelineObj {
   bool a2cTest = false;  // alpha-to-coverage pipeline created at 1x (MSAA forced off): alpha test in the fragment shader
   uint16_t colorIntKinds = 0;  // SpirvLowerOptions::colorIntKinds of the fragment stage
   uint8_t fragmentOutputs = 0;  // colour outputs the fragment shader writes (a dynamic colour write mask never enables others)
+  bool sampleBuiltin = false;   // the fragment shader declares BuiltIn SampleId / SampleMask (forced MSAA never upgrades a game MSAA pass using it)
   bool dualSource = false;      // the fragment shader writes [[color(0), index(1)]] (Metal: one render target)
   struct TexelVariant {
     std::vector<vpgpu::Format> formats;  // parallel to `texel`
@@ -695,12 +696,14 @@ struct MsaaTwins {
   std::vector<Twin> twins;
   // Passes forced, and the passes that qualified as scene passes but were left at 1x, by reason (cumulative).
   uint32_t passes = 0, skipLoad = 0, skipInput = 0, skipDsb = 0, skipEds = 0, skipFmt = 0, skipSamples = 0, skipArea = 0, skipShape = 0;
+  uint32_t up = 0;  // ... of those passes, the game's own s-sample MSAA passes upgraded to the forced N (included in passes)
   uint32_t gameAuto = 0;  // attachments of the game's own MSAA passes handled as autoMsaa (VPVK_GAME_MSAA_AUTO)
   uint32_t skipUnreadable = 0;  // ... and those left alone because their resolve target is not shader-readable (no sampled usage)
   uint32_t acquires = 0;  // calls of acquire (the sweep of dead guests runs every 256th)
   // forceMsaa rejections ("vk.msaa force ... rej{...}"): rejN force off (<2 samples), rejEye not an eye scene pass, rejCd no colour 0
-  // / depth, rejSmp the game's own samples, rejRes the game's own resolve, rejDesc a texture description unavailable.
-  uint32_t rejN = 0, rejEye = 0, rejCd = 0, rejSmp = 0, rejRes = 0, rejDesc = 0;
+  // / depth, rejSmp the game's own samples, rejStore a game MSAA pass that keeps / loads its samples (not upgradable), rejSmask a pipeline of the pass with a partial sample mask / SampleId / SampleMask (not upgraded), rejRes the
+  // game's own resolve, rejDesc a texture description unavailable.
+  uint32_t rejN = 0, rejEye = 0, rejCd = 0, rejSmp = 0, rejStore = 0, rejSmask = 0, rejRes = 0, rejDesc = 0;
   // Rejected passes logged ("vk.msaa rej"): up to 12 distinct (size, layers, reason) under 1 Mpx, and 12 at or above it.
   struct RejSeen { uint32_t w = 0, h = 0; uint16_t layers = 0; const char* why = nullptr; };
   RejSeen rejSeen[2][12];

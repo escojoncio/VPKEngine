@@ -1093,8 +1093,10 @@ struct Translator {
 
   // Does a draw of the pass about to open (ops after `at` up to its end, secondary buffers included) keep the pass at 1x?
   // 0 = none does, else the reason: 1 input attachment / pixel-local read, 2 dual-source blending, 3 extended dynamic state
-  // variant, 4 a draw without its pipeline object (no sample variant can be made). Returns true when the pass ended inside `ops`.
-  bool forceScan(const std::vector<Op>& ops, size_t from, int& why) {
+  // variant, 4 a draw without its pipeline object (no sample variant can be made), 5 (only with `up`, a game MSAA pass about to be
+  // upgraded) a pipeline with a baked partial sample mask or a fragment shader using SampleId / SampleMask: both depend on the
+  // game's sample count. Returns true when the pass ended inside `ops`.
+  bool forceScan(const std::vector<Op>& ops, size_t from, int& why, bool up = false) {
     auto note = [&](int w) { why = why && why < w ? why : w; };  // the lowest number wins
     for (size_t i = from; i < ops.size(); ++i) {
       const Op& op = ops[i];
@@ -1102,11 +1104,12 @@ struct Translator {
         if (!d->ok) continue;
         if (!d->pipe) note(4);
         else if (d->pipe->dualSource) note(2);
+        else if (up && (d->pipe->sampleMask != ~0u || d->pipe->sampleBuiltin)) note(5);
         if (d->edsVariant) note(3);
         for (const vpgpu::Access& a : d->draw.bindings)
           if (a.pixelLocal) note(1);
       } else if (const auto* e = std::get_if<OpExecute>(&op)) {
-        if (e->secondary && forceScan(e->secondary->ops, 0, why)) return true;
+        if (e->secondary && forceScan(e->secondary->ops, 0, why, up)) return true;
       } else if (std::holds_alternative<OpEndPass>(op) || std::holds_alternative<OpNextSubpass>(op) ||
                  std::holds_alternative<OpBeginPass>(op) || std::holds_alternative<OpBeginRendering>(op)) {
         return true;
@@ -1183,7 +1186,9 @@ struct Translator {
   // encoder is seeded from the 1x), so MSAA costs shading and resolve but no memory. Passes it cannot serve stay at 1x and are
   // counted (MsaaTwins::skip*): a partial render area (the resolve would overwrite the rest), stencil that must be loaded (the
   // seed cannot restore it), input attachments / local reads, dual-source blending, extended dynamic state draws, integer or
-  // reinterpreted formats, other attachments than colour 0 + depth, game MSAA, targets the twins cannot match. Called before uiPass
+  // reinterpreted formats, other attachments than colour 0 + depth, game MSAA, targets the twins cannot match. A game MSAA pass
+  // of s samples below the forced N is upgraded (below): its twins are N samples resolving into the game's own 1x targets.
+  // Called before uiPass
   // (the UI mask follows the pass's samples) with the description of the pass about to open.
   void forceMsaa(vpgpu::RenderPassDesc& d, const std::vector<Op>& ops, size_t at, const VkRect2D& area, bool localRead,
                  bool laterOrMultiSubpass) {
@@ -1204,8 +1209,20 @@ struct Translator {
     if (!c.texture || !z.texture) return rej(mt.rejCd, "cd");
     vpgpu::TextureDesc gc, gz;
     if (!dev->gpu->textureDesc(c.texture, gc) || !dev->gpu->textureDesc(z.texture, gz)) return rej(mt.rejDesc, "desc");
-    if (gc.samples != 1 || gz.samples != 1) return rej(mt.rejSmp, "smp");  // the game's own MSAA: not ours
-    if (c.resolve || z.resolve) return rej(mt.rejRes, "res");
+    // The game's own MSAA of s samples (colour and depth alike) below the forced N: the pass is upgraded (renders into N-sample
+    // twins that resolve into what the game resolves into), but only when the game never keeps its s samples: its colour is a
+    // memoryless Resolve into a 1x target, its depth a Resolve or a DONT_CARE, nothing loads. Anything else is the game's own MSAA.
+    const bool taaDepth = taaPass && !taa->still;  // the depth VPKTAA reads after the frame must reach the game's image
+    const bool up = n > int(gc.samples) && gc.samples > 1 && gc.samples == gz.samples;
+    if (!up && (gc.samples != 1 || gz.samples != 1)) return rej(mt.rejSmp, "smp");  // the game's own MSAA: not ours
+    if (up) {
+      const bool cOk = c.resolve && c.store == vpgpu::StoreAction::Resolve && c.load != vpgpu::LoadAction::Load;
+      const bool zOk = z.load != vpgpu::LoadAction::Load && ((z.resolve && z.store == vpgpu::StoreAction::Resolve) ||
+                                                              (!z.resolve && z.store == vpgpu::StoreAction::DontCare && !taaDepth));
+      if (!cOk || !zOk) return rej(mt.rejStore, "msstore");
+    } else if (c.resolve || z.resolve) {
+      return rej(mt.rejRes, "res");
+    }
     bool shape = d.rateMap || laterOrMultiSubpass;
     for (int i = 1; i < vpgpu::kMaxColorAttachments; ++i) shape = shape || d.colors[i].texture;
     if (shape) return rej(mt.skipShape, "shape");
@@ -1222,18 +1239,50 @@ struct Translator {
         gz.layers < z.layer + layers)
       return rej(mt.skipFmt, "fmt_size");
     if (area.offset.x != 0 || area.offset.y != 0 || area.extent.width < w || area.extent.height < h) return rej(mt.skipArea, "area");
+    if (up) {
+      // The game's resolve targets must be readable, as in gameAuto: a later Load / a heavy-encoder cut seeds the twin from them
+      // (a stencil plane through a stencil view: formatView).
+      auto unreadable = [&](const vpgpu::Attachment& a, bool stencil) {
+        vpgpu::TextureDesc rd;
+        return a.resolve && (!dev->gpu->textureDesc(a.resolve, rd) || !(rd.usage & vpgpu::usage::sampled) ||
+                             (stencil && !(rd.usage & vpgpu::usage::formatView)));
+      };
+      if (unreadable(c, false) || unreadable(z, fz.stencil())) {
+        ++mt.skipUnreadable;
+        return mt.noteRej(dev, d, "unreadable");
+      }
+    }
     int why = 0;
-    forceScan(ops, at + 1, why);
+    forceScan(ops, at + 1, why, up);
     if (why) {
+      if (why == 5) return rej(mt.rejSmask, "smask");
       return rej(why == 1 ? mt.skipInput : why == 2 ? mt.skipDsb : why == 3 ? mt.skipEds : mt.skipShape,
                  why == 1 ? "scan_input" : why == 2 ? "dsb" : why == 3 ? "eds" : "scan_shape");
     }
     const uint8_t samples = uint8_t(n);
     const vpgpu::TextureId tc = mt.acquire(dev, c.texture, gc, samples, layers, c.mip, c.layer);
     const vpgpu::TextureId tz = tc ? mt.acquire(dev, z.texture, gz, samples, layers, z.mip, z.layer) : vpgpu::TextureId{};
-    if (!tc || !tz) return rej(mt.skipSamples, "samples");
-    // The depth VPKTAA reads after the frame must reach the game's image even when the game discards it.
-    const bool taaDepth = taaPass && !taa->still;
+    // (An upgraded depth the game does not resolve gets a 1x partner of ours as resolve target, as in gameAuto.)
+    const vpgpu::TextureId partner = up && !z.resolve ? mt.acquire(dev, z.texture, gz, 1, layers, z.mip, z.layer) : vpgpu::TextureId{};
+    if (!tc || !tz || (up && !z.resolve && !partner)) return rej(mt.skipSamples, "samples");
+    if (up) {
+      // The game's resolve targets and modes (stencilResolve None included: Metal drops that aspect's resolve, and a heavy cut promotes it) stay as the game set them; only the sampled image is swapped for our twin.
+      auto swap = [](vpgpu::Attachment& a, vpgpu::TextureId t) {
+        a.texture = t, a.mip = 0, a.layer = 0;
+        a.autoMsaa = true, a.needsSeed = false, a.keepSamples = false;
+        a.store = vpgpu::StoreAction::Resolve;
+      };
+      swap(c, tc);
+      swap(z, tz);
+      if (!z.resolve) {
+        z.resolve = partner, z.resolveMip = 0, z.resolveLayer = 0;
+        z.depthResolve = vpgpu::ResolveMode::Sample0;
+        z.store = vpgpu::StoreAction::DontCare;
+      }
+      forceN = samples;
+      ++mt.passes, ++mt.up;
+      return;
+    }
     auto twin = [](vpgpu::Attachment& a, vpgpu::TextureId t, bool resolves) {
       const vpgpu::TextureId guest = a.texture;
       const uint16_t guestMip = a.mip, guestLayer = a.layer;
@@ -1972,11 +2021,11 @@ static void logMsaaForce(MsaaTwins& mt) {
   if (now < mt.nextLogNs) return;
   mt.nextLogNs = now + 1'000'000'000LL;
   const uint32_t skipped = mt.skipLoad + mt.skipInput + mt.skipDsb + mt.skipEds + mt.skipFmt + mt.skipSamples + mt.skipArea + mt.skipShape;
-  const uint32_t rejected = mt.rejEye + mt.rejCd + mt.rejSmp + mt.rejRes + mt.rejDesc;  // (rejN counts every pass while forcing is off)
+  const uint32_t rejected = mt.rejEye + mt.rejCd + mt.rejSmp + mt.rejStore + mt.rejSmask + mt.rejRes + mt.rejDesc;  // (rejN counts every pass while forcing is off)
   if (!mt.passes && !skipped && !rejected && !mt.gameAuto && !mt.skipUnreadable) return;
-  logf("vk.msaa force=%d passes=%u skip{load=%u,input=%u,dsb=%u,eds=%u,fmt=%u,samples=%u,area=%u,shape=%u} twins=%zu game_auto=%u skip_unreadable=%u rej{n=%u,eye=%u,cd=%u,smp=%u,res=%u,desc=%u}",
-       msaaForce(), mt.passes, mt.skipLoad, mt.skipInput, mt.skipDsb, mt.skipEds, mt.skipFmt, mt.skipSamples, mt.skipArea,
-       mt.skipShape, mt.twins.size(), mt.gameAuto, mt.skipUnreadable, mt.rejN, mt.rejEye, mt.rejCd, mt.rejSmp, mt.rejRes, mt.rejDesc);
+  logf("vk.msaa force=%d passes=%u up=%u skip{load=%u,input=%u,dsb=%u,eds=%u,fmt=%u,samples=%u,area=%u,shape=%u} twins=%zu game_auto=%u skip_unreadable=%u rej{n=%u,eye=%u,cd=%u,smp=%u,msstore=%u,smask=%u,res=%u,desc=%u}",
+       msaaForce(), mt.passes, mt.up, mt.skipLoad, mt.skipInput, mt.skipDsb, mt.skipEds, mt.skipFmt, mt.skipSamples, mt.skipArea,
+       mt.skipShape, mt.twins.size(), mt.gameAuto, mt.skipUnreadable, mt.rejN, mt.rejEye, mt.rejCd, mt.rejSmp, mt.rejStore, mt.rejSmask, mt.rejRes, mt.rejDesc);
 }
 
 vpgpu::TextureId UiMaskState::acquire(uint32_t slot, uint32_t w, uint32_t h, uint16_t layers, uint8_t samples) {

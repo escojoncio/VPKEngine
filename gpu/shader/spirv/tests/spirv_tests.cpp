@@ -270,6 +270,19 @@ void amplify(const std::string& dir, const std::string& v) {
         };
         CHECK(!layer(false) && layer(true));
     }
+    {  // declaresSampleBuiltin (forced MSAA leaves a game MSAA pass with such a fragment shader alone): BuiltIn SampleId (18) / SampleMask (20)
+        auto sample = [](uint32_t builtin) {
+            std::vector<uint32_t> w = kViewIndexFrag;
+            for (size_t i = 5; i + 3 < w.size(); ++i)
+                if (w[i] == 0x00040047 && w[i + 2] == 0x0b && w[i + 3] == 0x1158 && builtin) w[i + 3] = builtin;
+            std::string error;
+            spirv::SpirvModule* m = spirv::parse(w.data(), w.size(), error);
+            const bool declares = m && spirv::declaresSampleBuiltin(*m);
+            spirv::release(m);
+            return declares;
+        };
+        CHECK(!sample(0) && sample(18) && sample(20) && !sample(9));
+    }
 }
 
 // unpackFetch: unorm/snorm attributes of whole 4-byte words decode with the unpack_* builtins; the other formats

@@ -1786,6 +1786,7 @@ void finishGraphics(Device* d, PipelineObj* p, std::vector<PipelineObj::StageSrc
         if (!(o.msl.colorOutputs & (1u << c))) st.blend[c].writeMask = 0;
       p->fragmentOutputs = uint8_t(o.msl.colorOutputs & 0xFF);
       p->dualSource = o.msl.dualSource;
+      p->sampleBuiltin = p->sources.back().module && spirv::declaresSampleBuiltin(*p->sources.back().module);
       degradeSrc1Blend(st, o.msl.dualSource);
     }
   }
