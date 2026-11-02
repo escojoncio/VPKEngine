@@ -350,7 +350,8 @@ class Scheduler {
       // attachment), which a framebuffer-fetch pipeline does anyway.
       const bool same = r.pass.sameTargets(need);
       const bool joinable = same || (fetchesOpen && res_ && compatible(r.pass, need, *res_));
-      if (!joinable) reason = CutReason::AttachmentChange;
+      if (!options_.frameOpt) reason = CutReason::AttachmentChange;  // no merge: counted as an attachment cut
+      else if (!joinable) reason = CutReason::AttachmentChange;
       else if (!same && colorBytes(r.pass, need, *res_) > options_.tileBytesPerPixel) reason = CutReason::TileBudget;
       else if (resolveClash(r.pass, desc)) reason = CutReason::AttachmentChange;
       else if (clearsExisting(r.pass, desc)) reason = CutReason::ClearLoad;
@@ -375,6 +376,7 @@ class Scheduler {
   }
 
   void copy(uint32_t i, AccessList acc) {
+    if (!options_.frameOpt) closeRender();  // no hoist, no sink: the copy runs where it was recorded
     if (open_ < 0) return computeWork(i, CutReason::CopyWork, std::move(acc));
     if (conflicts(acc, acc_[open_]) || conflicts(acc, sunkAcc_)) {
       sunk_.push_back(i);

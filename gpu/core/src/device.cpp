@@ -30,6 +30,9 @@ Device::Device(Backend& backend, unsigned pipelineWorkers, LogSink log)
   // VPVK_MSAA_DEAD_STORE=1: drop client Stores of MSAA attachments nothing reads (opt-in, speculative: see
   // CompileOptions::msaaDeadStore). Anything else or unset = off.
   if (const char* e = std::getenv("VPVK_MSAA_DEAD_STORE"); e && e[0] == '1' && !e[1]) compile_.msaaDeadStore = true;
+  // VPVK_FRAME_OPT=0: no merge / hoist / sink in the frame compiler (CompileOptions::frameOpt). Anything else or unset = on.
+  if (const char* e = std::getenv("VPVK_FRAME_OPT"); e && e[0] == '0' && !e[1]) compile_.frameOpt = false;
+  log_(std::string("gpu.frame_opt enabled=") + (compile_.frameOpt ? "1" : "0"));
   if (const char* e = std::getenv("VP_HOLD_MS"); e && *e) holdMs_ = uint32_t(std::strtoul(e, nullptr, 10));
   log_("gpu.hold armed max_ms=" + std::to_string(holdMs_));
   // MSAA attachments that are stored and resolved drop the samples' store (resolve from tile) unless Attachment::keepSamples.

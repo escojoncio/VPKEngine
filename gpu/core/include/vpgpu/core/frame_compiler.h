@@ -278,6 +278,9 @@ struct CompileOptions {
   // geometry (an indirect draw, or more vertices than tileMaxVertices: "still_heavy"; the draw count alone does not stop it). Needs a backend that honours Encoder::view
   // (gpu/metal2). Switched at run time (splitViewsSwitch(); Device copies it here every frame); the pipelines do not change.
   bool splitViews = false;
+  // false (Device: VPVK_FRAME_OPT=0): no pass is merged into an open render encoder and no copy is hoisted or sunk: every command
+  // keeps its recorded position (an A/B switch against the optimiser; the hazards still get their barriers). Default true.
+  bool frameOpt = true;
   // The limit Device started with while tileMaxVertices is a raised one (0 = not raised): CompileStats::tileRaised counts the
   // encoders that only the raised limit keeps off HeavyGeometry.
   uint64_t tileBaseVertices = 0;

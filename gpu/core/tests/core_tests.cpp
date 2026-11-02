@@ -3250,6 +3250,90 @@ void testAutoMsaa() {
   }
 }
 
+// CompileOptions::frameOpt / VPVK_FRAME_OPT: off = no merge, hoist or sink; every command keeps its recorded position.
+void testFrameOpt() {
+  Scene s;
+  const TextureId c = s.rt(), c2 = s.rt();
+  const BufferId ubo = s.buf(), staging = s.buf(), vb = s.buf();
+  Frame f;
+  Scene::passWithDraw(f, Scene::pass(c), {Scene::vsRead(ubo, 0), Scene::vsRead(vb, 0)});  // 0
+  f.copyBuffer(Scene::span(staging), Scene::span(ubo, 256));                               // 1: hoisted
+  Scene::passWithDraw(f, Scene::pass(c), {Scene::vsRead(ubo, 256)});                       // 2: merges
+  f.copyBuffer(Scene::span(staging, 512), Scene::span(vb, 0));                             // 3: WAR on vb -> sunk
+  Scene::passWithDraw(f, Scene::pass(c), {Scene::vsRead(ubo, 512)});                       // 4: merges
+  f.dispatch(Scene::compute({write(ResourceRange::bytes(ubo, 1024, 256), stage::compute)}));  // 5
+  Scene::passWithDraw(f, Scene::pass(c2), {Scene::vsRead(ubo, 1024)});                     // 6
+  const auto& cmds = f.commands();
+
+  CompileOptions on, off;
+  off.frameOpt = false;
+  CHECK(on.frameOpt);
+  const CompiledFrame a = compileFrame(f, &s.res, on), b = compileFrame(f, &s.res, off);
+  CHECK(a.stats.passesMerged > 0 && a.stats.copiesHoisted > 0 && a.stats.copiesSunk > 0);
+  CHECK(b.stats.passesMerged == 0 && b.stats.copiesHoisted == 0 && b.stats.copiesSunk == 0);
+
+  auto accessesOf = [&](uint32_t i) {
+    std::vector<Access> out;
+    if (const auto* rp = std::get_if<RenderPass>(&cmds[i])) {
+      out = attachmentAccesses(rp->desc);
+      for (const Draw& d : rp->draws) for (const Access& x : drawAccesses(d)) out.push_back(x);
+    } else if (const auto* dp = std::get_if<Dispatch>(&cmds[i])) {
+      out = dp->bindings;
+    } else {
+      out = copyAccesses(std::get<Copy>(cmds[i]));
+    }
+    return out;
+  };
+  auto order = [&](const CompiledFrame& cf) {
+    std::vector<uint32_t> o;
+    for (const Encoder& e : cf.encoders) for (uint32_t ci : e.commands) o.push_back(ci);
+    return o;
+  };
+  const std::vector<uint32_t> oa = order(a), ob = order(b);
+  CHECK_EQ(ob.size(), cmds.size());
+  for (uint32_t i = 0; i < ob.size() && i < cmds.size(); ++i) CHECK_EQ(ob[i], i);  // off: the recorded order
+  // Same functional result: every pair of commands that conflicts (one writes what the other touches) runs in the recorded
+  // order, so each resource sees the same writes in the same relative order, with opt on and off.
+  for (const std::vector<uint32_t>* o : {&oa, &ob}) {
+    std::vector<size_t> pos(cmds.size(), 0);
+    for (size_t k = 0; k < o->size(); ++k) pos[(*o)[k]] = k;
+    for (uint32_t i = 0; i < cmds.size(); ++i)
+      for (uint32_t j = i + 1; j < cmds.size(); ++j) {
+        bool conflict = false;
+        for (const Access& x : accessesOf(i))
+          for (const Access& y : accessesOf(j)) conflict = conflict || ((x.write || y.write) && x.range.overlaps(y.range));
+        if (conflict) CHECK(pos[i] < pos[j]);
+      }
+  }
+  CHECK(b.encoders.size() > a.encoders.size());
+  CHECK(!b.barriers.empty());
+
+  {  // Device: VPVK_FRAME_OPT=0 logs gpu.frame_opt enabled=0 and its frames show merged=0 hoisted=0 sunk=0; default is on
+    for (int envOff = 0; envOff < 2; ++envOff) {
+      if (envOff) setenv("VPVK_FRAME_OPT", "0", 1);
+      std::vector<std::string> log;
+      NullBackend be;
+      Device dev(be, 0, [&](const std::string& l) { log.push_back(l); });
+      unsetenv("VPVK_FRAME_OPT");
+      const TextureId dc = dev.createTexture([] {
+        TextureDesc d;
+        d.format = Format::RGBA8Unorm;
+        d.width = d.height = 64;
+        d.usage = usage::colorTarget;
+        return d;
+      }());
+      Frame g;
+      Scene::passWithDraw(g, Scene::pass(dc));
+      Scene::passWithDraw(g, Scene::pass(dc));
+      const FrameReport r = dev.submit(g);
+      CHECK_EQ(r.compile.passesMerged, envOff ? 0u : 1u);
+      size_t lines = 0;
+      for (const std::string& l : log) lines += l == (envOff ? "gpu.frame_opt enabled=0" : "gpu.frame_opt enabled=1");
+      CHECK_EQ(lines, size_t{1});
+    }
+  }
+}
+
 int main(int argc, char** argv) {
   const std::vector<std::pair<const char*, std::function<void()>>> groups = {
       {"resources", testResources}, {"commands", testCommands}, {"merge", testMerge},
@@ -3260,7 +3344,7 @@ int main(int argc, char** argv) {
       {"bigframe", testBigFrameLog}, {"rectenv", testRectEnv}, {"mipchain", testMipChain},
       {"deadstore", testDeadStore}, {"rtmemory", testRtMemory}, {"scopedpool", testScopedPool},
       {"background", testBackground}, {"viewsplit", testViewSplit}, {"tilehot", testTileHot}, {"activity", testActivity}, {"harvest", testHarvest},
-      {"automsaa", testAutoMsaa}, {"required_dispatch", testRequiredDispatch}};
+      {"automsaa", testAutoMsaa}, {"required_dispatch", testRequiredDispatch}, {"frameopt", testFrameOpt}};
   bool ran = false;
   for (const auto& [name, fn] : groups) {
     if (argc > 1 && std::strcmp(argv[1], name) != 0) continue;
