@@ -745,6 +745,10 @@ struct Device : Dispatchable {
   std::unique_ptr<Platform> platform;
   std::unique_ptr<vpgpu::Device> gpu;
   std::unique_ptr<RecipeStore> recipes;  // pipeline recipes for prewarming the next run
+  // Recipes stored by FAIL_ON_PIPELINE_COMPILE_REQUIRED probes of this run (pipelines.cpp noteCompileRequired): not compiled, so
+  // pipelineKnown does not count them.
+  std::mutex probeMutex;
+  std::unordered_set<uint64_t> probed;
   // Recipes stored when this device was created (0 = no recipes / prewarm off) and how the game's own pipeline creates
   // fared against them (pipelines.cpp noteRecipeKey: gpu.pso.recipe game hits/misses). A miss is a key no earlier run
   // recorded: a new pipeline, or recipes that do not match the game's keys.

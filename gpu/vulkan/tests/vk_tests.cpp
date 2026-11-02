@@ -7362,11 +7362,22 @@ void testAsyncPipelines() {
 
 // ---- synchronous creation, opt-in with VPVK_ASYNC_PIPELINES=0 (pipelines.cpp "compile policy") ---------------------------------------------
 // vkCreateGraphicsPipelines does not return while a pipeline of the batch is still compiling, and with
-// VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT a pipeline nobody compiled is not requested at all.
+// VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT a pipeline nobody compiled is refused to the game (COMPILE_REQUIRED, no
+// handle), but its recipe is stored (noteCompileRequired); nothing is compiled until the recipes are (prewarm).
 void testSyncPipelines() {
   setenv("VPVK_ASYNC_PIPELINES", "0", 1);  // main() pins it for every group already; explicit here
   unsetenv("VPVK_REPORT_GEOM");
-  unsetenv("VP_PIPELINE_CACHE_DIR");  // no recipe store: no pipeline is "known" beforehand
+  struct RecipeDir {  // an empty recipe store: nothing is "known" beforehand, and the probes' recipes land in it (destroyed after the device)
+    char path[32] = "/tmp/vpvk_probe_XXXXXX";
+    RecipeDir() {
+      CHECK(mkdtemp(path) != nullptr);
+      setenv("VP_PIPELINE_CACHE_DIR", path, 1);
+    }
+    ~RecipeDir() {
+      unsetenv("VP_PIPELINE_CACHE_DIR");
+      std::filesystem::remove_all(path);
+    }
+  } recipeDir;
   CHECK(!asyncPipelinesOn());
   Ctx c;
   Device* d = from<Device>(c.dev);
@@ -7442,32 +7453,133 @@ void testSyncPipelines() {
   CHECK(pc.createTimedOut.load() == timed0);
   nb.onCompile = nullptr;
 
-  // 2. FAIL_ON_PIPELINE_COMPILE_REQUIRED: cull front was never created, so it is refused and nothing is requested.
+  // 2. FAIL_ON_PIPELINE_COMPILE_REQUIRED: cull front was never created, so the game is refused (COMPILE_REQUIRED, no handle). Only its
+  // recipe is stored: nothing is compiled, and the same state probed again is refused again.
   VkGraphicsPipelineCreateInfo fail = gp[2];
   fail.flags = VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT;
   cache.waitIdle();  // background compiles of the device (engine kernels) are not part of the count
+  CHECK(d->recipes != nullptr);
   const uint32_t compiled0 = cache.totals().compiled;
+  const size_t recipes0 = d->recipes->pipelineCount();
+  const uint64_t gfx0 = pc.probeGraphics.load(), rec0 = pc.probeRecorded.load(), dup0 = pc.probeDup.load(), cap0 = pc.probeCapped.load();
   VkPipeline refused = batch[0];  // overwritten with VK_NULL_HANDLE
   CHECK(vkCreateGraphicsPipelines(c.dev, VK_NULL_HANDLE, 1, &fail, nullptr, &refused) == VK_PIPELINE_COMPILE_REQUIRED);
   CHECK(refused == VK_NULL_HANDLE);
+  CHECK(pc.probeGraphics.load() == gfx0 + 1 && pc.probeRecorded.load() == rec0 + 1);
+  CHECK(pc.probeDup.load() == dup0 && pc.probeCapped.load() == cap0);
+  CHECK(d->recipes->pipelineCount() == recipes0 + 1);
   cache.waitIdle();
-  CHECK(cache.totals().compiled == compiled0);
-  // A batch: the pipeline the cache holds is created, the other one is refused (the call reports the error).
-  VkGraphicsPipelineCreateInfo mixed[2] = {gp[1], fail};
+  CHECK(cache.totals().compiled == compiled0);  // nothing compiled, in the background either
+  VkPipeline again = batch[1];
+  CHECK(vkCreateGraphicsPipelines(c.dev, VK_NULL_HANDLE, 1, &fail, nullptr, &again) == VK_PIPELINE_COMPILE_REQUIRED);
+  CHECK(again == VK_NULL_HANDLE);
+  CHECK(pc.probeGraphics.load() == gfx0 + 2 && pc.probeDup.load() == dup0 + 1);  // a second probe of the state: counted, not stored twice
+  CHECK(pc.probeRecorded.load() == rec0 + 1 && d->recipes->pipelineCount() == recipes0 + 1);
+  // A batch: the pipeline the cache holds is created, the other one (blending on) is refused (the call reports the error) and recorded.
+  VkPipelineColorBlendAttachmentState cbaBlend = cba;
+  cbaBlend.blendEnable = VK_TRUE, cbaBlend.srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA;
+  cbaBlend.dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+  VkPipelineColorBlendStateCreateInfo cbsBlend = cbs;
+  cbsBlend.pAttachments = &cbaBlend;
+  VkGraphicsPipelineCreateInfo unknown = gp[0];
+  unknown.pColorBlendState = &cbsBlend;
+  unknown.flags = VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT;
+  VkGraphicsPipelineCreateInfo mixed[2] = {gp[1], unknown};
   mixed[0].flags = VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT;
   VkPipeline mix[2] = {};
   CHECK(vkCreateGraphicsPipelines(c.dev, VK_NULL_HANDLE, 2, mixed, nullptr, mix) == VK_PIPELINE_COMPILE_REQUIRED);
   CHECK(mix[0] != VK_NULL_HANDLE && mix[1] == VK_NULL_HANDLE);
+  CHECK(pc.probeRecorded.load() == rec0 + 2 && d->recipes->pipelineCount() == recipes0 + 2);
   cache.waitIdle();
   CHECK(cache.totals().compiled == compiled0);
-  // Without the flag it is compiled; asked again with the flag it is known now.
-  VkPipeline front = VK_NULL_HANDLE, again = VK_NULL_HANDLE;
-  CHECK(vkCreateGraphicsPipelines(c.dev, VK_NULL_HANDLE, 1, &gp[2], nullptr, &front) == VK_SUCCESS);
-  CHECK(front && cache.totals().compiled == compiled0 + 1);
-  CHECK(vkCreateGraphicsPipelines(c.dev, VK_NULL_HANDLE, 1, &fail, nullptr, &again) == VK_SUCCESS);
-  CHECK(again != VK_NULL_HANDLE);
+  // The cap: past it nothing more is recorded, and the game is refused all the same.
+  VkPipelineColorBlendAttachmentState cbaCap = cbaBlend;
+  cbaCap.dstColorBlendFactor = VK_BLEND_FACTOR_ZERO;
+  VkPipelineColorBlendStateCreateInfo cbsCap = cbsBlend;
+  cbsCap.pAttachments = &cbaCap;
+  VkGraphicsPipelineCreateInfo capped = unknown;
+  capped.pColorBlendState = &cbsCap;
+  size_t probed = 0;
+  {
+    std::lock_guard<std::mutex> lock(d->probeMutex);
+    probed = d->probed.size();
+  }
+  setProbeRecipeCap(uint32_t(probed));  // full
+  VkPipeline over = batch[1];
+  CHECK(vkCreateGraphicsPipelines(c.dev, VK_NULL_HANDLE, 1, &capped, nullptr, &over) == VK_PIPELINE_COMPILE_REQUIRED);
+  setProbeRecipeCap(32768);  // kProbeRecipeCap
+  CHECK(over == VK_NULL_HANDLE);
+  CHECK(pc.probeCapped.load() == cap0 + 1 && pc.probeRecorded.load() == rec0 + 2 && d->recipes->pipelineCount() == recipes0 + 2);
+  CHECK(vkCreateGraphicsPipelines(c.dev, VK_NULL_HANDLE, 1, &capped, nullptr, &over) == VK_PIPELINE_COMPILE_REQUIRED);  // room again
+  CHECK(pc.probeRecorded.load() == rec0 + 3 && d->recipes->pipelineCount() == recipes0 + 3);
 
-  for (VkPipeline p : {batch[0], batch[1], mix[0], front, again}) vkDestroyPipeline(c.dev, p, nullptr);
+  // 3. Compute: the same (recipe with the stage input {0, 0, input}, nothing compiled, refused again).
+  VkDescriptorSetLayoutBinding sb[4] = {
+      {0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+      {1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+      {2, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+      {3, VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr}};
+  VkDescriptorSetLayoutCreateInfo slci{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+  slci.bindingCount = 4, slci.pBindings = sb;
+  VkDescriptorSetLayout sl;
+  vkCreateDescriptorSetLayout(c.dev, &slci, nullptr, &sl);
+  VkPushConstantRange pcr{VK_SHADER_STAGE_COMPUTE_BIT, 0, 100};
+  VkPipelineLayoutCreateInfo cplci{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+  cplci.setLayoutCount = 1, cplci.pSetLayouts = &sl, cplci.pushConstantRangeCount = 1, cplci.pPushConstantRanges = &pcr;
+  VkPipelineLayout cpl;
+  vkCreatePipelineLayout(c.dev, &cplci, nullptr, &cpl);
+  VkShaderModule cs = module(c, "cull.comp.opt.spv");
+  VkComputePipelineCreateInfo cci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+  cci.flags = VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT;
+  cci.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+  cci.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT, cci.stage.module = cs, cci.stage.pName = "main";
+  cci.layout = cpl;
+  const uint64_t cmp0 = pc.probeCompute.load();
+  VkPipeline cprobe = batch[0];
+  CHECK(vkCreateComputePipelines(c.dev, VK_NULL_HANDLE, 1, &cci, nullptr, &cprobe) == VK_PIPELINE_COMPILE_REQUIRED);
+  CHECK(cprobe == VK_NULL_HANDLE);
+  CHECK(pc.probeCompute.load() == cmp0 + 1 && pc.probeRecorded.load() == rec0 + 4 && d->recipes->pipelineCount() == recipes0 + 4);
+  cache.waitIdle();
+  CHECK(cache.totals().compiled == compiled0);
+  CHECK(vkCreateComputePipelines(c.dev, VK_NULL_HANDLE, 1, &cci, nullptr, &cprobe) == VK_PIPELINE_COMPILE_REQUIRED);  // still not in the cache
+  CHECK(cprobe == VK_NULL_HANDLE && pc.probeCompute.load() == cmp0 + 2 && pc.probeRecorded.load() == rec0 + 4);
+
+  // The game then creates a probed state for real: its recipe is stored but not compiled, so it is a fresh recipe, not a hit
+  // (noteRecipeKey: recipesFresh feeds vpvk_recipe_stats / warm.stamp).
+  const uint32_t fresh0 = d->recipesFresh.load();
+  VkGraphicsPipelineCreateInfo plain = capped;
+  plain.flags = 0;
+  VkPipeline real = VK_NULL_HANDLE;
+  CHECK(vkCreateGraphicsPipelines(c.dev, VK_NULL_HANDLE, 1, &plain, nullptr, &real) == VK_SUCCESS);
+  CHECK(real != VK_NULL_HANDLE && d->recipesFresh.load() == fresh0 + 1);
+  vkDestroyPipeline(c.dev, real, nullptr);
+
+  // 4. Once the recorded recipes are compiled (the pre-launch prewarm), the same probes succeed: known, a hit.
+  const PrewarmResult pr = prewarm(*d->platform, cache, *d->recipes, nullptr, 0.0);
+  CHECK(pr.failed == 0);
+  cache.waitIdle();
+  CHECK(cache.totals().compiled >= compiled0 + 4);
+  const uint64_t gfx1 = pc.probeGraphics.load(), cmp1 = pc.probeCompute.load();
+  VkPipeline hit[3] = {}, hitCompute = VK_NULL_HANDLE;
+  VkGraphicsPipelineCreateInfo retry[3] = {fail, unknown, capped};
+  CHECK(vkCreateGraphicsPipelines(c.dev, VK_NULL_HANDLE, 3, retry, nullptr, hit) == VK_SUCCESS);
+  CHECK(hit[0] && hit[1] && hit[2]);
+  CHECK(vkCreateComputePipelines(c.dev, VK_NULL_HANDLE, 1, &cci, nullptr, &hitCompute) == VK_SUCCESS);
+  CHECK(hitCompute != VK_NULL_HANDLE);
+  CHECK(pc.probeGraphics.load() == gfx1 && pc.probeCompute.load() == cmp1);  // no probe was refused
+  for (VkPipeline p : {hit[0], hit[1], hit[2], hitCompute}) vkDestroyPipeline(c.dev, p, nullptr);
+  vkDestroyShaderModule(c.dev, cs, nullptr);
+  vkDestroyPipelineLayout(c.dev, cpl, nullptr);
+  vkDestroyDescriptorSetLayout(c.dev, sl, nullptr);
+  // vk.pso.census carries the refused creates.
+  const std::string census = psoCensusLine(pc, cache.totals(), Platform::ArchiveCensus{});
+  CHECK(census.find(" compile_required=" + std::to_string(pc.probeGraphics.load() + pc.probeCompute.load())) != std::string::npos);
+  VkPipeline front = VK_NULL_HANDLE;
+  const uint32_t fresh1 = d->recipesFresh.load();
+  CHECK(vkCreateGraphicsPipelines(c.dev, VK_NULL_HANDLE, 1, &gp[2], nullptr, &front) == VK_SUCCESS);  // without the flag: a hit now
+  CHECK(front && d->recipesFresh.load() == fresh1);  // compiled by the prewarm: no longer a fresh recipe
+
+  for (VkPipeline p : {batch[0], batch[1], mix[0], front}) vkDestroyPipeline(c.dev, p, nullptr);
   vkDestroyShaderModule(c.dev, vs, nullptr);
   vkDestroyShaderModule(c.dev, fs, nullptr);
   vkDestroyPipelineLayout(c.dev, pl, nullptr);

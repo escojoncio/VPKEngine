@@ -247,8 +247,9 @@ void retainKey(Device* dev, const PipelineObj& p, vpgpu::PipelineKey k) {
 //   recipe store / disk cache already holds costs no wait. Game threads translate on their own and the Metal compiles run
 //   in parallel on the core's workers (PipelineCache::workerLoop compiles outside its mutex; the waiters sleep on a
 //   condition variable): no lock is held across the wait. With VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT a
-//   pipeline the cache / recipe store does not hold is not requested: VK_PIPELINE_COMPILE_REQUIRED, handle VK_NULL_HANDLE
-//   (not honoured in the asynchronous mode, where the key is not known when the call returns).
+//   pipeline the cache / recipe store does not hold is not requested for the game: VK_PIPELINE_COMPILE_REQUIRED, handle VK_NULL_HANDLE
+//   (not honoured in the asynchronous mode, where the key is not known when the call returns). Its recipe is stored, nothing is
+//   compiled (noteCompileRequired).
 uint32_t waitBudgetMs(const char* name, uint32_t fallback) {
   const char* e = std::getenv(name);
   return e && *e ? uint32_t(std::strtoul(e, nullptr, 10)) : fallback;
@@ -700,14 +701,14 @@ void pipelineSummary(Device* dev, bool final) {
 // The body of the vk.pso.census line. archived = serialized to disk; archive_pending = queued or added but not on disk yet;
 // archive_spilled = refused at the harvest queue's fuse; archive_trim_dropped = queued entries dropped by a critical trim.
 std::string psoCensusLine(const PipelineCounters& c, const vpgpu::PipelineStats& t, const Platform::ArchiveCensus& a) {
-  char b[480];
+  char b[512];
   std::snprintf(b, sizeof b,
                 "created=%llu compiled=%u failed=%llu timed_out=%llu archived=%u not_archived_depth_only=%u "
                 "not_archived_other=%u archive_hits=%u compiled_in_session=%u archive_dup=%u archive_pending=%u "
-                "archive_spilled=%u archive_trim_dropped=%u",
+                "archive_spilled=%u archive_trim_dropped=%u compile_required=%llu",
                 (unsigned long long)c.pipelinesCreated.load(), t.compiled, (unsigned long long)(t.failed + c.translateFailed.load()),
                 (unsigned long long)c.createTimedOut.load(), a.archived, a.depthOnly, a.other, a.hits, a.compiled, a.dup,
-                a.pending, a.spilled, a.trimDropped);
+                a.pending, a.spilled, a.trimDropped, (unsigned long long)(c.probeGraphics.load() + c.probeCompute.load()));
   return b;
 }
 
@@ -773,6 +774,7 @@ std::string RecipeUse::keysLine(const RecipeStore* recipes) const {
 // flush and device destroy (always printed).
 void psoCensus(Device* dev, bool force) {
   if (!dev) return;
+  probeReport(dev, force);
   static std::atomic<int64_t> nextNs{0};
   const int64_t nowNs = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
   if (!force && nowNs < nextNs.load(std::memory_order_relaxed)) return;
@@ -795,6 +797,60 @@ void psoCensus(Device* dev, bool force) {
     lastKeys = keys, ++keyLines;
     log("vk.pso.census_keys " + keys);
   }
+}
+
+// ---- FAIL_ON_PIPELINE_COMPILE_REQUIRED probes ----------------------------------------------------------
+// UE5 probes its whole PSO list (>8600) with the flag during its precache. The game is answered COMPILE_REQUIRED as the spec asks,
+// but the shaders are already translated: the recipe (state + stage inputs) is stored so a later boot's pre-launch compile has it.
+// Nothing is compiled, requested or retained here (the caller deletes the PipelineObj). Device::probed keeps pipelineKnown from
+// counting such a recipe as compiled: a probe of it is refused again until the cache holds the pipeline.
+namespace {
+constexpr uint32_t kProbeRecipeCap = 32768;  // recipes one session may store from probes
+std::atomic<uint32_t> gProbeRecipeCap{kProbeRecipeCap};
+}  // namespace
+
+void setProbeRecipeCap(uint32_t cap) { gProbeRecipeCap = cap; }
+
+void noteCompileRequired(Device* d, const vpgpu::PipelineState& st, vpgpu::PipelineKey key, const std::array<uint64_t, 3>& inputs,
+                         bool compute) {
+  PipelineCounters& c = pipelineCounters();
+  ++(compute ? c.probeCompute : c.probeGraphics);
+  if (!d->recipes) return;  // nothing to store into
+  {
+    std::lock_guard<std::mutex> lock(d->probeMutex);
+    if (d->probed.count(key.value)) {
+      ++c.probeDup;  // probed before (or by another thread a moment ago)
+      return;
+    }
+    if (d->probed.size() >= gProbeRecipeCap.load()) {
+      if (!c.probeCapped.fetch_add(1)) logf("vk.pso.probe capped recipes=%u (further probes are not recorded)", gProbeRecipeCap.load());
+      return;
+    }
+    d->probed.insert(key.value);
+  }
+  d->recipes->addPipeline(st, inputs);
+  if (d->recipes->has(key.value)) ++c.probeRecorded;  // (a store without a file, or a stage without an input, keeps nothing)
+}
+
+void probeReport(Device* d, bool force) {
+  static std::atomic<int64_t> nextNs{0};
+  static std::atomic<unsigned> lines{0};
+  static std::mutex m;
+  static std::string last;
+  PipelineCounters& c = pipelineCounters();
+  if (!d || !(c.probeGraphics.load() + c.probeCompute.load())) return;
+  const int64_t nowNs = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+  if (!force && nowNs < nextNs.load(std::memory_order_relaxed)) return;
+  std::lock_guard<std::mutex> lock(m);
+  nextNs.store(nowNs + 5'000'000'000LL, std::memory_order_relaxed);
+  char b[160];
+  std::snprintf(b, sizeof b, "graphics=%llu compute=%llu recorded=%llu dup=%llu capped=%llu", (unsigned long long)c.probeGraphics.load(),
+                (unsigned long long)c.probeCompute.load(), (unsigned long long)c.probeRecorded.load(),
+                (unsigned long long)c.probeDup.load(), (unsigned long long)c.probeCapped.load());
+  if (b == last || lines.load() >= 720) return;
+  last = b;
+  ++lines;
+  logf("vk.pso.probe %s", b);
 }
 
 // gpu.amp: at most every 10 s, the multiview draws recorded since the last line (none: no line). inst = multiview by
@@ -1830,14 +1886,27 @@ uint64_t vertexInputHash(const std::vector<spirv::VertexAttribute>& attrs, const
   return h;
 }
 
+// Would creating `key` compile nothing new: the core cache already has it (any status) or an earlier run's recipe does (its
+// prewarm / the Metal binary archive serve it)? What VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT tests.
+// A recipe stored by a probe of this run (Device::probed) is not compiled yet: it does not count.
+bool pipelineKnown(Device* d, vpgpu::PipelineKey key) {
+  if (d->gpu->pipelines().status(key) != vpgpu::PipelineCache::Status::Missing) return true;
+  if (!d->recipes || !d->recipes->has(key.value)) return false;
+  std::lock_guard<std::mutex> lock(d->probeMutex);
+  return !d->probed.count(key.value);
+}
+
 // Was this key among the recipes of earlier runs (or already requested on this device)? Checked before the game's request
 // records it. The boot log's last "gpu.pso.recipe game" line is what AVP reads to trust (or drop) warm.stamp.
 // gpu.pso.miss_detail: the first 20 misses with every field of the pipeline state and what the Vulkan object adds to it.
 void noteRecipeKey(Device* d, vpgpu::PipelineKey key, const PipelineObj& p, uint64_t viHash) {
   const std::string& label = p.state.label;
   d->recipeUse.note(key.value, label);
-  const bool hit = d->gpu->pipelines().status(key) != vpgpu::PipelineCache::Status::Missing ||
-                   (d->recipes && d->recipes->has(key.value));
+  const bool hit = pipelineKnown(d, key);  // (a recipe stored by a probe of this run, not compiled yet, is no hit)
+  if (d->recipes) {  // the game creates it for real now: its recipe is a normal one from here on (known even if the pipeline is destroyed later)
+    std::lock_guard<std::mutex> lock(d->probeMutex);
+    d->probed.erase(key.value);
+  }
   if (!hit) ++d->recipesFresh;  // vpvk_recipe_stats: also when nothing was stored (a first run misses everything)
   if (!d->prewarmedRecipes) return;
   const uint32_t h = hit ? ++d->recipeHits : d->recipeHits.load(), m = hit ? d->recipeMisses.load() : ++d->recipeMisses;
@@ -1845,13 +1914,6 @@ void noteRecipeKey(Device* d, vpgpu::PipelineKey key, const PipelineObj& p, uint
   if (!hit && m <= 20) log("gpu.pso.miss_detail " + recipeMissDetail(p, viHash));
   if (h + m <= 4 || (h + m) % 64 == 0)
     logf("gpu.pso.recipe game hits=%u misses=%u prewarmed=%u", h, m, d->prewarmedRecipes);
-}
-
-// Would creating `key` compile nothing new: the core cache already has it (any status) or an earlier run's recipe does (its
-// prewarm / the Metal binary archive serve it)? What VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT tests.
-bool pipelineKnown(Device* d, vpgpu::PipelineKey key) {
-  return d->gpu->pipelines().status(key) != vpgpu::PipelineCache::Status::Missing ||
-         (d->recipes && d->recipes->has(key.value));
 }
 
 // The part of a pipeline's creation that translates and registers shaders: everything that needs the SPIR-V. Runs on
@@ -1923,6 +1985,7 @@ void finishGraphics(Device* d, PipelineObj* p, std::vector<PipelineObj::StageSrc
   else p->attrs = std::move(attrs);
   if (ok && p->failOnCompile && !pipelineKnown(d, p->key)) {
     p->compileRequired = true;
+    noteCompileRequired(d, st, p->key, inputs, false);
     return;
   }
   if (ok) {
@@ -2101,6 +2164,7 @@ PipelineObj* createCompute(Device* d, const VkComputePipelineCreateInfo& ci) {
     p->key = p->state.key();
     if (p->failOnCompile && !pipelineKnown(d, p->key)) {
       p->compileRequired = true;
+      noteCompileRequired(d, p->state, p->key, {0, 0, o.input}, true);
       return;
     }
     noteRecipeKey(d, p->key, *p, 0);

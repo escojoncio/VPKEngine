@@ -319,6 +319,9 @@ struct PipelineCounters {
   // vk.pso.census: creations whose SPIR-V translation failed (the Metal compile failures are the cache's: totals().failed),
   // and pipelines still not ready when vkCreate*Pipelines gave up waiting (legacy mode, VPVK_PIPELINE_CREATE_WAIT_MS).
   std::atomic<uint64_t> translateFailed{0}, createTimedOut{0};
+  // vk.pso.probe (noteCompileRequired): creates refused with FAIL_ON_PIPELINE_COMPILE_REQUIRED, by kind; their recipes stored (recorded),
+  // probed before (dup) or refused at the cap (capped).
+  std::atomic<uint64_t> probeGraphics{0}, probeCompute{0}, probeRecorded{0}, probeDup{0}, probeCapped{0};
   std::atomic<uint64_t> recordWaits{0}, recordTimeouts{0};
   // Draws that wanted the indirect-argument patch kernel (vk.indirect_patch) while it was failed / not back in 2 s: CPU path or skipped.
   std::atomic<uint64_t> indirectPatchFallback{0};
@@ -345,6 +348,12 @@ void pipelineSummary(Device*, bool final);
 // "vk.pso.census": one line with how many pipelines the game created and what became of each (pipelines.cpp). Without
 // `force`, at most every 10 s and only when a counter moved; `force` (cache flush, device destroy) always prints.
 void psoCensus(Device*, bool force);
+// A create with FAIL_ON_PIPELINE_COMPILE_REQUIRED the cache / recipes do not hold is answered COMPILE_REQUIRED as always; only its recipe
+// is stored (at most kProbeRecipeCap per session) so the next boot's prewarm has it. Nothing is compiled or retained; the key stays
+// unknown (pipelineKnown) until something compiles it. probeReport: the "vk.pso.probe" line, at most every 5 s (`force`: now), 720 lines.
+void noteCompileRequired(Device*, const vpgpu::PipelineState&, vpgpu::PipelineKey, const std::array<uint64_t, 3>& inputs, bool compute);
+void probeReport(Device*, bool force);
+void setProbeRecipeCap(uint32_t cap);  // tests
 // The "key=value ..." body of that line.
 std::string psoCensusLine(const PipelineCounters&, const vpgpu::PipelineStats&, const Platform::ArchiveCensus&);
 // "gpu.amp": multiview draws per 10 s, vertex amplified vs by instancing (and why not amplified); called from the submit tick.
