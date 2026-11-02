@@ -1363,6 +1363,9 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkCreateDevice(VkPhysicalDevice pd,
   const bool doPrewarm = d->recipes->enabled() && prewarmEnabled();
   d->recipesLoaded = uint32_t(d->recipes->pipelineCount());
   if (doPrewarm) d->prewarmedRecipes = d->recipesLoaded;
+  // vk.pso.census prewarmed_unused / requested_not_prewarmed: the recipe keys once the prewarm's refresh() has rekeyed them
+  // (a changed translator gives other MSL ids, so other keys); read earlier they would not match anything the game asks for.
+  const auto noteRecipeKeys = [dev = d] { dev->recipeUse.setPrewarmed(dev->recipes->keys()); };
   if (asyncPipelinesOn()) {
     // vkCreate*Pipelines returns before translating (pipelines.cpp "compile policy"); the frame gate replaces the
     // core's frame hold, and the prewarm runs in the background (it used to block this call for up to 20 s).
@@ -1371,13 +1374,14 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkCreateDevice(VkPhysicalDevice pd,
     if (!std::getenv("VP_HOLD_MS")) d->gpu->setHoldMs(0);
     if (doPrewarm) {
       Device* dev = d;
-      d->prewarmThread = std::thread([dev] {
+      d->prewarmThread = std::thread([dev, noteRecipeKeys] {
 #if defined(__APPLE__)
         pthread_set_qos_class_self_np(QOS_CLASS_UTILITY, 0);
 #endif
         PrewarmHooks hooks;
         hooks.cancel = &dev->prewarmCancel;
         hooks.refreshThreads = 1;
+        hooks.afterRefresh = noteRecipeKeys;
         hooks.pollMs = 250;  // the game runs meanwhile: one status() lock per recipe per poll is not free
         hooks.addShader = [dev](uint64_t id, ShaderBlob blob) {
           std::lock_guard<std::mutex> lock(dev->shaderMutex);
@@ -1394,7 +1398,9 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkCreateDevice(VkPhysicalDevice pd,
   } else if (doPrewarm) {
     // Bounded (8 s from the prewarm's start, recipes and forced-MSAA variants alike): vkCreateDevice must not sit through a whole
     // cold prewarm; what is left (variants included) keeps compiling on the workers.
-    d->recipesPrewarmed = prewarm(*d->platform, d->gpu->pipelines(), *d->recipes, nullptr, 8.0).ready;
+    PrewarmHooks hooks;
+    hooks.afterRefresh = noteRecipeKeys;
+    d->recipesPrewarmed = prewarm(*d->platform, d->gpu->pipelines(), *d->recipes, nullptr, 8.0, hooks).ready;
   }
   logf("vk.device exts=%u multiview=%d fdm=%d metal_objects=%d", ci->enabledExtensionCount,
        d->multiview, d->densityMap, d->metalObjects);
@@ -3117,6 +3123,7 @@ void runBatches(Device* d, std::vector<DeferredBatch>& list, size_t count) {
   pipelineSummary(d, false);
   psoCensus(d, false);
   ampCensus();
+  indirectStatsLog();
   msaaSubmitTick(d->submits);
   if (taa.enabled) taaRecordSubmit(d->submits, taa, st.taaJittered, st.taaSkipped, st.taaTargetW, st.taaTargetH);
   if (taa.enabled && st.ui.passes) {  // masks for hosts that composite the eye themselves (vpvk_ui_mask_texture)

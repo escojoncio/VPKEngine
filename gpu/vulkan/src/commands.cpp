@@ -1110,6 +1110,14 @@ struct Translator {
 
   Device* devForce() const { return const_cast<Device*>(anyDevice()); }  // (the device is not const: ZeroLog only promises not to change it)
 
+  // The body of the "vk.msaa rej_detail" / "vk.msaa rej_first" lines: reason and what taaEyePass judged the pass by (eyeWhy).
+  static std::string rejDetailLine(const char* kind, const char* reason, const EyeWhy& e, const char* colorFmt, const char* depthFmt) {
+    char b[400];
+    std::snprintf(b, sizeof b, "vk.msaa %s reason=%s w=%u h=%u fbW=%u fbH=%u depthW=%u depthH=%u viewMask=0x%x eyeW=%u eyeH=%u jit=%d fmt=%s/%s",
+                  kind, reason, e.w, e.h, e.fbW, e.fbH, e.depthW, e.depthH, e.viewMask, e.eyeW, e.eyeH, e.jit ? 1 : 0, colorFmt, depthFmt);
+    return b;
+  }
+
   // "vk.msaa rej_detail reason=.. w= h= ...": the 'eye' rejection with what taaEyePass judged the pass by (eyeWhy). At most 3 lines
   // per session: the first rejected pass, then only passes of a larger area (the eye's scene is among the biggest). Decision unchanged.
   void eyeRejDetail(Device* dev, const vpgpu::RenderPassDesc& d) const {
@@ -1124,9 +1132,8 @@ struct Translator {
     const bool hc = d.colors[0].texture && dev->gpu->textureDesc(d.colors[0].texture, gc);
     const bool hz = d.depth.texture && dev->gpu->textureDesc(d.depth.texture, gz);
     static const char* const kWhy[] = {"no_depth", "no_eye_size", "size", "other"};
-    logf("vk.msaa rej_detail reason=%s w=%u h=%u fbW=%u fbH=%u depthW=%u depthH=%u viewMask=0x%x eyeW=%u eyeH=%u jit=%d fmt=%s/%s",
-         kWhy[eyeWhy.why], eyeWhy.w, eyeWhy.h, eyeWhy.fbW, eyeWhy.fbH, eyeWhy.depthW, eyeWhy.depthH, eyeWhy.viewMask, eyeWhy.eyeW,
-         eyeWhy.eyeH, eyeWhy.jit ? 1 : 0, hc ? vpgpu::formatInfo(gc.format).name : "none", hz ? vpgpu::formatInfo(gz.format).name : "none");
+    log(rejDetailLine("rej_detail", kWhy[eyeWhy.why], eyeWhy, hc ? vpgpu::formatInfo(gc.format).name : "none",
+                      hz ? vpgpu::formatInfo(gz.format).name : "none"));
   }
 
   // Does a draw of the pass about to open (ops after `at` up to its end, secondary buffers included) keep the pass at 1x?
@@ -1251,17 +1258,33 @@ struct Translator {
     if (!c.texture || !z.texture) return rej(mt.rejCd, "cd");
     vpgpu::TextureDesc gc, gz;
     if (!dev->gpu->textureDesc(c.texture, gc) || !dev->gpu->textureDesc(z.texture, gz)) return rej(mt.rejDesc, "desc");
+    // "vk.msaa rej_first reason=smp|msstore ...": the first pass rejected for each of those two reasons (once per device), with the
+    // rej_detail fields and the game's samples / store / load / resolve of the pass.
+    auto rejFirst = [&](int slot, const char* why) {
+      if (mt.rejFirstDone[slot]) return;
+      mt.rejFirstDone[slot] = true;
+      char x[160];
+      std::snprintf(x, sizeof x, " samples=%u/%u forced=%d store=%d/%d load=%d/%d resolve=%d/%d", unsigned(gc.samples), unsigned(gz.samples), n,
+                    int(c.store), int(z.store), int(c.load), int(z.load), int(c.resolve ? 1 : 0), int(z.resolve ? 1 : 0));
+      log(rejDetailLine("rej_first", why, eyeWhy, vpgpu::formatInfo(gc.format).name, vpgpu::formatInfo(gz.format).name) + x);
+    };
     // The game's own MSAA of s samples (colour and depth alike) below the forced N: the pass is upgraded (renders into N-sample
     // twins that resolve into what the game resolves into), but only when the game never keeps its s samples: its colour is a
     // memoryless Resolve into a 1x target, its depth a Resolve or a DONT_CARE, nothing loads. Anything else is the game's own MSAA.
     const bool taaDepth = taaPass && !taa->still;  // the depth VPKTAA reads after the frame must reach the game's image
     const bool up = n > int(gc.samples) && gc.samples > 1 && gc.samples == gz.samples;
-    if (!up && (gc.samples != 1 || gz.samples != 1)) return rej(mt.rejSmp, "smp");  // the game's own MSAA: not ours
+    if (!up && (gc.samples != 1 || gz.samples != 1)) {  // the game's own MSAA: not ours
+      rejFirst(0, "smp");
+      return rej(mt.rejSmp, "smp");
+    }
     if (up) {
       const bool cOk = c.resolve && c.store == vpgpu::StoreAction::Resolve && c.load != vpgpu::LoadAction::Load;
       const bool zOk = z.load != vpgpu::LoadAction::Load && ((z.resolve && z.store == vpgpu::StoreAction::Resolve) ||
                                                               (!z.resolve && z.store == vpgpu::StoreAction::DontCare && !taaDepth));
-      if (!cOk || !zOk) return rej(mt.rejStore, "msstore");
+      if (!cOk || !zOk) {
+        rejFirst(1, "msstore");
+        return rej(mt.rejStore, "msstore");
+      }
     } else if (c.resolve || z.resolve) {
       return rej(mt.rejRes, "res");
     }
@@ -1323,6 +1346,15 @@ struct Translator {
       }
       forceN = samples;
       ++mt.passes, ++mt.up;
+      if (!mt.upDetailDone) {  // "vk.msaa up_detail": the first upgraded pass (once per device)
+        mt.upDetailDone = true;
+        vpgpu::TextureDesc rc, rz;
+        const bool hrc = c.resolve && dev->gpu->textureDesc(c.resolve, rc), hrz = z.resolve && dev->gpu->textureDesc(z.resolve, rz);
+        logf("vk.msaa up_detail w=%u h=%u layers=%u color=%s depth=%s resolve=%s/%s samples=%u->%u multiview=%d viewMask=0x%x", w, h,
+             unsigned(layers), vpgpu::formatInfo(gc.format).name, vpgpu::formatInfo(gz.format).name,
+             hrc ? vpgpu::formatInfo(rc.format).name : "none", hrz ? vpgpu::formatInfo(rz.format).name : "none", unsigned(gc.samples),
+             unsigned(samples), std::popcount(viewMask) >= 2 ? 1 : 0, viewMask);
+      }
       return;
     }
     auto twin = [](vpgpu::Attachment& a, vpgpu::TextureId t, bool resolves) {

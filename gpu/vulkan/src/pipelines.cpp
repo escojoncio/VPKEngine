@@ -711,6 +711,60 @@ std::string psoCensusLine(const PipelineCounters& c, const vpgpu::PipelineStats&
   return b;
 }
 
+void RecipeUse::note(uint64_t key, const std::string& label) {
+  std::lock_guard<std::mutex> lock(mutex);
+  if (requested.size() >= kMax && !requested.count(key)) {
+    overflow = true;
+    return;
+  }
+  if (!requested.insert(key).second) return;
+  if (std::binary_search(prewarmed.begin(), prewarmed.end(), key)) ++requestedPrewarmed;
+  else if (freshSample.size() < kSample) freshSample.emplace_back(key, label);
+}
+
+void RecipeUse::setPrewarmed(std::vector<uint64_t> keys) {
+  std::sort(keys.begin(), keys.end());
+  std::lock_guard<std::mutex> lock(mutex);
+  prewarmed = std::move(keys);
+  requestedPrewarmed = 0;
+  for (const uint64_t k : requested)
+    if (std::binary_search(prewarmed.begin(), prewarmed.end(), k)) ++requestedPrewarmed;
+  freshSample.erase(std::remove_if(freshSample.begin(), freshSample.end(),
+                                   [&](const auto& f) { return std::binary_search(prewarmed.begin(), prewarmed.end(), f.first); }),
+                    freshSample.end());
+}
+
+std::string RecipeUse::census() const {
+  std::lock_guard<std::mutex> lock(mutex);
+  char b[160];
+  std::snprintf(b, sizeof b, " prewarmed_unused=%zu requested_not_prewarmed=%zu requested=%zu%s", prewarmed.size() - requestedPrewarmed,
+                requested.size() - requestedPrewarmed, requested.size(), overflow ? " requested_overflow=1" : "");
+  return b;
+}
+
+std::string RecipeUse::keysLine(const RecipeStore* recipes) const {
+  std::lock_guard<std::mutex> lock(mutex);
+  const auto entry = [](uint64_t key, std::string label) {
+    for (char& c : label)
+      if (c == ' ' || c == ',') c = '_';
+    char b[24];
+    std::snprintf(b, sizeof b, "%016llx:", (unsigned long long)key);
+    return b + label;
+  };
+  std::string unused, fresh;
+  size_t n = 0;
+  for (const uint64_t key : prewarmed) {
+    if (n >= kSample) break;
+    if (requested.count(key)) continue;
+    vpgpu::PipelineState st;
+    if (recipes) recipes->stateFor(key, st);
+    unused += (n++ ? "," : "") + entry(key, st.label.empty() ? "-" : st.label);
+  }
+  for (size_t i = 0; i < freshSample.size(); ++i) fresh += (i ? "," : "") + entry(freshSample[i].first, freshSample[i].second);
+  if (unused.empty() && fresh.empty()) return {};
+  return "prewarmed_unused=[" + unused + "] requested_not_prewarmed=[" + fresh + "]";
+}
+
 // created = vkCreate*Pipelines objects made; compiled / failed = the cache's backend compiles (failed also counts the
 // translations that never got there); timed_out = creations that came back unready after VPVK_PIPELINE_CREATE_WAIT_MS
 // (synchronous mode only: the asynchronous mode never waits). archived ... compiled_in_session: Platform::ArchiveCensus
@@ -726,14 +780,21 @@ void psoCensus(Device* dev, bool force) {
   const vpgpu::PipelineStats t = dev->gpu ? dev->gpu->pipelines().totals() : vpgpu::PipelineStats{};
   Platform::ArchiveCensus a;
   if (dev->platform) dev->platform->archiveCensus(a);
-  const std::string b = psoCensusLine(c, t, a);
+  const std::string b = psoCensusLine(c, t, a) + dev->recipeUse.census();
   static std::mutex m;
-  static std::string last;
+  static std::string last, lastKeys;
+  static unsigned keyLines = 0;
   std::lock_guard<std::mutex> lock(m);
   nextNs.store(nowNs + 10'000'000'000LL, std::memory_order_relaxed);
   if (!force && last == b) return;
   last = b;
   logf("vk.pso.census %s", b.c_str());
+  // The keys behind prewarmed_unused / requested_not_prewarmed (10 of each), on a line of their own; at most 120 per process.
+  const std::string keys = dev->recipeUse.keysLine(dev->recipes.get());
+  if (!keys.empty() && keys != lastKeys && keyLines < 120) {
+    lastKeys = keys, ++keyLines;
+    log("vk.pso.census_keys " + keys);
+  }
 }
 
 // gpu.amp: at most every 10 s, the multiview draws recorded since the last line (none: no line). inst = multiview by
@@ -1746,15 +1807,42 @@ void targetFormats(const VkGraphicsPipelineCreateInfo& ci, vpgpu::PipelineState&
     }
 }
 
+// The line body of gpu.pso.miss_detail for a Vulkan pipeline object: the core description of its state plus the creation inputs
+// that are not PipelineState fields (view count / mask, sample mask, vertex input hash). The render pass / subpass is not kept on the object.
+std::string recipeMissDetail(const PipelineObj& p, uint64_t viHash) {
+  char b[260];
+  std::snprintf(b, sizeof b,
+                "src=vk_recipe key_dec=%llu views=%u viewMask=0x%x sampleMask=0x%x a2cTest=%d gameSamples=%u topology=%d vbs=%zu vi=%016llx",
+                (unsigned long long)p.state.key().value, p.viewCount, p.viewMask, p.sampleMask, int(p.a2cTest), unsigned(p.gameSamples),
+                int(p.topology), p.vertexBuffers.size(), (unsigned long long)viHash);
+  return vpgpu::describePipelineState(p.state, b);
+}
+
+// Hash of a pipeline's vertex input (attributes and bindings): PipelineState::key() has no field for it, it only reaches the key
+// through the vertex shader id (gpu.pso.miss_detail vi=).
+uint64_t vertexInputHash(const std::vector<spirv::VertexAttribute>& attrs, const std::vector<spirv::VertexBufferBinding>& vbs) {
+  uint64_t h = 1469598103934665603ull;
+  const auto mix = [&h](uint64_t x) {
+    for (int i = 0; i < 8; ++i, x >>= 8) h = (h ^ (x & 0xFF)) * 1099511628211ull;
+  };
+  for (const spirv::VertexAttribute& a : attrs) mix(a.location), mix(a.binding), mix(a.offset), mix(uint64_t(a.format)), mix(a.components);
+  for (const spirv::VertexBufferBinding& v : vbs) mix(v.binding), mix(v.stride), mix(v.perInstance), mix(v.slot), mix(v.divisor);
+  return h;
+}
+
 // Was this key among the recipes of earlier runs (or already requested on this device)? Checked before the game's request
 // records it. The boot log's last "gpu.pso.recipe game" line is what AVP reads to trust (or drop) warm.stamp.
-void noteRecipeKey(Device* d, vpgpu::PipelineKey key, const std::string& label) {
+// gpu.pso.miss_detail: the first 20 misses with every field of the pipeline state and what the Vulkan object adds to it.
+void noteRecipeKey(Device* d, vpgpu::PipelineKey key, const PipelineObj& p, uint64_t viHash) {
+  const std::string& label = p.state.label;
+  d->recipeUse.note(key.value, label);
   const bool hit = d->gpu->pipelines().status(key) != vpgpu::PipelineCache::Status::Missing ||
                    (d->recipes && d->recipes->has(key.value));
   if (!hit) ++d->recipesFresh;  // vpvk_recipe_stats: also when nothing was stored (a first run misses everything)
   if (!d->prewarmedRecipes) return;
   const uint32_t h = hit ? ++d->recipeHits : d->recipeHits.load(), m = hit ? d->recipeMisses.load() : ++d->recipeMisses;
   if (!hit && m <= 8) logf("gpu.pso.recipe game miss key=%016llx pipeline=%s", (unsigned long long)key.value, label.c_str());
+  if (!hit && m <= 20) log("gpu.pso.miss_detail " + recipeMissDetail(p, viHash));
   if (h + m <= 4 || (h + m) % 64 == 0)
     logf("gpu.pso.recipe game hits=%u misses=%u prewarmed=%u", h, m, d->prewarmedRecipes);
 }
@@ -1827,6 +1915,7 @@ void finishGraphics(Device* d, PipelineObj* p, std::vector<PipelineObj::StageSrc
   if (p->rasterDiscard && !p->isDynamic(VK_DYNAMIC_STATE_RASTERIZER_DISCARD_ENABLE)) discardRaster(st);
   p->ok = ok;
   p->key = st.key();
+  const uint64_t vi = vertexInputHash(attrs, p->vertexBuffers);  // before attrs may be moved below
   if (!ok) noteTranslateFail(why, p->key.value, st.label);
   p->inputs = inputs;
   // Only texel buffer / stride variants and the VPKTAA UI-mask variants (maskPipelineKey) retranslate.
@@ -1837,7 +1926,7 @@ void finishGraphics(Device* d, PipelineObj* p, std::vector<PipelineObj::StageSrc
     return;
   }
   if (ok) {
-    noteRecipeKey(d, p->key, st.label);
+    noteRecipeKey(d, p->key, *p, vi);
     retainKey(d, *p, p->key);
     d->gpu->pipelines().request(st, p->key, vpgpu::Priority::Visible);
     if (d->recipes) d->recipes->addPipeline(st, inputs);
@@ -2014,7 +2103,7 @@ PipelineObj* createCompute(Device* d, const VkComputePipelineCreateInfo& ci) {
       p->compileRequired = true;
       return;
     }
-    noteRecipeKey(d, p->key, p->state.label);
+    noteRecipeKey(d, p->key, *p, 0);
     retainKey(d, *p, p->key);
     d->gpu->pipelines().request(p->state, p->key, vpgpu::Priority::Visible);
     if (d->recipes) d->recipes->addPipeline(p->state, {0, 0, o.input});
@@ -3212,6 +3301,80 @@ bool indirectPatch(Device* d, vpgpu::PipelineKey& key) {
   return false;
 }
 
+std::string indirectStatsLine(const PipelineCounters& c) {
+  char b[256];
+  std::snprintf(b, sizeof b,
+                "draws=%llu count_variants=%llu max_count=%u max_instances=%u cpu_readable=%llu not_readable=%llu over_cap_seen=%llu",
+                (unsigned long long)c.indirectDraws.load(), (unsigned long long)c.indirectCountDraws.load(), c.indirectMaxCount.load(),
+                c.indirectMaxInstances.load(), (unsigned long long)c.indirectCpuReadable.load(),
+                (unsigned long long)c.indirectNotReadable.load(), (unsigned long long)c.indirectOverCap.load());
+  return b;
+}
+
+void indirectStatsLog(int64_t nowNs) {
+  static std::atomic<int64_t> nextNs{0};
+  static std::mutex m;
+  static uint64_t lastDraws = 0;
+  static unsigned lines = 0;
+  if (nowNs < 0) nowNs = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+  if (nowNs < nextNs.load(std::memory_order_relaxed)) return;
+  const PipelineCounters& c = pipelineCounters();
+  std::lock_guard<std::mutex> lock(m);
+  const uint64_t draws = c.indirectDraws.load();
+  if (draws == lastDraws || lines >= 720) return;
+  lastDraws = draws, ++lines;
+  nextNs.store(nowNs + 5'000'000'000LL, std::memory_order_relaxed);
+  logf("vk.indirect_stats %s", indirectStatsLine(c).c_str());
+}
+
+// vk.indirect_stats: counts the draw and looks at up to kIndirectScan of its records when they sit in host-visible memory (what the CPU path
+// would read; for a Count draw the count word must be readable too and bounds the records). Device-local buffers are only counted.
+// With arguments the GPU generates, the host-visible bytes may be what an earlier frame left: the maxima are then stale data.
+static constexpr uint32_t kIndirectScan = 64;  // records looked at per command
+static void noteIndirectArgs(const Buffer* b, VkDeviceSize off, uint32_t n, uint32_t stride, bool indexed,
+                             const Buffer* countBuf, VkDeviceSize countOff) {
+  PipelineCounters& pc = pipelineCounters();
+  ++pc.indirectDraws;
+  if (countBuf) ++pc.indirectCountDraws;
+  const auto host = [](const Buffer* x, VkDeviceSize at, VkDeviceSize bytes) -> const uint8_t* {
+    return x && x->memory && x->memory->host && at + bytes <= x->size ? x->memory->host + x->offset + at : nullptr;
+  };
+  const uint32_t size = indexed ? 20 : 16;
+  uint32_t records = n;
+  if (countBuf) {
+    const uint8_t* cp = host(countBuf, countOff, 4);
+    if (cp) {
+      uint32_t live;
+      std::memcpy(&live, cp, 4);
+      records = std::min(records, live);
+    }
+    if (!cp || !host(b, off, size)) return void(++pc.indirectNotReadable);
+  } else if (!host(b, off, size)) {
+    return void(++pc.indirectNotReadable);
+  }
+  ++pc.indirectCpuReadable;
+  const auto atomicMax = [](std::atomic<uint32_t>& a, uint32_t v) {
+    uint32_t cur = a.load(std::memory_order_relaxed);
+    while (v > cur && !a.compare_exchange_weak(cur, v, std::memory_order_relaxed)) {}
+  };
+  for (uint32_t i = 0; i < std::min(records, kIndirectScan); ++i) {
+    const uint8_t* src = host(b, off + VkDeviceSize(i) * stride, size);
+    if (!src) break;
+    uint32_t count, instances;
+    if (indexed) {
+      VkDrawIndexedIndirectCommand c;
+      std::memcpy(&c, src, sizeof c);
+      count = c.indexCount, instances = c.instanceCount;
+    } else {
+      VkDrawIndirectCommand c;
+      std::memcpy(&c, src, sizeof c);
+      count = c.vertexCount, instances = c.instanceCount;
+    }
+    atomicMax(pc.indirectMaxCount, count), atomicMax(pc.indirectMaxInstances, instances);
+    if (count > (1u << 25) || instances > (1u << 20)) ++pc.indirectOverCap;  // commands.cpp kMaxIndirectCount / kMaxIndirectInstances
+  }
+}
+
 // vkCmdDraw(Indexed)Indirect(Count). GPU-read arguments whenever the draw is recorded inside a
 // render pass of this command buffer (the common case): plain draws read the app's buffer
 // directly; multiview and draw-count draws read a copy that the patch kernel writes before the
@@ -3231,6 +3394,7 @@ void recordIndirectDraw(Recorder& r, const Buffer* b, VkDeviceSize off, uint32_t
     r.ops.emplace_back(std::move(op));
     return;
   }
+  noteIndirectArgs(b, off, n, stride, indexed, countBuf, countOff);
   // Triangle fans have no Metal topology: each record becomes a direct draw converted like vkCmdDraw (makeDraw), the
   // arguments read now from the host-visible buffer (stale if the GPU writes them later in the submission).
   if (!countBuf && op.pipe && b->memory && b->memory->host &&

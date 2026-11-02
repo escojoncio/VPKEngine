@@ -1125,6 +1125,7 @@ PrewarmResult prewarm(Platform& platform, vpgpu::PipelineCache& cache, RecipeSto
   const RecipeStore::RefreshResult rf =
       store.refresh(hooks.refreshThreads ? hooks.refreshThreads : std::max(2u, std::thread::hardware_concurrency()));
   r.retranslated = rf.retranslated;
+  if (hooks.afterRefresh) hooks.afterRefresh();  // refresh() rekeys the pipelines of a changed translator: keys read earlier are stale
   if (cancelled()) return r;
   RecipeStore::Snapshot snap = store.snapshot();
   logf("gpu.pso.recipe loaded shaders=%zu pipelines=%zu retranslated=%u same_msl=%u failed=%u ms=%.0f",

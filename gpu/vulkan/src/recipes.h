@@ -320,6 +320,7 @@ struct PrewarmHooks {
   unsigned refreshThreads = 0;
   uint32_t pollMs = 15;
   uint32_t maxVariants = 0;  // cap of forced-MSAA variants (0 = kPrewarmMaxVariants)
+  std::function<void()> afterRefresh;  // called once the retranslation is done (the store's keys are final for this run)
 };
 PrewarmResult prewarm(Platform&, vpgpu::PipelineCache&, RecipeStore&,
                       const std::function<void(uint32_t, uint32_t)>& progress, double maxSeconds = 0,

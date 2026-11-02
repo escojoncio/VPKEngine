@@ -326,6 +326,11 @@ struct PipelineCounters {
   // gpu.amp (ampCensus): draws of multiview pipelines since the last line, amplified or instanced (by PipelineObj::AmpWhy for the
   // latter), and the view-vertices (count x instances, views included) of the instanced ones.
   std::atomic<uint64_t> ampDraws{0}, ampInstDraws{0}, ampInstVerts{0}, ampBy[PipelineObj::AmpWhyCount]{};
+  // vk.indirect_stats (indirectStatsLog): vkCmdDraw*Indirect* recorded (indirectDraws; indirectCountDraws = the Count variants), and what
+  // the CPU could see of their records in host-visible memory (never a GPU readback): the largest count / instance count, commands
+  // whose records were readable / not, and records past the caps of commands.cpp (count > 2^25 or instances > 2^20).
+  std::atomic<uint64_t> indirectDraws{0}, indirectCountDraws{0}, indirectCpuReadable{0}, indirectNotReadable{0}, indirectOverCap{0};
+  std::atomic<uint32_t> indirectMaxCount{0}, indirectMaxInstances{0};
 };
 PipelineCounters& pipelineCounters();
 struct GateResult {
@@ -344,6 +349,11 @@ void psoCensus(Device*, bool force);
 std::string psoCensusLine(const PipelineCounters&, const vpgpu::PipelineStats&, const Platform::ArchiveCensus&);
 // "gpu.amp": multiview draws per 10 s, vertex amplified vs by instancing (and why not amplified); called from the submit tick.
 void ampCensus();
+// "vk.indirect_stats": the indirect-draw counters above, cumulative, at most every 5 s and only when a draw was recorded since the last
+// line, 720 lines at most (called from the submit tick). nowNs < 0 = the steady clock (tests pass their own).
+void indirectStatsLog(int64_t nowNs = -1);
+// The "key=value ..." body of that line.
+std::string indirectStatsLine(const PipelineCounters&);
 
 struct Recorder {
   Device* device = nullptr;

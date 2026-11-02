@@ -3313,6 +3313,7 @@ void MetalBackend::Impl::notePso(bool archived, double ms, const PipelineState& 
   if (!archived && h <= 20)
     info("gpu.pso.miss n=" + std::to_string(h) + " kind=" + kind + " label=" + token(label) +
          " key=" + std::to_string(s.key().value) + " ms=" + std::to_string(int(ms)));
+  if (!archived && h <= 20) info("gpu.pso.miss_detail " + describePipelineState(s, std::string("src=metal kind=") + kind + " key_dec=" + std::to_string(s.key().value)));
   if ((a + h) <= 8 || (a + h) % 64 == 0 || (!archived && h <= 32)) {
     char b[160];
     std::snprintf(b, sizeof b, "gpu.pso.aot archived=%u hot=%u hot_ms_total=%.0f hot_ms_max=%.0f", a, h, total, worst);

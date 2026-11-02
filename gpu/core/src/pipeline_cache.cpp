@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdio>
 #include <fstream>
 #include <sstream>
 #include <utility>
@@ -64,6 +65,46 @@ PipelineKey PipelineState::key() const {
     for (int i = 0; i < 8; ++i, x >>= 8) h = (h ^ (x & 0xFF)) * 1099511628211ull;
   });
   return {h ? h : 1};  // 0 means "no pipeline"
+}
+
+std::string describePipelineState(const PipelineState& s, const std::string& more) {
+  static const char* const kPrimitive[] = {"points", "lines", "line_strip", "triangles", "triangle_strip"};
+  char b[160];
+  std::string label = s.label;
+  for (char& c : label)
+    if (c == ' ') c = '_';
+  std::string o;
+  std::snprintf(b, sizeof b, "key=%016llx ", (unsigned long long)s.key().value);
+  o += b;
+  o += "label=" + label + " samples=" + std::to_string(int(s.samples)) + " colorFormats=";
+  bool any = false;
+  for (const Format f : s.colorFormats)
+    if (f != Format::Undefined) o += (any ? "/" : "") + std::string(formatInfo(f).name), any = true;
+  if (!any) o += "none";
+  o += std::string(" depthFormat=") + formatInfo(s.depthFormat).name;
+  o += std::string(" primitive=") + kPrimitive[std::min<size_t>(size_t(s.primitive), 4)];
+  std::snprintf(b, sizeof b, " vs=%016llx fs=%016llx extra{cs=%016llx", (unsigned long long)s.vertexShader,
+                (unsigned long long)s.fragmentShader, (unsigned long long)s.computeShader);
+  o += b;
+  for (size_t i = 0; i < s.blend.size(); ++i) {
+    const BlendState& x = s.blend[i];
+    if (s.colorFormats[i] == Format::Undefined && !x.enabled) continue;
+    std::snprintf(b, sizeof b, " blend%zu=%d:%d.%d.%d/%d.%d.%d:m%x", i, int(x.enabled), int(x.srcColor), int(x.dstColor),
+                  int(x.colorOp), int(x.srcAlpha), int(x.dstAlpha), int(x.alphaOp), unsigned(x.writeMask));
+    o += b;
+  }
+  std::snprintf(b, sizeof b, " depth=%d%d:%d cull=%d a2c=%d fetch=%x", int(s.depthTest), int(s.depthWrite), int(s.depthCompare),
+                int(s.cull), int(s.alphaToCoverage), unsigned(s.fetch.mask));
+  o += b;
+  if (s.stencilTest) {
+    for (const StencilFace* f : {&s.stencilFront, &s.stencilBack}) {
+      std::snprintf(b, sizeof b, " stencil%s=%d.%d.%d:%d:%x.%x", f == &s.stencilFront ? "F" : "B", int(f->fail), int(f->depthFail),
+                    int(f->pass), int(f->compare), unsigned(f->readMask), unsigned(f->writeMask));
+      o += b;
+    }
+  }
+  if (!more.empty()) o += " " + more;
+  return o + "}";
 }
 
 PipelineCache::PipelineCache(Backend& backend, unsigned workers) : backend_(backend) {

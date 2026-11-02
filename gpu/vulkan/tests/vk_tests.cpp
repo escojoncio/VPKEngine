@@ -161,6 +161,32 @@ struct Ctx {
   vpgpu::Device& gpu() { return *from<Device>(dev)->gpu; }
 };
 
+// The driver's log has no sink (vpvk::log writes to stderr): what fn makes it write, read back from a temporary file that stands in for fd 2.
+std::string captureStderr(const std::function<void()>& fn) {
+  std::fflush(stderr);
+  char path[] = "/tmp/vpvk_stderr_XXXXXX";
+  const int fd = mkstemp(path);
+  const int saved = dup(2);
+  dup2(fd, 2);
+  fn();
+  std::fflush(stderr);
+  dup2(saved, 2);
+  close(saved);
+  std::string out;
+  char buf[4096];
+  lseek(fd, 0, SEEK_SET);
+  for (ssize_t n; (n = read(fd, buf, sizeof buf)) > 0;) out.append(buf, size_t(n));
+  close(fd);
+  unlink(path);
+  return out;
+}
+
+size_t countOf(const std::string& text, const std::string& needle) {
+  size_t n = 0;
+  for (size_t at = text.find(needle); at != std::string::npos; at = text.find(needle, at + 1)) ++n;
+  return n;
+}
+
 void testPhysical() {
   vpvk_config_set_quest_identity(1);  // asserts the Quest 3 / Adreno 740 profile: opt-in
   Ctx c;
@@ -1963,11 +1989,19 @@ void testRecipes() {
     RecipeStore s(dir2, 8);
     std::unique_ptr<Platform> platform = createPlatform();
     PrewarmResult r;
+    const std::vector<uint64_t> before = s.keys();  // keys under the old translator's MSL id
+    RecipeUse use;
+    PrewarmHooks hooks;
+    hooks.afterRefresh = [&] { use.setPrewarmed(s.keys()); };  // what vkCreateDevice does: the keys after the refresh
     {
       vpgpu::Device gpu(platform->backend(), 2, [](const std::string&) {});
-      r = prewarm(*platform, gpu.pipelines(), s, nullptr);
+      r = prewarm(*platform, gpu.pipelines(), s, nullptr, 0.0, hooks);
       CHECK(gpu.pipelines().status({key}) == vpgpu::PipelineCache::Status::Ready);
     }
+    CHECK(before.size() == 1 && before[0] != key);
+    CHECK(use.prewarmed == std::vector<uint64_t>({key}));  // the refreshed key, not the stale one
+    use.note(key, "cull");  // the key the runtime computes: a prewarmed one
+    CHECK(use.census() == " prewarmed_unused=0 requested_not_prewarmed=0 requested=1");
     CHECK(r.retranslated == 1 && r.recipes == 1 && r.failed == 0);
     vpgpu::PipelineState now;
     CHECK(s.keys().size() == 1 && s.stateFor(key, now) && now.computeShader == msl);
@@ -5110,7 +5144,10 @@ void testMsaaForce() {
       const vpgpu::TextureId mc = mk(vpgpu::Format::RGBA8Unorm, 4), md = mk(vpgpu::Format::D32Float, 4);
       OpBeginRendering mb = scene(vpgpu::LoadAction::Clear, vpgpu::StoreAction::DontCare, vpgpu::StoreAction::DontCare);
       mb.desc.colors[0].texture = mc, mb.desc.depth.texture = md;
-      run(mb, geo, f7);
+      const std::string smpLog = captureStderr([&] { run(mb, geo, f7); });
+      // vk.msaa rej_first reason=smp: the first pass of that reason (the game's own 4x here, forced 4).
+      CHECK(countOf(smpLog, "vk.msaa rej_first reason=smp w=1920 h=1824 ") == 1 &&
+            smpLog.find(" fmt=RGBA8Unorm/D32Float samples=4/4 forced=4 store=") != std::string::npos);
       CHECK(pass(f7).desc.colors[0].texture == mc && !pass(f7).desc.colors[0].autoMsaa && mt.passes == 3);
       c.gpu().destroy(mc);
       c.gpu().destroy(md);
@@ -5176,7 +5213,11 @@ void testMsaaForce() {
       };
       {  // colour: memoryless Resolve into the game's 1x; depth: DONT_CARE (gets a 1x partner of ours as resolve target)
         vpgpu::Frame f;
-        run(msPass(vpgpu::StoreAction::Resolve, vpgpu::StoreAction::DontCare, false, vpgpu::LoadAction::Clear), g2, f);
+        const std::string upLog = captureStderr([&] { run(msPass(vpgpu::StoreAction::Resolve, vpgpu::StoreAction::DontCare, false, vpgpu::LoadAction::Clear), g2, f); });
+        // vk.msaa up_detail: the first upgraded pass (size, formats incl. the resolve targets, samples before -> after, multiview).
+        CHECK(countOf(upLog, "vk.msaa up_detail ") == 1 && mt.upDetailDone);
+        CHECK(upLog.find("vk.msaa up_detail w=1920 h=1824 layers=1 color=RGBA8Unorm depth=D32Float resolve=RGBA8Unorm/D32Float samples=2->4 multiview=0 viewMask=0x0\n") !=
+              std::string::npos);
         const vpgpu::RenderPass rp = pass(f);
         const vpgpu::Attachment &c0 = rp.desc.colors[0], &z = rp.desc.depth;
         CHECK(c0.autoMsaa && z.autoMsaa && c0.texture != mc && z.texture != md && !c0.keepSamples && !z.keepSamples);
@@ -5190,7 +5231,8 @@ void testMsaaForce() {
       }
       {  // depth the game resolves: the twin resolves into the game's own depth resolve target
         vpgpu::Frame f;
-        run(msPass(vpgpu::StoreAction::Resolve, vpgpu::StoreAction::Resolve, true, vpgpu::LoadAction::Clear), g2, f);
+        CHECK(captureStderr([&] { run(msPass(vpgpu::StoreAction::Resolve, vpgpu::StoreAction::Resolve, true, vpgpu::LoadAction::Clear), g2, f); })
+                  .find("up_detail") == std::string::npos);  // once per session
         const vpgpu::RenderPass rp = pass(f);
         CHECK(rp.desc.depth.autoMsaa && rp.desc.depth.resolve == rd && rp.desc.depth.store == vpgpu::StoreAction::Resolve);
         CHECK(rp.desc.colors[0].resolve == color && mt.passes == passes0 + 2 && mt.up == up0 + 2);
@@ -5202,9 +5244,14 @@ void testMsaaForce() {
       };
       {  // the game stores its MS colour (StoreAndResolve), or its MS depth: its samples are read later, not upgraded
         vpgpu::Frame f1, f2, f3;
-        run(msPass(vpgpu::StoreAction::StoreAndResolve, vpgpu::StoreAction::DontCare, false, vpgpu::LoadAction::Clear), g2, f1);
+        const std::string first = captureStderr([&] { run(msPass(vpgpu::StoreAction::StoreAndResolve, vpgpu::StoreAction::DontCare, false, vpgpu::LoadAction::Clear), g2, f1); });
         CHECK(untouched2(f1) && mt.rejStore == store0 + 1);
-        run(msPass(vpgpu::StoreAction::Resolve, vpgpu::StoreAction::Store, false, vpgpu::LoadAction::Clear), g2, f2);
+        // vk.msaa rej_first: the first pass of each reason, with the rej_detail fields (eye size 1920x1824 from the jitter) and the pass's actions.
+        CHECK(countOf(first, "vk.msaa rej_first ") == 1);
+        CHECK(first.find("vk.msaa rej_first reason=msstore w=1920 h=1824 fbW=0 fbH=0 depthW=1920 depthH=1824 viewMask=0x0 eyeW=1920 eyeH=1824 jit=1 "
+                         "fmt=RGBA8Unorm/D32Float samples=2/2 forced=4 store=") != std::string::npos);
+        CHECK(captureStderr([&] { run(msPass(vpgpu::StoreAction::Resolve, vpgpu::StoreAction::Store, false, vpgpu::LoadAction::Clear), g2, f2); })
+                  .find("rej_first") == std::string::npos);  // the same reason again: not repeated
         CHECK(untouched2(f2) && mt.rejStore == store0 + 2);
         run(msPass(vpgpu::StoreAction::Resolve, vpgpu::StoreAction::DontCare, false, vpgpu::LoadAction::Load), g2, f3);  // continues stored samples
         CHECK(untouched2(f3) && mt.rejStore == store0 + 3);
@@ -5215,7 +5262,7 @@ void testMsaaForce() {
         const vpgpu::TextureId qc = mk(vpgpu::Format::RGBA8Unorm, 4, true), qd = mk(vpgpu::Format::D32Float, 4, true);
         OpBeginRendering qb = msPass(vpgpu::StoreAction::Resolve, vpgpu::StoreAction::DontCare, false, vpgpu::LoadAction::Clear);
         qb.desc.colors[0].texture = qc, qb.desc.depth.texture = qd;
-        run(qb, g2, f);
+        CHECK(captureStderr([&] { run(qb, g2, f); }).find("rej_first") == std::string::npos);  // (reason smp was reported above)
         CHECK(pass(f).desc.colors[0].texture == qc && !pass(f).desc.colors[0].autoMsaa && mt.rejSmp == smp0 + 1 && mt.up == up0 + 2);
         c.gpu().destroy(qc);
         c.gpu().destroy(qd);
@@ -5657,7 +5704,10 @@ void testMsaaForceMarkedEye() {
     };
     run(256, 256);
     CHECK(d->msaaTwins.passes == 1 && d->msaaTwins.rejEye == 0);
-    run(128, 128);  // not the eye size: a non-multiview pass must match it exactly
+    // (vk.msaa rej_detail keeps its fields after sharing its builder with rej_first.)
+    const std::string detail = captureStderr([&] { run(128, 128); });  // not the eye size: a non-multiview pass must match it exactly
+    CHECK(detail.find("vk.msaa rej_detail reason=size w=128 h=128 ") != std::string::npos &&
+          detail.find(" viewMask=0x0 eyeW=256 eyeH=256 jit=0 fmt=RGBA8Unorm/D32Float\n") != std::string::npos);
     CHECK(d->msaaTwins.passes == 1 && d->msaaTwins.rejEye == 1);
     // The marked size only adds detections: a multiview pass of any size is still an eye pass, as without it.
     run(1024, 1024, 0x3);
@@ -7571,12 +7621,73 @@ void testCreateDefault() {
   resetCreateWaitMs();
 }
 
+// RecipeUse (vk.pso.census prewarmed_unused= / requested_not_prewarmed=) and the line of gpu.pso.miss_detail (describePipelineState).
+void testRecipeUseAndMissDetail() {
+  {
+    RecipeUse ru;
+    ru.prewarmed = {1, 2, 3};
+    ru.note(2, "b"), ru.note(2, "b"), ru.note(9, "nine x"), ru.note(7, "seven");  // a repeat counts once
+    CHECK(ru.requestedPrewarmed == 1 && ru.requested.size() == 3 && !ru.overflow);
+    CHECK(ru.census() == " prewarmed_unused=2 requested_not_prewarmed=2 requested=3");
+    CHECK(ru.keysLine(nullptr) == "prewarmed_unused=[0000000000000001:-,0000000000000003:-] requested_not_prewarmed=[0000000000000009:nine_x,0000000000000007:seven]");
+    // prewarmed keys that arrive after the game's first creates (the prewarm's refresh() rekeyed the recipes): recounted.
+    RecipeUse late;
+    late.note(5, "five"), late.note(6, "six");
+    late.setPrewarmed({9, 6, 7});
+    CHECK(late.prewarmed == std::vector<uint64_t>({6, 7, 9}) && late.requestedPrewarmed == 1);
+    CHECK(late.census() == " prewarmed_unused=2 requested_not_prewarmed=1 requested=2");
+    CHECK(late.keysLine(nullptr) == "prewarmed_unused=[0000000000000007:-,0000000000000009:-] requested_not_prewarmed=[0000000000000005:five]");
+    late.setPrewarmed({5, 6});  // set again: not additive
+    CHECK(late.requestedPrewarmed == 2 && late.census() == " prewarmed_unused=0 requested_not_prewarmed=0 requested=2" && late.keysLine(nullptr).empty());
+    RecipeUse none;
+    CHECK(none.census() == " prewarmed_unused=0 requested_not_prewarmed=0 requested=0" && none.keysLine(nullptr).empty());
+  }
+  {  // 10 keys at most of each group; the counts still say how many
+    RecipeUse ru;
+    for (uint64_t k = 1; k <= 12; ++k) ru.prewarmed.push_back(k);
+    for (uint64_t k = 100; k < 120; ++k) ru.note(k, "f" + std::to_string(k));
+    CHECK(ru.census() == " prewarmed_unused=12 requested_not_prewarmed=20 requested=20");
+    const std::string keys = ru.keysLine(nullptr);
+    CHECK(countOf(keys, ":-") == 10 && countOf(keys, ":f1") == 10 && keys.find("000000000000000b") == std::string::npos &&
+          keys.find("000000000000006e") == std::string::npos);  // key 11 and the 11th fresh key (110 = 0x6e) are cut
+  }
+  {  // bounded: past kMax distinct keys nothing more is kept, and the census says so
+    RecipeUse ru;
+    for (uint64_t k = 0; k < RecipeUse::kMax + 5; ++k) ru.note(k + 1, "x");
+    CHECK(ru.requested.size() == RecipeUse::kMax && ru.overflow);
+    CHECK(ru.census().find(" requested=16384 requested_overflow=1") != std::string::npos);
+    ru.note(1, "x");  // a key already held is not an overflow
+    CHECK(ru.requested.size() == RecipeUse::kMax);
+  }
+  {  // describePipelineState: every field key() hashes, and the key
+    vpgpu::PipelineState s;
+    s.label = "my pipe", s.samples = 4, s.colorFormats[0] = vpgpu::Format::RGBA8Unorm, s.colorFormats[2] = vpgpu::Format::RGBA16Float;
+    s.depthFormat = vpgpu::Format::D32Float, s.primitive = vpgpu::Primitive::TriangleStrip, s.vertexShader = 0xAB, s.fragmentShader = 0xCD;
+    s.blend[0].enabled = true, s.blend[0].srcColor = vpgpu::BlendFactor::SrcAlpha, s.blend[0].dstColor = vpgpu::BlendFactor::OneMinusSrcAlpha;
+    s.depthTest = s.depthWrite = true, s.depthCompare = vpgpu::CompareOp::LessEqual, s.cull = vpgpu::CullMode::Back, s.alphaToCoverage = true;
+    char want[512];
+    std::snprintf(want, sizeof want,
+                  "key=%016llx label=my_pipe samples=4 colorFormats=RGBA8Unorm/RGBA16Float depthFormat=D32Float primitive=triangle_strip "
+                  "vs=00000000000000ab fs=00000000000000cd extra{cs=0000000000000000 blend0=1:4.5.0/1.0.0:mf blend2=0:1.0.0/1.0.0:mf "
+                  "depth=11:3 cull=2 a2c=1 fetch=0 src=test}",
+                  (unsigned long long)s.key().value);
+    CHECK(vpgpu::describePipelineState(s, "src=test") == want);
+    CHECK(vpgpu::describePipelineState(s).find(" fetch=0}") != std::string::npos);  // no extra: nothing appended
+    vpgpu::PipelineState t = s;  // a different blend is a different key and a different line
+    t.blend[0].dstColor = vpgpu::BlendFactor::One;
+    CHECK(t.key() != s.key() && vpgpu::describePipelineState(t).find("blend0=1:4.1.0/") != std::string::npos);
+    s.stencilTest = true, s.stencilFront.compare = vpgpu::CompareOp::Equal, s.stencilFront.readMask = 0x0F;
+    CHECK(vpgpu::describePipelineState(s).find(" stencilF=0.0.0:2:f.ff stencilB=0.0.0:7:ff.ff") != std::string::npos);
+  }
+}
+
 // vk.pso.census: the counters the creation calls and awaitPipelines move (created, translation failures, timeouts).
 namespace vpvk {
 unsigned awaitPipelines(Device*, const std::vector<vpgpu::PipelineKey>&, uint32_t, const char*, bool backoff);  // pipelines.cpp
 
 }
 void testPsoCensus() {
+  testRecipeUseAndMissDetail();
   Ctx c;
   Device* d = from<Device>(c.dev);
   VkAttachmentDescription att{};
@@ -7622,8 +7733,27 @@ void testPsoCensus() {
   PipelineCounters& pc = pipelineCounters();
   const uint64_t created0 = pc.pipelinesCreated.load(), failed0 = pc.translateFailed.load(), timed0 = pc.createTimedOut.load();
   VkPipeline good = VK_NULL_HANDLE, bad = VK_NULL_HANDLE;
-  CHECK(vkCreateGraphicsPipelines(c.dev, VK_NULL_HANDLE, 1, &gp, nullptr, &good) == VK_SUCCESS);
+  // gpu.pso.miss_detail: with recipes prewarmed, a create whose key nothing knew is a miss and logs every field of its state.
+  d->prewarmedRecipes = 1;
+  d->recipeUse.prewarmed = {0x1111, 0x2222};  // vk.pso.census prewarmed_unused: two recipes the game never asks for
+  const std::string made = captureStderr([&] { CHECK(vkCreateGraphicsPipelines(c.dev, VK_NULL_HANDLE, 1, &gp, nullptr, &good) == VK_SUCCESS); });
   CHECK(good && from<PipelineObj>(good)->ok);
+  {
+    const PipelineObj* po = from<PipelineObj>(good);
+    char want[512];
+    std::snprintf(want, sizeof want, "gpu.pso.miss_detail key=%016llx label=%s samples=1 colorFormats=RGBA8Unorm depthFormat=",
+                  (unsigned long long)po->key.value, po->state.label.c_str());
+    CHECK(countOf(made, "gpu.pso.miss_detail ") == 1 && made.find(want) != std::string::npos);
+    std::snprintf(want, sizeof want, " primitive=triangles vs=%016llx fs=%016llx extra{cs=0000000000000000 blend0=0:0.0.0/0.0.0:mf depth=00:7 cull=0",
+                  (unsigned long long)po->state.vertexShader, (unsigned long long)po->state.fragmentShader);
+    CHECK(made.find(want) != std::string::npos);
+    // Creation inputs that are not PipelineState fields: view count / mask, sample mask, vertex input hash (the hash's start value: no inputs).
+    // key_dec = the key in decimal, to match the Metal gpu.pso.miss line (key=<decimal>).
+    std::snprintf(want, sizeof want, "src=vk_recipe key_dec=%llu views=1 viewMask=0x0 sampleMask=0xffffffff a2cTest=0 gameSamples=1 topology=3 vbs=0 vi=14650fb0739d0383}",
+                  (unsigned long long)po->key.value);
+    CHECK(made.find(want) != std::string::npos);
+    CHECK(made.find("gpu.pso.recipe game miss key=") != std::string::npos);  // (the older line is still there)
+  }
   CHECK(pc.pipelinesCreated.load() - created0 == 1 && pc.translateFailed.load() == failed0 && pc.createTimedOut.load() == timed0);
   gp.stageCount = 3;
   CHECK(vkCreateGraphicsPipelines(c.dev, VK_NULL_HANDLE, 1, &gp, nullptr, &bad) == VK_SUCCESS);  // always VK_SUCCESS
@@ -7649,13 +7779,53 @@ void testPsoCensus() {
   Platform::ArchiveCensus a;
   CHECK(!d->platform->archiveCensus(a));  // the null platform has no archive
   CHECK(a.pending == 0 && a.spilled == 0);
-  psoCensus(d, true);                     // prints one vk.pso.census line
+  // vk.pso.census prewarmed_unused= / requested_not_prewarmed=: the 2 recipes nobody asked for, and the keys the game's creates asked for
+  // without a prewarmed recipe (the created pipeline and one more noted here), each group's keys on a line of their own.
+  d->recipeUse.note(0xfeed, "test fresh");
+  const size_t asked = d->recipeUse.requested.size();
+  CHECK(asked >= 2 && d->recipeUse.requested.count(from<PipelineObj>(good)->key.value) && d->recipeUse.requestedPrewarmed == 0);
+  const std::string census = captureStderr([&] { psoCensus(d, true); });  // prints one vk.pso.census line
+  char wantCensus[128];
+  std::snprintf(wantCensus, sizeof wantCensus, " prewarmed_unused=2 requested_not_prewarmed=%zu requested=%zu\n", asked, asked);
+  CHECK(census.find("vk.pso.census created=") != std::string::npos && census.find(wantCensus) != std::string::npos);
+  CHECK(census.find("vk.pso.census_keys prewarmed_unused=[0000000000001111:-,0000000000002222:-] requested_not_prewarmed=[") != std::string::npos);
+  CHECK(census.find(",000000000000feed:test_fresh]\n") != std::string::npos);
   // The archive fields: archived = serialized, plus how many are still pending and how many spilled at the queue's fuse.
   a.archived = 1696, a.pending = 5000, a.spilled = 7, a.trimDropped = 9, a.other = 2, a.dup = 3;
   const std::string line = psoCensusLine(pc, c.gpu().pipelines().totals(), a);
   CHECK(line.find(" archived=1696 ") != std::string::npos);
   CHECK(line.find("not_archived_other=2 ") != std::string::npos && line.find("archive_dup=3 ") != std::string::npos);
   CHECK(line.find(" archive_pending=5000 archive_spilled=7 archive_trim_dropped=9") != std::string::npos);
+  // gpu.pso.miss_detail is logged for the first 20 misses only (the created pipeline was the first): 25 more states, distinct by blend.
+  {
+    VkPipelineColorBlendAttachmentState blend = cba;
+    VkPipelineColorBlendStateCreateInfo bs = cbs;
+    bs.pAttachments = &blend;
+    gp.pColorBlendState = &bs;
+    gp.stageCount = 2;
+    VkPipeline again = VK_NULL_HANDLE;  // the first create once more: known now, no miss
+    gp.pColorBlendState = &cbs;
+    CHECK(captureStderr([&] { vkCreateGraphicsPipelines(c.dev, VK_NULL_HANDLE, 1, &gp, nullptr, &again); }).find("gpu.pso.miss_detail") ==
+          std::string::npos);
+    vkDestroyPipeline(c.dev, again, nullptr);
+    gp.pColorBlendState = &bs;
+    VkPipeline many[25];
+    const std::string log25 = captureStderr([&] {
+      for (int i = 0; i < 25; ++i) {
+        blend.blendEnable = VK_TRUE, blend.colorWriteMask = 1u + unsigned(i % 15);
+        blend.srcColorBlendFactor = i / 15 ? VK_BLEND_FACTOR_SRC_ALPHA : VK_BLEND_FACTOR_ONE;
+        blend.dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+        vkCreateGraphicsPipelines(c.dev, VK_NULL_HANDLE, 1, &gp, nullptr, &many[i]);
+      }
+    });
+    CHECK(countOf(log25, "gpu.pso.miss_detail ") == 19 && countOf(log25, "gpu.pso.recipe game miss key=") == 7);
+    // The blend is a PipelineState field, so it is in the key and in the line: src ONE (1) / SRC_ALPHA (4), dst ONE_MINUS_SRC_ALPHA (5).
+    CHECK(log25.find(" blend0=1:1.5.0/0.0.0:m1 ") != std::string::npos && log25.find(" blend0=1:1.5.0/0.0.0:mf ") != std::string::npos &&
+          log25.find(" blend0=1:4.5.0/0.0.0:m1 ") != std::string::npos);
+    CHECK(from<PipelineObj>(many[0])->key.value != from<PipelineObj>(many[1])->key.value);
+    CHECK(d->recipeMisses.load() == 26 && d->recipeUse.requested.size() == asked + 25);
+    for (VkPipeline p : many) vkDestroyPipeline(c.dev, p, nullptr);
+  }
   vkDestroyPipeline(c.dev, good, nullptr);
   vkDestroyPipeline(c.dev, bad, nullptr);
 }
@@ -8013,6 +8183,9 @@ void testSkipReasons() {
     VkDeviceMemory am = alloc(c, 1 << 16, 1);  // host-visible
     VkBuffer ab = buffer(c, 4096, am, 0);
     void* ap = nullptr;
+    PipelineCounters& ipc = pipelineCounters();  // vk.indirect_stats: moved by the commands recorded below
+    const uint64_t draws0 = ipc.indirectDraws.load(), readable0 = ipc.indirectCpuReadable.load(), unread0 = ipc.indirectNotReadable.load(),
+                   over0 = ipc.indirectOverCap.load(), countDraws0 = ipc.indirectCountDraws.load();
     CHECK(vkMapMemory(c.dev, am, 0, VK_WHOLE_SIZE, 0, &ap) == VK_SUCCESS);
     const uint32_t rec[4][4] = {{3, 1, 0, 0}, {0x7fffffffu, 1, 0, 0}, {3, 0x7fffffffu, 0, 0}, {6, 2, 0, 0}};
     std::memcpy(ap, rec, sizeof rec);
@@ -8026,6 +8199,10 @@ void testSkipReasons() {
     const std::vector<vpgpu::Draw> drawn = rig.finish(f2, s2);
     CHECK(drawn.size() == 2 && drawn[0].count == 3 && drawn[1].count == 6 && drawn[1].instances == 2);
     CHECK(s2.draws == 2 && s2.skippedBy[size_t(SkipReason::Indirect)] == 2);
+    // The 4 records sit in host-visible memory: one readable command, two of its records past the caps, the largest values seen.
+    CHECK(ipc.indirectDraws - draws0 == 1 && ipc.indirectCpuReadable - readable0 == 1 && ipc.indirectNotReadable == unread0);
+    CHECK(ipc.indirectOverCap - over0 == 2 && ipc.indirectCountDraws == countDraws0);
+    CHECK(ipc.indirectMaxCount.load() == 0x7fffffffu && ipc.indirectMaxInstances.load() == 0x7fffffffu);
     // Triangle fan: Metal has none, each record becomes a direct draw of the converted index list (5 vertices = 3
     // triangles, 4 vertices from vertex 1 x 2 instances = 2 triangles), whatever the GPU indirect setting.
     PipeOpts fo;
@@ -8046,7 +8223,57 @@ void testSkipReasons() {
     const std::vector<vpgpu::Draw> fd = rig.finish(f3, s3);
     CHECK(fd.size() == 2 && fd[0].count == 9 && fd[0].index && fd[0].drawIndex == 0 && fd[1].count == 6 &&
           fd[1].instances == 2 && fd[1].baseVertex == 1 && fd[1].drawIndex == 1 && !fd[0].indirect);
+    CHECK(ipc.indirectDraws - draws0 == 2 && ipc.indirectCpuReadable - readable0 == 2 && ipc.indirectOverCap - over0 == 2);  // the fan's records are fine
+    // A device-local argument buffer is only counted (no readback); a Count draw scans the records its count word allows (here 2 of 3).
+    VkDeviceMemory dm = alloc(c, 1 << 16, 0);
+    VkBuffer db = buffer(c, 4096, dm, 0);
+    DeviceMemory* dmem = from<Buffer>(db)->memory;  // (the null platform maps all memory: take the host pointer away, as for private storage)
+    uint8_t* const dhost = dmem->host;
+    dmem->host = nullptr;
+    ap = nullptr;
+    CHECK(vkMapMemory(c.dev, am, 0, VK_WHOLE_SIZE, 0, &ap) == VK_SUCCESS);
+    const uint32_t crec[3][4] = {{3, 1, 0, 0}, {0x7fffffffu, 1, 0, 0}, {7, 0x7fffffffu, 0, 0}};
+    std::memcpy(ap, crec, sizeof crec);
+    const uint32_t live = 2;
+    std::memcpy(static_cast<uint8_t*>(ap) + 256, &live, sizeof live);
+    vkUnmapMemory(c.dev, am);
+    rig.begin();
+    vkCmdBindPipeline(rig.cb, VK_PIPELINE_BIND_POINT_GRAPHICS, scissored);
+    vkCmdSetScissor(rig.cb, 0, 1, &fine);
+    vkCmdDrawIndirect(rig.cb, db, 0, 2, 16);                  // device-local records
+    vkCmdDrawIndirectCount(rig.cb, ab, 0, ab, 256, 3, 16);    // count word 2: records 0 and 1 are looked at, 2 is not
+    vkCmdDrawIndirectCount(rig.cb, ab, 0, db, 0, 3, 16);      // device-local count word: not readable
+    vpgpu::Frame f4;
+    TranslateStats s4;
+    rig.finish(f4, s4);
+    CHECK(ipc.indirectDraws - draws0 == 5 && ipc.indirectCountDraws - countDraws0 == 2);
+    CHECK(ipc.indirectCpuReadable - readable0 == 3 && ipc.indirectNotReadable - unread0 == 2 && ipc.indirectOverCap - over0 == 3);
+    // The line: cumulative values, every 5 s, only when a draw was recorded since the previous one, 720 lines at most.
+    const std::string body = indirectStatsLine(ipc);
+    char want[256];
+    std::snprintf(want, sizeof want,
+                  "draws=%llu count_variants=%llu max_count=2147483647 max_instances=2147483647 cpu_readable=%llu not_readable=%llu over_cap_seen=%llu",
+                  (unsigned long long)ipc.indirectDraws.load(), (unsigned long long)ipc.indirectCountDraws.load(),
+                  (unsigned long long)ipc.indirectCpuReadable.load(), (unsigned long long)ipc.indirectNotReadable.load(),
+                  (unsigned long long)ipc.indirectOverCap.load());
+    CHECK(body == want);
+    const std::string first = captureStderr([&] { indirectStatsLog(10'000'000'000LL); });
+    CHECK(first == "vk.indirect_stats " + body + "\n");
+    ++ipc.indirectDraws;
+    CHECK(captureStderr([&] { indirectStatsLog(14'000'000'000LL); }).empty());                 // 4 s later: too soon
+    CHECK(countOf(captureStderr([&] { indirectStatsLog(15'000'000'000LL); }), "vk.indirect_stats draws=") == 1);  // 5 s
+    CHECK(captureStderr([&] { indirectStatsLog(30'000'000'000LL); }).empty());                 // nothing recorded since
+    const std::string flood = captureStderr([&] {
+      for (int i = 0; i < 800; ++i) {
+        ++ipc.indirectDraws;
+        indirectStatsLog(40'000'000'000LL + i * 5'000'000'000LL);
+      }
+    });
+    CHECK(countOf(flood, "vk.indirect_stats ") == 718);  // 720 in all (2 above)
     vkDestroyPipeline(c.dev, fan, nullptr);
+    dmem->host = dhost;
+    vkDestroyBuffer(c.dev, db, nullptr);
+    vkFreeMemory(c.dev, dm, nullptr);
     vkDestroyBuffer(c.dev, ab, nullptr);
     vkFreeMemory(c.dev, am, nullptr);
   }

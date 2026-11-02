@@ -78,6 +78,10 @@ struct PipelineState {
   PipelineKey key() const;  // stable across runs: used as the disk cache key
 };
 
+// One line with every field key() hashes ("key=.. label=.. samples=.. colorFormats=.. depthFormat=.. primitive=.. vs=.. fs=..
+// extra{cs= blend.. depth= stencil= cull= a2c= fetch=}"), for diagnostics (gpu.pso.miss_detail). `more` is appended inside extra{}.
+std::string describePipelineState(const PipelineState&, const std::string& more = {});
+
 // Lower value runs first: a pipeline needed for the current frame jumps ahead of prefetching.
 // Urgent is only set by boost(): a draw is waiting for that pipeline, ahead of everything queued.
 enum class Priority : uint8_t { Urgent, Blocking, Visible, Prefetch };

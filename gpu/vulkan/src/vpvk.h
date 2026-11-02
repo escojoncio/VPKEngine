@@ -707,6 +707,8 @@ struct MsaaTwins {
   // ... rejEye by why taaEyePass said no: no depth attachment, no eye size known (and not multiview), size differs from the
   // eye's, other (no jitter snapshot / subpass out of range).
   uint32_t rejEyeBy[4] = {0, 0, 0, 0};
+  // "vk.msaa up_detail" (first upgraded pass) and "vk.msaa rej_first" (first smp / msstore rejection): each once per device.
+  bool upDetailDone = false, rejFirstDone[2] = {false, false};
   // Rejected passes logged ("vk.msaa rej"): up to 12 distinct (size, layers, reason) under 1 Mpx, and 12 at or above it.
   struct RejSeen { uint32_t w = 0, h = 0; uint16_t layers = 0; const char* why = nullptr; };
   RejSeen rejSeen[2][12];
@@ -718,6 +720,24 @@ struct MsaaTwins {
   vpgpu::TextureId acquire(Device* dev, vpgpu::TextureId guest, const vpgpu::TextureDesc& gd, uint8_t samples, uint16_t layers,
                            uint16_t mip, uint16_t layer);
   void release(Device* dev);  // vkDestroyDevice
+};
+
+// vk.pso.census prewarmed_unused= / requested_not_prewarmed= (pipelines.cpp noteRecipeKey): the pipeline keys the game's creates asked
+// for this session (at most kMax distinct; `overflow` once more arrived, the counts are then lower bounds) against the recipes the
+// prewarm compiled (`prewarmed`, sorted, set by setPrewarmed once the prewarm's refresh() has rekeyed the recipes; creates noted
+// before that are re-counted then).
+struct RecipeUse {
+  static constexpr size_t kMax = 16384, kSample = 10;
+  mutable std::mutex mutex;
+  std::vector<uint64_t> prewarmed;
+  std::unordered_set<uint64_t> requested;
+  uint32_t requestedPrewarmed = 0;  // requested keys that had a prewarmed recipe
+  bool overflow = false;
+  std::vector<std::pair<uint64_t, std::string>> freshSample;  // the first kSample requested keys without a prewarmed recipe
+  void note(uint64_t key, const std::string& label);
+  void setPrewarmed(std::vector<uint64_t> keys);        // replaces `prewarmed` (sorts it) and recounts requestedPrewarmed / freshSample
+  std::string census() const;                           // " prewarmed_unused=N requested_not_prewarmed=N requested=N[ requested_overflow=1]"
+  std::string keysLine(const RecipeStore* recipes) const;  // "prewarmed_unused=[key:label,..] requested_not_prewarmed=[..]" (up to kSample each), "" if both empty
 };
 
 struct Device : Dispatchable {
@@ -734,6 +754,7 @@ struct Device : Dispatchable {
   // prewarm off), recipes the prewarm left ready, and the game's creates no recipe covered (counted with nothing stored too).
   uint32_t recipesLoaded = 0;
   std::atomic<uint32_t> recipesPrewarmed{0}, recipesFresh{0};
+  RecipeUse recipeUse;
   Queue queues[kQueueCount];
   bool multiview = false, densityMap = false, metalObjects = false;
   std::mutex submitMutex;
