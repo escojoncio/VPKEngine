@@ -203,6 +203,7 @@ static EGLBoolean Terminate(EGLDisplay d) {
         std::lock_guard<std::recursive_mutex> l(dv->lock);
         texStatsTick(true);
         recipeStatsTick(true);
+        mapStatsTick(true);
     }
     return TRUE_;
 }

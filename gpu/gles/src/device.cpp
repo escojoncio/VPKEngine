@@ -117,6 +117,7 @@ void Device::shutdown() {
     if (!device) return;
     texStatsTick(true);
     recipeStatsTick(true);
+    mapStatsTick(true);
     vk.vkDeviceWaitIdle(device);
     retire(true);
     for (VkDescriptorPool p : freePools) vk.vkDestroyDescriptorPool(device, p, nullptr);
@@ -581,10 +582,7 @@ void Context::prepareWrite(Buffer& b, bool discard) {
     const bool gpuMayRead = pending && pending > dev->completed;
     if (!gpuMayRead) return;
     // New storage (copy on write); the old one stays alive with the work that reads it.
-    StorageP fresh = dev->newStorage(b.storage->size, b.storage->dev ? VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
-                                                                            VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
-                                                                            VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT
-                                                                      : 0);
+    StorageP fresh = dev->newStorage(b.storage->size, b.storage->dev ? kAllUsage : 0);
     if (!fresh) return;
     if (!discard) std::memcpy(fresh->host, b.storage->host, size_t(b.storage->size));
     b.storage = fresh;

@@ -973,11 +973,6 @@ Buffer* targetBuffer(Context* c, GLenum target) {
     if (!b) c->setError(gl::INVALID_OPERATION, target);
     return b;
 }
-constexpr VkBufferUsageFlags kAllUsage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
-                                         VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
-                                         VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_UNIFORM_TEXEL_BUFFER_BIT |
-                                         VK_BUFFER_USAGE_STORAGE_TEXEL_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
-                                         VK_BUFFER_USAGE_TRANSFER_DST_BIT;
 void BufferData(GLenum target, GLsizeiptr size, const void* data, GLenum usage) {
     CTX()
     if (!validUsage(usage)) return c->setError(gl::INVALID_ENUM, target);
@@ -1003,6 +998,32 @@ void BufferSubData(GLenum target, GLintptr off, GLsizeiptr size, const void* dat
     c->prepareWrite(*b, off == 0 && size == b->size);
     std::memcpy(b->storage->host + off, data, size_t(size));
 }
+// gles.map_stats: how often a MAP_UNSYNCHRONIZED write found its storage still in use by unfinished GPU work (the race window)
+// and what the copy-on-write cost, every ~5 s while the game maps buffers (720 lines at most); a last line at eglTerminate.
+struct MapStats {
+    std::atomic<uint64_t> maps{0}, unsync{0}, unsyncInuse{0}, cowBytes{0}, maxCowBytes{0}, discardInuse{0};
+    std::atomic<uint64_t> lastNs{0};
+    std::atomic<uint32_t> lines{0};
+    void tick(bool force) {
+        constexpr uint64_t kEveryNs = 5'000'000'000ull;
+        constexpr uint32_t kMaxLines = 720;
+        if (force && !maps.load()) return;
+        const uint64_t now = uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
+        uint64_t last = lastNs.load(std::memory_order_relaxed);
+        if (!force) {
+            if (!last) {
+                lastNs.compare_exchange_strong(last, now);
+                return;
+            }
+            if (now - last < kEveryNs || !lastNs.compare_exchange_strong(last, now)) return;
+        }
+        if (lines.fetch_add(1) >= kMaxLines) return;
+        logf("gles.map_stats maps=%llu unsync=%llu unsync_inuse=%llu cow_bytes=%llu max_cow_bytes=%llu discard_inuse=%llu",
+             static_cast<unsigned long long>(maps.load()), static_cast<unsigned long long>(unsync.load()),
+             static_cast<unsigned long long>(unsyncInuse.load()), static_cast<unsigned long long>(cowBytes.load()),
+             static_cast<unsigned long long>(maxCowBytes.load()), static_cast<unsigned long long>(discardInuse.load()));
+    }
+} mapStats;
 void* MapBufferRange(GLenum target, GLintptr off, GLsizeiptr len, GLbitfield access) {
     CTX(nullptr)
     Buffer* b = targetBuffer(c, target);
@@ -1025,7 +1046,26 @@ void* MapBufferRange(GLenum target, GLintptr off, GLsizeiptr len, GLbitfield acc
         if (b->storage->lastUse > c->dev->completed) c->flush(true);  // GPU writes visible
     } else if (!(access & gl::MAP_UNSYNCHRONIZED_BIT)) {
         c->prepareWrite(*b, (access & gl::MAP_INVALIDATE_BUFFER_BIT) != 0);
+    } else {
+        // UNSYNCHRONIZED write: the caller promises the GPU is not reading the range, but a draw already sent and not completed
+        // may still read this storage (the GPU here is further behind than the game's buffer ring expects): write to a new one.
+        mapStats.unsync.fetch_add(1, std::memory_order_relaxed);
+        if (b->storage && b->storage->lastUse > c->dev->completed) {
+            const BufferStorage* old = b->storage.get();
+            const uint64_t oldSize = old->size;
+            const bool discard = (access & gl::MAP_INVALIDATE_BUFFER_BIT) != 0;
+            c->prepareWrite(*b, discard);
+            mapStats.unsyncInuse.fetch_add(1, std::memory_order_relaxed);
+            if (discard) mapStats.discardInuse.fetch_add(1, std::memory_order_relaxed);
+            else if (b->storage.get() != old) {
+                mapStats.cowBytes.fetch_add(oldSize, std::memory_order_relaxed);
+                uint64_t mx = mapStats.maxCowBytes.load(std::memory_order_relaxed);
+                while (mx < oldSize && !mapStats.maxCowBytes.compare_exchange_weak(mx, oldSize, std::memory_order_relaxed)) {}
+            }
+        }
     }
+    mapStats.maps.fetch_add(1, std::memory_order_relaxed);
+    mapStats.tick(false);
     b->mapped = true, b->mapAccess = access, b->mapOffset = off, b->mapLength = len;
     return b->storage->host + off;
 }
@@ -3909,6 +3949,8 @@ const Entry kEntries[] = {
 #undef E
 
 }  // namespace
+
+void mapStatsTick(bool force) { mapStats.tick(force); }
 
 const char* Context::errorName(GLenum e) {
     switch (e) {

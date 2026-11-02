@@ -108,6 +108,8 @@ PFN_vkCmdClearDepthStencilImage realClearDepthImage;
 PFN_vkUpdateDescriptorSets realUpdateSets;
 PFN_vkGetQueryPoolResults realGetQueryResults;
 PFN_vkGetFenceStatus realGetFenceStatus;
+PFN_vkCreateBuffer realCreateBuffer;
+VkBufferUsageFlags lastBufferUsage = 0;  // usage of the last vkCreateBuffer the layer made
 // A GPU that is late with the occlusion results: the next `occLate` reads answer "not ready" (or all of them while
 // `occStuck`); once ready, a non-zero `occCount` is the sample count the read reports (the null backend counts 0).
 // `occFenceStuck`: its submissions do not finish either (a GPU that is behind). `occCalls` counts the reads it saw.
@@ -262,6 +264,11 @@ VKAPI_ATTR VkResult VKAPI_CALL myGetFenceStatus(VkDevice d, VkFence f) {
     return occFenceStuck ? VK_NOT_READY : realGetFenceStatus(d, f);
 }
 
+VKAPI_ATTR VkResult VKAPI_CALL myCreateBuffer(VkDevice d, const VkBufferCreateInfo* ci, const VkAllocationCallbacks* a, VkBuffer* out) {
+    lastBufferUsage = ci->usage;
+    return realCreateBuffer(d, ci, a, out);
+}
+
 PFN_vkVoidFunction intercept(const char* name, PFN_vkVoidFunction real) {
 #define I(n, mine, store)                                    \
     if (!std::strcmp(name, n)) {                              \
@@ -284,6 +291,7 @@ PFN_vkVoidFunction intercept(const char* name, PFN_vkVoidFunction real) {
     I("vkCmdDispatchIndirect", myDispatchIndirect, realDispatchIndirect)
     I("vkCmdCopyImage", myCopyImage, realCopyImage)
     I("vkCreateImage", myCreateImage, realCreateImage)
+    I("vkCreateBuffer", myCreateBuffer, realCreateBuffer)
     I("vkCreateImageView", myCreateImageView, realCreateImageView)
     I("vkCmdClearColorImage", myClearColorImage, realClearColorImage)
     I("vkCmdClearDepthStencilImage", myClearDepthImage, realClearDepthImage)
@@ -1546,6 +1554,82 @@ void testProgramBinary() {
         glGetProgramBinary(q, GLsizei(blob.size()), &nl, &nf, nullptr);
         CHECK(err() == gl::NO_ERROR && nl == got && nf == fmt);
     }
+    e.down();
+}
+
+// glMapBufferRange with MAP_UNSYNCHRONIZED over storage a draw already sent (not completed) still reads: the write goes to new
+// storage and the draw keeps the old contents; with no unfinished work it is the same storage (nothing is copied).
+void testMapUnsync() {
+    Egl e;
+    CHECK(e.up());
+    GLuint p = program(kVs100, kFs100);
+    G(glUseProgram, void (*)(GLuint));
+    G(glGenBuffers, void (*)(GLsizei, GLuint*));
+    G(glBindBuffer, void (*)(GLenum, GLuint));
+    G(glBufferData, void (*)(GLenum, GLsizeiptr, const void*, GLenum));
+    G(glMapBufferRange, void* (*)(GLenum, GLintptr, GLsizeiptr, GLbitfield));
+    G(glUnmapBuffer, GLboolean (*)(GLenum));
+    G(glGetAttribLocation, GLint (*)(GLuint, const char*));
+    G(glVertexAttribPointer, void (*)(GLuint, GLint, GLenum, GLboolean, GLsizei, const void*));
+    G(glEnableVertexAttribArray, void (*)(GLuint));
+    G(glDrawArrays, void (*)(GLenum, GLint, GLsizei));
+    G(glFlush, void (*)());
+    G(glFinish, void (*)());
+    G(eglTerminate, uint32_t (*)(void*));
+    glUseProgram(p);
+    const float verts[] = {-1, -1, 0, 1, 0, 0, 1, -1, 0, 1, 1, 0, 0, 1, 0, 1, 0, 1};
+    GLuint vb;
+    glGenBuffers(1, &vb);
+    glBindBuffer(gl::ARRAY_BUFFER, vb);
+    glBufferData(gl::ARRAY_BUFFER, sizeof verts, verts, gl::DYNAMIC_DRAW);
+    glVertexAttribPointer(GLuint(glGetAttribLocation(p, "a_pos")), 4, gl::FLOAT, 0, 24, nullptr);
+    glEnableVertexAttribArray(GLuint(glGetAttribLocation(p, "a_pos")));
+    const GLbitfield unsync = gl::MAP_WRITE_BIT | gl::MAP_UNSYNCHRONIZED_BIT;
+    // 1. Never drawn: same storage, nothing copied.
+    auto* m0 = static_cast<float*>(glMapBufferRange(gl::ARRAY_BUFFER, 0, sizeof verts, unsync));
+    CHECK(m0 && m0[6] == 1.0f);
+    m0[6] = 111.0f;
+    CHECK(glUnmapBuffer(gl::ARRAY_BUFFER));
+    // 2. A draw in flight reads this storage: the write goes to a new one holding the same data; the old keeps what the draw reads.
+    glDrawArrays(gl::TRIANGLES, 0, 3);
+    auto* m1 = static_cast<float*>(glMapBufferRange(gl::ARRAY_BUFFER, 0, sizeof verts, unsync));
+    CHECK(m1 && m1 != m0 && m1[6] == 111.0f);
+    // The copy keeps every usage of a GL buffer (indirect, texel...), not only the vertex ones.
+    constexpr VkBufferUsageFlags kNeeded = VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_UNIFORM_TEXEL_BUFFER_BIT |
+                                           VK_BUFFER_USAGE_STORAGE_TEXEL_BUFFER_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT |
+                                           VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT;
+    CHECK((lastBufferUsage & kNeeded) == kNeeded);
+    m1[6] = 222.0f;
+    CHECK(m0[6] == 111.0f && m1[6] == 222.0f);
+    CHECK(glUnmapBuffer(gl::ARRAY_BUFFER));
+    // 3. Everything completed: the same storage again.
+    glDrawArrays(gl::TRIANGLES, 0, 3);
+    glFinish();
+    auto* m2 = static_cast<float*>(glMapBufferRange(gl::ARRAY_BUFFER, 0, sizeof verts, unsync));
+    CHECK(m2 == m1 && m2[6] == 222.0f);
+    CHECK(glUnmapBuffer(gl::ARRAY_BUFFER));
+    // 4. INVALIDATE_BUFFER over storage in use: new storage, no copy.
+    glDrawArrays(gl::TRIANGLES, 0, 3);
+    auto* m3 = static_cast<float*>(glMapBufferRange(gl::ARRAY_BUFFER, 0, sizeof verts, unsync | gl::MAP_INVALIDATE_BUFFER_BIT));
+    CHECK(m3 && m3 != m2 && m2[6] == 222.0f);
+    CHECK(glUnmapBuffer(gl::ARRAY_BUFFER));
+    // 5. A read-only map does not change the storage (it waits for the GPU instead).
+    glDrawArrays(gl::TRIANGLES, 0, 3);
+    auto* m4 = static_cast<float*>(glMapBufferRange(gl::ARRAY_BUFFER, 0, sizeof verts, gl::MAP_READ_BIT));
+    CHECK(m4 == m3);
+    CHECK(glUnmapBuffer(gl::ARRAY_BUFFER));
+    // 6. Submitted but the fence has not signalled (a GPU that is behind): still in use.
+    occFenceStuck = true;
+    glDrawArrays(gl::TRIANGLES, 0, 3);
+    glFlush();
+    auto* m5 = static_cast<float*>(glMapBufferRange(gl::ARRAY_BUFFER, 0, sizeof verts, unsync));
+    CHECK(m5 && m5 != m4);
+    CHECK(glUnmapBuffer(gl::ARRAY_BUFFER));
+    occFenceStuck = false;
+    glFinish();
+    CHECK(err() == gl::NO_ERROR);
+    expectLines.push_back("gles.map_stats maps=6 unsync=5 unsync_inuse=3 cow_bytes=144 max_cow_bytes=72 discard_inuse=1");
+    eglTerminate(e.dpy);
     e.down();
 }
 
@@ -4647,7 +4731,7 @@ int main(int argc, char** argv) {
     captureStderr();
     const int ok = vpgles_init(reinterpret_cast<void*>(&myGipa));
     const std::map<std::string, std::function<void()>> tests = {
-        {"egl", testEgl}, {"eglthreads", testEglThreads}, {"formats", testFormats}, {"buffers", testBuffers}, {"textures", testTextures},
+        {"egl", testEgl}, {"eglthreads", testEglThreads}, {"formats", testFormats}, {"buffers", testBuffers}, {"mapunsync", testMapUnsync}, {"textures", testTextures},
         {"fbo", testFbo}, {"msrbo", testMsRbo}, {"program", testProgram}, {"draw", testDraw}, {"invalidate", testInvalidate}, {"multiview", testMultiview},
         {"errors", testErrors}, {"ubo", testUbo}, {"readback", testReadback}, {"external", testExternal}, {"es31", testEs31},
         {"progbin", testProgramBinary}, {"recipe", testRecipe}, {"recipe_session", testRecipeSession}, {"xfb", testXfb},

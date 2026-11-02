@@ -52,6 +52,11 @@ void texStatsTick(bool force);
 // shutdown; called from eglSwapBuffers, vpgles_flush and the creation of a new pipeline). Needs Device::lock.
 void recipeStatsTick(bool force);
 
+// Diagnostics: "gles.map_stats maps= unsync= unsync_inuse= cow_bytes= max_cow_bytes= discard_inuse=" (glMapBufferRange with
+// MAP_UNSYNCHRONIZED over storage the GPU may still read; see MapBufferRange): every ~5 s while maps happen (force: now, at
+// eglTerminate / device shutdown, if any map happened); at most 720 lines. Needs Device::lock.
+void mapStatsTick(bool force);
+
 constexpr int kMaxTextureUnits = 96;  // Quest 3 (Adreno 740): GL_MAX_COMBINED_TEXTURE_IMAGE_UNITS
 constexpr int kMaxVertexAttribs = 32;  // Quest 3: GL_MAX_VERTEX_ATTRIBS
 constexpr int kHwVertexAttribs = 31;   // VPVulkan maxVertexInputAttributes (Metal vertex buffer table): locations above are dropped
@@ -80,6 +85,12 @@ struct BufferStorage {
     ~BufferStorage();
 };
 using StorageP = std::shared_ptr<BufferStorage>;
+// Usage of a GL buffer object's storage (glBufferData, and the copy-on-write storage of Context::prepareWrite).
+constexpr VkBufferUsageFlags kAllUsage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
+                                         VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                                         VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_UNIFORM_TEXEL_BUFFER_BIT |
+                                         VK_BUFFER_USAGE_STORAGE_TEXEL_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
+                                         VK_BUFFER_USAGE_TRANSFER_DST_BIT;
 
 struct Device {
     Vk vk;
