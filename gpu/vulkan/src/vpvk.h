@@ -749,6 +749,11 @@ struct Device : Dispatchable {
   // CPU path / skip at once (100 draws must not cost 100 waits). Budgets are fields so tests can shorten them.
   std::atomic<int64_t> indirectPatchBackoffNs{0};
   uint32_t indirectPatchWaitMs = 2000, indirectPatchBackoffMs = 3000;
+  // Occlusion WAIT reads (pipelines.cpp vkGetQueryPoolResults): the query frame (+1) of the last wait that ran out (0: none; no
+  // read waits until the GPU is past it) and the ns the reads waited so far within vpgpu frame `occBudgetFrame` (20 ms per
+  // frame in all). `clockNs` replaces the steady clock (tests).
+  std::atomic<uint64_t> occLateFrame{0}, occBudgetFrame{UINT64_MAX}, occBudgetUsedNs{0};
+  int64_t (*clockNs)() = nullptr;
   uint64_t submits = 0;
   std::vector<DeferredBatch> deferred;  // submitMutex; submission order (batches of one queue keep their order, queues are independent)
   // vpvk_dump_pending: when each vpgpu frame was handed to the backend (by frame index % 64), and how many are noted.

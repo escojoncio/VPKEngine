@@ -96,6 +96,11 @@ struct Device {
     // Submission serials: the n-th vkQueueSubmit has serial n; `completed` is the highest one whose
     // fence signalled.
     uint64_t submitted = 0, completed = 0;
+    // QUERY_RESULT waits on occlusion counts (Context::occResult), under `lock`: the serial of the last wait that ran out
+    // (0: none; no read waits until the GPU is past it) and what the reads waited so far under serial `occBudgetSerial`
+    // (one budget per submission serial). `clockNs` replaces the steady clock (tests).
+    uint64_t occLateSerial = 0, occBudgetSerial = 0, occBudgetUsedNs = 0;
+    uint64_t (*clockNs)() = nullptr;
     struct InFlight {
         uint64_t serial;
         VkFence fence;
@@ -515,7 +520,12 @@ public:
     uint32_t occSlot();                // a free slot (UINT32_MAX: none)
     void occBegin(Query& q);
     void occEnd(Query& q);
-    bool occResult(Query& q, bool wait, uint64_t& value);  // false: not available
+    static constexpr uint64_t kOccWaitNs = 20'000'000;  // QUERY_RESULT waits for the GPU count: 20 ms in all per serial (Device)
+    // How a waiting occlusion read ended when the count was not there: Expired = the wait ran out, Skipped = it did not
+    // wait (the GPU is behind, or the budget is spent); both report the query visible (value 1).
+    enum class OccWait : uint8_t { Done, Expired, Skipped };
+    // false: not available. wait: blocks within the budget (Device::occBudgetUsedNs), else reports visible (*how).
+    bool occResult(Query& q, bool wait, uint64_t& value, OccWait* how = nullptr);
     void occPause();                   // internal draws (clears) do not count
     void occResume();
     // KHR_debug.

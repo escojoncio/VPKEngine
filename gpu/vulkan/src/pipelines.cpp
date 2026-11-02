@@ -3865,6 +3865,34 @@ bool occlusionOn() {
   return !(e && *e == '0');
 }
 
+// The WAITs on occlusion queries wait at most this long in all per device and vpgpu frame; past it (or while the GPU is behind
+// the frame of an earlier wait that ran out) the query reads visible at once (a late result must not read as occluded: the
+// game would cull what is on screen).
+constexpr uint64_t kOcclusionWaitNs = 20'000'000;
+constexpr uint32_t kQueryStatsLines = 720;
+constexpr int64_t kQueryStatsEveryNs = 5'000'000'000;
+
+// vk.query_stats: what the games read from occlusion queries (backed pools), every ~5 s while they are read.
+struct QueryStats {
+  std::atomic<uint64_t> reads{0}, notReady{0}, zero{0}, positive{0}, expired{0}, skipped{0};
+  std::atomic<int64_t> lastNs{0};
+  std::atomic<uint32_t> lines{0};
+  void tick() {
+    const int64_t now = pendingNowNs();
+    int64_t last = lastNs.load(std::memory_order_relaxed);
+    if (!last) {
+      lastNs.compare_exchange_strong(last, now);
+      return;
+    }
+    if (now - last < kQueryStatsEveryNs || !lastNs.compare_exchange_strong(last, now)) return;
+    if (lines.fetch_add(1) >= kQueryStatsLines) return;
+    logf("vk.query_stats api=vulkan reads=%llu not_ready=%llu zero=%llu positive=%llu wait_expired=%llu wait_skipped=%llu",
+         static_cast<unsigned long long>(reads.load()), static_cast<unsigned long long>(notReady.load()),
+         static_cast<unsigned long long>(zero.load()), static_cast<unsigned long long>(positive.load()),
+         static_cast<unsigned long long>(expired.load()), static_cast<unsigned long long>(skipped.load()));
+  }
+} queryStats;
+
 uint32_t allocVisibility(Device* d, uint32_t count) {
   Device::Visibility& v = d->visibility;
   std::lock_guard<std::mutex> l(v.m);
@@ -3967,6 +3995,13 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkGetQueryPoolResults(VkDevice, VkQue
     }
   };
   bool notReady = false;
+  const bool occ = p->type == VK_QUERY_TYPE_OCCLUSION;
+  Device* const dv = p->device;
+  const auto nowNs = [&] { return dv && dv->clockNs ? dv->clockNs() : pendingNowNs(); };
+  if (occ && backed) {  // a new vpgpu frame, a new wait budget
+    const uint64_t cur = dv->gpu->submittedFrames();
+    if (dv->occBudgetFrame.exchange(cur) != cur) dv->occBudgetUsedNs = 0;
+  }
   for (uint32_t i = 0; i < n; ++i) {
     uint8_t* at = static_cast<uint8_t*>(data) + size_t(i) * stride;
     if (size_t(i) * stride + word * (withAvail ? 2 : 1) > size) break;
@@ -3981,21 +4016,48 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkGetQueryPoolResults(VkDevice, VkQue
       std::lock_guard<std::mutex> l(p->m);
       f = q < p->frame.size() ? p->frame[q] : 0;
     }
-    bool avail = false;
+    bool avail = false, expired = false, skipped = false;
     if (f) {
-      const auto w = p->device->platform->waitFrames(f - 1, (flags & VK_QUERY_RESULT_WAIT_BIT) ? UINT64_MAX : 0);
+      uint64_t timeout = 0;
+      if (flags & VK_QUERY_RESULT_WAIT_BIT) {
+        if (!occ) timeout = UINT64_MAX;
+        else {
+          uint64_t late = dv->occLateFrame.load();
+          if (late && dv->platform->waitFrames(late - 1, 0) == Platform::WaitResult::Done)
+            dv->occLateFrame.compare_exchange_strong(late, 0), late = 0;
+          const uint64_t used = dv->occBudgetUsedNs.load();
+          if (!late && used < kOcclusionWaitNs) timeout = kOcclusionWaitNs - used;
+          else skipped = true;  // the GPU is behind / the budget is spent: look once, never wait
+        }
+      }
+      const int64_t t0 = timeout && occ ? nowNs() : 0;
+      const auto w = p->device->platform->waitFrames(f - 1, timeout);
+      if (timeout && occ) dv->occBudgetUsedNs += uint64_t(std::max<int64_t>(0, nowNs() - t0));
       if (w == Platform::WaitResult::Lost) return VK_ERROR_DEVICE_LOST;
       avail = w == Platform::WaitResult::Done;
+      expired = !avail && occ && timeout != 0;
+      skipped = skipped && !avail;
+      if (expired) {
+        uint64_t late = dv->occLateFrame.load();
+        while (late < f && !dv->occLateFrame.compare_exchange_weak(late, f)) {}
+      }
     }
     // (WAIT on a query never ended would hang forever in Vulkan; it reports not ready instead.)
-    if (avail || (flags & VK_QUERY_RESULT_PARTIAL_BIT)) {
-      uint64_t v;
-      std::memcpy(&v, p->device->visibility.host + size_t(p->base + q) * 8, 8);
-      put(at, v);
-    }
+    uint64_t v = 0;
+    if (avail || (!expired && !skipped && (flags & VK_QUERY_RESULT_PARTIAL_BIT)))
+      std::memcpy(&v, p->device->visibility.host + size_t(p->base + q) * 8, 8), put(at, v);
+    else if (expired || skipped) put(at, 1), avail = true;  // the wait ran out / was not made: visible, not 0
     if (withAvail) put(at + word, avail ? 1 : 0);
     if (!avail) notReady = true, p->lastNotReady = q;
+    if (occ) {
+      queryStats.reads.fetch_add(1, std::memory_order_relaxed);
+      if (expired) queryStats.expired.fetch_add(1, std::memory_order_relaxed);
+      else if (skipped) queryStats.skipped.fetch_add(1, std::memory_order_relaxed);
+      else if (!avail) queryStats.notReady.fetch_add(1, std::memory_order_relaxed);
+      else (v ? queryStats.positive : queryStats.zero).fetch_add(1, std::memory_order_relaxed);
+    }
   }
+  if (occ && p->base != UINT32_MAX) queryStats.tick();
   p->poll.note(notReady ? VK_NOT_READY : VK_SUCCESS);  // vk.pending (pending.cpp)
   return notReady ? VK_NOT_READY : VK_SUCCESS;
 }

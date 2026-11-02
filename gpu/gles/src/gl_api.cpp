@@ -3404,7 +3404,7 @@ GLboolean IsTransformFeedback(GLuint n) {
 // ---- queries / sync ---------------------------------------------------------------------------------------
 // Queries are "coherent", not GPU-measured: the occlusion result is 1 when a draw was issued between Begin
 // and End (0 when none was), TIME_ELAPSED is the host time between Begin and End, TIMESTAMP the host clock.
-// Every result is available at once, so a game that polls QUERY_RESULT_AVAILABLE never waits.
+// Occlusion queries with a GPU counter (see queryValue) are available when the GPU has finished them.
 uint64_t nowNs() {
     return uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
 }
@@ -3496,14 +3496,48 @@ Query* queryObject(Context* c, GLuint n, GLenum pname) {
     }
     return it->second.get();
 }
+// vk.query_stats: what the game reads from the occlusion queries, every ~5 s while it reads them (720 lines at most).
+struct OccStats {
+    std::atomic<uint64_t> reads{0}, notReady{0}, zero{0}, positive{0}, expired{0}, skipped{0};
+    std::atomic<uint64_t> lastNs{0};
+    std::atomic<uint32_t> lines{0};
+    void tick() {
+        constexpr uint64_t kEveryNs = 5'000'000'000ull;
+        constexpr uint32_t kMaxLines = 720;
+        const uint64_t now = nowNs();
+        uint64_t last = lastNs.load(std::memory_order_relaxed);
+        if (!last) {
+            lastNs.compare_exchange_strong(last, now);
+            return;
+        }
+        if (now - last < kEveryNs || !lastNs.compare_exchange_strong(last, now)) return;
+        if (lines.fetch_add(1) >= kMaxLines) return;
+        logf("vk.query_stats api=gles reads=%llu not_ready=%llu zero=%llu positive=%llu wait_expired=%llu wait_skipped=%llu",
+             static_cast<unsigned long long>(reads.load()), static_cast<unsigned long long>(notReady.load()),
+             static_cast<unsigned long long>(zero.load()), static_cast<unsigned long long>(positive.load()),
+             static_cast<unsigned long long>(expired.load()), static_cast<unsigned long long>(skipped.load()));
+    }
+} occStats;
 // Occlusion: the draws were counted by the GPU (VPVulkan's visibility results) and the layer saw at least one draw. A query
-// that got no counter (none free, or another one counting) keeps the coherent answer.
+// that got no counter (none free, or another one counting) keeps the coherent answer. QUERY_RESULT waits for the count
+// (within Context::kOccWaitNs per serial, then it reads visible without waiting while the GPU is behind): a not-ready count must never read 0, Unreal culls what reads 0.
 uint64_t queryValue(Context* c, Query& q, GLenum pname) {
-    if (isOcclusion(q.target) && q.slot != UINT32_MAX && c->occPool_) {
+    if (isOcclusion(q.target) && q.slot != UINT32_MAX && q.endSerial && c->occPool_) {
         uint64_t v = 0;
-        const bool ready = c->occResult(q, pname == gl::QUERY_RESULT, v);
-        if (pname == gl::QUERY_RESULT_AVAILABLE) return ready ? 1 : 0;
-        return q.result && v ? 1 : 0;
+        Context::OccWait how = Context::OccWait::Done;
+        const bool ready = c->occResult(q, pname == gl::QUERY_RESULT, v, &how);
+        occStats.reads.fetch_add(1, std::memory_order_relaxed);
+        if (how == Context::OccWait::Expired) occStats.expired.fetch_add(1, std::memory_order_relaxed);
+        else if (how == Context::OccWait::Skipped) occStats.skipped.fetch_add(1, std::memory_order_relaxed);
+        else if (!ready) occStats.notReady.fetch_add(1, std::memory_order_relaxed);
+        if (pname == gl::QUERY_RESULT) {
+            const uint64_t visible = how != Context::OccWait::Done || (q.result && v) ? 1 : 0;
+            (visible ? occStats.positive : occStats.zero).fetch_add(1, std::memory_order_relaxed);
+            occStats.tick();
+            return visible;
+        }
+        occStats.tick();
+        return ready ? 1 : 0;
     }
     return pname == gl::QUERY_RESULT_AVAILABLE ? 1 : q.result;
 }

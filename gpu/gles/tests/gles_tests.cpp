@@ -106,6 +106,14 @@ PFN_vkCreateImageView realCreateImageView;
 PFN_vkCmdClearColorImage realClearColorImage;
 PFN_vkCmdClearDepthStencilImage realClearDepthImage;
 PFN_vkUpdateDescriptorSets realUpdateSets;
+PFN_vkGetQueryPoolResults realGetQueryResults;
+PFN_vkGetFenceStatus realGetFenceStatus;
+// A GPU that is late with the occlusion results: the next `occLate` reads answer "not ready" (or all of them while
+// `occStuck`); once ready, a non-zero `occCount` is the sample count the read reports (the null backend counts 0).
+// `occFenceStuck`: its submissions do not finish either (a GPU that is behind). `occCalls` counts the reads it saw.
+int occLate = 0, occCalls = 0;
+bool occStuck = false, occFenceStuck = false;
+uint64_t occCount = 0;
 std::map<VkImage, VkImageType> imageTypes;  // images the layer created: their type (views of a 3D image as 2D are Metal aborts)
 
 VKAPI_ATTR void VKAPI_CALL myDraw(VkCommandBuffer c, uint32_t v, uint32_t i, uint32_t fv, uint32_t fi) {
@@ -237,6 +245,23 @@ VKAPI_ATTR void VKAPI_CALL myUpdateSets(VkDevice d, uint32_t n, const VkWriteDes
     realUpdateSets(d, n, w, cn, cp);
 }
 
+VKAPI_ATTR VkResult VKAPI_CALL myGetQueryResults(VkDevice d, VkQueryPool p, uint32_t f, uint32_t n, size_t sz, void* data, VkDeviceSize st,
+                                                 VkQueryResultFlags fl) {
+    if (!occLate && !occStuck && !occCount) return realGetQueryResults(d, p, f, n, sz, data, st, fl);
+    ++occCalls;
+    if (occStuck || occLate > 0) {
+        if (occLate > 0) --occLate;
+        return VK_NOT_READY;  // nothing written: the caller's zeros stay
+    }
+    const VkResult r = realGetQueryResults(d, p, f, n, sz, data, st, fl);
+    static_cast<uint64_t*>(data)[0] = occCount;
+    return r;
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL myGetFenceStatus(VkDevice d, VkFence f) {
+    return occFenceStuck ? VK_NOT_READY : realGetFenceStatus(d, f);
+}
+
 PFN_vkVoidFunction intercept(const char* name, PFN_vkVoidFunction real) {
 #define I(n, mine, store)                                    \
     if (!std::strcmp(name, n)) {                              \
@@ -263,6 +288,8 @@ PFN_vkVoidFunction intercept(const char* name, PFN_vkVoidFunction real) {
     I("vkCmdClearColorImage", myClearColorImage, realClearColorImage)
     I("vkCmdClearDepthStencilImage", myClearDepthImage, realClearDepthImage)
     I("vkUpdateDescriptorSets", myUpdateSets, realUpdateSets)
+    I("vkGetQueryPoolResults", myGetQueryResults, realGetQueryResults)
+    I("vkGetFenceStatus", myGetFenceStatus, realGetFenceStatus)
 #undef I
     return real;
 }
@@ -3497,6 +3524,57 @@ void testEs31() {
     glEndQuery(gl::ANY_SAMPLES_PASSED_CONSERVATIVE);
     glGetQueryObjectuiv(qs[1], gl::QUERY_RESULT, &r);
     CHECK(err() == gl::NO_ERROR && r == 0);  // nothing was drawn
+    // QUERY_RESULT waits for a late GPU result: it never reads 0 ("occluded") only because the count is not ready yet
+    // (Unreal hides what a not-ready query reports as 0). QUERY_RESULT_AVAILABLE does not wait.
+    {
+        GLuint qw;
+        glGenQueries(1, &qw);
+        glBeginQuery(gl::ANY_SAMPLES_PASSED, qw);
+        glDrawArrays(gl::TRIANGLES, 0, 3);
+        glEndQuery(gl::ANY_SAMPLES_PASSED);
+        occLate = 3, occCount = 5, occCalls = 0;
+        glGetQueryObjectuiv(qw, gl::QUERY_RESULT_AVAILABLE, &r);
+        CHECK(r == 0 && occCalls == 1);  // late: the poll answers "not yet" at once
+        r = 99;
+        glGetQueryObjectuiv(qw, gl::QUERY_RESULT, &r);
+        CHECK(err() == gl::NO_ERROR && r == 1 && occLate == 0 && occCalls >= 3);  // waited for the real count (5 samples: visible)
+        // A GPU that is behind (50 queries, none finishes): the first QUERY_RESULT waits its budget and reads visible, not 0;
+        // the other 49 read visible at once (one look each, no wait): ~20 ms in all, not 50 x 20 ms.
+        GLuint qm[50];
+        glGenQueries(50, qm);
+        for (GLuint q : qm) {
+            glBeginQuery(gl::ANY_SAMPLES_PASSED, q);
+            glDrawArrays(gl::TRIANGLES, 0, 3);
+            glEndQuery(gl::ANY_SAMPLES_PASSED);
+        }
+        occStuck = occFenceStuck = true, occCount = 0, occCalls = 0;
+        r = 99;
+        glGetQueryObjectuiv(qm[0], gl::QUERY_RESULT, &r);
+        const int firstCalls = occCalls;
+        CHECK(err() == gl::NO_ERROR && r == 1 && firstCalls >= 2);  // it asked again until the budget ran out
+        for (int i = 1; i < 50; ++i) {
+            r = 99;
+            glGetQueryObjectuiv(qm[i], gl::QUERY_RESULT, &r);
+            CHECK(err() == gl::NO_ERROR && r == 1);
+        }
+        CHECK(occCalls == firstCalls + 49);
+        // The next frame, the GPU still behind: no wait either (the late state outlives the frame's budget).
+        glBeginQuery(gl::ANY_SAMPLES_PASSED, qw);
+        glDrawArrays(gl::TRIANGLES, 0, 3);
+        glEndQuery(gl::ANY_SAMPLES_PASSED);
+        occCalls = 0;
+        r = 99;
+        glGetQueryObjectuiv(qw, gl::QUERY_RESULT, &r);
+        CHECK(err() == gl::NO_ERROR && r == 1 && occCalls == 1);
+        // The GPU gets up to date: reads wait normally again (a late count, then the real zero: a counted query that saw no
+        // samples is occluded).
+        occStuck = occFenceStuck = false, occLate = 3, occCount = 0, occCalls = 0;
+        r = 99;
+        glGetQueryObjectuiv(qw, gl::QUERY_RESULT, &r);
+        CHECK(err() == gl::NO_ERROR && r == 0 && occLate == 0 && occCalls == 3);  // (the call that finds the count goes through uncounted)
+        glDeleteQueries(50, qm);
+        glDeleteQueries(1, &qw);
+    }
     glEndQuery(gl::ANY_SAMPLES_PASSED);
     CHECK(err() == gl::INVALID_OPERATION);  // no active query
     glBeginQuery(gl::ANY_SAMPLES_PASSED, 0);

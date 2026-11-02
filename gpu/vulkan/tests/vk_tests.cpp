@@ -3159,6 +3159,170 @@ void testTimelineOrder() {
   dev->platform = std::move(gpu->inner);  // the stand-in goes before the device does
 }
 
+// A platform whose GPU has finished the frames below `done`. A blocking wait (timeout != 0) costs no real time: it advances
+// the device's injected clock (`clock`) by the timeout, or by `finishAfterNs` when the GPU finishes (`done` = `finishTo`) first.
+int64_t lateClock = 0;
+int64_t lateClockNs() { return lateClock; }
+struct LateGpu final : Platform {
+  std::unique_ptr<Platform> inner;
+  std::atomic<uint64_t> done{0};
+  int blocked = 0;                  // waits made with a timeout
+  int64_t finishAfterNs = -1;       // >= 0: a blocking wait that lasts this long sees the GPU finish
+  uint64_t finishTo = 0;
+  vpgpu::Backend& backend() override { return inner->backend(); }
+  WaitResult waitFrames(uint64_t frames, uint64_t timeoutNs) override {
+    if (frames <= done.load()) return WaitResult::Done;
+    if (!timeoutNs) return WaitResult::Timeout;
+    ++blocked;
+    if (finishAfterNs >= 0 && uint64_t(finishAfterNs) <= timeoutNs) {
+      lateClock += finishAfterNs, done = finishTo;
+      return frames <= finishTo ? WaitResult::Done : WaitResult::Timeout;
+    }
+    lateClock += int64_t(timeoutNs);
+    return WaitResult::Timeout;
+  }
+};
+
+// vkGetQueryPoolResults on an occlusion query whose frame the GPU has not finished: without WAIT it is VK_NOT_READY and
+// writes nothing (Vulkan: the app's value is not touched; availability 0); with WAIT it waits and returns the count. A wait
+// that runs out reports the query visible (non-zero), never 0, and the reads after it do not wait while the GPU is behind;
+// all the waits of a frame together take 20 ms; once the GPU is past, waits are normal again.
+void testQueryNotReady() {
+  constexpr int kQ = 52;
+  constexpr int64_t kMs = 1'000'000;
+  constexpr VkQueryResultFlags kWait = VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT | VK_QUERY_RESULT_WAIT_BIT;
+  Ctx c;
+  Device* dev = from<Device>(c.dev);
+  auto lateOwner = std::make_unique<LateGpu>();
+  LateGpu* gpu = lateOwner.get();
+  gpu->inner = std::move(dev->platform);
+  dev->platform = std::move(lateOwner);
+  dev->clockNs = lateClockNs;
+  lateClock = 0;
+  gpu->done = c.gpu().submittedFrames();
+  VkQueryPoolCreateInfo qi{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+  qi.queryType = VK_QUERY_TYPE_OCCLUSION;
+  qi.queryCount = kQ;
+  VkQueryPool qp;
+  CHECK(vkCreateQueryPool(c.dev, &qi, nullptr, &qp) == VK_SUCCESS);
+  QueryPoolObj* p = from<QueryPoolObj>(qp);
+  VkCommandPoolCreateInfo pi{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+  VkCommandPool pool;
+  vkCreateCommandPool(c.dev, &pi, nullptr, &pool);
+  VkCommandBufferAllocateInfo ai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+  ai.commandPool = pool;
+  ai.commandBufferCount = 1;
+  VkCommandBuffer cb;
+  vkAllocateCommandBuffers(c.dev, &ai, &cb);
+  // Queries 1..kQ-1 end in one submission whose frame is not finished (done stays below it).
+  auto submitEnding = [&](uint32_t first, uint32_t n) {
+    VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    vkResetCommandBuffer(cb, 0);
+    vkBeginCommandBuffer(cb, &bi);
+    vkCmdResetQueryPool(cb, qp, first, n);
+    for (uint32_t i = first; i < first + n; ++i) vkCmdBeginQuery(cb, qp, i, 0), vkCmdEndQuery(cb, qp, i);
+    vkEndCommandBuffer(cb);
+    VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+    si.commandBufferCount = 1;
+    si.pCommandBuffers = &cb;
+    CHECK(vkQueueSubmit(c.queue, 1, &si, VK_NULL_HANDLE) == VK_SUCCESS);
+  };
+  submitEnding(1, kQ - 1);
+  CHECK(p->frame[1] != 0 && p->frame[kQ - 1] != 0);
+  const uint64_t samples = 77;
+  for (int i = 1; i < kQ; ++i) std::memcpy(dev->visibility.host + size_t(p->base + i) * 8, &samples, 8);
+
+  // No WAIT: not ready, the destination is not written.
+  uint64_t r[2] = {0xAAAA, 0xBBBB};
+  CHECK(vkGetQueryPoolResults(c.dev, qp, 1, 1, sizeof r, r, 16, VK_QUERY_RESULT_64_BIT) == VK_NOT_READY);
+  CHECK(r[0] == 0xAAAA);
+  CHECK(vkGetQueryPoolResults(c.dev, qp, 1, 1, sizeof r, r, 16, VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT) ==
+        VK_NOT_READY);
+  CHECK(r[0] == 0xAAAA && r[1] == 0);
+  CHECK(gpu->blocked == 0 && dev->occLateFrame == 0);
+
+  // WAIT while the GPU finishes (after 3 ms): waits, then the count; the 3 ms count against the frame's 20.
+  gpu->finishAfterNs = 3 * kMs, gpu->finishTo = c.gpu().submittedFrames();
+  r[0] = r[1] = 0xAAAA;
+  CHECK(vkGetQueryPoolResults(c.dev, qp, 1, 1, sizeof r, r, 16, kWait) == VK_SUCCESS);
+  CHECK(r[0] == 77 && r[1] == 1 && gpu->blocked == 1 && lateClock == 3 * kMs && dev->occBudgetUsedNs == uint64_t(3 * kMs));
+  CHECK(dev->occLateFrame == 0);
+
+  // A GPU that is stuck: the first read waits up to what is left of the 20 ms and reads visible; the other 49 (each in its
+  // own call, then 3 in one call) read visible at once, with no wait of their own: ~20 ms in all, not 50 x 20 ms.
+  gpu->done = 0, gpu->finishAfterNs = -1, gpu->blocked = 0, lateClock = 0, dev->occBudgetUsedNs = 0;
+  for (int i = 2; i < kQ; ++i) {
+    r[0] = r[1] = 0xAAAA;
+    CHECK(vkGetQueryPoolResults(c.dev, qp, i, 1, sizeof r, r, 16, kWait) == VK_SUCCESS);
+    CHECK(r[0] == 1 && r[1] == 1);
+  }
+  CHECK(gpu->blocked == 1 && lateClock == 20 * kMs && dev->occLateFrame == p->frame[2]);
+  uint64_t many[6] = {};
+  CHECK(vkGetQueryPoolResults(c.dev, qp, 1, 3, sizeof many, many, 16, kWait) == VK_SUCCESS);
+  CHECK(many[0] == 1 && many[1] == 1 && many[2] == 1 && many[3] == 1 && many[4] == 1 && many[5] == 1);
+  CHECK(gpu->blocked == 1 && lateClock == 20 * kMs);
+  // Without WAIT the late state changes nothing: still not ready.
+  r[0] = r[1] = 0xAAAA;
+  CHECK(vkGetQueryPoolResults(c.dev, qp, 1, 1, sizeof r, r, 16, kWait & ~VK_QUERY_RESULT_WAIT_BIT) == VK_NOT_READY);
+  CHECK(r[0] == 0xAAAA && r[1] == 0);
+
+  // The GPU gets past the late frame: the real counts again, the late state is gone.
+  gpu->done = c.gpu().submittedFrames();
+  r[0] = r[1] = 0xAAAA;
+  CHECK(vkGetQueryPoolResults(c.dev, qp, 1, 1, sizeof r, r, 16, kWait) == VK_SUCCESS);
+  CHECK(r[0] == 77 && r[1] == 1 && dev->occLateFrame == 0 && gpu->blocked == 1);
+
+  // A new frame is a fresh budget, and waits are normal again: the GPU is late once more, so this one waits (and runs out).
+  submitEnding(0, 1);
+  gpu->done = c.gpu().submittedFrames() - 1;
+  lateClock = 0;
+  r[0] = r[1] = 0xAAAA;
+  CHECK(vkGetQueryPoolResults(c.dev, qp, 0, 1, sizeof r, r, 16, kWait) == VK_SUCCESS);
+  CHECK(r[0] == 1 && r[1] == 1 && gpu->blocked == 2 && lateClock == 20 * kMs && dev->occLateFrame == p->frame[0]);
+
+  // The budget alone (the GPU is not late, waits that succeed): 8 ms + 8 ms, then the third gets 4 ms and runs out; after
+  // it nothing waits. Then, with the late state cleared by hand, a read still finds the budget spent and does not wait.
+  submitEnding(1, 3);
+  for (int i = 1; i <= 3; ++i) std::memcpy(dev->visibility.host + size_t(p->base + i) * 8, &samples, 8);
+  const uint64_t doneBefore = c.gpu().submittedFrames() - 1;
+  gpu->done = doneBefore, gpu->finishAfterNs = 8 * kMs, gpu->finishTo = doneBefore + 1;
+  dev->occLateFrame = 0, gpu->blocked = 0, lateClock = 0;
+  for (int i = 1; i <= 2; ++i) {
+    gpu->done = doneBefore;
+    r[0] = r[1] = 0xAAAA;
+    CHECK(vkGetQueryPoolResults(c.dev, qp, i, 1, sizeof r, r, 16, kWait) == VK_SUCCESS);
+    CHECK(r[0] == 77 && r[1] == 1);
+  }
+  CHECK(gpu->blocked == 2 && lateClock == 16 * kMs && dev->occLateFrame == 0);
+  gpu->done = doneBefore;
+  r[0] = r[1] = 0xAAAA;
+  CHECK(vkGetQueryPoolResults(c.dev, qp, 3, 1, sizeof r, r, 16, kWait) == VK_SUCCESS);
+  CHECK(r[0] == 1 && r[1] == 1 && gpu->blocked == 3 && lateClock == 20 * kMs && dev->occBudgetUsedNs == uint64_t(20 * kMs));
+  dev->occLateFrame = 0;
+  gpu->done = doneBefore;
+  r[0] = r[1] = 0xAAAA;
+  CHECK(vkGetQueryPoolResults(c.dev, qp, 2, 1, sizeof r, r, 16, kWait) == VK_SUCCESS);
+  CHECK(r[0] == 1 && r[1] == 1 && gpu->blocked == 3 && lateClock == 20 * kMs);  // budget spent: no wait
+  gpu->done = doneBefore + 1;
+  r[0] = r[1] = 0xAAAA;
+  CHECK(vkGetQueryPoolResults(c.dev, qp, 2, 1, sizeof r, r, 16, kWait) == VK_SUCCESS);
+  CHECK(r[0] == 77 && r[1] == 1);  // spent budget, but the GPU is done: the real count
+
+  // A query never ended: WAIT does not hang, not ready (late state or not).
+  r[0] = r[1] = 0xAAAA;
+  VkQueryPool qp2;
+  CHECK(vkCreateQueryPool(c.dev, &qi, nullptr, &qp2) == VK_SUCCESS);
+  CHECK(vkGetQueryPoolResults(c.dev, qp2, 0, 1, sizeof r, r, 16, kWait) == VK_NOT_READY);
+  CHECK(r[0] == 0xAAAA && r[1] == 0);
+  vkDestroyQueryPool(c.dev, qp2, nullptr);
+
+  gpu->done = c.gpu().submittedFrames();
+  dev->clockNs = nullptr;
+  vkDestroyQueryPool(c.dev, qp, nullptr);
+  vkDestroyCommandPool(c.dev, pool, nullptr);
+  dev->platform = std::move(gpu->inner);  // the stand-in goes before the device does
+}
+
 // Render-pass load/store rules Metal's whole-attachment actions cannot express directly (CTS
 // renderpasses.attachment.*, multiview.*clear*): partial render areas keep the outside, multiview
 // load ops apply per view at its first subpass, one store for both depth/stencil aspects, and a
@@ -11914,7 +12078,7 @@ int main(int argc, char** argv) {
   const std::vector<std::pair<const char*, std::function<void()>>> groups = {
       {"exports", testExports}, {"physical", testPhysical}, {"memory", testMemory}, {"msaa_tile_off", testMsaaTileOff},
       {"passes", testPasses},   {"submit", testSubmit}, {"pipeline", testPipeline},
-      {"recipes", testRecipes}, {"recipe_keys", testRecipeKeys}, {"taa", testTaa}, {"msaa", testMsaa}, {"queries", testQueries},
+      {"recipes", testRecipes}, {"recipe_keys", testRecipeKeys}, {"taa", testTaa}, {"msaa", testMsaa}, {"queries", testQueries}, {"query_not_ready", testQueryNotReady},
       {"timeline", testTimeline}, {"queues", testQueues}, {"timeline_order", testTimelineOrder}, {"pending", testPending}, {"renderpass_ops", testRenderPassOps}, {"linear", testLinear}, {"images", testImages}, {"image_lifetime", testImageLifetime},
       {"vertex_stores", testVertexStores}, {"profile", testProfile}, {"profile13", testProfile13}, {"quest_extras", testQuestExtras}, {"push_descriptor", testPushDescriptor}, {"report_geom", testReportGeomInterpolators}, {"pipeline_policy", testPipelinePolicy}, {"eds", testExtendedDynamicState},
       {"native_identity", testNativeIdentity}, {"inline_uniform", testInlineUniformBlock}, {"bda", testBufferDeviceAddress}, {"ycbcr", testYcbcr},

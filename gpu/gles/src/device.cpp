@@ -4,6 +4,7 @@
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>
+#include <thread>
 
 #include "context.h"
 
@@ -416,6 +417,7 @@ uint32_t Context::occSlot() {
 }
 
 void Context::occBegin(Query& q) {
+    q.endSerial = 0;  // set again by occEnd if this run is counted
     if (q.slot == UINT32_MAX) q.slot = occSlot();
     if (q.slot == UINT32_MAX || occActive_ != UINT32_MAX) return;  // no slot / another query counting: this one stays coherent
     endPass();
@@ -439,18 +441,52 @@ void Context::occResume() {
     if (occActive_ != UINT32_MAX) dev->vk.vkCmdBeginQuery(cmd(), occPool_, occActive_, 0);
 }
 
-bool Context::occResult(Query& q, bool wait, uint64_t& value) {
+bool Context::occResult(Query& q, bool wait, uint64_t& value, OccWait* how) {
     if (dev->submitted < q.endSerial) flush(false);
-    uint64_t data[2] = {0, 0};
-    const VkResult r = dev->vk.vkGetQueryPoolResults(dev->device, occPool_, q.slot, 1, sizeof data, data, sizeof data,
-                                                     VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT |
-                                                         (wait ? VK_QUERY_RESULT_WAIT_BIT : 0));
-    if (r < 0) {  // device lost: the coherent answer stands
-        value = 1;
-        return true;
+    if (how) *how = OccWait::Done;
+    const auto now = [&] {
+        return dev->clockNs ? dev->clockNs() : uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                                            std::chrono::steady_clock::now().time_since_epoch()).count());
+    };
+    if (dev->occBudgetSerial != dev->submitted) dev->occBudgetSerial = dev->submitted, dev->occBudgetUsedNs = 0;
+    if (wait && dev->occLateSerial) {
+        dev->retire(false);
+        if (dev->completed >= dev->occLateSerial) dev->occLateSerial = 0;
     }
-    value = data[0];
-    return data[1] != 0;
+    // The GPU is behind (a wait ran out and it has not got past it) or the frame's budget is spent: look once, never wait.
+    const bool skip = wait && (dev->occLateSerial || dev->occBudgetUsedNs >= kOccWaitNs);
+    const bool block = wait && !skip;
+    const uint64_t t0 = block ? now() : 0;
+    for (;;) {
+        uint64_t data[2] = {0, 0};
+        const VkResult r = dev->vk.vkGetQueryPoolResults(dev->device, occPool_, q.slot, 1, sizeof data, data, sizeof data,
+                                                         VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT |
+                                                             (block ? VK_QUERY_RESULT_WAIT_BIT : 0));
+        if (r < 0) {  // device lost: the coherent answer stands
+            value = 1;
+            return true;
+        }
+        value = data[0];
+        const uint64_t waited = block ? now() - t0 : 0;
+        if (data[1] != 0) {
+            dev->occBudgetUsedNs += waited;
+            return true;
+        }
+        if (!wait) return false;
+        value = 1;  // never 0 for a result that is only late: the game would cull what is on screen
+        if (skip) {
+            if (how) *how = OccWait::Skipped;
+            return true;
+        }
+        // The result is late (a WAIT that returned not ready: the submission is not on the GPU yet): ask again, up to the budget.
+        if (dev->occBudgetUsedNs + waited >= kOccWaitNs) {
+            dev->occBudgetUsedNs = kOccWaitNs;
+            dev->occLateSerial = std::max(dev->occLateSerial, q.endSerial);
+            if (how) *how = OccWait::Expired;
+            return true;
+        }
+        std::this_thread::sleep_for(std::chrono::microseconds(100));
+    }
 }
 
 void Context::endPass() {
