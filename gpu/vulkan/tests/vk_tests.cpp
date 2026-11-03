@@ -7900,6 +7900,8 @@ void testPsoCensus() {
   char wantCensus[128];
   std::snprintf(wantCensus, sizeof wantCensus, " prewarmed_unused=2 requested_not_prewarmed=%zu requested=%zu\n", asked, asked);
   CHECK(census.find("vk.pso.census created=") != std::string::npos && census.find(wantCensus) != std::string::npos);
+  // modules_created= modules_used= modules_unused=: the 2 distinct modules made above (the geometry stage reuses the fragment one), both in a pipeline.
+  CHECK(census.find(" modules_created=2 modules_used=2 modules_unused=0 prewarmed_unused=2 ") != std::string::npos);
   CHECK(census.find("vk.pso.census_keys prewarmed_unused=[0000000000001111:-,0000000000002222:-] requested_not_prewarmed=[") != std::string::npos);
   CHECK(census.find(",000000000000feed:test_fresh]\n") != std::string::npos);
   // The archive fields: archived = serialized, plus how many are still pending and how many spilled at the queue's fuse.
@@ -7940,6 +7942,186 @@ void testPsoCensus() {
   }
   vkDestroyPipeline(c.dev, good, nullptr);
   vkDestroyPipeline(c.dev, bad, nullptr);
+}
+
+int64_t gCacheClock = 0;
+int64_t cacheClock() { return gCacheClock; }
+
+// Counts the archive flushes the driver asks of the platform (complete turning 1 requests one, on a thread of its own).
+struct FlushCountPlatform final : Platform {
+  std::unique_ptr<Platform> inner;
+  std::atomic<int> flushes{0};
+  vpgpu::Backend& backend() override { return inner->backend(); }
+  void flushCaches(bool, const std::function<void(uint32_t, uint32_t)>&) override { ++flushes; }
+  // The flush runs asynchronously: waits until `n` were made, then a moment more to see none extra.
+  bool flushesSettle(int n) {
+    for (int i = 0; i < 2000 && flushes.load() < n; ++i) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    return flushes.load() == n;
+  }
+};
+
+// The complete shader cache detector (CacheWatch, vpvk_cache_state, "vk.cache_state"): the rule with injected time and frames, the
+// log lines, then the same through a device with Device::clockNs (a created pipeline, a probed key, modules) and the exported call.
+void testCacheState() {
+  constexpr int64_t kSec = 1'000'000'000;
+  {  // 1. The rule.
+    CacheWatch w;
+    const auto ev = [&](int64_t t, uint64_t frame, bool idle = true) { return w.evaluate(t, frame, idle, 7); };
+    VpvkCacheState s = ev(100 * kSec, 5000);
+    CHECK(!s.complete && s.reason == CacheNoPipelines && s.pipelines_unique == 0 && s.recipes == 7 && s.version == kCacheStateVersion);
+    CHECK(s.idle_ms == 0 && s.frames_idle == 0);
+    w.noteKey(0xA, 10 * kSec, 100);
+    s = ev(10 * kSec + 19'999'000'000, 100 + 5000);  // enough frames, 1 ms short of the idle time
+    CHECK(!s.complete && s.reason == CacheRecent && s.idle_ms == 19999 && s.pipelines_unique == 1);
+    s = ev(30 * kSec, 100 + 599);  // idle time reached, one frame short
+    CHECK(!s.complete && s.reason == CacheNoFrames && s.idle_ms == 20000 && s.frames_idle == 599);
+    s = ev(30 * kSec, 100 + 600, false);  // everything but the pipeline cache still compiling
+    CHECK(!s.complete && s.reason == CacheCompiling);
+    s = ev(30 * kSec, 100 + 600);
+    CHECK(s.complete == 1 && s.reason == CacheOk && s.idle_ms == 20000 && s.frames_idle == 600);
+    w.noteKey(0xA, 30 * kSec, 700);  // a key already seen: nothing moves
+    s = ev(30 * kSec, 700);
+    CHECK(s.complete == 1 && s.pipelines_unique == 1);
+    w.noteKey(0xB, 30 * kSec, 700);  // a new key: back to "recent"
+    s = ev(30 * kSec, 700);
+    CHECK(!s.complete && s.reason == CacheRecent && s.pipelines_unique == 2 && s.idle_ms == 0 && s.frames_idle == 0);
+    s = ev(50 * kSec, 1300);
+    CHECK(s.complete == 1);
+    // Modules: 100 created; the unused ones may be 5 % at most. Referencing a module twice, or one never created, counts nothing more.
+    for (uint64_t u = 1; u <= 100; ++u) w.noteModule(u, false);
+    w.noteModule(5, false);  // created twice: one module
+    s = ev(50 * kSec, 1300);
+    CHECK(s.modules_created == 100 && s.modules_used == 0 && s.reason == CacheUnusedModules && !s.complete);
+    for (uint64_t u = 1; u <= 94; ++u) w.noteModule(u, true);
+    w.noteModule(1, true), w.noteModule(999, true);
+    s = ev(50 * kSec, 1300);
+    CHECK(s.modules_created == 100 && s.modules_used == 94 && s.reason == CacheUnusedModules);  // 6 % unused
+    s = ev(50 * kSec, 1300, false);
+    CHECK(s.reason == CacheCompiling);  // compiling is reported before the modules
+    w.noteModule(95, true);
+    s = ev(50 * kSec, 1300);
+    CHECK(s.modules_used == 95 && s.complete == 1 && s.reason == CacheOk);  // 5 % exactly is allowed
+    // Bounded sets: modules past the cap are not tracked; keys past the cap count as new.
+    for (uint64_t u = 1000; u < 1000 + CacheWatch::kMaxModules + 10; ++u) w.noteModule(u, false);
+    CHECK(w.evaluate(50 * kSec, 1300, true, 0).modules_created == CacheWatch::kMaxModules);
+    CacheWatch full;
+    for (uint64_t k = 1; k <= CacheWatch::kMaxKeys; ++k) full.noteKey(k, kSec, 1);
+    CHECK(full.evaluate(kSec, 1, true, 0).pipelines_unique == CacheWatch::kMaxKeys);
+    full.noteKey(CacheWatch::kMaxKeys + 1, 5 * kSec, 9);
+    CHECK(full.evaluate(5 * kSec, 9, true, 0).idle_ms == 0 && full.evaluate(5 * kSec, 9, true, 0).pipelines_unique == CacheWatch::kMaxKeys);
+    full.noteKey(1, 7 * kSec, 11);  // seen key: not new
+    CHECK(full.evaluate(7 * kSec, 11, true, 0).idle_ms == 2000);
+  }
+  {  // 2. The log: one line per change of complete / reason, at most kCacheLogLines.
+    CacheWatch w;
+    VpvkCacheState s{};
+    s.pipelines_unique = 3, s.modules_created = 10, s.modules_used = 9, s.idle_ms = 123, s.complete = 0, s.reason = CacheRecent;
+    std::string out = captureStderr([&] { w.logChange(s), w.logChange(s), s.idle_ms = 456, w.logChange(s); });
+    CHECK(countOf(out, "vk.cache_state ") == 1);
+    CHECK(out.find("vk.cache_state complete=0 reason=2 pipelines=3 modules_created=10 modules_used=9 idle_ms=123\n") != std::string::npos);
+    s.complete = 1, s.reason = CacheOk;
+    bool became = false;
+    out = captureStderr([&] { became = w.logChange(s); });
+    CHECK(out.find("vk.cache_state complete=1 reason=0 ") != std::string::npos && became);  // the flush is requested on 0 -> 1 only
+    CHECK(!w.logChange(s));
+    s.complete = 0, s.reason = CacheRecent;
+    CHECK(!w.logChange(s));
+    s.complete = 1, s.reason = CacheOk;
+    CHECK(w.logChange(s));
+    out = captureStderr([&] {
+      for (uint32_t i = 0; i < 300; ++i) s.complete = i & 1, s.reason = i & 1 ? CacheOk : CacheNoFrames, w.logChange(s);
+    });
+    CHECK(countOf(out, "vk.cache_state ") == kCacheLogLines - 4);
+  }
+  // 3. Through a device: pipelines, probes and modules; the exported call; the submit tick.
+  Ctx c;
+  Device* d = from<Device>(c.dev);
+  auto flushOwner = std::make_unique<FlushCountPlatform>();
+  FlushCountPlatform* flushPlatform = flushOwner.get();
+  flushOwner->inner = std::move(d->platform);
+  d->platform = std::move(flushOwner);
+  d->clockNs = cacheClock;
+  gCacheClock = 1000 * kSec;
+  VpvkCacheState s{};
+  CHECK(vpvk_cache_state(nullptr) == 0);
+  std::string out = captureStderr([&] { CHECK(vpvk_cache_state(&s) == 1); });
+  CHECK(s.version == kCacheStateVersion && s.reason == CacheNoPipelines && !s.complete && s.pipelines_unique == 0 && s.modules_created == 0);
+  CHECK(out.find("vk.cache_state complete=0 reason=1 pipelines=0 modules_created=0 modules_used=0 idle_ms=0\n") != std::string::npos);
+  VkDescriptorSetLayoutBinding b[2] = {{0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+                                       {1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr}};
+  VkDescriptorSetLayoutCreateInfo lci{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+  lci.bindingCount = 2, lci.pBindings = b;
+  VkDescriptorSetLayout sl;
+  vkCreateDescriptorSetLayout(c.dev, &lci, nullptr, &sl);
+  VkPipelineLayoutCreateInfo plci{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+  plci.setLayoutCount = 1, plci.pSetLayouts = &sl;
+  VkPipelineLayout pl;
+  vkCreatePipelineLayout(c.dev, &plci, nullptr, &pl);
+  const auto createCompute = [&](VkShaderModule m, VkPipeline& pipe) {
+    VkComputePipelineCreateInfo ci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+    ci.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+    ci.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT, ci.stage.module = m, ci.stage.pName = "main";
+    ci.layout = pl;
+    vkCreateComputePipelines(c.dev, VK_NULL_HANDLE, 1, &ci, nullptr, &pipe);
+    resolvePipeline(d, *from<PipelineObj>(pipe));  // (asynchronous creation: the key is known once the job ran)
+    c.gpu().pipelines().waitIdle();
+  };
+  VkShaderModule bda = module(c, "bda.comp.spv"), cull = module(c, "cull.comp.opt.spv");
+  s = {};
+  vpvk_cache_state(&s);
+  CHECK(s.modules_created == 2 && s.modules_used == 0 && s.pipelines_unique == 0 && s.reason == CacheNoPipelines);
+  VkPipeline pipe = VK_NULL_HANDLE;
+  createCompute(bda, pipe);
+  CHECK(from<PipelineObj>(pipe)->ok);
+  vpvk_cache_state(&s);
+  CHECK(s.pipelines_unique == 1 && s.modules_created == 2 && s.modules_used == 1 && s.reason == CacheRecent && s.idle_ms == 0);
+  gCacheClock += 20 * kSec;
+  vpvk_cache_state(&s);
+  CHECK(s.idle_ms == 20000 && s.reason == CacheNoFrames && s.frames_idle == 0);
+  for (uint32_t i = 0; i < kCacheIdleFrames; ++i) c.gpu().submit(vpgpu::Frame{});
+  vpvk_cache_state(&s);
+  CHECK(s.frames_idle == kCacheIdleFrames && s.reason == CacheUnusedModules && !s.complete);  // `cull` is in no pipeline: 50 % unused
+  VkPipeline pipe2 = VK_NULL_HANDLE;
+  createCompute(cull, pipe2);  // (it may not translate with this layout: the module is referenced either way)
+  out = captureStderr([&] { vpvk_cache_state(&s); });
+  if (from<PipelineObj>(pipe2)->ok) CHECK(s.pipelines_unique == 2 && s.reason == CacheRecent);
+  else CHECK(s.pipelines_unique == 1 && s.modules_used == 2 && s.complete == 1 && s.reason == CacheOk &&
+             out.find("vk.cache_state complete=1 reason=0 ") != std::string::npos);
+  // complete turned 1: exactly one flush request (logged at once, run on its own thread), none for polls that change nothing.
+  CHECK(countOf(out, "vk.cache_state flush=requested") == 1 && flushPlatform->flushesSettle(1));
+  gCacheClock += 20 * kSec;
+  for (uint32_t i = 0; i < kCacheIdleFrames; ++i) c.gpu().submit(vpgpu::Frame{});
+  out = captureStderr([&] { CHECK(vpvk_cache_state(&s) == 1); });
+  CHECK(s.complete == 1 && s.reason == CacheOk && s.modules_used == 2 && s.recipes == 0);
+  CHECK(out.find("vk.cache_state") == std::string::npos);  // unchanged since the last poll: no new line
+  CHECK(flushPlatform->flushesSettle(1));
+  // A probed key (FAIL_ON_PIPELINE_COMPILE_REQUIRED, noteCompileRequired) is a new key too: complete goes back to 0.
+  noteCompileRequired(d, vpgpu::PipelineState{}, vpgpu::PipelineKey{0x1234}, {0, 0, 0}, false);
+  noteCompileRequired(d, vpgpu::PipelineState{}, vpgpu::PipelineKey{0x1234}, {0, 0, 0}, false);  // the same key again
+  const uint32_t unique = s.pipelines_unique;
+  // The submit tick evaluates at most once a second.
+  gCacheClock += 2 * kSec;
+  out = captureStderr([&] { cacheStateTick(d); });
+  CHECK(out.find("vk.cache_state complete=0 reason=2 pipelines=") != std::string::npos);
+  vpvk_cache_state(&s);
+  CHECK(!s.complete && s.reason == CacheRecent && s.pipelines_unique == unique + 1 && s.idle_ms == 2000);
+  CHECK(out.find("flush=requested") == std::string::npos && flushPlatform->flushesSettle(1));  // back to 0: no flush
+  gCacheClock += 20 * kSec;
+  for (uint32_t i = 0; i < kCacheIdleFrames; ++i) c.gpu().submit(vpgpu::Frame{});
+  out = captureStderr([&] { cacheStateTick(d); });  // 20 s after the last tick
+  CHECK(out.find("vk.cache_state complete=1 reason=0 ") != std::string::npos);
+  CHECK(countOf(out, "vk.cache_state flush=requested") == 1 && flushPlatform->flushesSettle(2));  // 0 -> 1 again: one more
+  out = captureStderr([&] { cacheStateTick(d), cacheStateTick(d); });
+  CHECK(out.find("vk.cache_state") == std::string::npos);  // no change
+  CHECK(flushPlatform->flushesSettle(2));
+  d->clockNs = nullptr;
+  vkDestroyPipeline(c.dev, pipe, nullptr);
+  vkDestroyPipeline(c.dev, pipe2, nullptr);
+  vkDestroyShaderModule(c.dev, bda, nullptr);
+  vkDestroyShaderModule(c.dev, cull, nullptr);
+  vkDestroyPipelineLayout(c.dev, pl, nullptr);
+  vkDestroyDescriptorSetLayout(c.dev, sl, nullptr);
 }
 
 // vpvk_cmd_pass_drop: the host (vpgles' glInvalidateFramebuffer) learns after vkCmdBeginRendering that an attachment is
@@ -12422,7 +12604,7 @@ int main(int argc, char** argv) {
       {"vertex_stores", testVertexStores}, {"profile", testProfile}, {"profile13", testProfile13}, {"quest_extras", testQuestExtras}, {"push_descriptor", testPushDescriptor}, {"report_geom", testReportGeomInterpolators}, {"pipeline_policy", testPipelinePolicy}, {"eds", testExtendedDynamicState},
       {"native_identity", testNativeIdentity}, {"inline_uniform", testInlineUniformBlock}, {"bda", testBufferDeviceAddress}, {"ycbcr", testYcbcr},
       {"taa_native", testTaaNative}, {"taa_eye_depth", testTaaEyeDepth}, {"taa_uimask", testTaaUiMask}, {"msaa_force", testMsaaForce}, {"prewarm_variants", testPrewarmVariants}, {"msaa_force_marked", testMsaaForceMarkedEye}, {"aot", testAot}, {"aniso", testAniso}, {"zeroinit", testZeroInit}, {"archive_index", testArchiveIndex}, {"foveation", testFoveation},
-      {"stage_keys", testStageKeys}, {"async_pipelines", testAsyncPipelines}, {"sync_pipelines", testSyncPipelines}, {"create_default", testCreateDefault}, {"pso_census", testPsoCensus}, {"pass_drop", testPassDrop}, {"skip_reasons", testSkipReasons}, {"indirect_patch", testIndirectPatch}, {"astc3d", testAstc3d},
+      {"stage_keys", testStageKeys}, {"async_pipelines", testAsyncPipelines}, {"sync_pipelines", testSyncPipelines}, {"create_default", testCreateDefault}, {"pso_census", testPsoCensus}, {"cache_state", testCacheState}, {"pass_drop", testPassDrop}, {"skip_reasons", testSkipReasons}, {"indirect_patch", testIndirectPatch}, {"astc3d", testAstc3d},
       {"perf", testPerf}, {"phase1b", testPhase1b}, {"suspend_resume", testSuspendResume}, {"translator_modes", testTranslatorModes}, {"capture", testCapture}, {"capture_images", testCaptureImages}, {"capture_hooks", testCaptureHooks}, {"capture_codec", testCaptureCodec}, {"capture_env", testCaptureEnv}, {"capture_pools", testCapturePools}, {"capture_host_frames", testCaptureHostFrames}, {"capture_corrupt", testCaptureCorrupt}, {"capture_env_host", testCaptureEnvHost}, {"capture_env_dir", testCaptureEnvDir}, {"capture_devices", testCaptureDevices}, {"capture_unhooked", testCaptureUnhooked}, {"capture_budget", testCaptureBudget}, {"capture_locks", testCaptureLocks}, {"png", testPng}, {"imgdiff", testImgDiff}, {"replay", testReplay}, {"replay_lvp", testReplayLvp}, {"refcaps", testRefCaps}};
   bool ran = false;
   for (const auto& [name, fn] : groups) {

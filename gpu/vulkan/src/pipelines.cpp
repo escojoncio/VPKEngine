@@ -25,6 +25,7 @@
 #include "vpgpu/core/archive_harvest.h"
 #include "vpgpu/core/background.h"
 #include "vpgpu/core/perf.h"
+#include "vpgpu/core/scoped_pool.h"
 #include "vpmsl/msl.h"
 #include "vpvk.h"
 
@@ -666,7 +667,8 @@ GateResult gateFramePipelines(Device* dev, vpgpu::Frame& frame, uint64_t submitN
 }
 
 // One line per boot (after 20 s of device life, then every 60 s while something changed, and at vkDestroyDevice):
-// what the cache did and what the game's threads paid for it.
+// what the cache did and what the game's threads paid for it. stages cache_hits = stage translations answered by the
+// recipe store, cumulative (not distinct stages: the unique modules / pipelines are in vk.pso.census and vk.cache_state).
 void pipelineSummary(Device* dev, bool final) {
   if (!dev) return;
   PipelineCounters& c = pipelineCounters();
@@ -677,7 +679,7 @@ void pipelineSummary(Device* dev, bool final) {
   }
   const vpgpu::PipelineStats t = dev->gpu ? dev->gpu->pipelines().totals() : vpgpu::PipelineStats{};
   const std::string archive = dev->platform ? dev->platform->archiveSummary() : std::string();
-  logf("vk.boot_summary%s t_s=%.0f mode=%s translator=%s | stages cached=%llu translated=%llu translate_ms=%.0f "
+  logf("vk.boot_summary%s t_s=%.0f mode=%s translator=%s | stages cache_hits=%llu translated=%llu translate_ms=%.0f "
        "miss{new_content=%llu new_options=%llu lower=%llu emit=%llu driver=%llu baseline=%llu no_msl=%llu uncached=%llu} "
        "| pso compiled=%u failed=%u hits=%u compile_ms=%.0f max_ms=%.0f %s | pipelines created=%llu async=%llu "
        "| draws_skipped=%llu skip_frames=%llu | blocked_ms{create=%.0f record=%.0f gate=%.0f} record_waits=%llu "
@@ -782,7 +784,7 @@ void psoCensus(Device* dev, bool force) {
   const vpgpu::PipelineStats t = dev->gpu ? dev->gpu->pipelines().totals() : vpgpu::PipelineStats{};
   Platform::ArchiveCensus a;
   if (dev->platform) dev->platform->archiveCensus(a);
-  const std::string b = psoCensusLine(c, t, a) + dev->recipeUse.census();
+  const std::string b = psoCensusLine(c, t, a) + dev->cacheWatch.modulesCensus() + dev->recipeUse.census();
   static std::mutex m;
   static std::string last, lastKeys;
   static unsigned keyLines = 0;
@@ -797,6 +799,141 @@ void psoCensus(Device* dev, bool force) {
     lastKeys = keys, ++keyLines;
     log("vk.pso.census_keys " + keys);
   }
+}
+
+// ---- Complete shader cache detector ----------------------------------------------------------------------
+// The engine decides whether the game's shader cache is complete: some pipeline exists, no new pipeline key (created or probed)
+// for kCacheIdleMs, the game kept drawing (kCacheIdleFrames submitted since), nothing queued or compiling, and (nearly) every shader
+// module it created is referenced by a pipeline. The host polls vpvk_cache_state (entry.cpp); changes are logged here.
+int64_t cacheNowNs(const Device* d) { return d && d->clockNs ? d->clockNs() : pendingNowNs(); }
+
+void noteCacheKey(Device* d, uint64_t key) {
+  if (d) d->cacheWatch.noteKey(key, cacheNowNs(d), d->gpu ? d->gpu->submittedFrames() : 0);
+}
+
+void CacheWatch::noteKey(uint64_t key, int64_t nowNs, uint64_t frame) {
+  std::lock_guard<std::mutex> lock(keyMutex);
+  if (keys.size() >= kMaxKeys) {
+    if (!keys.count(key)) lastNewNs.store(nowNs), lastNewFrame.store(frame);  // full: unknown keys count as new
+    return;
+  }
+  if (!keys.insert(key).second) return;
+  uniqueKeys.store(uint32_t(keys.size()));
+  lastNewNs.store(nowNs), lastNewFrame.store(frame);
+}
+
+void CacheWatch::noteModule(uint64_t uid, bool used) {
+  std::lock_guard<std::mutex> lock(moduleMutex);
+  if (used) {
+    const auto it = modules.find(uid);
+    if (it != modules.end() && !it->second) it->second = true, ++modulesUsed;
+  } else if (modules.size() < kMaxModules) {
+    modules.emplace(uid, false);
+  }
+}
+
+std::string CacheWatch::modulesCensus() {
+  std::lock_guard<std::mutex> lock(moduleMutex);
+  char b[96];
+  std::snprintf(b, sizeof b, " modules_created=%zu modules_used=%u modules_unused=%zu", modules.size(), modulesUsed,
+                modules.size() - modulesUsed);
+  return b;
+}
+
+VpvkCacheState CacheWatch::evaluate(int64_t nowNs, uint64_t frame, bool pipelinesIdle, uint32_t recipes) {
+  const auto clamp32 = [](uint64_t v) { return uint32_t(std::min<uint64_t>(v, UINT32_MAX)); };
+  VpvkCacheState s{};
+  s.version = kCacheStateVersion;
+  s.recipes = recipes;
+  s.pipelines_unique = uniqueKeys.load();
+  uint64_t unused = 0;
+  {
+    std::lock_guard<std::mutex> lock(moduleMutex);
+    s.modules_created = uint32_t(modules.size()), s.modules_used = modulesUsed;
+    unused = modules.size() - modulesUsed;
+  }
+  if (s.pipelines_unique) {
+    const int64_t last = lastNewNs.load();
+    const uint64_t lastFrame = lastNewFrame.load();
+    s.idle_ms = clamp32(nowNs > last ? uint64_t(nowNs - last) / 1'000'000 : 0);
+    s.frames_idle = clamp32(frame > lastFrame ? frame - lastFrame : 0);
+  }
+  s.reason = !s.pipelines_unique                              ? CacheNoPipelines
+             : s.idle_ms < kCacheIdleMs                        ? CacheRecent
+             : s.frames_idle < kCacheIdleFrames                ? CacheNoFrames
+             : !pipelinesIdle                                  ? CacheCompiling
+             : unused * 100 > uint64_t(s.modules_created) * kCacheUnusedPercent ? CacheUnusedModules
+                                                                                 : CacheOk;
+  s.complete = s.reason == CacheOk;
+  return s;
+}
+
+bool CacheWatch::logChange(const VpvkCacheState& s) {
+  std::lock_guard<std::mutex> lock(logMutex);
+  if (s.complete == lastComplete && s.reason == lastReason) return false;
+  const bool becameComplete = s.complete && lastComplete != 1;
+  lastComplete = s.complete, lastReason = s.reason;
+  if (lines++ < kCacheLogLines)
+    logf("vk.cache_state complete=%u reason=%u pipelines=%u modules_created=%u modules_used=%u idle_ms=%u", s.complete, s.reason,
+         s.pipelines_unique, s.modules_created, s.modules_used, s.idle_ms);
+  return becameComplete;
+}
+
+// complete turned 1: the compiled pipelines must be on disk before the host lets the user leave (a paused app can be killed), so
+// the archive flush (the one vpvk_flush_caches does) starts now, on a thread of its own: the submit tick / the host's poll never
+// wait for it and it takes none of their locks. NOT a guarantee: complete=1 does not mean the flush finished.
+void requestCacheFlush(Device* d) {
+  logf("vk.cache_state flush=requested");
+  if (!d->platform) return;
+  CacheWatch& w = d->cacheWatch;
+  std::thread old;
+  {
+    std::lock_guard<std::mutex> lock(w.flushMutex);
+    if (w.flushRunning) {
+      w.flushAgain = true;  // the running flush may have started before the last compiles: once more when it ends
+      return;
+    }
+    w.flushRunning = true;
+    old = std::move(w.flushThread);  // (finished or leaving: it cleared flushRunning as its last locked act)
+  }
+  if (old.joinable()) old.join();
+  std::lock_guard<std::mutex> lock(w.flushMutex);
+  w.flushThread = std::thread([d] {
+    vpgpu::ScopedPool pool;  // own thread: no autorelease pool of its own (see scoped_pool.h)
+    CacheWatch& cw = d->cacheWatch;
+    for (;;) {
+      d->platform->flushCaches();
+      std::lock_guard<std::mutex> l(cw.flushMutex);
+      if (!cw.flushAgain) {
+        cw.flushRunning = false;
+        return;
+      }
+      cw.flushAgain = false;
+    }
+  });
+}
+
+void joinCacheFlush(Device* d) {
+  std::thread t;
+  {
+    std::lock_guard<std::mutex> lock(d->cacheWatch.flushMutex);
+    t = std::move(d->cacheWatch.flushThread);
+  }
+  if (t.joinable()) t.join();
+}
+
+void cacheState(Device* d, VpvkCacheState& out) {
+  const uint32_t recipes = d->recipes && d->recipes->enabled() ? uint32_t(d->recipes->pipelineCount()) : 0;
+  out = d->cacheWatch.evaluate(cacheNowNs(d), d->gpu->submittedFrames(), d->gpu->pipelines().idle(), recipes);
+  if (d->cacheWatch.logChange(out)) requestCacheFlush(d);
+}
+
+void cacheStateTick(Device* d) {
+  const int64_t now = cacheNowNs(d);
+  if (now < d->cacheWatch.nextTickNs.load(std::memory_order_relaxed)) return;
+  d->cacheWatch.nextTickNs.store(now + 1'000'000'000LL, std::memory_order_relaxed);
+  VpvkCacheState s;
+  cacheState(d, s);
 }
 
 // ---- FAIL_ON_PIPELINE_COMPILE_REQUIRED probes ----------------------------------------------------------
@@ -815,6 +952,7 @@ void noteCompileRequired(Device* d, const vpgpu::PipelineState& st, vpgpu::Pipel
                          bool compute) {
   PipelineCounters& c = pipelineCounters();
   ++(compute ? c.probeCompute : c.probeGraphics);
+  noteCacheKey(d, key.value);
   if (!d->recipes) return;  // nothing to store into
   {
     std::lock_guard<std::mutex> lock(d->probeMutex);
@@ -1118,10 +1256,12 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkCreateShaderModule(VkDevice dv, con
   auto* m = new ShaderModuleObj;
   m->module = std::shared_ptr<spirv::SpirvModule>(spirv::parse(ci->pCode, ci->codeSize / 4, m->error), spirv::release);
   if (!m->module) logf("vk.err what=spirv_parse error=\"%s\"", m->error.c_str());
-  const Device* d = dv ? from<Device>(dv) : nullptr;
+  Device* d = dv ? from<Device>(dv) : nullptr;
+  m->uid = spirvHash(ci->pCode, ci->codeSize / 4);
+  if (d) d->cacheWatch.noteModule(m->uid, false);
   if (m->module && d && d->recipes && d->recipes->enabled()) {
     auto w = std::make_shared<std::vector<uint32_t>>(ci->pCode, ci->pCode + ci->codeSize / 4);
-    m->hash = spirvHash(w->data(), w->size());
+    m->hash = m->uid;
     m->words = std::move(w);
   }
   *out = to<VkShaderModule>(m);
@@ -1901,6 +2041,7 @@ bool pipelineKnown(Device* d, vpgpu::PipelineKey key) {
 // gpu.pso.miss_detail: the first 20 misses with every field of the pipeline state and what the Vulkan object adds to it.
 void noteRecipeKey(Device* d, vpgpu::PipelineKey key, const PipelineObj& p, uint64_t viHash) {
   const std::string& label = p.state.label;
+  noteCacheKey(d, key.value);
   d->recipeUse.note(key.value, label);
   const bool hit = pipelineKnown(d, key);  // (a recipe stored by a probe of this run, not compiled yet, is no hit)
   if (d->recipes) {  // the game creates it for real now: its recipe is a normal one from here on (known even if the pipeline is destroyed later)
@@ -2129,6 +2270,7 @@ PipelineObj* createGraphics(Device* d, const VkGraphicsPipelineCreateInfo& ci) {
   std::vector<PipelineObj::StageSrc> srcs;  // read from the create info now: it does not outlive the call
   for (uint32_t i = 0; i < ci.stageCount; ++i) {
     const auto& s = ci.pStages[i];
+    if (const ShaderModuleObj* sm = from<ShaderModuleObj>(s.module)) d->cacheWatch.noteModule(sm->uid, true);  // referenced, supported stage or not
     if (s.stage != VK_SHADER_STAGE_VERTEX_BIT && s.stage != VK_SHADER_STAGE_FRAGMENT_BIT) {
       logf("vk.err what=stage value=%u pipeline=%s (geometry/tessellation unsupported)", unsigned(s.stage), st.label.c_str());
       ok = false;
@@ -2150,6 +2292,7 @@ PipelineObj* createCompute(Device* d, const VkComputePipelineCreateInfo& ci) {
   if (!p->layout) p->layout = std::make_shared<PipelineLayoutObj>();
   static std::atomic<unsigned> counter{0};
   p->state.label = "vk.comp" + std::to_string(counter++);
+  if (const ShaderModuleObj* sm = from<ShaderModuleObj>(ci.stage.module)) d->cacheWatch.noteModule(sm->uid, true);
   runCreation(d, p, [d, p, src = stageSrc(ci.stage)]() mutable {
     p->sources.push_back(std::move(src));
     StageOut o = translateStage(d, p->sources.back(), *p->layout, 1, {}, {}, p->state.label);

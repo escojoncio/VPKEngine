@@ -28,6 +28,23 @@
 #include "foveation.h"
 #include "perf.h"
 
+// vpvk_cache_state (the host finds it with dlsym): what the driver knows about whether the game's shader cache is complete. POD,
+// version 1 = these 9 fields; filled in full by the driver (the caller only provides the storage).
+// reason: 0 ok, 1 no pipelines yet, 2 a new pipeline key appeared less than idle time ago, 3 too few frames since it, 4 pipelines
+// still queued / compiling, 5 more than 5 % of the shader modules the game created are referenced by no pipeline.
+struct VpvkCacheState {
+  uint32_t version;
+  uint32_t pipelines_unique;  // distinct pipeline keys the game created or probed in this run
+  uint32_t recipes;           // recipes stored (earlier runs and this one)
+  uint32_t modules_created;   // distinct shader modules (SPIR-V content) the game created
+  uint32_t modules_used;      // ... of those, referenced by a pipeline that was created or probed
+  uint32_t idle_ms;           // since the last new pipeline key
+  uint32_t frames_idle;       // frames submitted since the last new pipeline key
+  uint32_t complete;          // 1 when every condition holds
+  uint32_t reason;
+};
+static_assert(sizeof(VpvkCacheState) == 36, "VpvkCacheState is host ABI");
+
 namespace vpvk {
 
 // Every log line of the driver starts with "vk." (one grep finds them all in the visor log).
@@ -393,6 +410,7 @@ struct ShaderModuleObj {
   // and the store saves the words once, so a later translator version can retranslate them.
   std::shared_ptr<const std::vector<uint32_t>> words;  // null unless recipes are recorded
   uint64_t hash = 0;
+  uint64_t uid = 0;  // spirvHash of the code, always (CacheWatch counts distinct modules by it)
 };
 
 struct SetLayoutBinding {
@@ -722,6 +740,48 @@ struct MsaaTwins {
   void release(Device* dev);  // vkDestroyDevice
 };
 
+// Complete shader cache detector (pipelines.cpp cacheState, vpvk_cache_state, "vk.cache_state"). The rule's thresholds:
+constexpr uint32_t kCacheIdleMs = 20000;       // no new pipeline key for this long ...
+constexpr uint32_t kCacheIdleFrames = 600;     // ... and this many frames submitted since (the game keeps drawing)
+constexpr uint32_t kCacheUnusedPercent = 5;    // more modules created but referenced by no pipeline than this: not complete
+constexpr uint32_t kCacheLogLines = 200;       // "vk.cache_state" lines per process
+constexpr uint32_t kCacheStateVersion = 1;
+enum CacheReason : uint32_t { CacheOk, CacheNoPipelines, CacheRecent, CacheNoFrames, CacheCompiling, CacheUnusedModules };
+
+// (A flush of the Metal pipeline archive is requested when complete turns 1: see CacheWatch::logChange.)
+// The distinct pipeline keys and shader modules of this run, and when the last new key appeared. Written by the creation calls
+// (any thread): one mutex per set, held for an insert; read by evaluate() (vpvk_cache_state, the submit tick).
+struct CacheWatch {
+  static constexpr size_t kMaxKeys = 262144, kMaxModules = 65536;  // sets are bounded (see noteKey / noteModule)
+  std::mutex keyMutex;
+  std::unordered_set<uint64_t> keys;
+  std::atomic<uint32_t> uniqueKeys{0};
+  std::atomic<int64_t> lastNewNs{0};      // clock of the last new key (0 = none yet)
+  std::atomic<uint64_t> lastNewFrame{0};  // gpu->submittedFrames() then
+  std::mutex moduleMutex;
+  std::unordered_map<uint64_t, bool> modules;  // module uid -> referenced by a pipeline
+  uint32_t modulesUsed = 0;
+  std::mutex logMutex;
+  uint32_t lastComplete = UINT32_MAX, lastReason = UINT32_MAX, lines = 0;
+  std::atomic<int64_t> nextTickNs{0};
+  // A key not seen in this run moves lastNewNs / lastNewFrame. A full set counts every key as new (never a false "complete").
+  void noteKey(uint64_t key, int64_t nowNs, uint64_t frame);
+  // A module the game created (used = false) or a pipeline references (used = true). Past kMaxModules new ones are not tracked.
+  void noteModule(uint64_t uid, bool used);
+  // The state at `nowNs` / `frame`. pipelinesIdle: nothing queued or compiling in the pipeline cache.
+  VpvkCacheState evaluate(int64_t nowNs, uint64_t frame, bool pipelinesIdle, uint32_t recipes);
+  std::string modulesCensus();  // " modules_created=N modules_used=N modules_unused=N" (vk.pso.census)
+  // One "vk.cache_state" line when complete or reason changed. True when complete turned 1 (from 0, or at the first evaluation):
+  // the caller asks for the archive flush, once per transition.
+  bool logChange(const VpvkCacheState&);
+  // The archive flush of that transition (pipelines.cpp requestCacheFlush): platform->flushCaches() on a thread of its own, one at
+  // a time (a request while one runs makes it run once more). Joined at vkDestroyDevice (joinCacheFlush). `complete` does not mean
+  // the flush finished: it is only requested when complete turns 1, and the thread may still be writing when the host reads it.
+  std::mutex flushMutex;
+  std::thread flushThread;
+  bool flushRunning = false, flushAgain = false;
+};
+
 // vk.pso.census prewarmed_unused= / requested_not_prewarmed= (pipelines.cpp noteRecipeKey): the pipeline keys the game's creates asked
 // for this session (at most kMax distinct; `overflow` once more arrived, the counts are then lower bounds) against the recipes the
 // prewarm compiled (`prewarmed`, sorted, set by setPrewarmed once the prewarm's refresh() has rekeyed the recipes; creates noted
@@ -759,6 +819,7 @@ struct Device : Dispatchable {
   uint32_t recipesLoaded = 0;
   std::atomic<uint32_t> recipesPrewarmed{0}, recipesFresh{0};
   RecipeUse recipeUse;
+  CacheWatch cacheWatch;
   Queue queues[kQueueCount];
   bool multiview = false, densityMap = false, metalObjects = false;
   std::mutex submitMutex;
@@ -945,3 +1006,4 @@ H to(T* p) { return reinterpret_cast<H>(p); }
 // earlier call. See the definition for what keeps its store.
 extern "C" void vpvk_cmd_pass_drop(VkCommandBuffer cb, uint32_t colorMask, int depth, int stencil);
 extern "C" void vpvk_recipe_stats(VkDevice dv, uint32_t out[4]);  // pipelines.cpp: gles.pso.recipe counters
+extern "C" int vpvk_cache_state(VpvkCacheState* out);  // entry.cpp: 1 = filled from the live device, 0 = no device (out zeroed, version set)

@@ -1427,6 +1427,7 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkDestroyDevice(VkDevice dv, const VkAllo
   { std::lock_guard<std::mutex> l(d->submitMutex); }
   d->prewarmCancel = true;
   if (d->prewarmThread.joinable()) d->prewarmThread.join();
+  joinCacheFlush(d);
   pipelineSummary(d, true);
   psoCensus(d, true);
   d->platform->waitIdle(UINT64_MAX);  // bounded by a lost device (Platform::waitIdle)
@@ -3122,6 +3123,7 @@ void runBatches(Device* d, std::vector<DeferredBatch>& list, size_t count) {
   ++d->submits;
   pipelineSummary(d, false);
   psoCensus(d, false);
+  cacheStateTick(d);
   ampCensus();
   indirectStatsLog();
   msaaSubmitTick(d->submits);
@@ -3577,6 +3579,19 @@ VPVK_EXPORT void vpvk_dump_pending(void) {
   if (!d || !d->platform) return;
   for (const std::string& l : pendingReport(*d)) log(l);
   d->platform->dumpInFlight("vk_pending");
+}
+
+// Host (dlsym): whether the game's shader cache looks complete (see VpvkCacheState in vpvk.h). Poll it; every change of
+// complete / reason is also logged ("vk.cache_state"). 1 = filled from the live device; 0 = no device or null `out`.
+VPVK_EXPORT int vpvk_cache_state(VpvkCacheState* out) {
+  if (!out) return 0;
+  *out = VpvkCacheState{};
+  out->version = kCacheStateVersion;
+  std::lock_guard<std::mutex> live(liveDeviceMutex());
+  Device* d = liveDevice();
+  if (!d || !d->gpu) return 0;
+  cacheState(d, *out);
+  return 1;
 }
 
 VPVK_EXPORT int vpvk_gpu_lost(void) {

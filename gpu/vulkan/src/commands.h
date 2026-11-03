@@ -308,6 +308,7 @@ vpgpu::PipelineKey pipelineFor(Device*, const PipelineObj&, uint8_t passSamples,
 bool resolvePipeline(Device*, const PipelineObj&);
 // Per-boot counters of the pipeline machinery (all threads).
 struct PipelineCounters {
+  // Cumulative, not distinct: every stage translation answered by the recipe store counts (the same stage twice counts twice).
   std::atomic<uint64_t> stagesCached{0}, stagesTranslated{0}, translateUs{0};
   // Why a stage was translated although a cache exists: the SPIR-V is new, only its options are (another layout,
   // vertex format, view mask), a translator component moved (lower / emit / driver / baseline), MSL gone, or no cache.
@@ -348,6 +349,14 @@ void pipelineSummary(Device*, bool final);
 // "vk.pso.census": one line with how many pipelines the game created and what became of each (pipelines.cpp). Without
 // `force`, at most every 10 s and only when a counter moved; `force` (cache flush, device destroy) always prints.
 void psoCensus(Device*, bool force);
+// Complete shader cache detector (vpvk.h CacheWatch). cacheNowNs: the device's clock (Device::clockNs in tests, else the steady
+// clock). noteCacheKey: a pipeline key was created or probed. cacheState: evaluates, fills `out` and logs a change of
+// complete / reason ("vk.cache_state"). cacheStateTick: from the submit tick, evaluates at most once a second.
+int64_t cacheNowNs(const Device*);
+void noteCacheKey(Device*, uint64_t key);
+void cacheState(Device*, VpvkCacheState& out);
+void cacheStateTick(Device*);
+void joinCacheFlush(Device*);  // vkDestroyDevice: waits for the archive flush thread that complete turning 1 started
 // A create with FAIL_ON_PIPELINE_COMPILE_REQUIRED the cache / recipes do not hold is answered COMPILE_REQUIRED as always; only its recipe
 // is stored (at most kProbeRecipeCap per session) so the next boot's prewarm has it. Nothing is compiled or retained; the key stays
 // unknown (pipelineKnown) until something compiles it. probeReport: the "vk.pso.probe" line, at most every 5 s (`force`: now), 720 lines.
