@@ -733,6 +733,22 @@ struct MsaaTwins {
   uint8_t rejLogged[2] = {0, 0};
   void noteRej(Device* dev, const vpgpu::RenderPassDesc& d, const char* why);  // logs a rejected pass (see above); count it separately
   int64_t nextLogNs = 0;
+  // "vk.msaa main force=N samples=S result=up|rej:<why> area=WxH eye=E": the main scene pass forceMsaa judged in the last 5 s window
+  // (an eye scene pass first, else the largest render area), the game's samples S (0 = its texture description was not available)
+  // and what forceMsaa did with it ("up": drawn at N samples). Written only when result / area / samples differ from this device's
+  // previous line, plus a heartbeat every 60 s while they do not; at most kMainLines lines in all per device (this struct is
+  // per device). Per pass, never per draw.
+  static constexpr uint32_t kMainLines = 60;
+  static constexpr int64_t kMainWindowNs = 5'000'000'000LL, kMainBeatNs = 60'000'000'000LL;
+  struct MainPass { uint64_t rank = 0; uint32_t w = 0, h = 0; uint8_t samples = 0, forced = 0; bool eye = false; const char* why = nullptr; };
+  MainPass mainPass;
+  MainPass lastMain;  // the pass of the last line written (valid when mainLines > 0)
+  const char* lastWhy = nullptr;  // the reason noteRej saw last (forceMsaa clears it first)
+  int64_t nextMainNs = 0, lastMainLineNs = 0;
+  uint32_t mainLines = 0, mainTick = 0;
+  // At the end of a window (nowNs): true with `out` = the pass to log, when it differs from the last line or 60 s passed since it.
+  bool takeMainLine(int64_t nowNs, MainPass& out);
+  void noteMain(Device* dev, vpgpu::TextureId game, const VkRect2D& area, bool eye, uint8_t forced);  // end of forceMsaa
   // The twin of `guest` (texture description `gd`) for a pass of `layers` layers over mip `mip`, layer `layer`; created on the
   // first use, and entries whose guest image is gone are freed first. {} if it cannot be created.
   vpgpu::TextureId acquire(Device* dev, vpgpu::TextureId guest, const vpgpu::TextureDesc& gd, uint8_t samples, uint16_t layers,
@@ -763,6 +779,7 @@ struct CacheWatch {
   uint32_t modulesUsed = 0;
   std::mutex logMutex;
   uint32_t lastComplete = UINT32_MAX, lastReason = UINT32_MAX, lines = 0;
+  bool lastFlushable = false;  // complete, or only unused modules hold it back (CacheUnusedModules): the pipelines are all there
   std::atomic<int64_t> nextTickNs{0};
   // A key not seen in this run moves lastNewNs / lastNewFrame. A full set counts every key as new (never a false "complete").
   void noteKey(uint64_t key, int64_t nowNs, uint64_t frame);
@@ -771,8 +788,8 @@ struct CacheWatch {
   // The state at `nowNs` / `frame`. pipelinesIdle: nothing queued or compiling in the pipeline cache.
   VpvkCacheState evaluate(int64_t nowNs, uint64_t frame, bool pipelinesIdle, uint32_t recipes);
   std::string modulesCensus();  // " modules_created=N modules_used=N modules_unused=N" (vk.pso.census)
-  // One "vk.cache_state" line when complete or reason changed. True when complete turned 1 (from 0, or at the first evaluation):
-  // the caller asks for the archive flush, once per transition.
+  // One "vk.cache_state" line when complete or reason changed. True when the state turned flushable (complete, or reason
+  // CacheUnusedModules; from not flushable, or at the first evaluation): the caller asks for the archive flush, once per transition.
   bool logChange(const VpvkCacheState&);
   // The archive flush of that transition (pipelines.cpp requestCacheFlush): platform->flushCaches() on a thread of its own, one at
   // a time (a request while one runs makes it run once more). Joined at vkDestroyDevice (joinCacheFlush). `complete` does not mean

@@ -469,7 +469,7 @@ private:
     Type typeOfValue(ValueId v) { return b_fn().typeOf(v); }
     vpir::Function& b_fn() { return out_.functions.back(); }
     ValueId un(Op op, ValueId a, Type t) { return b_->unary(op, a, t); }
-    ValueId bin(Op op, ValueId a, ValueId c, Type t) { return b_->binary(op, a, c, t); }
+    ValueId bin(Op op, ValueId a, ValueId c, Type t, bool precise = false) { return b_->binary(op, a, c, t, precise); }
     ValueId tri(Op op, ValueId a, ValueId c, ValueId d, Type t) { return b_->ternary(op, a, c, d, t); }
     // `v` as type `t` when they differ only in how the bits are read (int signedness, or float vs
     // int of one width: SPIR-V composites carry exact types, VPIR values may be typed otherwise).
@@ -1852,7 +1852,8 @@ private:
                                 leaf.index = addOutput(v);
                                 if (vb == vpir::Builtin::Layer) writesLayer_ = true, layerOutput_ = leaf.index;
                                 if (vb == vpir::Builtin::Position &&
-                                    ((d && d->has(Deco::Invariant)) || (vd && vd->has(Deco::Invariant))))
+                                    ((d && d->has(Deco::Invariant)) || (vd && vd->has(Deco::Invariant)) ||
+                                     (o_.invariantPos && stage_ == vpir::Stage::Vertex)))
                                     out_.invariantPosition = true;
                             }
                             if (special == IoLeaf::Io || special == IoLeaf::FrontFacing || special == IoLeaf::SampleMaskIn) {
@@ -4949,13 +4950,17 @@ private:
                 storeMem(p, Val{{whole}}, at);
                 return define1(id, frac);
             }
-            case GLSL_FMin: case GLSL_NMin: return res(bin(Op::Min, a(0), a(1), t));
-            case GLSL_FMax: case GLSL_NMax: return res(bin(Op::Max, a(0), a(1), t));
+            case GLSL_FMin: return res(bin(Op::Min, a(0), a(1), t));
+            case GLSL_FMax: return res(bin(Op::Max, a(0), a(1), t));
+            case GLSL_NMin: return res(bin(Op::Min, a(0), a(1), t, true));  // precise: a NaN operand loses
+            case GLSL_NMax: return res(bin(Op::Max, a(0), a(1), t, true));
             case GLSL_UMin: return res(bin(Op::Min, ai(0, Scalar::U32), ai(1, Scalar::U32), ut));
             case GLSL_UMax: return res(bin(Op::Max, ai(0, Scalar::U32), ai(1, Scalar::U32), ut));
             case GLSL_SMin: return res(bin(Op::Min, ai(0, Scalar::I32), ai(1, Scalar::I32), it));
             case GLSL_SMax: return res(bin(Op::Max, ai(0, Scalar::I32), ai(1, Scalar::I32), it));
-            case GLSL_FClamp: case GLSL_NClamp: return res(tri(Op::Clamp, a(0), a(1), a(2), t));
+            case GLSL_FClamp: return res(tri(Op::Clamp, a(0), a(1), a(2), t));
+            // NClamp = NMin(NMax(x, minVal), maxVal) as the spec defines it, both precise
+            case GLSL_NClamp: return res(bin(Op::Min, bin(Op::Max, a(0), a(1), t, true), a(2), t, true));
             case GLSL_UClamp: return res(tri(Op::Clamp, ai(0, Scalar::U32), ai(1, Scalar::U32), ai(2, Scalar::U32), ut));
             case GLSL_SClamp: return res(tri(Op::Clamp, ai(0, Scalar::I32), ai(1, Scalar::I32), ai(2, Scalar::I32), it));
             case GLSL_FMix: {

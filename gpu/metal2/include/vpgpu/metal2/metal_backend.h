@@ -245,13 +245,18 @@ class MetalBackend final : public Backend {
   };
   MemStats memStats() const;
   // Memory warning (level 1) / critical (2); any thread. Frees what is rebuildable (see metal_backend.mm), appends
-  // "key=MiB ..." to `report`, returns bytes freed immediately (submit-thread work is queued, reported as *_queued).
+  // "key=MiB ..." to `report`, returns bytes freed immediately (submit-thread work is queued; msaa_live / args_live are what is alive
+  // now, *_freed_since_last what earlier requests have given back since the previous report; trimSerialized does the queued part at once).
   size_t trimMemory(int level, std::string& report);
   // Releases the objects the guest destroyed that otherwise wait for the next frame to take a slot: the retired lists
   // of frames whose command buffers all completed, and the graveyard once the last submitted frame completed. Needs
   // no idle device (`minIdleMs` is ignored). NOT any-thread: same serialization as submit/destroyTexture (VPVulkan
   // calls it under its submit mutex, try-lock). Never waits. Bytes released.
   size_t drainRetired(uint32_t minIdleMs, std::string& report);
+  // The submit-thread half of trimMemory done at once: MSAA backings not used by the last frame and idle slots' chained
+  // argument buffers go to the graveyard (drainRetired then returns the part no frame reads). Same caller rules as
+  // drainRetired (under VPVulkan's submit mutex). Never waits. Returns the bytes moved; appends "serialized_msaa= serialized_args=" (MiB).
+  size_t trimSerialized(std::string& report);
   // Cumulative counters (key, value) of what the backend created and encoded, for the per-second diagnostics; keys
   // starting "g_" are gauges. Any thread, lock-free.
   void diagCounters(std::vector<std::pair<const char*, uint64_t>>& out) const;

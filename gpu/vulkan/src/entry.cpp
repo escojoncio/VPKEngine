@@ -3554,6 +3554,21 @@ VPVK_EXPORT size_t vpvk_mem_stats(char* out, size_t cap) {
   return n;
 }
 
+VPVK_EXPORT size_t vpvk_mem_brief(char* out, size_t cap) {
+  if (!out || !cap) return 0;
+  std::unique_lock<std::mutex> live(liveDeviceMutex(), std::try_to_lock);
+  if (!live.owns_lock()) return 0;  // a trim or a per-frame call holds it: skip this sample
+  Device* d = liveDevice();
+  if (!d || !d->platform) return 0;
+  vpgpu::ScopedPool pool;  // host thread: no autorelease pool of its own (see scoped_pool.h)
+  std::string s = d->platform->memStats();
+  if (const size_t at = s.find(" ledger: "); at != std::string::npos) s.resize(at);
+  const size_t n = std::min(s.size(), cap - 1);
+  std::memcpy(out, s.data(), n);
+  out[n] = 0;
+  return n;
+}
+
 VPVK_EXPORT unsigned vpvk_gpu_backlog_ms(void) {
   vpgpu::ScopedPool pool;  // guest thread: no autorelease pool of its own (see scoped_pool.h)
   std::lock_guard<std::mutex> live(liveDeviceMutex());
@@ -3625,20 +3640,40 @@ VPVK_EXPORT uint32_t vpvk_device_wait_compiles(VkDevice dv) {
 VPVK_EXPORT size_t vpvk_trim_memory(int level, char* out, size_t cap) {
   vpgpu::ScopedPool pool;  // guest thread: no autorelease pool of its own (see scoped_pool.h)
   if (out && cap) out[0] = 0;
-  std::lock_guard<std::mutex> live(liveDeviceMutex());
+  std::unique_lock<std::mutex> live(liveDeviceMutex());
   Device* d = liveDevice();
   if (!d || !d->platform) return 0;
   std::string report;
   size_t freed = d->platform->trimMemory(level, report);
-  // Also what the guest destroyed and no frame in flight reads (the submit mutex is only try-locked, as in
-  // vpvk_idle_drain: a busy device means "not now"; the trim request itself still applies at the next submit).
-  {
-    std::unique_lock<std::mutex> lock(d->submitMutex, std::try_to_lock);
-    if (lock.owns_lock()) {
-      std::string drained;
-      freed += d->platform->drainRetired(0, drained);
-      if (!drained.empty()) report += " " + drained;
+  // Also what the guest destroyed and no frame in flight reads, and the MSAA backings / argument buffers trimMemory could
+  // only queue. Nothing is ever blocked on: the submit mutex is try-locked (order live -> submit, as vpvk_native_submit) and
+  // retried for ~50 ms, with liveDeviceMutex RELEASED while waiting between attempts (a sleeping holder would stall every
+  // per-frame call that takes it) and the device fetched again each time. With frames running the submit mutex is free for
+  // gaps of a few ms, and one attempt per second (the caller's rate) almost never caught one, so the trim freed 0.
+  std::unique_lock<std::mutex> lock;
+  for (int i = 0;; ++i) {
+    if (live.owns_lock()) {
+      Device* cur = liveDevice();
+      if (cur != d || !cur || !cur->platform) {  // the device went away (or was replaced) while we waited
+        report += " device_gone=1";
+        d = nullptr;
+        break;
+      }
+      lock = std::unique_lock<std::mutex>(d->submitMutex, std::try_to_lock);
+      if (lock.owns_lock()) break;
+      live.unlock();
     }
+    if (i >= 50) break;
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));  // no lock held here
+    (void)live.try_lock();  // busy: counts as a failed attempt
+  }
+  if (d && lock.owns_lock()) {
+    d->platform->trimSerialized(report);  // moves to the graveyard; the drain below returns what no frame reads
+    std::string drained;
+    freed += d->platform->drainRetired(0, drained);
+    if (!drained.empty()) report += " " + drained;
+  } else if (d) {
+    report += " submit_busy=1";
   }
   if (out && cap) {
     const size_t n = std::min(report.size(), cap - 1);

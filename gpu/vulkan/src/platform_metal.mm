@@ -56,6 +56,7 @@ class MetalPlatform final : public Platform {
   uint32_t lastFrameChunks() const override { return backend_.lastFrameHangSplits(); }
   size_t trimMemory(int level, std::string& report) override { return backend_.trimMemory(level, report); }
   size_t drainRetired(uint32_t minIdleMs, std::string& report) override { return backend_.drainRetired(minIdleMs, report); }
+  size_t trimSerialized(std::string& report) override { return backend_.trimSerialized(report); }
   void diagCounters(std::vector<std::pair<const char*, uint64_t>>& out) const override { backend_.diagCounters(out); }
   void diagRanges(std::vector<std::pair<uintptr_t, uint64_t>>& out) const override { backend_.diagRanges(out); }
   std::string archiveSummary() override {

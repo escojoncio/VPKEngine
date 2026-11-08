@@ -110,7 +110,7 @@ if(BUILD_TESTING OR NOT DEFINED BUILD_TESTING)
       add_dependencies(vpgles_tests VPVulkan)
     endif()
     target_compile_options(vpvk_tests PRIVATE -Wall -Wextra -Wno-missing-field-initializers)
-    foreach(t exports physical memory passes submit pipeline recipes recipe_keys taa msaa queries query_not_ready timeline queues timeline_order pending renderpass_ops linear images image_lifetime vertex_stores profile profile13 quest_extras push_descriptor report_geom pipeline_policy eds native_identity inline_uniform bda ycbcr taa_native taa_eye_depth taa_uimask msaa_force msaa_force_marked prewarm_variants aot aniso zeroinit foveation archive_index stage_keys async_pipelines sync_pipelines create_default pso_census cache_state pass_drop skip_reasons indirect_patch astc3d phase1b suspend_resume translator_modes perf capture capture_images capture_pools capture_host_frames capture_corrupt capture_hooks capture_codec capture_devices capture_unhooked capture_budget capture_locks png imgdiff)
+    foreach(t exports physical memory passes submit pipeline recipes recipe_keys taa msaa queries query_not_ready timeline queues timeline_order pending renderpass_ops linear images image_lifetime vertex_stores profile profile13 quest_gpu_name quest_extras push_descriptor report_geom pipeline_policy eds native_identity inline_uniform bda ycbcr taa_native taa_eye_depth taa_uimask msaa_force msaa_force_marked prewarm_variants aot aniso zeroinit foveation archive_index stage_keys async_pipelines sync_pipelines create_default pso_census cache_state pass_drop skip_reasons indirect_patch astc3d phase1b suspend_resume translator_modes perf capture capture_images capture_pools capture_host_frames capture_corrupt capture_hooks capture_codec capture_devices capture_unhooked capture_budget capture_locks png imgdiff)
       add_test(NAME gpu_vulkan.${t} COMMAND vpvk_tests ${t} $<TARGET_FILE:VPVulkan>)
     endforeach()
     # vpreplay of a capture made by the test: replayed in libVPVulkan itself, with VPVulkan's own capture on the replay.
@@ -123,6 +123,9 @@ if(BUILD_TESTING OR NOT DEFINED BUILD_TESTING)
     if(VPVK_LVP_ICD)
       add_test(NAME gpu_vulkan.replay_lvp COMMAND vpvk_tests replay_lvp $<TARGET_FILE:VPVulkan> $<TARGET_FILE:vpreplay> ${VPVK_LVP_ICD})
     endif()
+    # The Quest identity's GPU name from VPVK_QUEST_GPU_NAME (latched at the first query): its own run with a Quest 2's.
+    add_test(NAME gpu_vulkan.quest_gpu_name_650 COMMAND vpvk_tests quest_gpu_name $<TARGET_FILE:VPVulkan>)
+    set_tests_properties(gpu_vulkan.quest_gpu_name_650 PROPERTIES ENVIRONMENT "VPVK_QUEST_GPU_NAME=Adreno (TM) 650")
     # msaaTileOn() reads VPVK_MSAA_TILE once per process: its own run with it off.
     add_test(NAME gpu_vulkan.msaa_tile_off COMMAND vpvk_tests msaa_tile_off $<TARGET_FILE:VPVulkan>)
     set_tests_properties(gpu_vulkan.msaa_tile_off PROPERTIES ENVIRONMENT "VPVK_MSAA_TILE=0")

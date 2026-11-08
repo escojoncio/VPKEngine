@@ -1544,6 +1544,21 @@ static void correctness(const std::string& dir) {
         CHECK(r.ok);
         CHECK(!r.module.invariantPosition);
         CHECK(r.msl.source.find("invariant") == std::string::npos);
+        // SpirvLowerOptions::invariantPos (VPVK_INVARIANT_POS): the same shader with the position invariant anyway.
+        o.invariantPos = true;
+        Result ri = run(dir + "/pos.vert.spv", o);
+        CHECK(ri.ok);
+        CHECK(ri.module.invariantPosition);
+        CHECK(ri.msl.source.find("[[position, invariant]]") != std::string::npos);
+    }
+    {  // only vertex stages: a fragment shader (FragCoord is a Position input) is untouched
+        spirv::SpirvLowerOptions o;
+        o.entry = "main", o.stage = vpir::Stage::Fragment;
+        o.invariantPos = true;
+        Result r = run(dir + "/outinit.frag.spv", o);
+        CHECK(r.ok);
+        CHECK(!r.module.invariantPosition);
+        CHECK(r.msl.source.find("invariant") == std::string::npos);
     }
     spirv::SpirvLowerOptions f;
     f.entry = "main", f.stage = vpir::Stage::Fragment;

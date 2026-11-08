@@ -737,7 +737,12 @@ private:
             else res_.extensions.insert(name);
             return;
         }
-        if (d == "pragma") return;
+        if (d == "pragma") {
+            if (line.size() == 7 && line[2].text == "STDGL" && line[3].text == "invariant" && line[4].text == "(" &&
+                line[5].text == "all" && line[6].text == ")")
+                res_.invariantAll = true;
+            return;
+        }
         if (d == "line") {
             // #line line [source-string-number] : plain decimal integers
             // The operands are macro-expanded first (`#define A 4` / `#line A`).

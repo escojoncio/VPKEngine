@@ -1091,8 +1091,9 @@ private:
             case Op::Div:
                 return define(in, t.isFloat() && in.precise ? call("precise::divide", in) : bin("/", in));
             case Op::Rem: return define(in, t.isFloat() ? math("fmod", in) : bin("%", in));
-            case Op::Min: return define(in, call("min", in));
-            case Op::Max: return define(in, call("max", in));
+            // precise Min / Max (SPIR-V NMin / NMax): a NaN operand loses, which min()/max() under fast math do not promise.
+            case Op::Min: return define(in, call(t.isFloat() && in.precise ? "precise::fmin" : "min", in));
+            case Op::Max: return define(in, call(t.isFloat() && in.precise ? "precise::fmax" : "max", in));
             case Op::And: return define(in, bin(t.isBool() ? "&&" : "&", in));
             case Op::Or: return define(in, bin(t.isBool() ? "||" : "|", in));
             case Op::Xor: return define(in, bin(t.isBool() ? "!=" : "^", in));
@@ -1100,7 +1101,14 @@ private:
             case Op::Shr: return define(in, bin(">>", in));
             case Op::Fma: return define(in, call("fma", in));  // single rounding in either mode
             case Op::Clamp: return define(in, call("clamp", in));
-            case Op::Mix: return define(in, call("mix", in));
+            case Op::Mix: {
+                // x + (y - x) * a with exact ends: mix(x, y, 1) == y and mix(x, y, 0) == x for any finite x, y
+                // (mix() / x * (1 - a) + y * a lose the small operand against a large one). `a` is splatted if scalar.
+                std::string w = a(2);
+                if (fn_->typeOf(in.args[2]).width != t.width) w = typeName(t) + "(" + w + ")";
+                const std::string nw = (w[0] == '-' ? "-(" + w + ")" : "-" + w);
+                return define(in, "fma(" + a(1) + ", " + w + ", fma(" + a(0) + ", " + nw + ", " + a(0) + "))");
+            }
             case Op::Eq: return define(in, bin("==", in));
             case Op::Ne: return define(in, bin("!=", in));
             case Op::Lt: return define(in, bin("<", in));

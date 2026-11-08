@@ -27,7 +27,7 @@ struct VpOut {
 };
 
 static float fn_lerp3(float v0, float v1, float v2) {
-    const float v3 = mix(v0, v1, v2);
+    const float v3 = fma(v1, v2, fma(v0, -v2, v0));
     return v3;
 }
 

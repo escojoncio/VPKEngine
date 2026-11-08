@@ -151,8 +151,9 @@ struct Machine {
                 return true;
             case Op::Mix:
                 out = map3(a[0], a[1], a[2], t, [&](uint32_t x, uint32_t y, uint32_t w) {
-                    float fx = fl(s, x);
-                    return fb(s, fx + (fl(s, y) - fx) * fl(s, w));
+                    // Same formula as the MSL emitter: fma(y, a, fma(x, -a, x)); exact at a = 0 and a = 1.
+                    const float fx = fl(s, x), fw = fl(s, w);
+                    return fb(s, std::fma(fl(s, y), fw, std::fma(fx, -fw, fx)));
                 });
                 return true;
             default: return false;

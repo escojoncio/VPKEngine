@@ -45,6 +45,7 @@ public:
         sh_ = std::make_shared<Shader>();
         sh_->stage = stage;
         sh_->version = pp_.version;
+        sh_->invariantPosition = pp_.invariantAll;
     }
 
     std::shared_ptr<Shader> run() {
@@ -641,6 +642,7 @@ private:
             errAt(line, "compute shaders have no inputs or outputs");
         if (q.invariant && peek().kind == Tok::Ident && !atTypeStart()) {
             // invariant <varying>;
+            sh_->invariantPosition = true;
             do expectIdent();
             while (acceptP(","));
             expectP(";");
@@ -825,6 +827,7 @@ private:
             s->prec = effectivePrecision(q.prec, declTypePrec_, base);
             needPrecision(s->prec, base, line, name);
             s->invariant = q.invariant;
+            if (q.invariant) sh_->invariantPosition = true;
             s->interp = q.flat ? Interp::Flat : q.centroid ? Interp::Centroid : Interp::Smooth;
             if (q.isConst) s->storage = Storage::Const;
             else if (q.uniform) s->storage = Storage::Uniform;

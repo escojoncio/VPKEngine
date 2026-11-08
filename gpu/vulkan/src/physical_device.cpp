@@ -20,7 +20,9 @@ VkPhysicalDeviceProperties makeProps(bool quest, bool geom) {
     p.driverVersion = VK_MAKE_VERSION(512, 744, 0);  // Adreno drivers set bit 31; Unity rejects Qualcomm without it
     p.vendorID = 0x5143;      // Qualcomm: engines key their mobile paths off it
     p.deviceID = 0x43051401;  // Adreno 740 (the id Quest 3 titles check)
-    std::strncpy(p.deviceName, "Adreno (TM) 740", sizeof p.deviceName - 1);
+    // VPVK_QUEST_GPU_NAME: the host names the headset it presents ("Adreno (TM) 650" for a Quest 2); only the name changes.
+    const char* gpu = std::getenv("VPVK_QUEST_GPU_NAME");
+    std::strncpy(p.deviceName, gpu && *gpu ? gpu : "Adreno (TM) 740", sizeof p.deviceName - 1);
   } else {
     p.driverVersion = VK_MAKE_API_VERSION(0, 0, 1, 0);
     p.vendorID = 0x106B;  // Apple (PCI SIG); Apple GPUs have no device id

@@ -526,6 +526,7 @@ private:
             positionVar_ = globalVar(typeId(tmp.type), SC::Output, "gl_Position");
             deco(positionVar_, Deco::BuiltIn, {uint32_t(BuiltIn::Position)});
         }
+        if (sh_.stage == Stage::Vertex && sh_.invariantPosition) deco(positionVar_, Deco::Invariant);
         if (sh_.stage == Stage::Vertex && !L_.xfb.empty()) declareXfb();
     }
 

@@ -973,12 +973,20 @@ struct MetalBackend::Impl {
   // Transient MSAA backing: deferred MSAA textures that currently own memory (candidates for release).
   std::unordered_set<uint32_t> backedMsaa;
   uint32_t msaaReleaseFrames = 120;  // VPVK_MSAA_RELEASE_FRAMES; 0 = sticky (old behaviour)
-  void releaseMsaaBackings(uint64_t frameIndex);
+  // bookkeeping=false: only the release loop (trimSerialized, outside a frame: no gpu.tex line, no ledger refresh).
+  // trimNow: release as in a trim request even if trimLevel is not set. In trim mode every backing that is not pinned and
+  // was not used by `frameIndex` goes (no tile-streak needed: it includes those that never passed through `target`);
+  // frameIndex == ~0ull means "no frame" and protects nothing (a texture never used has usedFrame == ~0ull too).
+  void releaseMsaaBackings(uint64_t frameIndex, bool bookkeeping = true, bool trimNow = false);
+  std::atomic<uint64_t> lastSubmitFrame{~0ull};  // newest frame handed to submit (~0ull = none yet); trimSerialized protects its backings
+  std::atomic<int64_t> trimSerNs{0};  // steadyNs() of the last completed trimSerialized pass
+  std::atomic<int> trimSerLevel{0};   // the trim level of that pass: one pass per level per second
   // trimMemory (any thread) asks the submit thread, the only owner of textures and slots, to give back what
   // is rebuildable: 0 = nothing pending, else the level; trimSlotsLeft = slots whose chained argument buffers
   // are still to be dropped (each is visited when the submit acquires it, i.e. when it is idle).
   std::atomic<uint64_t> trimmedArgsBytes{0};  // chained argument buffers given back by trim requests (cumulative)
   std::atomic<uint64_t> trimmedMsaaBytes{0};  // MSAA backings given back by trim requests (cumulative)
+  std::atomic<uint64_t> trimReportedMsaa{0}, trimReportedArgs{0};  // the two totals above at the previous trim report
   std::atomic<int> trimLevel{0};
   std::atomic<uint32_t> trimSlotsLeft{0};
   std::atomic<uint64_t> argsMoreBytes{0};  // bytes of every slot's chained argument buffers
@@ -1012,6 +1020,9 @@ struct MetalBackend::Impl {
   void notePso(bool archived, double ms, const PipelineState& s, const char* kind);
   uint32_t libCompiled = 0, libDedup = 0, libPrewarmed = 0, libLogged = 0;
   double libMsTotal = 0, libMsMax = 0;
+  // Libraries that compiled with preserveInvariance on, and those that only compiled after dropping it (and the
+  // ", invariant" attribute) from the retry in function().
+  std::atomic<uint32_t> libInvariant{0}, libInvRetries{0};
   // Pipeline binary archives under cacheRoot:
   //  - pipelines.metalar (legacy base, number 0) and pipelines-<n>.metalar (one per session that
   //    added pipelines) are loaded read-only into lookupArchives and never mutated or rewritten;
@@ -1971,15 +1982,15 @@ void MetalBackend::Impl::texLine() {
 // End of a frame: deferred MSAA textures that were served by the memoryless stand-in for msaaReleaseFrames
 // consecutive frames (and not used this frame) give their memory back; the next frame that cannot stay on tile
 // allocates again. Nothing is lost: a tile-local verdict means contents are neither loaded, stored nor sampled.
-void MetalBackend::Impl::releaseMsaaBackings(uint64_t frameIndex) {
-  {  // gpu.tex: one line every 60 s (the first 60 s after the first frame), whatever follows
+void MetalBackend::Impl::releaseMsaaBackings(uint64_t frameIndex, bool bookkeeping, bool trimNow) {
+  if (bookkeeping) {  // gpu.tex: one line every 60 s (the first 60 s after the first frame), whatever follows
     const int64_t now = steadyNs();
     if (!texLineNs) texLineNs = now;
     else if (now - texLineNs >= 60'000'000'000) texLineNs = now, texLine();
   }
   // The memory ledger for the heartbeat (any thread reads ledgerLast): every kLedgerFrames frames, and at once after a
   // frame that materialised or released MSAA memory, so a jump is attributed by the next heartbeat.
-  {
+  if (bookkeeping) {
     const uint64_t events = msaaMaterializations.load() + msaaReleases.load();
     if (frameIndex >= ledgerFrame + kLedgerFrames || events != ledgerEvents) {
       std::string l = memLedger();
@@ -1989,7 +2000,7 @@ void MetalBackend::Impl::releaseMsaaBackings(uint64_t frameIndex) {
       ledgerEvents = events;
     }
   }
-  const bool trim = trimLevel.load(std::memory_order_relaxed) != 0;  // memory warning: any unused backing goes
+  const bool trim = trimNow || trimLevel.load(std::memory_order_relaxed) != 0;  // memory warning: any unused backing goes
   if (!msaaReleaseFrames && !trim) return;
   for (auto bi = backedMsaa.begin(); bi != backedMsaa.end();) {
     auto it = textures.find(*bi);
@@ -1998,7 +2009,7 @@ void MetalBackend::Impl::releaseMsaaBackings(uint64_t frameIndex) {
       continue;
     }
     Texture& tex = it->second;
-    if (tex.pinned || tex.streak < (trim ? 1u : msaaReleaseFrames) || tex.usedFrame == frameIndex) {
+    if (tex.pinned || (!trim && tex.streak < msaaReleaseFrames) || (frameIndex != ~0ull && tex.usedFrame == frameIndex)) {
       ++bi;
       continue;
     }
@@ -2220,7 +2231,8 @@ id<MTLFunction> MetalBackend::Impl::function(uint64_t shaderId, const FetchInput
   o.languageVersion = MTLLanguageVersion3_2;
   // [[invariant]] positions (SPIR-V Invariant) only stay invariant with this set; no effect on the rest,
   // so the key above needs no constant (only MSL text that declares [[position, invariant]] is affected).
-  if (shader.source.find("invariant]]") != std::string::npos) o.preserveInvariance = YES;
+  const bool invariantMsl = shader.source.find("invariant]]") != std::string::npos;
+  if (invariantMsl) o.preserveInvariance = YES;
   NSMutableDictionary<NSString*, NSObject*>* macros = [NSMutableDictionary dictionary];
   if (noPointSize) macros[@"VP_PSZ"] = @"user(vp_psz)";
   if (noFragDepth) macros[@"VP_NO_FDEPTH"] = @"1";
@@ -2233,10 +2245,27 @@ id<MTLFunction> MetalBackend::Impl::function(uint64_t shaderId, const FetchInput
     return [device newLibraryWithSource:@(shader.source.c_str()) options:o error:pe];
   }, &retried);
   if (retried) err("what=compiler_unreachable site=msl retries=%d ok=%d", retried, lib ? 1 : 0);
+  bool invariantKept = invariantMsl;
+  if (!lib && invariantMsl && !compilerUnreachable(e)) {
+    // One more try without invariance: a library the compiler refuses with preserveInvariance still beats no
+    // library (the position is then not invariant against another pass; the depth prepass may Z-fight).
+    std::string plain = shader.source;
+    for (size_t at = 0; (at = plain.find(", invariant]]", at)) != std::string::npos;) plain.replace(at, 13, "]]");
+    o.preserveInvariance = NO;
+    NSError* e2 = nil;
+    int retried2 = 0;
+    lib = compileRetrying(&e2, [&](NSError* __autoreleasing* pe) {
+      return [device newLibraryWithSource:@(plain.c_str()) options:o error:pe];
+    }, &retried2);
+    const uint32_t n = ++libInvRetries;
+    if (n <= 5) err("what=invariance_retry n=%u ok=%d error=%s", n, lib ? 1 : 0, token(str(e)).c_str());
+    if (lib) invariantKept = false;
+  }
   if (!lib) {
     error = "msl compile: " + str(e);
     return nil;
   }
+  if (invariantKept) ++libInvariant;
   attr::trackObject("m2.lib.shader", lib, probe);
   id<MTLFunction> fn = [lib newFunctionWithName:@(shader.entry.c_str())];
   if (!fn) {
@@ -2264,9 +2293,9 @@ id<MTLFunction> MetalBackend::Impl::function(uint64_t shaderId, const FetchInput
       // bytes / wait_ms / src describe the library this line was written for: its MSL size, the time from the request
       // (the prewarm job's queueing, or the call for a draw) to the start of its compile, and who asked.
       std::snprintf(b, sizeof b,
-                    "gpu.shader.lib compiled=%u dedup=%u prewarmed=%u ms_total=%.0f ms_max=%.0f last_ms=%.0f bytes=%zu wait_ms=%.0f src=%s",
+                    "gpu.shader.lib compiled=%u dedup=%u prewarmed=%u ms_total=%.0f ms_max=%.0f last_ms=%.0f bytes=%zu wait_ms=%.0f src=%s invariant=%u invariant_retries=%u",
                     libCompiled, libDedup, libPrewarmed, libMsTotal, libMsMax, ms, shader.source.size(), waitMs,
-                    prewarm ? "prewarm" : "demand");
+                    prewarm ? "prewarm" : "demand", libInvariant.load(), libInvRetries.load());
       line = b;
     }
   }
@@ -4232,6 +4261,7 @@ bool MetalBackend::Impl::encodeNative(NativeEncodeFn fn, void* user) {
 }
 
 void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const CompiledFrame& compiled) {
+  lastSubmitFrame.store(frameIndex, std::memory_order_relaxed);
   tileRejectedTotal += compiled.stats.tileRejected;
   {
     std::lock_guard<std::recursive_mutex> t(tableMutex);  // retire() fills the graveyard that destroy* of guest threads fill too
@@ -7819,7 +7849,7 @@ size_t MetalBackend::trimMemory(int level, std::string& report) {
   Impl& m = *impl_;
   size_t freed = 0;
   uint32_t archqDropped = 0;
-  char b[512];
+  char b[768];
   @autoreleasepool {
     const uint64_t before = m.device.currentAllocatedSize;
     size_t dropped = 0, total = 0;
@@ -7852,9 +7882,20 @@ size_t MetalBackend::trimMemory(int level, std::string& report) {
       m.archiveTrimDropped.fetch_add(archqDropped, std::memory_order_relaxed);
     }
   }
-  std::snprintf(b, sizeof b, " msaa_queued=%.1f args_queued=%.1f msaa_freed_total=%.1f args_freed_total=%.1f",
+  // Real figures, MiB: *_live = bytes alive now (texBytes[kTexMsaa] / the slots' chained argument buffers), *_freed_since_last =
+  // given back since the previous trim report (the submit thread frees them after the request, so a request shows up in the next
+  // report), *_freed_total = since the start. held = destroyed objects still pinned by frames in flight, staging = internal
+  // staging buffers whose command buffer has not completed (neither is freed by a trim request itself; see trimSerialized).
+  const uint64_t msaaTot = m.trimmedMsaaBytes.load(), argsTot = m.trimmedArgsBytes.load();
+  const uint64_t msaaPrev = m.trimReportedMsaa.exchange(msaaTot), argsPrev = m.trimReportedArgs.exchange(argsTot);
+  std::snprintf(b, sizeof b,
+                " msaa_live=%.1f args_live=%.1f msaa_freed_since_last=%.1f args_freed_since_last=%.1f msaa_freed_total=%.1f "
+                "args_freed_total=%.1f held=%.1f staging=%.1f",
                 double(m.texBytes[Impl::kTexMsaa].load()) / 1048576.0, double(m.argsMoreBytes.load()) / 1048576.0,
-                double(m.trimmedMsaaBytes.load()) / 1048576.0, double(m.trimmedArgsBytes.load()) / 1048576.0);
+                double(msaaTot - std::min(msaaTot, msaaPrev)) / 1048576.0, double(argsTot - std::min(argsTot, argsPrev)) / 1048576.0,
+                double(msaaTot) / 1048576.0, double(argsTot) / 1048576.0,
+                double(m.cnt.heldBytes.load(std::memory_order_relaxed)) / 1048576.0,
+                double(m.bufIntLiveBytes.load(std::memory_order_relaxed)) / 1048576.0);
   report += b;
   m.trimSlotsLeft.store(uint32_t(m.slots.size()));
   m.trimLevel.store(level < 1 ? 1 : level);
@@ -7862,6 +7903,69 @@ size_t MetalBackend::trimMemory(int level, std::string& report) {
   report += b;
   m.info("gpu.metal.info what=trim level=" + std::to_string(level) + " " + report);
   return freed;
+}
+
+// What trimMemory can only queue for the next submit, done now. Same caller rules as drainRetired (VPVulkan calls it under its
+// submit mutex): the submit thread is not running, so the texture tables and the slots are ours. Releases the transient MSAA
+// backings that are not pinned and were not the last frame's tile work (a frame that needs one allocates it again), and the
+// chained argument buffers of the slots whose frame completed; both go to the graveyard, which drainRetired then empties for
+// the part no frame in flight reads. Never waits (tableMutex is try-locked). Appends "serialized_msaa=MiB serialized_args=MiB",
+// returns the bytes moved to the graveyard (not yet returned to the OS until drainRetired runs).
+size_t MetalBackend::trimSerialized(std::string& report) {
+  if (!ok()) return 0;
+  Impl& m = *impl_;
+  size_t moved = 0;
+  @autoreleasepool {
+    std::unique_lock<std::recursive_mutex> tables(m.tableMutex, std::try_to_lock);
+    if (!tables.owns_lock()) {  // distinct from "nothing to free" (that one reports serialized_msaa=0.0 serialized_args=0.0)
+      if (!report.empty()) report += ' ';
+      report += "table_busy=1";
+      return 0;
+    }
+    if (m.slots.empty() || !m.slotDone) return 0;
+    const int level = m.trimLevel.load(std::memory_order_relaxed);
+    const int64_t nowNs = steadyNs();
+    // One pass per level per second: under pressure the caller repeats the request, and each pass would release backings
+    // that the next frame materialises again.
+    if (level && level == m.trimSerLevel.load() && nowNs - m.trimSerNs.load() < 1'000'000'000) {
+      if (!report.empty()) report += ' ';
+      report += "serialized_throttled=1";
+      return 0;
+    }
+    const uint64_t msaa0 = m.trimmedMsaaBytes.load();
+    if (level) m.releaseMsaaBackings(m.lastSubmitFrame.load(std::memory_order_relaxed), false, true);
+    uint64_t argsFreed = 0;
+    size_t unsettled = 0;
+    for (size_t i = 0; i < m.slots.size(); ++i) {
+      Impl::Slot& slot = m.slots[i];
+      if (!m.slotSettled(i)) { ++unsettled; continue; }
+      if (slot.argsMore.empty()) continue;
+      for (id<MTLBuffer> buf : slot.argsMore) {
+        argsFreed += buf.length;
+        m.rangeDel(buf.contents);
+        m.retire(buf);
+      }
+      slot.argsMore.clear();
+    }
+    m.argsMoreBytes -= std::min<uint64_t>(m.argsMoreBytes.load(), argsFreed);
+    m.trimmedArgsBytes += argsFreed;
+    if (level) {
+      m.trimSerLevel.store(level);
+      m.trimSerNs.store(nowNs);
+      if (!unsettled) {  // every slot's chained buffers are given back: the request is complete, in-frame passes stop
+        m.trimSlotsLeft.store(0);
+        m.trimLevel.store(0);
+      }
+    }
+    const uint64_t msaaFreed = m.trimmedMsaaBytes.load() - msaa0;
+    moved = size_t(msaaFreed + argsFreed);
+    char b[96];
+    std::snprintf(b, sizeof b, "serialized_msaa=%.1f serialized_args=%.1f", double(msaaFreed) / 1048576.0,
+                  double(argsFreed) / 1048576.0);
+    if (!report.empty()) report += ' ';
+    report += b;
+  }
+  return moved;
 }
 
 // Gives back the objects destroyed by the guest that no command buffer can still read (completed frames' retired

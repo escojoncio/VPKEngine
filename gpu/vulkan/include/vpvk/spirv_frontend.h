@@ -133,6 +133,10 @@ struct SpirvLowerOptions {
   bool nativeFetch = false;
   bool unpackFetch = false;
   bool killExit = false;
+  // Vertex: the Position output is [[position, invariant]] even when the shader does not decorate it (VPVulkan's
+  // VPVK_INVARIANT_POS, on by default; the mode bit is "off"): a depth prepass and the main pass then compute the same z
+  // for the same vertex, whatever the compiler does to each shader. false = the MSL is byte-identical to before.
+  bool invariantPos = false;
   // robustBufferAccess in the emitted MSL (vpmsl::EmitOptions::robustBuffers): every storage buffer access is checked
   // against the buffer's size. Not a lowering input, but it changes the MSL, so it is part of a recipe input: VPVK_ROBUST
   // (config.cpp) decides it per translation. true = the MSL is byte-identical to before. Recipes: trailing, if false.

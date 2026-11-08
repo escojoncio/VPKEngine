@@ -506,6 +506,10 @@ void testEgl() {
             setQuest(1);
             CHECK(std::strstr(reinterpret_cast<const char*>(glGetString(gl::RENDERER)), "Adreno"));
             CHECK(std::strstr(reinterpret_cast<const char*>(glGetString(gl::VENDOR)), "Qualcomm"));
+            // The renderer is the Vulkan device's name: 740, or VPVK_QUEST_GPU_NAME (ctest gpu_gles.gl.egl_adreno650).
+            const char* gpuName = std::getenv("VPVK_QUEST_GPU_NAME");
+            CHECK(std::strcmp(reinterpret_cast<const char*>(glGetString(gl::RENDERER)),
+                              gpuName && *gpuName ? gpuName : "Adreno (TM) 740") == 0);
             setQuest(0);
         }
     }

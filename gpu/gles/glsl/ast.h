@@ -202,6 +202,9 @@ public:
     std::array<uint32_t, 3> localSize{1, 1, 1};
     bool hasLocalSize = false;
     bool earlyFragmentTests = false;
+    // Some output is declared invariant (`invariant gl_Position;`, an invariant varying, #pragma STDGL invariant(all)):
+    // the vertex shader's position is SPIR-V Invariant.
+    bool invariantPosition = false;
 
     // Arena.
     std::vector<std::unique_ptr<Symbol>> symbols;

@@ -96,6 +96,10 @@ class Platform {
   // slot, that no frame in flight reads (`minIdleMs` is no longer a gate). Called with the device's submit mutex held
   // (try-lock). Bytes released; 0 where there is nothing / it is not safe now.
   virtual size_t drainRetired(uint32_t /*minIdleMs*/, std::string& /*report*/) { return 0; }
+  // vpvk_trim_memory, after trimMemory and under the same submit mutex: does at once what trimMemory can only queue for the next
+  // submit (transient MSAA backings, idle slots' chained argument buffers -> the backend's graveyard, which drainRetired then
+  // empties). Bytes moved; appends "key=MiB ..." to `report`. 0 where there is nothing.
+  virtual size_t trimSerialized(std::string& /*report*/) { return 0; }
   // vpvk_diag_line: cumulative backend counters (key, value); keys starting "g_" are gauges. Any thread, lock-free.
   virtual void diagCounters(std::vector<std::pair<const char*, uint64_t>>& /*out*/) const {}
   // vpvk_diag_ranges (kind 1): CPU-visible (address, length) of the buffers the backend allocated itself.

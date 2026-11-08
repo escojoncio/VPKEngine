@@ -1243,6 +1243,16 @@ struct Translator {
     if (!dev || !dev->gpu) return;
     MsaaTwins& mt = dev->msaaTwins;
     if (n < 2) return void(++mt.rejN);
+    mt.lastWhy = nullptr;
+    struct MainNote {  // "vk.msaa main": how this call ends, whichever return it takes
+      MsaaTwins& mt;
+      Device* dev;
+      vpgpu::TextureId game;
+      const VkRect2D& area;
+      const bool& eye;
+      const uint8_t& forced;
+      ~MainNote() { mt.noteMain(dev, game, area, eye, forced); }
+    } mainNote{mt, dev, d.colors[0].texture, area, eyeScene, forceN};
     // (Every rejection from here on is counted by reason and logged by MsaaTwins::noteRej: "vk.msaa rej".)
     auto rej = [&](uint32_t& counter, const char* why) {
       ++counter;
@@ -2071,6 +2081,7 @@ void MsaaTwins::release(Device* dev) {
 // "vk.msaa rej <reason> WxHxL color=<fmt>/<samples>x depth=<fmt>/<samples>x": a pass forceMsaa left at 1x. Distinct (size, layers,
 // reason) only: 12 below 1 Mpx and 12 at or above it, so the frame's small shadow / UI passes do not hide the eye pass.
 void MsaaTwins::noteRej(Device* dev, const vpgpu::RenderPassDesc& d, const char* why) {
+  lastWhy = why;
   if (rejLogged[0] >= 12 && rejLogged[1] >= 12) return;  // both log classes full: skip the texture lookups on the hot path
   vpgpu::TextureDesc gc, gz;
   const bool hc = d.colors[0].texture && dev->gpu->textureDesc(d.colors[0].texture, gc);
@@ -2087,6 +2098,43 @@ void MsaaTwins::noteRej(Device* dev, const vpgpu::RenderPassDesc& d, const char*
   rejSeen[cls][rejLogged[cls]++] = {w, h, layers, why};
   logf("vk.msaa rej %s %ux%ux%u color=%s/%ux depth=%s/%ux", why, w, h, unsigned(layers), hc ? vpgpu::formatInfo(gc.format).name : "none",
        hc ? unsigned(gc.samples) : 0u, hz ? vpgpu::formatInfo(gz.format).name : "none", hz ? unsigned(gz.samples) : 0u);
+}
+
+// The pass forceMsaa just judged competes for "vk.msaa main": an eye scene pass beats any other, then the larger render area. The
+// game's samples are read only when it becomes the candidate (a pass or two per window), never per draw.
+void MsaaTwins::noteMain(Device* dev, vpgpu::TextureId game, const VkRect2D& area, bool eye, uint8_t forced) {
+  const uint64_t rank = (eye ? 1ull << 62 : 0) + uint64_t(area.extent.width) * area.extent.height;
+  if (rank <= mainPass.rank) return;
+  mainPass = {rank, area.extent.width, area.extent.height, 0, forced, eye, forced ? nullptr : lastWhy};
+  vpgpu::TextureDesc g;
+  if (game && dev->gpu->textureDesc(game, g)) mainPass.samples = uint8_t(g.samples);
+}
+
+bool MsaaTwins::takeMainLine(int64_t nowNs, MainPass& out) {
+  if (!mainPass.rank) return false;
+  if (!nextMainNs) nextMainNs = nowNs + kMainWindowNs;  // the window opens with the first pass
+  if (nowNs < nextMainNs) return false;
+  nextMainNs = nowNs + kMainWindowNs;
+  const MainPass m = mainPass;
+  mainPass = {};
+  if (mainLines >= kMainLines) return false;
+  const bool same = mainLines > 0 && (m.forced != 0) == (lastMain.forced != 0) && m.w == lastMain.w && m.h == lastMain.h &&
+                    m.samples == lastMain.samples &&
+                    (m.forced || std::strcmp(m.why ? m.why : "none", lastMain.why ? lastMain.why : "none") == 0);
+  if (same && nowNs - lastMainLineNs < kMainBeatNs) return false;
+  lastMain = m, lastMainLineNs = nowNs, ++mainLines;
+  out = m;
+  return true;
+}
+
+static void logMsaaMain(MsaaTwins& mt) {
+  if (!mt.mainPass.rank || mt.mainLines >= MsaaTwins::kMainLines) return;
+  if (++mt.mainTick & 31u) return;  // the clock is read on every 32nd command buffer, not on each one
+  const int64_t now = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+  MsaaTwins::MainPass m;
+  if (!mt.takeMainLine(now, m)) return;
+  logf("vk.msaa main force=%d samples=%u result=%s%s area=%ux%u eye=%d", msaaForce(), unsigned(m.samples), m.forced ? "up" : "rej:",
+       m.forced ? "" : (m.why ? m.why : "none"), m.w, m.h, m.eye ? 1 : 0);
 }
 
 // "vk.msaa force=N passes= skip{...}" about once a second while forced MSAA is on; the counts are cumulative since the device was created.
@@ -2178,7 +2226,10 @@ void translate(const Recorder& rec, vpgpu::Frame& frame, TranslateStats& st, con
   t.run(rec);
   t.close();
   t.zeroScan();
-  if (Device* dev = t.devForce(); dev && (msaaForce() > 0 || dev->msaaTwins.gameAuto || dev->msaaTwins.skipUnreadable)) logMsaaForce(dev->msaaTwins);
+  if (Device* dev = t.devForce(); dev && (msaaForce() > 0 || dev->msaaTwins.gameAuto || dev->msaaTwins.skipUnreadable)) {
+    logMsaaForce(dev->msaaTwins);
+    logMsaaMain(dev->msaaTwins);
+  }
 }
 
 }  // namespace vpvk

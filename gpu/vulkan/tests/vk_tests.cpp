@@ -97,6 +97,14 @@ void testExports() {
     CHECK(trim && mask);
     char out[16] = "x";
     CHECK(trim(2, out, sizeof out) == 0 && out[0] == 0 && trim(1, nullptr, 0) == 0);
+    {  // light memory line for a periodic telemetry thread: no device -> 0 and the buffer untouched; null/0 cap safe
+      auto brief = reinterpret_cast<size_t (*)(char*, size_t)>(dlsym(h, "vpvk_mem_brief"));
+      CHECK(brief);
+      if (brief) {
+        char b[16] = "x";
+        CHECK(brief(b, sizeof b) == 0 && b[0] == 'x' && brief(nullptr, 0) == 0 && brief(b, 0) == 0);
+      }
+    }
     int w = 7, hh = 7, sl = 7;
     CHECK(mask(0, &w, &hh, &sl) == nullptr && w == 0 && hh == 0 && sl == 0);
     CHECK(mask(2, nullptr, nullptr, nullptr) == nullptr);
@@ -1164,6 +1172,24 @@ void testVertexStores() {
   vkDestroyBuffer(c.dev, sb, nullptr);
   vkFreeMemory(c.dev, m, nullptr);
   unsetenv("VPVK_EXTRA_EXTENSIONS");
+}
+
+// VPVK_QUEST_GPU_NAME names the Adreno of the Quest identity (the host presents a Quest 2 as "Adreno (TM) 650"): only the
+// name changes, vendor / device id / limits stay the profile's. Properties are latched at the first query, so ctest runs
+// this group twice: without the variable (740) and with it (gpu_vulkan.quest_gpu_name_650).
+void testQuestGpuName() {
+  vpvk_config_set_quest_identity(1);
+  const char* env = getenv("VPVK_QUEST_GPU_NAME");
+  const char* want = env && *env ? env : "Adreno (TM) 740";
+  Ctx c;
+  CHECK(c.dev != nullptr);
+  VkPhysicalDeviceProperties p;
+  vkGetPhysicalDeviceProperties(c.pd, &p);
+  VkPhysicalDeviceProperties2 p2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
+  vkGetPhysicalDeviceProperties2(c.pd, &p2);
+  CHECK(std::strcmp(p.deviceName, want) == 0);
+  CHECK(std::strcmp(p2.properties.deviceName, want) == 0);
+  CHECK(p.vendorID == 0x5143 && p.deviceID == 0x43051401 && p.limits.maxPerStageDescriptorSamplers == 16);
 }
 
 // Default identity (no Quest identity): what the Apple GPU supports, honestly. The Adreno 740 profile is opt-in
@@ -2289,6 +2315,49 @@ void testTranslatorModes() {
   spirv::SpirvLowerOptions o;
   applyTranslatorMode(o);
   CHECK(!o.amplify && !o.nativeFetch && !o.unpackFetch && o.killExit);  // kill exit is on by default (mode bit = off)
+  CHECK(o.invariantPos);  // so is the invariant position (VPVK_INVARIANT_POS, mode bit 4 = off)
+  setenv("VPVK_INVARIANT_POS", "0", 1);
+  CHECK(refreshTranslatorMode() == 16 && translatorId() == (kTranslatorVersion | 16u << 16));
+  applyTranslatorMode(o);
+  CHECK(!o.invariantPos && o.killExit);
+  {  // the MSL a vertex shader gets through the recipe path: [[position, invariant]] unless the mode turns it off
+    const std::vector<uint32_t> w = spirvFile("pos.vert.spv");
+    std::string error;
+    std::shared_ptr<spirv::SpirvModule> m(spirv::parse(w.data(), w.size(), error), spirv::release);
+    CHECK(m != nullptr);
+    if (m) {
+      spirv::SpirvLowerOptions vo;
+      vo.entry = "main", vo.stage = vpir::Stage::Vertex;
+      uint64_t idOff = 0, idOn = 0;
+      ShaderBlob off, on;
+      CHECK(translateRecipeStage(*m, vo, idOff, off, error, nullptr));  // VPVK_INVARIANT_POS=0 still set
+      setenv("VPVK_INVARIANT_POS", "1", 1);
+      CHECK(refreshTranslatorMode() == 0);
+      CHECK(translateRecipeStage(*m, vo, idOn, on, error, nullptr));
+      CHECK(off.source.find("invariant") == std::string::npos);
+      CHECK(on.source.find("[[position, invariant]]") != std::string::npos && idOn != idOff);
+    }
+  }
+  setenv("VPVK_INVARIANT_POS", "1", 1);
+  CHECK(refreshTranslatorMode() == 0);
+  {  // strict parsing: only "0" / "off" / "false" (blanks around ignored) turn it off; anything else leaves it on
+    const struct { const char* v; uint32_t mode; } cases[] = {
+        {"", 0}, {"0", 16}, {"00", 0}, {"off", 16}, {" 0", 16}, {"0 ", 16}, {" false\t", 16}, {"1", 0}, {"x", 0}, {"OFF", 0}};
+    for (const auto& c : cases) {
+      setenv("VPVK_INVARIANT_POS", c.v, 1);
+      CHECK(refreshTranslatorMode() == c.mode);
+    }
+    setenv("VPVK_INVARIANT_POS", "0", 1);
+    setenv("VPSPV_KILL_EXIT", "0", 1);
+    CHECK(refreshTranslatorMode() == 24);  // both "off" bits
+    applyTranslatorMode(o);
+    CHECK(!o.invariantPos && !o.killExit);
+    unsetenv("VPSPV_KILL_EXIT");
+  }
+  unsetenv("VPVK_INVARIANT_POS");
+  CHECK(refreshTranslatorMode() == 0);
+  applyTranslatorMode(o);
+  CHECK(o.invariantPos);
   setenv("VPVK_AMPLIFY", "1", 1);
   CHECK(refreshTranslatorMode() == 2 && translatorId() == (kTranslatorVersion | 2u << 16));
   applyTranslatorMode(o);
@@ -2394,6 +2463,7 @@ void testTranslatorModes() {
   unsetenv("VPVK_AMPLIFY");
   unsetenv("VPVK_FETCH_NATIVE");
   unsetenv("VPSPV_KILL_EXIT");
+  unsetenv("VPVK_INVARIANT_POS");
   refreshTranslatorMode();
   std::error_code ec;
   std::filesystem::remove_all(dir, ec);
@@ -5010,7 +5080,67 @@ void testPrewarmVariants() {
 
 // Forced MSAA (VPVK_MSAA_FORCE / vpvk_config_set_msaa_force): the eye / scene pass the game renders at 1x draws into N-sample
 // autoMsaa twins resolved into the game's images; what it cannot serve stays at 1x and is counted. Host side only (null backend).
+// "vk.msaa main" throttle: a line only when result / area / samples differ from the previous one, plus a 60 s heartbeat, at
+// most kMainLines per device; the window is 5 s.
+void testMsaaMainLog() {
+  MsaaTwins mt;
+  const int64_t s = 1'000'000'000LL;
+  auto pass = [&](uint8_t forced, uint32_t w, uint32_t h, uint8_t samples, const char* why = nullptr) {
+    mt.mainPass = {uint64_t(w) * h, w, h, samples, forced, true, why};
+  };
+  MsaaTwins::MainPass out;
+  CHECK(!mt.takeMainLine(0, out));  // nothing judged yet
+  pass(0, 1920, 1824, 1, "eye");
+  CHECK(!mt.takeMainLine(1 * s, out));  // the window opens with the first pass: 5 s to go
+  CHECK(!mt.takeMainLine(5 * s, out));
+  CHECK(mt.takeMainLine(6 * s, out) && out.w == 1920 && mt.mainLines == 1 && !mt.mainPass.rank);
+  // Menus: the same verdict every window, nothing written until the 60 s heartbeat.
+  int64_t t = 6 * s;
+  for (int i = 0; i < 11; ++i) {  // up to 55 s after the line
+    pass(0, 1920, 1824, 1, "eye");
+    t += 5 * s;
+    CHECK(!mt.takeMainLine(t, out));
+  }
+  CHECK(mt.mainLines == 1);
+  pass(0, 1920, 1824, 1, "eye");
+  t += 5 * s;  // 60 s after the line
+  CHECK(t - mt.lastMainLineNs >= 60 * s && mt.takeMainLine(t, out) && mt.mainLines == 2);
+  // A change of result, of area and of samples each writes at once (at the next window).
+  pass(4, 1920, 1824, 1);
+  t += 5 * s;
+  CHECK(mt.takeMainLine(t, out) && out.forced == 4);
+  pass(4, 1920, 1824, 1);
+  t += 5 * s;
+  CHECK(!mt.takeMainLine(t, out));
+  pass(4, 1536, 1536, 1);
+  t += 5 * s;
+  CHECK(mt.takeMainLine(t, out) && out.w == 1536);
+  pass(4, 1536, 1536, 2);
+  t += 5 * s;
+  CHECK(mt.takeMainLine(t, out) && out.samples == 2);
+  pass(0, 1536, 1536, 2, "smp");  // another rejection reason
+  t += 5 * s;
+  CHECK(mt.takeMainLine(t, out));
+  pass(0, 1536, 1536, 2, "smp");
+  t += 5 * s;
+  CHECK(!mt.takeMainLine(t, out));
+  pass(0, 1536, 1536, 2, "eye");
+  t += 5 * s;
+  CHECK(mt.takeMainLine(t, out) && std::string(out.why) == "eye");
+  // The total cap per device: alternating verdicts (every window a change) stop at kMainLines.
+  for (int i = 0; i < 200; ++i) {
+    pass(uint8_t(i & 1 ? 4 : 0), 1920, 1824, 1, "eye");
+    t += 5 * s;
+    mt.takeMainLine(t, out);
+  }
+  CHECK(mt.mainLines == MsaaTwins::kMainLines);
+  pass(4, 100, 100, 1);
+  t += 5 * s;
+  CHECK(!mt.takeMainLine(t, out) && mt.mainLines == MsaaTwins::kMainLines);
+}
+
 void testMsaaForce() {
+  testMsaaMainLog();
   vpvk_taa_jitter eyeOnly{0, 1920, 1824, 0, 0, 0};  // jitter off, eye size known: the eye passes are found by size alone
   vpvk_taa_set_jitter(&eyeOnly);
   vpvk_config_set_msaa_force(4);
@@ -5075,6 +5205,9 @@ void testMsaaForce() {
       CHECK(tc->width == 1920 && tc->height == 1824 && tc->format == vpgpu::Format::RGBA8Unorm && tz->format == vpgpu::Format::D32Float);
       CHECK(rp.draws.size() == 1 && rp.draws[0].pipeline == v.key() && rp.draws[0].pipeline != po.key);
       CHECK(d->msaaTwins.passes == 1);
+      // "vk.msaa main": the pass forced to 4 samples, the game's 1x
+      const MsaaTwins::MainPass& mp = d->msaaTwins.mainPass;
+      CHECK(mp.forced == 4 && mp.samples == 1 && mp.w == 1920 && mp.h == 1824 && mp.why == nullptr);
     }
     // 2. The twins are reused by the next pass (a LOAD of the picture: the frame compiler seeds it); the game's depth store is
     // honoured as a resolve.
@@ -5379,6 +5512,10 @@ void testMsaaForce() {
     const vpgpu::RenderPass rp = std::get<vpgpu::RenderPass>(f.commands().at(0));
     CHECK(rp.desc.colors[0].texture == mc && rp.desc.depth.texture == md && !rp.desc.colors[0].autoMsaa && !rp.desc.depth.autoMsaa);
     CHECK(rp.draws[0].pipeline == p4.key && d->msaaTwins.passes == 0 && d->msaaTwins.up == 0 && d->msaaTwins.rejSmp == 1);
+    {  // "vk.msaa main": the game's own 4x pass left alone, with the reason
+      const MsaaTwins::MainPass& mp = d->msaaTwins.mainPass;
+      CHECK(mp.forced == 0 && mp.samples == 4 && mp.w == 1920 && mp.h == 1824 && mp.why && std::string(mp.why) == "smp");
+    }
     vpvk_config_set_msaa_force(0);
   }
   // 7. Off (the default): a game's 1x pass is not touched at all.
@@ -6663,7 +6800,7 @@ void testFoveation() {
 // CMake source fingerprint: a refactor that leaves the output alone keeps the digest (and every cache), a change of
 // output moves it. When this test fails the translator's OUTPUT changed: bump kLowerVersion (SPIR-V -> VPIR) or
 // kEmitVersion (VPIR -> MSL) in recipes.h, then update kCorpusDigest to the printed value in the same change.
-constexpr uint64_t kCorpusDigest = 0x8cf050f5382452aaull;  // the "corpus digest" line the test prints
+constexpr uint64_t kCorpusDigest = 0x2bf74b975e022b22ull;  // the "corpus digest" line the test prints
 
 uint64_t corpusDigest(unsigned& modules, unsigned& failed) {
   std::vector<std::string> names;
@@ -8034,6 +8171,24 @@ void testCacheState() {
     });
     CHECK(countOf(out, "vk.cache_state ") == kCacheLogLines - 4);
   }
+  {  // 2b. CacheUnusedModules (all pipelines there, only unused modules left) is flushable too: one request on entering it.
+    CacheWatch w;
+    VpvkCacheState s{};
+    s.pipelines_unique = 3, s.complete = 0, s.reason = CacheRecent;
+    CHECK(!w.logChange(s));
+    s.reason = CacheUnusedModules;
+    CHECK(w.logChange(s));  // not flushable -> flushable
+    CHECK(!w.logChange(s));
+    s.complete = 1, s.reason = CacheOk;
+    CHECK(!w.logChange(s));  // still flushable: no second request
+    s.complete = 0, s.reason = CacheRecent;
+    CHECK(!w.logChange(s));
+    s.reason = CacheUnusedModules;
+    CHECK(w.logChange(s));  // left flushable and came back: once more
+    CacheWatch first;
+    s.reason = CacheUnusedModules;
+    CHECK(first.logChange(s));  // at the first evaluation
+  }
   // 3. Through a device: pipelines, probes and modules; the exported call; the submit tick.
   Ctx c;
   Device* d = from<Device>(c.dev);
@@ -8080,16 +8235,18 @@ void testCacheState() {
   vpvk_cache_state(&s);
   CHECK(s.idle_ms == 20000 && s.reason == CacheNoFrames && s.frames_idle == 0);
   for (uint32_t i = 0; i < kCacheIdleFrames; ++i) c.gpu().submit(vpgpu::Frame{});
-  vpvk_cache_state(&s);
+  out = captureStderr([&] { vpvk_cache_state(&s); });
   CHECK(s.frames_idle == kCacheIdleFrames && s.reason == CacheUnusedModules && !s.complete);  // `cull` is in no pipeline: 50 % unused
+  // CacheUnusedModules requests the archive flush too (the host may never see complete=1): exactly one, on entering it.
+  CHECK(countOf(out, "vk.cache_state flush=requested") == 1 && flushPlatform->flushesSettle(1));
   VkPipeline pipe2 = VK_NULL_HANDLE;
   createCompute(cull, pipe2);  // (it may not translate with this layout: the module is referenced either way)
   out = captureStderr([&] { vpvk_cache_state(&s); });
   if (from<PipelineObj>(pipe2)->ok) CHECK(s.pipelines_unique == 2 && s.reason == CacheRecent);
   else CHECK(s.pipelines_unique == 1 && s.modules_used == 2 && s.complete == 1 && s.reason == CacheOk &&
              out.find("vk.cache_state complete=1 reason=0 ") != std::string::npos);
-  // complete turned 1: exactly one flush request (logged at once, run on its own thread), none for polls that change nothing.
-  CHECK(countOf(out, "vk.cache_state flush=requested") == 1 && flushPlatform->flushesSettle(1));
+  // unused-modules -> complete: already flushable, no second request (and none for polls that change nothing).
+  CHECK(countOf(out, "vk.cache_state flush=requested") == 0 && flushPlatform->flushesSettle(1));
   gCacheClock += 20 * kSec;
   for (uint32_t i = 0; i < kCacheIdleFrames; ++i) c.gpu().submit(vpgpu::Frame{});
   out = captureStderr([&] { CHECK(vpvk_cache_state(&s) == 1); });
@@ -12602,7 +12759,7 @@ int main(int argc, char** argv) {
       {"recipes", testRecipes}, {"recipe_keys", testRecipeKeys}, {"taa", testTaa}, {"msaa", testMsaa}, {"queries", testQueries}, {"query_not_ready", testQueryNotReady},
       {"timeline", testTimeline}, {"queues", testQueues}, {"timeline_order", testTimelineOrder}, {"pending", testPending}, {"renderpass_ops", testRenderPassOps}, {"linear", testLinear}, {"images", testImages}, {"image_lifetime", testImageLifetime},
       {"vertex_stores", testVertexStores}, {"profile", testProfile}, {"profile13", testProfile13}, {"quest_extras", testQuestExtras}, {"push_descriptor", testPushDescriptor}, {"report_geom", testReportGeomInterpolators}, {"pipeline_policy", testPipelinePolicy}, {"eds", testExtendedDynamicState},
-      {"native_identity", testNativeIdentity}, {"inline_uniform", testInlineUniformBlock}, {"bda", testBufferDeviceAddress}, {"ycbcr", testYcbcr},
+      {"quest_gpu_name", testQuestGpuName}, {"native_identity", testNativeIdentity}, {"inline_uniform", testInlineUniformBlock}, {"bda", testBufferDeviceAddress}, {"ycbcr", testYcbcr},
       {"taa_native", testTaaNative}, {"taa_eye_depth", testTaaEyeDepth}, {"taa_uimask", testTaaUiMask}, {"msaa_force", testMsaaForce}, {"prewarm_variants", testPrewarmVariants}, {"msaa_force_marked", testMsaaForceMarkedEye}, {"aot", testAot}, {"aniso", testAniso}, {"zeroinit", testZeroInit}, {"archive_index", testArchiveIndex}, {"foveation", testFoveation},
       {"stage_keys", testStageKeys}, {"async_pipelines", testAsyncPipelines}, {"sync_pipelines", testSyncPipelines}, {"create_default", testCreateDefault}, {"pso_census", testPsoCensus}, {"cache_state", testCacheState}, {"pass_drop", testPassDrop}, {"skip_reasons", testSkipReasons}, {"indirect_patch", testIndirectPatch}, {"astc3d", testAstc3d},
       {"perf", testPerf}, {"phase1b", testPhase1b}, {"suspend_resume", testSuspendResume}, {"translator_modes", testTranslatorModes}, {"capture", testCapture}, {"capture_images", testCaptureImages}, {"capture_hooks", testCaptureHooks}, {"capture_codec", testCaptureCodec}, {"capture_env", testCaptureEnv}, {"capture_pools", testCapturePools}, {"capture_host_frames", testCaptureHostFrames}, {"capture_corrupt", testCaptureCorrupt}, {"capture_env_host", testCaptureEnvHost}, {"capture_env_dir", testCaptureEnvDir}, {"capture_devices", testCaptureDevices}, {"capture_unhooked", testCaptureUnhooked}, {"capture_budget", testCaptureBudget}, {"capture_locks", testCaptureLocks}, {"png", testPng}, {"imgdiff", testImgDiff}, {"replay", testReplay}, {"replay_lvp", testReplayLvp}, {"refcaps", testRefCaps}};

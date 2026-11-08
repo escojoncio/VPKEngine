@@ -1433,6 +1433,180 @@ void testExecute() {
 }
 
 
+// Invariant position: `invariant gl_Position;`, `#pragma STDGL invariant(all)` and an invariant varying (declared or
+// listed) reach the final MSL as [[position, invariant]] (the metal2 backend turns preserveInvariance on from that text);
+// a shader that declares nothing keeps the plain [[position]].
+void testInvariant() {
+    const char* fs3 = "#version 300 es\nprecision mediump float; in vec4 v; out vec4 o; void main() { o = v; }";
+    const char* fs1 = "#version 100\nprecision mediump float; varying vec4 v; void main() { gl_FragColor = v; }";
+    auto vsMsl = [&](const char* vs, const char* fs) {
+        Program p = build(vs, fs);
+        CHECK(p.ok);
+        return p.vs.msl;
+    };
+    const char* kInv = "[[position, invariant]]";
+    CHECK(has(vsMsl("#version 300 es\ninvariant gl_Position; in vec4 a; out vec4 v; void main() { v = a; gl_Position = a; }", fs3), kInv));
+    CHECK(has(vsMsl("#version 100\ninvariant gl_Position; attribute vec4 a; varying vec4 v; void main() { v = a; gl_Position = a; }", fs1), kInv));
+    CHECK(has(vsMsl("#version 100\n#pragma STDGL invariant(all)\nattribute vec4 a; varying vec4 v; void main() { v = a; gl_Position = a; }", fs1), kInv));
+    CHECK(has(vsMsl("#version 300 es\n#pragma STDGL invariant(all)\nin vec4 a; out vec4 v; void main() { v = a; gl_Position = a; }", fs3), kInv));
+    CHECK(has(vsMsl("#version 300 es\nin vec4 a; invariant out vec4 v; void main() { v = a; gl_Position = a; }", fs3), kInv));
+    CHECK(has(vsMsl("#version 100\nattribute vec4 a; invariant varying vec4 v; void main() { v = a; gl_Position = a; }", fs1), kInv));
+    CHECK(has(vsMsl("#version 300 es\nin vec4 a; out vec4 v; invariant v; void main() { v = a; gl_Position = a; }", fs3), kInv));
+    // Nothing declared (and the pragma in an inactive #if group): the plain position.
+    const std::string plain = vsMsl("#version 300 es\n#if 0\n#pragma STDGL invariant(all)\n#endif\nin vec4 a; out vec4 v; void main() { v = a; gl_Position = a; }", fs3);
+    CHECK(!has(plain, "invariant"));
+    CHECK(has(plain, "[[position]]"));
+}
+
+// Numeric semantics of the GLSL builtins as the Vulkan path lowers them: a compute shader runs in the VPIR interpreter
+// (the reference semantics of the IR; the MSL itself is not executed here, only its text is checked), inputs come from
+// the buffer so nothing folds. What GLSL fixes: mod = x - y * floor(x / y) (not fmod), step(edge, x) = x < edge ? 0 : 1,
+// smoothstep = Hermite of the clamped ratio, integer / and % truncate toward zero (hardware / Metal; GLSL leaves a
+// negative operand of % undefined), mix(x, y, bool) selects, floatBitsToInt is a bit copy (NaN payloads kept).
+// round() is implementation-defined on halves; the emitter uses rint (round half to even, like roundEven and like the
+// hardware instruction mobile GPUs have), which is what engines compiled for Adreno see. min / max / clamp with a NaN
+// operand are undefined in GLSL; the IR gives the other operand (fmin / fmax), but the MSL `min` / `max` / `clamp`
+// under Metal's fast math make no promise, so NaN-protected shaders (saturate(NaN) = 0) depend on the device.
+void testSemantics() {
+    ComputeProgram p = buildCompute(
+        "#version 310 es\n"
+        "layout(local_size_x = 1) in;\n"
+        "layout(std430, binding = 0) buffer B { float a[6]; int ia[4]; float r[40]; int ir[16]; } b;\n"
+        "void main() {\n"
+        "    float x = b.a[0], y = b.a[1], h = b.a[2], t = b.a[3], nan = b.a[4], z = b.a[5];\n"  // -7.5 3 0.5 2.5 NaN 0
+        "    b.r[0] = mod(x, y); b.r[1] = mod(-x, -y); b.r[2] = mod(vec2(x, 1.0), y).y;\n"
+        "    b.r[3] = round(t); b.r[4] = round(-t); b.r[5] = roundEven(t + 1.0); b.r[6] = round(t + 0.1);\n"
+        "    b.r[7] = step(h, h); b.r[8] = step(h, x); b.r[9] = step(h, t); b.r[10] = step(vec2(h, t), vec2(t, t)).x;\n"
+        "    b.r[11] = smoothstep(z, 1.0, h); b.r[12] = smoothstep(z, 1.0, t); b.r[13] = smoothstep(z, 1.0, x);\n"
+        "    b.r[14] = smoothstep(z, 1.0, 0.25 + z);\n"
+        "    b.r[15] = min(nan, t); b.r[16] = max(nan, h); b.r[17] = clamp(nan, z, 1.0); b.r[18] = clamp(x, z, h);\n"
+        "    b.r[19] = inversesqrt(t + 1.5); b.r[20] = inversesqrt(z);\n"
+        "    b.r[21] = atan(h + 0.5, h + 0.5); b.r[22] = atan(1.0, -1.0 + z); b.r[23] = atan(-1.0, -1.0);\n"
+        "    b.r[24] = atan(-1.0, 1.0); b.r[25] = atan(z, -1.0); b.r[26] = atan(1.0, z); b.r[27] = atan(-1.0, z);\n"
+        "    b.r[28] = atan(t - 0.5); b.r[29] = atan(-h);\n"
+        "    b.r[30] = sign(x); b.r[31] = sign(z); b.r[32] = sign(t);\n"
+        "    b.r[33] = mix(h, t, true); b.r[34] = mix(h, t, false); b.r[35] = mix(vec2(x, y), vec2(h, t), bvec2(true, false)).x;\n"
+        "    b.r[36] = mix(vec2(x, y), vec2(h, t), bvec2(true, false)).y;\n"
+        "    b.r[37] = intBitsToFloat(floatBitsToInt(nan) + 0);\n"
+        "    int p = b.ia[0], q = b.ia[1], u = b.ia[2], v = b.ia[3];\n"  // -7 2 7 -3
+        "    b.ir[0] = p / q; b.ir[1] = p % q; b.ir[2] = u / v; b.ir[3] = u % v; b.ir[4] = sign(p);\n"
+        "    b.ir[5] = floatBitsToInt(1.0); b.ir[6] = floatBitsToInt(-z); b.ir[7] = floatBitsToInt(nan);\n"
+        "    b.ir[8] = int(uint(p) / 2u); b.ir[9] = -p % 4;\n"
+        "}\n");
+    CHECK(p.ok);
+    if (!p.ok) return;
+    const auto& blk = p.link.reflection.storageBlocks.at(0);
+    CHECK(blk.size >= 264);  // 24 + 16 + 160 + 64 bytes
+    int res = -1;
+    for (size_t i = 0; i < p.cs.module.resources.size(); ++i)
+        if (p.cs.module.resources[i].kind == vpir::ResourceKind::Buffer) res = int(i);
+    CHECK(res >= 0);
+    if (res < 0) return;
+    std::vector<uint8_t> mem(blk.size, 0);
+    auto setF = [&](uint32_t off, float v) { std::memcpy(&mem[off], &v, 4); };
+    auto setI = [&](uint32_t off, int32_t v) { std::memcpy(&mem[off], &v, 4); };
+    const float in[6] = {-7.5f, 3.0f, 0.5f, 2.5f, std::nanf(""), 0.0f};
+    for (uint32_t k = 0; k < 6; ++k) setF(k * 4, in[k]);
+    const int32_t iin[4] = {-7, 2, 7, -3};
+    for (uint32_t k = 0; k < 4; ++k) setI(24 + k * 4, iin[k]);
+    vpireval::Invocation inv;
+    inv.memory[uint32_t(res)] = mem;
+    std::string err;
+    CHECK(vpireval::run(p.cs.module, inv, err));
+    if (!err.empty()) std::fprintf(stderr, "  eval: %s\n", err.c_str());
+    const auto& out = inv.memory[uint32_t(res)];
+    auto R = [&](int k) { float v; std::memcpy(&v, &out[size_t(40 + 4 * k)], 4); return v; };
+    auto I = [&](int k) { int32_t v; std::memcpy(&v, &out[size_t(200 + 4 * k)], 4); return v; };
+    auto near = [&](int k, float want, float tol = 1e-5f) {
+        const bool ok = std::fabs(R(k) - want) <= tol;
+        if (!ok) std::fprintf(stderr, "  r[%d] = %.9g, want %.9g\n", k, R(k), want);
+        return ok;
+    };
+    CHECK(near(0, 1.5f) && near(1, -1.5f) && near(2, 1.0f));  // not fmod (-1.5, 1.5): the sign follows y
+    CHECK(near(3, 2.0f) && near(4, -2.0f) && near(5, 4.0f) && near(6, 3.0f));  // halves to even, others to nearest
+    CHECK(near(7, 1.0f) && near(8, 0.0f) && near(9, 1.0f) && near(10, 1.0f));  // x == edge gives 1
+    CHECK(near(11, 0.5f) && near(12, 1.0f) && near(13, 0.0f) && near(14, 0.15625f));
+    CHECK(near(15, 2.5f) && near(16, 0.5f) && near(17, 0.0f) && near(18, 0.0f));  // NaN: the other operand
+    CHECK(near(19, 0.5f) && std::isinf(R(20)) && R(20) > 0);
+    const float pi = 3.14159265358979f;
+    CHECK(near(21, pi / 4) && near(22, 3 * pi / 4) && near(23, -3 * pi / 4) && near(24, -pi / 4));
+    CHECK(near(25, pi) && near(26, pi / 2) && near(27, -pi / 2));
+    CHECK(near(28, std::atan(2.0f)) && near(29, std::atan(-0.5f)));
+    CHECK(near(30, -1.0f) && near(31, 0.0f) && near(32, 1.0f));
+    CHECK(near(33, 2.5f) && near(34, 0.5f) && near(35, 0.5f) && near(36, 3.0f));
+    uint32_t nanBits;
+    std::memcpy(&nanBits, &out[size_t(40 + 4 * 37)], 4);
+    CHECK((nanBits & 0x7fffffffu) > 0x7f800000u);  // still a NaN after the int round trip
+    CHECK(I(0) == -3 && I(1) == -1 && I(2) == -2 && I(3) == 1 && I(4) == -1);  // truncating / and %
+    CHECK(I(5) == 0x3f800000 && uint32_t(I(6)) == 0x80000000u && uint32_t(I(7)) == 0x7fc00000u);  // bit copies
+    CHECK(I(8) == int32_t(0xFFFFFFF9u / 2u) && I(9) == 3);  // unsigned division of the same bits; -(-7) % 4 = 3
+
+    // The MSL of the same builtins in a fragment shader: the structure that carries the semantics above.
+    Program f = build(kTrivialVs,
+        "#version 310 es\nprecision highp float; precision highp int; precision highp sampler2D;\n"
+        "uniform sampler2D s; uniform int lv; in vec2 uv; out vec4 o;\n"
+        "void main() {\n"
+        "    vec4 m = texelFetch(s, ivec2(uv), lv) + texelFetch(s, ivec2(uv), 2);\n"
+        "    o = m + vec4(mod(uv.x, uv.y), round(uv.x), inversesqrt(uv.x), atan(uv.y, uv.x)) + vec4(step(uv.x, uv.y), smoothstep(0.0, 1.0, uv.y), clamp(uv.x, 0.0, 1.0), sign(uv.y));\n"
+        "}\n");
+    CHECK(f.ok);
+    const std::string& msl = f.fs.msl;
+    CHECK(has(msl, "floor(") && !has(msl, "fmod("));  // mod is x - y * floor(x / y)
+    CHECK(has(msl, "rint("));                          // round: half to even
+    CHECK(has(msl, "rsqrt("));
+    // texelFetch with a lod reads that mip level, from the uniform and from the constant: two reads, the second one
+    // with the literal 2u as its last argument (matched inside its own statement, whatever the temporaries are called).
+    auto readWithLastArg = [&](const std::string& lod) {
+        for (size_t at = msl.find(".read("); at != std::string::npos; at = msl.find(".read(", at + 1)) {
+            const std::string stmt = msl.substr(at, msl.find(';', at) - at);
+            if (stmt.size() > lod.size() + 1 && stmt.compare(stmt.size() - lod.size() - 1, lod.size() + 1, lod + ")") == 0) return true;
+        }
+        return false;
+    };
+    CHECK(readWithLastArg("2u"));
+    // No assertion on how clamp / smoothstep reach the MSL (clamp or saturate): the interpreter above fixes their value
+    // for finite inputs and NaN as the IR defines it, but it does NOT test Metal's NaN semantics under fast math; those
+    // are measured on the headset.
+
+    // mix(x, y, a) keeps both ends exact: the textbook x + (y - x) * a loses the small operand against a large one.
+    ComputeProgram mp = buildCompute(
+        "#version 310 es\n"
+        "layout(local_size_x = 1) in;\n"
+        "layout(std430, binding = 0) buffer B { float a[4]; float r[8]; } b;\n"
+        "void main() {\n"
+        "    float x = b.a[0], y = b.a[1], one = b.a[2], zero = b.a[3];\n"  // 1e8 1e-8 1 0
+        "    b.r[0] = mix(x, y, one); b.r[1] = mix(x, y, zero);\n"
+        "    vec2 v = mix(vec2(x, y), vec2(y, x), one); b.r[2] = v.x; b.r[3] = v.y;\n"
+        "    b.r[4] = mix(x, y, 0.5 * one);\n"
+        "}\n");
+    CHECK(mp.ok);
+    if (!mp.ok) return;
+    int mres = -1;
+    for (size_t i = 0; i < mp.cs.module.resources.size(); ++i)
+        if (mp.cs.module.resources[i].kind == vpir::ResourceKind::Buffer) mres = int(i);
+    CHECK(mres >= 0);
+    if (mres < 0) return;
+    std::vector<uint8_t> mmem(48, 0);
+    const float mix_in[4] = {1e8f, 1e-8f, 1.0f, 0.0f};
+    std::memcpy(mmem.data(), mix_in, sizeof mix_in);
+    vpireval::Invocation minv;
+    minv.memory[uint32_t(mres)] = mmem;
+    std::string merr;
+    CHECK(vpireval::run(mp.cs.module, minv, merr));
+    const auto& mout = minv.memory[uint32_t(mres)];
+    auto M = [&](int k) { float v; std::memcpy(&v, &mout[size_t(16 + 4 * k)], 4); return v; };
+    CHECK(M(0) == 1e-8f);  // mix(x, y, 1) == y exactly (x + (y - x) * 1 would give 0)
+    CHECK(M(1) == 1e8f);   // mix(x, y, 0) == x exactly
+    CHECK(M(2) == 1e-8f && M(3) == 1e8f);  // vector ends, scalar weight splatted
+    CHECK(M(4) == 5e7f);   // 0.5: (x + y) / 2 to float precision
+    // The MSL spells it with fma, not mix().
+    Program mf = build(kTrivialVs,
+        "#version 310 es\nprecision highp float; in vec2 uv; out vec4 o;\n"
+        "void main() { o = mix(vec4(uv, 0.0, 1.0), vec4(1.0), uv.x); }\n");
+    CHECK(mf.ok);
+    CHECK(has(mf.fs.msl, "fma(") && !has(mf.fs.msl, "mix("));
+}
+
 // Transform feedback: the capture variant of the vertex shader writes the varyings glTransformFeedbackVaryings named (arrays,
 // array elements, matrices, integers, gl_Position as the shader wrote it, gl_PointSize, and an output no fragment shader reads)
 // into the record of (instance, vertex index); the VPIR interpreter runs it.
@@ -1744,7 +1918,7 @@ int main(int argc, char** argv) {
         {"textures", testTextures}, {"external", testExternalSampler}, {"link", testLink},
         {"compute", testCompute}, {"ssbo", testStorageBlocks}, {"images", testImages}, {"atomics", testAtomics},
         {"gather", testGather}, {"fbfetch", testFramebufferFetch}, {"exts", testExtensions}, {"texbuffer", testTextureBuffers}, {"exec", testExecute}, {"packed", testPackedUniforms}, {"shlight", testShLighting},
-        {"lenient", testLenient}, {"xfb", testXfb},
+        {"lenient", testLenient}, {"xfb", testXfb}, {"invariant", testInvariant}, {"semantics", testSemantics},
     };
     auto it = tests.find(argv[1]);
     if (it == tests.end()) return 2;

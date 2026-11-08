@@ -168,9 +168,15 @@ int vpvk_gpu_lost(void);
 // "not yet" (with the submit that should signal them), then the backend's command-buffer dump. Any thread; never waits
 // for the submit mutex (a busy one is reported as such).
 void vpvk_dump_pending(void);
-// Memory pressure: frees rebuildable GPU memory (idle PSOs / libraries, staging, arg rings). level 1 = OS
-// warning, 2 = critical. Writes a short key=value report into out (NUL-terminated, cut at cap; may be
-// NULL/0) and returns the bytes freed; 0 without a live device. Any thread.
+// Memory pressure: frees rebuildable GPU memory that nothing live uses: libraries no pipeline holds, transient MSAA backings
+// not used by the last frame, idle slots' chained argument buffers, and what the guest destroyed that no frame in flight reads
+// (graveyard). Pipeline states and the libraries/functions of live pipelines are never touched. level 1 = OS warning,
+// 2 = critical. Writes a short key=value report into out (NUL-terminated, cut at cap; may be NULL/0): libs= (MiB freed now),
+// msaa_live / args_live (MiB alive), msaa_freed_since_last / args_freed_since_last / *_freed_total, held, staging,
+// serialized_msaa / serialized_args (MiB moved to the graveyard now), retired_released / retired_mib (MiB returned), and
+// submit_busy=1 when the submit mutex could not be taken in ~50 ms (the MSAA / args / graveyard part then waits for the
+// next submit). Returns the bytes freed (libraries + retired objects); 0 without a live device. Any thread; may wait up to
+// ~50 ms for the submit mutex (never blocks on it).
 size_t vpvk_trim_memory(int level, char* out, size_t cap);
 // Releases what the guest destroyed that the backend keeps until a frame reuses a slot (the graveyard, and the
 // leftovers of frames that completed), without waiting for the GPU to go idle; min_idle_ms no longer gates it.
@@ -209,6 +215,10 @@ size_t vpvk_diag_ranges(int kind, vpvk_range* out, size_t max);
 // attr_top=tag:MiB/live (12 largest tags), attr_obj=tag:~MiB/live (pipelines / libraries: allocation growth seen around their
 // creation, cumulative and approximate), attr_cnt=tag:live (views, functions). Allocations >= 32 MiB log gpu.bigalloc at once.
 size_t vpvk_mem_stats(char* out, size_t cap);
+// The same counters without the object-table walk, the recipe store and the ledger, for a periodic telemetry thread: the first
+// part of vpvk_mem_stats (alloc ... fov_b: texture bytes by kind, buffers, pso / fn / lib counts, held_b, args_b, buf_int_b).
+// Never waits for the device mutex: a busy one returns 0 (the caller skips this sample). 0 (out untouched) without a live device.
+size_t vpvk_mem_brief(char* out, size_t cap);
 // Imágenes nuevas a cero (VPVK_ZERO_NEW_IMAGES): se limpian de forma perezosa en el siguiente submit
 // que las usa. Un host que lee una textura fuera del flujo Vulkan (el compositor) pregunta antes con el
 // id<MTLTexture> que obtuvo (vkGetMTLTextureMVK / vkExportMetalObjectsEXT). Barata, sin esperar submits.

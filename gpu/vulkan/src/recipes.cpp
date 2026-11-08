@@ -256,10 +256,27 @@ uint32_t refreshTranslatorMode() {
   }
   // VPSPV_KILL_EXIT (default on): only 0 turns it off. The bit is set for "off" so the default stays mode 0.
   const char* kill = std::getenv("VPSPV_KILL_EXIT");
-  const uint32_t m = (fetch & 1) | (flag("VPVK_AMPLIFY") ? 2u : 0u) | ((fetch & 2) << 1) | (kill && *kill == '0' ? 8u : 0u);
-  if (gTranslatorMode.exchange(m) != m)
+  // VPVK_INVARIANT_POS (default on): only "0" / "off" / "false" (surrounding blanks ignored) turn it off (bit set for
+  // "off", the default stays mode 0); any other value, empty included, leaves it on. Every vertex
+  // position becomes [[position, invariant]] (Metal preserveInvariance for that MSL), so a depth prepass and the main
+  // pass get the same z. Cost: the compiler may not reassociate / contract the math that feeds the position; expected
+  // negligible next to the rest of a vertex shader (not measured on the headset: compare vk.hitch / gpu_ms with =0).
+  bool invOff = false;
+  if (const char* e = std::getenv("VPVK_INVARIANT_POS")) {
+    std::string v(e);
+    const size_t b = v.find_first_not_of(" \t\r\n"), l = v.find_last_not_of(" \t\r\n");
+    v = b == std::string::npos ? std::string() : v.substr(b, l - b + 1);
+    invOff = v == "0" || v == "off" || v == "false";
+  }
+  const uint32_t m = (fetch & 1) | (flag("VPVK_AMPLIFY") ? 2u : 0u) | ((fetch & 2) << 1) | (kill && *kill == '0' ? 8u : 0u) |
+                     (invOff ? 16u : 0u);
+  if (gTranslatorMode.exchange(m) != m) {
     logf("vk.translator mode=%u native_fetch=%u amplify=%u unpack_fetch=%u kill_exit=%u id=%u", m, m & 1, (m >> 1) & 1,
          (m >> 2) & 1, (~m >> 3) & 1, kTranslatorVersion | m << 16);
+    // math=fast is metal_backend.mm's MTLMathModeFast. Whether a library really compiled with preserveInvariance
+    // (and how many fell back without it) is in the gpu.shader.lib lines: invariant= / invariant_retries=.
+    logf("gpu.shaderfx invariant_pos=%u math=fast", (~m >> 4) & 1);
+  }
   return m;
 }
 
@@ -276,6 +293,7 @@ void applyTranslatorMode(spirv::SpirvLowerOptions& o) {
   o.amplify = (m & 2) != 0;
   o.unpackFetch = (m & 4) != 0;
   o.killExit = (m & 8) == 0;
+  o.invariantPos = (m & 16) == 0;
 }
 
 uint8_t translatorDiff(uint64_t stored, uint64_t current) {

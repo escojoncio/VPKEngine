@@ -871,15 +871,16 @@ VpvkCacheState CacheWatch::evaluate(int64_t nowNs, uint64_t frame, bool pipeline
 bool CacheWatch::logChange(const VpvkCacheState& s) {
   std::lock_guard<std::mutex> lock(logMutex);
   if (s.complete == lastComplete && s.reason == lastReason) return false;
-  const bool becameComplete = s.complete && lastComplete != 1;
-  lastComplete = s.complete, lastReason = s.reason;
+  const bool flushable = s.complete || s.reason == CacheUnusedModules;
+  const bool becameFlushable = flushable && !lastFlushable;
+  lastComplete = s.complete, lastReason = s.reason, lastFlushable = flushable;
   if (lines++ < kCacheLogLines)
     logf("vk.cache_state complete=%u reason=%u pipelines=%u modules_created=%u modules_used=%u idle_ms=%u", s.complete, s.reason,
          s.pipelines_unique, s.modules_created, s.modules_used, s.idle_ms);
-  return becameComplete;
+  return becameFlushable;
 }
 
-// complete turned 1: the compiled pipelines must be on disk before the host lets the user leave (a paused app can be killed), so
+// complete turned 1 (or only unused modules hold it back): the compiled pipelines must be on disk before the host lets the user leave (a paused app can be killed), so
 // the archive flush (the one vpvk_flush_caches does) starts now, on a thread of its own: the submit tick / the host's poll never
 // wait for it and it takes none of their locks. NOT a guarantee: complete=1 does not mean the flush finished.
 void requestCacheFlush(Device* d) {
