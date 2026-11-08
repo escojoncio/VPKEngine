@@ -39,6 +39,11 @@ if(TARGET vpgcn_ref AND TARGET vpgcn_lift)
   target_link_libraries(vpgcn_diff PRIVATE vpgcn_ref vpgcn_lift vpmsl Threads::Threads)
   target_compile_options(vpgcn_diff PRIVATE -Wall -Wextra -Werror)
   add_test(NAME gcn.lift.differential COMMAND vpgcn_diff ${CMAKE_CURRENT_SOURCE_DIR}/diff/programs.txt)
+  # The DX9 legacy multiply (v_mul/mac/mad_legacy_f32): directed 0*inf / 0*NaN / signed-zero / NaN-c cases, and no float == 0 in the MSL.
+  add_executable(vpgcn_legacy_madd_test diff/legacy_madd_test.cpp diff/vpir_eval.cpp)
+  target_link_libraries(vpgcn_legacy_madd_test PRIVATE vpgcn_lift vpmsl Threads::Threads)
+  target_compile_options(vpgcn_legacy_madd_test PRIVATE -Wall -Wextra -Werror)
+  add_test(NAME gcn.lift.legacy_madd COMMAND vpgcn_legacy_madd_test)
   # The same with control flow: saveexec if/else (nested), uniform loops, per-lane loops.
   add_test(NAME gcn.lift.differential_isa COMMAND vpgcn_diff ${CMAKE_CURRENT_SOURCE_DIR}/diff/programs_isa.txt)
   add_test(NAME gcn.lift.differential_cf COMMAND vpgcn_diff ${CMAKE_CURRENT_SOURCE_DIR}/diff/programs_cf.txt)

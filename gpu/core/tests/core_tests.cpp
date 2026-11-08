@@ -364,6 +364,115 @@ void testHazards() {
   }
 }
 
+// A pass that clears a target must wait for the earlier encoders of the frame that wrote it (WAW between encoders; Metal
+// resources are hazard-untracked, so the barrier is the only ordering): both eyes drawn into one depth buffer, the second eye's
+// clear following the first eye's drawing with no barrier left cached depth landing on the cleared buffer block by block.
+void testClearBarrier() {
+  Scene s;
+  // The barrier of encoder `e`: item 0, the attachment stage on both sides, one WAW hazard in the whole frame.
+  auto ordered = [&](const CompiledFrame& cf, size_t encoders, uint32_t e) {
+    CHECK_EQ(cf.encoders.size(), encoders);
+    CHECK_EQ(cf.barriers.size(), size_t{1});
+    if (cf.barriers.size() != 1) return;
+    CHECK(cf.barriers[0].encoder == e && cf.barriers[0].item == 0);
+    CHECK((cf.barriers[0].after & stage::fragment) && (cf.barriers[0].before & stage::fragment));
+    CHECK(cf.barriers[0].hazards & (1 << int(HazardKind::WAW)));
+    CHECK_EQ(hazards(cf, HazardKind::WAW), 1u);
+  };
+  {  // two eyes, one depth: eye 1 draws into (colour 1, depth), eye 2 clears and draws into (colour 2, depth)
+    const TextureId c1 = s.rt(), c2 = s.rt(), d = s.depthRt();
+    Frame f;
+    Scene::passWithDraw(f, Scene::pass(c1, d, LoadAction::Clear));
+    Scene::passWithDraw(f, Scene::pass(c2, d, LoadAction::Clear));
+    const CompiledFrame cf = compileFrame(f, &s.res);
+    ordered(cf, 2, 1);
+    CHECK(cf.encoders[1].reason == CutReason::AttachmentChange);
+  }
+  {  // the same without a resource table (no tile or split analysis)
+    const TextureId c1 = s.rt(), c2 = s.rt(), d = s.depthRt();
+    Frame f;
+    Scene::passWithDraw(f, Scene::pass(c1, d, LoadAction::Clear));
+    Scene::passWithDraw(f, Scene::pass(c2, d, LoadAction::Clear));
+    ordered(compileFrame(f), 2, 1);
+  }
+  {  // a clear-only pass (Frame::clear: no draws) of the depth the first eye drew into
+    const TextureId c1 = s.rt(), c2 = s.rt(), d = s.depthRt();
+    Frame f;
+    Scene::passWithDraw(f, Scene::pass(c1, d, LoadAction::Clear));
+    f.clear(Scene::pass(c2, d));
+    ordered(compileFrame(f, &s.res), 2, 1);
+  }
+  {  // depth only (no colour attachment at all): the clear cuts the encoder (ClearLoad) and still waits
+    const TextureId d = s.depthRt();
+    Frame f;
+    Scene::passWithDraw(f, Scene::pass({}, d));
+    f.clear(Scene::pass({}, d));
+    const CompiledFrame cf = compileFrame(f, &s.res);
+    ordered(cf, 2, 1);
+    CHECK(cf.encoders[1].reason == CutReason::ClearLoad);
+  }
+  {  // stencil: a depth+stencil format is one attachment slot, cleared as a whole
+    const TextureId c = s.rt(), d = s.rt(256, 1, 1, Format::D24UnormS8);
+    Frame f;
+    Scene::passWithDraw(f, Scene::pass(c, d));
+    auto clr = Scene::pass(c, d, LoadAction::Clear);
+    clr.depth.clear.stencil = 7;
+    f.clear(clr);
+    ordered(compileFrame(f, &s.res), 2, 1);
+  }
+  {  // colour only: clearing a colour target drawn earlier
+    const TextureId c = s.rt();
+    Frame f;
+    Scene::passWithDraw(f, Scene::pass(c));
+    f.clear(Scene::pass(c));
+    ordered(compileFrame(f, &s.res), 2, 1);
+  }
+  {  // a clear after a compute pass wrote the target (the encoders between them are not render encoders)
+    const TextureId c = s.rt();
+    Frame f;
+    f.dispatch(Scene::compute({write(ResourceRange::subresource(c, 0, 1, 0, 1), stage::compute)}));
+    f.clear(Scene::pass(c));
+    const CompiledFrame cf = compileFrame(f, &s.res);
+    CHECK_EQ(cf.barriers.size(), size_t{1});
+    CHECK(cf.barriers.size() == 1 && cf.barriers[0].encoder == 1 && (cf.barriers[0].after & stage::compute));
+  }
+  {  // array layers: eye 2 on its own slice of the colour and the depth array shares no memory with eye 1 (no barrier);
+     // the same slice does
+    const TextureId c = s.rt(256, 1, 2), d = s.rt(256, 1, 2, Format::D32Float);
+    auto eye = [&](uint16_t layer, LoadAction load) {
+      RenderPassDesc p = Scene::pass(c, d, load);
+      p.colors[0].layer = layer;
+      p.depth.layer = layer;
+      return p;
+    };
+    Frame disjoint;
+    Scene::passWithDraw(disjoint, eye(0, LoadAction::Clear));
+    Scene::passWithDraw(disjoint, eye(1, LoadAction::Clear));
+    CHECK(compileFrame(disjoint, &s.res).barriers.empty());
+    Frame same;
+    Scene::passWithDraw(same, eye(1, LoadAction::Clear));
+    same.clear(eye(1, LoadAction::Clear));
+    ordered(compileFrame(same, &s.res), 2, 1);
+    // a two-layer clear covers both earlier slices: one barrier
+    Frame both;
+    Scene::passWithDraw(both, eye(0, LoadAction::Clear));
+    Scene::passWithDraw(both, eye(1, LoadAction::Clear));
+    RenderPassDesc all = Scene::pass(c, d, LoadAction::Clear);
+    all.layerCount = 2;
+    both.clear(all);
+    const CompiledFrame cf = compileFrame(both, &s.res);
+    CHECK_EQ(cf.barriers.size(), size_t{1});
+    CHECK(cf.barriers.size() == 1 && cf.barriers[0].encoder == cf.encoders.size() - 1);
+  }
+  {  // unrelated targets: no barrier (the wait is not free)
+    const TextureId c1 = s.rt(), c2 = s.rt(), d1 = s.depthRt(), d2 = s.depthRt();
+    Frame f;
+    Scene::passWithDraw(f, Scene::pass(c1, d1, LoadAction::Clear));
+    f.clear(Scene::pass(c2, d2));
+    CHECK(compileFrame(f, &s.res).barriers.empty());
+  }
+}
+
 void testSubresources() {
   Scene s;
   const TextureId chain = s.rt(256, 4), arr = s.rt(256, 1, 2);
@@ -2946,6 +3055,16 @@ void testViewSplit() {
     CHECK(cf.barriers.empty());  // the two encoders write different layers
     CHECK_EQ(cf.stats.hazards[int(HazardKind::WAW)], 0u);
   }
+  {  // a clear of the whole two-layer target after the split encoders waits for both (it covers each view's layer)
+    Eye e;
+    Frame f = e.frame(2);
+    f.clear(e.pass);
+    const CompiledFrame cf = compileFrame(f, &e.s.res, on);
+    CHECK_EQ(cf.encoders.size(), 3u);
+    CHECK(cf.encoders[0].view == 0 && cf.encoders[1].view == 1 && cf.encoders[2].view == -1);
+    CHECK_EQ(cf.barriers.size(), 1u);
+    CHECK(cf.barriers.size() == 1 && cf.barriers[0].encoder == 2 && (cf.barriers[0].hazards & (1 << int(HazardKind::WAW))));
+  }
   {  // the heavy test counts one view: 2 draws x 3 vertices = 6 per view, 12 for both
     Eye e;
     const Frame f = e.frame(2);
@@ -3594,6 +3713,7 @@ int main(int argc, char** argv) {
   const std::vector<std::pair<const char*, std::function<void()>>> groups = {
       {"resources", testResources}, {"commands", testCommands}, {"merge", testMerge},
       {"copies", testCopies},       {"hazards", testHazards},   {"subresources", testSubresources},
+      {"clearbarrier", testClearBarrier},
       {"cuts", testCuts},           {"diagnostics", testDiagnostics}, {"pipelines", testPipelines},
       {"device", testDevice},       {"tile", testTile},         {"bindings", testBindings},
       {"astro", testAstroFrame},    {"fuzz", testFuzz},         {"copyrects", testCopyRects},

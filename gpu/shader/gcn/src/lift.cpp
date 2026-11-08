@@ -675,6 +675,12 @@ struct Lifter {
     ValueId bin(V::Op op, ValueId a, ValueId c, V::Type t) { return b->binary(op, a, c, t); }
     ValueId sel(ValueId c, ValueId a, ValueId x, V::Type t) { return b->ternary(V::Op::Select, c, a, x, t); }
     ValueId b2u(ValueId c) { return sel(c, u(1), u(0), V::kU32); }
+    // The DX9 multiply's "a source is zero" (+0 or -0), tested on the bits: with fast math (no NaN/inf assumed) Metal folds a
+    // float `a == 0 ? .. : a * b` back into a plain multiply, and 0 * inf is NaN again.
+    ValueId legacyZero(ValueId a, ValueId c) {
+        auto zero = [&](ValueId x) { return bin(V::Op::Eq, bin(V::Op::And, asU(x, V::kF32), u(0x7fffffffu), V::kU32), u(0), V::kBool); };
+        return bin(V::Op::Or, zero(a), zero(c), V::kBool);
+    }
     ValueId nz(ValueId x) { return bin(V::Op::Ne, x, u(0), V::kBool); }
     ValueId notB(ValueId c) { return b->unary(V::Op::Not, c, V::kBool); }
 
@@ -1406,29 +1412,22 @@ struct Lifter {
             case G::v_mul_f32: return resultF(x, bin(Mul, srcF(x, 0), srcF(x, 1), F));
             case G::v_mul_legacy_f32: {
                 ValueId a = srcF(x, 0), c = srcF(x, 1);
-                ValueId zero = bin(V::Op::Or, bin(V::Op::Eq, a, f(0), V::kBool), bin(V::Op::Eq, c, f(0), V::kBool), V::kBool);
-                return resultF(x, sel(zero, f(0), bin(Mul, a, c, F), F));
+                ValueId p = bin(Mul, a, c, F);
+                return resultF(x, sel(legacyZero(a, c), f(0), p, F));
             }
             case G::v_mac_legacy_f32:
             case G::v_mac_f32: {
                 ValueId acc = asF(b->loadVar(vVar(x.dst.index)));
                 ValueId a = srcF(x, 0), c = srcF(x, 1);
-                ValueId p = bin(Mul, a, c, F);
-                if (op == G::v_mac_legacy_f32) {
-                    ValueId zero = bin(V::Op::Or, bin(V::Op::Eq, a, f(0), V::kBool), bin(V::Op::Eq, c, f(0), V::kBool), V::kBool);
-                    p = sel(zero, f(0), p, F);
-                }
-                return resultF(x, bin(Add, p, acc, F));
+                ValueId sum = bin(Add, bin(Mul, a, c, F), acc, F);
+                // Legacy: a zero source leaves the accumulator as it is (acc itself, even -0 / NaN / inf).
+                return resultF(x, op == G::v_mac_legacy_f32 ? sel(legacyZero(a, c), acc, sum, F) : sum);
             }
             case G::v_mad_f32:
             case G::v_mad_legacy_f32: {
                 ValueId a = srcF(x, 0), c = srcF(x, 1), d = srcF(x, 2);
-                ValueId p = bin(Mul, a, c, F);
-                if (op == G::v_mad_legacy_f32) {
-                    ValueId zero = bin(V::Op::Or, bin(V::Op::Eq, a, f(0), V::kBool), bin(V::Op::Eq, c, f(0), V::kBool), V::kBool);
-                    p = sel(zero, f(0), p, F);
-                }
-                return resultF(x, bin(Add, p, d, F));
+                ValueId sum = bin(Add, bin(Mul, a, c, F), d, F);
+                return resultF(x, op == G::v_mad_legacy_f32 ? sel(legacyZero(a, c), d, sum, F) : sum);
             }
             case G::v_fma_f32: return resultF(x, b->ternary(V::Op::Fma, srcF(x, 0), srcF(x, 1), srcF(x, 2), F));
             case G::v_madmk_f32: return resultF(x, bin(Add, bin(Mul, srcF(x, 0), srcF(x, 1), F), srcF(x, 2), F));
