@@ -90,6 +90,10 @@ void holdForceSingleSample(bool acquire);  // vkCreateDevice / vkDestroyDevice (
 int msaaForce();
 int msaaForceLive();
 bool gameMsaaAuto();  // VPVK_GAME_MSAA_AUTO (default on), frozen like msaaForce
+// VPVK_D24_EMUL (default off; "" / "0" = off): pipelines that render into a D24UnormS8 image (held by Metal as Depth32Float_Stencil8)
+// write their depth rounded to 24 bits UNORM from the fragment shader, with the depth bias applied there (pipelines.cpp
+// PipelineObj::d24Emul, SpirvLowerOptions::d24Emul). Read once per process.
+bool d24Emul();
 bool gameMsaaAutoLive();
 
 // ---- MSAA: detection of the game's eye pass and the sample-count override (config.cpp) ----
@@ -561,6 +565,7 @@ struct PipelineObj {
     std::shared_ptr<spirv::SpirvModule> module;
     std::shared_ptr<const std::vector<uint32_t>> words;  // recipes only
     uint64_t hash = 0;
+    bool synthetic = false;  // made by the layer, not the game's (the empty fragment stage of a D24-emulated depth-only pipeline)
     std::string entry;
     VkShaderStageFlagBits stage = VK_SHADER_STAGE_VERTEX_BIT;
     std::vector<std::pair<uint32_t, uint64_t>> spec;
@@ -569,6 +574,8 @@ struct PipelineObj {
   std::vector<spirv::VertexAttribute> attrs;
   uint32_t sampleMask = ~0u;  // VkSampleMask of the pipeline (pSampleMask[0]) when it clears samples of the game's count, else ~0u
   bool a2cTest = false;  // alpha-to-coverage pipeline created at 1x (MSAA forced off): alpha test in the fragment shader
+  bool d24Emul = false;  // d24Emul() and the pipeline tests depth into a D24UnormS8 image: its fragment stage rounds the depth to 24 bits
+  bool d24Skipped = false;  // ... except a shader with early fragment tests that may write resources (spirv::d24EmulSkipped): hardware depth
   uint16_t colorIntKinds = 0;  // SpirvLowerOptions::colorIntKinds of the fragment stage
   uint8_t fragmentOutputs = 0;  // colour outputs the fragment shader writes (a dynamic colour write mask never enables others)
   bool sampleBuiltin = false;   // the fragment shader declares BuiltIn SampleId / SampleMask (forced MSAA never upgrades a game MSAA pass using it)
@@ -702,6 +709,31 @@ struct UiMaskState {
   void release();  // vkDestroyDevice
 };
 
+// "vk.depth_diag": what the eye passes' draws ask of the depth buffer, to judge the D24 emulation (D24UnormS8 is held as float32 by
+// Metal). Per eye pass (Pass, counted by commands.cpp Translator::noteDepth) and folded into the period and the session; one line
+// every kPeriod frames (max kLines), plain counters and a fixed buffer, no allocation. submitMutex.
+struct DepthDiag {
+  static constexpr uint64_t kPeriod = 600;
+  static constexpr uint32_t kLines = 40;
+  struct Pass {
+    uint32_t draws = 0;
+    uint32_t bias = 0;                  // draws with a depth bias (constant or slope factor != 0)
+    uint32_t ge = 0, le = 0, eq = 0;    // draws testing GREATER_OR_EQUAL / LESS_OR_EQUAL / EQUAL without writing depth
+    uint32_t d24 = 0;                   // draws into a D24UnormS8 depth image
+    uint32_t emul = 0;                  // ... whose pipeline writes the depth itself (VPVK_D24_EMUL)
+    uint32_t skipped = 0;               // ... whose pipeline keeps the hardware depth: early fragment tests and resource writes (d24_skipped)
+    float constMax = 0, slopeMax = 0;   // largest |constant factor| / |slope factor|
+    bool any() const { return draws != 0; }
+  };
+  Pass period, session, best;  // best: the pass with most draws of the period
+  uint32_t periodPasses = 0, periodD24Passes = 0, sessionPasses = 0;
+  uint64_t nextFrame = 0;
+  uint32_t lines = 0;
+  void notePass(const Pass& p);
+  // At or after nextFrame with something counted: writes the line into buf and resets the period. False otherwise.
+  bool take(uint64_t frame, char* buf, size_t cap);
+};
+
 // Forced MSAA (msaaForce, commands.cpp Translator::forceMsaa): the transient N-sample twins the game's 1x scene / eye passes
 // render into (always tile memory: never stored, resolved into the game's image), cached per guest image, plus the counters
 // of the "vk.msaa force" line. submitMutex.
@@ -754,6 +786,26 @@ struct MsaaTwins {
   vpgpu::TextureId acquire(Device* dev, vpgpu::TextureId guest, const vpgpu::TextureDesc& gd, uint8_t samples, uint16_t layers,
                            uint16_t mip, uint16_t layer);
   void release(Device* dev);  // vkDestroyDevice
+
+  // "vk.msaa_eye f= eye_color_passes= upgraded= samples_in_hist= samples_out_hist= main_pass_samples=in->out main_pass_draws=
+  // non_eye_passes= top3 ...": every kEyePeriod frames (max kEyeLines lines per device), the eye passes forceMsaa judged in the period.
+  // Plain counters only (no allocation); "main_pass" is the eye pass with most draws of the last frame that had one.
+  static constexpr uint64_t kEyePeriod = 600;
+  static constexpr uint32_t kEyeLines = 40;
+  struct EyeSummary {
+    struct Size { uint32_t w = 0, h = 0, n = 0; uint16_t layers = 0; const char* fmt = nullptr; };
+    uint32_t eyePasses = 0, upgraded = 0, nonEye = 0, hin[4] = {0, 0, 0, 0}, hout[4] = {0, 0, 0, 0};  // hist: 1, 2, 4x, other
+    Size sizes[8];
+    uint64_t frame = 0, nextFrame = 0;  // frame of the pass being folded; the frame at which the next line is due
+    uint32_t curDraws = 0, mainDraws = 0;  // best eye pass of `frame` / of the last finished frame that had one
+    uint8_t curIn = 0, curOut = 0, mainIn = 0, mainOut = 0;
+    uint32_t lines = 0;
+    void notePass(uint64_t f, uint32_t w, uint32_t h, uint16_t layers, const char* fmt, uint8_t in, uint8_t out, uint32_t draws);
+    void noteNonEye(uint64_t f) { advance(f), ++nonEye; }
+    void advance(uint64_t f);  // a new frame: the best pass of the finished one becomes main_pass
+    // At or after nextFrame with something counted: writes the line into buf and resets the period. False otherwise.
+    bool take(uint64_t f, char* buf, size_t cap);
+  } eye;
 };
 
 // Complete shader cache detector (pipelines.cpp cacheState, vpvk_cache_state, "vk.cache_state"). The rule's thresholds:
@@ -864,6 +916,7 @@ struct Device : Dispatchable {
   std::atomic<uint64_t> frameNsNoted{0};
   UiMaskState uiMask;                   // submitMutex
   MsaaTwins msaaTwins;                  // submitMutex
+  DepthDiag depthDiag;                  // submitMutex
   FoveationState fovState;              // submitMutex
   HitchLine hitch;                      // vk.hitch (perf.h), submitMutex: this device's slow-frame lines
   struct {
@@ -1022,5 +1075,5 @@ H to(T* p) { return reinterpret_cast<H>(p); }
 // dynamic-rendering pass that are undefined when it ends (glInvalidateFramebuffer). The complete set, replacing an
 // earlier call. See the definition for what keeps its store.
 extern "C" void vpvk_cmd_pass_drop(VkCommandBuffer cb, uint32_t colorMask, int depth, int stencil);
-extern "C" void vpvk_recipe_stats(VkDevice dv, uint32_t out[4]);  // pipelines.cpp: gles.pso.recipe counters
+extern "C" void vpvk_recipe_stats(VkDevice dv, uint32_t out[5]);  // pipelines.cpp: gles.pso.recipe counters
 extern "C" int vpvk_cache_state(VpvkCacheState* out);  // entry.cpp: 1 = filled from the live device, 0 = no device (out zeroed, version set)

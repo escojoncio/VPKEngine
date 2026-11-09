@@ -546,6 +546,14 @@ bool gameMsaaAuto() {
   return gameMsaaAutoLive();
 }
 
+bool d24Emul() {
+  static const bool on = [] {
+    const char* e = getenv("VPVK_D24_EMUL");
+    return e && *e && *e != '0';
+  }();
+  return on;
+}
+
 // Frozen with the device like forceSingleSample: the twins, pass descriptions and pipeline variants must agree for its life.
 int msaaForce() {
   {

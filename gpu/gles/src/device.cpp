@@ -46,7 +46,7 @@ void forgetContext(Context* c) {
 // ---- diagnostics: pipeline recipes ----------------------------------------------------------------------
 namespace {
 struct RecipeStats {
-    uint32_t last[4] = {~0u, ~0u, ~0u, ~0u};  // counters of the last line (none printed yet)
+    uint32_t last[5] = {~0u, ~0u, ~0u, ~0u, ~0u};  // counters of the last line (none printed yet)
     std::chrono::steady_clock::time_point at = std::chrono::steady_clock::now();
 } gRecipeStats;
 }  // namespace
@@ -58,11 +58,12 @@ void recipeStatsTick(bool force) {
     const auto now = std::chrono::steady_clock::now();
     if (!force && now - st.at < std::chrono::seconds(10)) return;
     st.at = now;
-    uint32_t v[4];  // loaded, saved, prewarmed, miss_in_game
+    uint32_t v[5];  // loaded, new this run, prewarmed, miss_in_game, total stored
     dv->vk.vpvk_recipe_stats(dv->device, v);
-    if (!force && std::equal(v, v + 4, st.last)) return;
-    std::copy(v, v + 4, st.last);
-    logf("gles.pso.recipe saved=%u loaded=%u prewarmed=%u miss_in_game=%u", v[1], v[0], v[2], v[3]);
+    if (!force && std::equal(v, v + 5, st.last)) return;
+    std::copy(v, v + 5, st.last);
+    logf("gles.pso.recipe new_this_run=%u total=%u reused=%u saved=%u loaded=%u prewarmed=%u miss_in_game=%u", v[1], v[4], v[0], v[1], v[0], v[2],
+         v[3]);
 }
 
 // ---- Device -----------------------------------------------------------------------------------------
@@ -320,8 +321,33 @@ bool SamplerParams::operator==(const SamplerParams& o) const {
            compareMode == o.compareMode && compareFunc == o.compareFunc && std::memcmp(border, o.border, sizeof border) == 0;
 }
 
+// Compressed images only get texels from uploads / copies (Image::written): when [base,max] has written levels but not all of them,
+// the sampled range shrinks to the contiguous run of written levels from the first written one (the rest would read the zero fill).
+// Nothing written in [base,max]: unchanged. `clamped` tells whether the range was cut.
+void mipRange(const Texture& t, uint32_t& base, uint32_t& top, bool* clamped) {
+    if (clamped) *clamped = false;
+    const Image& im = *t.image;
+    base = uint32_t(std::min<GLint>(t.baseLevel, GLint(im.levels) - 1));
+    top = std::max(base, uint32_t(std::min<GLint>(t.maxLevel, GLint(im.levels) - 1)));  // max < base: the base level alone, never an unsigned wrap
+    if (!im.format->compressed || top >= 32) return;
+    const uint32_t all = ((top - base + 1) >= 32 ? ~0u : ((1u << (top - base + 1)) - 1u)) << base;
+    if ((im.written & all) == all) return;
+    uint32_t b = base;
+    while (b <= top && !(im.written >> b & 1u)) ++b;
+    if (b > top) return;
+    uint32_t m = b;
+    while (m < top && (im.written >> (m + 1) & 1u)) ++m;
+    base = b, top = m;
+    if (clamped) *clamped = true;
+}
+
 uint64_t Texture::viewKey() const {
     uint64_t k = uint64_t(baseLevel & 0xFF) | uint64_t(std::min(maxLevel, 255) & 0xFF) << 8;
+    if (image) {  // the effective range (it widens when more levels are uploaded: a new view)
+        uint32_t b, t;
+        mipRange(*this, b, t);
+        k |= uint64_t(b & 0xFF) << 34 | uint64_t(t & 0xFF) << 42;
+    }
     for (int i = 0; i < 4; ++i) k |= uint64_t(swizzle[i] & 0xF) << (16 + 4 * i);
     k |= uint64_t(depthStencilMode == gl::STENCIL_INDEX) << 32;
     k |= uint64_t(!srgbDecode) << 33;
@@ -362,8 +388,16 @@ VkImageView Texture::sampledView() {
     VkImageAspectFlags aspect = image->aspect();
     if (aspect == (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT))
         aspect = depthStencilMode == gl::STENCIL_INDEX ? VK_IMAGE_ASPECT_STENCIL_BIT : VK_IMAGE_ASPECT_DEPTH_BIT;
-    const uint32_t base0 = uint32_t(std::min<GLint>(baseLevel, GLint(image->levels) - 1));
-    const uint32_t top = std::max(base0, uint32_t(std::min<GLint>(maxLevel, GLint(image->levels) - 1)));  // max < base: the base level alone, never an unsigned wrap
+    uint32_t base0, top;
+    bool clamped;
+    mipRange(*this, base0, top, &clamped);
+    if (clamped) {
+        static int clampedViews = 0;  // at most 64 lines per session
+        ++clampedViews;
+        if (clampedViews <= 64)
+            logf("gles.mip_clamped tex=%u fmt=0x%04x levels=%u base=%d max=%d -> %u..%u written=0x%x views=%d", name, image->format->internal, image->levels,
+                 baseLevel, maxLevel, base0, top, image->written, clampedViews);
+    }
     ci.subresourceRange = {aspect, base0, std::max<uint32_t>(1, top - base0 + 1), 0, image->layers};
     VkImageView v = VK_NULL_HANDLE;
     image->dev->vk.vkCreateImageView(image->dev->device, &ci, nullptr, &v);

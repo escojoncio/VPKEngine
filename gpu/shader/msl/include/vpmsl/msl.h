@@ -64,6 +64,7 @@ namespace vpmsl {
 inline constexpr unsigned kDrawParamsBuffer = 29;
 inline constexpr unsigned kRateMapBuffer = 28;
 inline constexpr unsigned kViewBaseBuffer = 27;
+inline constexpr unsigned kDepthBiasBuffer = 26;
 // The parameter as emitted (the backend looks for it in the fragment MSL to know it needs the rate map data).
 inline constexpr const char* kRateMapDecl = "constant rasterization_rate_map_data& vp_rrm";
 // The parameter as emitted: what the backend looks for in the vertex MSL (the shader blob format
@@ -71,6 +72,10 @@ inline constexpr const char* kRateMapDecl = "constant rasterization_rate_map_dat
 inline constexpr const char* kDrawParamsDecl = "constant VpDrawParams& vp_draw";
 // Same for the vertex amplification view base (vertex MSL with [[amplification_id]] declares it).
 inline constexpr const char* kViewBaseDecl = "constant uint& vp_view_base";
+// D24 depth emulation (Builtin::DepthBias): a fragment entry point reading it takes `constant float3& vp_dbias [[buffer(26)]]` =
+// {constantFactor, slopeFactor, clamp} of the draw's Vulkan depth bias; the backend sets it per draw (setFragmentBytes) and
+// (16 bytes: {c, s, clamp, 0}) then draws with hardware depth bias 0, because the shader adds the bias to the depth it writes.
+inline constexpr const char* kDepthBiasDecl = "constant float3& vp_dbias";
 
 struct Argument {
     std::string name;

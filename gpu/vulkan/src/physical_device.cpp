@@ -15,9 +15,9 @@ namespace {
 // Adreno 740, with every limit / feature / extension of the headset's report that the translator honours.
 VkPhysicalDeviceProperties makeProps(bool quest, bool geom) {
   VkPhysicalDeviceProperties p{};
-  p.apiVersion = VK_API_VERSION_1_3;
+  p.apiVersion = quest ? VK_MAKE_API_VERSION(0, 1, 3, 295) : VK_API_VERSION_1_3;  // Quest 3 driver 512.837.7 reports 1.3.295
   if (quest) {
-    p.driverVersion = VK_MAKE_VERSION(512, 744, 0);  // Adreno drivers set bit 31; Unity rejects Qualcomm without it
+    p.driverVersion = VK_MAKE_VERSION(512, 837, 7);  // Adreno drivers set bit 31; Unity rejects Qualcomm without it
     p.vendorID = 0x5143;      // Qualcomm: engines key their mobile paths off it
     p.deviceID = 0x43051401;  // Adreno 740 (the id Quest 3 titles check)
     // VPVK_QUEST_GPU_NAME: the host names the headset it presents ("Adreno (TM) 650" for a Quest 2); only the name changes.

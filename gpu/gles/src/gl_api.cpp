@@ -47,20 +47,20 @@ GLenum GetError() {
 }
 
 const char* kExtensions[] = {
-    "GL_OES_element_index_uint", "GL_OES_packed_depth_stencil", "GL_OES_depth_texture", "GL_OES_depth24", "GL_OES_depth32",
+    "GL_OES_element_index_uint", "GL_OES_packed_depth_stencil", "GL_OES_depth_texture", "GL_OES_depth24",
     "GL_OES_rgb8_rgba8", "GL_OES_standard_derivatives", "GL_OES_texture_npot", "GL_OES_vertex_array_object",
     "GL_OES_EGL_image", "GL_OES_EGL_image_external", "GL_OES_EGL_image_external_essl3", "GL_OES_texture_half_float",
     "GL_OES_texture_half_float_linear", "GL_OES_texture_float", "GL_OES_texture_float_linear",
     "GL_OES_compressed_ETC1_RGB8_texture", "GL_OES_vertex_half_float", "GL_OES_texture_3D", "GL_OES_surfaceless_context",
-    "GL_OES_mapbuffer", "GL_EXT_texture_format_BGRA8888", "GL_EXT_read_format_bgra",
-    "GL_EXT_texture_filter_anisotropic", "GL_EXT_shader_texture_lod", "GL_EXT_color_buffer_float",
+    "GL_EXT_texture_format_BGRA8888", "GL_EXT_read_format_bgra",
+    "GL_EXT_texture_filter_anisotropic", "GL_EXT_color_buffer_float",
     "GL_EXT_color_buffer_half_float", "GL_EXT_sRGB", "GL_EXT_texture_sRGB_decode", "GL_EXT_discard_framebuffer",
     "GL_EXT_multisampled_render_to_texture", "GL_EXT_multisampled_render_to_texture2", "GL_EXT_draw_buffers",
-    "GL_EXT_frag_depth", "GL_EXT_shadow_samplers", "GL_EXT_texture_storage", "GL_EXT_map_buffer_range",
+    "GL_EXT_texture_storage", "GL_EXT_map_buffer_range",
     "GL_EXT_occlusion_query_boolean", "GL_EXT_instanced_arrays", "GL_EXT_draw_instanced",
     "GL_EXT_texture_rg", "GL_EXT_unpack_subimage", "GL_EXT_debug_marker", "GL_EXT_debug_label", "GL_EXT_robustness",
     "GL_KHR_texture_compression_astc_ldr", "GL_KHR_debug", "GL_OVR_multiview", "GL_OVR_multiview2",
-    "GL_OVR_multiview_multisampled_render_to_texture", "GL_ANGLE_instanced_arrays", "GL_NV_draw_buffers",
+    "GL_OVR_multiview_multisampled_render_to_texture",
     "GL_EXT_texture_buffer", "GL_EXT_copy_image", "GL_EXT_draw_buffers_indexed", "GL_OES_get_program_binary",
 };
 std::string extensionString() {

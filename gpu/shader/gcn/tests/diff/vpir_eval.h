@@ -1,6 +1,6 @@
 // A VPIR interpreter for tests: runs a module's entry point for one invocation with exact IEEE
 // single-precision arithmetic (no fast-math), byte-addressed buffers and captured outputs. Covers
-// the ops the GCN lifter emits except textures (answered by Invocation::image when set), interpolation, derivatives and cross-lane ops.
+// the ops the GCN lifter emits except textures (answered by Invocation::image when set), derivatives (Invocation::derivative), interpolation and cross-lane ops.
 #pragma once
 
 #include <cstdint>
@@ -25,6 +25,8 @@ struct Invocation {
     // Optional: texture ops (image_sample / image_size) are answered by the test; `args` are the
     // instruction's evaluated value operands, `in.sym` the texture and `in.sampler` the sampler resource.
     std::function<bool(const vpir::Inst& in, const std::vector<Value>& args, Value& out)> image;
+    // Optional: a derivative (ddx / ddy: `y` = ddy) of the evaluated operand, answered by the test (one invocation has no quad).
+    std::function<bool(const vpir::Inst& in, bool y, const Value& arg, Value& out)> derivative;
     // Results.
     std::map<uint32_t, Value> outputs;  // output index -> last stored value
     bool discarded = false;

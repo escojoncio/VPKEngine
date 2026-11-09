@@ -195,6 +195,46 @@ uint32_t floatBits(float f) {
 // The constant bits of `f` as type `t`: binary16 for F16 (a literal's bits are read in the type's own width), else binary32.
 uint32_t fbits(Type t, float f) { return t.scalar == Scalar::F16 ? vpir::floatToHalf(f) : floatBits(f); }
 
+// Can the fragment code of `m` have an effect other than its colour / depth outputs: an image write, an atomic, a store through
+// anything but its own Function / Private / Output variables (a pointer parameter, a buffer, a physical address: unresolved counts
+// as a store)? Used for D24 emulation: early fragment tests stay in a shader that does (running it for fragments the depth test
+// rejects would change what it writes).
+bool mayWriteResources(const SpirvModule& m) {
+    std::unordered_map<uint32_t, const Instr*> def;  // variables and the pointers derived from them
+    for (const auto& [id, fn] : m.functions)
+        for (const Block& b : fn.blocks)
+            for (const Instr& in : b.body)
+                if (in.count >= 4 && (in.op == OpVariable || in.op == OpAccessChain ||
+                                      in.op == OpInBoundsAccessChain || in.op == OpPtrAccessChain ||
+                                      in.op == OpInBoundsPtrAccessChain || in.op == OpCopyObject))
+                    def[m.w(in, 2)] = &in;
+    auto own = [&](uint32_t p) {
+        for (int depth = 0; depth < 64; ++depth) {
+            if (auto g = m.globals.find(p); g != m.globals.end())
+                return g->second.storage == Storage::Output || g->second.storage == Storage::Private ||
+                       g->second.storage == Storage::Function;
+            auto it = def.find(p);
+            if (it == def.end()) return false;
+            if (it->second->op == OpVariable) return true;  // declared inside a function: Function storage
+            p = m.w(*it->second, 3);
+        }
+        return false;
+    };
+    for (const auto& [id, fn] : m.functions)
+        for (const Block& b : fn.blocks)
+            for (const Instr& in : b.body) {
+                const uint32_t op = in.op;
+                if (op == OpImageWrite || op == OpImageTexelPointer || (op >= 228 && op <= 242) ||
+                    op == OpAtomicFlagTestAndSet || op == OpAtomicFlagClear ||
+                    op == OpAtomicFMinEXT || op == OpAtomicFMaxEXT || op == OpAtomicFAddEXT)
+                    return true;
+                if ((op == OpStore || op == OpCopyMemory || op == OpCopyMemorySized) &&
+                    in.count >= 3 && !own(m.w(in, 1)))
+                    return true;
+            }
+    return false;
+}
+
 class Lowering {
 public:
     Lowering(const SpirvModule& m, const SpirvLowerOptions& o, vpir::Module& out, SpirvInterface& iface,
@@ -218,6 +258,10 @@ private:
     std::unordered_map<uint32_t, IoVarInfo> io_;          // interface variable -> leaves
     int sampleMaskOutput_ = -1;                           // [[sample_mask]] output ANDed with SpirvLowerOptions::sampleMask
     bool sampleMaskOwn_ = false;                          // ... added by the lowering (the shader declares none)
+    int depthEmulOutput_ = -1;                            // FragDepth output rounded to 24 bits (SpirvLowerOptions::d24Emul)
+    bool depthEmulOwn_ = false;                           // ... added by the lowering (the shader writes no depth)
+    int depthBiasInput_ = -1;                             // Builtin::DepthBias input (own depth only)
+    int depthSlopeVar_ = -1;                              // max(|dz/dx|, |dz/dy|) of FragCoord.z, taken at the top of main
     int uiMaskOutput_ = -1;                               // VPKTAA UI mask output (SpirvLowerOptions::uiMaskSlot)
     std::vector<uint32_t> outputShadow_;                  // vpir output index -> variable
     std::map<uint32_t, int> packedColor_;                 // location | index << 8 -> packed colour output
@@ -2011,10 +2055,34 @@ private:
                 sampleMaskOwn_ = true;
             }
         }
+        // D24 emulation: the depth this invocation writes is rounded to 24 bits UNORM (flushOutputs). Early fragment tests would
+        // ignore it (and Metal rejects the combination), so they go, as with alphaTestDiscard / a sample mask: decided here, once, by
+        // d24EmulSkipped (a shader with early tests that also writes resources keeps them and its hardware depth).
+        if (stage_ == vpir::Stage::Fragment && o_.d24Emul && !d24EmulSkipped(m_, o_)) {
+            out_.earlyFragmentTests = false;
+            for (size_t i = 0; i < out_.outputs.size(); ++i)
+                if (out_.outputs[i].builtin == vpir::Builtin::FragDepth) depthEmulOutput_ = int(i);
+            if (depthEmulOutput_ < 0) {
+                vpir::IoVar v;
+                v.builtin = vpir::Builtin::FragDepth, v.name = "frag_depth", v.type = vpir::kF32;
+                depthEmulOutput_ = addOutput(v);
+                depthEmulOwn_ = true;
+                vpir::IoVar b;
+                b.builtin = vpir::Builtin::DepthBias, b.name = "depth_bias", b.type = vpir::kF32.withWidth(3);
+                depthBiasInput_ = addInput(b);
+            }
+        }
         for (size_t i = 0; i < out_.outputs.size(); ++i) {
             uint32_t var = newVar(out_.outputs[i].type);
             outputShadow_[i] = var;
             b_->storeVar(var, zeroOf(out_.outputs[i].type));
+        }
+        if (depthEmulOwn_) {  // derivatives need the whole quad: taken here, outside any branch
+            ValueId z = ext(positionInput(), 2);
+            ValueId m = bin(Op::Max, un(Op::Abs, un(Op::Ddx, z, vpir::kF32), vpir::kF32),
+                            un(Op::Abs, un(Op::Ddy, z, vpir::kF32), vpir::kF32), vpir::kF32);
+            depthSlopeVar_ = int(newVar(vpir::kF32));
+            b_->storeVar(uint32_t(depthSlopeVar_), m);
         }
     }
     // OpCapability `cap` among the module's leading capabilities.
@@ -2073,6 +2141,25 @@ private:
             return;
         }
     }
+    // The depth written under D24 emulation: `own` = the FragCoord.z of the invocation plus the draw's depth bias (Vulkan: constant *
+    // 2^-24 for UNORM24 + slope * max(|dz/dx|, |dz/dy|), limited by the clamp), else the shader's own value (no bias, as Vulkan);
+    // rounded to the nearest 24-bit UNORM step.
+    ValueId d24Depth(ValueId v) {
+        if (depthEmulOwn_) {
+            ValueId bias = b_->loadInput(uint32_t(depthBiasInput_), vpir::kF32.withWidth(3));
+            ValueId o = bin(Op::Add, bin(Op::Mul, ext(bias, 0), f32(1.0f / 16777216.0f), vpir::kF32),
+                            bin(Op::Mul, ext(bias, 1), loadVar(uint32_t(depthSlopeVar_)), vpir::kF32), vpir::kF32);
+            ValueId cl = ext(bias, 2);
+            ValueId zero = f32(0.0f);
+            o = select(bin(Op::Gt, cl, zero, vpir::kBool), bin(Op::Min, o, cl, vpir::kF32),
+                       select(bin(Op::Lt, cl, zero, vpir::kBool), bin(Op::Max, o, cl, vpir::kF32), o));
+            v = bin(Op::Add, ext(positionInput(), 2), o, vpir::kF32);
+        }
+        // round-to-even of z * (2^24 - 1) (MSL rint), then / (2^24 - 1): n / n = 1 exactly, so the result never exceeds 1. The divide is precise
+        // (MSL precise::divide): Metal compiles with fast math, where x / c may become an approximate reciprocal (> 1 ulp).
+        ValueId scaled = un(Op::Round, bin(Op::Mul, un(Op::Saturate, v, vpir::kF32), f32(16777215.0f), vpir::kF32), vpir::kF32);
+        return bin(Op::Div, scaled, f32(16777215.0f), vpir::kF32, true);
+    }
     void flushOutputs() {
         if (o_.alphaTest && stage_ == vpir::Stage::Fragment) alphaTestDiscard();
         if (sampleMaskOutput_ >= 0) out_.earlyFragmentTests = false;  // Metal: no early tests with a sample mask output
@@ -2090,6 +2177,7 @@ private:
             if (int(i) == viewportOutput_) v = amp_ ? u32(0) : viewIndex();
             if (int(i) == viewOutput_) v = viewIndex();
             if (int(i) == uiMaskOutput_) v = uiMaskValue();
+            if (int(i) == depthEmulOutput_) v = d24Depth(v);
             if (int(i) == sampleMaskOutput_) v = sampleMaskOwn_ ? u32(o_.sampleMask) : bin(Op::And, v, u32(o_.sampleMask), vpir::kU32);
             if (auto m = clipMirror_.find(int(i)); m != clipMirror_.end()) v = loadVar(outputShadow_[size_t(m->second)]);
             b_->storeOutput(uint32_t(i), v);
@@ -5514,6 +5602,18 @@ bool clipDependsOnView(const vpir::Module& m) {
 }
 
 }  // namespace
+
+bool d24EmulSkipped(const SpirvModule& m, const SpirvLowerOptions& o) {
+    // (alpha test and a sample mask drop the early tests anyway: nothing left to keep)
+    if (!o.d24Emul || o.stage != vpir::Stage::Fragment || o.alphaTest || o.sampleMask != ~0u) return false;
+    for (const EntryPoint& e : m.entries) {
+        if (e.model != Model::Fragment || !(o.entry.empty() || e.name == o.entry)) continue;
+        for (const Instr& md : e.modes)
+            if (Mode(m.w(md, 2)) == Mode::EarlyFragmentTests) return mayWriteResources(m);
+        return false;
+    }
+    return false;
+}
 
 bool lower(const SpirvModule& m, const SpirvLowerOptions& options, vpir::Module& out, SpirvInterface& iface,
            std::string& error) {

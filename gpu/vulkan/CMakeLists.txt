@@ -126,6 +126,9 @@ if(BUILD_TESTING OR NOT DEFINED BUILD_TESTING)
     # The Quest identity's GPU name from VPVK_QUEST_GPU_NAME (latched at the first query): its own run with a Quest 2's.
     add_test(NAME gpu_vulkan.quest_gpu_name_650 COMMAND vpvk_tests quest_gpu_name $<TARGET_FILE:VPVulkan>)
     set_tests_properties(gpu_vulkan.quest_gpu_name_650 PROPERTIES ENVIRONMENT "VPVK_QUEST_GPU_NAME=Adreno (TM) 650")
+    # d24Emul() reads VPVK_D24_EMUL once per process: its own run with it on.
+    add_test(NAME gpu_vulkan.d24_emul COMMAND vpvk_tests d24_emul $<TARGET_FILE:VPVulkan>)
+    set_tests_properties(gpu_vulkan.d24_emul PROPERTIES ENVIRONMENT "VPVK_D24_EMUL=1")
     # msaaTileOn() reads VPVK_MSAA_TILE once per process: its own run with it off.
     add_test(NAME gpu_vulkan.msaa_tile_off COMMAND vpvk_tests msaa_tile_off $<TARGET_FILE:VPVulkan>)
     set_tests_properties(gpu_vulkan.msaa_tile_off PROPERTIES ENVIRONMENT "VPVK_MSAA_TILE=0")

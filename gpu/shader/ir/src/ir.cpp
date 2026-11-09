@@ -47,7 +47,7 @@ const char* toString(Builtin b) {
                               "local_invocation_id", "workgroup_id", "num_workgroups",
                               "local_invocation_index", "subgroup_invocation", "subgroup_size",
                               "clip_distance", "base_vertex", "base_instance", "draw_index", "helper_invocation", "viewport_index",
-                              "amplification_id"};
+                              "amplification_id", "depth_bias"};
     return n[unsigned(b)];
 }
 const char* toString(Interp i) {
@@ -118,6 +118,7 @@ BuiltinInfo builtinInfo(Builtin b, bool asInput) {
         case Builtin::HelperInvocation: return {kBool, true, kFrag};
         case Builtin::ViewportIndex: return {kU32, false, kVtx};
         case Builtin::AmplificationId: return {kU32, true, kVtx};
+        case Builtin::DepthBias: return {Type{Scalar::F32, 3}, true, kFrag};
     }
     return {kVoid, asInput, 0};
 }

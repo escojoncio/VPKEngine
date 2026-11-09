@@ -52,7 +52,7 @@ void texStatsTick(bool force);
 enum class DiagCounter { Incomplete, MsrttDsContinued, TexRealloc, Unwritten, kCount };
 void diagCount(DiagCounter c, uint64_t n = 1);
 
-// Diagnostics: "gles.pso.recipe saved= loaded= prewarmed= miss_in_game=" (VPVulkan's pipeline-recipe store, see vpvk_recipe_stats):
+// Diagnostics: "gles.pso.recipe new_this_run= total= reused= saved= loaded= prewarmed= miss_in_game=" (saved == new_this_run and loaded == reused, repeated under their older names (no longer adjacent to the first); saved=0 means no NEW recipe, not that nothing is stored) (VPVulkan's pipeline-recipe store, see vpvk_recipe_stats):
 // printed when the counters changed and 10 s passed since the last line (force: now, even unchanged, at eglTerminate / device
 // shutdown; called from eglSwapBuffers, vpgles_flush and the creation of a new pipeline). Needs Device::lock.
 void recipeStatsTick(bool force);
@@ -245,6 +245,9 @@ struct Texture {
     VkImageView sampledView();
     uint64_t viewKey() const;
 };
+
+// The level range a texture is sampled over (base..top after the compressed written-levels cut; `clamped` says it was cut).
+void mipRange(const Texture& t, uint32_t& base, uint32_t& top, bool* clamped = nullptr);
 
 // A VkBufferView over a range of a buffer's storage (texel buffer descriptor of a samplerBuffer).
 struct TexelBufferView {

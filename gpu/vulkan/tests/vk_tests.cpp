@@ -208,9 +208,13 @@ void testPhysical() {
   vkGetPhysicalDeviceFeatures2(c.pd, &f);
   CHECK(mv.multiview == VK_TRUE);
   VkPhysicalDeviceMultiviewProperties mvp{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MULTIVIEW_PROPERTIES};
-  VkPhysicalDeviceProperties2 p2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &mvp};
+  VkPhysicalDeviceDepthStencilResolveProperties dsr{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_STENCIL_RESOLVE_PROPERTIES, &mvp};
+  VkPhysicalDeviceProperties2 p2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &dsr};
   vkGetPhysicalDeviceProperties2(c.pd, &p2);
-  CHECK(mvp.maxMultiviewViewCount == 8);
+  CHECK(mvp.maxMultiviewViewCount == 6);
+  // Quest 3 real dump (driver 512.837.7): Vulkan 1.3.295, no independent depth/stencil resolve.
+  CHECK(p2.properties.apiVersion == VK_MAKE_API_VERSION(0, 1, 3, 295));
+  CHECK(dsr.independentResolve == VK_FALSE && dsr.independentResolveNone == VK_FALSE);
   // Formats: RGBA8 renderable + blendable, sRGB not storage, D24S8 depth, unknown format none.
   VkFormatProperties fp;
   vkGetPhysicalDeviceFormatProperties(c.pd, VK_FORMAT_R8G8B8A8_UNORM, &fp);
@@ -1208,6 +1212,12 @@ void testNativeIdentity() {
   uint32_t iv = 0;
   vkEnumerateInstanceVersion(&iv);
   CHECK(iv == VK_API_VERSION_1_3);
+  {
+    VkPhysicalDeviceDepthStencilResolveProperties nd{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_STENCIL_RESOLVE_PROPERTIES};
+    VkPhysicalDeviceProperties2 np{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &nd};
+    vkGetPhysicalDeviceProperties2(c.pd, &np);
+    CHECK(nd.independentResolve == VK_TRUE);  // native identity untouched
+  }
   CHECK(p.limits.maxPerStageDescriptorSamplers == 64);
   VkPhysicalDeviceDriverProperties drv{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES};
   VkPhysicalDeviceProperties2 p2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &drv};
@@ -1306,7 +1316,7 @@ void testNativeIdentity() {
   // Chosen late (the device exists): the next query answers as the Quest 3.
   vpvk_config_set_quest_identity(1);
   vkGetPhysicalDeviceProperties(c.pd, &p);
-  CHECK(p.vendorID == 0x5143 && std::strcmp(p.deviceName, "Adreno (TM) 740") == 0 && p.apiVersion == VK_API_VERSION_1_3);
+  CHECK(p.vendorID == 0x5143 && std::strcmp(p.deviceName, "Adreno (TM) 740") == 0 && p.apiVersion == VK_MAKE_API_VERSION(0, 1, 3, 295));
   CHECK(p.limits.maxPerStageDescriptorSamplers == 16);
   // Quest identity: none of the phase 1b extensions, not even with VPVK_EXTRA_EXTENSIONS=1.
   for (const char* v : {"0", "1"}) {
@@ -1351,7 +1361,7 @@ void testProfile() {
     VkPhysicalDeviceDriverProperties gd{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES};
     VkPhysicalDeviceProperties2 gp2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &gd};
     vkGetPhysicalDeviceProperties2(g.pd, &gp2);
-    CHECK(gp.apiVersion == VK_API_VERSION_1_3 && iv == VK_API_VERSION_1_3);
+    CHECK(gp.apiVersion == VK_MAKE_API_VERSION(0, 1, 3, 295) && iv == VK_MAKE_API_VERSION(0, 1, 3, 295));
     CHECK(gd.conformanceVersion.major == 1 && gd.conformanceVersion.minor == 3 && gd.conformanceVersion.patch == 6);
     uint32_t n = 0;
     vkEnumerateDeviceExtensionProperties(g.pd, nullptr, &n, nullptr);
@@ -1369,7 +1379,7 @@ void testProfile() {
     VkPhysicalDeviceProperties zp;
     vkGetPhysicalDeviceProperties(g.pd, &zp);
     vkGetPhysicalDeviceFeatures2(g.pd, &f2);
-    CHECK(zp.apiVersion == VK_API_VERSION_1_3 && f13.dynamicRendering && tl.timelineSemaphore);
+    CHECK(zp.apiVersion == VK_MAKE_API_VERSION(0, 1, 3, 295) && f13.dynamicRendering && tl.timelineSemaphore);
     unsetenv("VPVK_EXTRA_EXTENSIONS");
   }
   setenv("VPVK_EXTRA_EXTENSIONS", "1", 1);
@@ -1382,18 +1392,18 @@ void testProfile() {
   vkGetPhysicalDeviceProperties2(c.pd, &p2);
   CHECK(drv.driverID == VK_DRIVER_ID_QUALCOMM_PROPRIETARY && p12.driverID == VK_DRIVER_ID_QUALCOMM_PROPRIETARY);
   CHECK(std::strstr(drv.driverName, "Qualcomm") && std::strstr(p12.driverName, "Adreno"));
-  CHECK(p11.maxMultiviewViewCount == 8 && p11.subgroupSize == 32 && p11.deviceLUIDValid);
+  CHECK(p11.maxMultiviewViewCount == 6 && p11.subgroupSize == 32 && p11.deviceLUIDValid);
   CHECK(p13.minSubgroupSize == 32 && p13.maxSubgroupSize == 32);
   CHECK(p2.pNext == &p13 && p13.pNext == &p11 && p11.pNext == &p12 && p12.pNext == &drv);  // chain kept
   CHECK(std::strcmp(p2.properties.deviceName, "Adreno (TM) 740") == 0);
   CHECK((p2.properties.driverVersion >> 22) == 512);
-  CHECK(p2.properties.apiVersion == VK_API_VERSION_1_3);
+  CHECK(p2.properties.apiVersion == VK_MAKE_API_VERSION(0, 1, 3, 295));
   CHECK(drv.conformanceVersion.major == 1 && drv.conformanceVersion.minor == 3);
   CHECK(p12.conformanceVersion.major == 1 && p12.conformanceVersion.minor == 3);
   {
     uint32_t iv = 0;
     vkEnumerateInstanceVersion(&iv);
-    CHECK(iv == VK_API_VERSION_1_3);
+    CHECK(iv == VK_MAKE_API_VERSION(0, 1, 3, 295));
     // The 1.1 / 1.3 core entry points a 1.3 loader asks for resolve and answer for one device.
     uint32_t ng = 0, nt = 7;
     CHECK(vkEnumeratePhysicalDeviceGroups(c.inst, &ng, nullptr) == VK_SUCCESS && ng == 1);
@@ -5145,8 +5155,281 @@ void testMsaaMainLog() {
   CHECK(!mt.takeMainLine(t, out) && mt.mainLines == MsaaTwins::kMainLines);
 }
 
+// "vk.msaa_eye": nothing before the period, one line at it with the counts, then silence until the next period; 40 lines at most.
+void testMsaaEyeSummary() {
+  MsaaTwins::EyeSummary e;
+  char buf[384];
+  e.notePass(10, 1920, 1824, 2, "RGBA8", 2, 4, 300);
+  e.notePass(10, 1920, 1824, 2, "RGBA8", 2, 4, 50);
+  e.notePass(10, 512, 512, 1, "R8", 1, 1, 3);
+  e.noteNonEye(10);
+  CHECK(!e.take(11, buf, sizeof buf) && !e.take(609, buf, sizeof buf));  // the period opens with the first take
+  e.notePass(611, 1920, 1824, 2, "RGBA8", 2, 4, 80);
+  CHECK(e.take(610 + MsaaTwins::kEyePeriod, buf, sizeof buf));
+  const std::string l = buf;
+  CHECK(l.rfind("vk.msaa_eye f=1210 eye_color_passes=4 upgraded=3 samples_in_hist={1:1,2:3,4:0} samples_out_hist={1:1,2:0,4:3} ", 0) == 0);
+  CHECK(l.find("main_pass_samples=2->4 main_pass_draws=80 non_eye_passes=1 (top3 1920x1824x2 RGBA8 x3 512x512x1 R8 x1)") != std::string::npos);
+  CHECK(!e.take(1211, buf, sizeof buf));  // nothing counted since, and not due
+  e.notePass(1212, 64, 64, 1, "R8", 1, 1, 1);
+  CHECK(!e.take(1212, buf, sizeof buf));  // counted but not due
+  uint32_t lines = 1;
+  uint64_t f = 1212;
+  for (int i = 0; i < 100; ++i) {
+    f += MsaaTwins::kEyePeriod;
+    e.notePass(f, 64, 64, 1, "R8", 1, 1, 1);
+    if (e.take(f, buf, sizeof buf)) ++lines;
+  }
+  CHECK(lines == MsaaTwins::kEyeLines);
+}
+
+// "vk.depth_diag": a synthetic frame's passes are folded into the period and the session; nothing before the period, one line at it
+// with the counts, then silence until the next period; 40 lines at most; the session totals keep growing across lines.
+void testDepthDiag() {
+  DepthDiag d;
+  char buf[512];
+  DepthDiag::Pass a;  // main pass: 200 draws, 12 with bias, 150 GE / 5 LE / 2 EQ without writing depth, all into D24
+  a.draws = 200, a.bias = 12, a.ge = 150, a.le = 5, a.eq = 2, a.d24 = 200, a.constMax = 4.0f, a.slopeMax = 1.5f;
+  DepthDiag::Pass b;  // a small pass into D32F
+  b.draws = 10, b.bias = 1, b.ge = 3, b.constMax = 2.0f, b.slopeMax = 2.5f;
+  d.notePass(a), d.notePass(b);
+  CHECK(!d.take(10, buf, sizeof buf) && !d.take(609, buf, sizeof buf));  // the period opens with the first take
+  CHECK(d.take(10 + DepthDiag::kPeriod, buf, sizeof buf));
+  const std::string l = buf;
+  CHECK(l.rfind("vk.depth_diag f=610 emul=0 eye_passes=2 d24_passes=1 draws=210 bias_on=13 ge_nowrite=153 le_nowrite=5 eq_nowrite=2 "
+                "d24_draws=200 emul_draws=0 bias_const_max=4.000 bias_slope_max=2.500 main_pass{draws=200 bias_on=12 ge_nowrite=150 "
+                "le_nowrite=5 eq_nowrite=2 d24_draws=200} session{passes=2 draws=210 bias_on=13 cmp_nowrite=160 d24_draws=200}", 0) == 0);
+  CHECK(!d.take(611, buf, sizeof buf));  // nothing counted since
+  d.notePass(b);
+  CHECK(!d.take(612, buf, sizeof buf));  // counted but not due
+  CHECK(d.take(610 + 2 * DepthDiag::kPeriod, buf, sizeof buf));
+  CHECK(std::string(buf).find("eye_passes=1 d24_passes=0 draws=10 ") != std::string::npos &&
+        std::string(buf).find("session{passes=3 draws=220 ") != std::string::npos);
+  {  // the per-draw counters: a synthetic frame of five draws
+    PipelineObj emul, plain;
+    emul.d24Emul = true;
+    DepthDiag::Pass p;
+    struct S { VkCompareOp op; bool test, write, d24; float bias, slope; const PipelineObj* pipe; };
+    const S frame[] = {{VK_COMPARE_OP_GREATER_OR_EQUAL, true, false, true, 0, 0, &emul},   // GE, no write, D24, emulated
+                       {VK_COMPARE_OP_GREATER_OR_EQUAL, true, true, true, -3.0f, 1.0f, &plain},  // writes depth: not counted as GE; bias
+                       {VK_COMPARE_OP_LESS_OR_EQUAL, true, false, false, 0, -2.5f, &plain},      // LE, slope-only bias, D32F
+                       {VK_COMPARE_OP_EQUAL, true, false, true, 2.0f, 0, &plain},                // EQ, bias
+                       {VK_COMPARE_OP_GREATER_OR_EQUAL, false, false, false, 0, 0, &plain}};     // no depth test at all
+    for (const S& s : frame) {
+      OpDraw op;
+      op.depthTested = s.test, op.depthWrite = s.write, op.depthD24 = s.d24, op.depthOp = s.op, op.pipe = s.pipe;
+      vpgpu::Draw dr;
+      dr.depthBias = s.bias, dr.depthBiasSlope = s.slope;
+      noteDepthDraw(p, dr, op);
+    }
+    CHECK(p.draws == 5 && p.bias == 3 && p.ge == 1 && p.le == 1 && p.eq == 1 && p.d24 == 3 && p.emul == 1);
+    CHECK(p.constMax == 3.0f && p.slopeMax == 2.5f);
+  }
+  uint32_t lines = 2;
+  uint64_t f = 610 + 2 * DepthDiag::kPeriod;
+  for (int i = 0; i < 100; ++i) {
+    f += DepthDiag::kPeriod;
+    d.notePass(b);
+    if (d.take(f, buf, sizeof buf)) ++lines;
+  }
+  CHECK(lines == DepthDiag::kLines);
+}
+
+// `void main() {}` with EarlyFragmentTests and, with `store`, a store into a storage buffer (set 0, binding 0): inline SPIR-V 1.3
+// (no fixture: the corpus digest of the translator tests is unchanged).
+std::vector<uint32_t> earlyFragmentWords(bool store) {
+  std::vector<uint32_t> w = {0x07230203u, 0x00010300u, 0u, 13u, 0u};
+  auto ins = [&](uint32_t op, std::initializer_list<uint32_t> ops) {
+    w.push_back((uint32_t(ops.size() + 1) << 16) | op);
+    w.insert(w.end(), ops);
+  };
+  ins(17, {1}), ins(14, {0, 1}), ins(15, {4, 1, 0x6e69616du, 0}), ins(16, {1, 7}), ins(16, {1, 9});  // Shader, GLSL450, "main", OriginUpperLeft, Early
+  ins(71, {5, 2}), ins(72, {5, 0, 35, 0}), ins(71, {7, 34, 0}), ins(71, {7, 33, 0});                  // Block, Offset, set 0, binding 0
+  ins(19, {2}), ins(33, {3, 2}), ins(21, {4, 32, 0}), ins(30, {5, 4}), ins(32, {6, 12, 5}), ins(59, {6, 7, 12});
+  ins(32, {8, 12, 4}), ins(43, {4, 9, 0}), ins(43, {4, 10, 1});
+  ins(54, {2, 1, 0, 3}), ins(248, {11});
+  if (store) ins(65, {8, 12, 7, 9}), ins(62, {12, 10});  // OpAccessChain, OpStore
+  ins(253, {}), ins(56, {});
+  return w;
+}
+
+// VPVK_D24_EMUL=1 (its own run: d24Emul() is read once per process, ctest gpu_vulkan.d24_emul): a pipeline that tests depth into a
+// D24UnormS8 attachment is translated with SpirvLowerOptions::d24Emul on its fragment stage only (the recipe input carries it and
+// the MSL writes the rounded [[depth(any)]]); the same pipeline over D32Float, and the vertex stage, are untouched.
+void testD24Emul() {
+  if (!getenv("VPVK_D24_EMUL") || std::strcmp(getenv("VPVK_D24_EMUL"), "1") != 0) {
+    std::printf("skipped (run with VPVK_D24_EMUL=1: ctest gpu_vulkan.d24_emul)\n");
+    return;
+  }
+  CHECK(d24Emul());
+  char rtmpl[] = "/tmp/vpvk_d24_XXXXXX";
+  const char* rdir = mkdtemp(rtmpl);
+  CHECK(rdir != nullptr);
+  if (!rdir) return;
+  setenv("VP_PIPELINE_CACHE_DIR", rdir, 1);
+  bool d24On = false, d32Off = false, noTestOff = false, depthOnlyOn = false, depthOnlyOff = false, earlyEmul = false, earlySkipped = false;
+  {
+    Ctx c;
+    VkPipelineLayoutCreateInfo plci{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    VkPipelineLayout pl;
+    vkCreatePipelineLayout(c.dev, &plci, nullptr, &pl);
+    VkShaderModule vs = module(c, "uimask.vert.spv"), fs = module(c, "uimask.frag.spv");
+    VkPipelineShaderStageCreateInfo stg[2]{{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO},
+                                           {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO}};
+    stg[0].stage = VK_SHADER_STAGE_VERTEX_BIT, stg[0].module = vs, stg[0].pName = "main";
+    stg[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT, stg[1].module = fs, stg[1].pName = "main";
+    VkPipelineVertexInputStateCreateInfo vis{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+    VkPipelineInputAssemblyStateCreateInfo ias{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
+    ias.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    VkPipelineRasterizationStateCreateInfo rs{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
+    rs.lineWidth = 1;
+    VkPipelineMultisampleStateCreateInfo ms{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
+    ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+    VkViewport vp{0, 0, 64, 64, 0, 1};
+    VkRect2D sc{{0, 0}, {64, 64}};
+    VkPipelineViewportStateCreateInfo vps{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
+    vps.viewportCount = 1, vps.pViewports = &vp, vps.scissorCount = 1, vps.pScissors = &sc;
+    auto make = [&](VkFormat depthFormat, bool depthTest, uint32_t stageCount = 2, const VkPipelineShaderStageCreateInfo* stages = nullptr,
+                    VkPipelineLayout layout = VK_NULL_HANDLE) {
+      VkAttachmentDescription att[2]{};
+      att[0].format = VK_FORMAT_R8G8B8A8_UNORM, att[0].samples = VK_SAMPLE_COUNT_1_BIT;
+      att[0].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR, att[0].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+      att[1].format = depthFormat, att[1].samples = VK_SAMPLE_COUNT_1_BIT;
+      att[1].loadOp = VK_ATTACHMENT_LOAD_OP_LOAD, att[1].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+      att[1].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE, att[1].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+      VkAttachmentReference cref{0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL},
+          dref{1, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL};
+      VkSubpassDescription sp{};
+      sp.colorAttachmentCount = 1, sp.pColorAttachments = &cref, sp.pDepthStencilAttachment = &dref;
+      VkRenderPassCreateInfo rpi{VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO};
+      rpi.attachmentCount = 2, rpi.pAttachments = att, rpi.subpassCount = 1, rpi.pSubpasses = &sp;
+      VkRenderPass rp;
+      vkCreateRenderPass(c.dev, &rpi, nullptr, &rp);
+      VkPipelineDepthStencilStateCreateInfo ds{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
+      ds.depthTestEnable = depthTest, ds.depthWriteEnable = VK_FALSE, ds.depthCompareOp = VK_COMPARE_OP_GREATER_OR_EQUAL;  // reverse-Z
+      VkPipelineColorBlendAttachmentState cba{};
+      cba.colorWriteMask = 0xF;
+      VkPipelineColorBlendStateCreateInfo cbs{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
+      cbs.attachmentCount = 1, cbs.pAttachments = &cba;
+      VkGraphicsPipelineCreateInfo gp{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
+      gp.stageCount = stageCount, gp.pStages = stages ? stages : stg, gp.pVertexInputState = &vis, gp.pInputAssemblyState = &ias;
+      gp.pViewportState = &vps, gp.pRasterizationState = &rs, gp.pMultisampleState = &ms, gp.pColorBlendState = &cbs;
+      gp.pDepthStencilState = &ds, gp.layout = layout ? layout : pl, gp.renderPass = rp;
+      VkPipeline p = VK_NULL_HANDLE;
+      CHECK(vkCreateGraphicsPipelines(c.dev, VK_NULL_HANDLE, 1, &gp, nullptr, &p) == VK_SUCCESS);
+      return std::pair<VkPipeline, VkRenderPass>(p, rp);
+    };
+    auto [d24, rp24] = make(VK_FORMAT_D24_UNORM_S8_UINT, true);
+    auto [d32, rp32] = make(VK_FORMAT_D32_SFLOAT, true);
+    auto [d24n, rp24n] = make(VK_FORMAT_D24_UNORM_S8_UINT, false);
+    const PipelineObj* p24 = d24 ? from<PipelineObj>(d24) : nullptr;
+    const PipelineObj* p32 = d32 ? from<PipelineObj>(d32) : nullptr;
+    const PipelineObj* p24n = d24n ? from<PipelineObj>(d24n) : nullptr;
+    CHECK(p24 && p24->ok && p32 && p32->ok && p24n && p24n->ok);
+    d24On = p24 && p24->d24Emul;
+    d32Off = p32 && !p32->d24Emul;
+    noTestOff = p24n && !p24n->d24Emul;
+    CHECK(p24 && !p24->d24Skipped && p24->state.fragmentShader != 0);
+    // Depth-only pipelines (no fragment stage: prepass, shadow maps) that test depth into D24 get an empty fragment stage that writes
+    // the rounded depth; over D32Float or without a depth test they stay without one.
+    auto [e24, rpe24] = make(VK_FORMAT_D24_UNORM_S8_UINT, true, 1, stg);
+    auto [e32, rpe32] = make(VK_FORMAT_D32_SFLOAT, true, 1, stg);
+    auto [e24n, rpe24n] = make(VK_FORMAT_D24_UNORM_S8_UINT, false, 1, stg);
+    const PipelineObj* pe24 = e24 ? from<PipelineObj>(e24) : nullptr;
+    const PipelineObj* pe32 = e32 ? from<PipelineObj>(e32) : nullptr;
+    const PipelineObj* pe24n = e24n ? from<PipelineObj>(e24n) : nullptr;
+    CHECK(pe24 && pe24->ok && pe32 && pe32->ok && pe24n && pe24n->ok);
+    depthOnlyOn = pe24 && pe24->d24Emul && pe24->state.fragmentShader != 0 && !pe24->d24Skipped && pe24->fragmentOutputs == 0;
+    depthOnlyOff = pe32 && pe32->state.fragmentShader == 0 && pe24n && pe24n->state.fragmentShader == 0;
+    // ... and the colour attachment it does not write keeps its contents (write mask none).
+    CHECK(pe24 && pe24->state.blend[0].writeMask == 0);
+    // Early fragment tests: without resource writes they are dropped and the depth is emulated; with a storage buffer store the
+    // shader stays as it is (d24Skipped, counted in depth_diag).
+    VkShaderModule efs = VK_NULL_HANDLE, efsStore = VK_NULL_HANDLE;
+    for (bool store : {false, true}) {
+      const std::vector<uint32_t> ew = earlyFragmentWords(store);
+      VkShaderModuleCreateInfo mci{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+      mci.codeSize = ew.size() * 4, mci.pCode = ew.data();
+      vkCreateShaderModule(c.dev, &mci, nullptr, store ? &efsStore : &efs);
+    }
+    VkDescriptorSetLayoutBinding sb{0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr};
+    VkDescriptorSetLayoutCreateInfo slci{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+    slci.bindingCount = 1, slci.pBindings = &sb;
+    VkDescriptorSetLayout dsl;
+    vkCreateDescriptorSetLayout(c.dev, &slci, nullptr, &dsl);
+    VkPipelineLayoutCreateInfo splci{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    splci.setLayoutCount = 1, splci.pSetLayouts = &dsl;
+    VkPipelineLayout spl;
+    vkCreatePipelineLayout(c.dev, &splci, nullptr, &spl);
+    VkPipelineShaderStageCreateInfo estg[2] = {stg[0], stg[1]};
+    estg[1].module = efs;
+    auto [y24, rpy24] = make(VK_FORMAT_D24_UNORM_S8_UINT, true, 2, estg, spl);
+    estg[1].module = efsStore;
+    auto [z24, rpz24] = make(VK_FORMAT_D24_UNORM_S8_UINT, true, 2, estg, spl);
+    const PipelineObj* py24 = y24 ? from<PipelineObj>(y24) : nullptr;
+    const PipelineObj* pz24 = z24 ? from<PipelineObj>(z24) : nullptr;
+    CHECK(py24 && py24->ok && pz24 && pz24->ok);
+    earlyEmul = py24 && py24->d24Emul && !py24->d24Skipped;
+    earlySkipped = pz24 && pz24->d24Emul && pz24->d24Skipped;
+    {  // the per-draw census: skipped pipelines are not counted as emulated, they are counted apart
+      DepthDiag::Pass dp;
+      OpDraw op;
+      op.depthTested = true, op.depthD24 = true, op.depthOp = VK_COMPARE_OP_GREATER_OR_EQUAL;
+      vpgpu::Draw dr;
+      for (const PipelineObj* po : {py24, pz24, pz24}) {
+        op.pipe = po;
+        noteDepthDraw(dp, dr, op);
+      }
+      CHECK(dp.draws == 3 && dp.emul == 1 && dp.skipped == 2);
+      DepthDiag dd;
+      dd.notePass(dp);
+      char line[640];
+      CHECK(!dd.take(1, line, sizeof line) && dd.take(1 + DepthDiag::kPeriod, line, sizeof line));  // (the period opens with the first take)
+      CHECK(std::string(line).find("emul_draws=1 ") != std::string::npos && std::strstr(line, " d24_skipped=2") != nullptr);
+    }
+    for (VkPipeline p : {y24, z24, e24, e32, e24n}) vkDestroyPipeline(c.dev, p, nullptr);
+    for (VkRenderPass r : {rpy24, rpz24, rpe24, rpe32, rpe24n}) vkDestroyRenderPass(c.dev, r, nullptr);
+    vkDestroyShaderModule(c.dev, efs, nullptr);
+    vkDestroyShaderModule(c.dev, efsStore, nullptr);
+    vkDestroyPipelineLayout(c.dev, spl, nullptr);
+    vkDestroyDescriptorSetLayout(c.dev, dsl, nullptr);
+    for (VkPipeline p : {d24, d32, d24n}) vkDestroyPipeline(c.dev, p, nullptr);
+    for (VkRenderPass r : {rp24, rp32, rp24n}) vkDestroyRenderPass(c.dev, r, nullptr);
+    vkDestroyShaderModule(c.dev, vs, nullptr);
+    vkDestroyShaderModule(c.dev, fs, nullptr);
+    vkDestroyPipelineLayout(c.dev, pl, nullptr);
+  }
+  CHECK(d24On && d32Off && noTestOff);
+  CHECK(depthOnlyOn && depthOnlyOff && earlyEmul && earlySkipped);
+  {
+    RecipeStore s(rdir);
+    int frag = 0, vert = 0, withDepth = 0, total = 0, keptEarly = 0;
+    for (const StageInput& si : s.stageInputs()) {
+      ++total;
+      (si.opt.stage == vpir::Stage::Fragment ? frag : vert) += si.opt.d24Emul;
+      RecipeStore::StageHit hit;
+      RecipeStore::MissInfo miss;
+      ShaderBlob blob;
+      if (si.opt.d24Emul && s.lookupStage(si.hash(), hit, &miss, si.spirv) && s.shaderBlob(hit.mslId, blob)) {
+        const bool depth = blob.source.find("[[depth(any)]]") != std::string::npos && blob.source.find("16777215") != std::string::npos &&
+                           blob.source.find("vp_dbias") != std::string::npos;
+        withDepth += depth;
+        keptEarly += !depth && blob.source.find("[[early_fragment_tests]]") != std::string::npos;
+        CHECK(!depth || blob.source.find("early_fragment_tests") == std::string::npos);  // (emulated: no early tests)
+      }
+    }
+    // fragment inputs with the option: uimask.frag, the synthesised empty one, the early-tests shader without a store (emulated) and
+    // with one (left as it is: early tests kept, no depth output)
+    CHECK(total >= 3 && frag == 4 && vert == 0 && withDepth == 3 && keptEarly == 1);
+  }
+  std::error_code ec;
+  std::filesystem::remove_all(rdir, ec);
+  unsetenv("VP_PIPELINE_CACHE_DIR");
+}
+
 void testMsaaForce() {
   testMsaaMainLog();
+  testMsaaEyeSummary();
+  testDepthDiag();
   vpvk_taa_jitter eyeOnly{0, 1920, 1824, 0, 0, 0};  // jitter off, eye size known: the eye passes are found by size alone
   vpvk_taa_set_jitter(&eyeOnly);
   vpvk_config_set_msaa_force(4);
@@ -6806,7 +7089,9 @@ void testFoveation() {
 // CMake source fingerprint: a refactor that leaves the output alone keeps the digest (and every cache), a change of
 // output moves it. When this test fails the translator's OUTPUT changed: bump kLowerVersion (SPIR-V -> VPIR) or
 // kEmitVersion (VPIR -> MSL) in recipes.h, then update kCorpusDigest to the printed value in the same change.
-constexpr uint64_t kCorpusDigest = 0x2bf74b975e022b22ull;  // the "corpus digest" line the test prints
+// (0xe59a6cb9b65b9167 = the previous 0x2bf74b975e022b22 plus depth_write.frag.spv, the D24 emulation fixture: the translator's output
+// for the 68 earlier modules is unchanged, checked by taking the file out.)
+constexpr uint64_t kCorpusDigest = 0xe59a6cb9b65b9167ull;  // the "corpus digest" line the test prints
 
 uint64_t corpusDigest(unsigned& modules, unsigned& failed) {
   std::vector<std::string> names;
@@ -7021,6 +7306,43 @@ void testStageKeys() {
   }
   std::error_code ec;
   std::filesystem::remove_all(dir, ec);
+
+  // D24 emulation (VPVK_D24_EMUL): the flag is part of the stage input (other MSL, other key; the default key above is untouched),
+  // also next to a sample mask and with robustBuffers off, and survives the file.
+  {
+    StageInput d24 = in;
+    d24.opt.d24Emul = true;
+    StageInput d24Mask = d24;
+    d24Mask.opt.sampleMask = 0x5u;
+    StageInput d24NoRobust = d24;
+    d24NoRobust.opt.robustBuffers = false;
+    CHECK(d24.hash() != h && d24Mask.hash() != d24.hash() && d24Mask.hash() != masked.hash());
+    CHECK(d24NoRobust.hash() != d24.hash() && d24NoRobust.hash() != noRobust.hash());
+    char t3[] = "/tmp/vpvk_keys3_XXXXXX";
+    const char* d3 = mkdtemp(t3);
+    CHECK(d3 != nullptr);
+    if (d3) {
+      {
+        RecipeStore s(d3);
+        ShaderBlob b;
+        b.source = "// msl";
+        StageIface f;
+        s.addStage(d24, d24.hash(), cull, 0x11, b, &f);
+        s.addStage(d24Mask, d24Mask.hash(), cull, 0x22, b, &f);
+        s.addStage(d24NoRobust, d24NoRobust.hash(), cull, 0x33, b, &f);
+      }
+      RecipeStore s(d3);
+      int on = 0, onMask = 0, onNoRobust = 0;
+      for (const StageInput& si : s.stageInputs()) {
+        on += si.opt.d24Emul;
+        onMask += si.opt.d24Emul && si.opt.sampleMask == 0x5u;
+        onNoRobust += si.opt.d24Emul && !si.opt.robustBuffers;
+      }
+      CHECK(s.stageInputs().size() == 3 && on == 3 && onMask == 1 && onNoRobust == 1);
+      std::filesystem::remove_all(d3, ec);
+    }
+    CHECK(!d24Emul());  // off unless VPVK_D24_EMUL is set (not in the test environment)
+  }
 
   // A module without multisample images keeps its key when MSAA forcing is toggled (cache entry reused).
   uint64_t translations[2] = {0, 0};
@@ -12766,7 +13088,7 @@ int main(int argc, char** argv) {
       {"timeline", testTimeline}, {"queues", testQueues}, {"timeline_order", testTimelineOrder}, {"pending", testPending}, {"renderpass_ops", testRenderPassOps}, {"linear", testLinear}, {"images", testImages}, {"image_lifetime", testImageLifetime},
       {"vertex_stores", testVertexStores}, {"profile", testProfile}, {"profile13", testProfile13}, {"quest_extras", testQuestExtras}, {"push_descriptor", testPushDescriptor}, {"report_geom", testReportGeomInterpolators}, {"pipeline_policy", testPipelinePolicy}, {"eds", testExtendedDynamicState},
       {"quest_gpu_name", testQuestGpuName}, {"native_identity", testNativeIdentity}, {"inline_uniform", testInlineUniformBlock}, {"bda", testBufferDeviceAddress}, {"ycbcr", testYcbcr},
-      {"taa_native", testTaaNative}, {"taa_eye_depth", testTaaEyeDepth}, {"taa_uimask", testTaaUiMask}, {"msaa_force", testMsaaForce}, {"prewarm_variants", testPrewarmVariants}, {"msaa_force_marked", testMsaaForceMarkedEye}, {"aot", testAot}, {"aniso", testAniso}, {"zeroinit", testZeroInit}, {"archive_index", testArchiveIndex}, {"foveation", testFoveation},
+      {"taa_native", testTaaNative}, {"taa_eye_depth", testTaaEyeDepth}, {"taa_uimask", testTaaUiMask}, {"msaa_force", testMsaaForce}, {"d24_emul", testD24Emul}, {"prewarm_variants", testPrewarmVariants}, {"msaa_force_marked", testMsaaForceMarkedEye}, {"aot", testAot}, {"aniso", testAniso}, {"zeroinit", testZeroInit}, {"archive_index", testArchiveIndex}, {"foveation", testFoveation},
       {"stage_keys", testStageKeys}, {"async_pipelines", testAsyncPipelines}, {"sync_pipelines", testSyncPipelines}, {"create_default", testCreateDefault}, {"pso_census", testPsoCensus}, {"cache_state", testCacheState}, {"pass_drop", testPassDrop}, {"skip_reasons", testSkipReasons}, {"indirect_patch", testIndirectPatch}, {"astc3d", testAstc3d},
       {"perf", testPerf}, {"phase1b", testPhase1b}, {"suspend_resume", testSuspendResume}, {"translator_modes", testTranslatorModes}, {"capture", testCapture}, {"capture_images", testCaptureImages}, {"capture_hooks", testCaptureHooks}, {"capture_codec", testCaptureCodec}, {"capture_env", testCaptureEnv}, {"capture_pools", testCapturePools}, {"capture_host_frames", testCaptureHostFrames}, {"capture_corrupt", testCaptureCorrupt}, {"capture_env_host", testCaptureEnvHost}, {"capture_env_dir", testCaptureEnvDir}, {"capture_devices", testCaptureDevices}, {"capture_unhooked", testCaptureUnhooked}, {"capture_budget", testCaptureBudget}, {"capture_locks", testCaptureLocks}, {"png", testPng}, {"imgdiff", testImgDiff}, {"replay", testReplay}, {"replay_lvp", testReplayLvp}, {"refcaps", testRefCaps}};
   bool ran = false;

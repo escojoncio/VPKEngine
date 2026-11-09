@@ -1248,6 +1248,318 @@ void sampleMask(const std::string& dir) {
     if (failures || std::getenv("VP_PRINT")) std::fprintf(stderr, "%s\n", r.msl.source.c_str());
 }
 
+// D24 emulation (SpirvLowerOptions::d24Emul): the fragment shader writes its depth rounded to 24 bits UNORM. solid.frag writes none: it
+// gets [[depth(any)]] = FragCoord.z + the draw's bias (vp_dbias), rounded; depth_write.frag writes 0.001: the value is rounded, no bias.
+// Without the option the MSL is exactly what it was (no depth output, no bias parameter).
+void d24Emul(const std::string& dir) {
+    spirv::SpirvLowerOptions o;
+    o.entry = "main";
+    o.stage = vpir::Stage::Fragment;
+    for (const char* name : {"/solid.frag.spv", "/depth_write.frag.spv"}) {
+        const bool own = std::string(name) == "/solid.frag.spv";
+        Result off = run(dir + name, o);
+        o.d24Emul = false;
+        Result off2 = run(dir + name, o);
+        CHECK(off.ok && off2.ok && off.msl.source == off2.msl.source);
+        CHECK(off.msl.source.find("vp_dbias") == std::string::npos && off.msl.source.find("16777215") == std::string::npos);
+        CHECK(own == (off.msl.source.find("depth(any)") == std::string::npos));
+        o.d24Emul = true;
+        Result on = run(dir + name, o);
+        o.d24Emul = false;
+        CHECK(on.ok);
+        if (!on.ok) continue;
+        const std::string& s = on.msl.source;
+        CHECK(s.find("[[depth(any)]]") != std::string::npos);
+        CHECK(s.find("16777215") != std::string::npos && s.find("rint(") != std::string::npos && s.find("floor(") == std::string::npos);
+        CHECK(s.find("precise::divide(") != std::string::npos);  // fast math must not turn the / 16777215 into a reciprocal
+        CHECK(own == (s.find("constant float3& vp_dbias [[buffer(26)]]") != std::string::npos));
+        CHECK(own == (s.find("dfdx(") != std::string::npos));
+        CHECK(on.msl.source != off.msl.source);
+        if (failures || std::getenv("VP_PRINT")) std::fprintf(stderr, "---- %s\n%s\n", name, s.c_str());
+    }
+    // Integer reference: round-to-nearest-even of z * (2^24 - 1) in exact (double) arithmetic, over 2^24 - 1.
+    auto quantN = [](float z) { return std::nearbyint(double(std::min(std::max(z, 0.0f), 1.0f)) * 16777215.0); };
+    auto quant = [&](float z) { return float(quantN(z)) / 16777215.0f; };
+    auto bitsOf = [](float f) {
+        uint32_t b;
+        std::memcpy(&b, &f, 4);
+        return b;
+    };
+    {
+        o.d24Emul = true;
+        Result r = run(dir + "/depth_write.frag.spv", o);
+        o.d24Emul = false;
+        CHECK(r.ok);
+        if (r.ok) {
+            vpireval::Invocation inv;
+            std::string err;
+            CHECK(vpireval::run(r.module, inv, err));
+            bool found = false;
+            for (size_t k = 0; k < r.module.outputs.size(); ++k) {
+                if (r.module.outputs[k].builtin != vpir::Builtin::FragDepth) continue;
+                auto it = inv.outputs.find(uint32_t(k));
+                CHECK(it != inv.outputs.end());
+                if (it == inv.outputs.end()) continue;
+                found = true;
+                float got;
+                std::memcpy(&got, &it->second.bits[0], 4);
+                CHECK(got == quant(0.001f) && got != 0.001f);
+            }
+            CHECK(found);
+        }
+    }
+    // The module evaluated, not mirrored (solid.frag, own depth: FragCoord.z + bias, rounded): one invocation with the given
+    // position.z, depth bias (constant, slope, clamp) and derivatives (the evaluator answers ddx / ddy from the test).
+    {
+        o.d24Emul = true;
+        Result r = run(dir + "/solid.frag.spv", o);
+        o.d24Emul = false;
+        CHECK(r.ok);
+        int depthOut = -1;
+        for (size_t k = 0; r.ok && k < r.module.outputs.size(); ++k)
+            if (r.module.outputs[k].builtin == vpir::Builtin::FragDepth) depthOut = int(k);
+        CHECK(depthOut >= 0);
+        auto eval = [&](float pz, float c, float sl, float cl, float dzdx, float dzdy, float& got) {
+            vpireval::Invocation inv;
+            vpireval::Value pos;
+            pos.type = vpir::kF32.withWidth(4);
+            pos.bits[0] = bitsOf(3.0f), pos.bits[1] = bitsOf(4.0f), pos.bits[2] = bitsOf(pz), pos.bits[3] = bitsOf(1.0f);
+            inv.builtins[vpir::Builtin::Position] = pos;
+            vpireval::Value bias;
+            bias.type = vpir::kF32.withWidth(3);
+            bias.bits[0] = bitsOf(c), bias.bits[1] = bitsOf(sl), bias.bits[2] = bitsOf(cl);
+            inv.builtins[vpir::Builtin::DepthBias] = bias;
+            inv.derivative = [&](const vpir::Inst&, bool y, const vpireval::Value&, vpireval::Value& out) {
+                out.bits[0] = bitsOf(y ? dzdy : dzdx);
+                return true;
+            };
+            std::string err;
+            if (!vpireval::run(r.module, inv, err)) return false;
+            auto it = inv.outputs.find(uint32_t(depthOut));
+            if (it == inv.outputs.end()) return false;
+            std::memcpy(&got, &it->second.bits[0], 4);
+            return true;
+        };
+        if (r.ok && depthOut >= 0) {
+            // (1) No bias: the rounding alone against the integer reference. z = 0, 1, 0.5 (a tie: to even), 1e-3, the ends, the
+            // 2^-24 steps, out-of-range values (saturate), then a grid of the 2^24 steps and a wide pseudo-random sweep.
+            unsigned bad = 0, over1 = 0, evalFail = 0, coarse = 0, total = 0;
+            auto one = [&](float z, bool exactStrict) {
+                float got = 0;
+                ++total;
+                if (!eval(z, 0, 0, 0, 0, 0, got)) return void(++evalFail);
+                over1 += got > 1.0f || got < 0.0f;
+                const double n = std::nearbyint(double(got) * 16777215.0);
+                if (got != quant(z)) {
+                    // (z below 0.5: float32 holds z * (2^24 - 1) in steps of 1/2 or finer, and rounding that again can land one step
+                    // off the exact rounding; at or above 0.5 the product is an integer already and the result is exact)
+                    ++coarse;
+                    bad += exactStrict || std::fabs(n - quantN(z)) > 1.0;
+                }
+            };
+            for (float z : {0.0f, 1.0f, 0.5f, 1e-3f, 0.25f, 0.75f, 0.999999f, std::nextafter(1.0f, 0.0f), std::nextafter(0.0f, 1.0f), 1e-9f,
+                            std::ldexp(1.0f, -24), std::ldexp(1.0f, -25), std::ldexp(3.0f, -25), 8388607.5f / 16777215.0f,
+                            std::nextafter(0.5f, 1.0f), std::nextafter(0.5f, 0.0f), -0.5f, 1.5f, -1e-30f, 1e30f})
+                one(z, true);
+            const unsigned stepsBefore = total;
+            for (uint32_t n = 0; n < 16777216u; n += 61) {  // z = n / (2^24 - 1): the 24-bit value itself must come back, never above 1
+                const float z = float(n) / 16777215.0f;
+                float got = 0;
+                ++total;
+                if (!eval(z, 0, 0, 0, 0, 0, got)) {
+                    ++evalFail;
+                    continue;
+                }
+                over1 += got > 1.0f;
+                bad += got != z;
+            }
+            CHECK(total > stepsBefore + 200000);
+            uint32_t rng = 12345u;
+            auto next = [&] { return rng = rng * 1664525u + 1013904223u; };
+            for (int i = 0; i < 200000; ++i) {
+                const float m = float(next() >> 8) / 16777216.0f;
+                one(std::ldexp(m, -int(next() % 20)), false);
+                one(1.0f - m * 0.5f, true);  // [0.5, 1]: exact
+            }
+            std::printf("  d24 rounding sweep: %u values, %u differ from the exact rounding (by one step, z < 0.5), %u bad, %u over 1\n",
+                        total, coarse, bad, over1);
+            CHECK(evalFail == 0 && bad == 0 && over1 == 0);
+            CHECK(coarse < total / 4);
+            // 1.0 gives exactly 1.0 (the old floor(z * K + 0.5) / K gave 1.00000012) and 0.5 gives 8388608 / K.
+            float g = 0;
+            CHECK(eval(1.0f, 0, 0, 0, 0, 0, g) && g == 1.0f);
+            CHECK(eval(0.5f, 0, 0, 0, 0, 0, g) && g == 8388608.0f / 16777215.0f);
+            CHECK(eval(0.0f, 0, 0, 0, 0, 0, g) && g == 0.0f);
+
+            // (2) The FragCoord.z + bias path against the spec's formula, in CPU arithmetic: constant * 2^-24 (UNORM24) + slope *
+            // max(|dz/dx|, |dz/dy|), limited by the clamp (positive: at most, negative: at least, 0: none), added to z, rounded.
+            struct Case { float z, c, sl, cl, dx, dy; };
+            const float u = std::ldexp(1.0f, -24);
+            const Case cases[] = {{0.3f, 0, 0, 0, 1e-4f, 2e-4f},        // no bias: z alone
+                                  {0.5f, 4, 0, 0, 0, 0},                 // constant only
+                                  {0.25f, 0, 2.0f, 0, 1e-6f, -3e-6f},    // slope only: max(|dx|, |dy|) = 3e-6
+                                  {0.75f, -3, 1.5f, 0, 2e-7f, 1e-7f},    // negative constant, slope
+                                  {0.4f, 100, 0, 10 * u, 0, 0},          // positive clamp reached
+                                  {0.4f, -100, 0, -10 * u, 0, 0},        // negative clamp reached
+                                  {0.4f, -5, 0, 1e-3f, 0, 0},            // positive clamp, negative bias: unchanged
+                                  {0.4f, 5, 0, -1e-3f, 0, 0},            // negative clamp, positive bias: unchanged
+                                  {0.4f, 7, 3.0f, 1e-2f, -5e-6f, 4e-6f},  // clamp not reached
+                                  {0.99999994f, 1000, 0, 0, 0, 0},       // above 1: saturates
+                                  {0.0f, -1000, 1.0f, 0, 1e-3f, 1e-3f},  // below 0: saturates
+                                  {1e-3f, 2, 0.5f, 0, 1e-6f, 1e-6f}};
+            for (const Case& k : cases) {
+                float got = 0;
+                const bool ok = eval(k.z, k.c, k.sl, k.cl, k.dx, k.dy, got);
+                CHECK(ok);
+                if (!ok) continue;
+                const float slope = std::max(std::fabs(k.dx), std::fabs(k.dy));
+                const float t0 = k.c * u;
+                const float t1 = k.sl * slope;
+                float off = t0 + t1;
+                if (k.cl > 0) off = std::min(off, k.cl);
+                else if (k.cl < 0) off = std::max(off, k.cl);
+                const float zb = k.z + off;
+                // (the bias path is under test, not the rounding: the product in float32 as the shader has it, which may sit one step
+                // from the exact rounding below 0.5, see above)
+                const float sat = std::min(std::max(zb, 0.0f), 1.0f);
+                const float prod = sat * 16777215.0f;
+                const float want = std::nearbyint(prod) / 16777215.0f;
+                CHECK(std::fabs(std::nearbyint(double(got) * 16777215.0) - quantN(zb)) <= 1.0);
+                if (got != want) std::fprintf(stderr, "  bias case z=%g c=%g s=%g cl=%g: got %.9g want %.9g\n", k.z, k.c, k.sl, k.cl, got, want);
+                CHECK(got == want);
+            }
+        }
+    }
+    // D24 emulation vs early fragment tests (inline modules: void main() with EarlyFragmentTests, then with a store into a storage
+    // buffer): without resource writes the early tests go and the shader writes the rounded depth; with them it stays as it was
+    // (d24EmulSkipped) unless the alpha test or a sample mask drops the early tests anyway (one decision, not two).
+    {
+        auto module = [](bool early, bool store, bool fragDepth = false) {
+            std::vector<uint32_t> w = {0x07230203u, 0x00010300u, 0u, 20u, 0u};
+            auto ins = [&](uint32_t op, std::initializer_list<uint32_t> ops) {
+                w.push_back((uint32_t(ops.size() + 1) << 16) | op);
+                w.insert(w.end(), ops);
+            };
+            ins(17, {1});                                    // OpCapability Shader
+            ins(14, {0, 1});                                 // OpMemoryModel Logical GLSL450
+            if (fragDepth) ins(15, {4, 1, 0x6e69616du, 0, 14});  // OpEntryPoint Fragment %1 "main" %14
+            else ins(15, {4, 1, 0x6e69616du, 0});            // OpEntryPoint Fragment %1 "main"
+            ins(16, {1, 7});                                 // OpExecutionMode %1 OriginUpperLeft
+            if (early) ins(16, {1, 9});                      // OpExecutionMode %1 EarlyFragmentTests
+            if (fragDepth) ins(16, {1, 12});                 // OpExecutionMode %1 DepthReplacing
+            if (fragDepth) ins(71, {14, 11, 22});            // OpDecorate %14 BuiltIn FragDepth
+            ins(71, {5, 2});                                 // OpDecorate %5 Block
+            ins(72, {5, 0, 35, 0});                          // OpMemberDecorate %5 0 Offset 0
+            ins(71, {7, 34, 0});                             // OpDecorate %7 DescriptorSet 0
+            ins(71, {7, 33, 0});                             // OpDecorate %7 Binding 0
+            ins(19, {2});                                    // %2 = OpTypeVoid
+            ins(33, {3, 2});                                 // %3 = OpTypeFunction %2
+            ins(21, {4, 32, 0});                             // %4 = OpTypeInt 32 0
+            ins(30, {5, 4});                                 // %5 = OpTypeStruct %4
+            ins(32, {6, 12, 5});                             // %6 = OpTypePointer StorageBuffer %5
+            ins(59, {6, 7, 12});                             // %7 = OpVariable %6 StorageBuffer
+            ins(32, {8, 12, 4});                             // %8 = OpTypePointer StorageBuffer %4
+            ins(43, {4, 9, 0});                              // %9 = OpConstant %4 0
+            ins(43, {4, 10, 1});                             // %10 = OpConstant %4 1
+            if (fragDepth) {
+                ins(22, {15, 32});                           // %15 = OpTypeFloat 32
+                ins(32, {16, 3, 15});                        // %16 = OpTypePointer Output %15
+                ins(59, {16, 14, 3});                        // %14 = OpVariable %16 Output
+                ins(43, {15, 17, 0x3a83126fu});              // %17 = OpConstant %15 0.001
+            }
+            ins(54, {2, 1, 0, 3});                           // %1 = OpFunction %2 None %3
+            ins(248, {11});                                  // %11 = OpLabel
+            if (store) {
+                ins(65, {8, 12, 7, 9});                      // %12 = OpAccessChain %8 %7 %9
+                ins(62, {12, 10});                           // OpStore %12 %10
+            }
+            if (fragDepth) ins(62, {14, 17});                // OpStore %14 %17
+            ins(253, {});                                    // OpReturn
+            ins(56, {});                                     // OpFunctionEnd
+            return w;
+        };
+        spirv::SpirvLowerOptions e;
+        e.entry = "main";
+        e.stage = vpir::Stage::Fragment;
+        e.layout = {bind(0, 0, vpgpu::BindKind::Buffer, 0)};
+        struct Variant { bool early, store, alpha; uint32_t mask; bool skipped; };
+        const Variant variants[] = {{false, false, false, ~0u, false},   // no early tests: emulated
+                                    {true, false, false, ~0u, false},    // early tests, no writes: they go, emulated
+                                    {true, true, false, ~0u, true},      // early tests and a store: as it was
+                                    {false, true, false, ~0u, false},    // a store, no early tests: emulated
+                                    {true, true, true, ~0u, false},      // alpha test drops the early tests: emulated
+                                    {true, true, false, 0x5u, false}};   // a sample mask drops them too: emulated
+        for (const Variant& v : variants) {
+            const std::vector<uint32_t> w = module(v.early, v.store);
+            std::string error;
+            std::shared_ptr<spirv::SpirvModule> m(spirv::parse(w.data(), w.size(), error), spirv::release);
+            CHECK(m != nullptr);
+            if (!m) continue;
+            e.alphaTest = v.alpha, e.sampleMask = v.mask, e.d24Emul = true;
+            CHECK(spirv::d24EmulSkipped(*m, e) == v.skipped);
+            Result on = runWords(w, e);
+            e.d24Emul = false;
+            Result off = runWords(w, e);
+            CHECK(on.ok && off.ok);
+            if (!on.ok || !off.ok) continue;
+            const bool early = on.msl.source.find("[[early_fragment_tests]]") != std::string::npos;
+            const bool depth = on.msl.source.find("[[depth(any)]]") != std::string::npos;
+            CHECK(!spirv::d24EmulSkipped(*m, e));  // (off: never)
+            CHECK(depth == !v.skipped);
+            CHECK(early == (v.skipped && v.early));
+            CHECK(v.skipped == (on.msl.source == off.msl.source));
+            if (failures || std::getenv("VP_PRINT")) std::fprintf(stderr, "---- early=%d store=%d alpha=%d mask=%x\n%s\n", v.early, v.store, v.alpha, v.mask, on.msl.source.c_str());
+        }
+        // A FragDepth write: with early tests Vulkan ignores it, so the depth is the invocation's FragCoord.z + the draw's bias (the
+        // `own` path: vp_dbias, dfdx); without them the shader's own value is rounded (no bias).
+        for (bool early : {true, false}) {
+            const std::vector<uint32_t> w = module(early, false, true);
+            e.alphaTest = false, e.sampleMask = ~0u, e.d24Emul = true;
+            Result on = runWords(w, e);
+            e.d24Emul = false;
+            CHECK(on.ok);
+            if (!on.ok) continue;
+            const std::string& s = on.msl.source;
+            CHECK(s.find("[[depth(any)]]") != std::string::npos);
+            CHECK(s.find("[[early_fragment_tests]]") == std::string::npos);
+            CHECK(early == (s.find("constant float3& vp_dbias [[buffer(26)]]") != std::string::npos));
+            CHECK(early == (s.find("dfdx(") != std::string::npos));
+            if (failures || std::getenv("VP_PRINT")) std::fprintf(stderr, "---- fragdepth early=%d\n%s\n", early, s.c_str());
+        }
+    }
+    // Two coplanar triangles at z ~ 1e-3 whose depths differ by float32 rounding only (the plane evaluated in two orders, 4 ulps
+    // apart at most): as float32 they differ at most pixels (>= comparisons flicker), rounded to 24 bits they tie, except where the
+    // pair straddles a rounding boundary (probability |dz| / 2^-24 ~ 0.2 %); away from a boundary they tie exactly.
+    {
+        unsigned raw = 0, tied = 0, total = 0, straddle = 0, farFromBoundaryDiff = 0;
+        for (int y = 0; y < 64; ++y)
+            for (int x = 0; x < 64; ++x) {
+                const float a = 1.3e-8f, b = -2.1e-8f, c = 1.0e-3f;
+                const float z1 = c + a * float(x) + b * float(y);
+                float z2 = (c + b * float(y)) + a * float(x);
+                for (int k = 0; k < (x * 7 + y * 3) % 5; ++k) z2 = std::nextafter(z2, 1.0f);  // up to 4 ulps
+                const float scaled = z1 * 16777215.0f + 0.5f;
+                const float frac = scaled - std::floor(scaled);
+                const bool nearBoundary = frac < 0.01f || frac > 0.99f;
+                ++total, raw += z1 != z2, tied += quant(z1) == quant(z2), straddle += nearBoundary;
+                farFromBoundaryDiff += !nearBoundary && quant(z1) != quant(z2);
+            }
+        CHECK(raw > total / 4);                  // float32 compares flicker
+        CHECK(tied >= total - total / 50);       // 24-bit rounding ties (>= 98 %)
+        CHECK(farFromBoundaryDiff == 0);
+        (void)straddle;
+    }
+    // The flag is ignored by a vertex stage.
+    spirv::SpirvLowerOptions v;
+    v.entry = "main";
+    v.stage = vpir::Stage::Vertex;
+    v.d24Emul = true;
+    Result vr = run(dir + "/pos.vert.spv", v);
+    v.d24Emul = false;
+    Result vr0 = run(dir + "/pos.vert.spv", v);
+    CHECK(vr.ok && vr0.ok && vr.msl.source == vr0.msl.source);
+}
+
 // shaderZeroInitializeWorkgroupMemory: a Workgroup variable with an OpConstantNull initializer is cleared by a
 // strided loop over the threadgroup array and a barrier before the body (zeroinit.comp.spvasm).
 void zeroInit(const std::string& dir) {
@@ -1941,6 +2253,7 @@ int main(int argc, char** argv) {
     else if (c == "f16_insert") f16Insert(dir);
     else if (c == "submask") subgroupMasks(dir);
     else if (c == "sample_mask") sampleMask(dir);
+    else if (c == "d24_emul") d24Emul(dir);
     else if (c == "ycbcr") ycbcr(dir);
     else if (c == "robust") robust(dir);
     else if (c == "correctness") correctness(dir);

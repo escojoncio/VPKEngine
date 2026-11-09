@@ -398,6 +398,10 @@ struct Machine {
             }
             case Op::Barrier:
             case Op::BarrierAll: return true;
+            case Op::Ddx:
+            case Op::Ddy:
+                if (!inv.derivative || !inv.derivative(in, in.op == Op::Ddy, a[0], out)) return fail(std::string("cannot evaluate ") + opInfo(in.op).name);
+                break;
             case Op::ImageSample:
             case Op::ImageSize:
                 if (!inv.image || !inv.image(in, a, out)) return fail(std::string("cannot evaluate ") + opInfo(in.op).name);

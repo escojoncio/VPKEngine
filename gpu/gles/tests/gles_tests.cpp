@@ -43,6 +43,7 @@ int failures = 0;
 bool expectLinkFailedVaryings = false;
 bool expectMipBeforeBase = false, expectTexStats = false;  // testTextures: the diagnostics lines must be in the driver log
 std::vector<std::string> expectLines;  // substrings the driver log must contain at the end of the run
+std::vector<std::string> forbidLines;  // substrings the driver log must not contain
 std::string gSelf, gLibPath;  // argv[0] and the driver path: the `recipe` group runs `recipe_session` children of this binary
   // testProgram: the link-failure varying diagnostic must survive 70 warnings
 #define CHECK(c)                                                                \
@@ -496,6 +497,9 @@ void testEgl() {
         CHECK(std::strstr(reinterpret_cast<const char*>(glGetString(gl::VERSION)), want.c_str()));
     }
     CHECK(std::strstr(reinterpret_cast<const char*>(glGetString(gl::EXTENSIONS)), "GL_OVR_multiview2"));
+    for (const char* gone : {"GL_ANGLE_instanced_arrays", "GL_NV_draw_buffers", "GL_OES_depth32", "GL_OES_mapbuffer",
+                             "GL_EXT_shader_texture_lod", "GL_EXT_shadow_samplers", "GL_EXT_frag_depth"})
+        CHECK(!std::strstr(reinterpret_cast<const char*>(glGetString(gl::EXTENSIONS)), gone));  // the real Quest 3 does not list them
     // Default: the Apple GPU's own identity; the Adreno 740 only with the Quest identity (asked on every call).
     {
         auto setQuest = reinterpret_cast<void (*)(int)>(dlsym(gLib, "vpvk_config_set_quest_identity"));
@@ -890,9 +894,19 @@ void testTextures() {
         expectLines.push_back("fail=level_missing level=1");
         expectLines.push_back("gles.tex_realloc tex=" + std::to_string(grow) + " target=0xde1 fmt=0x8058->0x8058 size=16x16->32x32 levels=5->6 lost_levels=5");
         expectLines.push_back("gles.census incomplete=1 incomplete_tick_max=1 msrtt_ds_continued=0");
-        // A complete compressed texture (immutable, 3 levels) sampled mipmapped with only level 0 uploaded: levels 1-2 read the
-        // zero fill (ASTC: black). Counted and logged (gles.unwritten).
-        GLuint uw;
+        // A complete compressed texture (immutable, 3 levels) sampled mipmapped with nothing uploaded: every level reads the zero fill
+        // (ASTC: black). Counted and logged (gles.unwritten). One with only level 0 uploaded is not: the view is cut to [0,0] (below).
+        GLuint uw0, uw;
+        glGenTextures(1, &uw0);
+        glBindTexture(gl::TEXTURE_2D, uw0);
+        glTexStorage2D(gl::TEXTURE_2D, 3, gl::COMPRESSED_RGBA_ASTC_4x4, 16, 16);
+        glTexParameteri(gl::TEXTURE_2D, gl::TEXTURE_MIN_FILTER, gl::LINEAR_MIPMAP_LINEAR);
+        glDrawArrays(gl::TRIANGLES, 0, 3);
+        glFinish();
+        CHECK(err() == gl::NO_ERROR);
+        expectLines.push_back("gles.unwritten tex=" + std::to_string(uw0) + " target=0xde1 fmt=0x93b0 img=16x16 levels=3 base=0 max=2 "
+                              "min_filter=0x2703 written=0x0 missing=0x7");
+        expectLines.push_back("unwritten=1 unwritten_tick_max=1");
         glGenTextures(1, &uw);
         std::vector<uint8_t> a0(4 * 4 * 16, 0);
         glBindTexture(gl::TEXTURE_2D, uw);
@@ -902,9 +916,30 @@ void testTextures() {
         glDrawArrays(gl::TRIANGLES, 0, 3);
         glFinish();
         CHECK(err() == gl::NO_ERROR);
-        expectLines.push_back("gles.unwritten tex=" + std::to_string(uw) + " target=0xde1 fmt=0x93b0 img=16x16 levels=3 base=0 max=2 "
-                              "min_filter=0x2703 written=0x1 missing=0x6");
-        expectLines.push_back("unwritten=1 unwritten_tick_max=1");
+        forbidLines.push_back("gles.unwritten tex=" + std::to_string(uw) + " ");
+        // The same texture: only level 0 is written, so the sampled view covers [0,0] (gles.mip_clamped); uploading level 1 widens it to [0,1].
+        expectLines.push_back("gles.mip_clamped tex=" + std::to_string(uw) + " fmt=0x93b0 levels=3 base=0 max=2 -> 0..0 written=0x1");
+        std::vector<uint8_t> a1(2 * 2 * 16, 0);
+        glCompressedTexSubImage2D(gl::TEXTURE_2D, 1, 0, 0, 8, 8, gl::COMPRESSED_RGBA_ASTC_4x4, GLsizei(a1.size()), a1.data());
+        glDrawArrays(gl::TRIANGLES, 0, 3);
+        glFinish();
+        CHECK(err() == gl::NO_ERROR);
+        expectLines.push_back("gles.mip_clamped tex=" + std::to_string(uw) + " fmt=0x93b0 levels=3 base=0 max=2 -> 0..1 written=0x3");
+        // Level 0 never written, 1-2 written (0x6): the view is [1,2]; no gles.unwritten (the cut left level 0 out). With this view
+        // textureSize / texelFetch / textureLod are relative to base' = 1 (level 0 of the shader is level 1 of the image).
+        GLuint uw2;
+        glGenTextures(1, &uw2);
+        std::vector<uint8_t> b2(1 * 1 * 16, 0);
+        glBindTexture(gl::TEXTURE_2D, uw2);
+        glTexStorage2D(gl::TEXTURE_2D, 3, gl::COMPRESSED_RGBA_ASTC_4x4, 16, 16);
+        glCompressedTexSubImage2D(gl::TEXTURE_2D, 1, 0, 0, 8, 8, gl::COMPRESSED_RGBA_ASTC_4x4, GLsizei(a1.size()), a1.data());
+        glCompressedTexSubImage2D(gl::TEXTURE_2D, 2, 0, 0, 4, 4, gl::COMPRESSED_RGBA_ASTC_4x4, GLsizei(b2.size()), b2.data());
+        glTexParameteri(gl::TEXTURE_2D, gl::TEXTURE_MIN_FILTER, gl::LINEAR_MIPMAP_LINEAR);
+        glDrawArrays(gl::TRIANGLES, 0, 3);
+        glFinish();
+        CHECK(err() == gl::NO_ERROR);
+        expectLines.push_back("gles.mip_clamped tex=" + std::to_string(uw2) + " fmt=0x93b0 levels=3 base=0 max=2 -> 1..2 written=0x6");
+        forbidLines.push_back("gles.unwritten tex=" + std::to_string(uw2) + " ");
     }
     // Per-format creation counts reach the log (summary at eglTerminate / every 10 s).
     {
@@ -4738,7 +4773,7 @@ void testRecipe() {
     if (!dir) return;
     struct Run {
         bool ok = false;
-        unsigned saved = 0, loaded = 0, prewarmed = 0, miss = 0;
+        unsigned saved = 0, loaded = 0, prewarmed = 0, miss = 0, newRun = 0, total = 0, reused = 0;
         int draws = 0, pipelines = 0, fromBinary = 0;
         std::string text;
     };
@@ -4755,8 +4790,9 @@ void testRecipe() {
         r.ok = status == 0;
         const size_t a = r.text.find("RECIPE gles.pso.recipe ");
         if (a != std::string::npos)
-            std::sscanf(r.text.c_str() + a, "RECIPE gles.pso.recipe saved=%u loaded=%u prewarmed=%u miss_in_game=%u", &r.saved, &r.loaded,
-                        &r.prewarmed, &r.miss);
+            std::sscanf(r.text.c_str() + a,
+                        "RECIPE gles.pso.recipe new_this_run=%u total=%u reused=%u saved=%u loaded=%u prewarmed=%u miss_in_game=%u", &r.newRun,
+                        &r.total, &r.reused, &r.saved, &r.loaded, &r.prewarmed, &r.miss);
         const size_t b = r.text.find("SESSION ");
         if (b != std::string::npos) std::sscanf(r.text.c_str() + b, "SESSION draws=%d pipelines=%d from_binary=%d", &r.draws, &r.pipelines, &r.fromBinary);
         if (!r.ok || a == std::string::npos) std::printf("  session output:\n%s\n", r.text.c_str());
@@ -4771,6 +4807,9 @@ void testRecipe() {
     // program binary and still produced the very same recipes).
     CHECK(s2.loaded == s1.saved && s2.prewarmed == s2.loaded && s2.saved == 0 && s2.miss == 0 && s2.fromBinary);
     CHECK(s2.draws == s1.draws && s2.pipelines == s1.pipelines);
+    // The line says what it counts: new_this_run (== saved), total stored, reused (== loaded).
+    CHECK(s1.newRun == s1.saved && s1.reused == 0 && s1.total == s1.newRun);
+    CHECK(s2.newRun == 0 && s2.reused == s1.total && s2.total == s1.total && s2.total > 0);
     std::error_code ec;
     std::filesystem::remove_all(dir, ec);
 }
@@ -5008,6 +5047,12 @@ int main(int argc, char** argv) {
     for (const std::string& want : expectLines) {
         if (log.find(want) == std::string::npos) {
             std::printf("  FAIL driver log lacks '%s'\n", want.c_str());
+            ++failures;
+        }
+    }
+    for (const std::string& unwanted : forbidLines) {
+        if (log.find(unwanted) != std::string::npos) {
+            std::printf("  FAIL driver log has '%s'\n", unwanted.c_str());
             ++failures;
         }
     }

@@ -119,7 +119,7 @@ struct Vk {
     // Optional: null with another driver (invalidated attachments are then stored).
     void (*vpvk_cmd_pass_drop)(VkCommandBuffer, uint32_t colorMask, int depth, int stencil) = nullptr;
     // VPVulkan's private hook (pipelines.cpp): pipeline-recipe counters {loaded, saved, prewarmed, miss_in_game}. Optional.
-    void (*vpvk_recipe_stats)(VkDevice, uint32_t out[4]) = nullptr;
+    void (*vpvk_recipe_stats)(VkDevice, uint32_t out[5]) = nullptr;
     // Loads the global and instance-level functions (instance may be null for the global ones).
     bool loadInstance(PFN_vkGetInstanceProcAddr gipa, VkInstance instance);
     bool loadDevice(VkDevice device);

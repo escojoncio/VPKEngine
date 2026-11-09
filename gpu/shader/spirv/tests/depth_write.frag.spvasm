@@ -1,0 +1,27 @@
+; Fragment shader: a constant colour at location 0 and a constant gl_FragDepth (0.001: reverse-Z, far away).
+OpCapability Cap:Shader
+OpMemoryModel AddrModel:Logical MemModel:GLSL450
+OpEntryPoint Model:Fragment %main "main" %color %depth
+OpExecutionMode %main ExecMode:OriginUpperLeft
+OpExecutionMode %main ExecMode:DepthReplacing
+OpName %main "main"
+OpDecorate %color Deco:Location 0
+OpDecorate %depth Deco:BuiltIn BuiltIn:FragDepth
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%f32 = OpTypeFloat 32
+%v4 = OpTypeVector %f32 4
+%pout = OpTypePointer Storage:Output %v4
+%pf = OpTypePointer Storage:Output %f32
+%color = OpVariable %pout Storage:Output
+%depth = OpVariable %pf Storage:Output
+%c0 = OpConstant %f32 f32:0.25
+%c1 = OpConstant %f32 f32:1.0
+%cd = OpConstant %f32 f32:0.001
+%cv = OpConstantComposite %v4 %c0 %c0 %c0 %c1
+%main = OpFunction %void 0 %fn
+%l = OpLabel
+OpStore %color %cv
+OpStore %depth %cd
+OpReturn
+OpFunctionEnd

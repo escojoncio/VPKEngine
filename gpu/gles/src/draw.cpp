@@ -1419,8 +1419,9 @@ static void noteIncomplete(const Texture& t, const SamplerParams& sp, const Inco
 static void noteUnwritten(const Texture& t, const SamplerParams& sp) {
     const Image& im = *t.image;
     const bool mip = sp.minFilter != gl::NEAREST && sp.minFilter != gl::LINEAR;
-    const GLint top = GLint(im.levels) - 1;
-    const GLint base = std::min(std::max(0, t.baseLevel), top), last = mip ? std::max(base, std::min(t.maxLevel, top)) : base;
+    uint32_t b, top;
+    mipRange(t, b, top);  // the range actually sampled: levels the cut already left out do not count
+    const GLint base = GLint(b), last = mip ? GLint(top) : base;
     uint32_t missing = 0;
     for (GLint l = base; l <= last && l < 32; ++l)
         if (!(im.written >> l & 1u)) missing |= 1u << l;

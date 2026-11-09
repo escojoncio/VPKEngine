@@ -5,6 +5,8 @@
 #include <atomic>
 
 #include <bit>
+#include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <unordered_map>
 
@@ -736,6 +738,7 @@ struct Translator {
       ++st.fovPasses;
       st.fovLogicalW = taaW, st.fovLogicalH = taaH;
     }
+    ddFlush();
     eyeRec = nullptr;
     if (taaPass && um && d.depth.texture && d.colors[0].texture) {
       UiMaskState::EyePass& r = um->eyePass[um->eyePasses++ % UiMaskState::kEyePasses];
@@ -755,6 +758,7 @@ struct Translator {
     ++st.passes;
   }
   void close() {
+    ddFlush();
     if (passOpen) frame.endRenderPass();
     passOpen = false;
     eyeRec = nullptr;
@@ -1141,6 +1145,20 @@ struct Translator {
   // variant, 4 a draw without its pipeline object (no sample variant can be made), 5 (only with `up`, a game MSAA pass about to be
   // upgraded) a pipeline with a baked partial sample mask or a fragment shader using SampleId / SampleMask: both depend on the
   // game's sample count. Returns true when the pass ended inside `ops`.
+  // Draws from ops[from] to the end of the pass (same extent as forceScan).
+  static uint32_t countDraws(const std::vector<Op>& ops, size_t from) {
+    uint32_t n = 0;
+    for (size_t i = from; i < ops.size(); ++i) {
+      const Op& op = ops[i];
+      if (const auto* d = std::get_if<OpDraw>(&op)) n += d->ok ? 1u : 0u;
+      else if (const auto* e = std::get_if<OpExecute>(&op)) {
+        if (e->secondary) n += countDraws(e->secondary->ops, 0);
+      } else if (std::holds_alternative<OpEndPass>(op) || std::holds_alternative<OpNextSubpass>(op) ||
+                 std::holds_alternative<OpBeginPass>(op) || std::holds_alternative<OpBeginRendering>(op))
+        break;
+    }
+    return n;
+  }
   bool forceScan(const std::vector<Op>& ops, size_t from, int& why, bool up = false) {
     auto note = [&](int w) { why = why && why < w ? why : w; };  // the lowest number wins
     for (size_t i = from; i < ops.size(); ++i) {
@@ -1260,6 +1278,7 @@ struct Translator {
     };
     if (!eyeScene) {
       ++mt.rejEyeBy[eyeWhy.why];
+      mt.eye.noteNonEye(dev->gpu->submittedFrames());
       eyeRejDetail(dev, d);
       return rej(mt.rejEye, "eye");
     }
@@ -1268,6 +1287,17 @@ struct Translator {
     if (!c.texture || !z.texture) return rej(mt.rejCd, "cd");
     vpgpu::TextureDesc gc, gz;
     if (!dev->gpu->textureDesc(c.texture, gc) || !dev->gpu->textureDesc(z.texture, gz)) return rej(mt.rejDesc, "desc");
+    struct EyeNote {  // "vk.msaa_eye": this eye pass with the samples it ends at (forceN), whichever return follows
+      MsaaTwins& mt;
+      Device* dev;
+      const vpgpu::TextureDesc& gc;
+      const uint8_t& forced;
+      uint32_t draws;
+      ~EyeNote() {
+        mt.eye.notePass(dev->gpu->submittedFrames(), gc.width, gc.height, uint16_t(gc.layers), vpgpu::formatInfo(gc.format).name,
+                        uint8_t(gc.samples), forced ? forced : uint8_t(gc.samples), draws);
+      }
+    } eyeNote{mt, dev, gc, forceN, mt.eye.lines >= MsaaTwins::kEyeLines ? 0u : countDraws(ops, at + 1)};  // lines used up: nothing prints, skip the count
     // "vk.msaa rej_first reason=smp|msstore ...": the first pass rejected for each of those two reasons (once per device), with the
     // rej_detail fields and the game's samples / store / load / resolve of the pass.
     auto rejFirst = [&](int slot, const char* why) {
@@ -1406,7 +1436,15 @@ struct Translator {
 
   // Everything an eye-pass geometry draw needs: its class (counted), the mask variant of its
   // pipeline in a masked pass, and the jitter (viewport shift) unless it is UI.
+  // "vk.depth_diag": the open eye pass's depth census (DepthDiag::Pass), folded into the device's summary when the pass ends.
+  DepthDiag::Pass dd;
+  void ddFlush() {
+    if (!dd.any()) return;
+    if (Device* dev = devForce()) dev->depthDiag.notePass(dd);
+    dd = {};
+  }
   void jitter(vpgpu::Draw& dr, const OpDraw& d) {
+    if (eyeScene) noteDepthDraw(dd, dr, d);  // (eye passes also without VPKTAA: the census does not depend on it)
     if (!taaPass) return;
     if (eyeRec && d.depthCmp) ++(d.depthCmp > 0 ? eyeRec->greater : eyeRec->less);
     taa::DrawClass cls = taa::DrawClass::Scene;
@@ -1786,6 +1824,7 @@ struct Translator {
         jitter(dr, d);
         frame.draw(std::move(dr));
       } else {
+        if (eyeScene) noteDepthDraw(dd, *base, d);
         frame.draw(*base);
       }
       ++st.draws;
@@ -2127,6 +2166,110 @@ bool MsaaTwins::takeMainLine(int64_t nowNs, MainPass& out) {
   return true;
 }
 
+static unsigned hbucket(uint8_t s) { return s == 1 ? 0u : s == 2 ? 1u : s == 4 ? 2u : 3u; }
+
+void MsaaTwins::EyeSummary::advance(uint64_t f) {
+  if (f == frame) return;
+  if (curDraws) mainDraws = curDraws, mainIn = curIn, mainOut = curOut;
+  curDraws = 0, frame = f;
+}
+
+void MsaaTwins::EyeSummary::notePass(uint64_t f, uint32_t w, uint32_t h, uint16_t layers, const char* fmt, uint8_t in, uint8_t out,
+                                     uint32_t draws) {
+  advance(f);
+  ++eyePasses, upgraded += out > in ? 1u : 0u;
+  ++hin[hbucket(in)], ++hout[hbucket(out)];
+  if (!curDraws || draws > curDraws) curDraws = draws, curIn = in, curOut = out;
+  Size* slot = nullptr;
+  for (Size& s : sizes) {
+    if (s.n && s.w == w && s.h == h && s.layers == layers && s.fmt == fmt) return void(++s.n);
+    if (!s.n && !slot) slot = &s;
+  }
+  if (slot) *slot = {w, h, 1, layers, fmt};
+}
+
+bool MsaaTwins::EyeSummary::take(uint64_t f, char* buf, size_t cap) {
+  if (!nextFrame) nextFrame = f + kEyePeriod;  // the period opens with the first pass
+  if (f < nextFrame || lines >= kEyeLines || !(eyePasses || nonEye)) return false;
+  advance(f);
+  nextFrame = f + kEyePeriod;
+  ++lines;
+  const Size* top[3] = {nullptr, nullptr, nullptr};
+  for (const Size& s : sizes) {
+    if (!s.n) continue;
+    const Size* x = &s;
+    for (const Size*& t : top)
+      if (x && (!t || x->n > t->n)) std::swap(t, x);
+  }
+  int len = std::snprintf(buf, cap,
+                          "vk.msaa_eye f=%llu eye_color_passes=%u upgraded=%u samples_in_hist={1:%u,2:%u,4:%u%s%.0u} samples_out_hist={1:%u,2:%u,4:%u%s%.0u} "
+                          "main_pass_samples=%u->%u main_pass_draws=%u non_eye_passes=%u (top3",
+                          (unsigned long long)f, eyePasses, upgraded, hin[0], hin[1], hin[2], hin[3] ? ",o:" : "", hin[3], hout[0], hout[1],
+                          hout[2], hout[3] ? ",o:" : "", hout[3], unsigned(mainIn), unsigned(mainOut), mainDraws, nonEye);
+  for (const Size* t : top)
+    if (t && len > 0 && size_t(len) < cap)
+      len += std::snprintf(buf + len, cap - size_t(len), " %ux%ux%u %s x%u", t->w, t->h, unsigned(t->layers), t->fmt ? t->fmt : "?", t->n);
+  if (len > 0 && size_t(len) < cap) std::snprintf(buf + len, cap - size_t(len), ")");
+  const uint64_t keepNext = nextFrame, keepFrame = frame;
+  const uint32_t keepLines = lines, keepMd = mainDraws;
+  const uint8_t keepIn = mainIn, keepOut = mainOut;
+  *this = EyeSummary{};
+  nextFrame = keepNext, frame = keepFrame, lines = keepLines, mainDraws = keepMd, mainIn = keepIn, mainOut = keepOut;
+  return true;
+}
+
+void noteDepthDraw(DepthDiag::Pass& p, const vpgpu::Draw& dr, const OpDraw& d) {
+  ++p.draws;
+  const bool bias = dr.depthBias != 0 || dr.depthBiasSlope != 0;
+  p.bias += bias;
+  if (bias) p.constMax = std::max(p.constMax, std::fabs(dr.depthBias)), p.slopeMax = std::max(p.slopeMax, std::fabs(dr.depthBiasSlope));
+  if (d.depthTested && !d.depthWrite) {
+    p.ge += d.depthOp == VK_COMPARE_OP_GREATER_OR_EQUAL;
+    p.le += d.depthOp == VK_COMPARE_OP_LESS_OR_EQUAL;
+    p.eq += d.depthOp == VK_COMPARE_OP_EQUAL;
+  }
+  p.d24 += d.depthD24;
+  p.emul += d.pipe && d.pipe->d24Emul && !d.pipe->d24Skipped;
+  p.skipped += d.pipe && d.pipe->d24Emul && d.pipe->d24Skipped;
+}
+
+void DepthDiag::notePass(const Pass& p) {
+  ++periodPasses, ++sessionPasses, periodD24Passes += p.d24 != 0;
+  for (Pass* t : {&period, &session}) {
+    t->draws += p.draws, t->bias += p.bias, t->ge += p.ge, t->le += p.le, t->eq += p.eq, t->d24 += p.d24, t->emul += p.emul, t->skipped += p.skipped;
+    t->constMax = std::max(t->constMax, p.constMax), t->slopeMax = std::max(t->slopeMax, p.slopeMax);
+  }
+  if (p.draws > best.draws) best = p;
+}
+
+bool DepthDiag::take(uint64_t f, char* buf, size_t cap) {
+  if (!nextFrame) nextFrame = f + kPeriod;  // the period opens with the first pass
+  if (f < nextFrame || lines >= kLines || !periodPasses) return false;
+  nextFrame = f + kPeriod;
+  ++lines;
+  std::snprintf(buf, cap,
+                "vk.depth_diag f=%llu emul=%d eye_passes=%u d24_passes=%u draws=%u bias_on=%u ge_nowrite=%u le_nowrite=%u eq_nowrite=%u "
+                "d24_draws=%u emul_draws=%u bias_const_max=%.3f bias_slope_max=%.3f main_pass{draws=%u bias_on=%u ge_nowrite=%u "
+                "le_nowrite=%u eq_nowrite=%u d24_draws=%u} session{passes=%u draws=%u bias_on=%u cmp_nowrite=%u d24_draws=%u} d24_skipped=%u",
+                (unsigned long long)f, int(d24Emul()), periodPasses, periodD24Passes, period.draws, period.bias, period.ge, period.le,
+                period.eq, period.d24, period.emul, double(period.constMax), double(period.slopeMax), best.draws, best.bias, best.ge,
+                best.le, best.eq, best.d24, sessionPasses, session.draws, session.bias, session.ge + session.le + session.eq, session.d24, period.skipped);
+  period = {}, best = {}, periodPasses = periodD24Passes = 0;
+  return true;
+}
+
+static void logDepthDiag(Device* dev) {
+  if (!dev->gpu || dev->depthDiag.lines >= DepthDiag::kLines) return;
+  char buf[640];
+  if (dev->depthDiag.take(dev->gpu->submittedFrames(), buf, sizeof buf)) log(std::string(buf));
+}
+
+static void logMsaaEye(Device* dev, MsaaTwins& mt) {
+  if (!dev->gpu || mt.eye.lines >= MsaaTwins::kEyeLines) return;
+  char buf[384];
+  if (mt.eye.take(dev->gpu->submittedFrames(), buf, sizeof buf)) log(std::string(buf));
+}
+
 static void logMsaaMain(MsaaTwins& mt) {
   if (!mt.mainPass.rank || mt.mainLines >= MsaaTwins::kMainLines) return;
   if (++mt.mainTick & 31u) return;  // the clock is read on every 32nd command buffer, not on each one
@@ -2226,9 +2369,11 @@ void translate(const Recorder& rec, vpgpu::Frame& frame, TranslateStats& st, con
   t.run(rec);
   t.close();
   t.zeroScan();
+  if (Device* dev = t.devForce()) logDepthDiag(dev);
   if (Device* dev = t.devForce(); dev && (msaaForce() > 0 || dev->msaaTwins.gameAuto || dev->msaaTwins.skipUnreadable)) {
     logMsaaForce(dev->msaaTwins);
     logMsaaMain(dev->msaaTwins);
+    logMsaaEye(dev, dev->msaaTwins);
   }
 }
 

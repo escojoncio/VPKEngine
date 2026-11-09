@@ -119,6 +119,7 @@ const char* builtinAttr(Builtin b) {
         case Builtin::HelperInvocation: return "";  // simd_is_helper_thread(), not an attribute
         case Builtin::ViewportIndex: return "viewport_array_index";
         case Builtin::AmplificationId: return "amplification_id";
+        case Builtin::DepthBias: return "";  // vp_dbias (kDepthBiasDecl), not an attribute
         case Builtin::None: break;
     }
     return "";
@@ -369,7 +370,7 @@ private:
         }
         if (!m_.resources.empty()) params.push_back("constant VpArgs& vp_args [[buffer(0)]]");
         for (const IoVar& v : m_.inputs)
-            if (v.builtin == Builtin::DrawIndex || v.builtin == Builtin::HelperInvocation) continue;  // vp_draw field / expression
+            if (v.builtin == Builtin::DrawIndex || v.builtin == Builtin::HelperInvocation || v.builtin == Builtin::DepthBias) continue;  // vp_draw field / expression / vp_dbias
             else if (v.builtin != Builtin::None)
                 params.push_back((v.builtin == Builtin::AmplificationId ? std::string("ushort") : typeName(v.type)) + " " +
                                  builtinParam(v) + " [[" + builtinAttr(v.builtin) + "]]");
@@ -380,6 +381,8 @@ private:
         if (rateMapPosition()) {
             params.push_back(std::string(vpmsl::kRateMapDecl) + " [[buffer(" + std::to_string(vpmsl::kRateMapBuffer) + ")]]");
         }
+        if (std::any_of(m_.inputs.begin(), m_.inputs.end(), [](const IoVar& v) { return v.builtin == Builtin::DepthBias; }))
+            params.push_back(std::string(vpmsl::kDepthBiasDecl) + " [[buffer(" + std::to_string(vpmsl::kDepthBiasBuffer) + ")]]");
         if (usesDrawParams()) {
             out_ += "\nstruct VpDrawParams {\n    uint drawIndex;\n    uint baseVertex;\n    uint metalBase;\n};\n";
             params.push_back(std::string(vpmsl::kDrawParamsDecl) + " [[buffer(" + std::to_string(vpmsl::kDrawParamsBuffer) + ")]]");
@@ -1009,6 +1012,7 @@ private:
         const IoVar& v = m_.inputs[i];
         if (v.builtin == Builtin::Position && rateMapPosition()) return "vp_pos";
         if (v.builtin == Builtin::DrawIndex) return "vp_draw.drawIndex";
+        if (v.builtin == Builtin::DepthBias) return "vp_dbias";
         if (v.builtin == Builtin::HelperInvocation) return "metal::simd_is_helper_thread()";
         if (v.builtin == Builtin::BaseVertex)
             return "(vp_draw.metalBase != 0u ? " + builtinParam(v) + " : vp_draw.baseVertex)";

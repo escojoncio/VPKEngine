@@ -123,6 +123,12 @@ struct SpirvLowerOptions {
   // false = the MSL is byte-identical to before. Recipes: flags bits 6 and 7.
   bool viewportIndex = false;
   bool rateMapPosition = false;
+  // Fragment: the pipeline renders into a D24UnormS8 image that the Metal backend holds as Depth32Float_Stencil8 (VPVK_D24_EMUL,
+  // off by default). The shader writes the depth (its FragDepth, else FragCoord.z plus the draw's depth bias, read from
+  // Builtin::DepthBias) rounded to 24 bits UNORM, [[depth(any)]], so equal-to-24-bits depths tie as on the Adreno. Skipped for a
+  // shader with early fragment tests that may write resources (d24EmulSkipped); one without such writes loses its early tests.
+  // false = the MSL is byte-identical to before. Recipes: emit flags bit 2.
+  bool d24Emul = false;
   // Translator modes (process-wide, VPVulkan's translatorMode(); not part of a recipe input's hash: the recipe store's
   // translator id carries them). amplify: two-view multiview through Metal vertex amplification (see
   // SpirvInterface::amplified). nativeFetch: half vertex attributes via half2. unpackFetch: unorm/snorm vertex attributes of
@@ -156,6 +162,12 @@ struct SpirvInterface {
   // NOT multiply instances by the view count, and the backend sets the amplification count.
   bool amplified = false;
 };
+
+// D24 emulation (SpirvLowerOptions::d24Emul) leaves a fragment shader as it is when it has early fragment tests and may write
+// resources (image / buffer stores, atomics; conservative) and neither the alpha test nor a sample mask drops those tests anyway:
+// running it for fragments the depth test rejects would change what it writes. The lowering and the pipelines (depth_diag
+// d24_skipped) both ask this.
+bool d24EmulSkipped(const SpirvModule&, const SpirvLowerOptions&);
 
 bool lower(const SpirvModule&, const SpirvLowerOptions&, vpir::Module& out, SpirvInterface& iface,
            std::string& error);

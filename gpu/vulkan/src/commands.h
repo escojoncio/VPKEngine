@@ -160,6 +160,8 @@ struct OpDraw {
   // VPKTAA UI mask classification (taa::DrawClassifier) and what the mask variant is made from.
   bool depthWrite = false, blended = false;
   int8_t depthCmp = 0;  // depth test of the draw: +1 GREATER-like (reversed Z), -1 LESS-like, 0 none / other
+  VkCompareOp depthOp = VK_COMPARE_OP_ALWAYS;  // its exact compare op when depthTested ("vk.depth_diag")
+  bool depthD24 = false;                       // the pipeline's depth attachment is D24UnormS8
   const PipelineObj* pipe = nullptr;
   PipelineObj::TexelVariant* texelVariant = nullptr;
   bool edsVariant = false;  // the pipeline key carries extended-dynamic-state overrides (no UI-mask variant)
@@ -466,6 +468,8 @@ void applyQueryEvents(const std::vector<TranslateStats::QueryEvent>&, uint64_t f
 // map (RenderPassDesc::rateMap, foveation.h) when FoveationState::mapFor gives one.
 // With `device` the attachments a dynamic rendering pass reads after an in-pass barrier are copied (VK_KHR_dynamic_rendering_local_read);
 // null (tests) leaves those reads on the attachments.
+// "vk.depth_diag": counts one draw of an eye pass into the pass's census (Translator::jitter).
+void noteDepthDraw(DepthDiag::Pass& pass, const vpgpu::Draw& draw, const OpDraw& op);
 void translate(const Recorder&, vpgpu::Frame& frame, TranslateStats& stats, const TaaJitter* taa = nullptr,
                UiMaskState* um = nullptr, ZeroLog* zl = nullptr, FoveationState* fov = nullptr, Device* device = nullptr);
 

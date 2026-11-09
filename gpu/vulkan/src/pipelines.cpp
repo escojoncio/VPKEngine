@@ -1771,7 +1771,7 @@ StageOut translateStage(Device* d, const PipelineObj::StageSrc& src, const Pipel
                         const std::vector<spirv::VertexBufferBinding>& vbs, const std::string& label,
                         uint32_t viewMask = 0, const std::vector<PipelineObj::TexelBinding>* texel = nullptr,
                         uint16_t colorIntKinds = 0, int uiMaskSlot = -1, bool uiMaskAlpha = false, bool a2cTest = false,
-                        uint32_t sampleMask = ~0u) {
+                        uint32_t sampleMask = ~0u, bool d24Emul = false) {
   StageOut o;
   if (!src.module) {
     logf("vk.err what=shader pipeline=%s stage=%u error=\"no module\"", label.c_str(), unsigned(src.stage));
@@ -1792,6 +1792,7 @@ StageOut translateStage(Device* d, const PipelineObj::StageSrc& src, const Pipel
     opt.uiMaskSlot = int8_t(uiMaskSlot), opt.uiMaskAlpha = uiMaskAlpha;
     opt.alphaTest = a2cTest;
     opt.sampleMask = sampleMask;
+    opt.d24Emul = d24Emul;
   }
   // Foveation: multiview stages of exactly two views (rate map layer = view) carry the viewport index / the
   // FragCoord mapping, in every pass they may run in (outside a foveated pass the backend binds an identity map
@@ -2060,16 +2061,51 @@ void noteRecipeKey(Device* d, vpgpu::PipelineKey key, const PipelineObj& p, uint
 
 // The part of a pipeline's creation that translates and registers shaders: everything that needs the SPIR-V. Runs on
 // the calling thread (legacy mode) or on the translate pool; writes the fields PipelineObj::resolved documents.
+// The fragment stage of a D24-emulated pipeline that has none (depth prepass, shadow maps): `void main() {}`. With d24Emul it writes
+// the FragCoord.z + bias rounded to 24 bits, as the main pass's shaders do; without a stage the hardware would keep float32 depth
+// and the main pass's EQUAL / GREATER_OR_EQUAL tests would fail against the rounded values. Hand-assembled SPIR-V 1.0.
+PipelineObj::StageSrc emptyFragmentSrc() {
+  static const std::shared_ptr<const std::vector<uint32_t>> words = std::make_shared<const std::vector<uint32_t>>(std::vector<uint32_t>{
+      0x07230203u, 0x00010000u, 0u, 5u, 0u,                    // magic, 1.0, generator, bound, schema
+      (2u << 16) | 17u, 1u,                                     // OpCapability Shader
+      (3u << 16) | 14u, 0u, 1u,                                 // OpMemoryModel Logical GLSL450
+      (5u << 16) | 15u, 4u, 1u, 0x6e69616du, 0u,                // OpEntryPoint Fragment %1 "main"
+      (3u << 16) | 16u, 1u, 7u,                                 // OpExecutionMode %1 OriginUpperLeft
+      (2u << 16) | 19u, 2u,                                     // %2 = OpTypeVoid
+      (3u << 16) | 33u, 3u, 2u,                                 // %3 = OpTypeFunction %2
+      (5u << 16) | 54u, 2u, 1u, 0u, 3u,                         // %1 = OpFunction %2 None %3
+      (2u << 16) | 248u, 4u,                                    // %4 = OpLabel
+      (1u << 16) | 253u,                                        // OpReturn
+      (1u << 16) | 56u});                                       // OpFunctionEnd
+  static const std::shared_ptr<spirv::SpirvModule> module = [] {
+    std::string error;
+    return std::shared_ptr<spirv::SpirvModule>(spirv::parse(words->data(), words->size(), error), spirv::release);
+  }();
+  PipelineObj::StageSrc s;
+  s.module = module, s.words = words, s.hash = spirvHash(words->data(), words->size());
+  s.entry = "main", s.stage = VK_SHADER_STAGE_FRAGMENT_BIT, s.synthetic = true;
+  return s;
+}
+
 void finishGraphics(Device* d, PipelineObj* p, std::vector<PipelineObj::StageSrc> srcs,
                     std::vector<spirv::VertexAttribute> attrs, bool ok) {
   vpgpu::PipelineState& st = p->state;
   std::array<uint64_t, 3> inputs{};  // recipe stage inputs: vertex, fragment, compute
   std::string why = ok ? std::string() : "stage_unsupported";  // vk.pso.fail: the first reason this pipeline is not ok
+  if (ok && p->d24Emul && !(p->rasterDiscard && !p->isDynamic(VK_DYNAMIC_STATE_RASTERIZER_DISCARD_ENABLE)) &&
+      std::none_of(srcs.begin(), srcs.end(), [](const PipelineObj::StageSrc& x) { return x.stage == VK_SHADER_STAGE_FRAGMENT_BIT; }))
+    if (PipelineObj::StageSrc e = emptyFragmentSrc(); e.module) srcs.push_back(std::move(e));
   for (PipelineObj::StageSrc& src : srcs) {
     p->sources.push_back(std::move(src));
     const VkShaderStageFlagBits stage = p->sources.back().stage;
+    if (p->d24Emul && stage == VK_SHADER_STAGE_FRAGMENT_BIT && p->sources.back().module) {
+      spirv::SpirvLowerOptions o;  // what translateStage decides on: the lowering asks the same
+      o.entry = p->sources.back().entry, o.stage = vpir::Stage::Fragment, o.alphaTest = p->a2cTest, o.sampleMask = p->sampleMask;
+      o.d24Emul = true;
+      p->d24Skipped = spirv::d24EmulSkipped(*p->sources.back().module, o);
+    }
     StageOut o = translateStage(d, p->sources.back(), *p->layout, p->viewCount, attrs, p->vertexBuffers, st.label,
-                                p->viewMask, nullptr, p->colorIntKinds, -1, false, p->a2cTest, p->sampleMask);
+                                p->viewMask, nullptr, p->colorIntKinds, -1, false, p->a2cTest, p->sampleMask, p->d24Emul);
     if (!o.ok) {
       if (ok) why = o.why;
       ok = false;
@@ -2260,6 +2296,8 @@ PipelineObj* createGraphics(Device* d, const VkGraphicsPipelineCreateInfo& ci) {
   }
   if (const auto* dy = ci.pDynamicState) p->dynamic.assign(dy->pDynamicStates, dy->pDynamicStates + dy->dynamicStateCount);
   p->dynStride = p->isDynamic(VK_DYNAMIC_STATE_VERTEX_INPUT_BINDING_STRIDE);
+  p->d24Emul = d24Emul() && st.depthFormat == vpgpu::Format::D24UnormS8 &&
+               (st.depthTest || p->isDynamic(VK_DYNAMIC_STATE_DEPTH_TEST_ENABLE));
 
   // Integer colour attachments by signedness (fragment outputs take the attachment's type).
   for (int c = 0; c < vpgpu::kMaxColorAttachments; ++c) {
@@ -2965,7 +3003,7 @@ PipelineObj::TexelVariant* texelVariant(Device* dev, const PipelineObj& p, const
   v.ok = true;
   for (const PipelineObj::StageSrc& src : p.sources) {
     StageOut o = translateStage(dev, src, *p.layout, p.viewCount, p.attrs, vbs, v.state.label, p.viewMask, &tb,
-                                p.colorIntKinds, -1, false, p.a2cTest, p.sampleMask);
+                                p.colorIntKinds, -1, false, p.a2cTest, p.sampleMask, p.d24Emul);
     if (!o.ok) {
       v.ok = false;
       break;
@@ -3025,9 +3063,9 @@ bool maskPipelineKey(Device* dev, const PipelineObj& p, PipelineObj::TexelVarian
       for (size_t i = 0; i < tb.size() && i < tv->formats.size(); ++i) tb[i].lowered = tv->formats[i];
     translated = false;
     for (const PipelineObj::StageSrc& src : p.sources) {
-      if (src.stage != VK_SHADER_STAGE_FRAGMENT_BIT) continue;
+      if (src.stage != VK_SHADER_STAGE_FRAGMENT_BIT || src.synthetic) continue;  // (a depth-only draw does not mark the mask)
       StageOut o = translateStage(dev, src, *p.layout, p.viewCount, p.attrs, p.vertexBuffers, st.label + ".um", p.viewMask,
-                                  tv ? &tb : nullptr, p.colorIntKinds, slot, uiMaskUsesAlpha(base.blend[0]), p.a2cTest, p.sampleMask);
+                                  tv ? &tb : nullptr, p.colorIntKinds, slot, uiMaskUsesAlpha(base.blend[0]), p.a2cTest, p.sampleMask, p.d24Emul);
       if (o.ok) st.fragmentShader = o.id, inputs[1] = o.input, translated = true;
       break;
     }
@@ -3265,7 +3303,9 @@ OpDraw makeDraw(Recorder& r, uint32_t first, uint32_t count, uint32_t instances,
                                 : p->rawDepth.compare;
     op.depthCmp = cmp == VK_COMPARE_OP_GREATER || cmp == VK_COMPARE_OP_GREATER_OR_EQUAL ? 1
                   : cmp == VK_COMPARE_OP_LESS || cmp == VK_COMPARE_OP_LESS_OR_EQUAL ? -1 : 0;
+    op.depthOp = cmp;
   }
+  op.depthD24 = p->state.depthFormat == vpgpu::Format::D24UnormS8;
   if (indexed) {
     if (!r.bound.index || !r.bound.index->id) {
       op.ok = false, op.reason = SkipReason::NoIndex;
@@ -4055,14 +4095,14 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdSetRenderingInputAttachmentIndicesKH
 
 // Private hook of vpgles (reached through vkGetDeviceProcAddr): the pipeline-recipe counters of this device for its
 // gles.pso.recipe line. out[0] loaded (recipes read from disk when the device was created), out[1] saved (recipes this run
-// added), out[2] prewarmed (recipes ready after the prewarm), out[3] miss_in_game (pipelines the game created that no
+// added), out[2] prewarmed (recipes ready after the prewarm), out[4] total (recipes in the store now), out[3] miss_in_game (pipelines the game created that no
 // recipe covered, so they compiled at their first draw). All 0 without a recipe store (VP_PIPELINE_CACHE_DIR unset).
-VPVK_EXPORT void vpvk_recipe_stats(VkDevice dv, uint32_t out[4]) {
+VPVK_EXPORT void vpvk_recipe_stats(VkDevice dv, uint32_t out[5]) {
   const Device* d = dv ? from<Device>(dv) : nullptr;
-  out[0] = out[1] = out[2] = out[3] = 0;
+  out[0] = out[1] = out[2] = out[3] = out[4] = 0;
   if (!d || !d->recipes || !d->recipes->enabled()) return;
   out[0] = d->recipesLoaded, out[1] = uint32_t(d->recipes->storedThisRun()), out[2] = d->recipesPrewarmed.load(),
-  out[3] = d->recipesFresh.load();
+  out[3] = d->recipesFresh.load(), out[4] = uint32_t(d->recipes->pipelineCount());
 }
 
 // Private hook of vpgles (reached through vkGetDeviceProcAddr): glInvalidateFramebuffer decides after the begin which

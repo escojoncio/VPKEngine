@@ -144,7 +144,7 @@ void encodeInput(Writer& w, const StageInput& in) {
   const uint8_t ext =
       uint8_t((o.multisampleAsSingle ? 1 : 0) | (o.viewMask ? 2 : 0) | (o.colorIntKinds ? 4 : 0) | (nYcbcr ? 8 : 0) |
                 (o.uiMaskSlot >= 0 ? 16 : 0) | (o.alphaTest ? 32 : 0) | (o.viewportIndex ? 64 : 0) | (o.rateMapPosition ? 128 : 0));
-  if (ext || !o.robustBuffers || o.sampleMask != ~0u) w.pod(ext);
+  if (ext || !o.robustBuffers || o.sampleMask != ~0u || o.d24Emul) w.pod(ext);
   if (o.viewMask) w.pod(uint32_t(o.viewMask));
   if (o.colorIntKinds) w.pod(uint16_t(o.colorIntKinds));
   if (nYcbcr) {
@@ -159,8 +159,9 @@ void encodeInput(Writer& w, const StageInput& in) {
     }
   }
   if (o.uiMaskSlot >= 0) w.pod(uint8_t(o.uiMaskSlot)), w.pod(uint8_t(o.uiMaskAlpha ? 1 : 0));
-  // last: emit flags, bit 0 robustBuffers off, bit 1 a sampleMask (uint32) follows
-  if (!o.robustBuffers || o.sampleMask != ~0u) w.pod(uint8_t((o.robustBuffers ? 0 : 1) | (o.sampleMask != ~0u ? 2 : 0)));
+  // last: emit flags, bit 0 robustBuffers off, bit 1 a sampleMask (uint32) follows, bit 2 d24Emul (no payload)
+  if (!o.robustBuffers || o.sampleMask != ~0u || o.d24Emul)
+    w.pod(uint8_t((o.robustBuffers ? 0 : 1) | (o.sampleMask != ~0u ? 2 : 0) | (o.d24Emul ? 4 : 0)));
   if (o.sampleMask != ~0u) w.pod(uint32_t(o.sampleMask));
 }
 
@@ -231,6 +232,7 @@ bool decodeInput(Reader& r, StageInput& in) {
   if (r.ok && r.p < r.end) {
     const uint8_t f = r.pod<uint8_t>();
     o.robustBuffers = !(f & 1);
+    o.d24Emul = (f & 4) != 0;
     if (f & 2) o.sampleMask = r.pod<uint32_t>();
   }
   return r.ok && in.spirv != 0;

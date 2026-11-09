@@ -254,7 +254,7 @@ using namespace vpvk;
 // Instance
 // ---------------------------------------------------------------------------------------------
 VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkEnumerateInstanceVersion(uint32_t* v) {
-  *v = deviceProperties().apiVersion;  // 1.3, or with the Quest identity 1.1 (1.3 in the conformance run): physical_device.cpp makeProps
+  *v = deviceProperties().apiVersion;  // 1.3 (1.3.295 with the Quest identity): physical_device.cpp makeProps
   return VK_SUCCESS;
 }
 
@@ -345,7 +345,7 @@ void fillDriver(VkPhysicalDeviceDriverProperties& d) {
   if (questIdentity()) {
     d.driverID = VK_DRIVER_ID_QUALCOMM_PROPRIETARY;
     std::strncpy(d.driverName, "Qualcomm Technologies Inc. Adreno Vulkan Driver", sizeof d.driverName - 1);
-    std::strncpy(d.driverInfo, "Driver Build: 512.744.0", sizeof d.driverInfo - 1);
+    std::strncpy(d.driverInfo, "Driver Build: 512.837.7", sizeof d.driverInfo - 1);
   } else {
     d.driverID = VK_DRIVER_ID_QUALCOMM_PROPRIETARY;  // no Apple id exists; the one AVP validated, so no MoltenVK paths turn on
     std::strncpy(d.driverName, "VPVulkan", sizeof d.driverName - 1);
@@ -368,8 +368,8 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkGetPhysicalDeviceProperties2(VkPhysical
         auto* m = reinterpret_cast<VkPhysicalDeviceMultiviewProperties*>(s);
         // Views are instances (view = instance % count, layer = the mask's bit index; spirv lower.cpp),
         // not Metal vertex amplification: any count up to the layered-rendering limit works.
-        m->maxMultiviewViewCount = 8;
-        m->maxMultiviewInstanceIndex = (1u << 27) - 1;  // x8 views still fits 32-bit instance ids
+        m->maxMultiviewViewCount = questIdentity() ? 6 : 8;  // Quest 3 real: 6
+        m->maxMultiviewInstanceIndex = (1u << 27) - 1;  // x8 views (native) still fits 32-bit instance ids
         break;
       }
       case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_DENSITY_MAP_PROPERTIES_EXT: {
@@ -405,8 +405,7 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkGetPhysicalDeviceProperties2(VkPhysical
         auto* r = reinterpret_cast<VkPhysicalDeviceDepthStencilResolveProperties*>(s);
         r->supportedDepthResolveModes = VK_RESOLVE_MODE_SAMPLE_ZERO_BIT | VK_RESOLVE_MODE_MIN_BIT | VK_RESOLVE_MODE_MAX_BIT;
         r->supportedStencilResolveModes = VK_RESOLVE_MODE_SAMPLE_ZERO_BIT;
-        r->independentResolveNone = VK_TRUE;
-        r->independentResolve = VK_TRUE;
+        r->independentResolveNone = r->independentResolve = questIdentity() ? VK_FALSE : VK_TRUE;  // Quest 3 real: false
         break;
       }
       case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MULTI_DRAW_PROPERTIES_EXT: {
@@ -443,7 +442,7 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkGetPhysicalDeviceProperties2(VkPhysical
         v->subgroupSupportedOperations = kSubgroupOps;
         v->subgroupQuadOperationsInAllStages = VK_FALSE;
         v->pointClippingBehavior = VK_POINT_CLIPPING_BEHAVIOR_ALL_CLIP_PLANES;
-        v->maxMultiviewViewCount = 8;
+        v->maxMultiviewViewCount = questIdentity() ? 6 : 8;  // Quest 3 real: 6
         v->maxMultiviewInstanceIndex = (1u << 27) - 1;
         v->protectedNoFault = VK_FALSE;
         v->maxPerSetDescriptors = 1024;
@@ -465,8 +464,7 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkGetPhysicalDeviceProperties2(VkPhysical
         v->shaderRoundingModeRTEFloat32 = VK_TRUE;
         v->supportedDepthResolveModes = VK_RESOLVE_MODE_SAMPLE_ZERO_BIT | VK_RESOLVE_MODE_MIN_BIT | VK_RESOLVE_MODE_MAX_BIT;
         v->supportedStencilResolveModes = VK_RESOLVE_MODE_SAMPLE_ZERO_BIT;
-        v->independentResolveNone = VK_TRUE;
-        v->independentResolve = VK_TRUE;
+        v->independentResolveNone = v->independentResolve = questIdentity() ? VK_FALSE : VK_TRUE;  // Quest 3 real: false
         v->maxTimelineSemaphoreValueDifference = UINT64_MAX;
         v->framebufferIntegerColorSampleCounts = VK_SAMPLE_COUNT_1_BIT;
         break;
@@ -659,8 +657,8 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkGetPhysicalDeviceFeatures2(VkPhysicalDe
   // What the driver really does, in one place; every extension / VulkanNN struct reads from it.
   // Not offered (the translator or the driver does not do it): 16-bit shader inputs/outputs,
   // variablePointers (workgroup pointers), protected memory, descriptor indexing, shader Int64
-  // atomics, availability / visibility chains, update-after-bind (see bitacora.md, "No viable"). Games therefore
-  // see apiVersion 1.1; the conformance run (VPVK_EXTRA_EXTENSIONS=1) reports 1.3 like the Adreno 740.
+  // atomics, availability / visibility chains, update-after-bind (see bitacora.md, "No viable"). Games see
+  // apiVersion 1.3 (1.3.295 with the Quest identity) like the Adreno 740.
   const VkBool32 multiDraw = extraExtensions();  // EXT_multi_draw is no Adreno extension
   // Everything added for the Adreno profile that the Vulkan CTS has not validated yet answers only
   // in the conformance run (VPVK_EXTRA_EXTENSIONS=1); games see the pre-profile answers.

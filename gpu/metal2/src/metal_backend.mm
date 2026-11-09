@@ -588,6 +588,9 @@ struct MetalBackend::Impl {
     // [[position]] (fsPosition) and, if so built, maps it back to screen space through the rate map data at
     // [[buffer(28)]] (rrmFs; vpmsl kRateMapDecl). A foveated pass only draws pipelines that can.
     bool vpIndexed = false, fsPosition = false, rrmFs = false;
+    // D24 emulation (VPVK_D24_EMUL): the fragment function reads the draw's depth bias at [[buffer(26)]] (vpmsl kDepthBiasDecl) and adds
+    // it to the depth it writes; the draw then sets the hardware depth bias to 0 and binds {constant, slope, clamp, 0} per draw.
+    bool dBias = false;
     // 2: the vertex shader multiviews through vertex amplification ([[amplification_id]]): its draws run with the encoder's
     // amplification count 2 and view mappings (view v -> layer v, and viewport v when vpIndexed).
     NSUInteger amp = 1;
@@ -3499,6 +3502,7 @@ bool MetalBackend::Impl::buildRender(const PipelineState& s, Pipeline& p, std::s
   if (s.fragmentShader) {
     p.fsPosition = fs.source.find("[[position]]") != std::string::npos;
     p.rrmFs = fs.source.find("constant rasterization_rate_map_data& vp_rrm") != std::string::npos;  // vpmsl kRateMapDecl
+    p.dBias = fs.source.find("constant float3& vp_dbias") != std::string::npos;  // vpmsl kDepthBiasDecl
   }
   p.label = s.label;
   p.vsId = s.vertexShader, p.fsId = s.fragmentShader;
@@ -6134,10 +6138,11 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
             curAmp = 1;
           }
           id<MTLRenderPipelineState> ps = p->render;
+          bool substituted = false;  // the VP_KNOCK_FSR substitute writes no depth: D24 emulation's bias is then the hardware's
           if (knockHere && knockFrame.fsr && p->vsId == knockFrame.vs && p->fsId == knockFrame.fs) {
             // VP_KNOCK_FSR: the same pipeline with a trivial fragment function (the draw and every other state are untouched);
             // one whose substitute is not ready draws as it is.
-            if (id<MTLRenderPipelineState> sub = knockFsrPso(d.pipeline.value)) ps = sub, ++knockSkipped;
+            if (id<MTLRenderPipelineState> sub = knockFsrPso(d.pipeline.value)) ps = sub, ++knockSkipped, substituted = true;
           }
           if (!elide || ampChange || st.ps != ps) {
             [open.render setRenderPipelineState:ps];
@@ -6196,9 +6201,18 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
             [open.render setFrontFacingWinding:winding];
             st.winding = winding;
           }
-          if (!elide || st.bias != d.depthBias || st.slope != d.depthBiasSlope || st.clamp != d.depthBiasClamp) {
-            [open.render setDepthBias:d.depthBias slopeScale:d.depthBiasSlope clamp:d.depthBiasClamp];
-            st.bias = d.depthBias, st.slope = d.depthBiasSlope, st.clamp = d.depthBiasClamp;
+          // D24 emulation: the shader adds the bias to the depth it writes, so the hardware applies none (unless the
+          // VP_KNOCK_FSR substitute draws: it writes no depth).
+          const bool depthInShader = p->dBias && !substituted;
+          const float hwBias = depthInShader ? 0.0f : d.depthBias, hwSlope = depthInShader ? 0.0f : d.depthBiasSlope,
+                      hwClamp = depthInShader ? 0.0f : d.depthBiasClamp;
+          if (!elide || st.bias != hwBias || st.slope != hwSlope || st.clamp != hwClamp) {
+            [open.render setDepthBias:hwBias slopeScale:hwSlope clamp:hwClamp];
+            st.bias = hwBias, st.slope = hwSlope, st.clamp = hwClamp;
+          }
+          if (depthInShader) {  // (set per draw: setFragmentBytes is cheap and the pipelines are few)
+            const float dbias[4] = {d.depthBias, d.depthBiasSlope, d.depthBiasClamp, 0.0f};
+            [open.render setFragmentBytes:dbias length:sizeof dbias atIndex:26];
           }
           const MTLDepthClipMode clip = d.depthClamp ? MTLDepthClipModeClamp : MTLDepthClipModeClip;
           if (!elide || st.clip != clip) {

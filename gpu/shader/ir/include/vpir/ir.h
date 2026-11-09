@@ -79,6 +79,8 @@ enum class Builtin : uint8_t {
     ViewportIndex,        // vertex out: u32 ([[viewport_array_index]]). Multiview with a rasterization rate map: =
                           // the view, because Metal picks the map's layer by viewport index, not by render target layer
     AmplificationId,      // vertex in: u32 ([[amplification_id]]: the view under Metal vertex amplification)
+    DepthBias,            // fragment in: vec3<f32> {constant factor, slope factor, clamp} of the draw's depth bias (D24 emulation;
+                          // MSL: vp_dbias, vpmsl kDepthBiasDecl). Never a stage attribute: the backend writes it per draw
 };
 
 enum class Interp : uint8_t { Perspective, Linear, Flat };
