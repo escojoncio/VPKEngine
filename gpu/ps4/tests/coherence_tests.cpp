@@ -1919,19 +1919,29 @@ void compareMismatch() {
     const Program cmp = load("ps_sample_compare");
     CHECK(qual(f, "compare_mismatch") == 0);
     const uint64_t before = qual(f, "compare_mismatch");
-    compareDraw(f, cmp, kTex, 64, 64, 4, 7);  // memory: a texture filled from guest memory
+    compareDraw(f, cmp, kTex, 64, 64, 4, 7);  // memory: a texture filled from guest memory, made a depth texture (the program
+                                              // declares depth2d: a colour texture bound there is undefined on Metal)
     CHECK(qual(f, "cmp_binds") == 1 && qual(f, "cmp_draws") == 1);
     CHECK(qual(f, "cmp_route_texture_from_memory") == 1);
-    CHECK(qual(f, "cmp_host_not_depth") == 1 && qual(f, "cmp_host_depth") == 0);
-    CHECK(qual(f, "compare_mismatch") == before + 1 && qual(f, "compare_mismatch_binds") == 1);
-    CHECK(qual(f, "cmp_h_4_r32float_texture_from_memory") == 1);
+    CHECK(qual(f, "cmp_host_depth") == 1 && qual(f, "cmp_host_not_depth") == 0);
+    CHECK(qual(f, "compare_mismatch") == before && qual(f, "compare_mismatch_binds") == 0);
+    CHECK(qual(f, "cmp_h_4_d32float_texture_from_memory") == 1);
     CHECK(qual(f, "cmp_fill_none") + qual(f, "cmp_fill_gpu_detile") + qual(f, "cmp_fill_cpu_detile") + qual(f, "cmp_fill_linear_upload") + qual(f, "cmp_fill_not_filled") == 1);
+    CHECK(qual(f, "cmp_fill_not_filled") == 0);
     f.renderer.draw(f.state());  // a colour target at kRt
     compareDraw(f, cmp, kRt, 128, 128, 4, 7);
     CHECK(qual(f, "cmp_route_color_target_found") == 1);
-    CHECK(qual(f, "compare_mismatch") == before + 2 && qual(f, "cmp_host_depth") == 0);
+    CHECK(qual(f, "compare_mismatch") == before + 1 && qual(f, "cmp_host_depth") == 1);
     CHECK(compareLine(f));
     if (failures) f.dump();
+    {  // VPKENGINE_CMP_COLOR=1: the old colour texture
+        setenv("VPKENGINE_CMP_COLOR", "1", 1);
+        Fixture g;
+        compareDraw(g, cmp, kTex, 64, 64, 4, 7);
+        CHECK(qual(g, "cmp_host_not_depth") == 1 && qual(g, "compare_mismatch") == 1);
+        unsetenv("VPKENGINE_CMP_COLOR");
+        if (failures) g.dump();
+    }
 }
 
 // The same T# over a depth target: the host resource is a depth texture, nothing is counted as a mismatch.

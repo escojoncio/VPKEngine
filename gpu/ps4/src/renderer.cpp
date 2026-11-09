@@ -3654,6 +3654,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
     }
 
     bool depthArrayLoose = !std::getenv("VPKENGINE_DEPTH_ARRAY_STRICT");
+    bool cmpAsDepth = !std::getenv("VPKENGINE_CMP_COLOR");
     // The render target a T# names: same address, base level, a slice range inside the target's, a
     // format of the same texel size (sampled through a view) and a size the target covers. A target is allocated
     // at the CB's pitch and height, so a T# of the picture drawn in it (816x870 in a 896x896 allocation) is
@@ -3874,11 +3875,11 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         return true;
     }
     std::vector<uint32_t> attachedWids;  // the images the draw being recorded renders to (colour and depth)
-    TexRef textureRef(const ImageDesc& desc, bool storage, bool write, bool integerOnly = false) {
+    TexRef textureRef(const ImageDesc& desc, bool storage, bool write, bool integerOnly = false, bool compare = false) {
         texWhy.clear();
         bool depthTarget = false;
         const TexturePlan plan = planFor(desc, storage, depthTarget);
-        const vpgpu::Format f = plan.format;
+        vpgpu::Format f = plan.format;
         if (f == vpgpu::Format::Undefined) {
             note("texture format " + std::to_string(desc.dataFormat) + "/" + std::to_string(desc.numFormat) + " unsupported" +
                  (plan.why ? std::string(" (") + plan.why + ")" : std::string()));
@@ -3942,6 +3943,13 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
             life.noteRead(id, r.frame_);
             return {id, {}};
         }
+        // A T# sampled with compare is declared a depth texture (depth2d, lift.cpp): with no depth target behind it, the texture
+        // made from memory is a depth texture of the same texel (32-bit float -> D32Float, 16-bit unorm -> D16Unorm). A colour
+        // texture in a depth slot is undefined on Metal. VPKENGINE_CMP_COLOR=1: the colour texture.
+        const bool asDepth = compare && !storage && !plan.softBc && cmpAsDepth &&
+                             (f == vpgpu::Format::R32Float || f == vpgpu::Format::R16Unorm) &&
+                             (desc.type == 9 || desc.type == 11 || desc.type == 13);
+        if (asDepth) f = f == vpgpu::Format::R32Float ? vpgpu::Format::D32Float : vpgpu::Format::D16Unorm;
         if (!plan.exact && plan.why) note(plan.why);
         ImageDesc d = desc;  // (the host texture of a subsampled / 1-bit format is narrower)
         if (plan.widthDivisor > 1) {
@@ -3995,7 +4003,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         // Metal has no sRGB storage). Memory never held that picture, and re-tiling it into another
         // layout would round-trip through a format conversion: this T# sees the writer's image
         // through a view of its format (the writer's own format without views).
-        if (!storage && !plan.softBc) {
+        if (!storage && !plan.softBc && !asDepth) {
             auto own = atAddress.find(h.h);
             const uint64_t ownVersion = own == atAddress.end() || !own->second.filled ? 0 : own->second.version;
             for (auto& [key, other] : atAddress)
@@ -4036,6 +4044,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
             if (!tex.id) return texWhy = invalidTexture(td), TexRef{};
             tex.storage = storage;
             tex.format = f;
+            tex.isDepth = asDepth;
             tex.layout = plan.softBc ? plan.layout : vpgpu::Format::Undefined;
             tex.softBc = plan.softBc;
             tex.softSigned = plan.softSigned;
@@ -4645,7 +4654,8 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
                     const ImageDesc image = decodeImage({words, b.dwords});
                     if (probeOn && stage == vpgcn::ShaderStage::Pixel && !probePs.valid) probePs = {true, image};
                     if ((cmpArm = res.depth && vpgpu::probe::enabled())) cmpRoute = ProbeStats::kCmpOther, cmpSurface = nullptr;
-                    const TexRef ref = textureRef(image, res.kind == vpir::ResourceKind::StorageTexture, a.write, res.integerOnly);
+                    const TexRef ref = textureRef(image, res.kind == vpir::ResourceKind::StorageTexture, a.write, res.integerOnly,
+                                                  res.depth && res.kind == vpir::ResourceKind::Texture);
                     if (cmpArm) probeCompare(image, stage, ref), cmpArm = false;
                     if (resolved_) {
                         ResolvedTexture rt;
