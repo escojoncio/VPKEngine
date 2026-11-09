@@ -60,6 +60,9 @@ struct DepthTarget {
     // depth resolve done by a draw). Without it the host resolves nearest-sample (msaa.h).
     bool depthCopy = false;
     uint8_t copySample = 0;
+    // DB_DEPTH_SIZE pitch and height (texels per row, rows) as allocated, when width/height are the title's smaller size
+    // (the SetDepthRenderTarget hint: dynamic resolution); 0: width/height. Guest memory is laid out at these.
+    uint32_t pitch = 0, rows = 0;
 };
 
 // CB_BLENDn_CONTROL fields (BLEND_* factor and COMB_* function encodings).

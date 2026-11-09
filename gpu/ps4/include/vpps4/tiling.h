@@ -74,6 +74,7 @@ struct TiledSurface {
     uint32_t bytesPerElement = 4;    // 1, 2, 4, 8 or 16 (a block for block-compressed formats)
     uint32_t width = 1, height = 1;  // texels of level 0
     uint32_t pitch = 0;              // texels per row of level 0 as allocated (0: width)
+    uint32_t rows = 0;               // rows of level 0 as allocated (0: height; a depth surface drawn smaller than DB_DEPTH_SIZE)
     uint32_t slices = 1;             // array layers (cube: 6 per cube), or the depth of a volume
     // Beyond mip 0 of a plain surface:
     uint32_t levels = 1;             // mip levels stored (T# last level - base level + 1)

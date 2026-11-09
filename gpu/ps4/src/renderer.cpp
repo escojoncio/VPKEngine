@@ -224,6 +224,7 @@ struct Renderer::Impl {
         uint64_t refillSkipped = 0, refillSkippedBytes = 0, refillLines = 0;  // refills of a target left out because only images wrote its range (R1)
         uint64_t fillPath[5] = {}, fillPathBytes[5] = {};                  // none, GPU detile, CPU detile, linear upload, not filled
         uint64_t mirrorCalls = 0, mirrorCopies = 0, mirrorBytes = 0;
+        uint64_t depthAllocLines = 0;  // depth targets made drawn smaller than their allocation (VPKENGINE_PROBE DEPTHALLOC)
         uint64_t msDraws[4][4] = {};  // samples the title asked for (1,2,4,8) x samples the host draws with
         std::unordered_map<const char*, uint64_t> resolveDrops;
         struct Plan {
@@ -1932,6 +1933,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         uint8_t tile = 8;    // TILE_MODE_INDEX
         uint8_t dfmt = 0, nfmt = 0;  // T# DATA_FORMAT / NUM_FORMAT (textures; diagnostics)
         uint32_t pitch = 0;  // texels per row as allocated (0: width)
+        uint32_t rows = 0;   // rows as allocated (0: height; a depth target drawn smaller than DB_DEPTH_SIZE)
         bool isDepth = false;
         uint16_t mips = 1;       // levels in the guest layout (textures)
         bool pow2Pad = false;    // T# POW2_PAD: arrays padded to a power of two slices in memory
@@ -2218,6 +2220,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         t.width = s.width;
         t.height = s.height;
         t.pitch = std::max(s.pitch, s.width);
+        t.rows = s.rows;
         t.volume = s.type == vpgpu::TextureType::Tex3D;
         t.slices = t.volume ? s.depth : s.layers;
         t.pow2Pad = s.pow2Pad;
@@ -2449,7 +2452,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
             return true;
         }
         const uint32_t blocksWide = (std::max(s.pitch, s.width) + fi.blockSize - 1) / fi.blockSize;
-        const uint32_t blocksHigh = (s.height + fi.blockSize - 1) / fi.blockSize;
+        const uint32_t blocksHigh = (std::max(s.rows, s.height) + fi.blockSize - 1) / fi.blockSize;
         const uint64_t rowBytes = uint64_t(blocksWide) * fi.bytesPerBlock;
         const uint64_t total = rowBytes * blocksHigh * slicesOf(s);
         BufferId buffer;
@@ -3594,7 +3597,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
     // through a view format (`viewAs`) of the existing target when the host has views.
     Target* target(std::map<uint64_t, std::vector<Target>>& cache, uint64_t address, vpgpu::Format f, uint32_t w,
                    uint32_t h, uint8_t samples, uint16_t layers, bool depth, uint8_t tile, uint32_t pitch,
-                   vpgpu::Format* viewAs = nullptr) {
+                   vpgpu::Format* viewAs = nullptr, uint32_t rows = 0) {
         layers = std::max<uint16_t>(layers, 1);
         if (depth)  // (a depth surface written at another base than it is read from answers for both)
             if (auto a = depthAliases.find(address); a != depthAliases.end())
@@ -3637,9 +3640,15 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         t.layers = layers;
         t.tile = tile;
         t.pitch = pitch;
+        t.rows = rows;
         t.isDepth = depth;
         t.address = address;
-        t.bytes = surfaceBytes(tile, depth ? zPlaneFormat(f) : f, w, h, pitch, layers);
+        t.bytes = surfaceBytes(tile, depth ? zPlaneFormat(f) : f, w, std::max(h, rows), pitch, layers);
+        if (depth && (pitch > w || rows > h) && vpgpu::probe::enabled() && (++pstat.depthAllocLines <= 40 || pstat.depthAllocLines % 600 == 0))
+            log("VPKENGINE_PROBE DEPTHALLOC n=" + std::to_string(pstat.depthAllocLines) + " f=" + std::to_string(r.frame_) + " addr=" + hex(address) +
+                " drawn=" + std::to_string(w) + "x" + std::to_string(h) + " alloc=" + std::to_string(std::max(pitch, w)) + "x" +
+                std::to_string(std::max(rows, h)) + " layers=" + std::to_string(layers) + " tile=" + std::to_string(tile) + " samples=" +
+                std::to_string(samples) + " fmt=" + std::to_string(int(f)));
         t.lastUse = r.frame_;
         ++r.stats_.targets;
         ++texGen;
@@ -3710,11 +3719,11 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         // The surfaces the passes drew into, at whatever sample count they have (a multisampled depth is copied
         // through its single-sample picture); a new empty 1x one only if nothing was drawn there yet.
         Target* src = existingDepth(from, zf, z.width, z.height, layers, z.tileMode);
-        if (!src) src = target(depthTargets, from, zf, z.width, z.height, 1, layers, true, z.tileMode, 0);
+        if (!src) src = target(depthTargets, from, zf, z.width, z.height, 1, layers, true, z.tileMode, depthPitch(z), nullptr, depthRows(z));
         if (!src) return skip("depth copy: target creation failed");
         const uint32_t srcWid = src->wid;
         Target* dst = existingDepth(to, zf, z.width, z.height, layers, z.tileMode);
-        if (!dst) dst = target(depthTargets, to, zf, z.width, z.height, 1, layers, true, z.tileMode, 0);
+        if (!dst) dst = target(depthTargets, to, zf, z.width, z.height, 1, layers, true, z.tileMode, depthPitch(z), nullptr, depthRows(z));
         if (!dst) return skip("depth copy: target creation failed");
         src = static_cast<Target*>(surfaceOf(srcWid));  // (a creation may have moved it)
         if (src->wid == dst->wid) return;  // one texture already answers for both addresses
@@ -3781,6 +3790,12 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
     }
 
     bool depthArrayLoose = !std::getenv("VPKENGINE_DEPTH_ARRAY_STRICT");
+    // A depth target drawn at the title's smaller size (DB extent hint, dynamic resolution) inside its DB_DEPTH_SIZE allocation:
+    // guest memory is laid out at the allocation, and a T# of the allocation sees the picture in its corner (as shadPS4: pitch
+    // and height from the registers, size from the hint). VPKENGINE_DEPTH_LAYOUT_HINT=1: laid out at the hinted size (before).
+    bool depthLayoutAlloc = !std::getenv("VPKENGINE_DEPTH_LAYOUT_HINT");
+    uint32_t depthPitch(const DepthTarget& z) const { return depthLayoutAlloc && z.pitch > z.width ? z.pitch : 0; }
+    uint32_t depthRows(const DepthTarget& z) const { return depthLayoutAlloc && z.rows > z.height ? z.rows : 0; }
     bool cmpAsDepth = !std::getenv("VPKENGINE_CMP_COLOR");
     // The render target a T# names: same address, base level, a slice range inside the target's, a
     // format of the same texel size (sampled through a view) and a size the target covers. A target is allocated
@@ -3798,7 +3813,10 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         const uint32_t lastSlice = d.type == 11 ? 6 * (uint32_t(d.lastArray) / 6 + 1) - 1 : arrayed ? d.lastArray : d.baseArray;
         Target* best = nullptr;
         for (Target& c : t->second) {
-            if (exact ? c.width != d.width || c.height != d.height : c.width < d.width || c.height < d.height) continue;
+            // (a depth target drawn smaller than its allocation, read by a T# no larger than the allocation: the picture is its corner)
+            const bool inAllocation = depth && (c.pitch > c.width || c.rows > c.height) && d.width <= std::max(c.pitch, c.width) &&
+                                      d.height <= std::max(c.rows, c.height);
+            if (exact ? c.width != d.width || c.height != d.height : (c.width < d.width || c.height < d.height) && !inAllocation) continue;
             // (a depth array drawn in fewer slices than its T# names, e.g. shadow cascades: the drawn slices are the target's,
             // the rest were never drawn; refilling all of them from memory every frame would round-trip the target. Only when
             // no smaller target at this address was used as recently as this one: drawn in ascending order the first time,
@@ -4990,7 +5008,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
             const uint64_t readAddress = z.zFormat ? z.zAddress : z.stencilAddress;
             const uint64_t writeAddress = z.zFormat ? z.zWriteAddress : z.stencilWriteAddress;
             Target* dt = target(depthTargets, readAddress, zf, z.width, z.height,
-                                samples, uint16_t(z.sliceStart + z.sliceCount), true, z.tileMode, 0);
+                                samples, uint16_t(z.sliceStart + z.sliceCount), true, z.tileMode, depthPitch(z), nullptr, depthRows(z));
             if (!dt) return skip("depth target creation failed");
             {
                 const uint64_t zBase = agreedBase(z.zAddress, z.zWriteAddress), stencilBase = agreedBase(z.stencilAddress, z.stencilWriteAddress);

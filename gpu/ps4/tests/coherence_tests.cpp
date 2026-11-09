@@ -1281,6 +1281,50 @@ void depthWriteBack() {
     }
 }
 
+// A depth surface drawn at the title's smaller size (the SetDepthRenderTarget hint of a dynamic resolution: 64x64) inside its
+// allocation (DB_DEPTH_SIZE pitch and height: 256x256): guest memory is laid out at the allocation, as a T# of the whole surface
+// reads it (shadow cascades sampled as a 1024x1024 array, drawn 512x512). The image owns the whole allocation and the retile
+// tiles the 64x64 picture with the allocation's pitch and rows; at the hinted size the rows land at other offsets and the
+// slices inside the first one. VPKENGINE_DEPTH_LAYOUT_HINT=1: the hinted size (before).
+void depthHintLayout() {
+    for (const bool old : {false, true}) {
+        if (old) setenv("VPKENGINE_DEPTH_LAYOUT_HINT", "1", 1);
+        Fixture f;
+        vpps4::DrawState d = zState(f, 3, false, 3);  // Z_32_FLOAT, depth 2D thin
+        d.depth.width = d.depth.height = 64;
+        d.depth.pitch = d.depth.rows = 256;
+        f.renderer.draw(d);
+        vpps4::TiledSurface full;
+        full.tileIndex = 3, full.bytesPerElement = 4, full.width = full.height = 64, full.pitch = 256, full.rows = 256;
+        vpps4::TiledSurface hinted = full;
+        hinted.pitch = hinted.rows = 0;
+        const vpps4::SurfaceLayout want = vpps4::computeLayout(old ? hinted : full);
+        CHECK(want.ok && vpps4::computeLayout(full).levels[0].pitch == 256 && vpps4::computeLayout(full).levels[0].paddedHeight == 256);
+        CHECK(vpps4::computeLayout(hinted).levels[0].pitch < 256);  // (the two layouts differ)
+        const uint64_t bytes = 256 * 256 * 4;
+        CHECK((f.renderer.tracker().ownerImage(kDepth + bytes / 2, bytes / 2) != 0) == !old);
+        f.rawWrite(kDepth + 0x100, 256);  // a raw reader of the Z plane: written back
+        CHECK(f.renderer.stats().gpuRetiled == 1);
+        f.renderer.submit();
+        unsigned ran = 0;
+        for (const vpgpu::Command& c : f.backend.commands) {
+            const auto* dp = std::get_if<vpgpu::Dispatch>(&c);
+            if (!dp || dp->label.rfind("gpu retile", 0) != 0) continue;
+            for (const vpgpu::Access& a : dp->bindings) {
+                if (a.kind != vpgpu::BindKind::ConstantBuffer || a.slot != 0) continue;
+                VptParams P;
+                std::memcpy(&P, f.backend.memory.at(a.range.index) + a.range.begin, sizeof P);
+                CHECK(P.level.pitch == want.levels[0].pitch && P.level.height == want.levels[0].paddedHeight);
+                CHECK(P.width == 64 && P.height == 64);
+                ++ran;
+            }
+        }
+        CHECK(ran == 1);
+        if (old) unsetenv("VPKENGINE_DEPTH_LAYOUT_HINT");
+        if (failures) f.dump();
+    }
+}
+
 // ---- Guest windows -----------------------------------------------------------------------------------------------
 
 constexpr uint64_t kWinBase = 0x40000000, kMiB = 1ull << 20;
@@ -1989,6 +2033,51 @@ void compareMismatch() {
     }
 }
 
+// Shadow cascades drawn at a dynamic resolution (64x64, one slice per pass) in a 256x256 allocation and sampled with compare through
+// a T# of the allocation (a 256x256 array of 2): the depth target is read (its picture copied into the corner of a texture of the
+// T#'s size, again whenever it is drawn), not a texture made from memory that the slice passes never write back (a slice cleared
+// alone does not make the image the guest's: the texture stayed as first filled). VPKENGINE_DEPTH_LAYOUT_HINT=1: from memory (before).
+void depthHintSample() {
+    ProbeOn probe;
+    const Program cmp = load("ps_sample_compare");
+    for (const bool old : {false, true}) {
+        if (old) setenv("VPKENGINE_DEPTH_LAYOUT_HINT", "1", 1);
+        Fixture f;
+        auto drawSlices = [&] {
+            for (uint16_t k = 0; k < 2; ++k) {
+                vpps4::DrawState d = f.depthState(true);
+                d.color[0] = {};
+                d.depth.width = d.depth.height = 64;
+                d.depth.pitch = d.depth.rows = 256;
+                d.depth.sliceStart = k;
+                d.depth.depthClear = true;
+                f.renderer.draw(d);
+            }
+        };
+        auto sampleArray = [&] {
+            vpps4::DrawState d = f.state();
+            d.ps.code = cmp.code;
+            d.ps.userSgprs = 12;
+            d.ps.userData.fill(0);
+            Fixture::tsharp(d.ps.userData.data(), kDepth, 256, 256, 4, 7, 8);
+            d.ps.userData[3] = (d.ps.userData[3] & 0x0fffffffu) | (13u << 28);  // 2D array
+            d.ps.userData[5] = 1u << 13;                                        // slices 0..1
+            f.renderer.draw(d);
+        };
+        drawSlices();
+        f.renderer.submit();
+        drawSlices();
+        sampleArray();
+        CHECK(qual(f, "cmp_route_depth_target_found") == (old ? 0u : 1u) && qual(f, "cmp_route_texture_from_memory") == (old ? 1u : 0u));
+        drawSlices();
+        sampleArray();
+        const auto e = f.events();
+        CHECK(Fixture::count(e, "copy sampled corner " + Fixture::hex(kDepth)) == (old ? 0u : 2u));  // (copied again after the draws)
+        if (old) unsetenv("VPKENGINE_DEPTH_LAYOUT_HINT");
+        if (failures) f.dump();
+    }
+}
+
 // The same T# over a depth target: the host resource is a depth texture, nothing is counted as a mismatch.
 void compareDepth() {
     ProbeOn probe;
@@ -2161,6 +2250,8 @@ int main(int argc, char** argv) {
     else if (t == "raw_depth_clear") rawDepthClear();
     else if (t == "tiled_retile") tiledRetile();
     else if (t == "depth_write_back") depthWriteBack();
+    else if (t == "depth_hint_layout") depthHintLayout();
+    else if (t == "depth_hint_sample") depthHintSample();
     else if (t == "flat_map") flatMap();
     else if (t == "window_superseded") windowSuperseded();
     else if (t == "eviction") eviction();

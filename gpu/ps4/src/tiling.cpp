@@ -131,7 +131,7 @@ SurfaceLayout computeLayout(const TiledSurface& s) {
     uint64_t offset = 0, linear = 0;
     for (uint32_t level = 0; level < s.levels; ++level) {
         LevelLayout l;
-        uint32_t lw = std::max(pitch0 >> level, 1u), lh = std::max(s.height >> level, 1u);
+        uint32_t lw = std::max(pitch0 >> level, 1u), lh = std::max(std::max(s.rows, s.height) >> level, 1u);
         uint32_t vw = std::max(s.width >> level, 1u), vh = std::max(s.height >> level, 1u);
         const uint32_t vd = s.volume ? std::max(s.slices >> level, 1u) : s.slices;
         if (s.blockSize > 1) {
