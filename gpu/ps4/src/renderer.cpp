@@ -2396,7 +2396,10 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
     const Surface* cmpSurface = nullptr;
     void routed(uint8_t route, const Surface& s) {
         if (cmpArm) cmpRoute = route, cmpSurface = &s;
-        if (cap.armed) cap.drawSampled.push_back(s.wid), capAdd(s.wid);
+        if (cap.armed) {
+            cap.drawSampled.push_back(s.wid), capAdd(s.wid);
+            if (cmpArm) cap.compare.insert(s.wid);
+        }
     }
     void probeSampled(const ImageDesc& d, const Surface& s, const char* backing, bool storage) {
         if (probePass.empty() || !probeOpen() || probeLines >= kProbeLines) return;
@@ -2969,10 +2972,11 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
     // "N" = every N s, "Nf" = every N frames, "0" = off). In a captured frame the render passes are listed in order
     // (VPKENGINE_PROBE FRAMECAP_PASS: attachments, draws, the images its draws sampled) and, once the frame ran (the submit
     // waits for the GPU: a debugging stall of the command processor, as TEXVERIFY), every image it drew into or sampled is
-    // read back (up to kCapImages, kCapBytes): FRAMECAP_IMG with the texels and aligned 8x8 / 32x32 tiles that are exactly
+    // read back (up to kCapImages, those sampled with compare, depth and big colour targets first; framecap::Budget bounds the
+    // bytes and texels): FRAMECAP_IMG with the texels and aligned 8x8 / 32x32 tiles that are exactly
     // zero, NaN / Inf, the finite range (depth), a hash, and for a texture the writers of its range and the targets that
     // overlap it (frame_capture.h). Its targets are kept stored in that frame (noteRead). Pictures
-    // framecap-<n>-<i>-<kind>-<addr>-<fmt>-<w>x<h>-s<slice>.ppm (<= 768 px wide, kCapDisk in all) for the first capture and for
+    // framecap-<n>-<i>-<kind>-<addr>-<fmt>-<w>x<h>-s<slice>.ppm (<= 768 px wide, capDisk in all: VPKENGINE_FRAMECAP_DISK bytes) for the first capture and for
     // the frame after a capture where a colour target of 512x512 or more has 1 % of its 8x8 tiles at zero (FRAMECAP_PATTERN),
     // at most one such every 30 s.
     struct FrameCap {
@@ -2982,7 +2986,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         uint64_t n = 0, disk = 0, nextFrame = 0;
         Clock::time_point next{}, nextFiles{};
         std::vector<uint32_t> wids, drawSampled, passSampled;  // images of the frame (first seen first); sampled by a draw / a pass
-        std::unordered_set<uint32_t> seen;
+        std::unordered_set<uint32_t> seen, compare;  // compare: sampled by a draw whose shader declares a depth texture
         std::vector<std::string> passes;
         std::string pass;
         uint32_t passDraws = 0;
@@ -2998,8 +3002,8 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         return c;
     }
     FrameCap cap = makeFrameCap();
-    static constexpr uint32_t kCapImages = 96;
-    static constexpr uint64_t kCapBytes = 256ull << 20, kCapDisk = 200ull << 20;
+    static constexpr uint32_t kCapImages = 24;
+    const uint64_t capDisk = std::getenv("VPKENGINE_FRAMECAP_DISK") ? std::strtoull(std::getenv("VPKENGINE_FRAMECAP_DISK"), nullptr, 10) : 200ull << 20;
     void capAdd(uint32_t wid) {
         if (wid && cap.seen.insert(wid).second) cap.wids.push_back(wid);
     }
@@ -3053,7 +3057,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         const Clock::time_point now = Clock::now();
         if (!cap.started) cap.started = true, cap.next = now + 2 * cap.period, cap.nextFrame = r.frame_ + cap.periodFrames;
         if (!cap.pattern && (cap.periodFrames ? r.frame_ + 1 < cap.nextFrame : now < cap.next)) return;
-        cap.files = (cap.n == 0 || cap.pattern) && cap.disk < kCapDisk;
+        cap.files = (cap.n == 0 || cap.pattern) && cap.disk < capDisk;
         cap.pattern = false;
         cap.armed = true;
         ++cap.n;
@@ -3077,7 +3081,13 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
                     std::filesystem::remove(e.path(), ec);
             }
         }
-        uint64_t readBytes = 0;
+        // (the images worth most first: sampled with compare, depth, big colour; the rest in the order seen)
+        const auto rank = [&](uint32_t wid) {
+            const Surface* s = surfaceOf(wid);
+            return !s ? 4 : cap.compare.count(wid) ? 0 : s->isDepth ? 1 : uint64_t(s->width) * s->height >= 512 * 512 ? 2 : 3;
+        };
+        std::stable_sort(cap.wids.begin(), cap.wids.end(), [&](uint32_t a, uint32_t b) { return rank(a) < rank(b); });
+        framecap::Budget budget;
         uint32_t images = 0, index = 0;
         bool pattern = false;
         for (const uint32_t wid : cap.wids) {
@@ -3115,35 +3125,48 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
                 log(line + " read=no_single_sample_picture");
                 continue;
             }
-            if (fi.blockSize != 1 || images >= kCapImages || readBytes >= kCapBytes) {
+            if (fi.blockSize != 1 || images >= kCapImages) {
                 log(line + (fi.blockSize != 1 ? " read=compressed" : " read=over_budget"));
                 continue;
             }
+            const uint64_t texels = uint64_t(s->width) * s->height;
+            const uint32_t slices = framecap::Budget::slices(
+                texels, fi.bytesPerBlock, s->type == vpgpu::TextureType::Tex3D ? 1u : std::min<uint32_t>(std::max<uint16_t>(s->layers, 1), 8));
+            if (!slices) {
+                log(line + " read=too_big");
+                continue;
+            }
             ++images;
-            const uint32_t slices = s->type == vpgpu::TextureType::Tex3D ? 1u : std::min<uint32_t>(std::max<uint16_t>(s->layers, 1), 8);
             for (uint32_t slice = 0; slice < slices; ++slice) {
+                const std::string at = line + " s=" + std::to_string(slice);
+                uint32_t step = 1;
+                if (!budget.take(texels, fi.bytesPerBlock, step)) {
+                    log(at + " read=over_budget");
+                    break;
+                }
                 vpgpu::TextureSpan sp;
                 sp.texture = s->id, sp.layer = uint16_t(slice), sp.aspect = aspectOf(*s), sp.width = s->width, sp.height = s->height;
                 std::vector<uint8_t> out;
                 const vpgpu::ReadResult rr = r.device_.readTexture(sp, out);
-                const std::string at = line + " s=" + std::to_string(slice);
-                const uint64_t texels = uint64_t(s->width) * s->height;
                 if (rr != vpgpu::ReadResult::Ok || !texels || out.size() % texels) {
                     log(at + " read=" + (rr == vpgpu::ReadResult::Ok ? "size" : rr == vpgpu::ReadResult::Unsupported ? "unsupported" : rr == vpgpu::ReadResult::Memoryless ? "memoryless" : "failed"));
                     continue;
                 }
-                readBytes += out.size();
                 const uint32_t bpe = uint32_t(out.size() / texels);
-                const framecap::Stats st = framecap::imageStats(out.data(), s->width, s->height, bpe, f);
+                // (a readback whose texels are not the format's size is not decoded: hash and raw zero counts only)
+                const vpgpu::Format sf = bpe == fi.bytesPerBlock ? f : vpgpu::Format::Undefined;
+                const framecap::Stats st = framecap::imageStats(out.data(), s->width, s->height, bpe, sf, step);
                 std::string l = at + " read=ok zero_px=" + std::to_string(framecap::permille(st.zero, st.pixels)) + " zero_t8=" +
                                 std::to_string(framecap::permille(st.zero8, st.tiles8)) + " zero_t32=" + std::to_string(framecap::permille(st.zero32, st.tiles32)) +
                                 " nan=" + std::to_string(st.nan) + " hash=" + hex(hashRange(out.data(), out.size()));
-                if (st.lo <= st.hi) {
+                if (sf == vpgpu::Format::Undefined) l += " raw_bpe=" + std::to_string(bpe);
+                if (step > 1) l += " step=" + std::to_string(step);
+                if (st.channels == 1 && st.lo <= st.hi) {  // (the range of channel 0: told for a one-channel image only)
                     char range[64];
                     std::snprintf(range, sizeof range, " lo=%.6g hi=%.6g", double(st.lo), double(st.hi));
                     l += range;
                 }
-                if (cap.files && !dir.empty() && cap.disk < kCapDisk) {
+                if (cap.files && !dir.empty() && cap.disk < capDisk) {
                     const std::string file = "framecap-" + n + "-" + std::to_string(index - 1) + "-" + kindName[kind] + "-" + hex(s->address) + "-" +
                                              fi.name + "-" + std::to_string(s->width) + "x" + std::to_string(s->height) + "-s" + std::to_string(slice) + ".ppm";
                     uint64_t written = 0;
@@ -3156,11 +3179,11 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         }
         const Clock::time_point now = Clock::now();
         if (cap.files) cap.nextFiles = now + std::chrono::seconds(30);
-        else if (pattern && now >= cap.nextFiles && cap.disk < kCapDisk) {
+        else if (pattern && now >= cap.nextFiles && cap.disk < capDisk) {
             cap.pattern = true;
             log("VPKENGINE_PROBE FRAMECAP_PATTERN n=" + n + " f=" + std::to_string(r.frame_) + " (the next frame is captured with pictures)");
         }
-        cap.wids.clear(), cap.seen.clear(), cap.passes.clear(), cap.drawSampled.clear(), cap.passSampled.clear(), cap.pass.clear();
+        cap.wids.clear(), cap.seen.clear(), cap.compare.clear(), cap.passes.clear(), cap.drawSampled.clear(), cap.passSampled.clear(), cap.pass.clear();
     }
 
     void fillFromMemory(Surface& s, Texture* tex) {

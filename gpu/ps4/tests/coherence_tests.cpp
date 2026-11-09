@@ -76,6 +76,7 @@ public:
     // flips a byte of what it reads.
     std::map<uint32_t, vpgpu::TextureDesc> textureDescs;
     bool corrupt = false;
+    uint32_t readDivisor = 1;  // the readback comes back this many times shorter (a size the format does not explain)
     vpgpu::ReadResult readTexture(const vpgpu::TextureSpan& s, std::vector<uint8_t>& out) override {
         for (auto it = commands.rbegin(); it != commands.rend(); ++it) {
             const auto* c = std::get_if<vpgpu::Copy>(&*it);
@@ -89,6 +90,7 @@ public:
             for (uint32_t y = 0; y < s.height; ++y)
                 out.insert(out.end(), src + uint64_t(y) * c->srcBuffer.bytesPerRow, src + uint64_t(y) * c->srcBuffer.bytesPerRow + uint64_t(s.width) * bpe);
             if (corrupt && !out.empty()) out[out.size() / 2] ^= 0xFF;
+            if (readDivisor > 1) out.resize(out.size() / readDivisor);
             return vpgpu::ReadResult::Ok;
         }
         return vpgpu::ReadResult::Failed;
@@ -2338,10 +2340,40 @@ void frameCapture() {
         CHECK(s.lo == 0.0f && s.hi == 0.5f && s.zero == 1 && s.zero8 == 0);
         s = fc::imageStats(rgba.data(), 64, 64, 4, vpgpu::Format::R32Uint);  // not decoded: zero bytes
         CHECK(!s.decoded && s.zero == 0);
+        CHECK(fc::imageStats(rgba.data(), 64, 64, 4, vpgpu::Format::RGBA8Unorm).channels == 4 && fc::imageStats(reinterpret_cast<const uint8_t*>(z.data()), 8, 8, 4, vpgpu::Format::D32Float).channels == 1);
+        s = fc::imageStats(rgba.data(), 64, 64, 4, vpgpu::Format::RGBA8Unorm, 2);  // every other texel of every other row
+        CHECK(s.pixels == 32 * 32 && s.zero == 16 && s.zero8 == 1);
+        // A readback whose texels are not the format's size is never decoded (its buffer is exactly as long as it says): raw counts.
+        const std::vector<uint8_t> shortRead(16 * 16 * 2, 0);
+        s = fc::imageStats(shortRead.data(), 16, 16, 2, vpgpu::Format::RGBA32Float);
+        CHECK(!s.decoded && s.pixels == 256 && s.zero == 256 && s.nan == 0);
+        s = fc::imageStats(shortRead.data(), 16, 16, 2, vpgpu::Format::RGBA8Unorm);
+        CHECK(!s.decoded && s.zero == 256);
+        std::uint64_t written = 0;
+        CHECK(!fc::writePpm("/nonexistent/x.ppm", shortRead.data(), 16, 16, 2, vpgpu::Format::RGBA32Float, 1, fc::Stats{.decoded = true}, written));
+        // The budget: no slice of an image over 64 MB (8k x 8k RGBA32F), the slices of one image within it, 64 M texels in all
+        // (a coarser step fits an image in), 256 MB read.
+        CHECK(fc::Budget::slices(8192ull * 8192, 16, 8) == 0 && fc::Budget::slices(2048ull * 2048, 16, 8) == 1 &&
+              fc::Budget::slices(1024ull * 1024, 4, 8) == 8 && fc::Budget::slices(2048ull * 2048, 4, 8) == 4);
+        fc::Budget b;
+        uint32_t step = 0;
+        for (unsigned i = 0; i < 3; ++i) CHECK(b.take(4096ull * 4096, 1, step) && step == 1);
+        CHECK(b.take(8192ull * 4096, 1, step) && step == 2);  // (16.7 M texels of room left: 33.5 M at every other texel and row)
+        CHECK(b.take(64ull * 64, 1, step) && step == 1);
+        fc::Budget c;
+        c.texels = fc::kTotalTexels - 1;
+        CHECK(!c.take(4096ull * 4096, 4, step));            // (even at step 8, 262 144 texels do not fit in 1)
+        fc::Budget d;
+        d.bytes = fc::kTotalBytes - 15;
+        CHECK(!d.take(2, 8, step) && d.take(1, 8, step));   // (16 bytes do not fit in 15, 8 do)
     }
     char dir[] = "/tmp/vpps4_framecap_XXXXXX";
     CHECK(mkdtemp(dir) != nullptr);
     setenv("SHADPS4_PROBE_DIR", dir, 1);
+    // (the pictures of an earlier run are replaced by the first capture of this one; nothing else in the directory is touched)
+    const auto put = [&](const char* name) { std::ofstream(std::string(dir) + "/" + name) << "x"; };
+    const auto exists = [&](const char* name) { return std::filesystem::exists(std::string(dir) + "/" + name); };
+    put("framecap-9-0-old.ppm"), put("notes.txt"), put("framecap-keep.txt"), put("other.ppm"), put("framecap-9-1-old.bin");
     auto find = [](Fixture& f, const std::string& what) {
         for (const std::string& l : f.log)
             if (l.find(what) != std::string::npos) return &l;
@@ -2362,6 +2394,8 @@ void frameCapture() {
         CHECK(find(f, "VPKENGINE_PROBE FRAMECAP_PASS n=1 pass=0 ") && find(f, " draws=1 sampled=["));
         const std::string* img = find(f, "kind=texture addr=" + Fixture::hex(kTex) + " fmt=");
         CHECK(img && img->find("read=ok zero_px=15 zero_t8=15 ") != std::string::npos && img->find(" file=framecap-1-") != std::string::npos);
+        CHECK(img && img->find(" lo=") == std::string::npos && img->find(" raw_bpe=") == std::string::npos);  // (RGBA: no range of channel 0)
+        CHECK(!exists("framecap-9-0-old.ppm") && exists("notes.txt") && exists("framecap-keep.txt") && exists("other.ppm") && exists("framecap-9-1-old.bin"));
         CHECK(find(f, "kind=color addr=" + Fixture::hex(kRt)));  // the target: listed (this backend cannot read it back)
         if (img) {
             const size_t at = img->find(" file=") + 6;
@@ -2369,6 +2403,47 @@ void frameCapture() {
             CHECK(fp != nullptr);
             if (fp) std::fclose(fp);
         }
+        if (failures) f.dump();
+    }
+    {  // a readback of a size the format does not explain: hash and raw counts, no picture, nothing read out of its bounds
+        ProbeOn probe;
+        setenv("VPKENGINE_FRAMECAP", "1f", 1);
+        Fixture f;
+        f.backend.readDivisor = 2;
+        for (uint32_t i = 0; i < 64 * 64; ++i) f.at(kTex)[i] = 0xff102030u;
+        f.renderer.draw(f.state());
+        f.renderer.submit();
+        f.renderer.invalidate(kTex, 4);
+        f.renderer.draw(f.state());
+        f.renderer.submit();
+        const std::string* img = find(f, "kind=texture addr=" + Fixture::hex(kTex) + " fmt=");
+        CHECK(img && img->find("read=ok ") != std::string::npos && img->find(" raw_bpe=2") != std::string::npos &&
+              img->find(" file=") == std::string::npos && img->find(" hash=") != std::string::npos);
+        if (failures) f.dump();
+    }
+    {  // the disk limit: the first picture is written, the next ones of the capture are not
+        ProbeOn probe;
+        setenv("VPKENGINE_FRAMECAP", "1f", 1);
+        setenv("VPKENGINE_FRAMECAP_DISK", "1", 1);
+        Fixture f;
+        constexpr uint64_t kTex2 = kBase + 0x14000;
+        for (uint32_t i = 0; i < 64 * 64; ++i) f.at(kTex)[i] = f.at(kTex2)[i] = 0xff102030u;
+        const auto twoDraws = [&] {
+            vpps4::DrawState d = f.state();
+            f.renderer.draw(d);
+            f.sample(kTex2, 64, 64, 10, 0, 8);
+            f.renderer.draw(d);
+            f.renderer.submit();
+        };
+        twoDraws();  // arms
+        f.renderer.invalidate(kTex, 4);
+        twoDraws();
+        unsigned images = 0, files = 0;
+        for (const std::string& l : f.log)
+            if (l.find("FRAMECAP_IMG") != std::string::npos && l.find("kind=texture") != std::string::npos)
+                images += l.find("read=ok") != std::string::npos, files += l.find(" file=") != std::string::npos;
+        CHECK(images == 2 && files == 1);
+        unsetenv("VPKENGINE_FRAMECAP_DISK");
         if (failures) f.dump();
     }
     for (bool probeOn : {true, false}) {  // "0", and the probe off: nothing
