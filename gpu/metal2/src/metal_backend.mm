@@ -704,7 +704,11 @@ struct MetalBackend::Impl {
   // Chunks (command buffers committed before the last one) of one frame that may be uncompleted at once
   // (VPVK_MAX_PENDING_CHUNKS; 0 = unlimited). Above it submit waits for the oldest: that wait is what bounds the memory,
   // the budget alone only batches it. Two keep the GPU fed (one running, one queued) while encoding goes on.
+  // The memory is the encoders': with the encoder budget on, the wait only comes once those chunks hold more than
+  // maxPendingChunks * maxEncodersPerCb encoders (chunks cut by the draw budget, a few encoders each, no longer make encoding
+  // wait for the GPU chunk by chunk). VPVK_CHUNK_WAIT_BY_COUNT=1: by chunk count alone, as before.
   uint32_t maxPendingChunks = 2;
+  bool chunkWaitByCount = false;
   // Fences a slot keeps between frames (one per encoder is created within a frame; the excess is released on reuse).
   static constexpr size_t kFenceKeep = 256;
   double encoderCost(const Encoder&, const std::vector<Command>&);
@@ -1583,6 +1587,7 @@ void MetalBackend::Impl::init() {
   if (const char* e = std::getenv("VPVK_MAX_DRAWS_PER_CB")) maxDrawsPerCb = uint32_t(std::strtoul(e, nullptr, 10));
   if (const char* e = std::getenv("VPVK_MAX_ENCODERS_PER_CB")) maxEncodersPerCb = uint32_t(std::strtoul(e, nullptr, 10));
   if (const char* e = std::getenv("VPVK_MAX_PENDING_CHUNKS")) maxPendingChunks = uint32_t(std::strtoul(e, nullptr, 10));
+  if (const char* e = std::getenv("VPVK_CHUNK_WAIT_BY_COUNT")) chunkWaitByCount = *e == '1';
   if (const char* e = std::getenv("VPVK_MSAA_RELEASE_FRAMES")) msaaReleaseFrames = uint32_t(std::strtoul(e, nullptr, 10));
   if (const char* e = std::getenv("VPVK_HANG_DIR"); e && *e) hangDir = e;
   else if (const char* k = std::getenv("KL_CAPTURE_DIR"); k && *k) hangDir = k;
@@ -4402,6 +4407,8 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
   const bool busyOn = gBusyOn.load(std::memory_order_relaxed);
   auto cbBusy = std::make_shared<std::vector<BusyRec>>();
   std::deque<dispatch_semaphore_t> chunkDone;  // one per committed chunk, signalled by its completion handler, oldest first
+  std::deque<uint32_t> chunkEnc;  // the encoders of each chunk in chunkDone
+  uint64_t chunkEncPending = 0;   // their sum
   std::function<void()> cutIfFull;  // set after commitChunk; encodeBlit (defined before it) calls it
   double cbCost = 0;  // estimated cost (draw units, see encoderCost) of the command buffer being filled
   Impl* const self = this;  // the destructor waits for every frame, so handlers never outlive *this
@@ -5153,6 +5160,8 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
   auto awaitOldestChunk = [&]() {
     dispatch_semaphore_t s = chunkDone.front();
     chunkDone.pop_front();
+    chunkEncPending -= chunkEnc.front();
+    chunkEnc.pop_front();
     if (lostFlag.load()) return;  // no more GPU work will run: stop throttling
     if (dispatch_semaphore_wait(s, DISPATCH_TIME_NOW) == 0) return;  // already complete: not a wait (keeps chunk_wait honest)
     const int64_t start = steadyNs();
@@ -5236,6 +5245,8 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
     // chunk (which may publish the frame and let the backend be destroyed).
     dispatch_semaphore_t chunkSem = dispatch_semaphore_create(0);
     chunkDone.push_back(chunkSem);
+    chunkEnc.push_back(cbEncoders);
+    chunkEncPending += cbEncoders;
     [cb addCompletedHandler:^(id<MTLCommandBuffer>) {
       hSelf->bufIntLiveBytes.fetch_sub(hIntBytes, std::memory_order_relaxed);
       hSelf->chunkCompletions.fetch_add(1, std::memory_order_relaxed);
@@ -5284,7 +5295,9 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
     cbEncoders = 0;
     // Throttle: at most `maxPendingChunks` earlier chunks of this frame uncompleted (their encoder memory stays
     // pinned until they complete). Nothing is open and the next command buffer is empty, so waiting here is safe.
-    while (maxPendingChunks && chunkDone.size() > maxPendingChunks) awaitOldestChunk();
+    while (maxPendingChunks && chunkDone.size() > maxPendingChunks &&
+           (chunkWaitByCount || !maxEncodersPerCb || chunkEncPending > uint64_t(maxPendingChunks) * maxEncodersPerCb))
+      awaitOldestChunk();
     tables.lock();
   };
   // Encoder budget (see maxEncodersPerCb): called only where no encoder is open.
