@@ -129,6 +129,17 @@ bool detileLevels(const SurfaceLayout&, uint32_t firstLevel, uint32_t levelCount
 bool tileLevels(const SurfaceLayout&, uint32_t firstLevel, uint32_t levelCount, uint32_t sample, const uint8_t* linear,
                 uint8_t* tiled);
 
+// One subresource (level, slice, sample 0) of the tiled surface against a host read of it (`packed`: rows of the level's
+// `width` elements, tightly packed, as Backend::readTexture gives them). ok false: the layout is not ok, the coordinates are
+// out of it, `tiled` (tiledBytes from the surface base) does not hold it or `packed` is short. Diagnostics (TEXVERIFY).
+struct LevelDiff {
+    bool ok = false;
+    uint64_t elements = 0, differing = 0;
+    uint32_t firstX = 0, firstY = 0;  // the first differing element (row order)
+};
+LevelDiff compareLevel(const SurfaceLayout&, uint32_t level, uint32_t slice, const uint8_t* tiled, uint64_t tiledBytes,
+                       const uint8_t* packed, uint64_t packedBytes);
+
 // ---- Mip 0 conveniences (the original API) ------------------------------------------------------
 
 // Bytes of guest memory mip 0 spans (all slices), or 0 if the layout is not covered (`why` says).

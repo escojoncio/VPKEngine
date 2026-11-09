@@ -66,7 +66,31 @@ public:
         if (d.guestMemory) memory[i.index] = static_cast<uint8_t*>(d.guestMemory);
         inner.createBuffer(i, d);
     }
-    void createTexture(vpgpu::TextureId i, const vpgpu::TextureDesc& d) override { inner.createTexture(i, d); }
+    void createTexture(vpgpu::TextureId i, const vpgpu::TextureDesc& d) override {
+        textureDescs[i.index] = d;
+        inner.createTexture(i, d);
+    }
+    // readTexture plays the last upload into the subresource from a buffer with host memory (TEXVERIFY tests); `corrupt`
+    // flips a byte of what it reads.
+    std::map<uint32_t, vpgpu::TextureDesc> textureDescs;
+    bool corrupt = false;
+    vpgpu::ReadResult readTexture(const vpgpu::TextureSpan& s, std::vector<uint8_t>& out) override {
+        for (auto it = commands.rbegin(); it != commands.rend(); ++it) {
+            const auto* c = std::get_if<vpgpu::Copy>(&*it);
+            if (!c || c->kind != vpgpu::CopyKind::BufferToTexture || !(c->dstTexture.texture == s.texture) || c->dstTexture.mip != s.mip)
+                continue;
+            const auto m = memory.find(c->srcBuffer.buffer.index);
+            if (m == memory.end()) return vpgpu::ReadResult::Unsupported;
+            const uint32_t bpe = vpgpu::formatInfo(textureDescs[s.texture.index].format).bytesPerBlock;
+            const uint8_t* src = m->second + c->srcBuffer.offset + uint64_t(s.layer) * c->srcBuffer.rowsPerImage * c->srcBuffer.bytesPerRow;
+            out.clear();
+            for (uint32_t y = 0; y < s.height; ++y)
+                out.insert(out.end(), src + uint64_t(y) * c->srcBuffer.bytesPerRow, src + uint64_t(y) * c->srcBuffer.bytesPerRow + uint64_t(s.width) * bpe);
+            if (corrupt && !out.empty()) out[out.size() / 2] ^= 0xFF;
+            return vpgpu::ReadResult::Ok;
+        }
+        return vpgpu::ReadResult::Failed;
+    }
     void createSampler(vpgpu::SamplerId i, const vpgpu::SamplerDesc& d) override { inner.createSampler(i, d); }
     void destroyBuffer(vpgpu::BufferId i) override { inner.destroyBuffer(i); }
     void destroyTexture(vpgpu::TextureId i) override { inner.destroyTexture(i); }
@@ -2037,6 +2061,36 @@ void compareDepthArray() {
 
 }  // namespace
 
+// TEXVERIFY (probe on, VPKENGINE_TEXVERIFY=1): a texture filled from memory is read back once its frame is submitted and compared
+// with the guest memory it came from; a read that differs says so (Recording plays the upload; `corrupt` breaks it).
+void texVerify() {
+    ProbeOn probe;
+    setenv("VPKENGINE_TEXVERIFY", "1", 1);
+    auto find = [](Fixture& f, const char* what) {
+        for (const std::string& l : f.log)
+            if (l.rfind("VPKENGINE_PROBE TEXVERIFY ", 0) == 0 && l.find(what) != std::string::npos) return true;
+        return false;
+    };
+    for (bool corrupt : {false, true}) {
+        Fixture f;
+        f.backend.corrupt = corrupt;
+        for (uint32_t i = 0; i < 64 * 64; ++i) f.at(kTex)[i] = 0x01020304u * (i + 1);
+        f.renderer.draw(f.state());
+        f.renderer.submit();
+        CHECK(find(f, " L0S0 "));
+        CHECK(find(f, corrupt ? "result=differs" : "result=ok"));
+        CHECK(find(f, "diff_mem=") && find(f, "mem_changed=0"));
+        if (failures) f.dump();
+    }
+    {  // off without the variable
+        unsetenv("VPKENGINE_TEXVERIFY");
+        Fixture f;
+        f.renderer.draw(f.state());
+        f.renderer.submit();
+        CHECK(!find(f, "TEXVERIFY"));
+    }
+}
+
 int main(int argc, char** argv) {
     const std::string_view t = argc > 1 ? argv[1] : "";
     if (t == "rt_to_texture") rtToTexture();
@@ -2085,6 +2139,7 @@ int main(int argc, char** argv) {
     else if (t == "compare_mismatch") compareMismatch();
     else if (t == "compare_depth") compareDepth();
     else if (t == "compare_depth_array") compareDepthArray();
+    else if (t == "tex_verify") texVerify();
     else if (t == "alias_channel_order") aliasChannelOrder();
     else return std::fprintf(stderr, "unknown test\n"), 2;
     return failures ? 1 : 0;

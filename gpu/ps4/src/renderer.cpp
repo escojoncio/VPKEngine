@@ -2800,6 +2800,127 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
     // fill itself fails, the image stays not filled and is tried again at its next use (never marked up to date with
     // stale or missing bytes).
     bool fillRetry = false;  // set by a fill that failed for a reason that passes (staging memory, a decode that stopped)
+    // ---- TEXVERIFY (probe on and VPKENGINE_TEXVERIFY=N): one fill from memory of a texture in N (one waiting at a time) is read
+    // back once its frame ran (the submit waits for the GPU: a debugging cost) and compared, through the CPU addressing
+    // (compareLevel), with the guest memory it came from: levels 0 and 1, first and last slice. Memory twice: as it was when the
+    // fill was recorded (`snap`) and as it is after the frame (GPU writes recorded before the fill, e.g. a retile, land in
+    // between). A VPKENGINE_PROBE TEXVERIFY line per subresource; the first 8 that differ go to SHADPS4_PROBE_DIR as
+    // texverify-<n>-L<level>S<slice>-{gpu,mem}.bin (packed rows of elements). The texture checked last is read again at the next
+    // check: not filled nor written since, it must read the same (TEXVERIFY_STABLE changed=0).
+    struct TexVerify {
+        uint32_t every = [] {  // VPKENGINE_TEXVERIFY (0: off)
+            const char* e = std::getenv("VPKENGINE_TEXVERIFY");
+            return e ? uint32_t(std::max(0, std::atoi(e))) : 0u;
+        }();
+        uint64_t fills = 0, n = 0, dumped = 0;
+        struct Item {
+            uint32_t wid = 0;
+            TextureId id;
+            uint64_t writeSeq = 0, version = 0, hash = 0;
+            SurfaceLayout lay;
+            std::vector<uint8_t> snap;
+        };
+        std::optional<Item> pending, last;
+    } tv;
+    static uint64_t fnv(const std::vector<uint8_t>& v) {
+        uint64_t h = 1469598103934665603ull;
+        for (uint8_t b : v) h = (h ^ b) * 1099511628211ull;
+        return h;
+    }
+    void texVerifyArm(const Surface& s) {
+        if (tv.pending || ++tv.fills % tv.every) return;
+        if (s.softBc || s.samples > 1 || s.type == vpgpu::TextureType::Tex3D) return;
+        SurfaceLayout lay = computeLayout(tiledOf(s));
+        if (!lay.ok || lay.bytes > (64ull << 20) || lay.surface.bytesPerElement != vpgpu::formatInfo(s.isDepth ? zPlaneFormat(s.format) : s.format).bytesPerBlock)
+            return;
+        GuestRegion g;
+        if (!region(s.address, lay.bytes, g)) return;
+        const uint8_t* at = static_cast<const uint8_t*>(g.host) + (s.address - g.base);
+        std::vector<uint8_t> snap(at, at + lay.bytes);
+        tv.pending = TexVerify::Item{s.wid, s.id, s.writeSeq, s.version, 0, std::move(lay), std::move(snap)};
+    }
+    void texVerifyCheck() {
+        TexVerify::Item p = std::move(*tv.pending);
+        tv.pending.reset();
+        r.device_.waitIdle(2'000'000'000ull);
+        const Surface* s = surfaceOf(p.wid);
+        const std::string head = "VPKENGINE_PROBE TEXVERIFY n=" + std::to_string(++tv.n) + " f=" + std::to_string(r.frame_);
+        if (!s || s->id != p.id) return log(head + " result=gone");
+        GuestRegion g;
+        if (!region(s->address, p.lay.bytes, g)) return log(head + " result=unmapped");
+        const uint8_t* now = static_cast<const uint8_t*>(g.host) + (s->address - g.base);
+        const vpgpu::Aspect aspect = aspectOf(*s);
+        auto read = [&](uint32_t level, uint32_t slice, std::vector<uint8_t>& out) {
+            vpgpu::TextureSpan sp;
+            sp.texture = s->id, sp.mip = uint16_t(level), sp.layer = uint16_t(slice), sp.aspect = aspect;
+            sp.width = std::max(s->width >> level, 1u), sp.height = std::max(s->height >> level, 1u);
+            return r.device_.readTexture(sp, out);
+        };
+        const std::string what = " addr=" + hex(s->address) + " host=" + vpgpu::formatInfo(s->format).name + " dfmt=" + std::to_string(s->dfmt) +
+                                 " nfmt=" + std::to_string(s->nfmt) + " tile=" + std::to_string(s->tile) + " " + std::to_string(s->width) + "x" +
+                                 std::to_string(s->height) + "x" + std::to_string(s->layers) + " mips=" + std::to_string(s->mips) +
+                                 " pitch=" + std::to_string(s->pitch) + " fill=" + std::to_string(s->fillPath);
+        // Stability: the texture checked last, neither filled nor written since, reads as it did.
+        if (tv.last) {
+            const Surface* o = surfaceOf(tv.last->wid);
+            std::vector<uint8_t> out;
+            if (o && o->id == tv.last->id && o->writeSeq == tv.last->writeSeq && o->version == tv.last->version && !o->writable) {
+                vpgpu::TextureSpan sp;
+                sp.texture = o->id, sp.aspect = aspectOf(*o), sp.width = o->width, sp.height = o->height;
+                if (r.device_.readTexture(sp, out) == vpgpu::ReadResult::Ok)
+                    log("VPKENGINE_PROBE TEXVERIFY_STABLE n=" + std::to_string(tv.n) + " addr=" + hex(o->address) + " frames=" +
+                        std::to_string(r.frame_) + " changed=" + (fnv(out) != tv.last->hash ? "1" : "0"));
+            }
+            tv.last.reset();
+        }
+        const LevelLayout& l0 = p.lay.levels[0];
+        const uint32_t levels = std::min<uint32_t>(uint32_t(p.lay.levels.size()), 2), lastSlice = l0.slices ? l0.slices - 1 : 0;
+        for (uint32_t level = 0; level < levels; ++level)
+            for (uint32_t k = 0; k < (lastSlice ? 2u : 1u); ++k) {
+                const uint32_t slice = k ? lastSlice : 0;
+                if (slice >= p.lay.levels[level].slices) continue;
+                std::vector<uint8_t> out;
+                const vpgpu::ReadResult rr = read(level, slice, out);
+                std::string line = head + what + " L" + std::to_string(level) + "S" + std::to_string(slice);
+                if (rr != vpgpu::ReadResult::Ok) {
+                    log(line + " result=read_" + (rr == vpgpu::ReadResult::Unsupported ? "unsupported" : rr == vpgpu::ReadResult::Memoryless ? "memoryless" : "failed"));
+                    continue;
+                }
+                if (level == 0 && slice == 0) tv.last = TexVerify::Item{p.wid, p.id, s->writeSeq, s->version, fnv(out), {}, {}};
+                const LevelDiff dNow = compareLevel(p.lay, level, slice, now, p.lay.bytes, out.data(), out.size());
+                const LevelDiff dFill = compareLevel(p.lay, level, slice, p.snap.data(), p.snap.size(), out.data(), out.size());
+                if (!dNow.ok) {
+                    log(line + " result=size read_bytes=" + std::to_string(out.size()));
+                    continue;
+                }
+                const bool memChanged = std::memcmp(now, p.snap.data(), p.lay.bytes) != 0;
+                const char* result = !dNow.differing ? "ok" : dFill.ok && !dFill.differing ? "fill_older_than_memory" : "differs";
+                line += " elements=" + std::to_string(dNow.elements) + " diff_mem=" + std::to_string(dNow.differing) + " diff_fill=" +
+                        std::to_string(dFill.differing) + " first=" + std::to_string(dNow.firstX) + "," + std::to_string(dNow.firstY) +
+                        " mem_changed=" + (memChanged ? "1" : "0") + " degraded=" + (p.lay.levels[level].degraded ? "1" : "0") + " result=" + result;
+                if (dNow.differing && tv.dumped < 8) {
+                    const char* dir = std::getenv("SHADPS4_PROBE_DIR");
+                    if (dir && *dir) {
+                        const LevelLayout& ll = p.lay.levels[level];
+                        const uint32_t bpe = p.lay.surface.bytesPerElement;
+                        std::vector<uint8_t> ref(uint64_t(ll.width) * ll.height * bpe);
+                        for (uint32_t y = 0; y < ll.height; ++y)
+                            for (uint32_t x = 0; x < ll.width; ++x)
+                                std::memcpy(ref.data() + (uint64_t(y) * ll.width + x) * bpe, now + p.lay.offsetOf(level, x, y, slice), bpe);
+                        const std::string base = std::string(dir) + "/texverify-" + std::to_string(tv.n) + "-L" + std::to_string(level) + "S" + std::to_string(slice);
+                        for (const auto& [suffix, data] : {std::pair{"-gpu.bin", &out}, std::pair{"-mem.bin", &ref}})
+                            if (FILE* fp = std::fopen((base + suffix).c_str(), "wb")) {
+                                std::fwrite(data->data(), 1, data->size(), fp);
+                                std::fclose(fp);
+                            }
+                        line += " dump=" + base + " row_elements=" + std::to_string(ll.width) + " bpe=" + std::to_string(bpe);
+                        ++tv.dumped;
+                    }
+                }
+                log(line);
+            }
+    }
+
     void fillFromMemory(Surface& s, Texture* tex) {
         syncRefused = false;
         syncOwners(s.address, s.bytes, false, s.wid);
@@ -2828,6 +2949,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         }
         ++r.stats_.refilled;
         if (tex) stamp(*tex);
+        if (tex && tv.every && vpgpu::probe::enabled()) texVerifyArm(s);
         if (r.hooks_.uploaded) r.hooks_.uploaded(s.address, s.bytes);
         if (r.hooks_.watchWrites && mirrored(s.address, s.bytes)) {
             r.hooks_.watchWrites(s.address, s.bytes);
@@ -6094,6 +6216,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         }
         vpgpu::FrameReport report = r.device_.submit(std::move(frame));
         r.cpu_.submitMs += msSince(t0);
+        if (tv.pending) texVerifyCheck();
         scratchDone[ringIndex] = report.frame + 1;
         frame = vpgpu::Frame{};
         retireOwned();

@@ -120,6 +120,8 @@ class Device {
   // timeout / lost device. waitIdle() = all frames submitted so far.
   bool waitFrames(uint64_t frames, uint64_t timeoutNs = UINT64_MAX);
   bool waitIdle(uint64_t timeoutNs = UINT64_MAX);
+  // Backend::readTexture (a debugging read: call waitIdle first; no frame may be in flight on another thread).
+  ReadResult readTexture(const TextureSpan& s, std::vector<uint8_t>& out) { return backend_.readTexture(s, out); }
 
   // GPU-ordered side effects: `action` runs, on a completion thread or inside a later Device call,
   // once frames 0..`frame` have finished (immediately if they have and nothing older is queued).

@@ -291,6 +291,32 @@ int main() {
         CHECK(!computeLayout(surf(10, 4, 64, 64, 0, 1, 17)).ok);
         CHECK(computeLayout(surf(10, 4, 64, 64, 0, 1, 1)).offsetOf(0, 128, 0, 0) == UINT64_MAX);  // level 0 is padded to a macro tile (128 wide)
     }
+
+    // compareLevel (TEXVERIFY): a level tiled from a pattern matches the pattern read back packed; one element changed is
+    // found at its place; a short read or a slice outside is not ok.
+    for (uint8_t m : {uint8_t(0), uint8_t(8), uint8_t(13), uint8_t(14)}) {
+        TiledSurface s = surf(m, 4, 100, 60, 0, 3, 3);
+        const SurfaceLayout l = computeLayout(s);
+        CHECK(l.ok);
+        if (!l.ok) continue;
+        std::vector<uint8_t> linear(l.linearBytes), tiled(l.bytes);
+        for (size_t i = 0; i < linear.size(); ++i) linear[i] = uint8_t(i * 7 + i / 251);
+        CHECK(tileLevels(l, 0, uint32_t(l.levels.size()), 0, linear.data(), tiled.data()));
+        for (uint32_t lv : {0u, 1u})
+            for (uint32_t z : {0u, 2u}) {
+                const LevelLayout& ll = l.levels[lv];
+                const uint64_t sliceBytes = uint64_t(ll.width) * ll.height * 4;
+                std::vector<uint8_t> packed(linear.begin() + ll.linearOffset + z * sliceBytes,
+                                            linear.begin() + ll.linearOffset + (z + 1) * sliceBytes);
+                LevelDiff d = compareLevel(l, lv, z, tiled.data(), tiled.size(), packed.data(), packed.size());
+                CHECK(d.ok && d.differing == 0 && d.elements == uint64_t(ll.width) * ll.height);
+                packed[(uint64_t(5) * ll.width + 3) * 4 + 1] ^= 0xFF;
+                d = compareLevel(l, lv, z, tiled.data(), tiled.size(), packed.data(), packed.size());
+                CHECK(d.ok && d.differing == 1 && d.firstX == 3 && d.firstY == 5);
+                CHECK(!compareLevel(l, lv, z, tiled.data(), tiled.size(), packed.data(), packed.size() - 1).ok);
+            }
+        CHECK(!compareLevel(l, 0, 3, tiled.data(), tiled.size(), linear.data(), linear.size()).ok);
+    }
     if (failures) {
         std::printf("%d failure(s)\n", failures);
         return 1;

@@ -277,6 +277,24 @@ bool tileLevels(const SurfaceLayout& layout, uint32_t firstLevel, uint32_t level
     return copyLevels<false>(layout, firstLevel, levelCount, sample, linear, tiled);
 }
 
+LevelDiff compareLevel(const SurfaceLayout& layout, uint32_t level, uint32_t slice, const uint8_t* tiled, uint64_t tiledBytes,
+                       const uint8_t* packed, uint64_t packedBytes) {
+    LevelDiff d;
+    if (!layout.ok || level >= layout.levels.size()) return d;
+    const LevelLayout& l = layout.levels[level];
+    const uint32_t bpe = layout.surface.bytesPerElement;
+    if (slice >= l.slices || packedBytes < uint64_t(l.width) * l.height * bpe) return d;
+    for (uint32_t y = 0; y < l.height; ++y)
+        for (uint32_t x = 0; x < l.width; ++x) {
+            const uint64_t o = l.offset + vpt_offset(l.hw, x, y, slice, 0);
+            if (o + bpe > tiledBytes) return LevelDiff{};
+            ++d.elements;
+            if (std::memcmp(tiled + o, packed + (uint64_t(y) * l.width + x) * bpe, bpe) && !d.differing++) d.firstX = x, d.firstY = y;
+        }
+    d.ok = true;
+    return d;
+}
+
 namespace {
 SurfaceLayout mip0(const TiledSurface& s) {
     TiledSurface t = s;
