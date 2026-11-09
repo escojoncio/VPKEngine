@@ -9,7 +9,7 @@ struct VpArgs {
 };
 
 struct VpOut {
-    float4 position [[position]];
+    float4 position [[position, invariant]];
     uint layer [[render_target_array_index]];
     float4 param0 [[user(loc0)]];
 };

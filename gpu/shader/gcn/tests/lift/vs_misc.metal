@@ -6,7 +6,7 @@ using namespace metal;
 
 struct VpOut {
     float vp_clip [[clip_distance]] [2];
-    float4 position [[position]];
+    float4 position [[position, invariant]];
     float point_size [[VP_PSZ]];
     uint layer [[render_target_array_index]];
 };

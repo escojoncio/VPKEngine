@@ -11,7 +11,7 @@ struct VpArgs {
 };
 
 struct VpOut {
-    float4 position [[position]];
+    float4 position [[position, invariant]];
     float4 param0 [[user(loc0)]];
 };
 

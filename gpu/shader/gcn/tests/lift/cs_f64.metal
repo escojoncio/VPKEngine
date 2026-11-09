@@ -508,6 +508,7 @@ inline u64 vpf_min(u64 a, u64 b, u32 mode) {
     if (ieee && vpf_issnan(b)) return vpf_quiet(b);
     if (vpf_isnan(a)) return b;
     if (vpf_isnan(b)) return a;
+    if (((a | b) & ~VPF_SIGN) == u64(0)) return (a & VPF_SIGN) != u64(0) ? a : b;  // -0 orders below +0 (as the f32 forms)
     return vpf_lt(a, b) ? a : b;
 }
 inline u64 vpf_max(u64 a, u64 b, u32 mode) {
@@ -518,6 +519,7 @@ inline u64 vpf_max(u64 a, u64 b, u32 mode) {
     if (ieee && vpf_issnan(b)) return vpf_quiet(b);
     if (vpf_isnan(a)) return b;
     if (vpf_isnan(b)) return a;
+    if (((a | b) & ~VPF_SIGN) == u64(0)) return (a & VPF_SIGN) != u64(0) ? b : a;  // +0 orders above -0
     return !vpf_lt(a, b) ? a : b;  // a >= b ? a : b
 }
 

@@ -4189,6 +4189,13 @@ struct Lifter {
     }
 
     uint32_t positionOutput() {
+        // The position is invariant: a title draws its depth prepass and its colour pass with two programs that compute the
+        // position with the same instructions, and tests the second against the depth of the first (EQUAL / LEQUAL). On the
+        // hardware the two give the same bits; a host compiler that optimizes each program on its own (fast math) does not
+        // unless told so, and the test then fails triangle by triangle (holes that show what is behind, flickering as the
+        // view moves). VPGCN_POSITION_VARIANT=1: as before.
+        static const bool variant = std::getenv("VPGCN_POSITION_VARIANT") != nullptr;
+        if (!variant) m.invariantPosition = true;
         return miscOutput(positionOut, "position", V::vec(V::kF32, 4), V::Builtin::Position);
     }
 
