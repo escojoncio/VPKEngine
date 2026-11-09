@@ -182,6 +182,30 @@ class ScopedHist {
   uint64_t t0_;
 };
 
+// GPU busy time as the UNION of the intervals of work, not their sum (command buffers overlap in flight: the sum of their GPU
+// times exceeds the wall time). Intervals are reported in completion order (a queue: each ends no earlier than the one before);
+// the time not already covered by an earlier one is added to `timer` (calls = intervals, ms/s of the line = busy fraction).
+class BusyUnion {
+ public:
+  explicit BusyUnion(Timer& timer) : timer_(timer) {}
+  void add(uint64_t startNs, uint64_t endNs) {
+    uint64_t cur = covered_.load(std::memory_order_relaxed);
+    uint64_t from;
+    do {
+      if (endNs <= cur) {
+        timer_.add(0);
+        return;
+      }
+      from = startNs > cur ? startNs : cur;
+    } while (!covered_.compare_exchange_weak(cur, endNs, std::memory_order_relaxed));
+    timer_.add(endNs - from);
+  }
+
+ private:
+  Timer& timer_;
+  std::atomic<uint64_t> covered_{0};
+};
+
 // ---- Registry and sampler ---------------------------------------------------------------------------------------
 
 class Registry {

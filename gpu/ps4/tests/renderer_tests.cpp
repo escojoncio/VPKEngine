@@ -2037,6 +2037,25 @@ void dmaThenLabel() {
     CHECK(*x.f.at(l3) == 0x44444444u && !x.f.renderer.labelPending(l3, 4));
 }
 
+// Probe DMASYNC: a CPU access that waits leaves a line with the caller, the busy range that made it wait and who made that.
+void dmaSyncProbe() {
+    vpgpu::probe::setEnabled(true);
+    {
+        Sched x;
+        x.work(kBase + 0x1000);
+        x.s.present();
+        CHECK(x.s.syncCpu(kBase + 0x1080, 64, vpgpu::SubmitReason::Dma, 0, 0, "owned_fault"));
+        std::string line;
+        for (const std::string& l : x.f.log)
+            if (l.rfind("VPKENGINE_PROBE DMASYNC_WAIT", 0) == 0) line = l;
+        CHECK(line.find("why=owned_fault") != std::string::npos && line.find("by=fill") != std::string::npos);
+        CHECK(line.find("busy=[0x10001000-0x10001100") != std::string::npos && line.find("in=frame 0") != std::string::npos);
+        CHECK(line.size() < 2048);
+        CHECK(vpgpu::probe::counter("DMASYNC", "owned_fault_waits").get() == 1);
+    }
+    vpgpu::probe::setEnabled(false);
+}
+
 // VPKENGINE_DMA_CPU: every DMA waits and runs on the CPU, as before.
 void dmaOnCpuOptOut() {
     setenv("VPKENGINE_DMA_CPU", "1", 1);
@@ -3148,6 +3167,7 @@ int main(int argc, char** argv) {
     else if (t == "one_frame_per_image") oneFramePerImage();
     else if (t == "partial_waits") partialWaits();
     else if (t == "dma_on_gpu") dmaOnGpu();
+    else if (t == "dma_sync_probe") dmaSyncProbe();
     else if (t == "staging_pool") stagingPool();
     else if (t == "unknown_extent_busy") unknownExtentBusy();
     else if (t == "dma_then_label") dmaThenLabel();

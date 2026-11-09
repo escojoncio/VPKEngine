@@ -3219,6 +3219,10 @@ std::shared_ptr<MetalBackend::Impl::CbTimes> MetalBackend::Impl::trackCb(id<MTLC
       static probe::Hist& hRun = probe::hist("GPU", "cb_run_us");
       static probe::Hist& hCommit = probe::hist("GPU", "cb_commit_us");
       if (finished.GPUStartTime > 0 && gpuMs >= 0) hGpu.add(uint64_t(gpuMs * 1000.0));
+      if (finished.GPUStartTime > 0 && gpuMs >= 0) {  // GPU busy as the union of the command buffers' intervals (GPU clock, seconds)
+        static probe::BusyUnion busyUnion(probe::timer("GPU", "busy_union"));
+        busyUnion.add(uint64_t(finished.GPUStartTime * 1e9), uint64_t(finished.GPUEndTime * 1e9));
+      }
       if (schedMs >= 0) hSched.add(uint64_t(schedMs * 1000.0));
       hRun.add(uint64_t(std::max(runMs, 0.0) * 1000.0));
       hCommit.add(uint64_t(commitMs * 1000.0));

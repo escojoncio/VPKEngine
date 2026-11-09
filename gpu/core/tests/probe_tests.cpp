@@ -61,6 +61,17 @@ std::string line(const std::vector<std::string>& lines, const std::string& famil
   return {};
 }
 
+void testBusyUnion() {
+  Timer t;
+  BusyUnion u(t);
+  u.add(100, 200);  // 100
+  u.add(150, 300);  // overlaps: +100
+  u.add(250, 280);  // inside: +0
+  u.add(400, 450);  // gap: +50
+  CHECK_EQ(t.ns(), 250u);
+  CHECK_EQ(t.calls(), 4u);
+}
+
 void testHist() {
   // Small values are exact, buckets grow with the value, and a bucket's middle is inside it.
   for (uint64_t v = 0; v < 16; ++v) CHECK_EQ(Hist::bucketOf(v), unsigned(v));
@@ -356,7 +367,7 @@ void testLog() {
 
 int main(int argc, char** argv) {
   const std::vector<std::pair<const char*, std::function<void()>>> groups = {
-      {"hist", testHist}, {"lines", testLines}, {"names", testNamesAndNumbers}, {"csv", testCsv},
+      {"hist", testHist}, {"busy_union", testBusyUnion}, {"lines", testLines}, {"names", testNamesAndNumbers}, {"csv", testCsv},
       {"summary", testSummary}, {"mutex", testScopedAndMutex}, {"bigalloc", testBigAlloc}, {"log", testLog}};
   bool ran = false;
   for (const auto& [name, fn] : groups) {
