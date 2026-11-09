@@ -245,6 +245,9 @@ public:
     // Whether the renderer has ever read guest [a, +n) on the CPU (descriptors, indices, program code, texture sources, constant
     // copies). A DMA recorded on the GPU timeline lands later than a CPU read would see, so such a range is DMA'd by the CPU.
     bool cpuReadSeen(uint64_t a, uint64_t n) const;
+    // Probe (first 50): a DMA over [a, +n) stays on the CPU because of cpuReadSeen: one DMA_CPU_READ line naming the first
+    // readers of the ranges it overlaps (cbuf_copy, read_guest, code, ...).
+    void probeDmaCpuRead(uint64_t a, uint64_t n, uint64_t src);
     // Probe (DMASYNC, needs vpgpu::probe enabled): the busy range a CPU access to [a, +n) (and [b, +m)) overlaps with who made
     // it ("" if none), and one access that waited `frames` frames (0: did not wait) for `ms` (counters, timer and a line per caller).
     std::string busyText(uint64_t a, uint64_t n, uint64_t b = 0, uint64_t m = 0) const;
@@ -255,8 +258,9 @@ public:
     uint64_t gdsAddress() const;
     // Runs `action` when the GPU has finished all the work recorded or submitted so far (a PM4 label
     // write: EOP / EOS / RELEASE_MEM). In order with every other afterGpu action. [address, +size) is
-    // what it writes (labelPending / labelWaitTarget). Immediately if nothing is outstanding.
-    void afterGpu(uint64_t address, uint32_t size, std::function<void()> action);
+    // what it writes (labelPending / labelWaitTarget). Immediately if nothing is outstanding. `pureWrite`: the action only
+    // writes that memory (vpgpu::LabelQueue::add).
+    void afterGpu(uint64_t address, uint32_t size, std::function<void()> action, bool pureWrite = false);
     bool labelPending(uint64_t address, uint32_t size) const;
     uint64_t labelWaitTarget(uint64_t address, uint32_t size) const;
     // The caller waited for the GPU: nothing recorded so far is still pending.

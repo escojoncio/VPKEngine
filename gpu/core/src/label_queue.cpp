@@ -15,11 +15,11 @@ bool overlap(uint64_t a, uint64_t n, uint64_t b, uint64_t m) {
 }
 }  // namespace
 
-void LabelQueue::add(uint64_t frame, uint64_t address, uint32_t size, std::function<void()> action) {
+void LabelQueue::add(uint64_t frame, uint64_t address, uint32_t size, std::function<void()> action, bool pureWrite) {
   std::lock_guard lock(mutex_);
   // Frames only grow: an entry never needs to run before one added earlier.
   if (!queue_.empty()) frame = std::max(frame, queue_.back().frame);
-  queue_.push_back({frame, address, size, std::move(action)});
+  queue_.push_back({frame, address, size, std::move(action), pureWrite});
   count_.store(queue_.size(), std::memory_order_release);
 }
 
@@ -90,6 +90,7 @@ size_t LabelQueue::runOnce(const std::function<uint64_t()>& completed) {
       std::lock_guard lock(mutex_);
       if (queue_.empty() || queue_.front().frame >= completed()) break;
       action = std::move(queue_.front().action);
+      queue_.front().running = true;  // (supersede() leaves it alone: it is being written now)
       // (kept in the queue while it runs, so pending() still says "not written yet")
     }
     if (action) action();
@@ -101,6 +102,18 @@ size_t LabelQueue::runOnce(const std::function<uint64_t()>& completed) {
     ++ran;
   }
   return ran;
+}
+
+size_t LabelQueue::supersede(uint64_t address, uint64_t size) {
+  std::lock_guard lock(mutex_);
+  size_t n = 0;
+  for (Entry& e : queue_)
+    if (e.pureWrite && !e.running && e.size && e.address >= address && e.address - address + e.size <= size) {
+      e.action = nullptr;
+      e.address = 0, e.size = 0, e.pureWrite = false;
+      ++n;
+    }
+  return n;
 }
 
 bool LabelQueue::pending(uint64_t address, uint32_t size) const {

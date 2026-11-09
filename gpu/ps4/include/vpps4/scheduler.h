@@ -63,6 +63,9 @@ public:
     // (a CP read: IB, label, WAIT_REG_MEM) goes through syncCpu, which finds the recorded range busy.
     // `dst` is what the DMA writes ([dst, +n)), `src` (0: none) what a copy reads. A destination the renderer has read on the CPU
     // (Renderer::cpuReadSeen) stays on the CPU path: it would read old bytes until the GPU runs the DMA.
+    // The caller then does the DMA (either way): label writes still queued whose every byte [dst, +n) covers, without an
+    // interrupt (scheduleLabel with `irq` false), are dropped first (Device::supersedeLabels; the DMA's bytes are what the
+    // in-order timeline leaves there), so neither path waits for them (VPKENGINE_LABEL_KEEP=1 keeps them: the DMA waits).
     bool dmaOnGpu(uint64_t dst, uint64_t n, uint64_t src = 0);
     // The caller recorded the DMA that dmaOnGpu allowed (Renderer::fill / copy succeeded): counted.
     void noteDmaRecorded() { ++counters_.dmaRecorded; }
@@ -70,7 +73,8 @@ public:
     bool syncGds() { return syncCpu(renderer_.gdsAddress(), 0x10000, vpgpu::SubmitReason::Gds); }
     // Everything submitted and recorded has finished.
     void finish();
-    // `action` (a label write + its interrupt) runs once the GPU has finished the work recorded so far.
+    // `action` (a label write + its interrupt) runs once the GPU has finished the work recorded so far. With `irq` false the
+    // action must only write [address, +size) (a later DMA over all of it may drop it: dmaOnGpu).
     // `value` (`size` bytes at `address`) is what the action writes: lets prepareWait recognise a wait the
     // GPU's own order satisfies. `hasValue` false = unknown (the label is never taken as satisfying).
     void scheduleLabel(uint64_t address, uint32_t size, bool irq, std::function<void()> action, uint64_t value = 0,
@@ -105,10 +109,13 @@ public:
         uint64_t dmaRecorded = 0;  // host DMAs recorded on the GPU timeline instead of waiting (dmaOnGpu)
         uint64_t dmaCpuRead = 0, dmaLabel = 0, dmaIdle = 0;  // dmaOnGpu said no: range read by the CPU, label pending, nothing queued
         uint64_t frames = 0, cpuSyncs = 0, cpuSyncFree = 0, partialWaits = 0, fullWaits = 0, labels = 0, labelTimeouts = 0;
+        uint64_t labelsSuperseded = 0;  // label writes a later DMA over all their bytes dropped (dmaOnGpu)
         double waitMs = 0;
+        double syncMs = 0;  // syncCpu calls that waited, whole (the submit they forced included)
     };
     const Counters& counters() const { return counters_; }
-    // "submits flip=.. dma=.. ..." since the last call (counters are reset).
+    // "submits flip=.. dma=.. ..." since the last call (counters are reset). `cp_wait_pct`: syncMs over the time since the
+    // last call; `frames_per_flip`: frames submitted per presented picture.
     std::string takeSummary();
 
 private:
@@ -119,6 +126,8 @@ private:
     Clock now_;
     std::function<void()> hook_;
     bool dmaGpu_;  // false (VPKENGINE_DMA_CPU set): a DMA always waits and runs on the CPU
+    bool supersede_;  // false (VPKENGINE_LABEL_KEEP set): a DMA over a pending label waits for it
+    double summarySince_ = 0;
     double openSince_ = -1, labelSince_ = -1;
     bool labelIrq_ = false;
     Counters counters_;

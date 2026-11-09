@@ -361,6 +361,8 @@ struct Renderer::Impl {
     uint64_t cpuReadLo = 0, cpuReadHi = 0;
     bool cpuReadAll = false;  // too many ranges: no DMA goes to the GPU any more
     static constexpr size_t kCpuReadRanges = 4096;
+    std::map<uint64_t, std::pair<uint64_t, const char*>> cpuReadFirst;  // probe: [start] -> (end, first reader), unmerged, capped
+    uint64_t dmaCpuReadLines = 0;
     // Probe: a range read on the CPU for the first time while a recorded fill / copy over it is still pending read old bytes
     // (QUAL dma_stale_read; the first 50 leave a DMA_STALE_READ line). `by` names the reader.
     void probeStaleRead(uint64_t a, uint64_t n, const char* by) {
@@ -377,7 +379,10 @@ struct Renderer::Impl {
         if (cpuReadAll || !n) return;
         uint64_t lo = a, hi = a + n < a ? ~uint64_t(0) : a + n;
         if (lo >= cpuReadLo && hi <= cpuReadHi) return;
-        if (vpgpu::probe::enabled()) probeStaleRead(a, n, by);
+        if (vpgpu::probe::enabled()) {
+            probeStaleRead(a, n, by);
+            if (cpuReadFirst.size() < kCpuReadRanges) cpuReadFirst.emplace(lo, std::pair{hi, by});
+        }
         auto it = cpuRead.upper_bound(lo);
         if (it != cpuRead.begin()) {
             auto prev = std::prev(it);
@@ -6504,20 +6509,30 @@ void Renderer::waitedBelow(uint64_t frames) {
     impl_->retireOwned();
 }
 bool Renderer::cpuReadSeen(uint64_t a, uint64_t n) const { return impl_->cpuReadSeen(a, n); }
+void Renderer::probeDmaCpuRead(uint64_t a, uint64_t n, uint64_t src) {
+    Impl& i = *impl_;
+    if (!vpgpu::probe::enabled() || ++i.dmaCpuReadLines > 50) return;
+    std::string by;
+    for (auto it = i.cpuReadFirst.begin(); it != i.cpuReadFirst.end() && it->first < a + n; ++it)
+        if (it->second.first > a && by.size() < 256) by += std::string(by.empty() ? "" : ",") + Impl::hex(it->first) + "+" +
+                                                         std::to_string(it->second.first - it->first) + ":" + it->second.second;
+    i.log("VPKENGINE_PROBE DMA_CPU_READ n=" + std::to_string(i.dmaCpuReadLines) + " f=" + std::to_string(frame_) + " dst=" + Impl::hex(a) +
+          " bytes=" + std::to_string(n) + " src=" + Impl::hex(src) + " all=" + std::to_string(int(i.cpuReadAll)) + " by=[" + by + "]");
+}
 std::string Renderer::busyText(uint64_t a, uint64_t n, uint64_t b, uint64_t m) const { return impl_->busyText(a, n, b, m); }
 void Renderer::noteCpuSync(const char* caller, uint64_t a, uint64_t n, uint64_t b, uint64_t m, const std::string& busy, uint64_t frames,
                            bool submitted, double ms) {
     impl_->noteCpuSync(caller, a, n, b, m, busy, frames, submitted, ms);
 }
 uint64_t Renderer::gdsAddress() const { return reinterpret_cast<uint64_t>(impl_->gds.memory); }
-void Renderer::afterGpu(uint64_t address, uint32_t size, std::function<void()> action) {
+void Renderer::afterGpu(uint64_t address, uint32_t size, std::function<void()> action, bool pureWrite) {
     const uint64_t submitted = device_.submittedFrames();
     if (hasRecordedWork()) {
-        device_.afterFrame(submitted, address, size, std::move(action));  // the frame the next submit() makes
+        device_.afterFrame(submitted, address, size, std::move(action), pureWrite);  // the frame the next submit() makes
     } else if (submitted == 0) {
         action();  // nothing ever ran
     } else {
-        device_.afterFrame(submitted - 1, address, size, std::move(action));
+        device_.afterFrame(submitted - 1, address, size, std::move(action), pureWrite);
     }
 }
 bool Renderer::labelPending(uint64_t address, uint32_t size) const { return device_.labelPending(address, size); }

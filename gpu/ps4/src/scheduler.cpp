@@ -1,6 +1,7 @@
 #include "vpps4/scheduler.h"
 
 #include <algorithm>
+#include <cstdio>
 #include <cstdlib>
 
 #include "vpgpu/core/probe.h"
@@ -10,7 +11,10 @@ namespace vpps4 {
 using vpgpu::SubmitReason;
 
 Scheduler::Scheduler(Renderer& r, vpgpu::Device& d, vpgpu::SubmitPolicy p, Clock c)
-    : renderer_(r), device_(d), policy_(p), now_(std::move(c)), dmaGpu_(!std::getenv("VPKENGINE_DMA_CPU")) {}
+    : renderer_(r), device_(d), policy_(p), now_(std::move(c)), dmaGpu_(!std::getenv("VPKENGINE_DMA_CPU")),
+      supersede_(!std::getenv("VPKENGINE_LABEL_KEEP")) {
+    summarySince_ = now_();
+}
 
 void Scheduler::resetOpen() {
     openSince_ = labelSince_ = -1;
@@ -71,6 +75,7 @@ bool Scheduler::syncCpu(uint64_t a, uint64_t n, SubmitReason why, uint64_t b, ui
         return false;
     }
     ++counters_.cpuSyncs;
+    const double tSync = now_();
     const bool probing = vpgpu::probe::enabled();
     const std::string busyRange = probing ? renderer_.busyText(a, n, b, m) : std::string();
     const bool unsubmitted = target == Renderer::kUnsubmitted || labels > device_.submittedFrames();
@@ -101,13 +106,19 @@ bool Scheduler::syncCpu(uint64_t a, uint64_t n, SubmitReason why, uint64_t b, ui
         }
     }
     counters_.waitMs += now_() - t0;
+    counters_.syncMs += now_() - tSync;
     if (probing) renderer_.noteCpuSync(caller, a, n, b, m, busyRange, frames, unsubmitted, now_() - t0);
     return frames != 0;
 }
 
 bool Scheduler::dmaOnGpu(uint64_t dst, uint64_t n, uint64_t src) {
+    // A label still to be written whose bytes this DMA all overwrites: in GPU order the label lands, then the DMA's bytes
+    // (the command processor's own WAIT_REG_MEM on it, between the two, was met in order: prepareWait). Dropped, the DMA needs
+    // no wait for it on either path. (One with an interrupt stays: its handler may read the label.)
+    if (supersede_ && device_.labelWaitTarget(dst, uint32_t(std::min<uint64_t>(n, ~0u))))
+        if (const size_t k = device_.supersedeLabels(dst, n)) counters_.labelsSuperseded += k, forgetLabelValues(dst, n);
     if (!dmaGpu_) return false;
-    if (renderer_.cpuReadSeen(dst, n)) return ++counters_.dmaCpuRead, false;
+    if (renderer_.cpuReadSeen(dst, n)) return renderer_.probeDmaCpuRead(dst, n, src), ++counters_.dmaCpuRead, false;
     const uint64_t m = src ? n : 0;
     // (a label write into the range lands when its frame completes: it must come before the DMA's bytes, which only the
     // CPU waiting for it guarantees)
@@ -147,7 +158,7 @@ void Scheduler::scheduleLabel(uint64_t address, uint32_t size, bool irq, std::fu
         labelIrq_ = labelIrq_ || irq;
         noteWork();
     }
-    renderer_.afterGpu(address, size, std::move(action));
+    renderer_.afterGpu(address, size, std::move(action), !irq && address && size);
 }
 
 void Scheduler::forgetLabelValues(uint64_t a, uint64_t n) {
@@ -215,8 +226,16 @@ std::string Scheduler::takeSummary() {
          " polled_waits=" + std::to_string(counters_.polledWaits) + " idle_waits=" + std::to_string(counters_.idleWaits) + " wait_ms=" + std::to_string(int(counters_.waitMs));
     s += " dma_cpu_read=" + std::to_string(counters_.dmaCpuRead) + " dma_label=" + std::to_string(counters_.dmaLabel) +
          " dma_idle=" + std::to_string(counters_.dmaIdle);
+    const double now = now_(), span = now - summarySince_;
+    const uint64_t flips = counters_.submits[size_t(SubmitReason::Flip)];
+    char extra[160];
+    std::snprintf(extra, sizeof extra, " label_superseded=%llu sync_ms=%d cp_wait_pct=%.1f frames_per_flip=%.1f",
+                  (unsigned long long)counters_.labelsSuperseded, int(counters_.syncMs), span > 0 ? counters_.syncMs * 100.0 / span : 0.0,
+                  flips ? double(counters_.frames) / double(flips) : 0.0);
+    s += extra;
     if (counters_.labelTimeouts) s += " label_timeouts=" + std::to_string(counters_.labelTimeouts);
     counters_ = {};
+    summarySince_ = now;
     return s;
 }
 

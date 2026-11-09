@@ -127,7 +127,10 @@ class Device {
   // once frames 0..`frame` have finished (immediately if they have and nothing older is queued).
   // [address, +size) is the memory it writes (see LabelQueue). Use the index the work will get
   // (submittedFrames() for work not submitted yet).
-  void afterFrame(uint64_t frame, uint64_t address, uint32_t size, std::function<void()> action);
+  // `pureWrite`: the action only writes that memory (see LabelQueue::add).
+  void afterFrame(uint64_t frame, uint64_t address, uint32_t size, std::function<void()> action, bool pureWrite = false);
+  // A later write in GPU order covers [address, +size): queued pure label writes inside it are dropped (LabelQueue::supersede).
+  size_t supersedeLabels(uint64_t address, uint64_t size) { return labels_.supersede(address, size); }
   bool labelsQueued() const { return !labels_.empty(); }
   bool labelPending(uint64_t address, uint32_t size) const { return labels_.pending(address, size); }
   // Frames that must finish before every queued write overlapping the range has run (0 = none).

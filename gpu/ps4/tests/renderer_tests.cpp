@@ -2008,7 +2008,7 @@ void dmaOnGpu() {
 }
 
 // The CP reads (IB, label, WAIT_REG_MEM) go through syncCpu: a range with a recorded DMA waits for it, and a label queued
-// after it lands after it. A label queued before it is written before the DMA (that DMA stays on the CPU, behind the wait).
+// after it lands after it. A label queued before it and covered by it never lands after it.
 void dmaThenLabel() {
     HostDma h;
     Sched& x = h.x;
@@ -2031,12 +2031,78 @@ void dmaThenLabel() {
     h.gpuRuns();
     x.f.backend.finishFramesBelow(x.f.device.submittedFrames());
     CHECK(*x.f.at(l2) == 7);
-    // A label queued before the DMA: the DMA waits for it (CPU, in place), the DMA's bytes are the last.
+    // A label queued before the DMA, all of it covered: dropped (labelThenDma), the DMA goes on the GPU timeline with the work
+    // and its bytes are the last.
     const uint64_t l3 = kBase + 0x6040;
     x.work(kBase + 0x6000);
     x.s.scheduleLabel(l3, 4, false, [&] { *x.f.at(l3) = 1; });
-    CHECK(h.fill(l3, 4, 0x44));
-    CHECK(*x.f.at(l3) == 0x44444444u && !x.f.renderer.labelPending(l3, 4));
+    CHECK(!h.fill(l3, 4, 0x44));
+    CHECK(!x.f.renderer.labelPending(l3, 4));
+    x.s.present();
+    h.gpuRuns();
+    x.f.backend.finishFramesBelow(x.f.device.submittedFrames());
+    CHECK(*x.f.at(l3) == 0x44444444u);
+}
+
+// A title stamps labels (EOP/EOS/RELEASE_MEM, no interrupt) into a block, waits for one on its own ring (WAIT_REG_MEM, met in
+// GPU order) and resets the block with a DMA fill. In GPU order the fill's bytes are the last ones: the labels it covers are
+// dropped and the fill neither submits nor waits. A label it does not cover (or one with an interrupt) still lands only when
+// the GPU is done with the work before it; a CP read after a fill recorded on the GPU waits for that fill.
+void labelThenDma() {
+    HostDma h;
+    Sched& x = h.x;
+    const uint64_t block = kBase + 0x7000, stamp = block + 0x10, other = kBase + 0x7900, irqLabel = kBase + 0x7a00;
+    uint64_t stampWrites = 0;
+    x.work(kBase + 0x1000);  // the work the labels follow (recorded)
+    x.s.scheduleLabel(stamp, 8, false, [&] { *reinterpret_cast<uint64_t*>(x.f.at(stamp)) = 0x1234, ++stampWrites; }, 0x1234, true);
+    x.s.scheduleLabel(other, 4, false, [&] { *x.f.at(other) = 5; }, 5, true);
+    CHECK(x.s.prepareWait(stamp, 4, [](uint32_t v) { return v == 0x1234; }) == vpps4::Scheduler::WaitKind::Ordered);
+    CHECK(h.fill(block, 2048, 0xee));  // nothing GPU touches the block: in place, now
+    CHECK(x.submits() == 0 && x.f.backend.waits.empty() && x.s.counters().cpuSyncs == 0);
+    CHECK(x.s.counters().labelsSuperseded == 1 && !x.f.renderer.labelPending(stamp, 8));
+    CHECK(*x.f.at(stamp) == 0xeeeeeeeeu && *x.f.at(other) == 0);  // (the other label: not before its work is done)
+    x.s.present();
+    CHECK(*x.f.at(other) == 0);
+    x.f.backend.finishFramesBelow(x.f.device.submittedFrames());
+    CHECK(*x.f.at(other) == 5 && stampWrites == 0 && *x.f.at(stamp) == 0xeeeeeeeeu);
+    // The block busy with recorded GPU work: the fill goes on the GPU timeline, the label covered is dropped, and the command
+    // processor reading the label word afterwards waits for the fill (label -> fill -> CP read).
+    x.work(block + 0x100);
+    x.s.scheduleLabel(stamp, 8, false, [&] { *reinterpret_cast<uint64_t*>(x.f.at(stamp)) = 0x99, ++stampWrites; }, 0x99, true);
+    const size_t submitted = x.submits();
+    CHECK(!h.fill(block, 2048, 0x22));
+    CHECK(x.submits() == submitted && x.f.backend.waits.empty() && x.s.counters().labelsSuperseded == 2);
+    CHECK(x.s.syncCpu(stamp, 8, vpgpu::SubmitReason::Dma, 0, 0, "cp_read"));
+    CHECK(x.submits() == submitted + 1);
+    h.gpuRuns();
+    x.f.backend.finishFramesBelow(x.f.device.submittedFrames());
+    CHECK(*x.f.at(stamp) == 0x22222222u && stampWrites == 0);
+    // A label with an interrupt, or one the fill covers only in part, is waited for as before.
+    int irqs = 0;
+    x.work(kBase + 0x1000);
+    x.s.scheduleLabel(irqLabel, 4, true, [&] { *x.f.at(irqLabel) = 7, ++irqs; }, 7, true);
+    x.s.scheduleLabel(irqLabel + 0x3c, 8, false, [&] { *x.f.at(irqLabel + 0x3c) = 8; }, 8, true);
+    CHECK(h.fill(irqLabel, 0x40, 0x33));
+    CHECK(irqs == 1 && *x.f.at(irqLabel) == 0x33333333u && x.s.counters().labelsSuperseded == 2);
+    CHECK(x.s.counters().submits[size_t(vpgpu::SubmitReason::Dma)] == 2);
+    const std::string sum = x.s.takeSummary();
+    CHECK(sum.find(" label_superseded=2 ") != std::string::npos && sum.find(" cp_wait_pct=") != std::string::npos);
+    CHECK(sum.find(" frames_per_flip=3.0") != std::string::npos);
+}
+
+// VPKENGINE_LABEL_KEEP=1: a DMA over a pending label waits for it (submit + wait), the label is written, then the DMA.
+void labelKeepOptOut() {
+    setenv("VPKENGINE_LABEL_KEEP", "1", 1);
+    HostDma h;
+    unsetenv("VPKENGINE_LABEL_KEEP");
+    Sched& x = h.x;
+    const uint64_t stamp = kBase + 0x7010;
+    int writes = 0;
+    x.work(kBase + 0x1000);
+    x.s.scheduleLabel(stamp, 4, false, [&] { *x.f.at(stamp) = 0x1234, ++writes; }, 0x1234, true);
+    CHECK(h.fill(kBase + 0x7000, 2048, 0xee));
+    CHECK(x.submits() == 1 && !x.f.backend.waits.empty() && writes == 1 && x.s.counters().labelsSuperseded == 0);
+    CHECK(*x.f.at(stamp) == 0xeeeeeeeeu);
 }
 
 // A range the renderer reads on the CPU (texture source, descriptors, ...) is not DMA'd on the GPU timeline even when the GPU is
@@ -2077,6 +2143,12 @@ void dmaStaleRead() {
         CHECK(fetchAt != 0 && !x.f.renderer.cpuReadSeen(fetchAt, 4));
         x.f.renderer.draw(d);
         CHECK(x.f.renderer.cpuReadSeen(fetchAt, 4));
+        // A DMA kept on the CPU by such a read names the reader (DMA_CPU_READ).
+        CHECK(!x.s.dmaOnGpu(kBase + 0x10040, 64));
+        std::string cpuRead;
+        for (const std::string& l : x.f.log)
+            if (l.rfind("VPKENGINE_PROBE DMA_CPU_READ", 0) == 0) cpuRead = l;
+        CHECK(cpuRead.find("dst=0x10010040 bytes=64") != std::string::npos && cpuRead.find("by=[0x10010000+") != std::string::npos);
     }
     vpgpu::probe::setEnabled(false);
 }
@@ -3217,6 +3289,8 @@ int main(int argc, char** argv) {
     else if (t == "staging_pool") stagingPool();
     else if (t == "unknown_extent_busy") unknownExtentBusy();
     else if (t == "dma_then_label") dmaThenLabel();
+    else if (t == "label_then_dma") labelThenDma();
+    else if (t == "label_keep_opt_out") labelKeepOptOut();
     else if (t == "dma_on_cpu_opt_out") dmaOnCpuOptOut();
     else if (t == "index_scan_memo") indexScanMemo();
     else if (t == "abandon_owners") abandonOwners();

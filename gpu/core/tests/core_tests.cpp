@@ -3421,6 +3421,36 @@ void testLabelQueue() {
     t.join();
     CHECK(q.empty() && !q.pending(0x10, 4));
   }
+  {  // supersede(): only pure writes entirely inside the range, not running; the entries keep their place, emptied
+    LabelQueue q;
+    std::vector<int> ran;
+    q.add(0, 0x100, 8, [&] { ran.push_back(1); }, true);   // inside: dropped
+    q.add(0, 0x1f8, 16, [&] { ran.push_back(2); }, true);  // straddles the end: kept
+    q.add(0, 0x110, 4, [&] { ran.push_back(3); });         // not a pure write (an interrupt too): kept
+    q.add(1, 0x120, 4, [&] { ran.push_back(4); }, true);   // a later frame, inside: dropped
+    CHECK_EQ(q.supersede(0x100, 0x100), 2u);
+    CHECK(q.size() == 4 && !q.pending(0x100, 8) && !q.pending(0x120, 4) && q.pending(0x110, 4));
+    CHECK_EQ(q.waitTarget(0x100, 0x10), 0u);
+    CHECK_EQ(q.waitTarget(0x100, 0x100), 1u);  // (the kept ones)
+    CHECK_EQ(q.supersede(0x100, 0x100), 0u);
+    CHECK_EQ(q.release(2), 4u);
+    CHECK(ran == (std::vector<int>{2, 3}));
+  }
+  {  // a pure write being written is not dropped (it lands now, before the caller's own write)
+    LabelQueue q;
+    std::atomic<bool> inside{false}, go{false};
+    q.add(0, 0x10, 4, [&] {
+      inside = true;
+      while (!go) std::this_thread::yield();
+    }, true);
+    std::thread t([&] { q.release(1); });
+    while (!inside) std::this_thread::yield();
+    CHECK_EQ(q.supersede(0, 0x100), 0u);
+    CHECK(q.pending(0x10, 4));
+    go = true;
+    t.join();
+    CHECK(q.empty());
+  }
   {  // interrupt-only entries (size 0) overlap nothing
     LabelQueue q;
     int ran = 0;
