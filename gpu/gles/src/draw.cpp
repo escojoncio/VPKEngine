@@ -1394,6 +1394,25 @@ static void noteIncomplete(const Texture& t, const SamplerParams& sp, const Inco
          why.level);
 }
 
+// Diagnostics: a complete compressed texture sampled with a level in its range that never received texels (no upload, no copy)
+// reads the zero fill (ASTC: black, alpha 0). Counted (gles.census unwritten) and the first 64 textures logged.
+static void noteUnwritten(const Texture& t, const SamplerParams& sp) {
+    const Image& im = *t.image;
+    const bool mip = sp.minFilter != gl::NEAREST && sp.minFilter != gl::LINEAR;
+    const GLint top = GLint(im.levels) - 1;
+    const GLint base = std::min(std::max(0, t.baseLevel), top), last = mip ? std::max(base, std::min(t.maxLevel, top)) : base;
+    uint32_t missing = 0;
+    for (GLint l = base; l <= last && l < 32; ++l)
+        if (!(im.written >> l & 1u)) missing |= 1u << l;
+    if (!missing) return;
+    diagCount(DiagCounter::Unwritten);
+    static std::set<GLuint> seen;
+    if (seen.size() >= 64 || !seen.insert(t.name).second) return;
+    logf("gles.unwritten tex=%u target=0x%x fmt=0x%04x img=%ux%u levels=%u base=%d max=%d min_filter=0x%x written=0x%x missing=0x%x immutable=%d",
+         t.name, t.target, im.format->internal, im.width, im.height, im.levels, t.baseLevel, t.maxLevel, sp.minFilter, im.written, missing,
+         int(t.immutable));
+}
+
 bool Context::bindResources(Program& p, const StorageP& xfbScratch) {
     VkDescriptorSet set = allocSet(xfbScratch ? p.xfbSetLayout : p.setLayout);
     if (!set) return false;
@@ -1516,6 +1535,7 @@ bool Context::bindResources(Program& p, const StorageP& xfbScratch) {
             if (t && complete(*t, sp, &why)) {
                 ii.sampler = samplerFor(sp, *t);
                 ii.imageView = t->sampledView();
+                if (t->image->format->compressed) noteUnwritten(*t, sp);
                 keep(t->image);
                 t->image->invalid.clear();
             } else {

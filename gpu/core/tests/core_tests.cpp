@@ -946,7 +946,9 @@ void testTile() {
       auto loading = msaa();
       loading.colors[0].load = LoadAction::Load;
       Scene::passWithDraw(l, loading);
-      CHECK_EQ(compileFrame(l, &s.res).stats.msaaStaleReads, 1u);
+      const CompiledFrame cl = compileFrame(l, &s.res);
+      CHECK_EQ(cl.stats.msaaStaleReads, 1u);
+      CHECK(cl.msaaStale.size() == 1 && cl.msaaStale[0] == mc);  // which texture (Device logs gpu.msaa_stale with its history)
     }
     {  // default (option off): samples stored as asked
       Frame f;

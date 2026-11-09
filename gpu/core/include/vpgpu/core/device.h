@@ -93,7 +93,10 @@ class Device {
     uint64_t bytes = 0, frame = ~uint64_t{0};
     bool memoryless = false;
     TileVerdict why = TileVerdict::None;
+    StoreAction store = StoreAction::Store;  // the last encoder of that frame that attaches it: its compiled store (gpu.msaa_stale)
+    bool keepSamples = false;
   };
+  uint32_t msaaStaleLogs_ = 0;
   std::unordered_map<uint64_t, RtMem> rtMem_;
   uint32_t rtMemMs_ = 10000, transientLogs_ = 0;
   uint64_t transientViolations_ = 0;  // TextureDesc::transient textures caught needing memory (TransientViolation), cumulative

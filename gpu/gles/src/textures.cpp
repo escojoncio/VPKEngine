@@ -60,12 +60,13 @@ void texStatsTick(bool force) {
     if (!std::equal(st.diagTotal, st.diagTotal + TexStats::kDiag, st.diagShown) && st.lines < 256) {
         ++st.lines;
         std::copy(st.diagTotal, st.diagTotal + TexStats::kDiag, st.diagShown);
-        const uint64_t* t = st.diagTotal;  // (DiagCounter order: Incomplete, MsrttDsContinued, TexRealloc)
+        const uint64_t* t = st.diagTotal;  // (DiagCounter order: Incomplete, MsrttDsContinued, TexRealloc, Unwritten)
         const uint64_t* m = st.diagMax;
         logf("gles.census incomplete=%llu incomplete_tick_max=%llu msrtt_ds_continued=%llu msrtt_ds_continued_tick_max=%llu "
-             "tex_realloc=%llu tex_realloc_tick_max=%llu",
+             "tex_realloc=%llu tex_realloc_tick_max=%llu unwritten=%llu unwritten_tick_max=%llu",
              static_cast<unsigned long long>(t[0]), static_cast<unsigned long long>(m[0]), static_cast<unsigned long long>(t[1]),
-             static_cast<unsigned long long>(m[1]), static_cast<unsigned long long>(t[2]), static_cast<unsigned long long>(m[2]));
+             static_cast<unsigned long long>(m[1]), static_cast<unsigned long long>(t[2]), static_cast<unsigned long long>(m[2]),
+             static_cast<unsigned long long>(t[3]), static_cast<unsigned long long>(m[3]));
     }
     for (const auto& [fmt, n] : st.count) {
         if (st.shown[fmt] == n) continue;
@@ -220,6 +221,7 @@ void Context::carryTexels(const ImageP& old, Texture& t) {
     barrier();
     dev->vk.vkCmdCopyImage(cmd(), old->image, VK_IMAGE_LAYOUT_GENERAL, t.image->image, VK_IMAGE_LAYOUT_GENERAL,
                            uint32_t(regions.size()), regions.data());
+    t.image->written |= old->written;
     barrier();
 }
 
@@ -237,6 +239,7 @@ void Context::copyBufferToImage(Image& img, uint32_t level, uint32_t layer, int3
     r.imageExtent = {w, h, img.type == VK_IMAGE_TYPE_3D ? d : 1};
     if (img.type != VK_IMAGE_TYPE_3D) r.imageSubresource.baseArrayLayer = layer + uint32_t(z);
     img.invalid.clear();
+    if (level < 32) img.written |= 1u << level;
     dev->vk.vkCmdCopyBufferToImage(cmd(), a.buffer, img.image, VK_IMAGE_LAYOUT_GENERAL, 1, &r);
     barrier();
 }
@@ -586,6 +589,7 @@ void Context::copyImageSubData(GLuint srcName, GLenum srcTarget, GLint srcLevel,
     barrier();
     side[0].image->invalid.clear(), side[1].image->invalid.clear();
     dev->vk.vkCmdCopyImage(cmd(), side[0].image->image, VK_IMAGE_LAYOUT_GENERAL, side[1].image->image, VK_IMAGE_LAYOUT_GENERAL, 1, &r);
+    if (dstLevel < 32) side[1].image->written |= 1u << dstLevel;
     keep(side[0].hold);
     keep(side[1].hold);
     barrier();

@@ -49,7 +49,7 @@ void texStatsTick(bool force);
 
 // Diagnostics: counters of events that should not happen, kept per tick (the texStatsTick calls: eglSwapBuffers / vpgles_flush)
 // and in all, printed with the texture census as "gles.census incomplete= ... " (max per tick, total) when they changed. Needs Device::lock.
-enum class DiagCounter { Incomplete, MsrttDsContinued, TexRealloc, kCount };
+enum class DiagCounter { Incomplete, MsrttDsContinued, TexRealloc, Unwritten, kCount };
 void diagCount(DiagCounter c, uint64_t n = 1);
 
 // Diagnostics: "gles.pso.recipe saved= loaded= prewarmed= miss_in_game=" (VPVulkan's pipeline-recipe store, see vpvk_recipe_stats):
@@ -179,6 +179,9 @@ struct Image {  // a VkImage with its memory
     // glInvalidateFramebuffer: attachment views (and aspects: 1 colour, 2 depth, 4 stencil) whose contents are undefined.
     // The next pass that begins on one of them loads DONT_CARE; any other use of the image defines it again.
     std::map<VkImageView, uint8_t> invalid;
+    // Diagnostics (compressed images, which only uploads and copies can fill): levels that received texels, a bit per level
+    // (gles.unwritten). External images count as written.
+    uint32_t written = 0;
     ~Image();
     VkImageAspectFlags aspect() const;
     // A 2D (array) view of one level and `layerCount` layers from `layer`, for attachments.

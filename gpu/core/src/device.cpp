@@ -151,6 +151,28 @@ void Device::trackRenderTargets(uint64_t index, const CompiledFrame& compiled, s
                   formatInfo(d->format).name, toString(v.why), int(v.load));
     lines.emplace_back(buf);
   }
+  // MSAA textures this frame read with contents from an earlier submit (stats.msaaStaleReads): what the last frame that attached
+  // them did with the samples (before this frame's entry below replaces it). store D / R (or memoryless) there = the read sees
+  // undefined samples (mem_valid: the resource table after this frame). The first 32 lines, then those of one frame in 600.
+  for (const TextureId t : compiled.msaaStale) {
+    if (msaaStaleLogs_ >= 32 && index % 600) break;
+    ++msaaStaleLogs_;
+    const TextureDesc* d = resources_.get(t);
+    if (!d) continue;
+    const auto it = rtMem_.find(uint64_t{t.generation} << 32 | t.index);
+    static const char* const kStore[] = {"D", "S", "R", "SR"};
+    char buf[320];
+    std::snprintf(buf, sizeof buf,
+                  "gpu.msaa_stale f=%llu tex=%u %ux%ux%u s%u fmt=%s transient=%d violated=%d persistent=%d mem_valid=%d prev_f=%lld "
+                  "prev_store=%s prev_keep=%d prev_memoryless=%d prev_why=%s label=%s",
+                  (unsigned long long)index, t.index, d->width, d->height, unsigned(d->layers), unsigned(d->samples),
+                  formatInfo(d->format).name, d->transient ? 1 : 0, resources_.transientViolated(t) ? 1 : 0, d->persistent ? 1 : 0,
+                  resources_.memValid(t) ? 1 : 0, it == rtMem_.end() ? -1LL : (long long)it->second.frame,
+                  it == rtMem_.end() ? "-" : kStore[int(it->second.store) & 3], it == rtMem_.end() ? 0 : int(it->second.keepSamples),
+                  it == rtMem_.end() ? 0 : int(it->second.memoryless), it == rtMem_.end() ? "-" : toString(it->second.why),
+                  d->label.empty() ? "-" : d->label.substr(0, 40).c_str());
+    lines.emplace_back(buf);
+  }
   for (const Encoder& e : compiled.encoders) {
     if (e.kind != Encoder::Kind::Render) continue;
     for (int slot = 0; slot <= kMaxColorAttachments; ++slot) {
@@ -164,6 +186,7 @@ void Device::trackRenderTargets(uint64_t index, const CompiledFrame& compiled, s
       } else if (r.memoryless && !e.tileLocal(slot)) {  // one encoder that needs memory is enough
         r.memoryless = false, r.why = e.tile[slot];
       }
+      r.store = a.store, r.keepSamples = a.keepSamples;
     }
   }
   const auto now = std::chrono::steady_clock::now();

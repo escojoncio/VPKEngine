@@ -220,6 +220,7 @@ struct CompiledFrame {
   std::vector<TextureId> elideMisses;  // textures whose elided contents were needed this frame (Device logs them once)
   std::vector<Barrier> barriers;  // sorted by (encoder, item)
   std::vector<MsaaReject> msaaRejects;  // MSAA attachments the resolve-on-tile option could not keep on tile
+  std::vector<TextureId> msaaStale;     // the first 8 textures counted in stats.msaaStaleReads (Device logs gpu.msaa_stale)
   // Draws the backend must not execute: a pixel-local read that no colour attachment of their
   // encoder serves (the shader would read garbage from [[color(n)]]). Sorted, unique.
   std::vector<DrawRef> badDraws;

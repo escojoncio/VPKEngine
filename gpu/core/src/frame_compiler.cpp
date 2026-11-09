@@ -857,8 +857,10 @@ void placeTiles(CompiledFrame& out, const std::vector<Command>& cmds, std::vecto
     const TextureDesc* d = res.get(TextureId{uint32_t(k & 0xffffffffu), uint32_t(k >> 32)});
     // Stale: read before its first attachment, never attached, or its first attachment Loads it (nothing rendered it
     // earlier in this frame).
-    if (d && d->samples > 1 && (u.firstAttach < 0 || u.firstRead < u.firstAttach || u.firstAttachLoads))
+    if (d && d->samples > 1 && (u.firstAttach < 0 || u.firstRead < u.firstAttach || u.firstAttachLoads)) {
       ++out.stats.msaaStaleReads;
+      if (out.msaaStale.size() < 8) out.msaaStale.push_back(TextureId{uint32_t(k & 0xffffffffu), uint32_t(k >> 32)});
+    }
   }
   // Dead-store history (CompileOptions::msaaDeadStore): what each touched MSAA texture's first access needs.
   std::unordered_map<uint64_t, size_t> obsAt;

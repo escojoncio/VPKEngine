@@ -4077,6 +4077,7 @@ static uint32_t wrapImageAs(uint32_t forceName, void* vkImage, uint32_t vkFormat
     img->dev = c->dev;
     img->image = reinterpret_cast<VkImage>(vkImage);
     img->external = true;
+    img->written = ~0u;
     img->format = f;
     img->width = w, img->height = h, img->layers = std::max(1u, layers), img->levels = std::max(1u, levels);
     GLuint name = forceName ? forceName : c->genName();

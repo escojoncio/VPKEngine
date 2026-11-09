@@ -890,6 +890,21 @@ void testTextures() {
         expectLines.push_back("fail=level_missing level=1");
         expectLines.push_back("gles.tex_realloc tex=" + std::to_string(grow) + " target=0xde1 fmt=0x8058->0x8058 size=16x16->32x32 levels=5->6 lost_levels=5");
         expectLines.push_back("gles.census incomplete=1 incomplete_tick_max=1 msrtt_ds_continued=0");
+        // A complete compressed texture (immutable, 3 levels) sampled mipmapped with only level 0 uploaded: levels 1-2 read the
+        // zero fill (ASTC: black). Counted and logged (gles.unwritten).
+        GLuint uw;
+        glGenTextures(1, &uw);
+        std::vector<uint8_t> a0(4 * 4 * 16, 0);
+        glBindTexture(gl::TEXTURE_2D, uw);
+        glTexStorage2D(gl::TEXTURE_2D, 3, gl::COMPRESSED_RGBA_ASTC_4x4, 16, 16);
+        glCompressedTexSubImage2D(gl::TEXTURE_2D, 0, 0, 0, 16, 16, gl::COMPRESSED_RGBA_ASTC_4x4, GLsizei(a0.size()), a0.data());
+        glTexParameteri(gl::TEXTURE_2D, gl::TEXTURE_MIN_FILTER, gl::LINEAR_MIPMAP_LINEAR);
+        glDrawArrays(gl::TRIANGLES, 0, 3);
+        glFinish();
+        CHECK(err() == gl::NO_ERROR);
+        expectLines.push_back("gles.unwritten tex=" + std::to_string(uw) + " target=0xde1 fmt=0x93b0 img=16x16 levels=3 base=0 max=2 "
+                              "min_filter=0x2703 written=0x1 missing=0x6");
+        expectLines.push_back("unwritten=1 unwritten_tick_max=1");
     }
     // Per-format creation counts reach the log (summary at eglTerminate / every 10 s).
     {
