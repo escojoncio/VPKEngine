@@ -2808,9 +2808,9 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
     // texverify-<n>-L<level>S<slice>-{gpu,mem}.bin (packed rows of elements). The texture checked last is read again at the next
     // check: not filled nor written since, it must read the same (TEXVERIFY_STABLE changed=0).
     struct TexVerify {
-        uint32_t every = [] {  // VPKENGINE_TEXVERIFY (0: off)
+        uint32_t every = [] {  // VPKENGINE_TEXVERIFY: N = one fill in N (0: off); not set: 50 (it needs the probe on anyway)
             const char* e = std::getenv("VPKENGINE_TEXVERIFY");
-            return e ? uint32_t(std::max(0, std::atoi(e))) : 0u;
+            return e ? uint32_t(std::max(0, std::atoi(e))) : 50u;
         }();
         uint64_t fills = 0, n = 0, dumped = 0, dumpedBytes = 0;  // (dumps stop at 256 MB in all)
         struct Item {

@@ -2082,7 +2082,7 @@ void compareDepthArray() {
 
 }  // namespace
 
-// TEXVERIFY (probe on, VPKENGINE_TEXVERIFY=1): a texture filled from memory is read back once its frame is submitted and compared
+// TEXVERIFY (probe on; VPKENGINE_TEXVERIFY=1 here, default 50): a texture filled from memory is read back once its frame is submitted and compared
 // with the guest memory it came from; a read that differs says so (Recording plays the upload; `corrupt` breaks it).
 void texVerify() {
     ProbeOn probe;
@@ -2103,12 +2103,33 @@ void texVerify() {
         CHECK(find(f, "diff_mem=") && find(f, "mem_changed=0"));
         if (failures) f.dump();
     }
-    {  // off without the variable
-        unsetenv("VPKENGINE_TEXVERIFY");
+    // Not set: one fill in 50 is checked (the probe is on); 0 turns it off.
+    for (const char* value : {static_cast<const char*>(nullptr), "0"}) {
+        if (value) setenv("VPKENGINE_TEXVERIFY", value, 1);
+        else unsetenv("VPKENGINE_TEXVERIFY");
         Fixture f;
+        for (int i = 0; i < 49; ++i) {
+            f.renderer.invalidate(kTex, 4);
+            f.renderer.draw(f.state());
+            f.renderer.submit();
+        }
+        CHECK(!find(f, "TEXVERIFY"));
+        f.renderer.invalidate(kTex, 4);
         f.renderer.draw(f.state());
         f.renderer.submit();
+        CHECK(find(f, " L0S0 ") == (value == nullptr));
+    }
+    {  // probe off: nothing, whatever the default
+        unsetenv("VPKENGINE_TEXVERIFY");
+        vpgpu::probe::setEnabled(false);
+        Fixture f;
+        for (int i = 0; i < 60; ++i) {
+            f.renderer.invalidate(kTex, 4);
+            f.renderer.draw(f.state());
+            f.renderer.submit();
+        }
         CHECK(!find(f, "TEXVERIFY"));
+        vpgpu::probe::setEnabled(true);
     }
 }
 
