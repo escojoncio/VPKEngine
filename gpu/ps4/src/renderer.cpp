@@ -3653,6 +3653,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         return best;
     }
 
+    bool depthArrayLoose = !std::getenv("VPKENGINE_DEPTH_ARRAY_STRICT");
     // The render target a T# names: same address, base level, a slice range inside the target's, a
     // format of the same texel size (sampled through a view) and a size the target covers. A target is allocated
     // at the CB's pitch and height, so a T# of the picture drawn in it (816x870 in a 896x896 allocation) is
@@ -3670,7 +3671,9 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         Target* best = nullptr;
         for (Target& c : t->second) {
             if (exact ? c.width != d.width || c.height != d.height : c.width < d.width || c.height < d.height) continue;
-            if (lastSlice >= c.layers) continue;
+            // (a depth array drawn in fewer slices than its T# names, e.g. shadow cascades: the drawn slices are the target's,
+            // the rest were never drawn; refilling all of them from memory every frame would round-trip the target)
+            if (lastSlice >= c.layers && !(depth && depthArrayLoose && arrayed && c.layers > 1 && d.baseArray < c.layers)) continue;
             if (!depth && !anyFormat && c.format != f && !sameTexel(c.format, f)) continue;
             if (!best || (c.format == f && best->format != f)) best = &c;
         }

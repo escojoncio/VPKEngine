@@ -1950,6 +1950,55 @@ void compareDepth() {
     if (failures) f.dump();
 }
 
+// A T# array of 8 slices over a depth target drawn in slices 0-5 only (shadow cascades: the T# names more slices than the frame
+// draws): the depth target itself is sampled, no texture is refilled from memory; one of a single layer is not an array and
+// still goes through memory. VPKENGINE_DEPTH_ARRAY_STRICT=1 keeps the old rule (every slice of the T# in the target).
+void compareDepthArray() {
+    ProbeOn probe;
+    const Program cmp = load("ps_sample_compare");
+    auto arrayDraw = [&](Fixture& f) {
+        vpps4::DrawState d = f.state();
+        d.color[0].address = kOut;
+        d.ps.code = cmp.code;
+        d.ps.userSgprs = 12;
+        d.ps.userData.fill(0);
+        Fixture::tsharp(d.ps.userData.data(), kDepth, 128, 128, 4, 7, 8);
+        d.ps.userData[3] = (d.ps.userData[3] & 0x0fffffffu) | (13u << 28);  // 2D array
+        d.ps.userData[5] = 7u << 13;                                        // slices 0..7
+        f.renderer.draw(d);
+    };
+    auto drawSlices = [](Fixture& f, uint16_t last) {
+        for (uint16_t s = 0; s <= last; ++s) {
+            vpps4::DrawState d = f.depthState(true);
+            d.depth.sliceStart = s;
+            f.renderer.draw(d);
+        }
+    };
+    {
+        Fixture f;
+        drawSlices(f, 5);
+        arrayDraw(f);
+        CHECK(qual(f, "cmp_route_depth_target_found") == 1 && qual(f, "cmp_route_texture_from_memory") == 0);
+        CHECK(qual(f, "compare_mismatch") == 0);
+        CHECK(Fixture::count(f.events(), "copy retile ") == 0);
+        if (failures) f.dump();
+    }
+    {
+        Fixture f;
+        drawSlices(f, 0);
+        arrayDraw(f);
+        CHECK(qual(f, "cmp_route_texture_from_memory") == 1 && qual(f, "cmp_route_depth_target_found") == 0);
+    }
+    {
+        setenv("VPKENGINE_DEPTH_ARRAY_STRICT", "1", 1);
+        Fixture f;
+        drawSlices(f, 5);
+        arrayDraw(f);
+        unsetenv("VPKENGINE_DEPTH_ARRAY_STRICT");
+        CHECK(qual(f, "cmp_route_texture_from_memory") == 1 && qual(f, "cmp_route_depth_target_found") == 0);
+    }
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -1999,6 +2048,7 @@ int main(int argc, char** argv) {
     else if (t == "small_then_big_targets") smallThenBigTargets();
     else if (t == "compare_mismatch") compareMismatch();
     else if (t == "compare_depth") compareDepth();
+    else if (t == "compare_depth_array") compareDepthArray();
     else if (t == "alias_channel_order") aliasChannelOrder();
     else return std::fprintf(stderr, "unknown test\n"), 2;
     return failures ? 1 : 0;
