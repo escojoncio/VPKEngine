@@ -1714,7 +1714,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         if (image) {
             const ImageDesc& d = imageDesc;
             bool depthTarget = false;
-            const TexturePlan plan = planFor(d, b.kind == vpir::ResourceKind::StorageTexture, depthTarget);
+            const TexturePlan plan = planFor(d, b.kind == vpir::ResourceKind::StorageTexture, depthTarget, b.kind == vpir::ResourceKind::Texture);
             out.dim = texDim(d);
             out.elem = texElem(plan);
             out.depth = depthTarget;
@@ -3794,16 +3794,20 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
     // guest memory is laid out at the allocation, and a T# of the allocation sees the picture in its corner (as shadPS4: pitch
     // and height from the registers, size from the hint). VPKENGINE_DEPTH_LAYOUT_HINT=1: laid out at the hinted size (before).
     bool depthLayoutAlloc = !std::getenv("VPKENGINE_DEPTH_LAYOUT_HINT");
-    uint32_t depthPitch(const DepthTarget& z) const { return depthLayoutAlloc && z.pitch > z.width ? z.pitch : 0; }
-    uint32_t depthRows(const DepthTarget& z) const { return depthLayoutAlloc && z.rows > z.height ? z.rows : 0; }
+    // (an allocation more than 4 times the hinted size is not believed: a stale register would lay the target out huge)
+    uint32_t depthPitch(const DepthTarget& z) const { return depthLayoutAlloc && z.pitch > z.width && z.pitch <= 4 * z.width ? z.pitch : 0; }
+    uint32_t depthRows(const DepthTarget& z) const { return depthLayoutAlloc && z.rows > z.height && z.rows <= 4 * z.height ? z.rows : 0; }
+    // textureRef gave up reading a depth target as the allocation of a larger T# (its corner could not be copied): memory.
+    bool depthAllocOff = false;
     bool cmpAsDepth = !std::getenv("VPKENGINE_CMP_COLOR");
     // The render target a T# names: same address, base level, a slice range inside the target's, a
     // format of the same texel size (sampled through a view) and a size the target covers. A target is allocated
     // at the CB's pitch and height, so a T# of the picture drawn in it (816x870 in a 896x896 allocation) is
     // smaller. `exact`: only a target of the T#'s own size (a shader sampling with normalised coordinates sees the
-    // picture, not the allocation; textureRef copies the corner into a texture of the T#'s size otherwise).
+    // picture, not the allocation; textureRef copies the corner into a texture of the T#'s size otherwise). `alloc`: a T# that
+    // reads normalised coordinates may name a depth target smaller than itself, drawn in its allocation (see depthPitch).
     Target* findTarget(std::map<uint64_t, std::vector<Target>>& cache, const ImageDesc& d, vpgpu::Format f, bool depth,
-                       bool anyFormat = false, bool exact = false) {
+                       bool anyFormat = false, bool exact = false, bool alloc = false) {
         auto t = cache.find(d.address);
         if (&cache == &depthTargets)
             if (auto a = depthAliases.find(d.address); a != depthAliases.end() && (t == cache.end() || t->second.empty()))
@@ -3812,10 +3816,16 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         const bool arrayed = d.type == 12 || d.type == 13 || d.type == 15;
         const uint32_t lastSlice = d.type == 11 ? 6 * (uint32_t(d.lastArray) / 6 + 1) - 1 : arrayed ? d.lastArray : d.baseArray;
         Target* best = nullptr;
+        const vpgpu::Format tf = alloc ? textureFormat(d.dataFormat, d.numFormat) : vpgpu::Format::Undefined;
         for (Target& c : t->second) {
-            // (a depth target drawn smaller than its allocation, read by a T# no larger than the allocation: the picture is its corner)
-            const bool inAllocation = depth && (c.pitch > c.width || c.rows > c.height) && d.width <= std::max(c.pitch, c.width) &&
-                                      d.height <= std::max(c.rows, c.height);
+            // (a depth target drawn smaller than its allocation, read by a T# no larger than the allocation: the picture is its corner.
+            // Only a T# of the depth's own kind (32-bit float for a D32, 16-bit unorm for a D16) drawn to lately: another format, or
+            // an image nothing has drawn to for a while, at that address is a different image)
+            const bool inAllocation = alloc && !depthAllocOff && depth && (c.pitch > c.width || c.rows > c.height) &&
+                                      d.width <= std::max(c.pitch, c.width) && d.height <= std::max(c.rows, c.height) &&
+                                      ((tf == vpgpu::Format::R32Float && zPlaneFormat(c.format) == vpgpu::Format::D32Float) ||
+                                       (tf == vpgpu::Format::R16Unorm && c.format == vpgpu::Format::D16Unorm)) &&
+                                      r.frame_ - c.lastUse <= 8;
             if (exact ? c.width != d.width || c.height != d.height : (c.width < d.width || c.height < d.height) && !inAllocation) continue;
             // (a depth array drawn in fewer slices than its T# names, e.g. shadow cascades: the drawn slices are the target's,
             // the rest were never drawn; refilling all of them from memory every frame would round-trip the target. Only when
@@ -3841,19 +3851,19 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         const Target* target = nullptr;
         bool depth = false;
     };
-    Bound boundTarget(const ImageDesc& d) {
+    Bound boundTarget(const ImageDesc& d, bool alloc = false) {
         const vpgpu::Format f = textureFormat(d.dataFormat, d.numFormat);
         if (Target* c = findTarget(colorTargets, d, f, false, true); c && sameTexel(c->format, f)) return {c, false};
-        if (Target* c = findTarget(depthTargets, d, f, true, true)) return {c, true};
+        if (Target* c = findTarget(depthTargets, d, f, true, true, false, alloc)) return {c, true};
         return {};
     }
 
     // How a T# is read: its format plan, adapted to the render target it names when there is one (a
     // target is read as it is stored: the plan's conversion is adjusted, no view is made).
-    TexturePlan planFor(const ImageDesc& d, bool storage, bool& depthTarget) {
+    TexturePlan planFor(const ImageDesc& d, bool storage, bool& depthTarget, bool alloc = false) {
         TexturePlan p = texturePlan(d.dataFormat, d.numFormat, storage);
         depthTarget = false;
-        const Bound b = p.softBc ? Bound{} : boundTarget(d);
+        const Bound b = p.softBc ? Bound{} : boundTarget(d, alloc);
         if (!b.target) return p;
         const vpgpu::Format tf = b.target->format;
         if (b.depth) {
@@ -3898,6 +3908,8 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
     TexRef mirrorTarget(const ImageDesc& desc, uint32_t wid, bool depth, bool msaa, vpgpu::Format f) {
         Target* c = static_cast<Target*>(surfaceOf(wid));
         if (!c || !c->width || inOrderOf(f, c->format) != c->format) return {};
+        // (a depth and stencil picture is not copied: the Z plane of a D32FloatS8 is not a texture of its own here)
+        if (depth && c->format != vpgpu::Format::D32Float && c->format != vpgpu::Format::D16Unorm) return {};
         // (a multisampled T# copies samples: no host copy between multisampled textures yet, the target itself is sampled)
         if (msaa && c->ms) return {};
         TextureId src = c->id;
@@ -4023,7 +4035,10 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
     TexRef textureRef(const ImageDesc& desc, bool storage, bool write, bool integerOnly = false, bool compare = false) {
         texWhy.clear();
         bool depthTarget = false;
-        const TexturePlan plan = planFor(desc, storage, depthTarget);
+        // A sampled T# that reads normalised coordinates sees a picture of its own size (see mirrorTarget); an integer
+        // fetch or a storage access addresses the target's texels, which the target covers.
+        const bool ownSize = !storage && !integerOnly;
+        const TexturePlan plan = planFor(desc, storage, depthTarget, ownSize);
         vpgpu::Format f = plan.format;
         if (f == vpgpu::Format::Undefined) {
             note("texture format " + std::to_string(desc.dataFormat) + "/" + std::to_string(desc.numFormat) + " unsupported" +
@@ -4031,9 +4046,6 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
             texWhy = "format " + std::to_string(desc.dataFormat) + "/" + std::to_string(desc.numFormat) + " unsupported";
             return {};
         }
-        // A sampled T# that reads normalised coordinates sees a picture of its own size (see mirrorTarget); an integer
-        // fetch or a storage access addresses the target's texels, which the target covers.
-        const bool ownSize = !storage && !integerOnly;
         Target* ct = nullptr;
         if (!plan.softBc) {
             if (ownSize) ct = findTarget(colorTargets, desc, f, false, false, true);
@@ -4064,7 +4076,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         Target* dt = nullptr;
         if (!plan.softBc) {
             if (ownSize) dt = findTarget(depthTargets, desc, f, true, false, true);
-            if (!dt) dt = findTarget(depthTargets, desc, f, true, false);
+            if (!dt) dt = findTarget(depthTargets, desc, f, true, false, false, ownSize);
         }
         if (Target* c = dt) {
             routed(ProbeStats::kCmpDepthTarget, *c);
@@ -4072,6 +4084,14 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
                 const uint32_t wid = c->wid;
                 if (const TexRef m = mirrorTarget(desc, wid, true, msaaImage(desc), f); m.id) return m;
                 c = static_cast<Target*>(surfaceOf(wid));
+                if (c->width < desc.width || c->height < desc.height) {
+                    // (the target holds a corner of the T#, which cannot be copied: not the T# sampled through all of it, memory)
+                    const bool off = depthAllocOff;
+                    depthAllocOff = true;
+                    const TexRef m = textureRef(desc, storage, write, integerOnly, compare);
+                    depthAllocOff = off;
+                    return m;
+                }
                 note("T# smaller than its depth target sampled through the whole target");
             }
             c->lastUse = r.frame_;

@@ -2078,6 +2078,62 @@ void depthHintSample() {
     }
 }
 
+// A depth target drawn at 64x64 in a 256x256 allocation, and a T# of `size` over it (dfmt / nfmt).
+void drawDepthAlloc(Fixture& f, bool stencil) {
+    vpps4::DrawState d = zState(f, 3, stencil, 8);
+    d.color[0] = {};
+    d.depth.width = d.depth.height = 64;
+    d.depth.pitch = d.depth.rows = 256;
+    f.renderer.draw(d);
+}
+vpps4::ImageDesc depthAllocImage(uint32_t dfmt, uint32_t nfmt, uint32_t size) {
+    uint32_t w[8]{};
+    Fixture::tsharp(w, kDepth, size, size, dfmt, nfmt, 8);
+    return vpps4::decodeImage(std::span<const uint32_t>(w, 8));
+}
+
+// A T# of the allocation read with integer coordinates addresses the target's texels, which a corner copy does not cover: it
+// is not the depth target nor its corner, but the texture made from memory; sampled, it is the corner.
+void depthAllocInteger() {
+    Fixture f;
+    drawDepthAlloc(f, false);
+    const vpgpu::TextureId target = f.renderer.textureFor(depthAllocImage(4, 7, 64));
+    CHECK(target);
+    const std::string corner = "copy sampled corner " + Fixture::hex(kDepth);
+    CHECK(f.renderer.textureFor(depthAllocImage(4, 7, 256), true) != target);
+    CHECK(Fixture::count(f.events(), corner) == 0);
+    CHECK(f.renderer.textureFor(depthAllocImage(4, 7, 256)) != target);
+    CHECK(Fixture::count(f.events(), corner) == 1);
+    if (failures) f.dump();
+}
+
+// A depth target whose corner cannot be copied (a depth and stencil one: the mirror is of D32 / D16 only) is not sampled through
+// the whole target scaled to the T#: the T# reads memory.
+void depthAllocNoMirror() {
+    Fixture f;
+    drawDepthAlloc(f, true);
+    const vpgpu::TextureId target = f.renderer.textureFor(depthAllocImage(4, 7, 64));
+    CHECK(target);
+    CHECK(f.renderer.textureFor(depthAllocImage(4, 7, 256)) != target);
+    CHECK(Fixture::count(f.events(), "copy sampled corner " + Fixture::hex(kDepth)) == 0);
+    if (failures) f.dump();
+}
+
+// A T# of the allocation's address in a format that is not the depth's (16 bits, 8888) is another image: memory.
+void depthAllocFormat() {
+    Fixture f;
+    drawDepthAlloc(f, false);
+    const vpgpu::TextureId target = f.renderer.textureFor(depthAllocImage(4, 7, 64));
+    CHECK(target);
+    const std::string corner = "copy sampled corner " + Fixture::hex(kDepth);
+    CHECK(f.renderer.textureFor(depthAllocImage(2, 0, 256)) != target);
+    CHECK(f.renderer.textureFor(depthAllocImage(10, 0, 256)) != target);
+    CHECK(Fixture::count(f.events(), corner) == 0);
+    CHECK(f.renderer.textureFor(depthAllocImage(4, 7, 256)) != target);  // (the depth's own format)
+    CHECK(Fixture::count(f.events(), corner) == 1);
+    if (failures) f.dump();
+}
+
 // The same T# over a depth target: the host resource is a depth texture, nothing is counted as a mismatch.
 void compareDepth() {
     ProbeOn probe;
@@ -2252,6 +2308,9 @@ int main(int argc, char** argv) {
     else if (t == "depth_write_back") depthWriteBack();
     else if (t == "depth_hint_layout") depthHintLayout();
     else if (t == "depth_hint_sample") depthHintSample();
+    else if (t == "depth_alloc_integer") depthAllocInteger();
+    else if (t == "depth_alloc_no_mirror") depthAllocNoMirror();
+    else if (t == "depth_alloc_format") depthAllocFormat();
     else if (t == "flat_map") flatMap();
     else if (t == "window_superseded") windowSuperseded();
     else if (t == "eviction") eviction();
