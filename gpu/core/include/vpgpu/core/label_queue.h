@@ -20,10 +20,14 @@ class LabelQueue {
   // memory it writes (0/0 for an interrupt only): pending() and waitTarget() look at it.
   // `pureWrite`: the action only writes [address, +size) (no interrupt, nothing else): supersede() may drop it.
   void add(uint64_t frame, uint64_t address, uint32_t size, std::function<void()> action, bool pureWrite = false);
+  // The command processor's own wait on the pure write [address, +size) was met in GPU order (nobody else waits for its
+  // value): marks the newest such entry not yet running as droppable by supersede(). Returns how many were marked (0 or 1).
+  size_t markOrdered(uint64_t address, uint32_t size);
   // A write the caller makes later in GPU order covers [address, +size) (a DMA fill / copy of the command processor, after
-  // the label in the command stream): the pure writes queued entirely inside it, not yet running, would only be overwritten
-  // by it, so they are dropped (their entries stay, empty, in order). Returns how many were dropped.
-  size_t supersede(uint64_t address, uint64_t size);
+  // the label in the command stream): the marked pure writes (markOrdered) queued entirely inside it, not yet running, would
+  // only be overwritten by it, so they are dropped (their entries stay, empty, in order). Not those that overlap
+  // [keepAddress, +keepSize) (what a copy reads: it must find them written). Returns how many were dropped.
+  size_t supersede(uint64_t address, uint64_t size, uint64_t keepAddress = 0, uint64_t keepSize = 0);
   // Runs, on the calling thread and in the order they were added, the entries whose frame is below
   // `completedBelow`; stops at the first that is not ready (labels never overtake each other).
   // Actions must not call release(). Returns how many ran. Any thread.
@@ -56,7 +60,7 @@ class LabelQueue {
     uint64_t frame, address;
     uint32_t size;
     std::function<void()> action;
-    bool pureWrite = false, running = false;
+    bool pureWrite = false, running = false, ordered = false;
   };
   size_t runOnce(const std::function<uint64_t()>& completed);    // one pass, runMutex_ held
   size_t runLocked(const std::function<uint64_t()>& completed);  // runMutex_ held

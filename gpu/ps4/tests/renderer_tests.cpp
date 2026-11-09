@@ -2031,17 +2031,56 @@ void dmaThenLabel() {
     h.gpuRuns();
     x.f.backend.finishFramesBelow(x.f.device.submittedFrames());
     CHECK(*x.f.at(l2) == 7);
-    // A label queued before the DMA, all of it covered: dropped (labelThenDma), the DMA goes on the GPU timeline with the work
-    // and its bytes are the last.
+    // A label queued before the DMA, nothing met it in GPU order (labelThenDma drops those): the DMA waits for it (CPU, in place),
+    // the DMA's bytes are the last.
     const uint64_t l3 = kBase + 0x6040;
     x.work(kBase + 0x6000);
     x.s.scheduleLabel(l3, 4, false, [&] { *x.f.at(l3) = 1; });
-    CHECK(!h.fill(l3, 4, 0x44));
-    CHECK(!x.f.renderer.labelPending(l3, 4));
+    CHECK(h.fill(l3, 4, 0x44));
+    CHECK(*x.f.at(l3) == 0x44444444u && !x.f.renderer.labelPending(l3, 4) && x.s.counters().labelsSuperseded == 0);
+}
+
+// Only a label the command processor's own WAIT_REG_MEM already met in GPU order (prepareWait: Ordered) is dropped by a DMA
+// over it: a CPU poll or another ring waiting for that value would otherwise hang. A copy keeps the labels that overlap what it
+// reads (its source overlaps its destination: the copy reads them written).
+void labelSupersedeConsumed() {
+    HostDma h;
+    Sched& x = h.x;
+    const uint64_t block = kBase + 0x7400, stamp = block + 0x10, unmet = block + 0x20;
+    int stamps = 0, unmets = 0;
+    x.work(kBase + 0x1000);
+    x.s.scheduleLabel(stamp, 4, false, [&] { *x.f.at(stamp) = 0x1234, ++stamps; }, 0x1234, true);
+    x.s.scheduleLabel(unmet, 4, false, [&] { *x.f.at(unmet) = 0x55, ++unmets; }, 0x55, true);
+    CHECK(x.s.prepareWait(stamp, 4, [](uint32_t v) { return v == 0x1234; }) == vpps4::Scheduler::WaitKind::Ordered);
+    CHECK(x.s.prepareWait(unmet, 4, [](uint32_t v) { return v == 0x66; }) == vpps4::Scheduler::WaitKind::Poll);  // (not the value it waits for)
     x.s.present();
-    h.gpuRuns();
-    x.f.backend.finishFramesBelow(x.f.device.submittedFrames());
-    CHECK(*x.f.at(l3) == 0x44444444u);
+    // Over the block: the label met in order is dropped, the other is written first (the fill waits for it).
+    CHECK(h.fill(block, 0x40, 0xee));
+    CHECK(stamps == 0 && unmets == 1 && x.s.counters().labelsSuperseded == 1);
+    CHECK(*x.f.at(stamp) == 0xeeeeeeeeu && *x.f.at(unmet) == 0xeeeeeeeeu);
+    // A copy whose source overlaps its destination: a label met in order inside both is kept, one only in the destination dropped.
+    const uint64_t dst = kBase + 0x7800, src = dst + 0x20, inDst = dst + 0x4, inBoth = dst + 0x30;
+    int dropped = 0, kept = 0;
+    x.work(kBase + 0x1000);
+    x.s.scheduleLabel(inDst, 4, false, [&] { ++dropped; }, 0x11, true);
+    x.s.scheduleLabel(inBoth, 4, false, [&] { *x.f.at(inBoth) = 0x22, ++kept; }, 0x22, true);
+    CHECK(x.s.prepareWait(inDst, 4, [](uint32_t v) { return v == 0x11; }) == vpps4::Scheduler::WaitKind::Ordered);
+    CHECK(x.s.prepareWait(inBoth, 4, [](uint32_t v) { return v == 0x22; }) == vpps4::Scheduler::WaitKind::Ordered);
+    const uint64_t superseded = x.s.counters().labelsSuperseded;
+    CHECK(h.copy(dst, src, 0x40));
+    CHECK(x.s.counters().labelsSuperseded == superseded + 1 && dropped == 0 && kept == 1);
+}
+
+// The scheduler takes the clock only to call it: an empty one does not throw when it is built.
+void schedulerNoClock() {
+    Fixture f;
+    bool threw = false;
+    try {
+        vpps4::Scheduler s(f.renderer, f.device, vpgpu::SubmitPolicy{}, vpps4::Scheduler::Clock{});
+    } catch (...) {
+        threw = true;
+    }
+    CHECK(!threw);
 }
 
 // A title stamps labels (EOP/EOS/RELEASE_MEM, no interrupt) into a block, waits for one on its own ring (WAIT_REG_MEM, met in
@@ -2069,6 +2108,7 @@ void labelThenDma() {
     // processor reading the label word afterwards waits for the fill (label -> fill -> CP read).
     x.work(block + 0x100);
     x.s.scheduleLabel(stamp, 8, false, [&] { *reinterpret_cast<uint64_t*>(x.f.at(stamp)) = 0x99, ++stampWrites; }, 0x99, true);
+    CHECK(x.s.prepareWait(stamp, 4, [](uint32_t v) { return v == 0x99; }) == vpps4::Scheduler::WaitKind::Ordered);
     const size_t submitted = x.submits();
     CHECK(!h.fill(block, 2048, 0x22));
     CHECK(x.submits() == submitted && x.f.backend.waits.empty() && x.s.counters().labelsSuperseded == 2);
@@ -3069,15 +3109,14 @@ long long probeP7(const Fixture& f, const std::string& key) {
     return -1;
 }
 
-// Constant buffers at an address that is not 16-byte aligned are copied into the upload ring. A V# says how much (its size,
-// not more); a bare address gets the usual 64 KiB window. Within a submit a buffer that was not written since is bound again
-// from its copy, however many others were copied in between; one written since (told to the tracker, or only seen in its
-// bytes) is copied afresh, and a new submit starts the copies over.
 // A small read-only buffer the renderer already reads on the CPU (its DMAs run on the CPU) is copied to the upload ring when the
 // draw is recorded: the draw does not hold the guest bytes, so a CPU DMA there right after neither submits nor waits (it waited
 // for the draw before: WAR). Bound in place when the GPU wrote it last, when a label write into it is pending, or with
 // VPKENGINE_BUFFER_LIVE=1.
 void bufferSnapshot() {
+    namespace pr = vpgpu::probe;
+    pr::setEnabled(true);
+    pr::registry().reset();
     const Program vt = load("vs_transform");
     const auto drawWith = [&](Sched& x, uint64_t cb, uint32_t bytes) {
         uint32_t* vtable = x.f.at(kBase + 0x100);
@@ -3106,18 +3145,50 @@ void bufferSnapshot() {
         x.s.finish();
         CHECK(x.f.renderer.cpuReadSeen(at, 400) && !x.f.renderer.gpuMayAccess(at, 400));
     };
+    // The first word of each constant buffer of `bytes` bytes the draws recorded so far are bound to (read once the frame ran).
+    const auto bound = [&](Sched& x, uint32_t bytes) {
+        std::vector<uint32_t> words;
+        for (const vpgpu::Draw& d : x.f.backend.draws)
+            for (const vpgpu::Access& a : d.bindings) {
+                const auto m = x.f.backend.memory.find(a.range.index);
+                if (a.range.kind != vpgpu::ResourceRange::Kind::Buffer || a.range.end - a.range.begin != bytes || m == x.f.backend.memory.end())
+                    continue;
+                uint32_t v;
+                std::memcpy(&v, static_cast<const uint8_t*>(m->second) + a.range.begin, 4);
+                words.push_back(v);
+            }
+        return words;
+    };
+    const auto snapshots = [&](Sched& x) -> long long {  // (the probe counter buffer_snapshots)
+        x.f.renderer.publishProbe(1);
+        std::string all;
+        for (const std::string& l : pr::registry().sample(1.0))
+            if (l.find("VPKENGINE_PROBE RATES ") == 0) all += l;
+        const size_t at = all.find(" buffer_snapshots=");
+        return at == std::string::npos ? -1 : std::stoll(all.substr(at + 18));
+    };
     const uint64_t cb = kBase + 0x30000;
     {
         HostDma h;
         Sched& x = h.x;
         readOnCpu(x, cb);
+        *x.f.at(cb) = 0xa1;
+        *x.f.at(cb + 0x1a0) = 0xb2;
         const size_t submits = x.submits();
+        const long long snaps = snapshots(x);
         drawWith(x, cb, 400);
         CHECK(!x.f.renderer.gpuMayAccess(cb, 400));
         CHECK(h.copy(cb, cb + 0x1a0, 400));  // the next record over the current one, as the title does: on the CPU, free
         CHECK(x.submits() == submits && x.f.backend.waits.size() == 1 && x.s.counters().cpuSyncs == 0);
+        CHECK(*x.f.at(cb) == 0xb2);
         drawWith(x, cb, 400);  // the next draw copies the new bytes
         CHECK(!x.f.renderer.gpuMayAccess(cb, 400));
+        CHECK(snapshots(x) == snaps + 2);
+        x.s.finish();
+        {  // (the draw before the DMA got the bytes from before it, the one after the bytes it left)
+            const std::vector<uint32_t> words = bound(x, 400);
+            CHECK(words.size() >= 2 && words[words.size() - 2] == 0xa1 && words[words.size() - 1] == 0xb2);
+        }
         // The GPU wrote it last: in place.
         readOnCpu(x, cb + 0x1000);
         x.f.renderer.noteGpuWrite(cb + 0x1000, 4);
@@ -3133,6 +3204,54 @@ void bufferSnapshot() {
         // Never read on the CPU: in place (its DMAs go on the GPU timeline).
         drawWith(x, cb + 0x3000, 400);
         CHECK(x.f.renderer.gpuMayAccess(cb + 0x3000, 400));
+        // Up to 4 KiB; more is bound in place.
+        readOnCpu(x, cb + 0x8000);
+        readOnCpu(x, cb + 0x9000);
+        const long long snaps2 = snapshots(x);
+        drawWith(x, cb + 0x9000, 4096);
+        CHECK(!x.f.renderer.gpuMayAccess(cb + 0x9000, 4096) && snapshots(x) == snaps2 + 1);
+        drawWith(x, cb + 0x8000, 4097);
+        CHECK(x.f.renderer.gpuMayAccess(cb + 0x8000, 4097) && snapshots(x) == snaps2 + 1);
+        // Not 16-byte aligned: not a snapshot.
+        readOnCpu(x, cb + 0xa000);
+        *x.f.at(cb + 0xa008) = 0xc3;
+        drawWith(x, cb + 0xa008, 400);
+        CHECK(snapshots(x) == snaps2 + 1);
+        x.s.finish();
+        CHECK(!bound(x, 400).empty() && bound(x, 400).back() == 0xc3);
+        // The tracker forgot its history (past its interval limit): who wrote last is not known until the work recorded before
+        // has finished, so it is bound in place; later, copied again.
+        readOnCpu(x, cb + 0xb000);
+        for (uint64_t i = 0; i < 140000; ++i) x.f.renderer.noteGpuWrite(0x7000000000ull + i * 64, 4);
+        CHECK(x.f.renderer.tracker().forgetHistoryCalls() >= 1);
+        const long long snaps3 = snapshots(x);
+        drawWith(x, cb + 0xb000, 400);
+        CHECK(x.f.renderer.gpuMayAccess(cb + 0xb000, 400) && snapshots(x) == snaps3);
+        x.s.finish();
+        drawWith(x, cb + 0xb000, 400);
+        CHECK(!x.f.renderer.gpuMayAccess(cb + 0xb000, 400) && snapshots(x) == snaps3 + 1);
+    }
+    {  // A FLAT store writes anywhere in the regions its table maps: they are bound in place.
+        HostDma h;
+        Sched& x = h.x;
+        static const uint32_t code[] = {0x7e040200u, 0x7e060201u, 0x7e080202u, 0x7e0a0203u, 0xdc300000u, 0x0a000002u,
+                                        0xdc700000u, 0x00000a04u, 0xBF810000u};  // (flat_load v10 <- [s0:1]; flat_store [s2:3] <- v10)
+        vpps4::DispatchState d;
+        d.cs.code = code;
+        d.cs.address = kBase + 0x82000;
+        d.cs.userSgprs = 4;
+        d.cs.workgroupSize = {64, 1, 1};
+        d.cs.userData[0] = uint32_t(cb);
+        d.cs.userData[1] = uint32_t(cb >> 32);
+        d.cs.userData[2] = uint32_t(cb + 0x100);
+        d.cs.userData[3] = uint32_t((cb + 0x100) >> 32);
+        x.f.renderer.dispatch(d);
+        x.f.renderer.dispatch(d);
+        CHECK(x.f.renderer.stats().shaderErrors == 0 && x.f.renderer.stats().skipped.empty());
+        readOnCpu(x, cb);
+        const long long snaps = snapshots(x);
+        drawWith(x, cb, 400);
+        CHECK(x.f.renderer.gpuMayAccess(cb, 400) && snapshots(x) == snaps);
     }
     {
         setenv("VPKENGINE_BUFFER_LIVE", "1", 1);
@@ -3145,8 +3264,13 @@ void bufferSnapshot() {
         CHECK(h.copy(cb, cb + 0x1a0, 400));
         CHECK(x.s.counters().submits[size_t(vpgpu::SubmitReason::Dma)] == 1);
     }
+    pr::setEnabled(false);
 }
 
+// Constant buffers at an address that is not 16-byte aligned are copied into the upload ring. A V# says how much (its size,
+// not more); a bare address gets the usual 64 KiB window. Within a submit a buffer that was not written since is bound again
+// from its copy, however many others were copied in between; one written since (told to the tracker, or only seen in its
+// bytes) is copied afresh, and a new submit starts the copies over.
 void alignedConstantCopies() {
     const Program vt = load("vs_transform");
     // vs_transform: vertices through the V# table at s[0:1] (+0x100), constants from the V# in s[4:7].
@@ -3364,6 +3488,8 @@ int main(int argc, char** argv) {
     else if (t == "unknown_extent_busy") unknownExtentBusy();
     else if (t == "dma_then_label") dmaThenLabel();
     else if (t == "label_then_dma") labelThenDma();
+    else if (t == "label_supersede_consumed") labelSupersedeConsumed();
+    else if (t == "scheduler_no_clock") schedulerNoClock();
     else if (t == "buffer_snapshot") bufferSnapshot();
     else if (t == "label_keep_opt_out") labelKeepOptOut();
     else if (t == "dma_on_cpu_opt_out") dmaOnCpuOptOut();

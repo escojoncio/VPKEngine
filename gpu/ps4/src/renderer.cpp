@@ -918,12 +918,24 @@ struct Renderer::Impl {
     static constexpr uint64_t kSnapshotBytes = 4096;
     bool bufferLive = std::getenv("VPKENGINE_BUFFER_LIVE") != nullptr;
     uint64_t snapForgets = 0, snapAfter = 0;
+    // The guest regions a FLAT shader may write anywhere in (the GuestMap table's windows), merged: the tracker only hears of
+    // them as touched, so a snapshot of a buffer inside one could miss what a store left there.
+    std::map<uint64_t, uint64_t> flatReach;
+    void noteFlatReach(uint64_t lo, uint64_t hi) {
+        auto it = flatReach.upper_bound(lo);
+        if (it != flatReach.begin() && std::prev(it)->second >= lo) it = std::prev(it);
+        while (it != flatReach.end() && it->first <= hi) lo = std::min(lo, it->first), hi = std::max(hi, it->second), it = flatReach.erase(it);
+        flatReach[lo] = hi;
+    }
     bool snapshotSafe(uint64_t address, uint64_t size) {
-        if (bufferLive || !size || size > kSnapshotBytes || address % 16 || !cpuReadSeen(address, size)) return false;
+        if (bufferLive || !size || size > kSnapshotBytes || address % 16 || overlaps(flatReach, false, address, size)) return false;
+        // (once the CPU reads are no longer followed, everything counts as read: then only a range the old ranges cover whole does)
+        const auto covering = cpuRead.upper_bound(address);
+        if (cpuReadAll ? covering == cpuRead.begin() || std::prev(covering)->second < address + size : !cpuReadSeen(address, size)) return false;
         if (tracker.forgetHistoryCalls() != snapForgets)
             snapForgets = tracker.forgetHistoryCalls(), snapAfter = r.device_.submittedFrames() + 1;
         if (r.device_.completedFrames() < snapAfter) return false;
-        return !tracker.gpuWritten(address, size) && !r.device_.labelPending(address, uint32_t(size));
+        return !tracker.gpuWritten(address, size) && !(r.device_.labelsQueued() && r.device_.labelPending(address, uint32_t(size)));
     }
     std::optional<uint64_t> alignedConstantCopy(uint64_t address, uint64_t bytes, const void* host) {
         if (alignedGeneration != ringGeneration || alignedCopies.size() >= kAlignedCopies) forgetAlignedCopies();
@@ -4662,6 +4674,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
             a.write = true;
             a.range = ResourceRange::bytes(e.b->id, 0, e.size);
             touch(e.base, e.size);
+            noteFlatReach(e.base, e.base + e.size);
             out.push_back(a);
         }
         return true;
@@ -4794,7 +4807,6 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
                     if (!pointer && !a.write && snapshotSafe(address, size)) {
                         GuestRegion g;
                         if (region(address, size, g)) {
-                            noteCpuRead(address, size, "buffer_snapshot");
                             const Phase cbPhase(r.cpu_.bindCbMs);
                             if (const auto at = alignedConstantCopy(address, size, static_cast<const uint8_t*>(g.host) + (address - g.base))) {
                                 ++pstat.bufferSnapshots;

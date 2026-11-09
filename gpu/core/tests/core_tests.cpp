@@ -3428,13 +3428,26 @@ void testLabelQueue() {
     q.add(0, 0x1f8, 16, [&] { ran.push_back(2); }, true);  // straddles the end: kept
     q.add(0, 0x110, 4, [&] { ran.push_back(3); });         // not a pure write (an interrupt too): kept
     q.add(1, 0x120, 4, [&] { ran.push_back(4); }, true);   // a later frame, inside: dropped
-    CHECK_EQ(q.supersede(0x100, 0x100), 2u);
+    CHECK_EQ(q.supersede(0x100, 0x100), 0u);               // (nothing met them in order yet: none is dropped)
+    CHECK_EQ(q.markOrdered(0x100, 8), 1u);
+    CHECK_EQ(q.markOrdered(0x120, 4), 1u);
+    CHECK_EQ(q.markOrdered(0x200, 4), 0u);                 // (no such entry)
+    CHECK_EQ(q.supersede(0x100, 0x100, 0x110, 0x10), 2u);  // (the range the caller reads, 0x110.., holds none of them)
     CHECK(q.size() == 4 && !q.pending(0x100, 8) && !q.pending(0x120, 4) && q.pending(0x110, 4));
     CHECK_EQ(q.waitTarget(0x100, 0x10), 0u);
     CHECK_EQ(q.waitTarget(0x100, 0x100), 1u);  // (the kept ones)
     CHECK_EQ(q.supersede(0x100, 0x100), 0u);
     CHECK_EQ(q.release(2), 4u);
     CHECK(ran == (std::vector<int>{2, 3}));
+  }
+  {  // supersede(): a marked write that overlaps the range the caller reads is kept
+    LabelQueue q;
+    q.add(0, 0x100, 4, [] {}, true);
+    q.add(0, 0x140, 4, [] {}, true);
+    CHECK_EQ(q.markOrdered(0x100, 4), 1u);
+    CHECK_EQ(q.markOrdered(0x140, 4), 1u);
+    CHECK_EQ(q.supersede(0x100, 0x100, 0x13c, 8), 1u);
+    CHECK(!q.pending(0x100, 4) && q.pending(0x140, 4));
   }
   {  // a pure write being written is not dropped (it lands now, before the caller's own write)
     LabelQueue q;

@@ -104,13 +104,24 @@ size_t LabelQueue::runOnce(const std::function<uint64_t()>& completed) {
   return ran;
 }
 
-size_t LabelQueue::supersede(uint64_t address, uint64_t size) {
+size_t LabelQueue::markOrdered(uint64_t address, uint32_t size) {
+  std::lock_guard lock(mutex_);
+  for (auto it = queue_.rbegin(); it != queue_.rend(); ++it)
+    if (it->pureWrite && !it->running && it->address == address && it->size == size) {
+      it->ordered = true;
+      return 1;
+    }
+  return 0;
+}
+
+size_t LabelQueue::supersede(uint64_t address, uint64_t size, uint64_t keepAddress, uint64_t keepSize) {
   std::lock_guard lock(mutex_);
   size_t n = 0;
   for (Entry& e : queue_)
-    if (e.pureWrite && !e.running && e.size && e.address >= address && e.address - address + e.size <= size) {
+    if (e.pureWrite && e.ordered && !e.running && e.size && e.address >= address && e.address - address + e.size <= size &&
+        !(keepSize && overlap(e.address, e.size, keepAddress, keepSize))) {
       e.action = nullptr;
-      e.address = 0, e.size = 0, e.pureWrite = false;
+      e.address = 0, e.size = 0, e.pureWrite = e.ordered = false;
       ++n;
     }
   return n;

@@ -162,6 +162,7 @@ class NullBackend final : public Backend {
   std::vector<Draw> draws;               // every draw submitted, in render passes (tests)
   std::vector<RenderPassDesc> passes;    // the render passes submitted (tests)
   std::vector<Copy> copies;              // the copies submitted (tests)
+  std::map<uint32_t, void*> memory;      // host memory of the buffers that alias some (guest windows, upload rings), by index (tests)
   std::atomic<uint64_t> completedBelow{0};  // what completedFrames reports (tests move it: nothing finishes by itself)
   uint64_t failPipeline = 0;   // compilePipeline fails for this key value (0 = never)
   std::function<bool(const BufferDesc&)> failBuffer;  // createBuffer refuses the buffers it says true for (tests)

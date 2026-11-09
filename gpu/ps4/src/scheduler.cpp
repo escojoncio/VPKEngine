@@ -13,7 +13,7 @@ using vpgpu::SubmitReason;
 Scheduler::Scheduler(Renderer& r, vpgpu::Device& d, vpgpu::SubmitPolicy p, Clock c)
     : renderer_(r), device_(d), policy_(p), now_(std::move(c)), dmaGpu_(!std::getenv("VPKENGINE_DMA_CPU")),
       supersede_(!std::getenv("VPKENGINE_LABEL_KEEP")) {
-    summarySince_ = now_();
+    summarySince_ = now_ ? now_() : 0;
 }
 
 void Scheduler::resetOpen() {
@@ -112,11 +112,12 @@ bool Scheduler::syncCpu(uint64_t a, uint64_t n, SubmitReason why, uint64_t b, ui
 }
 
 bool Scheduler::dmaOnGpu(uint64_t dst, uint64_t n, uint64_t src) {
-    // A label still to be written whose bytes this DMA all overwrites: in GPU order the label lands, then the DMA's bytes
-    // (the command processor's own WAIT_REG_MEM on it, between the two, was met in order: prepareWait). Dropped, the DMA needs
-    // no wait for it on either path. (One with an interrupt stays: its handler may read the label.)
+    // A label still to be written whose bytes this DMA all overwrites and that the command processor's own WAIT_REG_MEM already
+    // met in order (prepareWait: Ordered): in GPU order the label lands, then the DMA's bytes. Dropped, the DMA needs no wait for
+    // it on either path. (One with an interrupt, one nobody met in order, whose value a CPU poll or another ring may wait for,
+    // or one overlapping what a copy reads stays.)
     if (supersede_ && device_.labelWaitTarget(dst, uint32_t(std::min<uint64_t>(n, ~0u))))
-        if (const size_t k = device_.supersedeLabels(dst, n)) counters_.labelsSuperseded += k, forgetLabelValues(dst, n);
+        if (const size_t k = device_.supersedeLabels(dst, n, src, src ? n : 0)) counters_.labelsSuperseded += k, forgetLabelValues(dst, n);
     if (!dmaGpu_) return false;
     if (renderer_.cpuReadSeen(dst, n)) return renderer_.probeDmaCpuRead(dst, n, src), ++counters_.dmaCpuRead, false;
     const uint64_t m = src ? n : 0;
@@ -178,6 +179,7 @@ Scheduler::WaitKind Scheduler::prepareWait(uint64_t a, uint64_t n, const std::fu
             if (a < it->address || a + 4 > it->address + it->size) break;       // partial: unknown
             const unsigned shift = unsigned(a - it->address) * 8;
             if (wanted(uint32_t(it->value >> shift))) {
+                device_.markLabelOrdered(it->address, it->size);
                 ++counters_.orderedWaits;
                 return WaitKind::Ordered;
             }

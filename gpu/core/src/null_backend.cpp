@@ -11,6 +11,7 @@ void NullBackend::createBuffer(BufferId id, const BufferDesc& d) {
     failedBuffers.insert({id.index, id.generation});
     return;
   }
+  if (record && d.guestMemory) memory[id.index] = d.guestMemory;
   if (record) calls.push_back(std::format("createBuffer {} size={} guest={}", id.index, d.size, d.guestMemory != nullptr));
 }
 void NullBackend::createTexture(TextureId id, const TextureDesc& d) {

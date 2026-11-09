@@ -5245,8 +5245,10 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
     // chunk (which may publish the frame and let the backend be destroyed).
     dispatch_semaphore_t chunkSem = dispatch_semaphore_create(0);
     chunkDone.push_back(chunkSem);
-    chunkEnc.push_back(cbEncoders);
-    chunkEncPending += cbEncoders;
+    // (a chunk cut by the draw budget weighs as the encoders its draws would fill: its memory is the draws', not the few encoders')
+    const uint32_t chunkWeight = std::max(cbEncoders, maxDrawsPerCb ? uint32_t(uint64_t(cbDraws) * maxEncodersPerCb / maxDrawsPerCb) : 0u);
+    chunkEnc.push_back(chunkWeight);
+    chunkEncPending += chunkWeight;
     [cb addCompletedHandler:^(id<MTLCommandBuffer>) {
       hSelf->bufIntLiveBytes.fetch_sub(hIntBytes, std::memory_order_relaxed);
       hSelf->chunkCompletions.fetch_add(1, std::memory_order_relaxed);
@@ -5295,8 +5297,10 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
     cbEncoders = 0;
     // Throttle: at most `maxPendingChunks` earlier chunks of this frame uncompleted (their encoder memory stays
     // pinned until they complete). Nothing is open and the next command buffer is empty, so waiting here is safe.
+    // (never more than 8 times the count: the weights are estimates, and the pending chunks' memory must stay bounded)
     while (maxPendingChunks && chunkDone.size() > maxPendingChunks &&
-           (chunkWaitByCount || !maxEncodersPerCb || chunkEncPending > uint64_t(maxPendingChunks) * maxEncodersPerCb))
+           (chunkWaitByCount || !maxEncodersPerCb || chunkDone.size() > 8ull * maxPendingChunks ||
+            chunkEncPending > uint64_t(maxPendingChunks) * maxEncodersPerCb))
       awaitOldestChunk();
     tables.lock();
   };

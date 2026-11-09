@@ -63,9 +63,12 @@ public:
     // (a CP read: IB, label, WAIT_REG_MEM) goes through syncCpu, which finds the recorded range busy.
     // `dst` is what the DMA writes ([dst, +n)), `src` (0: none) what a copy reads. A destination the renderer has read on the CPU
     // (Renderer::cpuReadSeen) stays on the CPU path: it would read old bytes until the GPU runs the DMA.
-    // The caller then does the DMA (either way): label writes still queued whose every byte [dst, +n) covers, without an
-    // interrupt (scheduleLabel with `irq` false), are dropped first (Device::supersedeLabels; the DMA's bytes are what the
-    // in-order timeline leaves there), so neither path waits for them (VPKENGINE_LABEL_KEEP=1 keeps them: the DMA waits).
+    // Contract: the caller does the DMA over [dst, +n) after this call, whatever it returns (on the GPU timeline or, after
+    // syncCpu, on the CPU): label writes still queued whose every byte [dst, +n) covers, without an interrupt (scheduleLabel
+    // with `irq` false) and already met in order by the command processor's WAIT_REG_MEM (prepareWait: Ordered), are dropped
+    // here, before the DMA exists (Device::supersedeLabels; the DMA's bytes are what the in-order timeline leaves there), so
+    // neither path waits for them. A caller that then does not do the DMA loses those label writes. Labels overlapping what a
+    // copy reads ([src, +n)) stay. (VPKENGINE_LABEL_KEEP=1 keeps them all: the DMA waits.)
     bool dmaOnGpu(uint64_t dst, uint64_t n, uint64_t src = 0);
     // The caller recorded the DMA that dmaOnGpu allowed (Renderer::fill / copy succeeded): counted.
     void noteDmaRecorded() { ++counters_.dmaRecorded; }
@@ -81,9 +84,10 @@ public:
                        bool hasValue = false);
     // A WAIT_REG_MEM is about to poll [a, +n). `wanted(word)` says whether a value in memory satisfies it.
     //  Ordered: a label write already queued behind work recorded on this (in-order) queue writes a
-    //           satisfying value. Whatever the command processor records from now on runs after that
-    //           work, so the wait is met in GPU order: nothing is submitted, nothing is spun on (the
-    //           write itself still happens when the GPU completes the work, for CPU observers).
+    //           satisfying value (the label is then marked: a later DMA over it may drop it, see dmaOnGpu).
+    //           Whatever the command processor records from now on runs after that work, so the wait is met in GPU
+    //           order: nothing is submitted, nothing is spun on (the write itself still happens when the GPU completes
+    //           the work, for CPU observers).
     //  Poll:    the value comes from elsewhere (guest CPU, recorded shader writes, unknown label): the
     //           work that produces it is put on the GPU (a recorded frame is submitted if a pending label
     //           or recorded work writes there) and the caller polls, see idleWait. Never waits.

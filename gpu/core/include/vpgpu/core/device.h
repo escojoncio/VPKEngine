@@ -129,8 +129,13 @@ class Device {
   // (submittedFrames() for work not submitted yet).
   // `pureWrite`: the action only writes that memory (see LabelQueue::add).
   void afterFrame(uint64_t frame, uint64_t address, uint32_t size, std::function<void()> action, bool pureWrite = false);
-  // A later write in GPU order covers [address, +size): queued pure label writes inside it are dropped (LabelQueue::supersede).
-  size_t supersedeLabels(uint64_t address, uint64_t size) { return labels_.supersede(address, size); }
+  // The command processor's wait on the pure write [address, +size) was met in GPU order (LabelQueue::markOrdered).
+  size_t markLabelOrdered(uint64_t address, uint32_t size) { return labels_.markOrdered(address, size); }
+  // A later write in GPU order covers [address, +size): queued pure label writes marked ordered, inside it and not overlapping
+  // [keepAddress, +keepSize), are dropped (LabelQueue::supersede).
+  size_t supersedeLabels(uint64_t address, uint64_t size, uint64_t keepAddress = 0, uint64_t keepSize = 0) {
+    return labels_.supersede(address, size, keepAddress, keepSize);
+  }
   bool labelsQueued() const { return !labels_.empty(); }
   bool labelPending(uint64_t address, uint32_t size) const { return labels_.pending(address, size); }
   // Frames that must finish before every queued write overlapping the range has run (0 = none).
