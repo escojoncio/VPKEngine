@@ -5555,13 +5555,68 @@ void testMsaaForce() {
       run(ib, geo, f5);
       CHECK(pass(f5).desc.colors[0].texture == ic && !pass(f5).desc.colors[0].autoMsaa && mt.skipFmt == 1);
       c.gpu().destroy(ic);
-      vpgpu::Frame f6;  // stencil that must be loaded: the seed cannot restore it
+      vpgpu::Frame f6;  // stencil that must be loaded, its image without format views: the seed cannot restore it
       const vpgpu::TextureId ds = mk(vpgpu::Format::D32FloatS8, 1);
       OpBeginRendering sb = scene(vpgpu::LoadAction::Load, vpgpu::StoreAction::Store, vpgpu::StoreAction::Store);
       sb.desc.depth.texture = ds;
-      run(sb, geo, f6);
+      const std::string loadLog = captureStderr([&] { run(sb, geo, f6); });
       CHECK(!pass(f6).desc.depth.autoMsaa && mt.skipLoad == 1);
+      // vk.msaa rej_first reason=load: the first pass of that reason (once per device)
+      CHECK(countOf(loadLog, "vk.msaa rej_first reason=load w=1920 h=1824 ") == 1 &&
+            loadLog.find(" fmt=RGBA8Unorm/D32FloatS8 samples=1/1 forced=4 ") != std::string::npos);
+      vpgpu::Frame f6b;
+      CHECK(countOf(captureStderr([&] { run(sb, geo, f6b); }), "rej_first reason=load") == 0 && mt.skipLoad == 2);
       c.gpu().destroy(ds);
+      // ... and with the stencil plane readable (sampled + format views: what imageDesc gives a 1x depth/stencil attachment under
+      // forced MSAA) the pass is upgraded: depth and stencil Load, the twin is seeded from the game's image (frame compiler), and
+      // both aspects resolve back into it.
+      {
+        vpgpu::TextureDesc td;
+        td.format = vpgpu::Format::D32FloatS8, td.width = 1920, td.height = 1824;
+        td.usage = vpgpu::usage::depthTarget | vpgpu::usage::sampled | vpgpu::usage::formatView;
+        const vpgpu::TextureId rds = c.gpu().createTexture(td);
+        const uint32_t before = mt.passes;
+        vpgpu::Frame fa;
+        OpBeginRendering first = scene(vpgpu::LoadAction::Clear, vpgpu::StoreAction::Store, vpgpu::StoreAction::Store);
+        first.desc.depth.texture = rds;
+        OpDraw live = geo;  // (the compiler drops a pass that binds a dead index buffer: the test's default one)
+        live.draw.index.reset();
+        run(first, live, fa);
+        const vpgpu::TextureId sm = mk(vpgpu::Format::D32Float, 1, false, 512, 512);
+        OpBeginRendering shadow;  // an unrelated pass in between: the Load below starts a new encoder (a seed), it does not merge
+        shadow.area = {{0, 0}, {512, 512}};
+        shadow.depthWidth = shadow.depthHeight = 512;
+        shadow.desc.depth.texture = sm;
+        run(shadow, live, fa);
+        OpBeginRendering cont = scene(vpgpu::LoadAction::Load, vpgpu::StoreAction::Store, vpgpu::StoreAction::Store);
+        cont.desc.depth.texture = rds;
+        run(cont, live, fa);  // (appended to the same frame)
+        CHECK(mt.passes == before + 2 && mt.skipLoad == 2);
+        const vpgpu::RenderPass rp = std::get<vpgpu::RenderPass>(fa.commands().at(2));
+        const vpgpu::Attachment& z = rp.desc.depth;
+        CHECK(z.autoMsaa && z.texture != rds && z.resolve == rds && z.load == vpgpu::LoadAction::Load);
+        CHECK(z.depthResolve == vpgpu::ResolveMode::Sample0 && z.stencilResolve == vpgpu::ResolveMode::Sample0 &&
+              z.store == vpgpu::StoreAction::Resolve);
+        const vpgpu::CompiledFrame cf = vpgpu::compileFrame(fa, &c.gpu().resources());
+        CHECK(cf.encoders.size() == 3 && cf.stats.seedMissing == 0);
+        if (cf.encoders.size() == 3) {
+          const vpgpu::Attachment& sz = cf.encoders[2].pass.depth;
+          CHECK(sz.needsSeed && sz.seedSrc == rds && sz.load == vpgpu::LoadAction::DontCare);  // (depth + stencil: one slot)
+        }
+        c.gpu().destroy(rds);
+        c.gpu().destroy(sm);
+        // imageDesc under forced MSAA: a 1x depth/stencil attachment is readable with format views, depth-only and transient ones not.
+        const VkImageUsageFlags dsUse = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
+        VkImage gds = image(c, VK_FORMAT_D32_SFLOAT_S8_UINT, 64, 1, dsUse, 0), g24 = image(c, VK_FORMAT_D24_UNORM_S8_UINT, 64, 1, dsUse, 0),
+                gd = image(c, VK_FORMAT_D32_SFLOAT, 64, 1, dsUse, 0),
+                gtr = image(c, VK_FORMAT_D32_SFLOAT_S8_UINT, 64, 1, dsUse | VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT, 0);
+        const uint32_t rv = vpgpu::usage::sampled | vpgpu::usage::formatView;
+        CHECK(gds && g24 && gd && gtr);
+        CHECK((from<Image>(gds)->desc.usage & rv) == rv && (from<Image>(g24)->desc.usage & rv) == rv);
+        CHECK(!(from<Image>(gd)->desc.usage & vpgpu::usage::formatView) && !(from<Image>(gtr)->desc.usage & rv));
+        for (VkImage i : {gds, g24, gd, gtr}) vkDestroyImage(c.dev, i, nullptr);
+        mt.passes = before;  // (the counters below count from the earlier cases)
+      }
       vpgpu::Frame f7;  // the game's own MSAA is not touched
       const vpgpu::TextureId mc = mk(vpgpu::Format::RGBA8Unorm, 4), md = mk(vpgpu::Format::D32Float, 4);
       OpBeginRendering mb = scene(vpgpu::LoadAction::Clear, vpgpu::StoreAction::DontCare, vpgpu::StoreAction::DontCare);

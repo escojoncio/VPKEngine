@@ -1248,8 +1248,8 @@ struct Translator {
   // into N-sample twins instead (MsaaTwins) and resolves them into the game's images at its end. The twins are Attachment::autoMsaa:
   // the frame compiler keeps their samples on tile for good (memoryless, never stored; a pass continuing the picture in a new
   // encoder is seeded from the 1x), so MSAA costs shading and resolve but no memory. Passes it cannot serve stay at 1x and are
-  // counted (MsaaTwins::skip*): a partial render area (the resolve would overwrite the rest), stencil that must be loaded (the
-  // seed cannot restore it), input attachments / local reads, dual-source blending, extended dynamic state draws, integer or
+  // counted (MsaaTwins::skip*): a partial render area (the resolve would overwrite the rest), stencil that must be loaded from an
+  // image without format views (the seed cannot restore it), input attachments / local reads, dual-source blending, extended dynamic state draws, integer or
   // reinterpreted formats, other attachments than colour 0 + depth, game MSAA, targets the twins cannot match. A game MSAA pass
   // of s samples below the forced N is upgraded (below): its twins are N samples resolving into the game's own 1x targets.
   // Called before uiPass
@@ -1311,7 +1311,7 @@ struct Translator {
                         uint8_t(gc.samples), forced ? forced : uint8_t(gc.samples), draws);
       }
     } eyeNote{mt, dev, gc, forceN, mt.eye.lines >= MsaaTwins::kEyeLines ? 0u : countDraws(ops, at + 1), eyeScene};  // lines used up: nothing prints, skip the count
-    // "vk.msaa rej_first reason=smp|msstore ...": the first pass rejected for each of those two reasons (once per device), with the
+    // "vk.msaa rej_first reason=smp|msstore|load ...": the first pass rejected for each of those reasons (once per device), with the
     // rej_detail fields and the game's samples / store / load / resolve of the pass.
     auto rejFirst = [&](int slot, const char* why) {
       if (mt.rejFirstDone[slot]) return;
@@ -1350,7 +1350,13 @@ struct Translator {
         gz.type != vpgpu::TextureType::Tex2D)
       return rej(mt.skipFmt, "fmt");
     // (A stencil aspect that loads makes the attachment's load a Load: attach / the dynamic rendering merge in pipelines.cpp.)
-    if (fz.stencil() && z.load == vpgpu::LoadAction::Load) return rej(mt.skipLoad, "load");
+    // The twin's Load is a seed from the game's image: depth plane as is, stencil plane through a stencil view (format views;
+    // entry.cpp imageDesc gives them to a 1x depth/stencil attachment under forced MSAA). Without them the stencil is lost.
+    if (fz.stencil() && z.load == vpgpu::LoadAction::Load &&
+        !((gz.usage & vpgpu::usage::sampled) && (gz.usage & vpgpu::usage::formatView))) {
+      rejFirst(2, "load");
+      return rej(mt.skipLoad, "load");
+    }
     const uint32_t w = std::max(1u, gc.width >> c.mip), h = std::max(1u, gc.height >> c.mip);
     const uint16_t layers = std::max<uint16_t>(d.layerCount, 1);
     if (std::max(1u, gz.width >> z.mip) != w || std::max(1u, gz.height >> z.mip) != h || gc.layers < c.layer + layers ||

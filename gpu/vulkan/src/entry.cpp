@@ -222,8 +222,12 @@ vpgpu::TextureDesc imageDesc(const VkImageCreateInfo& ci) {
   // The 1x images forced MSAA resolves into (and seeds samples from, Attachment::needsSeed): a shader reads them. The game's own
   // MSAA (gameMsaaAuto) adds nothing: commands.cpp gameAuto only serves resolve targets that are already readable.
   if (d.samples <= 1 && (ci.usage & (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT)) &&
-      !(ci.usage & VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT) && msaaForce() > 0)
+      !(ci.usage & VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT) && msaaForce() > 0) {
     d.usage |= vpgpu::usage::sampled;
+    // A depth/stencil one also gets format views: a forced twin that loads its stencil is seeded from it through a stencil view
+    // (commands.cpp forceMsaa; its depth plane is read as is).
+    if (ufi.depth() && ufi.stencil()) d.usage |= vpgpu::usage::formatView;
+  }
   // Transient attachments never need memory: the core keeps them on tile when it can.
   d.transient = (ci.usage & VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT) != 0;
   // Anything sampled may be read in a later frame (Vulkan gives no frame boundary).

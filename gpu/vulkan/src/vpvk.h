@@ -760,8 +760,8 @@ struct MsaaTwins {
   // The game's main 3D scene drawn into an intermediate target (not the eye's size), forced all the same: sceneUp passes (included
   // in passes); rejScene: such a candidate (colour + depth of >= half the eye's pixels) with too few draws / layers / mips.
   uint32_t sceneUp = 0, rejScene = 0;
-  // "vk.msaa up_detail" (first upgraded pass) and "vk.msaa rej_first" (first smp / msstore rejection): each once per device.
-  bool upDetailDone = false, rejFirstDone[2] = {false, false};
+  // "vk.msaa up_detail" (first upgraded pass) and "vk.msaa rej_first" (first smp / msstore / load rejection): each once per device.
+  bool upDetailDone = false, rejFirstDone[3] = {false, false, false};
   // Rejected passes logged ("vk.msaa rej"): up to 12 distinct (size, layers, reason) under 1 Mpx, and 12 at or above it.
   struct RejSeen { uint32_t w = 0, h = 0; uint16_t layers = 0; const char* why = nullptr; };
   RejSeen rejSeen[2][12];
