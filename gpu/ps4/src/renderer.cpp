@@ -6911,7 +6911,10 @@ void Renderer::waitedBelow(uint64_t frames) {
     impl_->retireOwned();
 }
 bool Renderer::cpuReadSeen(uint64_t a, uint64_t n) const { return impl_->cpuReadSeen(a, n); }
-void Renderer::cpuAccessed(uint64_t a, uint64_t n) { impl_->noteCpuRead(a, n, "cp_access"); }
+void Renderer::cpuAccessed(uint64_t a, uint64_t n) {
+    // (bounded: a title that rotates such ranges must not use up the ranges the CPU reads are followed with)
+    if (impl_->cpuRead.size() < 1024) impl_->noteCpuRead(a, n, "cp_access");
+}
 void Renderer::probeDmaCpuRead(uint64_t a, uint64_t n, uint64_t src) {
     Impl& i = *impl_;
     if (!vpgpu::probe::enabled() || ++i.dmaCpuReadLines > 50) return;
