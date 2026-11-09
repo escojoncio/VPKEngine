@@ -5,6 +5,7 @@
 #include <cmath>
 #include <cstring>
 #include <map>
+#include <set>
 
 #include "context.h"
 
@@ -30,6 +31,9 @@ struct TexStats {
     std::map<GLenum, uint64_t> count, shown;  // internal format -> textures defined / count at its last line
     std::chrono::steady_clock::time_point last = std::chrono::steady_clock::now();
     int lines = 0;
+    // DiagCounter: all, this tick, the most in one tick, and all at the last line.
+    static constexpr size_t kDiag = size_t(DiagCounter::kCount);
+    uint64_t diagTotal[kDiag]{}, diagTick[kDiag]{}, diagMax[kDiag]{}, diagShown[kDiag]{};
 } gTexStats;
 }  // namespace
 
@@ -43,11 +47,26 @@ void texStatsCount(GLenum internalFormat) {
     }
 }
 
+void diagCount(DiagCounter c, uint64_t n) {
+    gTexStats.diagTotal[size_t(c)] += n, gTexStats.diagTick[size_t(c)] += n;
+}
+
 void texStatsTick(bool force) {
     TexStats& st = gTexStats;
+    for (size_t i = 0; i < TexStats::kDiag; ++i) st.diagMax[i] = std::max(st.diagMax[i], st.diagTick[i]), st.diagTick[i] = 0;
     const auto now = std::chrono::steady_clock::now();
     if (!force && now - st.last < std::chrono::seconds(10)) return;
     st.last = now;
+    if (!std::equal(st.diagTotal, st.diagTotal + TexStats::kDiag, st.diagShown) && st.lines < 256) {
+        ++st.lines;
+        std::copy(st.diagTotal, st.diagTotal + TexStats::kDiag, st.diagShown);
+        const uint64_t* t = st.diagTotal;  // (DiagCounter order: Incomplete, MsrttDsContinued, TexRealloc)
+        const uint64_t* m = st.diagMax;
+        logf("gles.census incomplete=%llu incomplete_tick_max=%llu msrtt_ds_continued=%llu msrtt_ds_continued_tick_max=%llu "
+             "tex_realloc=%llu tex_realloc_tick_max=%llu",
+             static_cast<unsigned long long>(t[0]), static_cast<unsigned long long>(m[0]), static_cast<unsigned long long>(t[1]),
+             static_cast<unsigned long long>(m[1]), static_cast<unsigned long long>(t[2]), static_cast<unsigned long long>(m[2]));
+    }
     for (const auto& [fmt, n] : st.count) {
         if (st.shown[fmt] == n) continue;
         if (st.lines >= 256) return;
@@ -69,7 +88,7 @@ static bool storageCapable(VkFormat f) {
     }
 }
 
-bool Context::realizeTexture(Texture& t) {
+bool Context::realizeTexture(Texture& t, bool carries) {
     // The image is sized from level 0. When level 0 is not defined (UE4 mip streaming: levels 3.. with GL_TEXTURE_BASE_LEVEL 3) it is
     // sized from the lowest defined level `a`, as if level 0 were that level's size << a (exact for power-of-two chains): GL level L
     // stays image level L, and the levels below `a` are allocated but never sampled (the base level is >= a).
@@ -91,16 +110,33 @@ bool Context::realizeTexture(Texture& t) {
     const uint32_t depth = is3D ? l0.d << a : 1;
     const uint32_t levels = t.immutable ? uint32_t(t.immutableLevels) : mipCount(imgW, imgH, depth);
     const bool storage = t.wantStorage && storageCapable(l0.format->vk);
+    const bool formatViews = t.wantFormatViews && l0.format->depth && l0.format->stencil && samples == 1 && !is3D;
     if (t.image && t.image->format == l0.format && t.image->width == imgW && t.image->height == imgH &&
         t.image->depth == depth && t.image->layers == layers && t.image->levels == levels && t.image->storage == storage &&
-        uint32_t(t.image->samples) == samples)
+        t.image->formatViews == formatViews && uint32_t(t.image->samples) == samples)
         return true;
+    // diagnostics: the texture had an image, which is replaced by an empty one (its texels are gone until the app uploads again);
+    // not when the caller carries them over to a new image of the same shape
+    if (t.image && !(carries && t.image->format == l0.format && t.image->width == imgW && t.image->height == imgH &&
+                     t.image->depth == depth && t.image->layers == layers && t.image->levels == levels &&
+                     uint32_t(t.image->samples) == samples)) {
+        diagCount(DiagCounter::TexRealloc);
+        static std::set<GLuint> seen;  // the first 64 textures
+        if (seen.size() < 64 && seen.insert(t.name).second) {
+            uint32_t defined = 0;
+            for (const Texture::Level& l : t.levels) defined += l.format != nullptr;
+            logf("gles.tex_realloc tex=%u target=0x%x fmt=0x%04x->0x%04x size=%ux%u->%ux%u levels=%u->%u lost_levels=%u defined=%u base=%d max=%d immutable=%d",
+                 t.name, t.target, t.image->format->internal, l0.format->internal, t.image->width, t.image->height, imgW, imgH, t.image->levels,
+                 levels, t.image->levels, defined, t.baseLevel, t.maxLevel, int(t.immutable));
+        }
+    }
     auto img = std::make_shared<Image>();
     img->dev = dev;
     img->format = l0.format;
     img->width = imgW, img->height = imgH, img->depth = depth, img->layers = layers, img->levels = levels;
     img->cube = cube;
     img->storage = storage;
+    img->formatViews = formatViews;
     img->samples = VkSampleCountFlagBits(samples);
     img->type = is3D ? VK_IMAGE_TYPE_3D : VK_IMAGE_TYPE_2D;
     VkImageCreateInfo ci{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
@@ -123,6 +159,10 @@ bool Context::realizeTexture(Texture& t) {
         ci.usage |= VK_IMAGE_USAGE_STORAGE_BIT;  // lazy: ShaderWrite turns off lossless compression on Apple GPUs
         ci.flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;  // glBindImageTexture may read the texels with another format of the same size
     }
+    // An EXT_multisampled_render_to_texture depth/stencil attachment: the twin of a continuing pass is seeded from it, and the seed
+    // reads its stencil plane through a stencil view (format views, as for the multisample renderbuffers). Other depth textures
+    // do not pay for it (MUTABLE_FORMAT turns off lossless depth compression on Apple GPUs).
+    if (formatViews) ci.flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
     ci.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
     if (dev->vk.vkCreateImage(dev->device, &ci, nullptr, &img->image) != VK_SUCCESS) {
         setError(gl::OUT_OF_MEMORY);
@@ -147,21 +187,33 @@ bool Context::makeStorage(Texture& t) {
     if (t.image->external || t.target == gl::TEXTURE_EXTERNAL_OES || !storageCapable(t.image->format->vk)) return false;
     ImageP old = t.image;
     t.wantStorage = true;
-    if (!realizeTexture(t)) {
+    if (!realizeTexture(t, true)) {
         t.wantStorage = false;  // creation with STORAGE failed: keep the texture usable without it
         return false;
     }
     if (t.image == old) return false;
+    carryTexels(old, t);
+    return true;
+}
+
+void Context::makeFormatViews(Texture& t) {
+    t.wantFormatViews = true;
+    if (!t.image || t.image->formatViews || t.image->external) return;
+    ImageP old = t.image;
+    if (realizeTexture(t, true) && t.image != old) carryTexels(old, t);
+}
+
+void Context::carryTexels(const ImageP& old, Texture& t) {
     // A level 0 definition that no longer matches the old image (nothing to carry over): start empty.
     if (t.image->width != old->width || t.image->height != old->height || t.image->depth != old->depth ||
         t.image->layers != old->layers || t.image->levels != old->levels)
-        return true;
+        return;
     // Views, framebuffer attachments and descriptors are resolved from t.image at each draw, so the new image
     // is picked up there; the old one stays alive (realizeTexture keeps it) until the recorded work completes.
     VkImageCopy r{};
     std::vector<VkImageCopy> regions;
     for (uint32_t l = 0; l < old->levels; ++l) {
-        r.srcSubresource = r.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, l, 0, old->layers};
+        r.srcSubresource = r.dstSubresource = {old->aspect(), l, 0, old->layers};
         r.extent = {std::max(1u, old->width >> l), std::max(1u, old->height >> l), std::max(1u, old->depth >> l)};
         regions.push_back(r);
     }
@@ -169,7 +221,6 @@ bool Context::makeStorage(Texture& t) {
     dev->vk.vkCmdCopyImage(cmd(), old->image, VK_IMAGE_LAYOUT_GENERAL, t.image->image, VK_IMAGE_LAYOUT_GENERAL,
                            uint32_t(regions.size()), regions.data());
     barrier();
-    return true;
 }
 
 void Context::copyBufferToImage(Image& img, uint32_t level, uint32_t layer, int32_t x, int32_t y, int32_t z,

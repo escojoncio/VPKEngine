@@ -325,9 +325,9 @@ bool Context::beginPass(const FbInfo& fb, std::vector<VkClearAttachment>* firstC
     // `resolve`: the single-sample view a multisample attachment is resolved into at the end of the pass (a multisample default
     // framebuffer stores its samples too: the next pass loads them).
     // An implicit-multisample attachment (`implicit`) is not stored (its twin stays on the tile) and starts from what the seed
-    // draw copies into it: its LOAD becomes DONT_CARE (depth / stencil of a texture have no seed: they start undefined). The
-    // depth / stencil of the default framebuffer (`seeded`) keep their LOAD: the twin is an autoMsaa slot of the backend, which
-    // seeds it from the resolved image.
+    // draw copies into it: its LOAD becomes DONT_CARE. The depth / stencil of the default framebuffer, of a renderbuffer and of
+    // a texture (`seeded`) keep their LOAD: the twin is an autoMsaa slot of the backend, which seeds it from the image the
+    // previous pass resolved into (the attachment's own, single-sample one).
     uint32_t seedMask = 0;
     auto fill = [&](VkRenderingAttachmentInfo& a, VkImageView v, size_t idx, VkImageView resolve = VK_NULL_HANDLE, bool integer = false,
                     bool implicit = false, bool seeded = false) {
@@ -355,8 +355,50 @@ bool Context::beginPass(const FbInfo& fb, std::vector<VkClearAttachment>* firstC
         if (colors[i].imageView) colorCount = uint32_t(i + 1);
     }
     VkRenderingAttachmentInfo depth{}, stencil{};
-    fill(depth, key.depth, kMaxDrawBuffers, key.depthResolve, true, fb.depth.implicit, bool(fb.depth.seedImage));
-    fill(stencil, key.stencil, kMaxDrawBuffers + 1, key.stencilResolve, true, fb.stencil.implicit, bool(fb.stencil.seedImage));
+    fill(depth, key.depth, kMaxDrawBuffers, key.depthResolve, true, fb.depth.implicit, bool(fb.depth.seedImage || fb.depth.tex));
+    fill(stencil, key.stencil, kMaxDrawBuffers + 1, key.stencilResolve, true, fb.stencil.implicit, bool(fb.stencil.seedImage || fb.stencil.tex));
+    // Diagnostics: a pass that goes on (the depth / stencil is not cleared) from the depth / stencil of an implicit-multisample texture.
+    // Counted (gles.census msrtt_ds_continued, per tick too) and the first 64 distinct cases logged: the format, what is attached, the
+    // load of each aspect (inv: loaded as DONT_CARE because glInvalidateFramebuffer left it undefined) and whether the backend is
+    // expected to seed the twin from the texture (commands.cpp gameAuto: a format with a stencil plane needs a stencil resolve target
+    // and a texture with format views; only what GLES can see: the area / TAA checks of the backend are not known here).
+    {
+        const bool dCont = key.depth && fb.depth.implicit && fb.depth.tex && load[kMaxDrawBuffers] != VK_ATTACHMENT_LOAD_OP_CLEAR;
+        const bool sCont = key.stencil && fb.stencil.implicit && fb.stencil.tex && load[kMaxDrawBuffers + 1] != VK_ATTACHMENT_LOAD_OP_CLEAR;
+        if (dCont || sCont) {
+            diagCount(DiagCounter::MsrttDsContinued);
+            const FbTarget& ft = fb.depth.image ? fb.depth : fb.stencil;
+            const FormatInfo* fi = ft.image->format;
+            const VkFormat vkf = fi->vk;
+            const bool vkStencil = vkf == VK_FORMAT_D24_UNORM_S8_UINT || vkf == VK_FORMAT_D32_SFLOAT_S8_UINT || vkf == VK_FORMAT_D16_UNORM_S8_UINT ||
+                                   vkf == VK_FORMAT_S8_UINT;
+            const char* why = !key.depthResolve && !key.stencilResolve ? "no_resolve"
+                              : vkStencil && !key.stencilResolve       ? "stencil_not_attached"
+                              : vkStencil && !ft.image->formatViews    ? "no_format_views"
+                                                                       : nullptr;
+            auto state = [&](bool cont, size_t idx) {
+                return !cont ? "-" : load[idx] == VK_ATTACHMENT_LOAD_OP_DONT_CARE ? "inv" : "load";
+            };
+            auto name = [](GLenum f) {
+                switch (f) {
+                    case gl::DEPTH24_STENCIL8: return "D24S8";
+                    case gl::DEPTH32F_STENCIL8: return "D32FS8";
+                    case gl::DEPTH_COMPONENT32F: return "D32F";
+                    case gl::DEPTH_COMPONENT24: return "D24";
+                    case gl::DEPTH_COMPONENT16: return "D16";
+                    case gl::STENCIL_INDEX8: return "S8";
+                    default: return "other";
+                }
+            };
+            char line[256];
+            std::snprintf(line, sizeof line, "tex=%u fmt=%s(0x%04x) attach=%s depth=%s stencil=%s serve=%s%s%s fb=%ux%u samples=%u", ft.tex,
+                          name(fi->internal), fi->internal, fb.depth.image && fb.stencil.image ? "depth_stencil" : fb.depth.image ? "depth" : "stencil",
+                          state(dCont, kMaxDrawBuffers), state(sCont, kMaxDrawBuffers + 1), why ? "no" : "yes", why ? " why=" : "", why ? why : "",
+                          fb.width, fb.height, fb.samples);
+            static std::set<std::string> seen;
+            if (seen.size() < 64 && seen.insert(line).second) logf("gles.msrtt_ds %s", line);
+        }
+    }
     VkRenderingInfo ri{VK_STRUCTURE_TYPE_RENDERING_INFO};
     ri.renderArea = {{0, 0}, {fb.width, fb.height}};
     ri.layerCount = key.viewMask ? 1 : 1;
@@ -1291,34 +1333,65 @@ static GLenum samplerTarget(const vpglsl::Variable& v) {
 }
 
 // Texture completeness (GLES 3.0 §8.17): an incomplete texture samples as (0, 0, 0, 1). `sp` are the sampling parameters
-// the unit really uses (a sampler object bound to the unit replaces the texture's own).
-static bool complete(const Texture& t, const SamplerParams& sp) {
-    if (!t.image || t.levels.empty()) return false;
+// the unit really uses (a sampler object bound to the unit replaces the texture's own). `why` (diagnostics): the rule that failed
+// and the first level it failed at (-1: none).
+struct Incomplete {
+    const char* reason = "";
+    int level = -1;
+};
+static bool complete(const Texture& t, const SamplerParams& sp, Incomplete* why = nullptr) {
+    auto no = [&](const char* reason, int level = -1) {
+        if (why) why->reason = reason, why->level = level;
+        return false;
+    };
+    if (!t.image || t.levels.empty()) return no(t.image ? "no_levels" : "no_image");
     const bool mip = sp.minFilter != gl::NEAREST && sp.minFilter != gl::LINEAR;
-    if (mip && t.maxLevel < t.baseLevel) return false;  // no level in [base, max]
-    if (t.immutable) return t.levels[0].format != nullptr;
+    if (mip && t.maxLevel < t.baseLevel) return no("max_lt_base");  // no level in [base, max]
+    if (t.immutable) return t.levels[0].format != nullptr ? true : no("immutable_no_format", 0);
     // The base level array must be defined (level 0 may not be: UE4 mip streaming moves GL_TEXTURE_BASE_LEVEL up).
     const uint32_t base = uint32_t(std::max(0, t.baseLevel));
-    if (base >= t.levels.size() || !t.levels[base].format) return false;
+    if (base >= t.levels.size() || !t.levels[base].format) return no("base_undefined", int(base));
     const uint32_t last = mip ? std::min<uint32_t>(uint32_t(t.maxLevel), t.image->levels - 1) : base;
     if (t.target == gl::TEXTURE_CUBE_MAP) {
         // Every face has the same size and format at the base level, and (mipmapped) at every level up to the last.
         for (const auto& fl : t.faceLevels) {
-            if (base >= fl.size()) return false;
+            if (base >= fl.size()) return no("cube_base_missing", int(base));
             for (uint32_t l = base; l <= last; ++l) {
-                if (l >= fl.size() || fl[l].format != t.image->format) return false;
-                if (fl[l].w != std::max(1u, t.image->width >> l) || fl[l].h != std::max(1u, t.image->height >> l)) return false;
+                if (l >= fl.size()) return no("cube_level_missing", int(l));
+                if (fl[l].format != t.image->format) return no("cube_level_format", int(l));
+                if (fl[l].w != std::max(1u, t.image->width >> l) || fl[l].h != std::max(1u, t.image->height >> l)) return no("cube_level_size", int(l));
             }
         }
         return true;
     }
     if (!mip) return true;
-    if (base >= t.levels.size()) return false;
+    if (base >= t.levels.size()) return no("base_undefined", int(base));
     for (uint32_t l = base; l <= last; ++l) {
-        if (l >= t.levels.size() || t.levels[l].format != t.image->format) return false;
-        if (t.levels[l].w != std::max(1u, t.image->width >> l) || t.levels[l].h != std::max(1u, t.image->height >> l)) return false;
+        if (l >= t.levels.size()) return no("level_missing", int(l));
+        if (t.levels[l].format != t.image->format) return no("level_format", int(l));
+        if (t.levels[l].w != std::max(1u, t.image->width >> l) || t.levels[l].h != std::max(1u, t.image->height >> l)) return no("level_size", int(l));
     }
     return true;
+}
+
+// Diagnostics: a bound texture that reads as the black stand-in because complete() said no. Counted (gles.census) and the first
+// 64 distinct textures logged, with what the sampling would have used: the effective base / max level (as Texture::sampledView clamps them).
+static void noteIncomplete(const Texture& t, const SamplerParams& sp, const Incomplete& why) {
+    diagCount(DiagCounter::Incomplete);
+    static std::set<GLuint> seen;
+    if (seen.size() >= 64 || !seen.insert(t.name).second) return;
+    std::string lv;
+    for (size_t l = 0; l < t.levels.size() && l < 16; ++l)
+        if (t.levels[l].format) lv += (lv.empty() ? "" : ",") + std::to_string(l) + ":" + std::to_string(t.levels[l].w) + "x" + std::to_string(t.levels[l].h);
+    const bool integer = t.image && t.image->format->integer;
+    const bool linear = sp.magFilter == gl::LINEAR || (sp.minFilter != gl::NEAREST && sp.minFilter != gl::NEAREST_MIPMAP_NEAREST && sp.minFilter != gl::NEAREST_MIPMAP_LINEAR);
+    const GLint imgLevels = t.image ? GLint(t.image->levels) : 1;
+    const GLint effBase = std::min(t.baseLevel, imgLevels - 1), effMax = std::max(effBase, std::min(t.maxLevel, imgLevels - 1));
+    logf("gles.incomplete tex=%u target=0x%x fmt=0x%04x img=%ux%u img_levels=%d base=%d max=%d eff_base=%d eff_max=%d defined=[%s] min_filter=0x%x "
+         "immutable=%d integer=%d int_linear=%d fail=%s level=%d",
+         t.name, t.target, t.image ? t.image->format->internal : 0u, t.image ? t.image->width : 0u, t.image ? t.image->height : 0u, int(imgLevels),
+         t.baseLevel, t.maxLevel, int(effBase), int(effMax), lv.c_str(), sp.minFilter, int(t.immutable), int(integer), int(integer && linear), why.reason,
+         why.level);
 }
 
 bool Context::bindResources(Program& p, const StorageP& xfbScratch) {
@@ -1439,12 +1512,14 @@ bool Context::bindResources(Program& p, const StorageP& xfbScratch) {
                 if (un.sampler)
                     if (auto it = share->samplers.find(un.sampler); it != share->samplers.end()) sp = it->second->params;
             }
-            if (t && complete(*t, sp)) {
+            Incomplete why;
+            if (t && complete(*t, sp, &why)) {
                 ii.sampler = samplerFor(sp, *t);
                 ii.imageView = t->sampledView();
                 keep(t->image);
                 t->image->invalid.clear();
             } else {
+                if (t) noteIncomplete(*t, sp, why);
                 // Incomplete/missing: a 1x1 black opaque texture.
                 Texture& b = blackTexture();
                 ii.sampler = samplerFor(b.sampler, b);

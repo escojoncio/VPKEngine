@@ -47,6 +47,11 @@ void logLenient(const std::vector<std::string>& rules, const char* what, unsigne
 void texStatsCount(GLenum internalFormat);
 void texStatsTick(bool force);
 
+// Diagnostics: counters of events that should not happen, kept per tick (the texStatsTick calls: eglSwapBuffers / vpgles_flush)
+// and in all, printed with the texture census as "gles.census incomplete= ... " (max per tick, total) when they changed. Needs Device::lock.
+enum class DiagCounter { Incomplete, MsrttDsContinued, TexRealloc, kCount };
+void diagCount(DiagCounter c, uint64_t n = 1);
+
 // Diagnostics: "gles.pso.recipe saved= loaded= prewarmed= miss_in_game=" (VPVulkan's pipeline-recipe store, see vpvk_recipe_stats):
 // printed when the counters changed and 10 s passed since the last line (force: now, even unchanged, at eglTerminate / device
 // shutdown; called from eglSwapBuffers, vpgles_flush and the creation of a new pipeline). Needs Device::lock.
@@ -169,6 +174,7 @@ struct Image {  // a VkImage with its memory
     VkSampleCountFlagBits samples = VK_SAMPLE_COUNT_1_BIT;
     bool cube = false;
     bool storage = false;  // created with STORAGE_BIT (only textures used with glBindImageTexture pay for it)
+    bool formatViews = false;  // a depth/stencil image created with MUTABLE_FORMAT (only multisampled-render-to-texture attachments pay for it)
     std::map<uint64_t, VkImageView> views;  // cached views
     // glInvalidateFramebuffer: attachment views (and aspects: 1 colour, 2 depth, 4 stencil) whose contents are undefined.
     // The next pass that begins on one of them loads DONT_CARE; any other use of the image defines it again.
@@ -199,6 +205,7 @@ struct Texture {
     ImageP image;
     bool immutable = false;
     bool wantStorage = false;  // glBindImageTexture used it: its image is (re)created with STORAGE_BIT
+    bool wantFormatViews = false;  // attached as a depth / stencil with EXT_multisampled_render_to_texture: its image is (re)created with MUTABLE_FORMAT
     GLint immutableLevels = 0;
     // Level definitions (glTexImage*): per level, the size and format the app defined.
     struct Level {
@@ -647,9 +654,15 @@ public:
     void prepareWrite(Buffer& b, bool discard);
 
     // Images
-    bool realizeTexture(Texture& t);  // (re)creates t.image from its level definitions
+    // (Re)creates t.image from its level definitions. `carries`: the caller copies the old texels over (carryTexels), so a new image
+    // of the same shape loses nothing (gles.tex_realloc does not count it).
+    bool realizeTexture(Texture& t, bool carries = false);
     // Gives t an image with STORAGE_BIT (glBindImageTexture), keeping the contents. False when it cannot be image-bound.
     bool makeStorage(Texture& t);
+    // Gives a depth/stencil texture an image with MUTABLE_FORMAT (the seed of a continuing multisampled-render-to-texture pass reads
+    // its stencil plane through a stencil view), keeping the contents. Without an image yet: the image is created with it later.
+    void makeFormatViews(Texture& t);
+    void carryTexels(const ImageP& old, Texture& t);  // copies every level of `old` into t.image (same shape)
     void imageInit(Image& img);       // UNDEFINED -> GENERAL
     VkSampler samplerFor(const SamplerParams& p, const Texture& t);
 

@@ -2182,6 +2182,9 @@ static void framebufferTexture2D(GLenum target, GLenum att, GLenum textarget, GL
         a.kind = Attachment::Tex, a.name = tex, a.level = level, a.samples = samples;
         if (textarget >= gl::TEXTURE_CUBE_MAP_POSITIVE_X && textarget <= gl::TEXTURE_CUBE_MAP_NEGATIVE_Z)
             a.layer = GLint(textarget - gl::TEXTURE_CUBE_MAP_POSITIVE_X);
+        // An implicit-multisample depth / stencil: the seed of a continuing pass reads the texture through format views.
+        if (samples > 0 && (att == gl::DEPTH_ATTACHMENT || att == gl::STENCIL_ATTACHMENT || att == gl::DEPTH_STENCIL_ATTACHMENT))
+            c->makeFormatViews(*t);
     }
     setAttachment(c, f, att, a);
 }

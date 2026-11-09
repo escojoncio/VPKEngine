@@ -864,6 +864,33 @@ void testTextures() {
         CHECK(err() == gl::NO_ERROR);
         CHECK(peekStderr().find("gles.tex fmt=0x822b count=1") != std::string::npos);
     }
+    // Diagnostics: a sampled texture that is incomplete (mipmapped filter, level 1 never defined) reads black, is counted and logged once with
+    // the rule it broke; a texture that gets a new image over its old one is logged too. The summary is gles.census.
+    {
+        G(glUseProgram, void (*)(GLuint));
+        G(glDrawArrays, void (*)(GLenum, GLint, GLsizei));
+        G(glFinish, void (*)());
+        GLuint inc, grow;
+        glGenTextures(1, &inc);
+        glGenTextures(1, &grow);
+        GLuint pd = program("#version 300 es\nvoid main() { gl_Position = vec4(float(gl_VertexID & 1) * 2.0 - 1.0, float(gl_VertexID >> 1) * 2.0 - 1.0, 0.0, 1.0); }\n",
+                            "#version 300 es\nprecision mediump float; uniform sampler2D u_tex; out vec4 o; void main() { o = texture(u_tex, vec2(0.5)); }\n");
+        glUseProgram(pd);
+        glBindTexture(gl::TEXTURE_2D, inc);
+        glTexImage2D(gl::TEXTURE_2D, 0, gl::RGBA, 8, 8, 0, gl::RGBA, gl::UNSIGNED_BYTE, px.data());
+        glTexParameteri(gl::TEXTURE_2D, gl::TEXTURE_MIN_FILTER, gl::LINEAR_MIPMAP_LINEAR);
+        glBindTexture(gl::TEXTURE_2D, grow);
+        glTexImage2D(gl::TEXTURE_2D, 0, gl::RGBA, 16, 16, 0, gl::RGBA, gl::UNSIGNED_BYTE, px.data());
+        glTexImage2D(gl::TEXTURE_2D, 0, gl::RGBA, 32, 32, 0, gl::RGBA, gl::UNSIGNED_BYTE, px.data());  // a new, larger image over the old one
+        glBindTexture(gl::TEXTURE_2D, inc);
+        glDrawArrays(gl::TRIANGLES, 0, 3);
+        glFinish();
+        CHECK(err() == gl::NO_ERROR);
+        expectLines.push_back("gles.incomplete tex=" + std::to_string(inc) + " target=0xde1 fmt=0x8058 img=8x8 img_levels=4 base=0 max=1000 eff_base=0 eff_max=3 defined=[0:8x8]");
+        expectLines.push_back("fail=level_missing level=1");
+        expectLines.push_back("gles.tex_realloc tex=" + std::to_string(grow) + " target=0xde1 fmt=0x8058->0x8058 size=16x16->32x32 levels=5->6 lost_levels=5");
+        expectLines.push_back("gles.census incomplete=1 incomplete_tick_max=1 msrtt_ds_continued=0");
+    }
     // Per-format creation counts reach the log (summary at eglTerminate / every 10 s).
     {
         G(eglTerminate, uint32_t (*)(void*));
@@ -2381,6 +2408,213 @@ void testMsRbo() {
     e.down();
 }
 
+// EXT_multisampled_render_to_texture, depth / stencil of a texture across a cut of the pass (barrier, occlusion query): the pass
+// that goes on loads the depth from the single-sample texture the previous pass resolved into (the backend seeds the transient
+// twin from it) instead of testing against an undefined depth. The null backend executes nothing, so what is checked is the
+// contract: the load op / resolve target the layer gives the pass, the format views the seed needs (only for a texture attached as
+// such), that the frame compiler plans a depth seed (gpu.frame seed_draws) and what gles.msrtt_ds / gles.census say about it.
+void testMsrttDepth() {
+    Egl e;
+    CHECK(e.up());
+    GLuint p = program("attribute vec4 a_pos; uniform float u_z; void main() { gl_Position = vec4(a_pos.xy, u_z, 1.0); }\n",
+                       "precision mediump float; uniform vec4 u_col; void main() { gl_FragColor = u_col; }\n");
+    G(glUseProgram, void (*)(GLuint));
+    G(glGenBuffers, void (*)(GLsizei, GLuint*));
+    G(glBindBuffer, void (*)(GLenum, GLuint));
+    G(glBufferData, void (*)(GLenum, GLsizeiptr, const void*, GLenum));
+    G(glVertexAttribPointer, void (*)(GLuint, GLint, GLenum, GLboolean, GLsizei, const void*));
+    G(glEnableVertexAttribArray, void (*)(GLuint));
+    G(glGetAttribLocation, GLint (*)(GLuint, const char*));
+    G(glGetUniformLocation, GLint (*)(GLuint, const char*));
+    G(glUniform1f, void (*)(GLint, GLfloat));
+    G(glUniform4f, void (*)(GLint, GLfloat, GLfloat, GLfloat, GLfloat));
+    G(glDrawArrays, void (*)(GLenum, GLint, GLsizei));
+    G(glGenFramebuffers, void (*)(GLsizei, GLuint*));
+    G(glBindFramebuffer, void (*)(GLenum, GLuint));
+    G(glFramebufferTexture2DMultisampleEXT, void (*)(GLenum, GLenum, GLenum, GLuint, GLint, GLsizei));
+    G(glCheckFramebufferStatus, GLenum (*)(GLenum));
+    G(glGenTextures, void (*)(GLsizei, GLuint*));
+    G(glBindTexture, void (*)(GLenum, GLuint));
+    G(glTexStorage2D, void (*)(GLenum, GLsizei, GLenum, GLsizei, GLsizei));
+    G(glClear, void (*)(GLbitfield));
+    G(glClearColor, void (*)(GLfloat, GLfloat, GLfloat, GLfloat));
+    G(glClearDepthf, void (*)(GLfloat));
+    G(glEnable, void (*)(GLenum));
+    G(glDepthFunc, void (*)(GLenum));
+    G(glMemoryBarrier, void (*)(GLbitfield));
+    G(glGenQueries, void (*)(GLsizei, GLuint*));
+    G(glBeginQuery, void (*)(GLenum, GLuint));
+    G(glEndQuery, void (*)(GLenum));
+    glUseProgram(p);
+    const float quad[] = {-1, -1, 1, -1, -1, 1, 1, 1};
+    GLuint vb;
+    glGenBuffers(1, &vb);
+    glBindBuffer(gl::ARRAY_BUFFER, vb);
+    glBufferData(gl::ARRAY_BUFFER, sizeof quad, quad, gl::STATIC_DRAW);
+    const GLint pos = glGetAttribLocation(p, "a_pos"), uz = glGetUniformLocation(p, "u_z"), uc = glGetUniformLocation(p, "u_col");
+    glVertexAttribPointer(GLuint(pos), 2, gl::FLOAT, 0, 8, nullptr);
+    glEnableVertexAttribArray(GLuint(pos));
+    glEnable(gl::DEPTH_TEST);
+    glDrawArrays(gl::TRIANGLE_STRIP, 0, 4);  // the first draw uploads the vertex data (ends its pass)
+    settle();
+
+    GLuint colorTex, fb;
+    glGenTextures(1, &colorTex);
+    glGenFramebuffers(1, &fb);
+    glBindTexture(gl::TEXTURE_2D, colorTex);
+    glTexStorage2D(gl::TEXTURE_2D, 1, gl::RGBA8, 32, 32);
+    glBindFramebuffer(gl::FRAMEBUFFER, fb);
+    glFramebufferTexture2DMultisampleEXT(gl::FRAMEBUFFER, gl::COLOR_ATTACHMENT0, gl::TEXTURE_2D, colorTex, 0, 4);
+
+    // cut: 1 = glMemoryBarrier, 2 = an occlusion query begins. `func` / `clearZ`: forward-Z (LESS, far = 1) or reverse-Z (GREATER, far = 0).
+    // A near quad, the cut, a far quad that must lose the depth test: its pass has to start from the near quad's depth.
+    auto scenario = [&](int cut, GLenum func, float clearZ, float nearZ, float farZ) {
+        GLuint q = 0;
+        glGenQueries(1, &q);
+        settle();
+        glDepthFunc(func);
+        glClearColor(0, 0, 0, 1);
+        glClearDepthf(clearZ);
+        glClear(gl::COLOR_BUFFER_BIT | gl::DEPTH_BUFFER_BIT | gl::STENCIL_BUFFER_BIT);
+        glUniform1f(uz, nearZ);
+        glUniform4f(uc, 1, 0, 0, 1);
+        glDrawArrays(gl::TRIANGLE_STRIP, 0, 4);
+        if (cut == 1) glMemoryBarrier(0x00000001);
+        if (cut == 2) glBeginQuery(gl::ANY_SAMPLES_PASSED, q);
+        counts = {};
+        glUniform1f(uz, farZ);
+        glUniform4f(uc, 0, 1, 0, 1);
+        glDrawArrays(gl::TRIANGLE_STRIP, 0, 4);
+        if (cut == 2) glEndQuery(gl::ANY_SAMPLES_PASSED);
+        settle();
+    };
+    auto seedDraws = [](const std::string& log) {
+        size_t seeded = 0;
+        for (size_t at = log.find("seed_draws="); at != std::string::npos; at = log.find("seed_draws=", at + 1))
+            seeded += std::strtoul(log.c_str() + at + 11, nullptr, 10);
+        return seeded;
+    };
+    // Each case attaches a fresh depth (/ stencil) texture as a multisampled-render-to-texture attachment and cuts the pass.
+    // `ifmt` / `att`: its format and attachment point. `viewsFlag`: the texture gets MUTABLE_FORMAT (format views) when attached.
+    // `seeded`: the frame compiler plans a depth seed (a gpu.frame line with seed_draws >= 4 over the 4 cut passes); false: it plans none.
+    // `line`: what gles.msrtt_ds says about the continuing pass.
+    struct Case {
+        const char* name;
+        GLenum ifmt, att;
+        bool viewsFlag, seeded;
+        const char* line;
+    };
+    // KNOWN GAP (the two "unseeded" cases): a depth attached alone whose Vulkan format also has a stencil plane (DEPTH_COMPONENT24 and
+    // DEPTH24_STENCIL8 are both D24S8) has no stencil resolve target, so the backend (commands.cpp gameAuto) does not seed the twin: the
+    // continuing pass keeps its LOAD but starts from an undefined depth. This test documents that; when it is fixed the cases flip to seeded.
+    const Case cases[] = {
+        {"D24S8 depth+stencil", gl::DEPTH24_STENCIL8, gl::DEPTH_STENCIL_ATTACHMENT, true, true,
+         "fmt=D24S8(0x88f0) attach=depth_stencil depth=load stencil=load serve=yes"},
+        {"D32F depth only", gl::DEPTH_COMPONENT32F, gl::DEPTH_ATTACHMENT, false, true, "fmt=D32F(0x8cac) attach=depth depth=load stencil=- serve=yes"},
+        {"D24 depth only (known gap: unseeded)", gl::DEPTH_COMPONENT24, gl::DEPTH_ATTACHMENT, false, false,
+         "fmt=D24(0x81a6) attach=depth depth=load stencil=- serve=no why=stencil_not_attached"},
+        {"D24S8 depth only (known gap: unseeded)", gl::DEPTH24_STENCIL8, gl::DEPTH_ATTACHMENT, true, false,
+         "fmt=D24S8(0x88f0) attach=depth depth=load stencil=- serve=no why=stencil_not_attached"},
+    };
+    G(glFramebufferTexture2D, void (*)(GLenum, GLenum, GLenum, GLuint, GLint));
+    for (const Case& c : cases) {
+        GLuint depthTex;
+        glGenTextures(1, &depthTex);
+        glBindTexture(gl::TEXTURE_2D, depthTex);
+        counts = {};
+        glTexStorage2D(gl::TEXTURE_2D, 1, c.ifmt, 32, 32);
+        // A depth texture that is not a multisampled-render-to-texture attachment keeps its lossless depth compression: no format views,
+        // also as a plain framebuffer attachment.
+        CHECK(err() == gl::NO_ERROR && counts.imagesCreated == 1 && !(counts.lastImageFlags & VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT));
+        glFramebufferTexture2DMultisampleEXT(gl::FRAMEBUFFER, gl::DEPTH_STENCIL_ATTACHMENT, gl::TEXTURE_2D, 0, 0, 0);  // detach both
+        glFramebufferTexture2D(gl::FRAMEBUFFER, c.att, gl::TEXTURE_2D, depthTex, 0);
+        CHECK(err() == gl::NO_ERROR && counts.imagesCreated == 1 && !(counts.lastImageFlags & VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT));
+        // Attached as a multisampled-render-to-texture attachment: the image is recreated with format views, its texels copied over.
+        counts = {};
+        glFramebufferTexture2DMultisampleEXT(gl::FRAMEBUFFER, c.att, gl::TEXTURE_2D, depthTex, 0, 4);
+        CHECK(err() == gl::NO_ERROR && glCheckFramebufferStatus(gl::FRAMEBUFFER) == gl::FRAMEBUFFER_COMPLETE);
+        if (c.viewsFlag) {
+            CHECK(counts.imagesCreated == 1 && (counts.lastImageFlags & VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT) && counts.copiesImage == 1);
+        } else {
+            CHECK(counts.imagesCreated == 0 && counts.copiesImage == 0);  // (no stencil plane to read through a view: nothing recreated)
+        }
+        const size_t markCase = peekStderr().size();
+        // (A first frame on the new texture is not counted: the frame compiler's line for it may still carry the change of attachments.)
+        scenario(1, gl::LESS, 1.0f, 0.2f, 0.7f);
+        const size_t mark = peekStderr().size();
+        for (int cut = 1; cut <= 2; ++cut) {
+            for (int reverse = 0; reverse <= 1; ++reverse) {
+                scenario(cut, reverse ? gl::GREATER : gl::LESS, reverse ? 0.0f : 1.0f, reverse ? 0.8f : 0.2f, reverse ? 0.3f : 0.7f);
+                // A new pass: the colour is seeded by the layer's own draw (DONT_CARE + a seed draw before the quad), the depth keeps its
+                // LOAD (the backend seeds it; the cleared value is not applied again: no clear in the new pass) and, like in the first
+                // pass, resolves into the texture; nothing is stored.
+                CHECK(err() == gl::NO_ERROR && counts.passes == 1);
+                CHECK(counts.depthLoad == VK_ATTACHMENT_LOAD_OP_LOAD && counts.depthResolve && counts.depthStore == VK_ATTACHMENT_STORE_OP_DONT_CARE);
+                CHECK(counts.colorLoad == VK_ATTACHMENT_LOAD_OP_DONT_CARE && counts.colorResolve && counts.draws == 2 && counts.imagesStoredMS == 0);
+                CHECK(counts.clears == 0);
+            }
+        }
+        const std::string whole = peekStderr(), log = whole.substr(mark);
+        // The frame compiler plans a depth seed for each of the 4 passes, or (known gap) none.
+        if (c.seeded) {
+            CHECK(seedDraws(log) >= 4);
+        } else {
+            CHECK(seedDraws(log) == 0);
+        }
+        const std::string sinceCase = whole.substr(markCase);
+        const bool said = sinceCase.find(std::string("gles.msrtt_ds tex=") + std::to_string(depthTex) + " " + c.line) != std::string::npos;
+        if (!said) std::printf("  case %s: gles.msrtt_ds line missing; log since the case:\n%s\n", c.name, sinceCase.c_str());
+        CHECK(said);
+    }
+    // An invalidated depth continues as DONT_CARE (glInvalidateFramebuffer): the line says so.
+    {
+        G(glInvalidateFramebuffer, void (*)(GLenum, GLsizei, const GLenum*));
+        GLuint depthTex;
+        glGenTextures(1, &depthTex);
+        glBindTexture(gl::TEXTURE_2D, depthTex);
+        glTexStorage2D(gl::TEXTURE_2D, 1, gl::DEPTH24_STENCIL8, 32, 32);
+        glFramebufferTexture2DMultisampleEXT(gl::FRAMEBUFFER, gl::DEPTH_STENCIL_ATTACHMENT, gl::TEXTURE_2D, depthTex, 0, 4);
+        glDepthFunc(gl::LESS);
+        glClearDepthf(1.0f);
+        glClear(gl::COLOR_BUFFER_BIT | gl::DEPTH_BUFFER_BIT | gl::STENCIL_BUFFER_BIT);
+        glUniform1f(uz, 0.2f);
+        glDrawArrays(gl::TRIANGLE_STRIP, 0, 4);
+        glMemoryBarrier(0x00000001);
+        const GLenum atts[] = {gl::DEPTH_ATTACHMENT, gl::STENCIL_ATTACHMENT};
+        glInvalidateFramebuffer(gl::FRAMEBUFFER, 2, atts);
+        const size_t mark = peekStderr().size();
+        glDrawArrays(gl::TRIANGLE_STRIP, 0, 4);
+        settle();
+        CHECK(err() == gl::NO_ERROR && counts.depthLoad == VK_ATTACHMENT_LOAD_OP_DONT_CARE);
+        CHECK(peekStderr().substr(mark).find("gles.msrtt_ds tex=" + std::to_string(depthTex) + " fmt=D24S8(0x88f0) attach=depth_stencil depth=inv stencil=inv serve=yes") !=
+              std::string::npos);
+    }
+    // No cut: the pass goes on as it is (no new pass, nothing loaded again, one draw).
+    settle();
+    glDepthFunc(gl::LESS);
+    glClearDepthf(1.0f);
+    glClear(gl::COLOR_BUFFER_BIT | gl::DEPTH_BUFFER_BIT | gl::STENCIL_BUFFER_BIT);
+    glUniform1f(uz, 0.2f);
+    glDrawArrays(gl::TRIANGLE_STRIP, 0, 4);
+    counts = {};
+    glUniform1f(uz, 0.7f);
+    glDrawArrays(gl::TRIANGLE_STRIP, 0, 4);
+    settle();
+    CHECK(err() == gl::NO_ERROR && counts.passes == 0 && counts.draws == 1 && counts.clears == 0);
+    // The census counts the continued passes (per tick too): eglTerminate prints it.
+    {
+        G(eglTerminate, uint32_t (*)(void*));
+        const size_t mark = peekStderr().size();
+        eglTerminate(e.dpy);
+        const std::string log = peekStderr().substr(mark);
+        const size_t at = log.find("msrtt_ds_continued=");
+        CHECK(at != std::string::npos && std::strtoul(log.c_str() + at + 19, nullptr, 10) >= 8);
+        const size_t mx = log.find("msrtt_ds_continued_tick_max=");
+        CHECK(mx != std::string::npos && std::strtoul(log.c_str() + mx + 28, nullptr, 10) >= 1);
+    }
+    e.down();
+}
+
 void testExternal() {
     Egl e;
     CHECK(e.up());
@@ -3268,6 +3502,8 @@ void testEs31() {
             counts = {};
             glBindImageTexture(0, ta, 0, 0, 0, gl::READ_ONLY, 0x8236);
             CHECK(counts.lastImageFlags & VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT);
+            // (The new image carries the texels over: gles.tex_realloc, which counts the images that lose them, stays silent.)
+            CHECK(counts.copiesImage >= 1 && peekStderr().find("gles.tex_realloc tex=" + std::to_string(ta) + " ") == std::string::npos);
             glBindImageTexture(1, tb, 0, 0, 0, gl::WRITE_ONLY, 0x8236);
             glDispatchCompute(1, 1, 1);
             CHECK(err() == gl::NO_ERROR && counts.dispatches == 1);
@@ -4736,7 +4972,7 @@ int main(int argc, char** argv) {
     const int ok = vpgles_init(reinterpret_cast<void*>(&myGipa));
     const std::map<std::string, std::function<void()>> tests = {
         {"egl", testEgl}, {"eglthreads", testEglThreads}, {"formats", testFormats}, {"buffers", testBuffers}, {"mapunsync", testMapUnsync}, {"textures", testTextures},
-        {"fbo", testFbo}, {"msrbo", testMsRbo}, {"program", testProgram}, {"draw", testDraw}, {"invalidate", testInvalidate}, {"multiview", testMultiview},
+        {"fbo", testFbo}, {"msrbo", testMsRbo}, {"msrtt_depth", testMsrttDepth}, {"program", testProgram}, {"draw", testDraw}, {"invalidate", testInvalidate}, {"multiview", testMultiview},
         {"errors", testErrors}, {"ubo", testUbo}, {"readback", testReadback}, {"external", testExternal}, {"es31", testEs31},
         {"progbin", testProgramBinary}, {"recipe", testRecipe}, {"recipe_session", testRecipeSession}, {"xfb", testXfb},
         {"uniform_raw", testUniformRaw}, {"uniform_strict", testUniformStrict},
