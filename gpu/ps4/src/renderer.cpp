@@ -4,6 +4,7 @@
 #include <array>
 #include <chrono>
 #include <deque>
+#include <filesystem>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -27,6 +28,7 @@
 #include "vpps4/foveation.h"
 #include "vpps4/lifetime.h"
 #include "vpps4/msaa.h"
+#include "frame_capture.h"
 #include "translation_cache.h"
 #include "vpps4/report.h"
 #include "vpps4/tiling.h"
@@ -224,7 +226,7 @@ struct Renderer::Impl {
         uint64_t refillSkipped = 0, refillSkippedBytes = 0, refillLines = 0;  // refills of a target left out because only images wrote its range (R1)
         uint64_t fillPath[5] = {}, fillPathBytes[5] = {};                  // none, GPU detile, CPU detile, linear upload, not filled
         uint64_t mirrorCalls = 0, mirrorCopies = 0, mirrorBytes = 0;
-        uint64_t depthAllocLines = 0;  // depth targets made drawn smaller than their allocation (VPKENGINE_PROBE DEPTHALLOC)
+        uint64_t depthAllocLines = 0, depthWritesUntracked = 0;  // depth targets made drawn smaller than their allocation (VPKENGINE_PROBE DEPTHALLOC)
         uint64_t msDraws[4][4] = {};  // samples the title asked for (1,2,4,8) x samples the host draws with
         std::unordered_map<const char*, uint64_t> resolveDrops;
         struct Plan {
@@ -2194,6 +2196,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         if (!s.bytes) return;
         Plane planes[2];
         const unsigned n = planesOf(s, planes);
+        pstat.depthWritesUntracked += s.isDepth && !n;  // (memory never learns of these: a T# read through memory keeps its old bytes)
         for (unsigned i = 0; i < n; ++i)
             s.version = tracker.markGpuWrite(planes[i].address, planes[i].bytes, s.wid);
         watchOwned(s, true);
@@ -2393,6 +2396,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
     const Surface* cmpSurface = nullptr;
     void routed(uint8_t route, const Surface& s) {
         if (cmpArm) cmpRoute = route, cmpSurface = &s;
+        if (cap.armed) cap.drawSampled.push_back(s.wid), capAdd(s.wid);
     }
     void probeSampled(const ImageDesc& d, const Surface& s, const char* backing, bool storage) {
         if (probePass.empty() || !probeOpen() || probeLines >= kProbeLines) return;
@@ -2959,6 +2963,204 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
                 }
                 log(line);
             }
+    }
+
+    // ---- FRAMECAP (probe on and SHADPS4_PROBE_DIR set; VPKENGINE_FRAMECAP: not set = one frame every 10 s from 20 s on,
+    // "N" = every N s, "Nf" = every N frames, "0" = off). In a captured frame the render passes are listed in order
+    // (VPKENGINE_PROBE FRAMECAP_PASS: attachments, draws, the images its draws sampled) and, once the frame ran (the submit
+    // waits for the GPU: a debugging stall of the command processor, as TEXVERIFY), every image it drew into or sampled is
+    // read back (up to kCapImages, kCapBytes): FRAMECAP_IMG with the texels and aligned 8x8 / 32x32 tiles that are exactly
+    // zero, NaN / Inf, the finite range (depth), a hash, and for a texture the writers of its range and the targets that
+    // overlap it (frame_capture.h). Its targets are kept stored in that frame (noteRead). Pictures
+    // framecap-<n>-<i>-<kind>-<addr>-<fmt>-<w>x<h>-s<slice>.ppm (<= 768 px wide, kCapDisk in all) for the first capture and for
+    // the frame after a capture where a colour target of 512x512 or more has 1 % of its 8x8 tiles at zero (FRAMECAP_PATTERN),
+    // at most one such every 30 s.
+    struct FrameCap {
+        bool off = false, armed = false, files = false, pattern = false, started = false;
+        uint32_t periodFrames = 0;
+        std::chrono::milliseconds period{10000};
+        uint64_t n = 0, disk = 0, nextFrame = 0;
+        Clock::time_point next{}, nextFiles{};
+        std::vector<uint32_t> wids, drawSampled, passSampled;  // images of the frame (first seen first); sampled by a draw / a pass
+        std::unordered_set<uint32_t> seen;
+        std::vector<std::string> passes;
+        std::string pass;
+        uint32_t passDraws = 0;
+    };
+    static FrameCap makeFrameCap() {
+        FrameCap c;
+        const char* e = std::getenv("VPKENGINE_FRAMECAP");
+        if (!e || !*e) return c;
+        const long v = std::atol(e);
+        c.off = v <= 0;
+        if (std::strchr(e, 'f')) c.periodFrames = uint32_t(std::max(v, 1L));
+        else c.period = std::chrono::milliseconds(std::max(v, 1L) * 1000);
+        return c;
+    }
+    FrameCap cap = makeFrameCap();
+    static constexpr uint32_t kCapImages = 96;
+    static constexpr uint64_t kCapBytes = 256ull << 20, kCapDisk = 200ull << 20;
+    void capAdd(uint32_t wid) {
+        if (wid && cap.seen.insert(wid).second) cap.wids.push_back(wid);
+    }
+    std::string capWho(uint32_t wid) {
+        const Surface* s = surfaceOf(wid);
+        if (!s) return std::to_string(wid) + "@?";
+        return std::to_string(wid) + "@" + hex(s->address) + ":" + vpgpu::formatInfo(s->format).name + ":" + std::to_string(s->width) + "x" +
+               std::to_string(s->height) + "x" + std::to_string(slicesOf(*s)) +
+               (s->isDepth ? ":p" + std::to_string(s->pitch) + "x" + std::to_string(s->rows) + ":za" + std::to_string(s->zAuthoritative) +
+                                 ":fo" + std::to_string(s->followed)
+                           : std::string());
+    }
+    uint32_t capWidOf(TextureId id) {
+        for (auto* cache : {&colorTargets, &depthTargets})
+            for (const auto& [a, v] : *cache)
+                for (const Target& t : v)
+                    if (t.id == id || t.ms == id) return t.wid;
+        return 0;
+    }
+    void capPassEnd() {
+        if (cap.pass.empty()) return;
+        std::string line = cap.pass + " draws=" + std::to_string(cap.passDraws) + " sampled=[";
+        std::unordered_set<uint32_t> once;
+        for (uint32_t w : cap.passSampled)
+            if (once.insert(w).second && once.size() <= 12) line += (once.size() > 1 ? " " : "") + capWho(w);
+        if (once.size() > 12) line += " +" + std::to_string(once.size() - 12);
+        cap.passes.push_back(line + "]");
+        cap.pass.clear(), cap.passSampled.clear(), cap.passDraws = 0;
+    }
+    void capPassBegin(const vpgpu::RenderPassDesc& p) {
+        capPassEnd();
+        std::string label = p.label.substr(0, 48);
+        std::replace(label.begin(), label.end(), ' ', '_');
+        cap.pass = "pass=" + std::to_string(cap.passes.size()) + " label=" + (label.empty() ? "-" : label);
+        for (const vpgpu::Attachment& c : p.colors)
+            if (c.texture) {
+                const uint32_t w = capWidOf(c.texture);
+                capAdd(w);
+                cap.pass += " color=" + capWho(w) + "/l" + std::to_string(c.layer);
+            }
+        if (p.depth.texture) {
+            const uint32_t w = capWidOf(p.depth.texture);
+            capAdd(w);
+            cap.pass += " depth=" + capWho(w) + "/l" + std::to_string(p.depth.layer);
+        }
+    }
+    void capArm() {
+        if (cap.off || cap.armed || !vpgpu::probe::enabled()) return;
+        const char* dir = std::getenv("SHADPS4_PROBE_DIR");
+        if (!dir || !*dir) return;
+        const Clock::time_point now = Clock::now();
+        if (!cap.started) cap.started = true, cap.next = now + 2 * cap.period, cap.nextFrame = r.frame_ + cap.periodFrames;
+        if (!cap.pattern && (cap.periodFrames ? r.frame_ + 1 < cap.nextFrame : now < cap.next)) return;
+        cap.files = (cap.n == 0 || cap.pattern) && cap.disk < kCapDisk;
+        cap.pattern = false;
+        cap.armed = true;
+        ++cap.n;
+        cap.next = now + cap.period, cap.nextFrame = r.frame_ + 1 + cap.periodFrames;
+    }
+    void capFinish() {
+        cap.armed = false;
+        const bool idle = r.device_.waitIdle(2'000'000'000ull);
+        const std::string n = std::to_string(cap.n);
+        log("VPKENGINE_PROBE FRAMECAP n=" + n + " f=" + std::to_string(r.frame_) + " idle=" + (idle ? "1" : "0") + " passes=" +
+            std::to_string(cap.passes.size()) + " images=" + std::to_string(cap.wids.size()) + " files=" + (cap.files ? "1" : "0") +
+            " disk_mb=" + std::to_string(cap.disk >> 20));
+        for (const std::string& p : cap.passes) log("VPKENGINE_PROBE FRAMECAP_PASS n=" + n + " " + p);
+        const std::string dir = std::getenv("SHADPS4_PROBE_DIR") ? std::getenv("SHADPS4_PROBE_DIR") : "";
+        static const char* const kindName[3] = {"color", "depth", "texture"};
+        if (cap.files && cap.disk == 0 && !dir.empty()) {  // (the pictures of an earlier run: this one's replace them)
+            std::error_code ec;
+            for (const auto& e : std::filesystem::directory_iterator(dir, ec)) {
+                const std::string name = e.path().filename().string();
+                if (name.rfind("framecap-", 0) == 0 && name.size() > 4 && name.compare(name.size() - 4, 4, ".ppm") == 0)
+                    std::filesystem::remove(e.path(), ec);
+            }
+        }
+        uint64_t readBytes = 0;
+        uint32_t images = 0, index = 0;
+        bool pattern = false;
+        for (const uint32_t wid : cap.wids) {
+            const Surface* s = surfaceOf(wid);
+            const auto ref = surfaceRefs.find(wid);
+            if (!s || ref == surfaceRefs.end()) continue;
+            const unsigned kind = std::min<unsigned>(ref->second.kind, 2);
+            const vpgpu::Format f = s->isDepth ? zPlaneFormat(s->format) : s->format;
+            const vpgpu::FormatInfo& fi = vpgpu::formatInfo(f);
+            std::string line = "VPKENGINE_PROBE FRAMECAP_IMG n=" + n + " i=" + std::to_string(index++) + " wid=" + std::to_string(wid) + " kind=" +
+                               kindName[kind] + " addr=" + hex(s->address) + " fmt=" + fi.name + " " + std::to_string(s->width) + "x" +
+                               std::to_string(s->height) + "x" + std::to_string(slicesOf(*s)) + " samples=" + std::to_string(s->samples) +
+                               " bytes=" + std::to_string(s->bytes) + " tile=" + std::to_string(s->tile) + " pitch=" + std::to_string(s->pitch);
+            if (kind == 2) {
+                std::vector<MemoryTracker::WriterId> ws;
+                tracker.writersSince(s->address, std::max<uint64_t>(s->bytes, 1), s->wid, 0, ws);
+                line += " dfmt=" + std::to_string(s->dfmt) + "/" + std::to_string(s->nfmt) + " fills=" + std::to_string(s->fills) + " fill=" +
+                        std::to_string(s->fillPath) + " writers=" + std::to_string(ws.size()) + "[";
+                for (size_t i = 0; i < ws.size() && i < 4; ++i)
+                    line += (i ? " " : "") + (MemoryTracker::isImage(ws[i]) ? capWho(ws[i]) : ws[i] == MemoryTracker::kCpu ? std::string("cpu")
+                                                                                  : ws[i] == MemoryTracker::kDma ? std::string("dma") : std::string("gpu_raw"));
+                line += "] overlaps=[";
+                unsigned k = 0;
+                for (auto* cache : {&colorTargets, &depthTargets})
+                    for (auto c = cache->lower_bound(s->address > (1ull << 30) ? s->address - (1ull << 30) : 0);
+                         c != cache->end() && c->first < s->address + std::max<uint64_t>(s->bytes, 1); ++c)
+                        for (const Target& t : c->second)
+                            if (c->first + std::max<uint64_t>(t.bytes, 1) > s->address && k++ < 6)
+                                line += (k > 1 ? " " : "") + capWho(t.wid) + ":age=" + std::to_string(r.frame_ - t.lastUse);
+                line += "]";
+            } else {
+                line += " draws=" + std::to_string(s->draws) + " ms=" + (s->ms ? "1" : "0") + (s->twinStale == r.frame_ ? " twin_stale=1" : "");
+            }
+            if (!s->id) {
+                log(line + " read=no_single_sample_picture");
+                continue;
+            }
+            if (fi.blockSize != 1 || images >= kCapImages || readBytes >= kCapBytes) {
+                log(line + (fi.blockSize != 1 ? " read=compressed" : " read=over_budget"));
+                continue;
+            }
+            ++images;
+            const uint32_t slices = s->type == vpgpu::TextureType::Tex3D ? 1u : std::min<uint32_t>(std::max<uint16_t>(s->layers, 1), 8);
+            for (uint32_t slice = 0; slice < slices; ++slice) {
+                vpgpu::TextureSpan sp;
+                sp.texture = s->id, sp.layer = uint16_t(slice), sp.aspect = aspectOf(*s), sp.width = s->width, sp.height = s->height;
+                std::vector<uint8_t> out;
+                const vpgpu::ReadResult rr = r.device_.readTexture(sp, out);
+                const std::string at = line + " s=" + std::to_string(slice);
+                const uint64_t texels = uint64_t(s->width) * s->height;
+                if (rr != vpgpu::ReadResult::Ok || !texels || out.size() % texels) {
+                    log(at + " read=" + (rr == vpgpu::ReadResult::Ok ? "size" : rr == vpgpu::ReadResult::Unsupported ? "unsupported" : rr == vpgpu::ReadResult::Memoryless ? "memoryless" : "failed"));
+                    continue;
+                }
+                readBytes += out.size();
+                const uint32_t bpe = uint32_t(out.size() / texels);
+                const framecap::Stats st = framecap::imageStats(out.data(), s->width, s->height, bpe, f);
+                std::string l = at + " read=ok zero_px=" + std::to_string(framecap::permille(st.zero, st.pixels)) + " zero_t8=" +
+                                std::to_string(framecap::permille(st.zero8, st.tiles8)) + " zero_t32=" + std::to_string(framecap::permille(st.zero32, st.tiles32)) +
+                                " nan=" + std::to_string(st.nan) + " hash=" + hex(hashRange(out.data(), out.size()));
+                if (st.lo <= st.hi) {
+                    char range[64];
+                    std::snprintf(range, sizeof range, " lo=%.6g hi=%.6g", double(st.lo), double(st.hi));
+                    l += range;
+                }
+                if (cap.files && !dir.empty() && cap.disk < kCapDisk) {
+                    const std::string file = "framecap-" + n + "-" + std::to_string(index - 1) + "-" + kindName[kind] + "-" + hex(s->address) + "-" +
+                                             fi.name + "-" + std::to_string(s->width) + "x" + std::to_string(s->height) + "-s" + std::to_string(slice) + ".ppm";
+                    uint64_t written = 0;
+                    if (framecap::writePpm(dir + "/" + file, out.data(), s->width, s->height, bpe, f, (s->width + 767) / 768, st, written))
+                        cap.disk += written, l += " file=" + file;
+                }
+                log(l);
+                if (kind == 0 && s->width >= 512 && s->height >= 512 && framecap::permille(st.zero8, st.tiles8) >= 10) pattern = true;
+            }
+        }
+        const Clock::time_point now = Clock::now();
+        if (cap.files) cap.nextFiles = now + std::chrono::seconds(30);
+        else if (pattern && now >= cap.nextFiles && cap.disk < kCapDisk) {
+            cap.pattern = true;
+            log("VPKENGINE_PROBE FRAMECAP_PATTERN n=" + n + " f=" + std::to_string(r.frame_) + " (the next frame is captured with pictures)");
+        }
+        cap.wids.clear(), cap.seen.clear(), cap.passes.clear(), cap.drawSampled.clear(), cap.passSampled.clear(), cap.pass.clear();
     }
 
     void fillFromMemory(Surface& s, Texture* tex) {
@@ -4947,6 +5149,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         frame.beginRenderPass(pass);
         passOpen = true;
         ++r.stats_.passes;
+        if (cap.armed) capPassBegin(pass);
         // Later draws on the same targets continue it: no clear on reopen.
         for (vpgpu::Attachment& c : pass.colors) c.load = vpgpu::LoadAction::Load;
         pass.depth.load = vpgpu::LoadAction::Load;
@@ -4959,6 +5162,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         ringRoom();
         const RegionScope regions(*this);
         ++r.stats_.draws;
+        if (cap.armed) cap.drawSampled.clear();  // (what a dispatch sampled is not this draw's)
         if (d.count == 0 || d.instances == 0) return skip("empty draw");
         if (isDepthCopy(d)) return handled("depth copy"), depthCopy(d);
         if (d.raster.cullFront && d.raster.cullBack) return skip("both faces culled");
@@ -5677,6 +5881,11 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         if (vis.active && r.device_.submittedFrames() - vis.lastZpassFrame > Vis::kIdleFrames) vis.active = false;
         if (vis.active) draw.visibility = vpgpu::BufferSpan{vis.id, (vis.seq % kVisSlots) * 8, 8};
         openPass(desc, clears);
+        if (cap.armed) {
+            cap.passSampled.insert(cap.passSampled.end(), cap.drawSampled.begin(), cap.drawSampled.end());
+            cap.drawSampled.clear();
+            ++cap.passDraws;
+        }
         for (auto& rc : inPassClears) {
             vpgpu::Draw cd;
             cd.clear = std::move(rc);
@@ -6289,6 +6498,11 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
                 life.setResolveDropSink([this](TextureId ms, TextureId twin, const char* why) { noteResolveDropped(ms, twin, why); });
                 life.setProbeSink([this](const std::string& l) { log(l); });
             }
+            if (cap.armed) {  // (FRAMECAP: what the frame drew is read back after it, so it is stored)
+                capPassEnd();
+                for (const uint32_t w : cap.wids)
+                    if (const Surface* s = surfaceOf(w); s && s->id) life.noteRead(s->id, r.frame_);
+            }
             const auto tLife = Clock::now();
             const LifetimeStats ls = life.plan(frame, r.device_.resources(), r.frame_);
             r.cpu_.lifeMs += msSince(tLife);
@@ -6305,6 +6519,8 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         vpgpu::FrameReport report = r.device_.submit(std::move(frame));
         r.cpu_.submitMs += msSince(t0);
         if (tv.pending) texVerifyCheck();
+        if (cap.armed) capFinish();
+        capArm();
         scratchDone[ringIndex] = report.frame + 1;
         frame = vpgpu::Frame{};
         retireOwned();
@@ -6736,9 +6952,12 @@ void Renderer::publishProbe(uint64_t pictures) {
         uint64_t texN = 0, texBytes = 0, byType[4] = {}, byTypeBytes[4] = {}, byMips[3] = {}, bySamples[4] = {}, unfilled = 0, seeded = 0;
         uint64_t storage = 0, softBc = 0, mirrored = 0;
         std::map<std::string, std::pair<uint64_t, uint64_t>> byFormat;
-        for (const auto& [addr, shapes] : im.textures)
+        uint64_t dupAddr = 0, dupBytes = 0;  // addresses with more than one texture (other shape, levels, format): the others' bytes
+        for (const auto& [addr, shapes] : im.textures) {
+            unsigned atAddr = 0;
             for (const auto& [shape, t] : shapes) {
                 if (!t.id) continue;
+                if (atAddr++) dupBytes += bytesOf(t.id), dupAddr += atAddr == 2;
                 ++texN;
                 const uint64_t b = bytesOf(t.id);
                 texBytes += b;
@@ -6754,7 +6973,9 @@ void Renderer::publishProbe(uint64_t pictures) {
                 if (t.softBc) ++softBc;
                 if (t.mirrorSrc) ++mirrored;
             }
+        }
         G(f, "tex_n", double(texN)), G(f, "tex_mb", MB(texBytes)), G(f, "tex_unfilled", double(unfilled)), G(f, "tex_seeded", double(seeded));
+        G(f, "tex_dup_addr", double(dupAddr)), G(f, "tex_dup_mb", MB(dupBytes));
         G(f, "tex_storage", double(storage)), G(f, "tex_soft_bc", double(softBc)), G(f, "tex_mirror_copies", double(mirrored));
         for (int k = 0; k < 4; ++k)
             G(f, std::string("tex_") + typeNames[k], double(byType[k])), G(f, std::string("tex_") + typeNames[k] + "_mb", MB(byTypeBytes[k]));
@@ -6798,6 +7019,7 @@ void Renderer::publishProbe(uint64_t pictures) {
             C(f, std::string("refill_") + why[k], ps.refills[k]), C(f, std::string("refill_") + why[k] + "_bytes", ps.refillBytes[k]);
         C(f, "refill_unfilled", ps.refillFailed);
         C(f, "refill_skipped", ps.refillSkipped), C(f, "refill_skipped_bytes", ps.refillSkippedBytes);
+        C(f, "depth_writes_untracked", ps.depthWritesUntracked);
         C(f, "dma_stale_read", ps.dmaStaleReads), C(f, "cpu_read_all", ps.cpuReadAll);
         static const char* const aliasWhy[Impl::kAliasReasons] = {"depth", "address", "shape", "layout", "mips", "samples", "format", "no_view", "range", "feedback"};
         C(f, "alias_hits", ps.aliasHits), C(f, "alias_hits_legacy", ps.aliasHitsLegacy);

@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <functional>
 #include <map>
@@ -20,6 +21,7 @@
 #include "vpgpu/core/probe.h"
 #include "vpps4/renderer.h"
 #include "vpps4/tiling.h"
+#include "../src/frame_capture.h"
 
 #ifndef VPPS4_LIFT_DIR
 #error "VPPS4_LIFT_DIR must point at gpu/shader/gcn/tests/lift"
@@ -2278,9 +2280,80 @@ void texVerify() {
     }
 }
 
+// FRAMECAP (probe on, SHADPS4_PROBE_DIR set; VPKENGINE_FRAMECAP=1f here: every frame): the frame after the arming submit
+// lists its passes and reads back what it sampled (Recording plays the upload of the texture): zero texels / tiles counted,
+// a picture written for the first capture. "0" or the probe off: nothing. Then the stats themselves on known texels.
+void frameCapture() {
+    namespace fc = vpps4::framecap;
+    {  // stats: RGBA8 64x64 with its first 8x8 tile black (alpha ignored), RGBA16F with a NaN, D32 range
+        std::vector<uint8_t> rgba(64 * 64 * 4, 0x40);
+        for (uint32_t y = 0; y < 8; ++y)
+            for (uint32_t x = 0; x < 8; ++x) std::memcpy(&rgba[(y * 64 + x) * 4], "\0\0\0\xff", 4);
+        fc::Stats s = fc::imageStats(rgba.data(), 64, 64, 4, vpgpu::Format::RGBA8Unorm);
+        CHECK(s.zero == 64 && s.zero8 == 1 && s.tiles8 == 64 && s.zero32 == 0 && s.tiles32 == 4 && s.nan == 0);
+        std::vector<uint16_t> h(16 * 16 * 4, 0x3c00);  // 1.0
+        h[5] = 0x7e00;                                 // NaN
+        s = fc::imageStats(reinterpret_cast<const uint8_t*>(h.data()), 16, 16, 8, vpgpu::Format::RGBA16Float);
+        CHECK(s.nan == 1 && s.zero == 0);
+        std::vector<float> z(8 * 8, 0.5f);
+        z[0] = 0.25f, z[1] = 0.0f;
+        s = fc::imageStats(reinterpret_cast<const uint8_t*>(z.data()), 8, 8, 4, vpgpu::Format::D32Float);
+        CHECK(s.lo == 0.0f && s.hi == 0.5f && s.zero == 1 && s.zero8 == 0);
+        s = fc::imageStats(rgba.data(), 64, 64, 4, vpgpu::Format::R32Uint);  // not decoded: zero bytes
+        CHECK(!s.decoded && s.zero == 0);
+    }
+    char dir[] = "/tmp/vpps4_framecap_XXXXXX";
+    CHECK(mkdtemp(dir) != nullptr);
+    setenv("SHADPS4_PROBE_DIR", dir, 1);
+    auto find = [](Fixture& f, const std::string& what) {
+        for (const std::string& l : f.log)
+            if (l.find(what) != std::string::npos) return &l;
+        return static_cast<const std::string*>(nullptr);
+    };
+    {
+        ProbeOn probe;
+        setenv("VPKENGINE_FRAMECAP", "1f", 1);
+        Fixture f;
+        for (uint32_t i = 0; i < 64 * 64; ++i) f.at(kTex)[i] = (i % 64) < 8 && (i / 64) < 8 ? 0xff000000u : 0xff102030u;
+        f.renderer.draw(f.state());
+        f.renderer.submit();  // arms
+        CHECK(!find(f, "FRAMECAP"));
+        f.renderer.invalidate(kTex, 4);
+        f.renderer.draw(f.state());
+        f.renderer.submit();
+        CHECK(find(f, "VPKENGINE_PROBE FRAMECAP n=1 ") && find(f, " files=1"));
+        CHECK(find(f, "VPKENGINE_PROBE FRAMECAP_PASS n=1 pass=0 ") && find(f, " draws=1 sampled=["));
+        const std::string* img = find(f, "kind=texture addr=" + Fixture::hex(kTex) + " fmt=");
+        CHECK(img && img->find("read=ok zero_px=15 zero_t8=15 ") != std::string::npos && img->find(" file=framecap-1-") != std::string::npos);
+        CHECK(find(f, "kind=color addr=" + Fixture::hex(kRt)));  // the target: listed (this backend cannot read it back)
+        if (img) {
+            const size_t at = img->find(" file=") + 6;
+            std::FILE* fp = std::fopen((std::string(dir) + "/" + img->substr(at, img->find(' ', at) - at)).c_str(), "rb");
+            CHECK(fp != nullptr);
+            if (fp) std::fclose(fp);
+        }
+        if (failures) f.dump();
+    }
+    for (bool probeOn : {true, false}) {  // "0", and the probe off: nothing
+        setenv("VPKENGINE_FRAMECAP", probeOn ? "0" : "1f", 1);
+        vpgpu::probe::setEnabled(probeOn);
+        Fixture f;
+        for (int i = 0; i < 3; ++i) {
+            f.renderer.draw(f.state());
+            f.renderer.submit();
+        }
+        CHECK(!find(f, "FRAMECAP"));
+        vpgpu::probe::setEnabled(false);
+    }
+    unsetenv("VPKENGINE_FRAMECAP");
+    unsetenv("SHADPS4_PROBE_DIR");
+    std::filesystem::remove_all(dir);
+}
+
 int main(int argc, char** argv) {
     const std::string_view t = argc > 1 ? argv[1] : "";
     if (t == "rt_to_texture") rtToTexture();
+    else if (t == "frame_capture") frameCapture();
     else if (t == "sample_extent") sampleExtent();
     else if (t == "soft_bc_upload") softBcUpload();
     else if (t == "soft_bc_tiled") softBcTiled();
