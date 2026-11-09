@@ -40,6 +40,7 @@ int main(int argc, char** argv) {
     }
     vpgcn::LiftInput input;
     std::vector<uint32_t> code, fetch;
+    std::vector<std::string> expectMsl;
     vpgcn::DescriptorInfo info;  // tex_dim / tex_elem / tex_bits / tex_num: what the client would say of every T#
     bool haveInfo = false;
     std::istringstream file(readFile(argv[1]));
@@ -59,6 +60,12 @@ int main(int argc, char** argv) {
                                             : vpgcn::ShaderStage::Compute;
         } else if (key == "vgpr_comp_cnt") {
             ls >> input.vgprCompCnt;
+        } else if (key == "step_rate") {
+            ls >> input.instanceStepRate[0] >> input.instanceStepRate[1];
+        } else if (key == "expect_msl") {  // text the MSL must contain (a line of it)
+            std::string t;
+            std::getline(ls >> std::ws, t);
+            expectMsl.push_back(t);
         } else if (key == "vs_out_cntl") {
             std::string v;
             ls >> v;
@@ -153,6 +160,11 @@ int main(int argc, char** argv) {
         return 0;
     }
     int status = 0;
+    for (const std::string& t : expectMsl)
+        if (e.shader.source.find(t) == std::string::npos) {
+            std::fprintf(stderr, "MSL lacks: %s\n", t.c_str());
+            status = 1;
+        }
     if (summary.str() != readFile(argv[3])) {
         std::fprintf(stderr, "summary differs from %s; got:\n%s", argv[3], summary.str().c_str());
         status = 1;

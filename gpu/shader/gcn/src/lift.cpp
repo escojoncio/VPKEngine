@@ -4949,15 +4949,17 @@ struct Lifter {
     // ---- Entry state ---------------------------------------------------------------------------
 
     // Vertex-style inputs: v0 the vertex id; with VGPR_COMP_CNT, v1 / v2 the instance id divided
-    // by the step rates and v3 the instance id.
+    // by the step rates (0: zero, as the reference does; VPKENGINE_R3_STEPRATE0_IID=1: the instance id as before)
+    // and v3 the instance id.
     void vertexRegs(ValueId vid, ValueId iid) {
+        static const bool rate0IsInstance = std::getenv("VPKENGINE_R3_STEPRATE0_IID") != nullptr;
         b->storeVar(vVar(0), vid);
         if (in.vgprCompCnt >= 1) {
             for (unsigned v = 1; v <= in.vgprCompCnt && v < 4; ++v) {
                 uint32_t rate = v < 3 ? in.instanceStepRate[v - 1] : 1;
-                b->storeVar(vVar(v), rate > 1 ? bin(V::Op::Div, iid, u(rate), V::kU32) : iid);
+                b->storeVar(vVar(v), rate == 0 && !rate0IsInstance ? u(0) : rate > 1 ? bin(V::Op::Div, iid, u(rate), V::kU32) : iid);
             }
-            if (in.vgprCompCnt >= 1 && (!in.instanceStepRate[0] || (in.vgprCompCnt >= 2 && !in.instanceStepRate[1])))
+            if (rate0IsInstance && (!in.instanceStepRate[0] || (in.vgprCompCnt >= 2 && !in.instanceStepRate[1])))
                 note("instance step-rate VGPRs (v1, v2) hold the instance id");
         }
     }

@@ -1,0 +1,9 @@
+# vs_fetch with instance step rates 0 and 3: v1 = 0, v2 = instance id / 3, v3 = instance id (the reference: a step rate of 0 is not the instance id)
+stage vertex
+user_sgprs 6
+step_rate 0 3
+expect_msl l11 = 0u;
+expect_msl = in_instance_id / 3u;
+expect_msl l13 = in_instance_id;
+code be802102 f80008cf 07060504 f800020f 07060504 bf810000
+fetch c0840500 bf8c007f e00c2000 80020400 bf8c0f70 be802000
