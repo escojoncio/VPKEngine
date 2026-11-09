@@ -220,7 +220,7 @@ struct Renderer::Impl {
     struct ProbeStats {
         uint64_t aliasHits = 0, aliasHitsLegacy = 0, aliasRejected[kAliasReasons] = {};  // T#s read through the image that wrote their memory / those that could not
         uint64_t guestBufAdds = 0, guestBufRemoves = 0, guestBufRefused = 0;
-        uint64_t uploadBytes = 0, alignedCopies = 0, bufferSnapshots = 0;
+        uint64_t uploadBytes = 0, alignedCopies = 0, bufferSnapshots = 0, pointerSnapshots = 0;
         uint64_t refills[3] = {}, refillBytes[3] = {}, refillFailed = 0;  // first fill, written by others (version), history forgotten
         uint64_t dmaStaleReads = 0, cpuReadAll = 0;  // CPU reads of a range a recorded fill / copy was still to write (probe); cpuReadRanges gave up
         uint64_t refillSkipped = 0, refillSkippedBytes = 0, refillLines = 0;  // refills of a target left out because only images wrote its range (R1)
@@ -937,6 +937,29 @@ struct Renderer::Impl {
         // (once the CPU reads are no longer followed, everything counts as read: then only a range the old ranges cover whole does)
         const auto covering = cpuRead.upper_bound(address);
         if (cpuReadAll ? covering == cpuRead.begin() || std::prev(covering)->second < address + size : !cpuReadSeen(address, size)) return false;
+        if (tracker.forgetHistoryCalls() != snapForgets)
+            snapForgets = tracker.forgetHistoryCalls(), snapAfter = r.device_.submittedFrames() + 1;
+        if (r.device_.completedFrames() < snapAfter) return false;
+        return !tracker.gpuWritten(address, size) && !(r.device_.labelsQueued() && r.device_.labelPending(address, uint32_t(size)));
+    }
+    // Ranges the command processor writes in order with the draws and had to wait for (Renderer::cpuAccessed: DUMP_CONST_RAM,
+    // WRITE_DATA, a small DMA), merged. A read-only buffer bound by a bare pointer into one (no V#: its extent is not known)
+    // is copied when its draw is recorded, kSnapshotBytes of it (the window the hazards follow for such a buffer), so the
+    // draw no longer reads memory the next write of the range would have to wait for. VPKENGINE_POINTER_LIVE=1: in place.
+    std::map<uint64_t, uint64_t> cpAccess;
+    bool pointerLive = std::getenv("VPKENGINE_POINTER_LIVE") != nullptr;
+    void noteCpAccess(uint64_t lo, uint64_t hi) {
+        if (cpAccess.size() >= 1024) return;
+        auto it = cpAccess.upper_bound(lo);
+        if (it != cpAccess.begin() && std::prev(it)->second >= lo) it = std::prev(it);
+        while (it != cpAccess.end() && it->first <= hi) lo = std::min(lo, it->first), hi = std::max(hi, it->second), it = cpAccess.erase(it);
+        cpAccess[lo] = hi;
+    }
+    bool pointerSnapshotSafe(uint64_t address, uint64_t size) {
+        if (bufferLive || pointerLive || cpAccess.empty() || !size || address % 16) return false;
+        const auto it = cpAccess.upper_bound(address);
+        if (it == cpAccess.begin() || std::prev(it)->second <= address) return false;
+        if (overlaps(flatReach, false, address, size)) return false;
         if (tracker.forgetHistoryCalls() != snapForgets)
             snapForgets = tracker.forgetHistoryCalls(), snapAfter = r.device_.submittedFrames() + 1;
         if (r.device_.completedFrames() < snapAfter) return false;
@@ -2008,6 +2031,8 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         // Depth targets: the image holds the whole plane (a clear of all of it, or a fill from memory), so writing it over
         // memory loses nothing. False when made: an image that was only drawn into holds texels nothing defined.
         bool zAuthoritative = false, stencilAuthoritative = false;
+        float clearDepth = 1.0f;  // depth targets: DB_DEPTH_CLEAR of the last draw that cleared Z (`clearDepthKnown`)
+        bool clearDepthKnown = false;
         uint64_t lastDraw = ~uint64_t(0);  // colour targets: the frame (r.frame_) a pass last drew into it (~0: never; diagnostics)
         uint64_t draws = 0, drawsTaken = 0;  // draws into it, and those already handed to Renderer::takeTargetDraws
         int32_t lastScissor[4] = {};         // x, y, width, height / viewport of the last colour pass that drew into it (probe REFILL only)
@@ -3385,14 +3410,21 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
             const auto kept = impliedDepths.find(t.address);
             return kept != impliedDepths.end() && t.clearedStamp == kept->second.stamp ? &kept->second : nullptr;
         }
+        // (wider or taller than the allocation of every target there; more slices alone is the same picture with slices
+        // still to draw, which memory or the target serve)
+        const Target* newest = nullptr;
         for (const Target& g : dt->second) {
             const bool wideTarget = g.format == vpgpu::Format::D32Float || g.format == vpgpu::Format::D32FloatS8;
-            if (wide != wideTarget && !(g.format == vpgpu::Format::D16Unorm && !wide)) return nullptr;  // (another texel size: not this surface)
-            if (g.width >= t.width && g.height >= t.height && g.layers >= t.layers) return nullptr;      // (it could hold the texture: memory, as before)
+            if (!wideTarget && g.format != vpgpu::Format::D16Unorm) return nullptr;
+            if (wide != wideTarget) return nullptr;  // (another texel size: not this surface)
+            if (std::max(g.pitch, g.width) >= t.width && std::max(g.rows, g.height) >= t.height) return nullptr;
+            if (g.clearDepthKnown && (!newest || g.lastUse > newest->lastUse)) newest = &g;
         }
-        float value = 1.0f;
-        if (const auto r = clearedDepths.find(t.address); r != clearedDepths.end()) value = r->second.value;
         ClearedDepth& c = impliedDepths[t.address];
+        float value = c.value;
+        if (const auto r = clearedDepths.find(t.address); r != clearedDepths.end()) value = r->second.value;
+        else if (newest) value = newest->clearDepth;
+        else if (!c.stamp) return impliedDepths.erase(t.address), nullptr;  // (no clear value known: memory, as before)
         if (!c.stamp || c.value != value) c.value = value, c.mask = ~uint32_t(0), c.stamp = ++clearedDepthStamp;
         return &c;
     }
@@ -5184,6 +5216,21 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
                             }
                         }
                     }
+                    if (pointer && !a.write && address && !cpAccess.empty()) {
+                        GuestRegion g;
+                        if (region(address, 1, g)) {
+                            const uint64_t bytes = std::min<uint64_t>(kSnapshotBytes, g.base + g.size - address) & ~uint64_t(15);
+                            if (pointerSnapshotSafe(address, bytes)) {
+                                const Phase cbPhase(r.cpu_.bindCbMs);
+                                if (const auto at = alignedConstantCopy(address, bytes, static_cast<const uint8_t*>(g.host) + (address - g.base))) {
+                                    ++pstat.bufferSnapshots, ++pstat.pointerSnapshots;
+                                    if (resolved_) resolved_->buffers.push_back({uint8_t(stage), address, bytes, stride, false, pointer});
+                                    a.range = ResourceRange::bytes(rings[ringIndex].id, *at, bytes);
+                                    break;
+                                }
+                            }
+                        }
+                    }
                     BufferId id;
                     uint64_t offset = 0, available = 0;
                     bool found = false;
@@ -5445,6 +5492,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
             Target* dt = target(depthTargets, readAddress, zf, z.width, z.height,
                                 samples, uint16_t(z.sliceStart + z.sliceCount), true, z.tileMode, depthPitch(z), nullptr, depthRows(z));
             if (!dt) return skip("depth target creation failed");
+            if (z.depthClear && z.zFormat) dt->clearDepth = z.clearDepth, dt->clearDepthKnown = true;
             {
                 const uint64_t zBase = agreedBase(z.zAddress, z.zWriteAddress), stencilBase = agreedBase(z.stencilAddress, z.stencilWriteAddress);
                 const uint64_t primary = z.zFormat ? zBase : stencilBase;
@@ -6937,6 +6985,7 @@ bool Renderer::cpuReadSeen(uint64_t a, uint64_t n) const { return impl_->cpuRead
 void Renderer::cpuAccessed(uint64_t a, uint64_t n) {
     // (bounded: a title that rotates such ranges must not use up the ranges the CPU reads are followed with)
     if (impl_->cpuRead.size() < 1024) impl_->noteCpuRead(a, n, "cp_access");
+    impl_->noteCpAccess(a, a + n);
 }
 void Renderer::probeDmaCpuRead(uint64_t a, uint64_t n, uint64_t src) {
     Impl& i = *impl_;
@@ -7059,7 +7108,7 @@ void Renderer::publishProbe(uint64_t pictures) {
         C(f, "views_made", s.viewsMade), C(f, "syncs", s.syncs), C(f, "seeded", s.seeded);
         C(f, "pictures", pictures);
         C(f, "aligned_copies", ps.alignedCopies), C(f, "aligned_copy_bytes", im.alignedCopyBytes);
-        C(f, "buffer_snapshots", ps.bufferSnapshots);
+        C(f, "buffer_snapshots", ps.bufferSnapshots), C(f, "pointer_snapshots", ps.pointerSnapshots);
         C(f, "life_stores_dropped", im.lifeTotal.storesDropped);
         C(f, "life_samples_dropped", im.lifeTotal.samplesDropped), C(f, "life_resolves_dropped", im.lifeTotal.resolvesDropped);
         C(f, "life_resolves_deferred", im.lifeTotal.resolvesDeferred), C(f, "life_misses", im.lifeTotal.misses);
