@@ -1146,6 +1146,7 @@ struct Translator {
   // upgraded) a pipeline with a baked partial sample mask or a fragment shader using SampleId / SampleMask: both depend on the
   // game's sample count. Returns true when the pass ended inside `ops`.
   // Draws from ops[from] to the end of the pass (same extent as forceScan).
+  static constexpr uint32_t kSceneMinDraws = 32;  // draws of the main 3D scene pass in an intermediate target (forceMsaa sceneMain)
   static uint32_t countDraws(const std::vector<Op>& ops, size_t from) {
     uint32_t n = 0;
     for (size_t i = from; i < ops.size(); ++i) {
@@ -1276,14 +1277,25 @@ struct Translator {
       ++counter;
       mt.noteRej(dev, d, why);
     };
-    if (!eyeScene) {
+    vpgpu::Attachment& c = d.colors[0];
+    vpgpu::Attachment& z = d.depth;
+    // A pass that is not at the eye's size can still be the game's main 3D scene, drawn into an intermediate target that is later
+    // copied / composited into the eye: colour + depth of at least half the eye's pixels, one 2D level, at most two layers, and
+    // kSceneMinDraws draws (a UI / post-process pass has a few). -1: it is big enough but not that (counted "scene"), 0: not a candidate.
+    auto sceneMain = [&]() {
+      vpgpu::TextureDesc tc;
+      if (!c.texture || !z.texture || !eyeWhy.eyeW || !eyeWhy.eyeH || !dev->gpu->textureDesc(c.texture, tc)) return 0;
+      if (tc.type != vpgpu::TextureType::Tex2D || tc.mips != 1 || tc.layers > 2) return 0;
+      if (uint64_t(tc.width) * tc.height * 2 < uint64_t(eyeWhy.eyeW) * eyeWhy.eyeH) return 0;
+      return countDraws(ops, at + 1) >= kSceneMinDraws ? 1 : -1;
+    };
+    const int scene = eyeScene ? 1 : sceneMain();
+    if (scene < 1) {
       ++mt.rejEyeBy[eyeWhy.why];
       mt.eye.noteNonEye(dev->gpu->submittedFrames());
       eyeRejDetail(dev, d);
-      return rej(mt.rejEye, "eye");
+      return scene ? rej(mt.rejScene, "scene") : rej(mt.rejEye, "eye");
     }
-    vpgpu::Attachment& c = d.colors[0];
-    vpgpu::Attachment& z = d.depth;
     if (!c.texture || !z.texture) return rej(mt.rejCd, "cd");
     vpgpu::TextureDesc gc, gz;
     if (!dev->gpu->textureDesc(c.texture, gc) || !dev->gpu->textureDesc(z.texture, gz)) return rej(mt.rejDesc, "desc");
@@ -1293,11 +1305,12 @@ struct Translator {
       const vpgpu::TextureDesc& gc;
       const uint8_t& forced;
       uint32_t draws;
+      bool on;  // an eye pass only (not a scene pass in an intermediate target)
       ~EyeNote() {
-        mt.eye.notePass(dev->gpu->submittedFrames(), gc.width, gc.height, uint16_t(gc.layers), vpgpu::formatInfo(gc.format).name,
+        if (on) mt.eye.notePass(dev->gpu->submittedFrames(), gc.width, gc.height, uint16_t(gc.layers), vpgpu::formatInfo(gc.format).name,
                         uint8_t(gc.samples), forced ? forced : uint8_t(gc.samples), draws);
       }
-    } eyeNote{mt, dev, gc, forceN, mt.eye.lines >= MsaaTwins::kEyeLines ? 0u : countDraws(ops, at + 1)};  // lines used up: nothing prints, skip the count
+    } eyeNote{mt, dev, gc, forceN, mt.eye.lines >= MsaaTwins::kEyeLines ? 0u : countDraws(ops, at + 1), eyeScene};  // lines used up: nothing prints, skip the count
     // "vk.msaa rej_first reason=smp|msstore ...": the first pass rejected for each of those two reasons (once per device), with the
     // rej_detail fields and the game's samples / store / load / resolve of the pass.
     auto rejFirst = [&](int slot, const char* why) {
@@ -1386,6 +1399,7 @@ struct Translator {
       }
       forceN = samples;
       ++mt.passes, ++mt.up;
+      mt.sceneUp += eyeScene ? 0u : 1u;
       if (!mt.upDetailDone) {  // "vk.msaa up_detail": the first upgraded pass (once per device)
         mt.upDetailDone = true;
         vpgpu::TextureDesc rc, rz;
@@ -1413,6 +1427,7 @@ struct Translator {
     if (taaDepth) dev->gpu->markTransientViolated(guestDepth);  // a transient game depth would be dropped with its tile
     forceN = samples;
     ++mt.passes;
+    mt.sceneUp += eyeScene ? 0u : 1u;
   }
 
   // Moves the viewport of an eye-pass geometry draw by the jitter; the scissor stays (it bounds
@@ -2286,12 +2301,12 @@ static void logMsaaForce(MsaaTwins& mt) {
   if (now < mt.nextLogNs) return;
   mt.nextLogNs = now + 1'000'000'000LL;
   const uint32_t skipped = mt.skipLoad + mt.skipInput + mt.skipDsb + mt.skipEds + mt.skipFmt + mt.skipSamples + mt.skipArea + mt.skipShape;
-  const uint32_t rejected = mt.rejEye + mt.rejCd + mt.rejSmp + mt.rejStore + mt.rejSmask + mt.rejRes + mt.rejDesc;  // (rejN counts every pass while forcing is off)
+  const uint32_t rejected = mt.rejEye + mt.rejScene + mt.rejCd + mt.rejSmp + mt.rejStore + mt.rejSmask + mt.rejRes + mt.rejDesc;  // (rejN counts every pass while forcing is off)
   if (!mt.passes && !skipped && !rejected && !mt.gameAuto && !mt.skipUnreadable) return;
-  logf("vk.msaa force=%d passes=%u up=%u skip{load=%u,input=%u,dsb=%u,eds=%u,fmt=%u,samples=%u,area=%u,shape=%u} twins=%zu game_auto=%u skip_unreadable=%u rej{n=%u,eye=%u,cd=%u,smp=%u,msstore=%u,smask=%u,res=%u,desc=%u} eye_why{no_depth=%u,no_eye_size=%u,size=%u,other=%u}",
+  logf("vk.msaa force=%d passes=%u up=%u skip{load=%u,input=%u,dsb=%u,eds=%u,fmt=%u,samples=%u,area=%u,shape=%u} twins=%zu game_auto=%u skip_unreadable=%u rej{n=%u,eye=%u,cd=%u,smp=%u,msstore=%u,smask=%u,res=%u,desc=%u} eye_why{no_depth=%u,no_eye_size=%u,size=%u,other=%u} scene{up=%u,rej=%u}",
        msaaForce(), mt.passes, mt.up, mt.skipLoad, mt.skipInput, mt.skipDsb, mt.skipEds, mt.skipFmt, mt.skipSamples, mt.skipArea,
        mt.skipShape, mt.twins.size(), mt.gameAuto, mt.skipUnreadable, mt.rejN, mt.rejEye, mt.rejCd, mt.rejSmp, mt.rejStore, mt.rejSmask, mt.rejRes, mt.rejDesc,
-       mt.rejEyeBy[0], mt.rejEyeBy[1], mt.rejEyeBy[2], mt.rejEyeBy[3]);
+       mt.rejEyeBy[0], mt.rejEyeBy[1], mt.rejEyeBy[2], mt.rejEyeBy[3], mt.sceneUp, mt.rejScene);
 }
 
 vpgpu::TextureId UiMaskState::acquire(uint32_t slot, uint32_t w, uint32_t h, uint16_t layers, uint8_t samples) {

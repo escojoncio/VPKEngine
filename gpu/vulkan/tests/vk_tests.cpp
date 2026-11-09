@@ -5589,6 +5589,71 @@ void testMsaaForce() {
       CHECK(!pass(f).desc.depth.autoMsaa && d->msaaTwins.passes == 3);
       c.gpu().destroy(sm);
     }
+    // 5b. The game's main 3D scene drawn into an intermediate target (not the eye's size, colour + depth of >= half the eye's pixels,
+    // many draws) is forced: its twins resolve into the game's 1x intermediate. Shadow maps, small targets, UI / post passes
+    // (few draws) and the game's own MSAA stay as they are.
+    {
+      MsaaTwins& mt = d->msaaTwins;
+      const uint32_t passes0 = mt.passes, scene0 = mt.sceneUp, eye0 = mt.rejEye, sceneRej0 = mt.rejScene, smp0 = mt.rejSmp;
+      auto inter = [&](uint32_t w, uint32_t h, uint8_t samples, bool withColor, size_t draws, vpgpu::Frame& f) {
+        OpBeginRendering b;
+        b.area = {{0, 0}, {w, h}};
+        b.depthWidth = w, b.depthHeight = h;
+        const vpgpu::TextureId cc = withColor ? mk(vpgpu::Format::RGBA8Unorm, samples, false, w, h) : vpgpu::TextureId{};
+        const vpgpu::TextureId zz = mk(vpgpu::Format::D32Float, samples, false, w, h);
+        b.desc.colors[0].texture = cc, b.desc.colors[0].load = vpgpu::LoadAction::Clear, b.desc.colors[0].store = vpgpu::StoreAction::Store;
+        b.desc.depth.texture = zz, b.desc.depth.load = vpgpu::LoadAction::Clear, b.desc.depth.store = vpgpu::StoreAction::DontCare;
+        Recorder rec;
+        rec.ops.emplace_back(b);
+        for (size_t i = 0; i < draws; ++i) rec.ops.emplace_back(geo);
+        rec.ops.emplace_back(OpEndPass{});
+        TranslateStats st;
+        translate(rec, f, st, nullptr, nullptr, nullptr, nullptr, d);
+        return std::pair<vpgpu::TextureId, vpgpu::TextureId>{cc, zz};
+      };
+      auto drop = [&](std::pair<vpgpu::TextureId, vpgpu::TextureId> t) {
+        if (t.first) c.gpu().destroy(t.first);
+        c.gpu().destroy(t.second);
+      };
+      {  // 80 % of the eye per axis: forced, resolving into the game's intermediate images
+        vpgpu::Frame f;
+        const auto t = inter(1536, 1459, 1, true, 40, f);
+        const vpgpu::RenderPass rp = pass(f);
+        const vpgpu::Attachment &c0 = rp.desc.colors[0], &z = rp.desc.depth;
+        CHECK(c0.autoMsaa && z.autoMsaa && c0.resolve == t.first && z.resolve == t.second && c0.texture != t.first);
+        CHECK(c0.store == vpgpu::StoreAction::Resolve && z.store == vpgpu::StoreAction::DontCare && !c0.keepSamples);
+        const vpgpu::TextureDesc* tc = c.gpu().resources().get(c0.texture);
+        CHECK(tc && tc->samples == 4 && tc->transient && tc->width == 1536 && tc->height == 1459);
+        CHECK(rp.draws.size() == 40 && rp.draws[0].pipeline == v.key());
+        CHECK(mt.passes == passes0 + 1 && mt.sceneUp == scene0 + 1 && mt.rejEye == eye0);
+        drop(t);
+      }
+      {  // a shadow map (2048x2048, depth only) and a small colour + depth target with many draws: not forced
+        vpgpu::Frame f;
+        const auto t = inter(2048, 2048, 1, false, 40, f);
+        CHECK(!pass(f).desc.depth.autoMsaa && pass(f).desc.depth.texture == t.second);
+        drop(t);
+        vpgpu::Frame f2;
+        const auto t2 = inter(512, 512, 1, true, 40, f2);
+        CHECK(!pass(f2).desc.colors[0].autoMsaa && !pass(f2).desc.depth.autoMsaa);
+        drop(t2);
+        CHECK(mt.passes == passes0 + 1 && mt.rejEye == eye0 + 2 && mt.rejScene == sceneRej0);
+      }
+      {  // big enough but a UI / post-process pass (a few draws): not forced, counted as "scene"
+        vpgpu::Frame f;
+        const auto t = inter(1536, 1459, 1, true, 3, f);
+        CHECK(!pass(f).desc.colors[0].autoMsaa && !pass(f).desc.depth.autoMsaa);
+        CHECK(mt.passes == passes0 + 1 && mt.rejScene == sceneRej0 + 1 && mt.rejEye == eye0 + 2);
+        drop(t);
+      }
+      {  // the game's own MSAA in the intermediate (4x here, forced 4): left alone
+        vpgpu::Frame f;
+        const auto t = inter(1536, 1459, 4, true, 40, f);
+        CHECK(!pass(f).desc.colors[0].autoMsaa && pass(f).desc.colors[0].texture == t.first);
+        CHECK(mt.passes == passes0 + 1 && mt.rejSmp == smp0 + 1 && mt.sceneUp == scene0 + 1);
+        drop(t);
+      }
+    }
     // 6. Twins go with their image (swept every 256th acquire).
     {
       MsaaTwins& mt = d->msaaTwins;

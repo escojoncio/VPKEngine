@@ -750,13 +750,16 @@ struct MsaaTwins {
   uint32_t gameAuto = 0;  // attachments of the game's own MSAA passes handled as autoMsaa (VPVK_GAME_MSAA_AUTO)
   uint32_t skipUnreadable = 0;  // ... and those left alone because their resolve target is not shader-readable (no sampled usage)
   uint32_t acquires = 0;  // calls of acquire (the sweep of dead guests runs every 256th)
-  // forceMsaa rejections ("vk.msaa force ... rej{...}"): rejN force off (<2 samples), rejEye not an eye scene pass, rejCd no colour 0
+  // forceMsaa rejections ("vk.msaa force ... rej{...}"): rejN force off (<2 samples), rejEye not an eye scene pass (nor an intermediate main scene: sceneUp), rejCd no colour 0
   // / depth, rejSmp the game's own samples, rejStore a game MSAA pass that keeps / loads its samples (not upgradable), rejSmask a pipeline of the pass with a partial sample mask / SampleId / SampleMask (not upgraded), rejRes the
   // game's own resolve, rejDesc a texture description unavailable.
   uint32_t rejN = 0, rejEye = 0, rejCd = 0, rejSmp = 0, rejStore = 0, rejSmask = 0, rejRes = 0, rejDesc = 0;
   // ... rejEye by why taaEyePass said no: no depth attachment, no eye size known (and not multiview), size differs from the
   // eye's, other (no jitter snapshot / subpass out of range).
   uint32_t rejEyeBy[4] = {0, 0, 0, 0};
+  // The game's main 3D scene drawn into an intermediate target (not the eye's size), forced all the same: sceneUp passes (included
+  // in passes); rejScene: such a candidate (colour + depth of >= half the eye's pixels) with too few draws / layers / mips.
+  uint32_t sceneUp = 0, rejScene = 0;
   // "vk.msaa up_detail" (first upgraded pass) and "vk.msaa rej_first" (first smp / msstore rejection): each once per device.
   bool upDetailDone = false, rejFirstDone[2] = {false, false};
   // Rejected passes logged ("vk.msaa rej"): up to 12 distinct (size, layers, reason) under 1 Mpx, and 12 at or above it.
