@@ -1800,6 +1800,74 @@ void aliasEvicted() {
     if (failures) f.dump();
 }
 
+// ---- A small target in the memory of a bigger one (the free half of a dynamic resolution target)
+
+constexpr uint64_t kSub = kRt + 0x8000;  // 64x64 RGBA8 in the second half of the 128x128 target at kRt
+
+// One frame: the big target drawn, the small one drawn, then each sampled by a draw into kOut.
+void bigAndSmallFrame(Fixture& f) {
+    f.renderer.draw(f.state());
+    vpps4::DrawState s = f.state();
+    s.color[0] = {kSub, 64, 64, 64, 10, 0, 0, 8};
+    f.renderer.draw(s);
+    vpps4::DrawState d = f.state();
+    d.color[0].address = kOut;
+    f.sample(kRt, 128, 128, 10, 0, 8);
+    f.renderer.draw(d);
+    f.sample(kSub, 64, 64, 10, 0, 8);
+    f.renderer.draw(d);
+}
+
+// Images of the renderer wrote each other's ranges: none is written back or filled from memory because of it (the small
+// one keeps its texels, the big one keeps the rest of its own). A CPU / raw writer of the range still refills as always, and
+// VPKENGINE_R1_ROUNDTRIP=1 brings the round trip back.
+void bigAndSmallTargets() {
+    {
+        ProbeOn probe;
+        Fixture f;
+        bigAndSmallFrame(f);
+        const auto& st = f.renderer.stats();
+        const uint64_t retiled = st.retiled, refilled = st.refilled, copies = st.copies;
+        for (int i = 0; i < 3; ++i) bigAndSmallFrame(f);
+        CHECK(st.retiled == retiled && st.refilled == refilled && st.copies == copies);
+        CHECK(st.retiled == 0);
+        const auto e = f.events();
+        CHECK(Fixture::count(e, "copy retile ") == 0);
+        CHECK(Fixture::count(e, "copy upload " + Fixture::hex(kRt)) == 0 && Fixture::count(e, "copy upload " + Fixture::hex(kSub)) == 0);
+        CHECK(f.renderer.tracker().ownerImage(kSub, 64 * 64 * 4) != 0);  // the images still hold the newest bytes
+        CHECK(qual(f, "refill_skipped") >= 1 && qual(f, "refill_skipped_bytes") >= 64 * 64 * 4);
+        bool line = false;  // (the REFILL line names the writer: the big target, its base and its scissor)
+        for (const std::string& l : f.log)
+            if (l.rfind("VPKENGINE_PROBE REFILL ", 0) == 0 && l.size() <= 2048 && l.find("skipped=1") != std::string::npos &&
+                l.find("addr=" + Fixture::hex(kRt) + " bytes=65536") != std::string::npos && l.find("scissor=0,0,128,128") != std::string::npos)
+                line = true;
+        CHECK(line);
+        if (failures) f.dump();
+    }
+    {  // a raw write over the small target: memory is the truth there
+        Fixture f;
+        bigAndSmallFrame(f);
+        f.rawWrite(kSub, 16);
+        const uint64_t refilled = f.renderer.stats().refilled;
+        vpps4::DrawState s = f.state();
+        s.color[0] = {kSub, 64, 64, 64, 10, 0, 0, 8};
+        f.renderer.draw(s);
+        CHECK(f.renderer.stats().refilled == refilled + 1);
+        if (failures) f.dump();
+    }
+    {  // turned off: the round trip as before
+        setenv("VPKENGINE_R1_ROUNDTRIP", "1", 1);
+        Fixture f;
+        unsetenv("VPKENGINE_R1_ROUNDTRIP");
+        bigAndSmallFrame(f);
+        const auto& st = f.renderer.stats();
+        const uint64_t retiled = st.retiled, refilled = st.refilled;
+        bigAndSmallFrame(f);
+        CHECK(st.retiled > retiled && st.refilled > refilled);
+        if (failures) f.dump();
+    }
+}
+
 // ---- Compare-sampled T#s (QUAL cmp_*, compare_mismatch)
 
 // The draw of ps_sample_compare (a depth texture in the lifted program) reading the T# `at` (dfmt/nfmt, w x h, tile 8) and writing kOut.
@@ -1902,6 +1970,7 @@ int main(int argc, char** argv) {
     else if (t == "alias_rejects") aliasRejects();
     else if (t == "alias_evicted") aliasEvicted();
     else if (t == "alias_off") aliasOff();
+    else if (t == "big_and_small_targets") bigAndSmallTargets();
     else if (t == "compare_mismatch") compareMismatch();
     else if (t == "compare_depth") compareDepth();
     else if (t == "alias_channel_order") aliasChannelOrder();

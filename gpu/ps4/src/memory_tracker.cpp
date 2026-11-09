@@ -92,6 +92,16 @@ bool MemoryTracker::writtenByOthers(uint64_t address, uint64_t size, WriterId se
     return false;
 }
 
+void MemoryTracker::writersSince(uint64_t address, uint64_t size, WriterId self, uint64_t since, std::vector<WriterId>& out) const {
+    out.clear();
+    if (floor_ > since) out.push_back(kNone);
+    const uint64_t end = endOf(address, std::max<uint64_t>(size, 1));
+    for (auto it = firstOverlap(address); it != spans_.end() && it->first < end; ++it)
+        if (it->second.version > since && it->second.writer != self &&
+            std::find(out.begin(), out.end(), it->second.writer) == out.end())
+            out.push_back(it->second.writer);
+}
+
 void MemoryTracker::staleOwners(uint64_t address, uint64_t size, std::vector<Owner>& out, WriterId except) const {
     out.clear();
     const uint64_t end = endOf(address, std::max<uint64_t>(size, 1));

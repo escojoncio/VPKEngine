@@ -57,6 +57,10 @@ public:
     // Has a writer other than `self` written part of the range after version `since`?
     bool writtenByOthers(uint64_t address, uint64_t size, WriterId self, uint64_t since) const;
 
+    // The writers other than `self` that wrote part of the range after version `since`, each once (kNone: a released
+    // image, or the history was forgotten since: who wrote is unknown).
+    void writersSince(uint64_t address, uint64_t size, WriterId self, uint64_t since, std::vector<WriterId>& out) const;
+
     struct Owner {
         WriterId writer = 0;
         uint64_t version = 0;       // newest version of that writer's stale intervals in the range

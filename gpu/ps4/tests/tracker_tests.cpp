@@ -50,6 +50,23 @@ void writtenByOthers() {
     CHECK(!t.writtenByOthers(0x10000, 0x4000, img, raw));
     t.markCpuWrite(0x13fff, 1);
     CHECK(t.writtenByOthers(0x10000, 0x4000, img, raw));
+    // Who wrote since: each writer once, never `self`.
+    const auto other = t.newImage();
+    const uint64_t o = t.markGpuWrite(0x12000, 0x1000, other);
+    t.markGpuWrite(0x12800, 0x10, other);
+    std::vector<MemoryTracker::WriterId> w;
+    t.writersSince(0x10000, 0x4000, img, 0, w);
+    CHECK(w.size() == 3 && w[0] == MemoryTracker::kGpuRaw && w[1] == other && w[2] == MemoryTracker::kCpu);
+    t.writersSince(0x10000, 0x4000, img, o, w);
+    CHECK(w.size() == 1 && w[0] == other);  // (only the second write of `other` is newer than o)
+    t.writersSince(0x10000, 0x1000, img, 0, w);
+    CHECK(w.empty());
+    t.release(other);
+    t.writersSince(0x12000, 0x1000, img, 0, w);
+    CHECK(w.size() == 1 && w[0] == MemoryTracker::kNone);
+    t.forgetHistory();
+    t.writersSince(0x10000, 0x4000, img, 0, w);
+    CHECK(!w.empty() && w[0] == MemoryTracker::kNone);
 }
 
 void ownership() {

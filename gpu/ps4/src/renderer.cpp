@@ -219,6 +219,7 @@ struct Renderer::Impl {
         uint64_t guestBufAdds = 0, guestBufRemoves = 0, guestBufRefused = 0;
         uint64_t uploadBytes = 0, alignedCopies = 0;
         uint64_t refills[3] = {}, refillBytes[3] = {}, refillFailed = 0;  // first fill, written by others (version), history forgotten
+        uint64_t refillSkipped = 0, refillSkippedBytes = 0, refillLines = 0;  // refills of a target left out because only images wrote its range (R1)
         uint64_t fillPath[5] = {}, fillPathBytes[5] = {};                  // none, GPU detile, CPU detile, linear upload, not filled
         uint64_t mirrorCalls = 0, mirrorCopies = 0, mirrorBytes = 0;
         uint64_t msDraws[4][4] = {};  // samples the title asked for (1,2,4,8) x samples the host draws with
@@ -1843,6 +1844,8 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         bool zAuthoritative = false, stencilAuthoritative = false;
         uint64_t lastDraw = ~uint64_t(0);  // colour targets: the frame (r.frame_) a pass last drew into it (~0: never; diagnostics)
         uint64_t draws = 0, drawsTaken = 0;  // draws into it, and those already handed to Renderer::takeTargetDraws
+        int32_t lastScissor[4] = {};         // x, y, width, height / viewport of the last colour pass that drew into it (probe REFILL only)
+        float lastViewport[4] = {};
     };
     struct Target : Surface {};
 
@@ -2768,6 +2771,53 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         if (tex) tex->seeded = true;  // (the source in memory is not what the texture holds: a check must not read that as a CPU write, nor read the memory at all)
         return true;
     }
+    // R1: the writers newer than the target (`tex` null) in its range are all images of the renderer, none of them at its own
+    // base: another target, or a texture, that shares part of its memory (the free half of a dynamic resolution target holds
+    // smaller targets). The hardware writes only what each of them covers, but the range is marked whole for each write, so
+    // refilling from memory would write back the other image (all of it) and detile it over this one, giving it stale
+    // texels of the other. The target keeps its own; CPU, DMA and raw writers, depth, and an image of the same base (the
+    // same picture seen another way) still refill. VPKENGINE_R1_ROUNDTRIP=1 turns this off. Fills `refillWriters`
+    // (the probe line reads them) when it can tell.
+    bool imageWritersSkip = !std::getenv("VPKENGINE_R1_ROUNDTRIP");
+    std::vector<MemoryTracker::WriterId> refillWriters;
+    bool onlyImagesWrote(const Surface& s, const Texture* tex, uint64_t since) {
+        refillWriters.clear();
+        if (tex && !vpgpu::probe::enabled()) return false;
+        tracker.writersSince(s.address, s.bytes, s.wid, since, refillWriters);
+        if (tex || !imageWritersSkip || s.isDepth || refillWriters.empty()) return false;
+        for (const MemoryTracker::WriterId w : refillWriters) {
+            const Surface* o = MemoryTracker::isImage(w) ? surfaceOf(w) : nullptr;
+            if (!o || o->isDepth || o->address == s.address) return false;
+        }
+        return true;
+    }
+    // A refill of a target / texture from memory, or the one left out (QUAL refill_*): the first 200 and then one in 600 leave
+    // a REFILL line with the writers that caused it (an image's base, size and the last scissor / viewport it drew with).
+    void probeRefill(const Surface& s, const Texture* tex, unsigned why, bool skipped) {
+        if (!vpgpu::probe::enabled()) return;
+        const uint64_t n = ++pstat.refillLines;
+        if (n > 200 && n % 600) return;
+        static const char* const reason[3] = {"first", "written_by_others", "forget_history"};
+        std::string line = "VPKENGINE_PROBE REFILL n=" + std::to_string(n) + " f=" + std::to_string(r.frame_) + " wid=" + std::to_string(s.wid) +
+                           (tex ? " kind=texture addr=" : " kind=target addr=") + hex(s.address) + " bytes=" + std::to_string(s.bytes) +
+                           " shape=" + std::to_string(s.width) + "x" + std::to_string(s.height) + "x" + std::to_string(slicesOf(s)) +
+                           " fmt=" + std::to_string(int(s.format)) + " pitch=" + std::to_string(s.pitch) + " tile=" + std::to_string(s.tile) +
+                           " reason=" + reason[why] + " skipped=" + (skipped ? "1" : "0") + " writers=" + std::to_string(refillWriters.size());
+        for (size_t i = 0; i < refillWriters.size() && i < 4; ++i) {
+            const MemoryTracker::WriterId w = refillWriters[i];
+            const Surface* o = MemoryTracker::isImage(w) ? surfaceOf(w) : nullptr;
+            if (!o) {
+                line += w == MemoryTracker::kCpu ? " [cpu]" : w == MemoryTracker::kDma ? " [dma]" : w == MemoryTracker::kGpuRaw ? " [gpu_raw]" : " [unknown]";
+                continue;
+            }
+            line += " [wid=" + std::to_string(w) + " addr=" + hex(o->address) + " bytes=" + std::to_string(o->bytes) + " scissor=" +
+                    std::to_string(o->lastScissor[0]) + "," + std::to_string(o->lastScissor[1]) + "," + std::to_string(o->lastScissor[2]) + "," +
+                    std::to_string(o->lastScissor[3]) + " viewport=" + std::to_string(int(o->lastViewport[0])) + "," +
+                    std::to_string(int(o->lastViewport[1])) + "," + std::to_string(int(o->lastViewport[2])) + "," +
+                    std::to_string(int(o->lastViewport[3])) + "]";
+        }
+        log(line);
+    }
     // Before a use: has another writer changed the image's range since it last held it?
     void refresh(Surface& s, Texture* tex) {
         if (!s.bytes) return;
@@ -2787,6 +2837,14 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
             return;
         }
         const unsigned why = first ? 0u : tracker.floor() > s.version ? 2u : 1u;
+        const bool skip = onlyImagesWrote(s, tex, first ? 0 : s.version);
+        probeRefill(s, tex, why, skip);
+        if (skip) {  // the target keeps its texels (see onlyImagesWrote)
+            s.version = tracker.current();
+            ++pstat.refillSkipped;
+            pstat.refillSkippedBytes += s.bytes;
+            return;
+        }
         ++pstat.refills[why];
         pstat.refillBytes[why] += s.bytes;
         if (tex && vpgpu::probe::enabled()) probeTile(s, computeLayout(tiledOf(s)), true);
@@ -5228,6 +5286,11 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         for (const Drawn& dc : drawnColors) {
             latestColor[dc.address] = dc.id;
             markWriteWid(dc.wid);
+            if (vpgpu::probe::enabled())
+                if (Surface* ds = surfaceOf(dc.wid)) {
+                    ds->lastScissor[0] = sl, ds->lastScissor[1] = stp, ds->lastScissor[2] = sr - sl, ds->lastScissor[3] = sb - stp;
+                    ds->lastViewport[0] = vr.x, ds->lastViewport[1] = vr.y, ds->lastViewport[2] = vr.width, ds->lastViewport[3] = vr.height;
+                }
         }
         if (probeOn && !drawnColors.empty()) noteProbe(drawnColors[0].address, geom, d.geom.maxVertOut, gsDrawIndices);
         if (depthWid) clearDone(clears ? desc.layerCount : z.sliceCount);  // (a clear of one plane or of part of the target is a rectangle inside the pass)
@@ -6291,6 +6354,7 @@ void Renderer::publishProbe(uint64_t pictures) {
         for (int k = 0; k < 3; ++k)
             C(f, std::string("refill_") + why[k], ps.refills[k]), C(f, std::string("refill_") + why[k] + "_bytes", ps.refillBytes[k]);
         C(f, "refill_unfilled", ps.refillFailed);
+        C(f, "refill_skipped", ps.refillSkipped), C(f, "refill_skipped_bytes", ps.refillSkippedBytes);
         static const char* const aliasWhy[Impl::kAliasReasons] = {"depth", "address", "shape", "layout", "mips", "samples", "format", "no_view", "range", "feedback"};
         C(f, "alias_hits", ps.aliasHits), C(f, "alias_hits_legacy", ps.aliasHitsLegacy);
         for (unsigned k = 0; k < Impl::kAliasReasons; ++k) C(f, std::string("alias_rejected_") + aliasWhy[k], ps.aliasRejected[k]);
