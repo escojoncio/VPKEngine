@@ -2812,7 +2812,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
             const char* e = std::getenv("VPKENGINE_TEXVERIFY");
             return e ? uint32_t(std::max(0, std::atoi(e))) : 0u;
         }();
-        uint64_t fills = 0, n = 0, dumped = 0;
+        uint64_t fills = 0, n = 0, dumped = 0, dumpedBytes = 0;  // (dumps stop at 256 MB in all)
         struct Item {
             uint32_t wid = 0;
             TextureId id;
@@ -2842,7 +2842,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
     void texVerifyCheck() {
         TexVerify::Item p = std::move(*tv.pending);
         tv.pending.reset();
-        r.device_.waitIdle(2'000'000'000ull);
+        const bool idle = r.device_.waitIdle(2'000'000'000ull);  // (not idle: the read may see a frame half done; no `differs`)
         const Surface* s = surfaceOf(p.wid);
         const std::string head = "VPKENGINE_PROBE TEXVERIFY n=" + std::to_string(++tv.n) + " f=" + std::to_string(r.frame_);
         if (!s || s->id != p.id) return log(head + " result=gone");
@@ -2874,7 +2874,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
             tv.last.reset();
         }
         const LevelLayout& l0 = p.lay.levels[0];
-        const uint32_t levels = std::min<uint32_t>(uint32_t(p.lay.levels.size()), 2), lastSlice = l0.slices ? l0.slices - 1 : 0;
+        const uint32_t levels = std::min<uint32_t>(uint32_t(p.lay.levels.size()), 2), lastSlice = std::min<uint32_t>(l0.slices ? l0.slices - 1 : 0, s->layers ? s->layers - 1 : 0);
         for (uint32_t level = 0; level < levels; ++level)
             for (uint32_t k = 0; k < (lastSlice ? 2u : 1u); ++k) {
                 const uint32_t slice = k ? lastSlice : 0;
@@ -2894,15 +2894,20 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
                     continue;
                 }
                 const bool memChanged = std::memcmp(now, p.snap.data(), p.lay.bytes) != 0;
-                const char* result = !dNow.differing ? "ok" : dFill.ok && !dFill.differing ? "fill_older_than_memory" : "differs";
+                const char* result = !dNow.differing ? "ok" : dFill.ok && !dFill.differing ? "fill_older_than_memory" : idle ? "differs" : "timeout";
                 line += " elements=" + std::to_string(dNow.elements) + " diff_mem=" + std::to_string(dNow.differing) + " diff_fill=" +
                         std::to_string(dFill.differing) + " first=" + std::to_string(dNow.firstX) + "," + std::to_string(dNow.firstY) +
                         " mem_changed=" + (memChanged ? "1" : "0") + " degraded=" + (p.lay.levels[level].degraded ? "1" : "0") + " result=" + result;
-                if (dNow.differing && tv.dumped < 8) {
+                if (dNow.differing && idle && tv.dumped < 8) {
                     const char* dir = std::getenv("SHADPS4_PROBE_DIR");
                     if (dir && *dir) {
                         const LevelLayout& ll = p.lay.levels[level];
                         const uint32_t bpe = p.lay.surface.bytesPerElement;
+                        if (tv.dumpedBytes + uint64_t(ll.width) * ll.height * bpe + out.size() > (256ull << 20)) {
+                            log(line + " dump=skipped_size_limit");
+                            continue;
+                        }
+                        tv.dumpedBytes += uint64_t(ll.width) * ll.height * bpe + out.size();
                         std::vector<uint8_t> ref(uint64_t(ll.width) * ll.height * bpe);
                         for (uint32_t y = 0; y < ll.height; ++y)
                             for (uint32_t x = 0; x < ll.width; ++x)

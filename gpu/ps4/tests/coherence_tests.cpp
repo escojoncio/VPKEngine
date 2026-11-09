@@ -1966,6 +1966,27 @@ void compareMismatch() {
         unsetenv("VPKENGINE_CMP_COLOR");
         if (failures) g.dump();
     }
+    // The same fill from memory for a 16-bit depth, a cube (6 slices) and a 2D array (4 slices): a depth texture, filled, no mismatch.
+    struct Case {
+        const char* name;
+        uint32_t dfmt, nfmt, type, lastSlice;
+    };
+    for (const Case c : {Case{"d16unorm", 2, 0, 9, 0}, Case{"cube", 4, 7, 11, 5}, Case{"array", 4, 7, 13, 3}}) {
+        Fixture g;
+        vpps4::DrawState d = g.state();
+        d.color[0].address = kOut;
+        d.ps.code = cmp.code;
+        d.ps.userSgprs = 12;
+        d.ps.userData.fill(0);
+        Fixture::tsharp(d.ps.userData.data(), kTex, 64, 64, c.dfmt, c.nfmt, 8);
+        d.ps.userData[3] = (d.ps.userData[3] & 0x0fffffffu) | (c.type << 28);
+        d.ps.userData[5] = c.lastSlice << 13;
+        g.renderer.draw(d);
+        CHECK(qual(g, "cmp_binds") == 1 && qual(g, "cmp_route_texture_from_memory") == 1);
+        CHECK(qual(g, "cmp_host_depth") == 1 && qual(g, "cmp_host_not_depth") == 0);
+        CHECK(qual(g, "compare_mismatch") == 0 && qual(g, "cmp_fill_not_filled") == 0);
+        if (failures) g.dump();
+    }
 }
 
 // The same T# over a depth target: the host resource is a depth texture, nothing is counted as a mismatch.
