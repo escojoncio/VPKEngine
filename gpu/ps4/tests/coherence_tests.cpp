@@ -2109,25 +2109,19 @@ void depthHintSample() {
     }
 }
 
-// A depth array drawn once at 64x64 and then only cleared through its HTILE (Renderer::depthCleared: nothing binds it again), sampled
-// with compare through a T# of another size (128x128, 4 slices): no depth target serves that T#, and memory holds what the first size
-// left there. The layers take the clear value (a copy each), memory is not read; a slice drawn into afterwards goes back to memory,
-// the others keep the value. VPKENGINE_HTILE_CLEAR_MEMORY=1: filled from memory (before).
+// A T# larger than every depth target drawn at its base (a 128x128 array of 4 over a depth array drawn 64x64, 2 slices), sampled
+// with compare: no depth target serves it and memory holds the bytes of the smaller layout (or of nothing). As the reference
+// renderer, which grows its image and does not read memory for it, the texture is not filled from memory: every layer takes the
+// depth clear value (a copy each), once, whatever is drawn into the smaller target afterwards. Without a depth target at the base,
+// the same holds for a surface whose HTILE was cleared (Renderer::depthCleared) until something else writes its memory.
+// VPKENGINE_HTILE_CLEAR_MEMORY=1: filled from memory (before).
 void depthClearedTexture() {
     ProbeOn probe;
     const Program cmp = load("ps_sample_compare");
     for (const bool old : {false, true}) {
         if (old) setenv("VPKENGINE_HTILE_CLEAR_MEMORY", "1", 1);
-        Fixture f;
-        auto drawSlice = [&](uint16_t k, bool clear = true) {
-            vpps4::DrawState d = f.depthState(true);
-            d.color[0] = {};
-            d.depth.width = d.depth.height = 64;
-            d.depth.sliceStart = k;
-            d.depth.depthClear = clear;
-            f.renderer.draw(d);
-        };
-        auto sampleArray = [&] {
+        const std::string label = "copy depth clear value " + Fixture::hex(kDepth);
+        auto sampleArray = [&](Fixture& f) {
             vpps4::DrawState d = f.state();
             d.ps.code = cmp.code;
             d.ps.userSgprs = 12;
@@ -2137,36 +2131,49 @@ void depthClearedTexture() {
             d.ps.userData[5] = 3u << 13;                                        // slices 0..3
             f.renderer.draw(d);
         };
-        const std::string label = "copy depth clear value " + Fixture::hex(kDepth);
-        drawSlice(0), drawSlice(1);
-        f.renderer.submit();
-        const uint64_t base = f.renderer.stats().refilled;
-        f.renderer.depthCleared(kDepth, 1.0f);
-        sampleArray();
-        CHECK(qual(f, "cmp_route_texture_from_memory") == 1);
-        CHECK(Fixture::count(f.events(), label) == (old ? 0u : 4u) && qual(f, "depth_clear_fills") == (old ? 0u : 4u));
-        const uint64_t refilled = f.renderer.stats().refilled;
-        CHECK(refilled - base == (old ? 1u : 0u));  // (all four layers hold the value: memory was not read)
-        f.renderer.depthCleared(kDepth, 1.0f);  // the same clear again, and another use: nothing more
-        sampleArray();
-        CHECK(Fixture::count(f.events(), label) == (old ? 0u : 4u));
-        if (!old) {
-            drawSlice(1);  // a clear of slice 1 leaves the value there: nothing changes
-            sampleArray();
-            CHECK(f.renderer.stats().refilled == refilled && Fixture::count(f.events(), label) == 4u);
-            drawSlice(1, false);  // slice 1 is drawn into: it is memory's again, the other three keep the value
-            sampleArray();
-            CHECK(Fixture::count(f.events(), label) == 7u);  // (and slice 1 is looked for in memory again)
-            f.renderer.depthCleared(kDepth, 1.0f);  // cleared again: all four
-            sampleArray();
-            CHECK(Fixture::count(f.events(), label) == 11u);
-            f.renderer.invalidate(kDepth, 4096);  // the CPU writes the surface: the clear no longer stands, memory is read
-            const uint64_t before = f.renderer.stats().refilled;
-            sampleArray();
-            CHECK(f.renderer.stats().refilled == before + 1 && Fixture::count(f.events(), label) == 11u);
+        {
+            Fixture f;
+            auto drawSlice = [&](uint16_t k, bool clear) {
+                vpps4::DrawState d = f.depthState(true);
+                d.color[0] = {};
+                d.depth.width = d.depth.height = 64;
+                d.depth.sliceStart = k;
+                d.depth.depthClear = clear;
+                f.renderer.draw(d);
+            };
+            drawSlice(0, true), drawSlice(1, true);
+            f.renderer.submit();
+            const uint64_t base = f.renderer.stats().refilled;
+            sampleArray(f);
+            CHECK(qual(f, "cmp_route_texture_from_memory") == 1);
+            CHECK(Fixture::count(f.events(), label) == (old ? 0u : 4u) && qual(f, "depth_clear_fills") == (old ? 0u : 4u));
+            CHECK(f.renderer.stats().refilled - base == (old ? 1u : 0u));  // (memory was not read)
+            drawSlice(1, false);  // the smaller target is drawn into: the texture is not its picture, nothing changes
+            sampleArray(f);
+            f.renderer.submit();
+            sampleArray(f);
+            CHECK(Fixture::count(f.events(), label) == (old ? 0u : 4u));
+            if (failures) f.dump();
+        }
+        {
+            Fixture f;  // no depth target at the base: the HTILE clear alone
+            f.renderer.depthCleared(kDepth, 1.0f);
+            const uint64_t base = f.renderer.stats().refilled;
+            sampleArray(f);
+            CHECK(Fixture::count(f.events(), label) == (old ? 0u : 4u));
+            CHECK(f.renderer.stats().refilled - base == (old ? 1u : 0u));
+            f.renderer.depthCleared(kDepth, 1.0f);
+            sampleArray(f);
+            CHECK(Fixture::count(f.events(), label) == (old ? 0u : 4u));
+            if (!old) {
+                f.renderer.invalidate(kDepth, 4096);  // the CPU writes the surface: the clear no longer stands, memory is read
+                const uint64_t before = f.renderer.stats().refilled;
+                sampleArray(f);
+                CHECK(f.renderer.stats().refilled == before + 1 && Fixture::count(f.events(), label) == 4u);
+            }
+            if (failures) f.dump();
         }
         if (old) unsetenv("VPKENGINE_HTILE_CLEAR_MEMORY");
-        if (failures) f.dump();
     }
 }
 

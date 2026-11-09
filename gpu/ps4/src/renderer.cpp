@@ -2975,7 +2975,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
             }
     }
 
-    // ---- FRAMECAP (probe on and SHADPS4_PROBE_DIR set; VPKENGINE_FRAMECAP: not set = one frame every 60 s from 20 s on,
+    // ---- FRAMECAP (probe on and SHADPS4_PROBE_DIR set; VPKENGINE_FRAMECAP: not set = one frame every 60 s from 80 s on,
     // "N" = every N s, "Nf" = every N frames, "0" = off). In a captured frame the render passes are listed in order
     // (VPKENGINE_PROBE FRAMECAP_PASS: attachments, draws, the images its draws sampled) and, once the frame ran (the submit
     // waits for the GPU: a debugging stall of the command processor, as TEXVERIFY), every image it drew into or sampled is
@@ -3062,9 +3062,9 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         const char* dir = std::getenv("SHADPS4_PROBE_DIR");
         if (!dir || !*dir) return;
         const Clock::time_point now = Clock::now();
-        if (!cap.started) cap.started = true, cap.next = now + 2 * cap.period, cap.nextFrame = r.frame_ + cap.periodFrames;
+        if (!cap.started) cap.started = true, cap.next = now + std::min<std::chrono::milliseconds>(2 * cap.period, std::chrono::milliseconds(80000)), cap.nextFrame = r.frame_ + cap.periodFrames;
         if (!cap.pattern && (cap.periodFrames ? r.frame_ + 1 < cap.nextFrame : now < cap.next)) return;
-        cap.files = (cap.n == 0 || cap.pattern) && cap.disk < capDisk;
+        cap.files = (cap.n < 2 || cap.pattern) && cap.disk < capDisk;
         cap.pattern = false;
         cap.armed = true;
         ++cap.n;
@@ -3374,13 +3374,36 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
     // (the record ends when something other than a depth image wrote the range since the clear: the memory was given another
     // use, or the CPU / a DMA filled the surface, and the texture is memory's again)
     std::vector<MemoryTracker::WriterId> clearedWriters;
+    // A texture larger (wider, taller or with more slices) than every depth target drawn at its base: the reference
+    // renderer grows the image it has there and never reads guest memory for it (shadPS4 ResolveDepthOverlap: the new image
+    // is not dirty), and neither does this: the bytes in memory are those of the smaller layout, or of nothing. The
+    // texture holds the depth clear value (the one its HTILE was last cleared to when known, else 1) in every layer.
+    std::unordered_map<uint64_t, ClearedDepth> impliedDepths;
+    const ClearedDepth* impliedClear(const Texture& t, bool wide) {
+        const auto dt = depthTargets.find(t.address);
+        if (dt == depthTargets.end() || dt->second.empty()) {  // (the targets were let go: what the texture held stands)
+            const auto kept = impliedDepths.find(t.address);
+            return kept != impliedDepths.end() && t.clearedStamp == kept->second.stamp ? &kept->second : nullptr;
+        }
+        for (const Target& g : dt->second) {
+            const bool wideTarget = g.format == vpgpu::Format::D32Float || g.format == vpgpu::Format::D32FloatS8;
+            if (wide != wideTarget && !(g.format == vpgpu::Format::D16Unorm && !wide)) return nullptr;  // (another texel size: not this surface)
+            if (g.width >= t.width && g.height >= t.height && g.layers >= t.layers) return nullptr;      // (it could hold the texture: memory, as before)
+        }
+        float value = 1.0f;
+        if (const auto r = clearedDepths.find(t.address); r != clearedDepths.end()) value = r->second.value;
+        ClearedDepth& c = impliedDepths[t.address];
+        if (!c.stamp || c.value != value) c.value = value, c.mask = ~uint32_t(0), c.stamp = ++clearedDepthStamp;
+        return &c;
+    }
     const ClearedDepth* clearedDepthOf(const Texture& t) {
-        if (clearedDepths.empty()) return nullptr;
+        if (!clearedDepthFills) return nullptr;
         const vpgpu::Format f = t.format;
         if (f != vpgpu::Format::D32Float && f != vpgpu::Format::R32Float && f != vpgpu::Format::D16Unorm && f != vpgpu::Format::R16Unorm)
             return nullptr;
         if (!t.id || t.mips != 1 || t.samples > 1 || t.softBc || t.storage || t.type == vpgpu::TextureType::Tex3D || !t.layers || t.layers > 32)
             return nullptr;
+        if (const ClearedDepth* c = impliedClear(t, f == vpgpu::Format::D32Float || f == vpgpu::Format::R32Float)) return c;
         const auto it = clearedDepths.find(t.address);
         if (it == clearedDepths.end()) return nullptr;
         if (tracker.writtenByOthers(t.address, t.bytes, t.wid, it->second.version)) {
