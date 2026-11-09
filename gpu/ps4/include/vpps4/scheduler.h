@@ -103,6 +103,7 @@ public:
         std::array<uint64_t, size_t(vpgpu::SubmitReason::Count)> submits{};
         uint64_t orderedWaits = 0, polledWaits = 0, idleWaits = 0;
         uint64_t dmaRecorded = 0;  // host DMAs recorded on the GPU timeline instead of waiting (dmaOnGpu)
+        uint64_t dmaCpuRead = 0, dmaLabel = 0, dmaIdle = 0;  // dmaOnGpu said no: range read by the CPU, label pending, nothing queued
         uint64_t frames = 0, cpuSyncs = 0, cpuSyncFree = 0, partialWaits = 0, fullWaits = 0, labels = 0, labelTimeouts = 0;
         double waitMs = 0;
     };

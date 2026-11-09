@@ -106,14 +106,16 @@ bool Scheduler::syncCpu(uint64_t a, uint64_t n, SubmitReason why, uint64_t b, ui
 }
 
 bool Scheduler::dmaOnGpu(uint64_t dst, uint64_t n, uint64_t src) {
-    if (!dmaGpu_ || renderer_.cpuReadSeen(dst, n)) return false;
+    if (!dmaGpu_) return false;
+    if (renderer_.cpuReadSeen(dst, n)) return ++counters_.dmaCpuRead, false;
     const uint64_t m = src ? n : 0;
     // (a label write into the range lands when its frame completes: it must come before the DMA's bytes, which only the
     // CPU waiting for it guarantees)
     if (device_.labelWaitTarget(dst, uint32_t(std::min<uint64_t>(n, ~0u))) ||
         (m && device_.labelWaitTarget(src, uint32_t(std::min<uint64_t>(m, ~0u)))))
-        return false;
-    return renderer_.waitTarget(dst, n, src, m) != 0;
+        return ++counters_.dmaLabel, false;
+    if (renderer_.waitTarget(dst, n, src, m) == 0) return ++counters_.dmaIdle, false;
+    return true;
 }
 
 void Scheduler::finish() {
@@ -211,6 +213,8 @@ std::string Scheduler::takeSummary() {
          std::to_string(counters_.partialWaits) + " full_waits=" + std::to_string(counters_.fullWaits) +
          " dma_gpu=" + std::to_string(counters_.dmaRecorded) + " labels=" + std::to_string(counters_.labels) + " ordered_waits=" + std::to_string(counters_.orderedWaits) +
          " polled_waits=" + std::to_string(counters_.polledWaits) + " idle_waits=" + std::to_string(counters_.idleWaits) + " wait_ms=" + std::to_string(int(counters_.waitMs));
+    s += " dma_cpu_read=" + std::to_string(counters_.dmaCpuRead) + " dma_label=" + std::to_string(counters_.dmaLabel) +
+         " dma_idle=" + std::to_string(counters_.dmaIdle);
     if (counters_.labelTimeouts) s += " label_timeouts=" + std::to_string(counters_.labelTimeouts);
     counters_ = {};
     return s;
