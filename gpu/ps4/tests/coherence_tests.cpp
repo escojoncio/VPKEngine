@@ -2080,6 +2080,43 @@ void depthHintSample() {
     }
 }
 
+// The same depth array drawn 64x64 first in 64x64 slices, then in 256x256 slices (the allocation changes, the drawn size
+// stays): the second is another image laid out at its allocation, so a T# of 256x256 reads its corner, not memory. With
+// VPKENGINE_DEPTH_REUSE_ANY_PITCH=1 the first image takes the second's draws and the T# goes through memory.
+void depthAllocPitchChange() {
+    ProbeOn probe;
+    const Program cmp = load("ps_sample_compare");
+    for (const bool old : {false, true}) {
+        if (old) setenv("VPKENGINE_DEPTH_REUSE_ANY_PITCH", "1", 1);
+        Fixture f;
+        auto drawSlices = [&](uint32_t alloc) {
+            for (uint16_t k = 0; k < 2; ++k) {
+                vpps4::DrawState d = f.depthState(true);
+                d.color[0] = {};
+                d.depth.width = d.depth.height = 64;
+                d.depth.pitch = d.depth.rows = alloc;
+                d.depth.sliceStart = k;
+                d.depth.depthClear = true;
+                f.renderer.draw(d);
+            }
+        };
+        drawSlices(64);
+        f.renderer.submit();
+        drawSlices(256);
+        vpps4::DrawState d = f.state();
+        d.ps.code = cmp.code;
+        d.ps.userSgprs = 12;
+        d.ps.userData.fill(0);
+        Fixture::tsharp(d.ps.userData.data(), kDepth, 256, 256, 4, 7, 8);
+        d.ps.userData[3] = (d.ps.userData[3] & 0x0fffffffu) | (13u << 28);  // 2D array
+        d.ps.userData[5] = 1u << 13;                                        // slices 0..1
+        f.renderer.draw(d);
+        CHECK(qual(f, "cmp_route_depth_target_found") == (old ? 0u : 1u) && qual(f, "cmp_route_texture_from_memory") == (old ? 1u : 0u));
+        if (old) unsetenv("VPKENGINE_DEPTH_REUSE_ANY_PITCH");
+        if (failures) f.dump();
+    }
+}
+
 // A depth target drawn at 64x64 in a 256x256 allocation, and a T# of `size` over it (dfmt / nfmt).
 void drawDepthAlloc(Fixture& f, bool stencil) {
     vpps4::DrawState d = zState(f, 3, stencil, 8);
@@ -2354,6 +2391,7 @@ int main(int argc, char** argv) {
     const std::string_view t = argc > 1 ? argv[1] : "";
     if (t == "rt_to_texture") rtToTexture();
     else if (t == "frame_capture") frameCapture();
+    else if (t == "depth_alloc_pitch_change") depthAllocPitchChange();
     else if (t == "sample_extent") sampleExtent();
     else if (t == "soft_bc_upload") softBcUpload();
     else if (t == "soft_bc_tiled") softBcTiled();

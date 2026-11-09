@@ -3829,20 +3829,25 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
     // in the same array (CB address is slice 0): the first with at least the layers asked for.
     // Another format of the same texel size at the same address is the same memory: it is drawn
     // through a view format (`viewAs`) of the existing target when the host has views.
+    bool depthReuseAnyPitch = std::getenv("VPKENGINE_DEPTH_REUSE_ANY_PITCH") != nullptr;
     Target* target(std::map<uint64_t, std::vector<Target>>& cache, uint64_t address, vpgpu::Format f, uint32_t w,
                    uint32_t h, uint8_t samples, uint16_t layers, bool depth, uint8_t tile, uint32_t pitch,
                    vpgpu::Format* viewAs = nullptr, uint32_t rows = 0) {
         layers = std::max<uint16_t>(layers, 1);
+        // A depth target is laid out in memory at its allocation (pitch / rows, see depthPitch): one drawn the same size in
+        // another allocation is another image (a shadow map drawn 512x512 in a 1024x1024 slice after one of 512x512 slices).
+        // VPKENGINE_DEPTH_REUSE_ANY_PITCH=1: the first one made, whatever the allocation.
+        const auto sameAlloc = [&](const Target& t) { return !depth || depthReuseAnyPitch || (t.pitch == pitch && t.rows == rows); };
         if (depth)  // (a depth surface written at another base than it is read from answers for both)
             if (auto a = depthAliases.find(address); a != depthAliases.end())
                 for (Target& t : cache[a->second])
-                    if (t.format == f && t.width == w && t.height == h && t.samples == samples && t.tile == tile && t.layers >= layers) {
+                    if (t.format == f && t.width == w && t.height == h && t.samples == samples && t.tile == tile && t.layers >= layers && sameAlloc(t)) {
                         t.lastUse = r.frame_;
                         return &t;
                     }
         auto& list = cache[address];
         for (Target& t : list)
-            if (t.format == f && t.width == w && t.height == h && t.samples == samples && t.tile == tile && t.layers >= layers) {
+            if (t.format == f && t.width == w && t.height == h && t.samples == samples && t.tile == tile && t.layers >= layers && sameAlloc(t)) {
                 t.lastUse = r.frame_;
                 return &t;
             }
