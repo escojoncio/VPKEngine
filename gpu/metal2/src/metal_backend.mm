@@ -1177,6 +1177,7 @@ struct MetalBackend::Impl {
   std::atomic<bool> lostClaimed{false};  // markLost's single winner (lostAtNs is set before lostFlag)
   std::atomic<int64_t> lostAtNs{0};
   bool strictLost = false;  // VPVK_DEVICE_LOST_STRICT=1: every non-memoryless failure is a loss
+  bool safeMath = false;    // VPVK_MSL_SAFE_MATH=1 (diagnostic A/B, e.g. a capture replay): MTLMathModeSafe instead of Fast
   void frameFinished(uint64_t frameIndex);
   void markLost(const std::string& why);
   // Classifies a failed command buffer: true when it means the device is lost.
@@ -1544,6 +1545,8 @@ void MetalBackend::Impl::init() {
   }
   if (const char* d = std::getenv("VP_DUMP_DIR")) dumpDir = d;
   if (const char* e = std::getenv("VPVK_DEVICE_LOST_STRICT")) strictLost = *e == '1';
+  if (const char* e = std::getenv("VPVK_MSL_SAFE_MATH")) safeMath = *e == '1';
+  if (safeMath) err("what=msl_safe_math (VPVK_MSL_SAFE_MATH=1: MTLMathModeSafe)");
   if (const char* e = std::getenv("VPVK_HARVEST_MIN_FREE_MB")) harvestMinFreeMB = std::strtoull(e, nullptr, 10);
   if (const char* e = std::getenv("VPVK_HANG_SPLIT")) hangSplit = uint32_t(std::strtoul(e, nullptr, 10));
   if (const char* e = std::getenv("VPVK_MAX_DRAWS_PER_CB")) maxDrawsPerCb = uint32_t(std::strtoul(e, nullptr, 10));
@@ -2168,6 +2171,7 @@ id<MTLFunction> MetalBackend::Impl::function(uint64_t shaderId, const FetchInput
   // Same for a fragment FragDepth write in a pass without a depth attachment.
   noFragDepth = noFragDepth && shader.source.find("VP_NO_FDEPTH") != std::string::npos;
   if (noFragDepth) key = (key ^ 0x4644E9ull) * 1099511628211ull;
+  if (safeMath) key = (key ^ 0x5AFE3A7Bull) * 1099511628211ull;  // another math mode compiles other code
   if (keyOut) *keyOut = key;
   if (prewarm) {
     // Speculative: nothing to do when a thread already has or is making it, and it must not compete with the compiles a
@@ -2227,7 +2231,7 @@ id<MTLFunction> MetalBackend::Impl::function(uint64_t shaderId, const FetchInput
   // that leaves a shader's MSL identical keeps its archived pipelines. If mathMode / languageVersion / a new macro
   // ever changes the compiled code for the same text, mix a constant into `key` above at that moment.
   MTLCompileOptions* o = [MTLCompileOptions new];
-  o.mathMode = MTLMathModeFast;  // the emitter marks precise math with precise:: explicitly
+  o.mathMode = safeMath ? MTLMathModeSafe : MTLMathModeFast;  // the emitter marks precise math with precise:: explicitly
   o.languageVersion = MTLLanguageVersion3_2;
   // [[invariant]] positions (SPIR-V Invariant) only stay invariant with this set; no effect on the rest,
   // so the key above needs no constant (only MSL text that declares [[position, invariant]] is affected).

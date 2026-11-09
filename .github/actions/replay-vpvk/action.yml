@@ -14,6 +14,9 @@ inputs:
   dump-at:
     description: draw or pass; has to be the granularity the reference was dumped with
     default: draw
+  vpvk-env:
+    description: VPVK_* variables (space separated KEY=VALUE) for vpreplay in the simulator (simctl SIMCTL_CHILD_ prefix)
+    default: ''
 runs:
   using: composite
   steps:
@@ -80,8 +83,10 @@ runs:
         REPLAY_DIR: ${{ inputs.dir }}
         MIN_PSNR: ${{ inputs.min-psnr }}
         DUMP_AT: ${{ inputs.dump-at }}
+        VPVK_ENV: ${{ inputs.vpvk-env }}
       run: |
         mkdir -p build/logs
+        for kv in $VPVK_ENV; do export "SIMCTL_CHILD_$kv"; done  # simctl spawn hands SIMCTL_CHILD_X to the child as X
         export VPREPLAY="$PWD/build/gpu-xrsim-replay/vulkan/vpreplay" VPVK_LIB="$PWD/build/gpu-xrsim-replay/vulkan/libVPVulkan.dylib" \
                VPIMGDIFF="$PWD/build/gpu-host/vulkan/vpimgdiff" RUNNER="$PWD/gpu/metal/ci/simctl-run.sh"
         LOG=build/logs/replay-compare.txt

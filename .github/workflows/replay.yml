@@ -30,6 +30,10 @@ on:
         type: choice
         options: [draw, pass]
         default: draw
+      vpvk_env:
+        description: 'VPVK_* variables for the Metal leg only, space separated (e.g. VPVK_MSL_SAFE_MATH=1)'
+        required: false
+        default: ''
 
 permissions:
   contents: read
@@ -103,3 +107,4 @@ jobs:
           dir: build/replay-ref
           min-psnr: ${{ inputs.min_psnr }}
           dump-at: ${{ inputs.dump_at }}
+          vpvk-env: ${{ inputs.vpvk_env }}

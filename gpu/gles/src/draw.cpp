@@ -936,9 +936,12 @@ static void logUniformErr(const Program* p, const vpglsl::Variable* u, GLint loc
 // element is applied) or a location past the program's range (`u` null, `reason`: ignored). One line per (program, uniform name,
 // called type, reason) (per location when the uniform is unknown), at most 512 keys, repeated with n= at the 100th, 1000th and
 // 10000th repetition. A sampler set through a call that is not glUniform1i (UE4 sends glUniform4* with the unit as first
-// component) takes that first component as its unit (`reason`: sampler_first_component).
+// component) takes that first component as its unit (`reason`: sampler_first_component). A base-type mismatch (`prev`/`next`
+// given) also logs the call's count, the array size, the first element it addresses and that element's words (hex) before and
+// after the call: float words in `prev` overwritten by small ints in `new` = the call overwrites float data a strict driver keeps.
 static void logUniformLenient(const Program* p, const vpglsl::Variable* u, int comps, bool isInt, bool isUint, const char* reason = nullptr,
-                              GLint location = -1) {
+                              GLint location = -1, const uint8_t* prev = nullptr, const void* next = nullptr, GLsizei count = 0,
+                              int element = 0) {
     static std::mutex mu;
     static std::map<std::string, uint32_t> seen;
     const std::string callType = callTypeName(comps, 0, isInt, isUint);
@@ -950,6 +953,21 @@ static void logUniformLenient(const Program* p, const vpglsl::Variable* u, int c
         return;
     std::string extra = reason ? std::string(" reason=") + reason : std::string();
     if (!u) extra += " loc=" + std::to_string(location);
+    if (u && prev && next) {
+        auto hex = [&](const void* src) {
+            std::string s;
+            for (int c = 0; c < comps; ++c) {
+                uint32_t w;
+                std::memcpy(&w, static_cast<const uint8_t*>(src) + 4 * c, 4);
+                char b[12];
+                std::snprintf(b, sizeof b, "%s%08x", c ? "," : "", w);
+                s += b;
+            }
+            return s;
+        };
+        extra += " count=" + std::to_string(count) + " arraySize=" + std::to_string(u->arraySize) + " element=" + std::to_string(element) +
+                 " prev=" + hex(prev) + " new=" + hex(next);
+    }
     if (n > 1) extra += " n=" + std::to_string(n);
     logf("gles.uniform_lenient prog=%u name=%s decl=%s call=%s%s", prog, name.c_str(), u ? uniformTypeName(u->glType).c_str() : "?", callType.c_str(),
          extra.c_str());
@@ -1040,7 +1058,9 @@ void Context::setUniform(GLint location, int comps, Kind kind, GLsizei count, co
     if (ucols != cols || ucomps != comps) return note("size_mismatch"), setError(gl::INVALID_OPERATION);
     if (ukind != Kind::Bool && ukind != kind) {
         if (cols || vpglsl::strictMode()) return note("base_type_mismatch"), setError(gl::INVALID_OPERATION);
-        logUniformLenient(p, &u, comps, isInt, isUint);
+        logUniformLenient(p, &u, comps, isInt, isUint, nullptr, -1,
+                          p->defaultBlock.data() + u.offset + uint32_t(loc.element) * (u.arrayStride ? u.arrayStride : 16), v, count,
+                          loc.element);
     }
     if (ukind == Kind::Bool && cols) return note("matrix_on_bool"), setError(gl::INVALID_OPERATION);
     const uint32_t stride = u.arrayStride ? u.arrayStride : 16;
@@ -1783,6 +1803,34 @@ static float readComponent(const VertexAttrib& a, const uint8_t* p, int c) {
     }
 }
 
+// Diagnostics: each distinct vertex attribute setup the draws read (GL type, size, normalized, integer call, the shader input's base
+// type, zero stride, divisor, CPU conversion) is logged the first time with the program, location, input name, stride and Vulkan
+// format (at most 64 setups), then again with n= at the 10000th and 1000000th draw that reads it. mismatch=1: the shader input is
+// float and the array integer (glVertexAttribIPointer) or the reverse (GL: undefined values).
+static void noteVertexAttrib(const Program& p, const vpglsl::Variable& av, uint32_t loc, const VertexAttrib& a, const VertexBinding& b,
+                             VkFormat f, bool cpu) {
+    const uint32_t t = av.glType;
+    const bool sInt = t == 0x1404 || (t >= 0x8B53 && t <= 0x8B55), sUint = t == 0x1405 || (t >= 0x8DC6 && t <= 0x8DC8);
+    const bool mismatch = a.integer != (sInt || sUint);
+    const uint64_t key = uint64_t(a.type) | uint64_t(a.size) << 16 | uint64_t(a.normalized) << 19 | uint64_t(a.integer) << 20 |
+                         uint64_t(sInt) << 21 | uint64_t(sUint) << 22 | uint64_t(b.stride == 0) << 23 | uint64_t(b.divisor > 0) << 24 |
+                         uint64_t(b.divisor > 1) << 25 | uint64_t(cpu) << 26;
+    static std::mutex mu;
+    static std::map<uint64_t, uint64_t> seen;
+    std::lock_guard<std::mutex> g(mu);
+    auto it = seen.find(key);
+    if (it == seen.end()) {
+        if (seen.size() >= 64) return;
+        it = seen.emplace(key, 0u).first;
+    }
+    const uint64_t n = ++it->second;
+    if (n != 1 && n != 10000 && n != 1000000) return;
+    logf("gles.vattr prog=%u loc=%u name=%s shader=%s type=0x%x size=%d norm=%d int=%d stride=%d divisor=%u vk=%d cpu=%d mismatch=%d%s",
+         unsigned(p.name), loc, av.name.c_str(), uniformTypeName(t).c_str(), unsigned(a.type), int(a.size), int(a.normalized),
+         int(a.integer), int(b.stride), unsigned(b.divisor), int(f), int(cpu), int(mismatch),
+         n > 1 ? (" n=" + std::to_string(n)).c_str() : "");
+}
+
 Program* Context::uniformProgram() {
     if (program) return prog(program);
     auto it = programPipelines.find(programPipeline);
@@ -1997,6 +2045,7 @@ bool Context::prepareDraw(GLenum mode, VkPrimitiveTopology& topo, uint32_t verte
                     return false;
                 }
                 const bool convert = needsCpuConversion(a, f) || (perInstance && divisor > 1);
+                noteVertexAttrib(*p, av, loc, a, vbind, f, convert);
                 // A buffer range that does not start on a 4-byte boundary (glVertexAttribPointer accepts any byte offset) is not bound in place.
                 if (convert || !vb || (where & 3)) {
                     // Client arrays, unaligned buffer offsets and formats needing conversion: copied into the stream, tightly.

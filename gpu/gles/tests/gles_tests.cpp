@@ -1397,7 +1397,11 @@ void uniformRaw(bool strict) {
     CHECK(uint32_t(back[0]) == 0xdeadbeefu);
     expectLines.push_back(strict ? "gles.uniform_err name=vc0_h[0] decl_type=vec4 call_type=ivec4 count=5 arraySize=2 loc=" + std::to_string(lh) +
                                        " reason=base_type_mismatch"
-                                 : "gles.uniform_lenient prog=" + std::to_string(q) + " name=vc0_h[0] decl=vec4 call=ivec4");
+                                 : "gles.uniform_lenient prog=" + std::to_string(q) + " name=vc0_h[0] decl=vec4 call=ivec4 count=5 arraySize=2 "
+                                   "element=0 prev=00000000,00000000,00000000,00000000 new=3f800000,ffffffff,7fc00001,40490fdb");
+    // What the uint call wrote over: the words the int call left in element 0.
+    expectLines.push_back("name=vc0_h[0] decl=vec4 call=uvec4 count=1 arraySize=2 element=0 prev=3f800000,ffffffff,7fc00001,40490fdb "
+                              "new=deadbeef,00000001,00000002,00000003");
     e.down();
 }
 void testUniformRaw() { uniformRaw(false); }
@@ -2941,7 +2945,9 @@ void testEs31() {
     glVertexAttribBinding(col, 2);
     glEnableVertexAttribArray(pos);
     glEnableVertexAttribArray(uv);
-    CHECK(err() == gl::NO_ERROR);
+    glEnableVertexAttribArray(col);  // integer array on a float input: gles.vattr mismatch=1 (vk 41 = R8G8B8A8_UINT)
+    expectLines.push_back("gles.vattr prog=" + std::to_string(p) + " loc=" + std::to_string(col) +
+                          " name=a_col shader=vec4 type=0x1401 size=4 norm=0 int=1 stride=24 divisor=0 vk=41 cpu=0 mismatch=1");    CHECK(err() == gl::NO_ERROR);
     GLint q = -1;
     glGetVertexAttribiv(uv, gl::VERTEX_ATTRIB_BINDING, &q);
     CHECK(q == 2);
