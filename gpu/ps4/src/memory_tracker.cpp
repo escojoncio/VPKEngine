@@ -84,6 +84,13 @@ MemoryTracker::WriterId MemoryTracker::ownerImage(uint64_t address, uint64_t siz
     return best;
 }
 
+bool MemoryTracker::gpuWritten(uint64_t address, uint64_t size) const {
+    const uint64_t end = endOf(address, std::max<uint64_t>(size, 1));
+    for (auto it = firstOverlap(address); it != spans_.end() && it->first < end; ++it)
+        if (it->second.writer == kGpuRaw || it->second.writer == kDma || isImage(it->second.writer)) return true;
+    return false;
+}
+
 bool MemoryTracker::writtenByOthers(uint64_t address, uint64_t size, WriterId self, uint64_t since) const {
     if (floor_ > since) return true;
     const uint64_t end = endOf(address, std::max<uint64_t>(size, 1));

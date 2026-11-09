@@ -54,6 +54,8 @@ public:
     // written one); 0 if memory is current there.
     WriterId ownerImage(uint64_t address, uint64_t size) const;
 
+    // Is the last writer of some byte of the range the GPU (kGpuRaw, kDma or an image)? Recorded writes count before they run.
+    bool gpuWritten(uint64_t address, uint64_t size) const;
     // Has a writer other than `self` written part of the range after version `since`?
     bool writtenByOthers(uint64_t address, uint64_t size, WriterId self, uint64_t since) const;
 

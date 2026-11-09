@@ -218,7 +218,7 @@ struct Renderer::Impl {
     struct ProbeStats {
         uint64_t aliasHits = 0, aliasHitsLegacy = 0, aliasRejected[kAliasReasons] = {};  // T#s read through the image that wrote their memory / those that could not
         uint64_t guestBufAdds = 0, guestBufRemoves = 0, guestBufRefused = 0;
-        uint64_t uploadBytes = 0, alignedCopies = 0;
+        uint64_t uploadBytes = 0, alignedCopies = 0, bufferSnapshots = 0;
         uint64_t refills[3] = {}, refillBytes[3] = {}, refillFailed = 0;  // first fill, written by others (version), history forgotten
         uint64_t dmaStaleReads = 0, cpuReadAll = 0;  // CPU reads of a range a recorded fill / copy was still to write (probe); cpuReadRanges gave up
         uint64_t refillSkipped = 0, refillSkippedBytes = 0, refillLines = 0;  // refills of a target left out because only images wrote its range (R1)
@@ -909,6 +909,21 @@ struct Renderer::Impl {
     void forgetAlignedCopies() {
         alignedCopies.clear();
         alignedGeneration = ringGeneration;
+    }
+    // A small read-only buffer the renderer already reads on the CPU: its DMAs run on the CPU, in command order
+    // (Scheduler::dmaOnGpu), so a draw bound to the guest bytes in place makes the next DMA there wait for that draw (WAR:
+    // submit + wait for the frame). Copied to the upload ring when it is recorded instead (as the CPU readers see it), when
+    // memory holds its newest bytes: no GPU write (recorded or not yet run: the tracker's last writer), no label write
+    // pending, no tracker history forgotten while work recorded before was still running. VPKENGINE_BUFFER_LIVE=1: in place.
+    static constexpr uint64_t kSnapshotBytes = 4096;
+    bool bufferLive = std::getenv("VPKENGINE_BUFFER_LIVE") != nullptr;
+    uint64_t snapForgets = 0, snapAfter = 0;
+    bool snapshotSafe(uint64_t address, uint64_t size) {
+        if (bufferLive || !size || size > kSnapshotBytes || address % 16 || !cpuReadSeen(address, size)) return false;
+        if (tracker.forgetHistoryCalls() != snapForgets)
+            snapForgets = tracker.forgetHistoryCalls(), snapAfter = r.device_.submittedFrames() + 1;
+        if (r.device_.completedFrames() < snapAfter) return false;
+        return !tracker.gpuWritten(address, size) && !r.device_.labelPending(address, uint32_t(size));
     }
     std::optional<uint64_t> alignedConstantCopy(uint64_t address, uint64_t bytes, const void* host) {
         if (alignedGeneration != ringGeneration || alignedCopies.size() >= kAlignedCopies) forgetAlignedCopies();
@@ -4776,6 +4791,19 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
                         size = d.bytes();
                         stride = d.stride;
                     }
+                    if (!pointer && !a.write && snapshotSafe(address, size)) {
+                        GuestRegion g;
+                        if (region(address, size, g)) {
+                            noteCpuRead(address, size, "buffer_snapshot");
+                            const Phase cbPhase(r.cpu_.bindCbMs);
+                            if (const auto at = alignedConstantCopy(address, size, static_cast<const uint8_t*>(g.host) + (address - g.base))) {
+                                ++pstat.bufferSnapshots;
+                                if (resolved_) resolved_->buffers.push_back({uint8_t(stage), address, size, stride, false, pointer});
+                                a.range = ResourceRange::bytes(rings[ringIndex].id, *at, size);
+                                break;
+                            }
+                        }
+                    }
                     BufferId id;
                     uint64_t offset = 0, available = 0;
                     bool found = false;
@@ -6630,6 +6658,7 @@ void Renderer::publishProbe(uint64_t pictures) {
         C(f, "views_made", s.viewsMade), C(f, "syncs", s.syncs), C(f, "seeded", s.seeded);
         C(f, "pictures", pictures);
         C(f, "aligned_copies", ps.alignedCopies), C(f, "aligned_copy_bytes", im.alignedCopyBytes);
+        C(f, "buffer_snapshots", ps.bufferSnapshots);
         C(f, "life_stores_dropped", im.lifeTotal.storesDropped);
         C(f, "life_samples_dropped", im.lifeTotal.samplesDropped), C(f, "life_resolves_dropped", im.lifeTotal.resolvesDropped);
         C(f, "life_resolves_deferred", im.lifeTotal.resolvesDeferred), C(f, "life_misses", im.lifeTotal.misses);

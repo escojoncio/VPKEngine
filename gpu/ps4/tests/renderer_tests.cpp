@@ -3073,6 +3073,80 @@ long long probeP7(const Fixture& f, const std::string& key) {
 // not more); a bare address gets the usual 64 KiB window. Within a submit a buffer that was not written since is bound again
 // from its copy, however many others were copied in between; one written since (told to the tracker, or only seen in its
 // bytes) is copied afresh, and a new submit starts the copies over.
+// A small read-only buffer the renderer already reads on the CPU (its DMAs run on the CPU) is copied to the upload ring when the
+// draw is recorded: the draw does not hold the guest bytes, so a CPU DMA there right after neither submits nor waits (it waited
+// for the draw before: WAR). Bound in place when the GPU wrote it last, when a label write into it is pending, or with
+// VPKENGINE_BUFFER_LIVE=1.
+void bufferSnapshot() {
+    const Program vt = load("vs_transform");
+    const auto drawWith = [&](Sched& x, uint64_t cb, uint32_t bytes) {
+        uint32_t* vtable = x.f.at(kBase + 0x100);
+        const uint64_t vb = kBase + 0x1000;
+        vtable[0] = uint32_t(vb);
+        vtable[1] = uint32_t(vb >> 32) | (16u << 16);
+        vtable[2] = 64;
+        vtable[3] = (7u << 12) | (14u << 15);
+        vpps4::DrawState d = x.f.state();
+        d.vs.code = vt.code;
+        d.vs.fetch = vt.fetch;
+        d.vs.userSgprs = vt.userSgprs;
+        d.vs.vgprCompCnt = 0;
+        d.vs.userData = {};
+        d.vs.userData[0] = uint32_t(kBase + 0x100);
+        d.vs.userData[4] = uint32_t(cb);
+        d.vs.userData[5] = uint32_t(cb >> 32);
+        d.vs.userData[6] = bytes;
+        d.vs.userData[7] = (7u << 12) | (14u << 15);
+        x.f.renderer.draw(d);
+        x.s.noteWork();
+    };
+    // Read on the CPU once (an unaligned constant buffer over it is copied), then the GPU goes idle.
+    const auto readOnCpu = [&](Sched& x, uint64_t at) {
+        drawWith(x, at + 8, 400);
+        x.s.finish();
+        CHECK(x.f.renderer.cpuReadSeen(at, 400) && !x.f.renderer.gpuMayAccess(at, 400));
+    };
+    const uint64_t cb = kBase + 0x30000;
+    {
+        HostDma h;
+        Sched& x = h.x;
+        readOnCpu(x, cb);
+        const size_t submits = x.submits();
+        drawWith(x, cb, 400);
+        CHECK(!x.f.renderer.gpuMayAccess(cb, 400));
+        CHECK(h.copy(cb, cb + 0x1a0, 400));  // the next record over the current one, as the title does: on the CPU, free
+        CHECK(x.submits() == submits && x.f.backend.waits.size() == 1 && x.s.counters().cpuSyncs == 0);
+        drawWith(x, cb, 400);  // the next draw copies the new bytes
+        CHECK(!x.f.renderer.gpuMayAccess(cb, 400));
+        // The GPU wrote it last: in place.
+        readOnCpu(x, cb + 0x1000);
+        x.f.renderer.noteGpuWrite(cb + 0x1000, 4);
+        drawWith(x, cb + 0x1000, 400);
+        CHECK(x.f.renderer.gpuMayAccess(cb + 0x1000, 400));
+        // A label write into it pending: in place.
+        readOnCpu(x, cb + 0x2000);
+        x.work(kBase + 0x5000);  // (the label waits for this work)
+        x.s.scheduleLabel(cb + 0x2010, 4, false, [] {});
+        CHECK(x.f.renderer.labelPending(cb + 0x2010, 4));
+        drawWith(x, cb + 0x2000, 400);
+        CHECK(x.f.renderer.gpuMayAccess(cb + 0x2000, 400));
+        // Never read on the CPU: in place (its DMAs go on the GPU timeline).
+        drawWith(x, cb + 0x3000, 400);
+        CHECK(x.f.renderer.gpuMayAccess(cb + 0x3000, 400));
+    }
+    {
+        setenv("VPKENGINE_BUFFER_LIVE", "1", 1);
+        HostDma h;
+        unsetenv("VPKENGINE_BUFFER_LIVE");
+        Sched& x = h.x;
+        readOnCpu(x, cb);
+        drawWith(x, cb, 400);
+        CHECK(x.f.renderer.gpuMayAccess(cb, 400));
+        CHECK(h.copy(cb, cb + 0x1a0, 400));
+        CHECK(x.s.counters().submits[size_t(vpgpu::SubmitReason::Dma)] == 1);
+    }
+}
+
 void alignedConstantCopies() {
     const Program vt = load("vs_transform");
     // vs_transform: vertices through the V# table at s[0:1] (+0x100), constants from the V# in s[4:7].
@@ -3290,6 +3364,7 @@ int main(int argc, char** argv) {
     else if (t == "unknown_extent_busy") unknownExtentBusy();
     else if (t == "dma_then_label") dmaThenLabel();
     else if (t == "label_then_dma") labelThenDma();
+    else if (t == "buffer_snapshot") bufferSnapshot();
     else if (t == "label_keep_opt_out") labelKeepOptOut();
     else if (t == "dma_on_cpu_opt_out") dmaOnCpuOptOut();
     else if (t == "index_scan_memo") indexScanMemo();
