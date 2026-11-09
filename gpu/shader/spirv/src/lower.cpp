@@ -5439,6 +5439,80 @@ void Lowering::run() {
         }
 }
 
+// SpirvLowerOptions::ampClip: may a ClipDistance output of this amplified vertex module differ between the views? Metal
+// computes it once for both, so it must not depend on [[amplification_id]]: through values, variables, memory (any write
+// taints its whole target) or control flow (a store under a condition that does). Conservative: a call, a jump (break,
+// continue, return) under such a condition, cross-lane ops and built-in inputs other than the vertex / instance / draw ones
+// count as depending on the view.
+bool clipDependsOnView(const vpir::Module& m) {
+    using vpir::Op;
+    const vpir::Function* f = m.entry();
+    if (!f || m.functions.size() != 1) return true;
+    std::vector<char> val(f->valueTypes.size()), var(f->vars.size());
+    std::set<uint32_t> mem;  // memory targets / resources written with a view-dependent value
+    bool clip = false, giveUp = false, grew = false;
+    auto tainted = [&](vpir::ValueId v) { return v < val.size() && val[v]; };
+    auto inputTainted = [&](uint32_t i) {
+        if (i >= m.inputs.size()) return true;
+        switch (m.inputs[i].builtin) {
+            case vpir::Builtin::None: case vpir::Builtin::VertexId: case vpir::Builtin::InstanceId:
+            case vpir::Builtin::BaseVertex: case vpir::Builtin::BaseInstance: case vpir::Builtin::DrawIndex: return false;
+            default: return true;
+        }
+    };
+    auto taintMem = [&](uint32_t t) { grew = mem.insert(t).second || grew; };
+    std::function<void(const vpir::Block&, bool)> walk = [&](const vpir::Block& block, bool ctl) {
+        for (const vpir::Node& n : block) {
+            if (giveUp) return;
+            switch (n.kind) {
+                case vpir::NodeKind::If: {
+                    const bool c = ctl || tainted(n.value);
+                    walk(n.body, c);
+                    walk(n.elseBody, c);
+                    continue;
+                }
+                case vpir::NodeKind::Loop: walk(n.body, ctl); continue;
+                case vpir::NodeKind::Inst: break;
+                default: giveUp = giveUp || ctl; continue;  // a jump taken by one view only
+            }
+            const vpir::Inst& in = n.inst;
+            bool t = false;
+            for (vpir::ValueId a : in.args) t = t || tainted(a);
+            const char* sig = vpir::opInfo(in.op).signature;
+            const bool target = sig[0] == 'm' || sig[0] == 'r';  // memory target / resource in `sym`
+            const bool writes = in.op == Op::Store || in.op == Op::ImageStore ||
+                                (in.op >= Op::AtomicAdd && in.op <= Op::ImageAtomicCompareExchange);
+            switch (in.op) {
+                case Op::Call: giveUp = true; return;
+                case Op::LoadInput: case Op::InterpCentroid: case Op::InterpSample: case Op::InterpOffset:
+                    t = t || inputTainted(in.sym);
+                    break;
+                case Op::LoadVar: t = in.sym < var.size() && var[in.sym]; break;
+                case Op::StoreVar:
+                    if (in.sym < var.size() && !var[in.sym] && (t || ctl)) var[in.sym] = 1, grew = true;
+                    break;
+                case Op::StoreOutput:
+                    if (in.sym < m.outputs.size() && m.outputs[in.sym].builtin == vpir::Builtin::ClipDistance && (t || ctl))
+                        clip = true;
+                    break;
+                case Op::SubgroupBallot: case Op::SubgroupBroadcast: case Op::SubgroupShuffle: case Op::SubgroupReadFirst:
+                case Op::SubgroupAny: case Op::SubgroupAll: case Op::SubgroupArith: case Op::QuadShuffle: case Op::QuadAny:
+                    t = true;  // other lanes may be the other view
+                    break;
+                default: break;
+            }
+            if (writes && (t || ctl)) taintMem(in.sym);
+            if (target) t = t || mem.count(in.sym);
+            if (in.result < val.size() && t) val[in.result] = 1;
+        }
+    };
+    do {
+        grew = false;
+        walk(f->body, false);
+    } while (grew && !giveUp);
+    return giveUp || clip;
+}
+
 }  // namespace
 
 bool lower(const SpirvModule& m, const SpirvLowerOptions& options, vpir::Module& out, SpirvInterface& iface,
@@ -5449,7 +5523,8 @@ bool lower(const SpirvModule& m, const SpirvLowerOptions& options, vpir::Module&
     auto l = std::make_unique<Lowering>(m, options, out, iface);
     try {
         l->lowerAll();
-        if (l->needsInstancing()) {  // amplified but writes ClipDistance: again with multiview by instancing
+        // Amplified but writes ClipDistance: again with multiview by instancing (with ampClip only if it depends on the view).
+        if (l->needsInstancing() && (!options.ampClip || clipDependsOnView(out))) {
             l.reset();
             iface = SpirvInterface{};
             out = vpir::Module{};

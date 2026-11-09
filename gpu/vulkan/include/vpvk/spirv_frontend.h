@@ -133,6 +133,10 @@ struct SpirvLowerOptions {
   bool nativeFetch = false;
   bool unpackFetch = false;
   bool killExit = false;
+  // With amplify: a vertex shader that writes ClipDistance stays amplified when no clip distance depends on the view
+  // (Metal computes built-in outputs other than the position once for both views); else it keeps instancing as without it.
+  // false = the MSL is byte-identical to before.
+  bool ampClip = false;
   // Vertex: the Position output is [[position, invariant]] even when the shader does not decorate it (VPVulkan's
   // VPVK_INVARIANT_POS, on by default; the mode bit is "off"): a depth prepass and the main pass then compute the same z
   // for the same vertex, whatever the compiler does to each shader. false = the MSL is byte-identical to before.

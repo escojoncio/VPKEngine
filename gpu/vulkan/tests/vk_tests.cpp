@@ -2384,6 +2384,12 @@ void testTranslatorModes() {
   setenv("VPSPV_KILL_EXIT", "1", 1);
   CHECK(refreshTranslatorMode() == 5);
   unsetenv("VPSPV_KILL_EXIT");
+  CHECK(!o.ampClip);  // VPVK_AMPLIFY_CLIP (bit 5): off unless set
+  setenv("VPVK_AMPLIFY_CLIP", "1", 1);
+  CHECK(refreshTranslatorMode() == 37 && translatorId() == (kTranslatorVersion | 37u << 16));
+  applyTranslatorMode(o);
+  CHECK(o.ampClip);
+  unsetenv("VPVK_AMPLIFY_CLIP");
   setenv("VPVK_AMPLIFY", "1", 1);
   setenv("VPVK_FETCH_NATIVE", "1", 1);
 

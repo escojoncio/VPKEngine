@@ -269,10 +269,10 @@ uint32_t refreshTranslatorMode() {
     invOff = v == "0" || v == "off" || v == "false";
   }
   const uint32_t m = (fetch & 1) | (flag("VPVK_AMPLIFY") ? 2u : 0u) | ((fetch & 2) << 1) | (kill && *kill == '0' ? 8u : 0u) |
-                     (invOff ? 16u : 0u);
+                     (invOff ? 16u : 0u) | (flag("VPVK_AMPLIFY_CLIP") ? 32u : 0u);
   if (gTranslatorMode.exchange(m) != m) {
-    logf("vk.translator mode=%u native_fetch=%u amplify=%u unpack_fetch=%u kill_exit=%u id=%u", m, m & 1, (m >> 1) & 1,
-         (m >> 2) & 1, (~m >> 3) & 1, kTranslatorVersion | m << 16);
+    logf("vk.translator mode=%u native_fetch=%u amplify=%u unpack_fetch=%u kill_exit=%u amplify_clip=%u id=%u", m, m & 1,
+         (m >> 1) & 1, (m >> 2) & 1, (~m >> 3) & 1, (m >> 5) & 1, kTranslatorVersion | m << 16);
     // math=fast is metal_backend.mm's MTLMathModeFast. Whether a library really compiled with preserveInvariance
     // (and how many fell back without it) is in the gpu.shader.lib lines: invariant= / invariant_retries=.
     logf("gpu.shaderfx invariant_pos=%u math=fast", (~m >> 4) & 1);
@@ -294,6 +294,7 @@ void applyTranslatorMode(spirv::SpirvLowerOptions& o) {
   o.unpackFetch = (m & 4) != 0;
   o.killExit = (m & 8) == 0;
   o.invariantPos = (m & 16) == 0;
+  o.ampClip = (m & 32) != 0;
 }
 
 uint8_t translatorDiff(uint64_t stored, uint64_t current) {

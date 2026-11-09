@@ -96,6 +96,8 @@ inline constexpr uint32_t kVulkanLoopGuard = 65536;
 //  bit 4 invariantPosOff  VPVK_INVARIANT_POS=0 / off / false (default on; any other value leaves it on): without it only the
 //                     positions the shader decorates Invariant (GLSL `invariant gl_Position`, #pragma STDGL invariant(all))
 //                     are [[position, invariant]].
+//  bit 5 ampClip      VPVK_AMPLIFY_CLIP (default 0), with amplify: a vertex shader writing ClipDistance stays amplified when
+//                     no clip distance depends on the view (SpirvLowerOptions::ampClip); else it keeps instancing.
 // They change the MSL of the stored inputs without being part of them (SpirvLowerOptions::amplify / nativeFetch are not in
 // the input's hash or encoding), so they travel with the translator id instead.
 uint32_t translatorMode();
