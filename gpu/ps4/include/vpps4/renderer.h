@@ -194,6 +194,11 @@ public:
     // value, copy guest memory to guest memory. False (logged) if a range is not guest memory.
     bool fill(uint64_t address, uint64_t bytes, uint32_t value);
     bool copy(uint64_t dst, uint64_t src, uint64_t bytes);
+    // The HTILE of the depth buffer whose Z plane is at `zAddress` was cleared (a fill or a copy of cleared entries, a
+    // kernel that wrote it): every slice holds `value` until a draw binds it. The hardware reads that value through a
+    // texture of the surface (HTILE the texture unit understands); guest memory keeps whatever was there. A texture
+    // filled from memory at that base takes the value for the slices not drawn into since.
+    void depthCleared(uint64_t zAddress, float value);
     // The CPU wrote guest memory: images filled from there are filled again on their next use.
     void invalidate(uint64_t address, uint64_t size);
     // The title synchronised its caches over [address, +size) (ACQUIRE_MEM / SURFACE_SYNC): what the

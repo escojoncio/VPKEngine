@@ -226,6 +226,7 @@ struct Renderer::Impl {
         uint64_t refillSkipped = 0, refillSkippedBytes = 0, refillLines = 0;  // refills of a target left out because only images wrote its range (R1)
         uint64_t fillPath[5] = {}, fillPathBytes[5] = {};                  // none, GPU detile, CPU detile, linear upload, not filled
         uint64_t mirrorCalls = 0, mirrorCopies = 0, mirrorBytes = 0;
+        uint64_t depthClearFills = 0, depthClearLines = 0;  // layers of a texture given the clear value of their depth buffer (Renderer::depthCleared)
         uint64_t depthAllocLines = 0, depthWritesUntracked = 0, flatTables = 0;  // depth targets made drawn smaller than their allocation (VPKENGINE_PROBE DEPTHALLOC)
         uint64_t msDraws[4][4] = {};  // samples the title asked for (1,2,4,8) x samples the host draws with
         std::unordered_map<const char*, uint64_t> resolveDrops;
@@ -2031,6 +2032,10 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         // write version at the copy.
         TextureId mirrorSrc;
         uint64_t mirrorVersion = ~uint64_t(0);
+        // Layers that hold the clear value of their depth buffer, not memory (see clearedDepthFill): the mask, the record's
+        // stamp and the fills from memory at the time.
+        uint32_t clearedLayers = 0, clearedFills = 0;
+        uint64_t clearedStamp = 0;
     };
     struct RetiredTexture {
         TextureId id;
@@ -2970,7 +2975,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
             }
     }
 
-    // ---- FRAMECAP (probe on and SHADPS4_PROBE_DIR set; VPKENGINE_FRAMECAP: not set = one frame every 10 s from 20 s on,
+    // ---- FRAMECAP (probe on and SHADPS4_PROBE_DIR set; VPKENGINE_FRAMECAP: not set = one frame every 60 s from 20 s on,
     // "N" = every N s, "Nf" = every N frames, "0" = off). In a captured frame the render passes are listed in order
     // (VPKENGINE_PROBE FRAMECAP_PASS: attachments, draws, the images its draws sampled) and, once the frame ran (the submit
     // waits for the GPU: a debugging stall of the command processor, as TEXVERIFY), every image it drew into or sampled is
@@ -2984,7 +2989,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
     struct FrameCap {
         bool off = false, armed = false, files = false, pattern = false, started = false;
         uint32_t periodFrames = 0;
-        std::chrono::milliseconds period{10000};
+        std::chrono::milliseconds period{60000};
         uint64_t n = 0, disk = 0, nextFrame = 0;
         Clock::time_point next{}, nextFiles{};
         std::vector<uint32_t> wids, drawSampled, passSampled;  // images of the frame (first seen first); sampled by a draw / a pass
@@ -3335,6 +3340,92 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
                     std::to_string(int(o->lastViewport[3])) + "]";
         }
         log(line);
+    }
+    // Renderer::depthCleared: the slices of the depth buffer at a base that hold its clear value and were not drawn into
+    // since (a bit each; a draw that binds a slice takes its bit, see draw). A texture of that base that no depth target
+    // serves (another size than the one last drawn) reads memory, which the clear never wrote: its layers with the bit
+    // take the value, as the hardware reads it through the HTILE. VPKENGINE_HTILE_CLEAR_MEMORY=1 leaves them to memory.
+    struct ClearedDepth {
+        float value = 1.0f;
+        uint32_t mask = 0;
+        uint64_t stamp = 0;
+    };
+    std::unordered_map<uint64_t, ClearedDepth> clearedDepths;
+    uint64_t clearedDepthStamp = 0;
+    bool clearedDepthFills = !std::getenv("VPKENGINE_HTILE_CLEAR_MEMORY");
+    void depthCleared(uint64_t zAddress, float value) {
+        if (!clearedDepthFills || !zAddress) return;
+        ClearedDepth& c = clearedDepths[zAddress];
+        if (c.mask == ~uint32_t(0) && c.value == value) return;
+        c.value = value, c.mask = ~uint32_t(0), c.stamp = ++clearedDepthStamp;
+    }
+    void depthDrawn(uint64_t zAddress, uint32_t sliceStart, uint32_t sliceCount) {
+        const auto it = clearedDepths.find(zAddress);
+        if (it == clearedDepths.end()) return;
+        uint32_t bits = 0;
+        for (uint32_t i = sliceStart; i < sliceStart + sliceCount && i < 32; ++i) bits |= 1u << i;
+        if (!(it->second.mask & bits)) return;
+        it->second.mask &= ~bits, it->second.stamp = ++clearedDepthStamp;
+        if (!it->second.mask) clearedDepths.erase(it);
+    }
+    static uint32_t layerMask(const Surface& s) { return s.layers >= 32 ? ~uint32_t(0) : (1u << s.layers) - 1; }
+    const ClearedDepth* clearedDepthOf(const Texture& t) const {
+        if (clearedDepths.empty()) return nullptr;
+        const vpgpu::Format f = t.format;
+        if (f != vpgpu::Format::D32Float && f != vpgpu::Format::R32Float && f != vpgpu::Format::D16Unorm && f != vpgpu::Format::R16Unorm)
+            return nullptr;
+        if (!t.id || t.mips != 1 || t.samples > 1 || t.softBc || t.storage || t.type == vpgpu::TextureType::Tex3D || !t.layers || t.layers > 32)
+            return nullptr;
+        const auto it = clearedDepths.find(t.address);
+        return it != clearedDepths.end() ? &it->second : nullptr;
+    }
+    // Before the texture's refresh: true when every layer holds the clear value (memory is not looked at). A layer drawn
+    // into since it took the value goes back to memory.
+    bool clearedDepthWhole(Texture& t, const ClearedDepth* c) {
+        const uint32_t now = c ? c->mask & layerMask(t) : 0;
+        if (t.clearedLayers & ~now) t.filled = false, t.clearedLayers = 0;
+        if (!c || now != layerMask(t)) return false;
+        t.filled = true, t.seeded = true;
+        t.version = tracker.current();
+        return true;
+    }
+    // After it: the layers with the bit are written with the value (once per change of the record, and again after a fill
+    // from memory wrote over them).
+    void clearedDepthFill(Texture& t, const ClearedDepth& c) {
+        const uint32_t now = c.mask & layerMask(t);
+        if (!now || (t.clearedStamp == c.stamp && t.clearedFills == t.fills && t.clearedLayers == now)) return;
+        const bool wide = t.format == vpgpu::Format::D32Float || t.format == vpgpu::Format::R32Float;
+        const uint64_t row = uint64_t(t.width) * (wide ? 4 : 2), bytes = row * t.height;
+        BufferId buffer;
+        uint64_t offset = 0;
+        uint8_t* dst = staging(bytes, buffer, offset);
+        if (!dst) return note("no staging memory for the clear value of a depth buffer: the texture keeps what memory held"), void();
+        if (wide) std::fill_n(reinterpret_cast<float*>(dst), uint64_t(t.width) * t.height, c.value);
+        else std::fill_n(reinterpret_cast<uint16_t*>(dst), uint64_t(t.width) * t.height, uint16_t(std::clamp(c.value, 0.0f, 1.0f) * 65535.0f + 0.5f));
+        closePass();
+        for (uint32_t layer = 0; layer < t.layers; ++layer) {
+            if (!(now >> layer & 1)) continue;
+            vpgpu::Copy cp;
+            cp.kind = vpgpu::CopyKind::BufferToTexture;
+            cp.srcBuffer = {buffer, offset, bytes, uint32_t(row), t.height};
+            cp.dstTexture.texture = t.id;
+            cp.dstTexture.layer = uint16_t(layer);
+            cp.dstTexture.layerCount = 1;
+            cp.dstTexture.width = t.width;
+            cp.dstTexture.height = t.height;
+            cp.dstTexture.depth = 1;
+            cp.dstTexture.aspect = aspectOf(t);
+            cp.label = "depth clear value " + hex(t.address);
+            frame.copy(cp);
+            ++r.stats_.copies;
+            ++pstat.depthClearFills;
+        }
+        ++t.writeSeq;
+        t.clearedStamp = c.stamp, t.clearedFills = t.fills, t.clearedLayers = now;
+        if (vpgpu::probe::enabled() && (++pstat.depthClearLines <= 40 || pstat.depthClearLines % 600 == 0))
+            log("VPKENGINE_PROBE CLEARFILL n=" + std::to_string(pstat.depthClearLines) + " f=" + std::to_string(r.frame_) + " addr=" + hex(t.address) +
+                " " + std::to_string(t.width) + "x" + std::to_string(t.height) + "x" + std::to_string(t.layers) + " fmt=" +
+                vpgpu::formatInfo(t.format).name + " layers_mask=" + hex(now) + " value=" + std::to_string(c.value));
     }
     // Before a use: has another writer changed the image's range since it last held it?
     void refresh(Surface& s, Texture* tex) {
@@ -4514,8 +4605,10 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         }
         tex.lastUse = r.frame_;
         fillDeferred = nullptr;
-        refresh(tex, &tex);
+        const ClearedDepth* cleared = clearedDepthOf(tex);
+        if (!clearedDepthWhole(tex, cleared)) refresh(tex, &tex);
         if (fillDeferred) return texWhy = fillDeferred, TexRef{};
+        if (cleared) clearedDepthFill(tex, *cleared);
         routed(ProbeStats::kCmpMemory, tex);
         if (probeOpen())
             probeSampled(desc, tex, tex.filled && tracker.writerAt(tex.address) == tex.wid ? "texture written by the GPU" : "texture from memory", storage);
@@ -5311,6 +5404,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
             Target* dt = target(depthTargets, readAddress, zf, z.width, z.height,
                                 samples, uint16_t(z.sliceStart + z.sliceCount), true, z.tileMode, depthPitch(z), nullptr, depthRows(z));
             if (!dt) return skip("depth target creation failed");
+            depthDrawn(readAddress, z.sliceStart, z.sliceCount);
             {
                 const uint64_t zBase = agreedBase(z.zAddress, z.zWriteAddress), stencilBase = agreedBase(z.stencilAddress, z.stencilWriteAddress);
                 const uint64_t primary = z.zFormat ? zBase : stencilBase;
@@ -7052,6 +7146,7 @@ void Renderer::publishProbe(uint64_t pictures) {
         C(f, "refill_unfilled", ps.refillFailed);
         C(f, "refill_skipped", ps.refillSkipped), C(f, "refill_skipped_bytes", ps.refillSkippedBytes);
         C(f, "depth_writes_untracked", ps.depthWritesUntracked);
+        C(f, "depth_clear_fills", ps.depthClearFills);
         C(f, "flat_tables", ps.flatTables);
         C(f, "dma_stale_read", ps.dmaStaleReads), C(f, "cpu_read_all", ps.cpuReadAll);
         static const char* const aliasWhy[Impl::kAliasReasons] = {"depth", "address", "shape", "layout", "mips", "samples", "format", "no_view", "range", "feedback"};
@@ -7178,6 +7273,7 @@ bool Renderer::fill(uint64_t address, uint64_t bytes, uint32_t value) {
     if (!ok) impl_->resolvedStatus(Resolved::Status::Skipped, "range is not guest memory");
     return ok;
 }
+void Renderer::depthCleared(uint64_t zAddress, float value) { impl_->depthCleared(zAddress, value); }
 bool Renderer::copy(uint64_t dst, uint64_t src, uint64_t bytes) {
     const ResolvedScope scope(*this, Resolved::Kind::Copy);
     const bool ok = impl_->copy(dst, src, bytes);
