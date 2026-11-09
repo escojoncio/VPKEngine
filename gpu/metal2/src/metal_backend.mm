@@ -2289,6 +2289,12 @@ id<MTLFunction> MetalBackend::Impl::function(uint64_t shaderId, const FetchInput
   // so the key above needs no constant (only MSL text that declares [[position, invariant]] is affected).
   const bool invariantMsl = shader.source.find("invariant]]") != std::string::npos;
   if (invariantMsl) o.preserveInvariance = YES;
+  // ... and with the arithmetic left as written: under fast math the compiler contracts a multiply and an add into an
+  // fma (or reassociates) differently in each program, so two programs that compute the position with the same
+  // operations still differ in the last bits (the depth prepass against the colour pass). The reference recompiler marks
+  // every operation NoContraction. Programs that export a position only (vertex stages); a text archived before this
+  // keeps the pipelines it has.
+  if (invariantMsl) o.mathMode = MTLMathModeSafe;
   NSMutableDictionary<NSString*, NSObject*>* macros = [NSMutableDictionary dictionary];
   if (noPointSize) macros[@"VP_PSZ"] = @"user(vp_psz)";
   if (noFragDepth) macros[@"VP_NO_FDEPTH"] = @"1";

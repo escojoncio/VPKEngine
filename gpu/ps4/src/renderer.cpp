@@ -955,15 +955,20 @@ struct Renderer::Impl {
         while (it != cpAccess.end() && it->first <= hi) lo = std::min(lo, it->first), hi = std::max(hi, it->second), it = cpAccess.erase(it);
         cpAccess[lo] = hi;
     }
+    // (why a pointer inside such a range was still bound in place: QUAL pointer_snapshot_no_*)
+    uint64_t pointerNo[5] = {};  // unaligned, flat reach, history forgotten, GPU wrote it, label pending
     bool pointerSnapshotSafe(uint64_t address, uint64_t size) {
-        if (bufferLive || pointerLive || cpAccess.empty() || !size || address % 16) return false;
+        if (bufferLive || pointerLive || cpAccess.empty() || !size) return false;
         const auto it = cpAccess.upper_bound(address);
         if (it == cpAccess.begin() || std::prev(it)->second <= address) return false;
-        if (overlaps(flatReach, false, address, size)) return false;
+        if (address % 16) return ++pointerNo[0], false;
+        if (overlaps(flatReach, false, address, size)) return ++pointerNo[1], false;
         if (tracker.forgetHistoryCalls() != snapForgets)
             snapForgets = tracker.forgetHistoryCalls(), snapAfter = r.device_.submittedFrames() + 1;
-        if (r.device_.completedFrames() < snapAfter) return false;
-        return !tracker.gpuWritten(address, size) && !(r.device_.labelsQueued() && r.device_.labelPending(address, uint32_t(size)));
+        if (r.device_.completedFrames() < snapAfter) return ++pointerNo[2], false;
+        if (tracker.gpuWritten(address, size)) return ++pointerNo[3], false;
+        if (r.device_.labelsQueued() && r.device_.labelPending(address, uint32_t(size))) return ++pointerNo[4], false;
+        return true;
     }
     std::optional<uint64_t> alignedConstantCopy(uint64_t address, uint64_t bytes, const void* host) {
         if (alignedGeneration != ringGeneration || alignedCopies.size() >= kAlignedCopies) forgetAlignedCopies();
@@ -1116,6 +1121,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         uint64_t ioff = 0;
         if (indexed) {
             uint64_t iavail = 0;
+            const Who who(touchWho, "draw_index");
             if (!guestBuffer(d.indexAddress, 4, ib, ioff, iavail)) return why = "index buffer outside guest memory", false;
             if (ioff % (d.index32 ? 4 : 2)) return why = "misaligned index buffer", false;
             avail = uint32_t(std::min<uint64_t>(iavail / (d.index32 ? 4 : 2), UINT32_MAX));
@@ -5013,6 +5019,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
             if (va < 0x10000 || !region(va, 1, g)) continue;
             BufferId id;
             uint64_t offset = 0, available = 0;
+            const Who who(touchWho, "draw_flat");
             guestBuffer(va, 1, id, offset, available);
         }
         // A window over a mirror the host has replaced is left out (and retired). The table must be sorted by base and
@@ -5236,6 +5243,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
                     bool found = false;
                     {
                         const Phase ph(r.cpu_.bindBufMs);
+                        const Who who(touchWho, pointer ? "draw_pointer" : a.write ? "draw_rw_buffer" : size > kSnapshotBytes ? "draw_big_buffer" : "draw_buffer");
                         found = address && guestBuffer(address, size, id, offset, available);
                     }
                     if (found && a.write && guestReadOnly) return why = "guest memory read-only", false;
@@ -7109,6 +7117,9 @@ void Renderer::publishProbe(uint64_t pictures) {
         C(f, "pictures", pictures);
         C(f, "aligned_copies", ps.alignedCopies), C(f, "aligned_copy_bytes", im.alignedCopyBytes);
         C(f, "buffer_snapshots", ps.bufferSnapshots), C(f, "pointer_snapshots", ps.pointerSnapshots);
+        C(f, "pointer_snapshot_no_align", impl_->pointerNo[0]), C(f, "pointer_snapshot_no_flat", impl_->pointerNo[1]);
+        C(f, "pointer_snapshot_no_history", impl_->pointerNo[2]), C(f, "pointer_snapshot_no_gpu_wrote", impl_->pointerNo[3]);
+        C(f, "pointer_snapshot_no_label", impl_->pointerNo[4]), C(f, "cp_access_ranges", impl_->cpAccess.size());
         C(f, "life_stores_dropped", im.lifeTotal.storesDropped);
         C(f, "life_samples_dropped", im.lifeTotal.samplesDropped), C(f, "life_resolves_dropped", im.lifeTotal.resolvesDropped);
         C(f, "life_resolves_deferred", im.lifeTotal.resolvesDeferred), C(f, "life_misses", im.lifeTotal.misses);
