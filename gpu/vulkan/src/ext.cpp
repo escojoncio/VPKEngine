@@ -307,6 +307,7 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkCopyMemoryToImageEXT(VkDevice dv, c
     c.dstTexture = h.span;
     c.srcBuffer = {st.id, 0, h.bytes, h.row, h.rows};
     c.label = "vk.host_upload";
+    noteMipsWritten(&im, r.imageSubresource.mipLevel);
     settleZero(d, h.span, true);
     vpgpu::Frame frame;
     frame.copy(std::move(c));
@@ -356,6 +357,7 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkCopyImageToImageEXT(VkDevice dv, co
     c.label = "vk.host_image_copy";
     settleZero(d, c.srcTexture, false);
     settleZero(d, c.dstTexture, true);
+    noteMipsWritten(&dst, r.dstSubresource.mipLevel);
     vpgpu::Frame frame;
     frame.copy(std::move(c));
     if (const VkResult res = runNow(d, frame)) return res;

@@ -3935,6 +3935,104 @@ void testImageLifetime() {
   vkFreeMemory(c.dev, m, nullptr);
 }
 
+// vk.device_req (what vkCreateDevice asked, decoded) and vk.tex_hist (sampled images by mips written, ASTC apart).
+void testTexHist() {
+  // --- vk.device_req
+  VkInstanceCreateInfo ici{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
+  VkInstance inst = nullptr;
+  vkCreateInstance(&ici, nullptr, &inst);
+  uint32_t np = 1;
+  VkPhysicalDevice pd = nullptr;
+  vkEnumeratePhysicalDevices(inst, &np, &pd);
+  const char* exts[] = {"VK_KHR_multiview"};
+  VkPhysicalDeviceMultiDrawFeaturesEXT other{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MULTI_DRAW_FEATURES_EXT};  // not decoded
+  VkPhysicalDeviceShaderImageAtomicInt64FeaturesEXT imgAtomic{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_IMAGE_ATOMIC_INT64_FEATURES_EXT, &other};
+  imgAtomic.shaderImageInt64Atomics = VK_TRUE;
+  VkPhysicalDeviceVulkan12Features v12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES, &imgAtomic};
+  v12.descriptorIndexing = v12.bufferDeviceAddress = VK_TRUE;
+  VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &v12};
+  f2.features.sparseBinding = f2.features.shaderInt64 = VK_TRUE;
+  float prio = 1;
+  VkDeviceQueueCreateInfo q{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
+  q.queueCount = 1, q.pQueuePriorities = &prio;
+  VkDeviceCreateInfo dci{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, &f2};
+  dci.queueCreateInfoCount = 1, dci.pQueueCreateInfos = &q;
+  dci.enabledExtensionCount = 1, dci.ppEnabledExtensionNames = exts;
+  std::string all;
+  for (const std::string& l : deviceRequestLines(pd, &dci)) all += l + "\n";
+  CHECK(all.find("vk.device_req exts=1 names=VK_KHR_multiview\n") != std::string::npos);
+  CHECK(all.find("struct=features2 on=shaderInt64,sparseBinding unsupported=shaderInt64,sparseBinding\n") != std::string::npos);
+  CHECK(all.find("struct=vulkan12 on=descriptorIndexing,bufferDeviceAddress unsupported=descriptorIndexing") != std::string::npos);
+  CHECK(all.find("struct=image_atomic_int64 on=shaderImageInt64Atomics unsupported=shaderImageInt64Atomics\n") != std::string::npos);
+  CHECK(all.find("other_sType_not_decoded=1000392000\n") != std::string::npos);
+  // vkCreateDevice logs it once for the same request (the second device, after the first is gone, does not repeat it).
+  const std::string logged = captureStderr([&] {
+    for (int k = 0; k < 2; ++k) {
+      VkDevice dev = nullptr;
+      CHECK(vkCreateDevice(pd, &dci, nullptr, &dev) == VK_SUCCESS);
+      if (dev) vkDestroyDevice(dev, nullptr);
+    }
+  });
+  CHECK(countOf(logged, "vk.device_req exts=1 names=VK_KHR_multiview") == 1);
+  CHECK(countOf(logged, "vk.device_req features struct=") == 3);
+  vkDestroyInstance(inst, nullptr);
+
+  // --- vk.tex_hist
+  Ctx c;
+  VkCommandPoolCreateInfo pi{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+  VkCommandPool pool;
+  vkCreateCommandPool(c.dev, &pi, nullptr, &pool);
+  VkCommandBufferAllocateInfo ai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+  ai.commandPool = pool, ai.commandBufferCount = 1;
+  VkCommandBuffer cb;
+  vkAllocateCommandBuffers(c.dev, &ai, &cb);
+  VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+  vkBeginCommandBuffer(cb, &bi);
+  VkDeviceMemory mem = alloc(c, 1 << 20, 1);
+  VkBuffer staging = buffer(c, 64 * 64 * 4, mem, 0);
+  auto make = [&](VkFormat f, uint32_t mips, VkImageUsageFlags usage) {
+    VkImageCreateInfo ii{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+    ii.imageType = VK_IMAGE_TYPE_2D, ii.format = f, ii.extent = {64, 64, 1}, ii.mipLevels = mips, ii.arrayLayers = 1;
+    ii.samples = VK_SAMPLE_COUNT_1_BIT, ii.tiling = VK_IMAGE_TILING_OPTIMAL, ii.usage = usage;
+    VkImage i = VK_NULL_HANDLE;
+    CHECK(vkCreateImage(c.dev, &ii, nullptr, &i) == VK_SUCCESS);
+    return i;
+  };
+  auto upload = [&](VkImage im, uint32_t mip) {
+    VkBufferImageCopy r{};
+    r.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, mip, 0, 1};
+    r.imageExtent = {std::max(1u, 64u >> mip), std::max(1u, 64u >> mip), 1};
+    vkCmdCopyBufferToImage(cb, staging, im, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &r);
+  };
+  const VkImageUsageFlags tex = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+  VkImage astcFull = make(VK_FORMAT_ASTC_4x4_UNORM_BLOCK, 6, tex);  // 6 mips written -> m6p
+  for (uint32_t m = 0; m < 6; ++m) upload(astcFull, m);
+  VkImage low = make(VK_FORMAT_R8G8B8A8_UNORM, 5, tex);  // mips 3 and 4 only -> m1_2, base never delivered
+  upload(low, 3), upload(low, 4);
+  VkImage mid = make(VK_FORMAT_R8G8B8A8_UNORM, 4, tex);  // all 4 -> m3_5, complete
+  for (uint32_t m = 0; m < 4; ++m) upload(mid, m);
+  VkImage none = make(VK_FORMAT_ASTC_4x4_UNORM_BLOCK, 3, tex);  // never written -> m0
+  VkImage rt = make(VK_FORMAT_R8G8B8A8_UNORM, 1, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT);
+  VkImage notSampled = make(VK_FORMAT_R8G8B8A8_UNORM, 1, VK_IMAGE_USAGE_TRANSFER_DST_BIT);
+  vkEndCommandBuffer(cb);
+  CHECK(from<Image>(astcFull)->mipsWritten.load() == 0x3Fu && from<Image>(low)->mipsWritten.load() == 0x18u);
+  TexHistAcc a;
+  for (VkImage im : {astcFull, low, mid, none, rt, notSampled}) texHistAdd(a, *from<Image>(im));
+  CHECK(a.sampled == 4 && a.b[0].n == 1 && a.b[1].n == 1 && a.b[2].n == 1 && a.b[3].n == 1);
+  CHECK(a.b[0].astcN == 1 && a.b[3].astcN == 1 && a.b[1].astcN == 0);
+  CHECK(a.b[3].astcBytes > 0 && a.b[3].astcBytes <= a.b[3].bytes);
+  CHECK(a.partial == 1 && a.top0Missing == 1 && a.rtN == 1 && a.rtBytes > 0);
+  const std::string line = texHistFormat(a);
+  CHECK(line.find("sampled=4 | m0 n=1 ") == 0 && line.find(" | m6p n=1 ") != std::string::npos);
+  CHECK(line.find(" | partial=1 top0_unwritten=1 | rt n=1 ") != std::string::npos);
+  // The registry the tick walks holds these images: forced, the tick prints the line (it is 5 s apart otherwise).
+  const std::string tick = captureStderr([] { texHistTick(true); });
+  CHECK(countOf(tick, "vk.tex_hist t=") == 1);
+  for (VkImage im : {astcFull, low, mid, none, rt, notSampled}) vkDestroyImage(c.dev, im, nullptr);
+  vkDestroyCommandPool(c.dev, pool, nullptr);
+  vkFreeMemory(c.dev, mem, nullptr);
+}
+
 void testImages() {
   Ctx c;
   VkDeviceMemory m = alloc(c, 16 << 20, 1);
@@ -13205,7 +13303,7 @@ int main(int argc, char** argv) {
       {"exports", testExports}, {"physical", testPhysical}, {"memory", testMemory}, {"msaa_tile_off", testMsaaTileOff},
       {"passes", testPasses},   {"submit", testSubmit}, {"pipeline", testPipeline},
       {"recipes", testRecipes}, {"recipe_keys", testRecipeKeys}, {"taa", testTaa}, {"msaa", testMsaa}, {"queries", testQueries}, {"query_not_ready", testQueryNotReady},
-      {"timeline", testTimeline}, {"queues", testQueues}, {"timeline_order", testTimelineOrder}, {"pending", testPending}, {"renderpass_ops", testRenderPassOps}, {"linear", testLinear}, {"images", testImages}, {"image_lifetime", testImageLifetime},
+      {"timeline", testTimeline}, {"queues", testQueues}, {"timeline_order", testTimelineOrder}, {"pending", testPending}, {"renderpass_ops", testRenderPassOps}, {"linear", testLinear}, {"images", testImages}, {"image_lifetime", testImageLifetime}, {"tex_hist", testTexHist},
       {"vertex_stores", testVertexStores}, {"profile", testProfile}, {"profile13", testProfile13}, {"quest_extras", testQuestExtras}, {"push_descriptor", testPushDescriptor}, {"report_geom", testReportGeomInterpolators}, {"pipeline_policy", testPipelinePolicy}, {"eds", testExtendedDynamicState},
       {"quest_gpu_name", testQuestGpuName}, {"native_identity", testNativeIdentity}, {"inline_uniform", testInlineUniformBlock}, {"bda", testBufferDeviceAddress}, {"ycbcr", testYcbcr},
       {"taa_native", testTaaNative}, {"taa_eye_depth", testTaaEyeDepth}, {"taa_uimask", testTaaUiMask}, {"msaa_force", testMsaaForce}, {"d24_emul", testD24Emul}, {"prewarm_variants", testPrewarmVariants}, {"msaa_force_marked", testMsaaForceMarkedEye}, {"aot", testAot}, {"aniso", testAniso}, {"zeroinit", testZeroInit}, {"archive_index", testArchiveIndex}, {"foveation", testFoveation},

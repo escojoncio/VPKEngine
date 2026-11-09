@@ -4176,6 +4176,7 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdCopyImage(VkCommandBuffer cb, VkImag
     Image* d = planeOf(from<Image>(dst), c.dstSubresource.aspectMask);
     if (s != from<Image>(src)) c.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
     if (d != from<Image>(dst)) c.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    noteMipsWritten(d, c.dstSubresource.mipLevel);
     r.ops.emplace_back(OpCopyImage{s, d, c});
   }
 }
@@ -4200,6 +4201,7 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdBlitImage(VkCommandBuffer cb, VkImag
     const int dw = b.dstOffsets[1].x - b.dstOffsets[0].x, dh = b.dstOffsets[1].y - b.dstOffsets[0].y;
     const int sd = b.srcOffsets[1].z - b.srcOffsets[0].z, dd = b.dstOffsets[1].z - b.dstOffsets[0].z;
     if (!sw || !sh || !dw || !dh) continue;
+    noteMipsWritten(d, b.dstSubresource.mipLevel);
     if (sw == dw && sh == dh && sd == dd && sw > 0 && sh > 0 && rawBlitCompatible(s->desc.format, d->desc.format) &&
         isSwappedRB(s->info.format) == isSwappedRB(d->info.format)) {
       VkImageCopy c{};

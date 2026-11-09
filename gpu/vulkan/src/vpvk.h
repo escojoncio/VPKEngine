@@ -277,7 +277,22 @@ struct Image {
   // VK_KHR_dynamic_rendering_local_read: the copy that draws after an in-pass barrier read instead of this attachment
   // (commands.cpp localReadSplit), made on first need and destroyed with the image (submitMutex).
   mutable vpgpu::TextureId localReadCopy;
+  // vk.tex_hist: bit m = mip m got a copy/blit recorded into it (relaxed; recording threads write, the submit tick reads).
+  mutable std::atomic<uint32_t> mipsWritten{0};
 };
+// vk.tex_hist (entry.cpp): live images registered at vkCreateImage / dropped at vkDestroyImage; the per-5 s residency line.
+void noteMipsWritten(const Image* im, uint32_t mip);
+void texHistTick(bool force = false);
+// vk.device_req (entry.cpp): the lines for what a vkCreateDevice asked (extension names; per feature struct the ones enabled and
+// those the driver does not report). Exposed for the tests.
+std::vector<std::string> deviceRequestLines(VkPhysicalDevice pd, const VkDeviceCreateInfo* ci);
+// vk.tex_hist accumulator and its line (exposed for the tests). Images with an attachment usage count apart (rt).
+struct TexHistAcc {
+  struct Bucket { uint64_t n = 0, bytes = 0, astcN = 0, astcBytes = 0; } b[4];  // 0 mips written, 1-2, 3-5, 6+
+  uint64_t sampled = 0, partial = 0, top0Missing = 0, rtN = 0, rtBytes = 0;
+};
+void texHistAdd(TexHistAcc& a, const Image& im);
+std::string texHistFormat(const TexHistAcc& a);
 
 // The image a copy of `aspect` touches: plane images of a multi-planar image for PLANE_1 / PLANE_2,
 // otherwise the image itself.

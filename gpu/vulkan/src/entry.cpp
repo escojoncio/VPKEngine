@@ -1188,6 +1188,223 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkEnumerateDeviceLayerProperties(VkPh
 }
 
 // ---------------------------------------------------------------------------------------------
+// Diagnostics: vk.device_req (what vkCreateDevice asked) and vk.tex_hist (texture residency by mips written)
+// ---------------------------------------------------------------------------------------------
+namespace vpvk {
+namespace {
+// Feature structs a vkCreateDevice chain is decoded from: VkBool32 count after the header and the member names (space separated;
+// "" = print the index). A struct not listed shows up as `other_sType=`: its size is unknown, so it is not read.
+struct FeatTable {
+  VkStructureType type;
+  const char* label;
+  uint32_t bools;
+  const char* names;
+};
+const FeatTable kFeatTable[] = {
+    {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES, "vulkan11", 12,
+     "storageBuffer16BitAccess uniformAndStorageBuffer16BitAccess storagePushConstant16 storageInputOutput16 multiview "
+     "multiviewGeometryShader multiviewTessellationShader variablePointersStorageBuffer variablePointers protectedMemory "
+     "samplerYcbcrConversion shaderDrawParameters"},
+    {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES, "vulkan12", 47,
+     "samplerMirrorClampToEdge drawIndirectCount storageBuffer8BitAccess uniformAndStorageBuffer8BitAccess storagePushConstant8 "
+     "shaderBufferInt64Atomics shaderSharedInt64Atomics shaderFloat16 shaderInt8 descriptorIndexing "
+     "shaderInputAttachmentArrayDynamicIndexing shaderUniformTexelBufferArrayDynamicIndexing "
+     "shaderStorageTexelBufferArrayDynamicIndexing shaderUniformBufferArrayNonUniformIndexing "
+     "shaderSampledImageArrayNonUniformIndexing shaderStorageBufferArrayNonUniformIndexing "
+     "shaderStorageImageArrayNonUniformIndexing shaderInputAttachmentArrayNonUniformIndexing "
+     "shaderUniformTexelBufferArrayNonUniformIndexing shaderStorageTexelBufferArrayNonUniformIndexing "
+     "descriptorBindingUniformBufferUpdateAfterBind descriptorBindingSampledImageUpdateAfterBind "
+     "descriptorBindingStorageImageUpdateAfterBind descriptorBindingStorageBufferUpdateAfterBind "
+     "descriptorBindingUniformTexelBufferUpdateAfterBind descriptorBindingStorageTexelBufferUpdateAfterBind "
+     "descriptorBindingUpdateUnusedWhilePending descriptorBindingPartiallyBound descriptorBindingVariableDescriptorCount "
+     "runtimeDescriptorArray samplerFilterMinmax scalarBlockLayout imagelessFramebuffer uniformBufferStandardLayout "
+     "shaderSubgroupExtendedTypes separateDepthStencilLayouts hostQueryReset timelineSemaphore bufferDeviceAddress "
+     "bufferDeviceAddressCaptureReplay bufferDeviceAddressMultiDevice vulkanMemoryModel vulkanMemoryModelDeviceScope "
+     "vulkanMemoryModelAvailabilityVisibilityChains shaderOutputViewportIndex shaderOutputLayer subgroupBroadcastDynamicId"},
+    {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES, "vulkan13", 15,
+     "robustImageAccess inlineUniformBlock descriptorBindingInlineUniformBlockUpdateAfterBind pipelineCreationCacheControl "
+     "privateData shaderDemoteToHelperInvocation shaderTerminateInvocation subgroupSizeControl computeFullSubgroups "
+     "synchronization2 textureCompressionASTC_HDR shaderZeroInitializeWorkgroupMemory dynamicRendering "
+     "shaderIntegerDotProduct maintenance4"},
+    {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MULTIVIEW_FEATURES, "multiview", 3,
+     "multiview multiviewGeometryShader multiviewTessellationShader"},
+    {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_FEATURES, "descriptor_indexing", 20,
+     "shaderInputAttachmentArrayDynamicIndexing shaderUniformTexelBufferArrayDynamicIndexing "
+     "shaderStorageTexelBufferArrayDynamicIndexing shaderUniformBufferArrayNonUniformIndexing "
+     "shaderSampledImageArrayNonUniformIndexing shaderStorageBufferArrayNonUniformIndexing "
+     "shaderStorageImageArrayNonUniformIndexing shaderInputAttachmentArrayNonUniformIndexing "
+     "shaderUniformTexelBufferArrayNonUniformIndexing shaderStorageTexelBufferArrayNonUniformIndexing "
+     "descriptorBindingUniformBufferUpdateAfterBind descriptorBindingSampledImageUpdateAfterBind "
+     "descriptorBindingStorageImageUpdateAfterBind descriptorBindingStorageBufferUpdateAfterBind "
+     "descriptorBindingUniformTexelBufferUpdateAfterBind descriptorBindingStorageTexelBufferUpdateAfterBind "
+     "descriptorBindingUpdateUnusedWhilePending descriptorBindingPartiallyBound descriptorBindingVariableDescriptorCount "
+     "runtimeDescriptorArray"},
+    {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_INT64_FEATURES, "atomic_int64", 2,
+     "shaderBufferInt64Atomics shaderSharedInt64Atomics"},
+    {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_IMAGE_ATOMIC_INT64_FEATURES_EXT, "image_atomic_int64", 2,
+     "shaderImageInt64Atomics sparseImageInt64Atomics"},
+    {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES, "buffer_device_address", 3,
+     "bufferDeviceAddress bufferDeviceAddressCaptureReplay bufferDeviceAddressMultiDevice"},
+    {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT, "robustness2", 3,
+     "robustBufferAccess2 robustImageAccess2 nullDescriptor"},
+    {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT16_INT8_FEATURES, "float16_int8", 2, "shaderFloat16 shaderInt8"},
+    {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_16BIT_STORAGE_FEATURES, "16bit_storage", 4, ""},
+    {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_8BIT_STORAGE_FEATURES, "8bit_storage", 3, ""},
+    {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES, "timeline_semaphore", 1, "timelineSemaphore"},
+    {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SYNCHRONIZATION_2_FEATURES, "sync2", 1, "synchronization2"},
+    {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_FEATURES, "dynamic_rendering", 1, "dynamicRendering"},
+    {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SCALAR_BLOCK_LAYOUT_FEATURES, "scalar_block_layout", 1, "scalarBlockLayout"},
+    {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_HOST_QUERY_RESET_FEATURES, "host_query_reset", 1, "hostQueryReset"},
+    {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_DRAW_PARAMETERS_FEATURES, "draw_parameters", 1, "shaderDrawParameters"},
+    {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_INDEX_TYPE_UINT8_FEATURES_EXT, "index_uint8", 1, "indexTypeUint8"},
+};
+const char* kCoreFeatureNames =
+    "robustBufferAccess fullDrawIndexUint32 imageCubeArray independentBlend geometryShader tessellationShader sampleRateShading "
+    "dualSrcBlend logicOp multiDrawIndirect drawIndirectFirstInstance depthClamp depthBiasClamp fillModeNonSolid depthBounds "
+    "wideLines largePoints alphaToOne multiViewport samplerAnisotropy textureCompressionETC2 textureCompressionASTC_LDR "
+    "textureCompressionBC occlusionQueryPrecise pipelineStatisticsQuery vertexPipelineStoresAndAtomics fragmentStoresAndAtomics "
+    "shaderTessellationAndGeometryPointSize shaderImageGatherExtended shaderStorageImageExtendedFormats "
+    "shaderStorageImageMultisample shaderStorageImageReadWithoutFormat shaderStorageImageWriteWithoutFormat "
+    "shaderUniformBufferArrayDynamicIndexing shaderSampledImageArrayDynamicIndexing shaderStorageBufferArrayDynamicIndexing "
+    "shaderStorageImageArrayDynamicIndexing shaderClipDistance shaderCullDistance shaderFloat64 shaderInt64 shaderInt16 "
+    "shaderResourceResidency shaderResourceMinLod sparseBinding sparseResidencyBuffer sparseResidencyImage2D "
+    "sparseResidencyImage3D sparseResidency2Samples sparseResidency4Samples sparseResidency8Samples sparseResidency16Samples "
+    "sparseResidencyAliased variableMultisampleRate inheritedQueries";
+
+std::string nameAt(const char* names, size_t index) {
+  size_t i = 0;
+  const char* p = names;
+  while (*p) {
+    const char* e = std::strchr(p, ' ');
+    const size_t len = e ? size_t(e - p) : std::strlen(p);
+    if (i++ == index) return std::string(p, len);
+    if (!e) break;
+    p = e + 1;
+  }
+  return "#" + std::to_string(index);
+}
+
+// "label on=a,b unsupported=c": the features set in `want` (bools of them) and, of those, the ones `have` does not report.
+std::string featureLine(const char* label, const VkBool32* want, const VkBool32* have, size_t bools, const char* names) {
+  std::string on, bad;
+  for (size_t i = 0; i < bools; ++i) {
+    if (!want[i]) continue;
+    const std::string n = nameAt(names, i);
+    on += (on.empty() ? "" : ",") + n;
+    if (!have[i]) bad += (bad.empty() ? "" : ",") + n;
+  }
+  return std::string("vk.device_req features struct=") + label + " on=" + (on.empty() ? "none" : on) +
+         " unsupported=" + (bad.empty() ? "none" : bad);
+}
+}  // namespace
+
+std::vector<std::string> deviceRequestLines(VkPhysicalDevice pd, const VkDeviceCreateInfo* ci) {
+  std::vector<std::string> out;
+  std::string exts;
+  for (uint32_t i = 0; i < ci->enabledExtensionCount; ++i) exts += (i ? "," : "") + std::string(ci->ppEnabledExtensionNames[i]);
+  out.push_back("vk.device_req exts=" + std::to_string(ci->enabledExtensionCount) + " names=" + exts);
+  VkPhysicalDeviceFeatures base{};
+  vkGetPhysicalDeviceFeatures(pd, &base);
+  if (ci->pEnabledFeatures)
+    out.push_back(featureLine("features", reinterpret_cast<const VkBool32*>(ci->pEnabledFeatures),
+                              reinterpret_cast<const VkBool32*>(&base), sizeof base / sizeof(VkBool32), kCoreFeatureNames));
+  std::string other;
+  const size_t head = sizeof(VkBaseOutStructure);
+  for (auto* s = static_cast<const VkBaseInStructure*>(ci->pNext); s; s = s->pNext) {
+    if (s->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2) {
+      out.push_back(featureLine("features2", reinterpret_cast<const VkBool32*>(&reinterpret_cast<const VkPhysicalDeviceFeatures2*>(s)->features),
+                                reinterpret_cast<const VkBool32*>(&base), sizeof base / sizeof(VkBool32), kCoreFeatureNames));
+      continue;
+    }
+    const FeatTable* t = nullptr;
+    for (const FeatTable& f : kFeatTable)
+      if (f.type == s->sType) t = &f;
+    if (!t) {
+      other += (other.empty() ? "" : ",") + std::to_string(unsigned(s->sType));
+      continue;
+    }
+    alignas(8) uint8_t have[256] = {};  // what the driver reports for this struct (all zero when it does not know it)
+    reinterpret_cast<VkBaseOutStructure*>(have)->sType = t->type;
+    VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+    f2.pNext = have;
+    vkGetPhysicalDeviceFeatures2(pd, &f2);
+    out.push_back(featureLine(t->label, reinterpret_cast<const VkBool32*>(reinterpret_cast<const uint8_t*>(s) + head),
+                              reinterpret_cast<const VkBool32*>(have + head), t->bools, t->names));
+  }
+  if (!other.empty()) out.push_back("vk.device_req features other_sType_not_decoded=" + other);
+  return out;
+}
+
+// ---- vk.tex_hist ----
+namespace {
+std::mutex& imgRegMutex() { static auto* m = new std::mutex; return *m; }  // leaked on purpose, like liveDeviceMutex
+std::unordered_set<const Image*>& imgReg() { static auto* s = new std::unordered_set<const Image*>; return *s; }
+void imgRegAdd(const Image* im) { std::lock_guard<std::mutex> l(imgRegMutex()); imgReg().insert(im); }
+void imgRegRemove(const Image* im) { std::lock_guard<std::mutex> l(imgRegMutex()); imgReg().erase(im); }
+bool isAstcFormat(VkFormat f) {
+  return (f >= VK_FORMAT_ASTC_4x4_UNORM_BLOCK && f <= VK_FORMAT_ASTC_12x12_SRGB_BLOCK) ||
+         (f >= VK_FORMAT_ASTC_4x4_SFLOAT_BLOCK_EXT && f <= VK_FORMAT_ASTC_12x12_SFLOAT_BLOCK_EXT);
+}
+}  // namespace
+
+void noteMipsWritten(const Image* im, uint32_t mip) {
+  if (im && mip < 32) im->mipsWritten.fetch_or(1u << mip, std::memory_order_relaxed);
+}
+
+void texHistAdd(TexHistAcc& a, const Image& im) {
+  if (!(im.info.usage & VK_IMAGE_USAGE_SAMPLED_BIT)) return;
+  const uint64_t bytes = imageBytes(im.desc);
+  if (im.info.usage & (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT)) {
+    ++a.rtN, a.rtBytes += bytes;
+    return;
+  }
+  const uint32_t mask = im.mipsWritten.load(std::memory_order_relaxed);
+  const int written = __builtin_popcount(mask);
+  auto& b = a.b[written == 0 ? 0 : written <= 2 ? 1 : written <= 5 ? 2 : 3];
+  ++a.sampled, ++b.n, b.bytes += bytes;
+  if (isAstcFormat(im.info.format)) ++b.astcN, b.astcBytes += bytes;
+  if (written > 0 && uint32_t(written) < im.info.mipLevels) ++a.partial;
+  if (written > 0 && !(mask & 1u)) ++a.top0Missing;  // some mips came in but the base one never did: the streamer has not delivered the top
+}
+
+std::string texHistFormat(const TexHistAcc& a) {
+  static const char* kName[4] = {"m0", "m1_2", "m3_5", "m6p"};
+  char buf[640];
+  std::string s = "sampled=" + std::to_string(a.sampled);
+  for (int i = 0; i < 4; ++i) {
+    std::snprintf(buf, sizeof buf, " | %s n=%llu mib=%.1f astc_n=%llu astc_mib=%.1f", kName[i], (unsigned long long)a.b[i].n,
+                  double(a.b[i].bytes) / 1048576.0, (unsigned long long)a.b[i].astcN, double(a.b[i].astcBytes) / 1048576.0);
+    s += buf;
+  }
+  std::snprintf(buf, sizeof buf, " | partial=%llu top0_unwritten=%llu | rt n=%llu mib=%.1f", (unsigned long long)a.partial,
+                (unsigned long long)a.top0Missing, (unsigned long long)a.rtN, double(a.rtBytes) / 1048576.0);
+  return s + buf;
+}
+
+// Every 5 s from the submit tick (psoCensus's place): the residency of sampled images by how many mips got a copy recorded (m0 =
+// none: render-target-like or not streamed yet), ASTC apart, so a streamer that keeps lacking mips shows as a flat line. Printed
+// when the numbers changed, at most 240 lines. "Written" = a copy/blit into that mip was RECORDED (not necessarily executed yet).
+void texHistTick(bool force) {
+  static std::atomic<int64_t> nextNs{0};
+  const int64_t nowNs = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+  if (!force && nowNs < nextNs.load(std::memory_order_relaxed)) return;
+  nextNs.store(nowNs + 5'000'000'000LL, std::memory_order_relaxed);
+  static std::string last;
+  static unsigned lines = 0;
+  static const int64_t startNs = nowNs;
+  TexHistAcc a;
+  {
+    std::lock_guard<std::mutex> l(imgRegMutex());
+    for (const Image* im : imgReg()) texHistAdd(a, *im);
+  }
+  const std::string body = texHistFormat(a);
+  if (body == last || lines >= 240) return;
+  last = body, ++lines;
+  logf("vk.tex_hist t=%llus %s", (unsigned long long)((nowNs - startNs) / 1'000'000'000LL), body.c_str());
+}
+}  // namespace vpvk
+
+// ---------------------------------------------------------------------------------------------
 // Device and queue
 // ---------------------------------------------------------------------------------------------
 namespace {
@@ -1283,6 +1500,20 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkCreateDevice(VkPhysicalDevice pd,
                                                           const VkAllocationCallbacks*,
                                                           VkDevice* out) {
   const auto have = deviceExtensions();
+  if (!internalClient()) {  // vk.device_req: what the game asked, once per distinct request (a retry with the same one is not repeated)
+    static std::mutex reqMutex;
+    static std::set<std::string> reqSeen;
+    std::string all;
+    const std::vector<std::string> lines = deviceRequestLines(pd, ci);
+    for (const std::string& l : lines) all += l + "\n";
+    bool first;
+    {
+      std::lock_guard<std::mutex> lock(reqMutex);
+      first = reqSeen.insert(all).second;
+    }
+    if (first)
+      for (const std::string& l : lines) log(l);
+  }
   auto* d = new Device;
   d->physical = from<PhysicalDevice>(pd);
   bool wantIndexU8 = false;
@@ -1790,6 +2021,7 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkCreateImage(VkDevice, const VkImage
     for (auto& pl : img->planes) pl->linear = img->linear;  // planes of a linear multi-planar image are linear as well
   }
   *out = to<VkImage>(img);
+  imgRegAdd(img);
   const bool linearTiling = ci->tiling == VK_IMAGE_TILING_LINEAR;
   if (linearTiling) img->desc.label = "vk.linear";  // gpu.bigframe tiling (core knows no tiling); labels don't affect sharing
   diag::add(linearTiling ? diag::c().imgLinearN : diag::c().imgOptimalN);
@@ -1849,6 +2081,7 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkDestroyImage(VkDevice dv, VkImage im,
     releaseImageTexture(*d, *i);
     if (i->localReadCopy) d->gpu->destroy(i->localReadCopy);
   }
+  imgRegRemove(i);
   delete i;
 }
 
@@ -2679,6 +2912,7 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdCopyBufferToImage(VkCommandBuffer cb
     VkBufferImageCopy c = regions[i];
     Image* im = planeOf(from<Image>(dst), c.imageSubresource.aspectMask);  // a plane of a multi-planar image
     if (im != from<Image>(dst)) c.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    noteMipsWritten(im, c.imageSubresource.mipLevel);
     OpCopyBufferToImage op{from<Buffer>(src), im, c};
     if (isDecodedVolume(*im)) {  // room for the RGBA8 texels; the blocks are decoded at submit (commands.cpp)
       const VkDeviceSize bytes = VkDeviceSize(c.imageExtent.width) * c.imageExtent.height * c.imageExtent.depth * 4;
@@ -3125,6 +3359,7 @@ void runBatches(Device* d, std::vector<DeferredBatch>& list, size_t count) {
   ++d->submits;
   pipelineSummary(d, false);
   psoCensus(d, false);
+  texHistTick();
   cacheStateTick(d);
   ampCensus();
   indirectStatsLog();
