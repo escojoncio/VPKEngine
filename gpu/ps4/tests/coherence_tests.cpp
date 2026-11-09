@@ -1951,51 +1951,77 @@ void compareDepth() {
 }
 
 // A T# array of 8 slices over a depth target drawn in slices 0-5 only (shadow cascades: the T# names more slices than the frame
-// draws): the depth target itself is sampled, no texture is refilled from memory; one of a single layer is not an array and
-// still goes through memory. VPKENGINE_DEPTH_ARRAY_STRICT=1 keeps the old rule (every slice of the T# in the target).
+// draws): when ONE target holds every drawn slice (drawn from the top slice down, or a later frame reusing the biggest target)
+// the depth target itself is sampled and no texture is refilled from memory. Drawn in ascending order for the first time, each slice
+// has a target of its own (layers 1..6) and the biggest holds only the last slice: the T# is then filled from memory, which has them
+// all. One layer is not an array, an MSAA array (type 15) is never taken loosely. VPKENGINE_DEPTH_ARRAY_STRICT=1 keeps the old rule.
 void compareDepthArray() {
     ProbeOn probe;
     const Program cmp = load("ps_sample_compare");
-    auto arrayDraw = [&](Fixture& f) {
+    auto arrayDraw = [&](Fixture& f, uint32_t type = 13) {
         vpps4::DrawState d = f.state();
         d.color[0].address = kOut;
         d.ps.code = cmp.code;
         d.ps.userSgprs = 12;
         d.ps.userData.fill(0);
         Fixture::tsharp(d.ps.userData.data(), kDepth, 128, 128, 4, 7, 8);
-        d.ps.userData[3] = (d.ps.userData[3] & 0x0fffffffu) | (13u << 28);  // 2D array
+        d.ps.userData[3] = (d.ps.userData[3] & 0x0fffffffu) | (type << 28);  // 2D array
         d.ps.userData[5] = 7u << 13;                                        // slices 0..7
         f.renderer.draw(d);
     };
-    auto drawSlices = [](Fixture& f, uint16_t last) {
-        for (uint16_t s = 0; s <= last; ++s) {
+    auto drawSlices = [](Fixture& f, uint16_t last, bool descending = false) {
+        for (uint16_t k = 0; k <= last; ++k) {
             vpps4::DrawState d = f.depthState(true);
-            d.depth.sliceStart = s;
+            d.depth.sliceStart = descending ? uint16_t(last - k) : k;
             f.renderer.draw(d);
         }
     };
-    {
+    auto fromMemory = [&](Fixture& f) { return qual(f, "cmp_route_texture_from_memory") == 1 && qual(f, "cmp_route_depth_target_found") == 0; };
+    auto fromTarget = [&](Fixture& f) { return qual(f, "cmp_route_depth_target_found") == 1 && qual(f, "cmp_route_texture_from_memory") == 0; };
+    {  // top slice first: one target of 6 layers holds them all
+        Fixture f;
+        drawSlices(f, 5, true);
+        arrayDraw(f);
+        CHECK(fromTarget(f));
+        CHECK(qual(f, "compare_mismatch") == 0);
+        CHECK(Fixture::count(f.events(), "copy retile ") == 0);
+        if (failures) f.dump();
+    }
+    {  // ascending, first frame: six targets of 1..6 layers, the biggest has only slice 5 -> memory
         Fixture f;
         drawSlices(f, 5);
         arrayDraw(f);
-        CHECK(qual(f, "cmp_route_depth_target_found") == 1 && qual(f, "cmp_route_texture_from_memory") == 0);
-        CHECK(qual(f, "compare_mismatch") == 0);
-        CHECK(Fixture::count(f.events(), "copy retile ") == 0);
+        CHECK(fromMemory(f));
+        if (failures) f.dump();
+    }
+    {  // ... the next frame's draws all go to the biggest target (it holds every slice now) -> the target
+        Fixture f;
+        drawSlices(f, 5);
+        f.renderer.submit();
+        drawSlices(f, 5);
+        arrayDraw(f);
+        CHECK(fromTarget(f));
         if (failures) f.dump();
     }
     {
         Fixture f;
         drawSlices(f, 0);
         arrayDraw(f);
-        CHECK(qual(f, "cmp_route_texture_from_memory") == 1 && qual(f, "cmp_route_depth_target_found") == 0);
+        CHECK(fromMemory(f));
+    }
+    {  // an MSAA array T# is not taken loosely
+        Fixture f;
+        drawSlices(f, 5, true);
+        arrayDraw(f, 15);
+        CHECK(fromMemory(f));
     }
     {
         setenv("VPKENGINE_DEPTH_ARRAY_STRICT", "1", 1);
         Fixture f;
-        drawSlices(f, 5);
+        drawSlices(f, 5, true);
         arrayDraw(f);
         unsetenv("VPKENGINE_DEPTH_ARRAY_STRICT");
-        CHECK(qual(f, "cmp_route_texture_from_memory") == 1 && qual(f, "cmp_route_depth_target_found") == 0);
+        CHECK(fromMemory(f));
     }
 }
 

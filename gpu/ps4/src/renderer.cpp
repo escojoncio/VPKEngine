@@ -3672,8 +3672,16 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         for (Target& c : t->second) {
             if (exact ? c.width != d.width || c.height != d.height : c.width < d.width || c.height < d.height) continue;
             // (a depth array drawn in fewer slices than its T# names, e.g. shadow cascades: the drawn slices are the target's,
-            // the rest were never drawn; refilling all of them from memory every frame would round-trip the target)
-            if (lastSlice >= c.layers && !(depth && depthArrayLoose && arrayed && c.layers > 1 && d.baseArray < c.layers)) continue;
+            // the rest were never drawn; refilling all of them from memory every frame would round-trip the target. Only when
+            // no smaller target at this address was used as recently as this one: drawn in ascending order the first time,
+            // every slice got a target of its own and the biggest holds only the last; memory has them all. Not for an MSAA array.)
+            if (lastSlice >= c.layers) {
+                if (!(depth && depthArrayLoose && arrayed && d.type != 15 && c.layers > 1 && d.baseArray < c.layers)) continue;
+                bool holdsAll = true;
+                for (const Target& o : t->second)
+                    if (&o != &c && o.layers < c.layers && o.lastUse >= c.lastUse) holdsAll = false;
+                if (!holdsAll) continue;
+            }
             if (!depth && !anyFormat && c.format != f && !sameTexel(c.format, f)) continue;
             if (!best || (c.format == f && best->format != f)) best = &c;
         }
