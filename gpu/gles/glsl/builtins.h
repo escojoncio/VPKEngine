@@ -1,6 +1,7 @@
 // Internal: built-in function signatures (resolution by argument types) of GLSL ES 1.00-3.20.
 #pragma once
 
+#include <algorithm>
 #include <optional>
 #include <set>
 #include <string>
@@ -15,6 +16,15 @@ struct BuiltinCtx {
     int version;
     const std::set<std::string>* extensions;
     bool ext(const char* e) const { return extensions && extensions->count(e); }
+    // Strict-mode rules this resolution let through (lenient mode); may be null.
+    std::vector<std::string>* lenient = nullptr;
+    // True when a rule the language has but a lenient driver does not enforce does not apply: always in lenient mode
+    // (the rule is noted), never in strict mode.
+    bool lenientAllows(const char* rule) const {
+        if (strictMode()) return false;
+        if (lenient && std::find(lenient->begin(), lenient->end(), rule) == lenient->end()) lenient->push_back(rule);
+        return true;
+    }
 };
 
 namespace Builtins {

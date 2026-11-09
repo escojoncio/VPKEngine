@@ -77,7 +77,7 @@ fragment VpOut vp_main(VpIn vp_in [[stage_in]],
     const float3 v57 = v56 - vp_in.world_pos;
     const float3 v58 = normalize(v57);
     const float3 v60 = float3(v7.z);
-    const float3 v61 = mix(float3(0.04f), v53, v60);
+    const float3 v61 = fma(v53, v60, fma(float3(0.04f), -v60, float3(0.04f)));
     const float v62 = 1.0f - v7.z;
     const float3 v63 = float3(v62);
     const float3 v64 = v53 * v63;
@@ -366,7 +366,7 @@ fragment VpOut vp_main(VpIn vp_in [[stage_in]],
     const float v326 = pow(v324, 5.0f);
     const float3 v327 = float3(1.0f);
     const float3 v328 = float3(v326);
-    const float3 v329 = mix(v61, v327, v328);
+    const float3 v329 = fma(v327, v328, fma(v61, -v328, v61));
     const float3 v330 = v312 * v64;
     const float3 v331 = float3(v7.x);
     const float3 v332 = l0;
@@ -382,7 +382,7 @@ fragment VpOut vp_main(VpIn vp_in [[stage_in]],
     const float v345 = exp2(v344);
     const float3 v346 = v341.xyz;
     const float3 v347 = float3(v345);
-    const float3 v348 = mix(v346, v339, v347);
+    const float3 v348 = fma(v339, v347, fma(v346, -v347, v346));
     const float3 v350 = float3(v319.x);
     const float3 v351 = v348 * v350;
     const float3 v352 = v351 + v327;

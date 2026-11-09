@@ -134,11 +134,17 @@ std::string interpAttr(const IoVar& v) {
            (v.interp == Interp::Linear ? "_no_perspective" : "_perspective");
 }
 
+bool isStorageCube(const Resource& r) {
+    return r.kind == ResourceKind::StorageTexture && (r.dim == TexDim::Cube || r.dim == TexDim::CubeArray);
+}
+
 std::string textureType(const Resource& r) {
     static const char* color[] = {"texture1d", "texture2d", "texture2d_array", "texture3d", "texturecube",
                                   "texturecube_array"};
     static const char* depth[] = {"", "depth2d", "depth2d_array", "", "depthcube", "depthcube_array"};
     std::string t = r.depth ? depth[unsigned(r.dim)] : color[unsigned(r.dim)];
+    // Storage cubes are 2D arrays of faces (Metal has no atomics on cubes; the driver binds a 2D-array view).
+    if (isStorageCube(r)) t = "texture2d_array";
     if (r.multisample) t = std::string(r.depth ? "depth2d_ms" : "texture2d_ms") + (r.dim == TexDim::D2Array ? "_array" : "");
     t += "<" + scalarName(r.elem);
     if (r.kind == ResourceKind::StorageTexture) {
@@ -254,6 +260,7 @@ private:
                 case ResourceKind::Texture:
                 case ResourceKind::StorageTexture: decl = textureType(r); break;
                 case ResourceKind::BufferSize: decl = "ulong"; break;  // bytes of the bound range
+                case ResourceKind::SamplerBias: decl = "float"; break;  // lod bias of the sampler (8-byte entry: next member is aligned)
             }
             out_ += "    " + decl + " " + ident(r.name) + ";\n";
         }
@@ -277,7 +284,7 @@ private:
                             ident(v.name) + " [[user(loc" + loc + ")]];\n";
                 } else {
                     std::string q = interpAttr(v);
-                    out_ += "    " + typeName(v.type) + " " + ident(v.name) + " [[user(loc" + loc + ")" +
+                    out_ += "    " + typeName(paddedVarying(v, true) ? v.type.withWidth(4) : v.type) + " " + ident(v.name) + " [[user(loc" + loc + ")" +
                             (q.empty() ? "" : ", " + q) + "]];\n";
                 }
             }
@@ -301,6 +308,19 @@ private:
 
     bool isFragDepth(const IoVar& v) const { return m_.stage == Stage::Fragment && v.builtin == Builtin::FragDepth; }
     bool paddedColor(const IoVar& v) const { return m_.stage == Stage::Fragment && v.builtin == Builtin::None; }
+    // Integer varyings (<4 wide) cross the vertex/mesh -> fragment boundary as 4-wide on both sides: Vulkan lets the
+    // fragment shader read fewer components than the previous stage writes (ivec4 out, ivec2 in); Metal does not accept
+    // an int2 fragment input fed by an int4 output. Per-primitive and builtin values are not matched that way.
+    bool paddedVarying(const IoVar& v, bool input) const {
+        if (v.builtin != Builtin::None || v.perPrimitive || !v.type.isInt() || v.type.width >= 4) return false;
+        return input ? m_.stage == Stage::Fragment : (m_.stage == Stage::Vertex || m_.stage == Stage::Mesh);
+    }
+    // `e` (the IoVar's own width) widened to 4 with zeros.
+    std::string padVarying(const IoVar& v, const std::string& e) const {
+        std::string pad;
+        for (unsigned i = v.type.width; i < 4; ++i) pad += ", " + literal(v.type.scalar, 0u);
+        return typeName(v.type.withWidth(4)) + "(" + e + pad + ")";
+    }
 
     bool hasPrimitiveOutputs() const {
         return std::any_of(m_.outputs.begin(), m_.outputs.end(), [](const IoVar& v) { return v.perPrimitive; });
@@ -326,7 +346,7 @@ private:
             else attr = "user(loc" + std::to_string(v.location) + (v.component ? "_" + std::to_string(v.component) : "") + ")";
             // Fragment colour outputs are always 4-wide: Metal refuses a pipeline whose output has
             // fewer components than the attachment's format (Vulkan leaves the rest undefined).
-            const Type mt = paddedColor(v) ? v.type.withWidth(4) : v.type;
+            const Type mt = paddedColor(v) || paddedVarying(v, false) ? v.type.withWidth(4) : v.type;
             std::string member = "    " + typeName(mt) + " " + ident(v.name) + " [[" + attr + "]];\n";
             if (isFragDepth(v)) member = "#ifndef VP_NO_FDEPTH\n" + member + "#endif\n";
             out_ += member;
@@ -904,6 +924,7 @@ private:
             case TexDim::D2Array: return c + ".xy, " + layer('z');
             case TexDim::Cube: return integer ? c + ".xy, " + c + ".z" : c;
             case TexDim::CubeArray:
+                if (isStorageCube(r)) return c + ".xy, " + c + ".w * 6u + " + c + ".z";  // slice = layer * 6 + face
                 return integer ? c + ".xy, " + c + ".z, " + c + ".w" : c + ".xyz, " + layer('w');
             default: return c;
         }
@@ -917,12 +938,20 @@ private:
         size_t i = 1;  // optional operands follow the coordinate
         std::string lod, offset, compare;
         static const char* grad[] = {"", "gradient2d", "gradient2d", "gradient3d", "gradientcube", "gradientcube"};
-        if (in.image & kImageLod) lod = "level(" + ex(in.args[i++]) + ")";
-        if (in.image & kImageBias) lod = "bias(" + ex(in.args[i++]) + ")";
+        // The sampler's lod bias (a backend-written argument; EmitOptions::samplerBias), added to the lod.
+        std::string sb;
+        if (!gather)
+            for (const Resource& x : m_.resources)
+                if (x.kind == ResourceKind::SamplerBias && x.index == m_.resources[in.sampler].index) sb = "vp_args." + ident(x.name);
+        const std::string plus = sb.empty() ? "" : " + " + sb;
+        if (in.image & kImageLod) lod = "level(" + ex(in.args[i++]) + plus + ")";
+        if (in.image & kImageBias) lod = "bias(" + ex(in.args[i++]) + plus + ")";
         if (in.image & kImageGrad) {
-            lod = std::string(grad[unsigned(r.dim)]) + "(" + ex(in.args[i]) + ", " + ex(in.args[i + 1]) + ")";
+            const std::string scale = sb.empty() ? "" : " * exp2(" + sb + ")";  // lod + bias = log2(rho * 2^bias)
+            lod = std::string(grad[unsigned(r.dim)]) + "(" + ex(in.args[i]) + scale + ", " + ex(in.args[i + 1]) + scale + ")";
             i += 2;
         }
+        if (lod.empty() && !sb.empty() && m_.stage == Stage::Fragment) lod = "bias(" + sb + ")";
         if (in.image & kImageOffset) offset = ex(in.args[i++]);
         if (in.image & kImageCompare) compare = ex(in.args[i++]);
         if (in.image & kImageMinLod) {
@@ -964,7 +993,8 @@ private:
         std::vector<std::string> parts = {t + ".get_width(" + lod + ")"};
         if (in.type.width > 1) parts.push_back(t + ".get_height(" + lod + ")");
         if (in.type.width > 2)
-            parts.push_back(r.dim == TexDim::D3 ? t + ".get_depth(" + lod + ")" : t + ".get_array_size()");
+            parts.push_back(r.dim == TexDim::D3 ? t + ".get_depth(" + lod + ")"
+                                                : t + ".get_array_size()" + (isStorageCube(r) ? " / 6u" : ""));
         if (parts.size() == 1) return parts[0];
         std::string s = typeName(in.type) + "(";
         for (size_t k = 0; k < parts.size(); ++k) s += (k ? ", " : "") + parts[k];
@@ -1007,13 +1037,24 @@ private:
         if (v.builtin == Builtin::AmplificationId) return "(uint(" + builtinParam(v) + ") + vp_view_base)";
         if (v.builtin != Builtin::None) return builtinParam(v);
         std::string e = "vp_in." + ident(v.name);
+        if (paddedVarying(v, true)) return e + std::string(".xyz").substr(0, v.type.width == 1 ? 2 : v.type.width + 1);
         if (interpolated_.contains(i))
             return e + (v.sampling == Sampling::Centroid ? ".interpolate_at_centroid()" : ".interpolate_at_center()");
         return e;
     }
 
     std::string meshAggregate(const char* type, const Inst& in) const {
-        return std::string(type) + "{" + args(in, 1) + "}";
+        if (std::string_view(type) != "VpVertex") return std::string(type) + "{" + args(in, 1) + "}";
+        // Padded integer varyings (paddedVarying): the aggregate's values follow the per-vertex outputs in order (ir verify).
+        std::string s;
+        size_t k = 1;
+        for (const IoVar& v : m_.outputs) {
+            if (v.perPrimitive || k >= in.args.size()) continue;
+            s += (k > 1 ? ", " : "") + (paddedVarying(v, false) ? padVarying(v, ex(in.args[k])) : ex(in.args[k]));
+            ++k;
+        }
+        for (; k < in.args.size(); ++k) s += (s.empty() ? "" : ", ") + ex(in.args[k]);
+        return std::string(type) + "{" + s + "}";
     }
 
     void inst(const Inst& in) {
@@ -1054,6 +1095,8 @@ private:
                                                        : v.type.isFloat() ? std::bit_cast<uint32_t>(1.0f) : 1u);
                     return line("vp_out.", ident(v.name), " = ", typeName(v.type.withWidth(4)), "(", a(0), pad, ");");
                 }
+                if (const IoVar& v = m_.outputs[in.sym]; paddedVarying(v, false))
+                    return line("vp_out.", ident(v.name), " = ", padVarying(v, a(0)), ";");
                 return line("vp_out.", ident(m_.outputs[in.sym].name), " = ", a(0), ";");
             case Op::Call: {
                 std::string c = helperName(in.sym) + "(" + args(in) + ")";
@@ -1068,8 +1111,9 @@ private:
             case Op::Div:
                 return define(in, t.isFloat() && in.precise ? call("precise::divide", in) : bin("/", in));
             case Op::Rem: return define(in, t.isFloat() ? math("fmod", in) : bin("%", in));
-            case Op::Min: return define(in, call("min", in));
-            case Op::Max: return define(in, call("max", in));
+            // precise Min / Max (SPIR-V NMin / NMax): a NaN operand loses, which min()/max() under fast math do not promise.
+            case Op::Min: return define(in, call(t.isFloat() && in.precise ? "precise::fmin" : "min", in));
+            case Op::Max: return define(in, call(t.isFloat() && in.precise ? "precise::fmax" : "max", in));
             case Op::And: return define(in, bin(t.isBool() ? "&&" : "&", in));
             case Op::Or: return define(in, bin(t.isBool() ? "||" : "|", in));
             case Op::Xor: return define(in, bin(t.isBool() ? "!=" : "^", in));
@@ -1077,7 +1121,14 @@ private:
             case Op::Shr: return define(in, bin(">>", in));
             case Op::Fma: return define(in, call("fma", in));  // single rounding in either mode
             case Op::Clamp: return define(in, call("clamp", in));
-            case Op::Mix: return define(in, call("mix", in));
+            case Op::Mix: {
+                // x + (y - x) * a with exact ends: mix(x, y, 1) == y and mix(x, y, 0) == x for any finite x, y
+                // (mix() / x * (1 - a) + y * a lose the small operand against a large one). `a` is splatted if scalar.
+                std::string w = a(2);
+                if (fn_->typeOf(in.args[2]).width != t.width) w = typeName(t) + "(" + w + ")";
+                const std::string nw = (w[0] == '-' ? "-(" + w + ")" : "-" + w);
+                return define(in, "fma(" + a(1) + ", " + w + ", fma(" + a(0) + ", " + nw + ", " + a(0) + "))");
+            }
             case Op::Eq: return define(in, bin("==", in));
             case Op::Ne: return define(in, bin("!=", in));
             case Op::Lt: return define(in, bin("<", in));
@@ -1280,13 +1331,13 @@ private:
             case Op::Barrier: return line("threadgroup_barrier(mem_flags::mem_threadgroup);");
             case Op::BarrierAll:
                 return line("threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup | mem_flags::mem_texture);");
-            case Op::SubgroupBallot:
-                return define(in, "uint4(as_type<uint2>(simd_vote::vote_t(simd_ballot(" + a(0) + "))), 0u, 0u)");
+            case Op::SubgroupBallot: return define(in, "uint4(" + activeWord(a(0)) + ", 0u, 0u, 0u)");
             case Op::SubgroupBroadcast: return define(in, "simd_broadcast(" + a(0) + ", ushort(" + a(1) + "))");
             case Op::SubgroupShuffle: return define(in, "simd_shuffle(" + a(0) + ", ushort(" + a(1) + "))");
-            case Op::SubgroupReadFirst: return define(in, call("simd_broadcast_first", in));
+            case Op::SubgroupReadFirst: return readFirst(in);
             case Op::SubgroupAny: return define(in, call("simd_any", in));
             case Op::SubgroupAll: return define(in, call("simd_all", in));
+            case Op::SubgroupArith: return subgroupArith(in);
             case Op::QuadShuffle: return define(in, "quad_shuffle(" + a(0) + ", ushort(" + a(1) + "))");
             case Op::QuadAny: return define(in, call("quad_any", in));
             case Op::MeshDispatch: return line("vp_grid.set_threadgroups_per_grid(uint3(", args(in), "));");
@@ -1298,12 +1349,112 @@ private:
         }
     }
 
+    // Name of the lane-id parameter ([[thread_index_in_simdgroup]]), "" when the stage has none (vertex).
+    std::string laneParam() const {
+        for (const IoVar& v : m_.inputs)
+            if (v.builtin == Builtin::SubgroupInvocation) return builtinParam(v);
+        return {};
+    }
+
+    // Lanes (bit i = lane i of the 32-wide SIMD-group) of the ACTIVE invocations whose `pred` is true (all active ones for
+    // ""). Built with simd_or of one bit per lane: the Metal compiler treats simd_ballot() and simd_active_threads_mask()
+    // as pure calls and merges two of them across a divergent branch (the second one in `if (odd lane)` returned the
+    // mask of the whole SIMD-group on device: CTS subgroups arithmetic / ballot_broadcast); a simd_or reduction is not merged.
+    // Without a lane id (vertex shaders) the plain calls stay.
+    std::string activeWord(const std::string& pred) const {
+        const std::string lane = laneParam();
+        const bool all = pred.empty() || pred == "true";
+        if (lane.empty())
+            return "as_type<uint2>(simd_vote::vote_t(" + (all ? std::string("simd_active_threads_mask()") : "simd_ballot(" + pred + ")") + ")).x";
+        return all ? "simd_or(1u << " + lane + ")" : "simd_or((" + pred + ") ? (1u << " + lane + ") : 0u)";
+    }
+
+    // subgroup_read_first: the value of the lowest ACTIVE lane. Only that lane contributes its bits to a simd_or. Not
+    // simd_broadcast_first: on device it hung the GPU in a fragment shader when the value came from a comparison with the
+    // elected lane (CTS vote.graphics.subgroupallequal_bvec2, 2-wide; the isolated shader hangs with simd_broadcast_first
+    // and with simd_shuffle of the first lane, not with this).
+    void readFirst(const Inst& in) {
+        if (!uses_.contains(in.result)) return;
+        const std::string lane = laneParam();
+        if (lane.empty()) return define(in, "simd_broadcast_first(" + ex(in.args[0]) + ")");
+        const std::string id = std::to_string(in.result), f = "sf" + id, x = "sv" + id;
+        line("const bool ", f, " = ", lane, " == ctz(", activeWord(""), ");");
+        line("const ", typeName(in.type), " ", x, " = ", ex(in.args[0]), ";");
+        const Scalar sc = in.type.scalar;
+        std::string e = in.type.width > 1 ? typeName(in.type) + "(" : "";
+        for (unsigned k = 0; k < in.type.width; ++k) {
+            const std::string c = in.type.width > 1 ? x + "." + "xyzw"[k] : x;
+            std::string bits = sc == Scalar::U32 ? c : sc == Scalar::F16 ? "uint(as_type<ushort>(" + c + "))" : "as_type<uint>(" + c + ")";
+            std::string r = "simd_or(" + f + " ? " + bits + " : 0u)";
+            if (sc == Scalar::I32) r = "as_type<int>(" + r + ")";
+            else if (sc == Scalar::F32) r = "as_type<float>(" + r + ")";
+            else if (sc == Scalar::F16) r = "as_type<half>(ushort(" + r + "))";
+            e += std::string(k ? ", " : "") + r;
+        }
+        define(in, in.type.width > 1 ? e + ")" : e);
+    }
+
+    // subgroup_arith (ir.h): Metal's own simd_* reductions, simd_prefix_{inclusive,exclusive}_{sum,product} for the two scans
+    // it has, and for every other scan / clustered reduction a loop over the 32 lanes combining the values of the ACTIVE
+    // lanes in range (every active lane runs all 32 shuffles, so each shuffle reads a lane that is running). Vectors go
+    // component by component.
+    void subgroupArith(const Inst& in) {
+        if (!uses_.contains(in.result)) return;
+        const uint32_t kind = in.lits[0], mode = in.lits[1], cluster = in.lits[2], identityBits = in.lits[3];
+        const Type t = in.type, et = t.element();
+        const std::string id = std::to_string(in.result), x = "sx" + id;
+        static const char* const reduceFn[] = {"simd_sum", "simd_product", "simd_min", "simd_max", "simd_and", "simd_or", "simd_xor"};
+        line("const ", typeName(t), " ", x, " = ", ex(in.args[0]), ";");
+        const bool builtin = mode == 0 || ((mode == 1 || mode == 2) && kind <= 1);
+        const std::string mask = "sm" + id, lane = "sl" + id;
+        if (!builtin) {
+            line("const uint ", mask, " = ", activeWord(""), ";");
+            line("const uint ", lane, " = ", ex(in.args[1]), ";");
+        }
+        // Identity element: integers carry their bits; floats 0, 1, +inf, -inf.
+        const bool half = et.scalar == Scalar::F16;
+        uint32_t idBits = identityBits;
+        if (et.isFloat()) {
+            static const uint32_t f32[] = {0u, 0x3F800000u, 0x7F800000u, 0xFF800000u}, f16[] = {0u, 0x3C00u, 0x7C00u, 0xFC00u};
+            idBits = kind < 4 ? (half ? f16 : f32)[kind] : 0u;
+        }
+        std::string results;
+        for (unsigned k = 0; k < t.width; ++k) {
+            const std::string c = t.width > 1 ? x + "." + "xyzw"[k] : x;
+            std::string r;
+            if (builtin) {
+                r = mode == 0 ? std::string(reduceFn[kind]) + "(" + c + ")"
+                              : std::string(mode == 1 ? "simd_prefix_inclusive_" : "simd_prefix_exclusive_") + (kind == 0 ? "sum" : "product") + "(" + c + ")";
+            } else {
+                r = "sa" + id + "_" + std::to_string(k);
+                std::string cond = mode == 1 ? "sk <= " + lane : mode == 2 ? "sk < " + lane : "";
+                if (mode == 3) {
+                    const std::string lg = std::to_string(std::countr_zero(cluster));
+                    cond = "(sk >> " + lg + "u) == (" + lane + " >> " + lg + "u)";
+                }
+                static const char* const combine[] = {"sacc + sv", "sacc * sv", "min(sacc, sv)", "max(sacc, sv)", "sacc & sv", "sacc | sv", "sacc ^ sv"};
+                std::string body = combine[kind];
+                for (size_t at; (at = body.find("sacc")) != std::string::npos;) body.replace(at, 4, r);
+                line(typeName(et), " ", r, " = ", literal(et.scalar, idBits), ";");
+                line("for (uint sk = 0u; sk < 32u; ++sk) {");
+                line("    const ", typeName(et), " sv = simd_shuffle(", c, ", ushort(sk));");
+                line("    if (((", mask, " >> sk) & 1u) != 0u && ", cond, ") ", r, " = ", body, ";");
+                line("}");
+            }
+            results += (k ? ", " : "") + r;
+        }
+        define(in, t.width > 1 ? typeName(t) + "(" + results + ")" : results);
+    }
+
     // Bounds condition of a storage-buffer access of `bytes` at `addr` (robust mode), "" when the
     // target is not checked. 64-bit compare: addr + bytes cannot wrap.
     std::string guard(uint32_t target, ValueId addr, unsigned bytes) const {
         auto it = sizeOf_.find(target);
         if (it == sizeOf_.end()) return {};
-        return "ulong(" + ex(addr) + ") + " + std::to_string(bytes ? bytes : 4) + "ul <= " + texture(it->second);
+        // The range counts rounded up to a word (robustStorageBufferAccessSizeAlignment = 4): 8/16-bit members at the
+        // end of a buffer of an odd size are read and merged as whole words (spirv lower.cpp load16 / store16).
+        return "ulong(" + ex(addr) + ") + " + std::to_string(bytes ? bytes : 4) + "ul <= ((" + texture(it->second) +
+               " + 3ul) & ~3ul)";
     }
     // An atomic's result (or the bare statement when unused), under the bounds guard when robust.
     void atomicDefine(const Inst& in, const std::string& e) {
@@ -1349,6 +1500,14 @@ private:
     std::unordered_map<uint32_t, uint32_t> sizeOf_;  // robust: Buffer resource -> its BufferSize resource
 };
 
+// Ops that build the active mask (activeWord) and need the lane id.
+bool usesBallot(const Block& b) {
+    return std::any_of(b.begin(), b.end(), [](const Node& n) {
+        return (n.kind == NodeKind::Inst && (n.inst.op == Op::SubgroupBallot || n.inst.op == Op::SubgroupReadFirst)) ||
+               usesBallot(n.body) || usesBallot(n.elseBody);
+    });
+}
+
 }  // namespace
 
 EmitResult emitMsl(const Module& module, const EmitOptions& options) {
@@ -1363,6 +1522,13 @@ EmitResult emitMsl(const Module& module, const EmitOptions& options) {
             r.errors.push_back(why);
             return r;
         }
+    }
+    if ((m.stage == Stage::Fragment || m.stage == Stage::Compute) &&
+        std::any_of(m.functions.begin(), m.functions.end(), [](const Function& f) { return usesBallot(f.body); }) &&
+        std::none_of(m.inputs.begin(), m.inputs.end(), [](const IoVar& v) { return v.builtin == Builtin::SubgroupInvocation; })) {
+        IoVar lane;  // activeWord() needs the lane id
+        lane.builtin = Builtin::SubgroupInvocation, lane.name = "lane", lane.type = vpir::kU32;
+        m.inputs.push_back(lane);
     }
     if (options.robustBuffers) {
         // A BufferSize entry for every storage buffer the shader loads, stores or does atomics on.
@@ -1391,10 +1557,32 @@ EmitResult emitMsl(const Module& module, const EmitOptions& options) {
             m.resources.push_back(r);
         }
     }
+    if (options.samplerBias) {
+        // A SamplerBias entry for every sampler a sample goes through.
+        std::set<uint32_t> used;
+        std::function<void(const Block&)> walk = [&](const Block& b) {
+            for (const Node& n : b) {
+                const Inst& in = n.inst;
+                if (n.kind == NodeKind::Inst && in.op == Op::ImageSample && in.sampler < m.resources.size())
+                    used.insert(m.resources[in.sampler].index);
+                walk(n.body);
+                walk(n.elseBody);
+            }
+        };
+        for (const Function& f : m.functions) walk(f.body);
+        for (uint32_t slot : used) {
+            Resource r;
+            r.kind = ResourceKind::SamplerBias;
+            r.index = slot;
+            r.name = "sbias" + std::to_string(slot);
+            r.access = Access::Read;
+            m.resources.push_back(r);
+        }
+    }
     if (options.positionalNames) {
         // Same order as argumentBuffer(): (kind, slot).
-        static const char* prefix[] = {"b", "c", "t", "s", "u", "bs"};  // by ResourceKind
-        static_assert(std::size(prefix) == size_t(ResourceKind::BufferSize) + 1);
+        static const char* prefix[] = {"b", "c", "t", "s", "u", "bs", "sb"};  // by ResourceKind
+        static_assert(std::size(prefix) == size_t(ResourceKind::SamplerBias) + 1);
         std::vector<size_t> order(m.resources.size());
         for (size_t i = 0; i < order.size(); ++i) order[i] = i;
         std::sort(order.begin(), order.end(), [&](size_t a, size_t b) {
@@ -1417,8 +1605,8 @@ EmitResult emitMsl(const Module& module, const EmitOptions& options) {
 }
 
 std::string describeKey(const MslShader& s) {
-    static const char* kind[] = {"b", "c", "t", "s", "u", "bs"};  // by ResourceKind
-    static_assert(std::size(kind) == size_t(ResourceKind::BufferSize) + 1);
+    static const char* kind[] = {"b", "c", "t", "s", "u", "bs", "sb"};  // by ResourceKind
+    static_assert(std::size(kind) == size_t(ResourceKind::SamplerBias) + 1);
     char head[96];
     std::snprintf(head, sizeof head, "src=%016llx bytes=%zu args=", (unsigned long long)sourceHash(s.source), s.source.size());
     std::string out = head;

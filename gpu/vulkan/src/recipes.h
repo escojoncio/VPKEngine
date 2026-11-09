@@ -66,8 +66,8 @@ namespace vpvk {
 // BaseVertex/BaseInstance/DrawIndex); 9 robustBufferAccess; 10 loop nests bounded as a whole; 11 16-bit storage;
 // 12 Y'CbCr lowering; 13 VPKTAA nativo: UI fragment shaders with an extra mask output (uiMaskSlot).
 inline constexpr uint32_t kTranslatorBaseline = 13;
-inline constexpr uint32_t kLowerVersion = 3;  // 1: Invariant position, OpKill leaves loops, storage image access from use; 2: killExit on by default; 3: row-major matrices load one vector per memory row, one killExit check for a chain of kills
-inline constexpr uint32_t kEmitVersion = 3;  // 1: constant-only private arrays as program-scope `constant` tables; 2: no loop guard on loops that cannot repeat (switches, inlined calls); 3: vertex amplification view = amplification_id + vp_view_base (buffer 27)
+inline constexpr uint32_t kLowerVersion = 13;  // 13: every vertex position is Invariant (invariantPos, VPVK_INVARIANT_POS); 12: float -> integer conversions skip the NaN/overflow selects when the operand range is bounded; 11: OpGroupNonUniform{I,F}{Add,Mul} / {S,U,F}{Min,Max} / Bitwise / Logical (subgroup_arith); 10: OpGroupNonUniformShuffleXor / Up / Down; 9: ldexp exponents beyond the float range (three-way split), Output variable initializers, memory pointers returned by functions, image memory barriers fence the device; 8: gl_Subgroup{Eq,Ge,Gt,Le,Lt}Mask; 7: narrow-int vector <-> word bitcasts, OpSpecConstantOp ShiftRightArithmetic; 6: 16-bit float math (constants in binary16, hyperbolics / exp / log / atan / frexp / ldexp / cross / reflect / determinant in 32 bits); 5: float -> integer conversions saturate (NaN = 0); 4: integer dot product, zero-initialised workgroup memory; 1: Invariant position, OpKill leaves loops, storage image access from use; 2: killExit on by default; 3: row-major matrices load one vector per memory row, one killExit check for a chain of kills
+inline constexpr uint32_t kEmitVersion = 12;  // 12: Mix as fma(y, a, fma(x, -a, x)) (exact at a = 0 and 1), NMin / NMax / NClamp as precise::fmin / fmax; 11: sampler mipLodBias added in the shader (SamplerBias argument per sampled sampler); 10: subgroup ballot / active mask / read-first as simd_or of one bit per lane (simd_ballot and simd_active_threads_mask are merged across divergent branches; simd_broadcast_first hung a fragment shader); 9: subgroup_arith (simd_sum / prefix builtins, lane loop for the other scans and clustered reductions); 8: subgroup read-first of vectors lane by lane; 7: integer varyings under 4 wide cross VS/mesh -> FS as 4-wide; 6: subgroup read-first from the active mask (simd_shuffle of the lowest active lane); 5: storage cubes are texture2d_array (slice = layer * 6 + face); 4: robust storage-buffer bounds count the range rounded up to a word; 1: constant-only private arrays as program-scope `constant` tables; 2: no loop guard on loops that cannot repeat (switches, inlined calls); 3: vertex amplification view = amplification_id + vp_view_base (buffer 27)
 inline constexpr uint32_t kDriverVersion = 1;  // 1: StageIface keeps dualSource (Src1 blend factors need it)
 // What recipes.bin stores per record (`translator`): equal to 13 while every component is at 0, so files written
 // before the split stay valid. Any component bump changes it.
@@ -93,6 +93,9 @@ inline constexpr uint32_t kVulkanLoopGuard = 65536;
 //                     words through MSL's unpack_*_to_float.
 //  bit 3 killExitOff  VPSPV_KILL_EXIT=0 (default 1 = on, so the default mode stays 0): without it a fragment shader keeps
 //                     running after every lane of its SIMD-group is killed.
+//  bit 4 invariantPosOff  VPVK_INVARIANT_POS=0 / off / false (default on; any other value leaves it on): without it only the
+//                     positions the shader decorates Invariant (GLSL `invariant gl_Position`, #pragma STDGL invariant(all))
+//                     are [[position, invariant]].
 // They change the MSL of the stored inputs without being part of them (SpirvLowerOptions::amplify / nativeFetch are not in
 // the input's hash or encoding), so they travel with the translator id instead.
 uint32_t translatorMode();
@@ -138,6 +141,17 @@ struct StageIface {
 // (Metal rejects the pipeline otherwise): without them they fall back to the first source. Applied by
 // createGraphics and by the recipe store, so a prewarmed pipeline has the key the runtime computes.
 void degradeSrc1Blend(vpgpu::PipelineState& st, bool dualSource);
+
+// The variants of a pipeline the runtime asks for under forced MSAA, derived in one place so the prewarm and the runtime
+// (pipelines.cpp pipelineFor / maskPipelineKey) get the same state and therefore the same key. msaaVariantState: the
+// pipeline with the pass's sample count ('.msN'). applyUiMaskTarget: the R8 mask target at taa::kUiMaskSlot on a mask
+// variant ('.ums': the draw leaves it untouched; writes: '.umu', the fragment shader also writes it).
+vpgpu::PipelineState msaaVariantState(const vpgpu::PipelineState& base, uint8_t samples);
+void applyUiMaskTarget(vpgpu::PipelineState& st, bool writes);
+// What the runtime would add to `s` (a recipe) with forced MSAA of `n` (>= 2) samples, appended to `out`: its '.msN' variant,
+// and with `masks` (VPKTAA UI mask on) its '.ums' variant; a recipe that already is a mask variant ('.ums' / '.umu') comes
+// again with n samples. Only pipelines of a pass forceMsaa can serve (colour 0 + depth, nothing else) and below n samples.
+void forcedMsaaVariants(const vpgpu::PipelineState& s, int n, bool masks, std::vector<vpgpu::PipelineState>& out);
 
 // Translation used by refresh() (pipelines.cpp: same code path as vkCreate*Pipelines, quiet).
 bool translateRecipeStage(const spirv::SpirvModule&, const spirv::SpirvLowerOptions&, uint64_t& mslId, ShaderBlob& blob,
@@ -199,6 +213,14 @@ class RecipeStore {
   };
   Snapshot snapshot() const;
   std::vector<uint64_t> keys() const;
+  // Identity of a recipe that survives a translator change. The pipeline key hashes the shader ids (MSL content hashes), so it
+  // changes whenever refresh() retranslates to other MSL; the identity hashes the pipeline state without its shader ids plus
+  // the stage inputs (SPIR-V + lowering options) the shaders come from, which no translator change moves. It is what
+  // vkGetPipelineCacheData hands the game: the blob of an earlier launch still names the recipes afterwards.
+  static uint64_t recipeId(const vpgpu::PipelineState&, const std::array<uint64_t, 3>& inputs);
+  std::vector<uint64_t> ids() const;  // recipeId of every stored recipe
+  // The pipeline key of the recipe `idOrKey` names: a recipeId, or (blobs written before the identity existed) a pipeline key.
+  bool resolve(uint64_t idOrKey, uint64_t& key) const;
   // The recipe's state. With `shaders`, also the MSL of each of its stages, and false when one of
   // them is missing (the pipeline could not be built: its shader was never registered).
   bool stateFor(uint64_t key, vpgpu::PipelineState& out,
@@ -264,6 +286,7 @@ class RecipeStore {
   std::unordered_map<uint64_t, IfaceRec> ifaces_;  // by input hash ('F' records)
   std::unordered_map<uint64_t, SpirvRec> spirv_;
   std::unordered_map<uint64_t, PipeRec> pipelines_;
+  std::unordered_map<uint64_t, uint64_t> byId_;  // recipeId -> key in pipelines_
   size_t storedThisRun_ = 0, records_ = 0, deadRecords_ = 0;
   bool drift_ = false;        // a run saw the same input give another MSL under the same version
   bool driftWritten_ = false; // drift record appended this run
@@ -275,6 +298,7 @@ class RecipeStore {
 struct PrewarmResult {
   uint32_t recipes = 0, compiled = 0, hits = 0, failed = 0, retranslated = 0;
   uint32_t ready = 0;  // recipes whose pipeline was ready (or already released by the game) when the prewarm ended
+  uint32_t variants = 0, variantsFailed = 0;  // forced MSAA: variants added to the recipes (forcedMsaaVariants), and those that failed
   double ms = 0;
 };
 // precompile.cpp: ahead-of-time build into the Metal binary archive (VPVK_AOT=1, see aotBuild).
@@ -292,11 +316,14 @@ void addShaderLibRecipes(const std::vector<uint64_t>& sourceHashes);
 // Platform::addShader (the device registers every shader once, under its shader mutex, shared with the translate
 // jobs), `refreshThreads` bounds the retranslation of stale recipes (0 = every core), `pollMs` is how often it looks
 // at the compiles. The pipelines are requested at Prefetch priority: whatever the game asks for goes first.
+constexpr uint32_t kPrewarmMaxVariants = 3072;  // forced-MSAA variants a prewarm compiles at most (they stay resident, ownerless)
 struct PrewarmHooks {
   const std::atomic<bool>* cancel = nullptr;
   std::function<void(uint64_t, ShaderBlob)> addShader;
   unsigned refreshThreads = 0;
   uint32_t pollMs = 15;
+  uint32_t maxVariants = 0;  // cap of forced-MSAA variants (0 = kPrewarmMaxVariants)
+  std::function<void()> afterRefresh;  // called once the retranslation is done (the store's keys are final for this run)
 };
 PrewarmResult prewarm(Platform&, vpgpu::PipelineCache&, RecipeStore&,
                       const std::function<void(uint32_t, uint32_t)>& progress, double maxSeconds = 0,

@@ -3,3 +3,4 @@ build/
 .DS_Store
 apps/Demo/Generated/
 apps/Demo/*.xcodeproj
+__pycache__/

@@ -3,16 +3,18 @@
 // (probada en Linux). Dos kernels:
 //   vpktaa_native_resolve  color con jitter (+ profundidad del juego, MSAA o no, + vectores de
 //                          SpaceWarp opcionales) + historia -> historia nueva (rgb lineal, a =
-//                          distancia de vista); sin afilar: la historia nunca se afila dos veces.
-//   vpktaa_native_rcas     RCAS (afilado de FSR, implementación propia) sobre la historia nueva -> salida del ojo
+//                          distancia de vista) y, en el mismo dispatch, salida del ojo SIN afilar
 //                          (codifica sRGB si VPKN_OUT_SRGB: la salida es una vista unorm de una imagen sRGB).
-//                          Sin TAA (RCAS independiente) lee el color del juego (VPKN_RCAS_COLOR).
+//                          El afilado con TAA lo aplica el host sobre esa salida.
+//   vpktaa_native_rcas     RCAS (afilado de FSR, implementación propia) solo sin TAA (RCAS independiente):
+//                          lee el color del juego (VPKN_RCAS_COLOR) -> salida del ojo.
 //   vpktaa_native_depth_*  profundidad MSAA -> depth32Float con la muestra más cercana (o la 0),
 //                          para consumidores de profundidad de 1 muestra (PTW del compositor).
 // Pipeline por píxel g (texels del color):
 //   1. reconstrucción en el centro sin jitter: 3x3 alrededor de g + base con pesos gaussianos
 //      precalculados en CPU (el desplazamiento es uniforme), en espacio tonemapeado reversible y YCoCg;
-//   2. profundidad: la más cercana del 3x3 (dilatación, un borde se mueve con lo que tiene delante);
+//   2. profundidad: la más cercana de la cruz de 5 (dilatación, un borde se mueve con lo que tiene delante);
+//      el 3x3 de color (+ halo) y la profundidad se cargan una vez por threadgroup (kTg x kTg) a memoria compartida;
 //   3. movimiento: objeto (SpaceWarp, si lo hay) y luego cámara por reproyección desde profundidad
 //      + pose (rotación y traslación; sin profundidad o cielo: solo rotación);
 //   4. historia Catmull-Rom de 5 lecturas, recortada contra la caja de varianza YCoCg (estrecha en
@@ -154,28 +156,77 @@ static inline float depthAt(VpknDepthTex d, int2 t, uint slice, uint, bool) {
 }
 #endif
 
+// Threadgroup del resolve (16x16 píxeles; el dispatch de taa_native_metal.mm usa el mismo tamaño y
+// dispatchThreadgroups, así que todos los threadgroups son completos y alcanzan la barrera).
+// kCT: tile de color = threadgroup + halo de 1. kDT: tile de profundidad = threadgroup + halo de 1 +
+// 1 por la deriva de la escala color->profundidad (<1 texel en 16 px si las resoluciones casi coinciden;
+// fuera del tile se lee la textura).
+enum : int { kTg = 16, kCT = kTg + 2, kDT = kTg + 3 };
+
+static inline float depthTile(const threadgroup float* tile, VpknDepthTex d, int2 c, int2 org, uint slice, uint samples, bool rev) {
+    const int2 q = c - org;
+    if (q.x >= 0 && q.y >= 0 && q.x < kDT && q.y < kDT) return tile[q.y * kDT + q.x];
+    return depthAt(d, c, slice, samples, rev);
+}
+
+static inline float3 srgbEncode(float3 c) {
+    c = saturate(c);
+    return select(1.055f * pow(c, 1.0f / 2.4f) - 0.055f, c * 12.92f, c <= 0.0031308f);
+}
+// Salida del ojo (sin afilar): la historia nueva saturada, sRGB si VPKN_OUT_SRGB.
+static inline float3 eyeOut(float3 c, uint flags) {
+    c = saturate(c);
+    return (flags & VPKN_OUT_SRGB) ? srgbEncode(c) : c;
+}
+
 kernel void vpktaa_native_resolve(texture2d_array<float, access::read> color [[texture(0)]],
                                   VpknDepthTex depth [[texture(1)]],
                                   texture2d_array<float> uiMask [[texture(2)]],
                                   texture2d_array<float> motion [[texture(3)]],
                                   texture2d_array<float> history [[texture(4)]],
                                   texture2d_array<float, access::write> historyOut [[texture(5)]],
+                                  texture2d_array<float, access::write> eyeOutTex [[texture(6)]],
                                   constant VpknParams& p [[buffer(0)]],
-                                  uint3 gid [[thread_position_in_grid]]) {
+                                  uint3 gid [[thread_position_in_grid]],
+                                  uint3 lid [[thread_position_in_threadgroup]],
+                                  uint3 tgp [[threadgroup_position_in_grid]]) {
+    threadgroup float3 tileC[kCT * kCT];  // 3x3 de color (+ halo) en YCoCg tonemapeado
+    threadgroup float tileD[kDT * kDT];
+    if (gid.z + p.size.w > 1) return;  // uniforme en el threadgroup (z = ojo): no hay barrera pendiente
     const uint W = p.size.x, H = p.size.y;
-    if (gid.x >= W || gid.y >= H || gid.z + p.size.w > 1) return;
     const uint eyeIx = gid.z + p.size.w;
     constant VpknEye& e = p.eye[eyeIx];
     const uint flags = e.slices.w;
     const bool rev = (flags & VPKN_REVZ) != 0;
+    const bool haveDepth = (flags & VPKN_DEPTH) != 0;
+    const int2 maxT = int2(W, H) - 1;
+
+    // 0. Carga cooperativa a memoria compartida (todos los hilos del threadgroup, antes de cualquier return).
+    // Tile de color: texel (g0 + base - 1 + i) con la misma sujeción a la imagen que la lectura directa.
+    const int tid = int(lid.y) * kTg + int(lid.x);
+    const int2 g0 = int2(tgp.xy) * int(kTg);
+    const int2 cOrg = g0 + p.base.xy - 1;
+    for (int i = tid; i < kCT * kCT; i += kTg * kTg) {
+        const int2 t = clamp(cOrg + int2(i % kCT, i / kCT), int2(0), maxT);
+        tileC[i] = toYCoCg(compress(sane(color.read(uint2(t), e.slices.x).rgb)));
+    }
+    // Tile de profundidad: origen = texel de profundidad del primer píxel del threadgroup, -1.
+    const int2 dOrg = int2(floor((float2(g0 + p.base.xy) + 0.5f) * e.depthAB.xy + e.depthAB.zw)) - 1;
+    if (haveDepth)
+        for (int i = tid; i < kDT * kDT; i += kTg * kTg)
+            tileD[i] = depthAt(depth, dOrg + int2(i % kDT, i / kDT), e.slices.y, p.size.z, rev);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (gid.x >= W || gid.y >= H) return;
     const int2 g = int2(gid.xy);
     const float2 size = float2(W, H);
     const float2 cropSize = e.crop.xy * size, cropOrg = e.crop.zw * size;
     const float2 pc = float2(g) + 0.5f;
     const bool inside = all(pc >= cropOrg) && all(pc <= cropOrg + cropSize);
-    const int2 maxT = int2(W, H) - 1;
     if (!inside) {
-        historyOut.write(float4(sane(color.read(uint2(g), e.slices.x).rgb), p.depthP.z), uint2(g), eyeIx);
+        const float3 c = sane(color.read(uint2(g), e.slices.x).rgb);
+        historyOut.write(float4(c, p.depthP.z), uint2(g), eyeIx);
+        eyeOutTex.write(float4(eyeOut(c, flags), 1.0f), uint2(g), eyeIx);
         return;
     }
 
@@ -184,8 +235,7 @@ kernel void vpktaa_native_resolve(texture2d_array<float, access::read> color [[t
     const int2 b = g + p.base.xy;
     float3 rec = 0.0f, m1 = 0.0f, m2 = 0.0f, lo = float3(1.0e9f), hi = float3(-1.0e9f);
     for (int i = 0; i < 9; ++i) {
-        const int2 t = clamp(b + int2(i % 3, i / 3) - 1, int2(0), maxT);
-        const float3 s = toYCoCg(compress(sane(color.read(uint2(t), e.slices.x).rgb)));
+        const float3 s = tileC[(int(lid.y) + i / 3) * kCT + int(lid.x) + i % 3];
         rec += s * wts[i];
         m1 += s;
         m2 += s * s;
@@ -197,17 +247,18 @@ kernel void vpktaa_native_resolve(texture2d_array<float, access::read> color [[t
     const float uiM = uiCoverage(uiMask, e, g);
     if (uiM > 0.0f) rec = mix(rec, toYCoCg(compress(sane(color.read(uint2(g), e.slices.x).rgb))), uiM);
 
-    // 2. Profundidad: más cercana y más lejana del 3x3, y la propia (texel más cercano).
+    // 2. Profundidad: más cercana y más lejana de la cruz de 5, y la propia (texel más cercano).
+    // Texel de profundidad = centro del texel de color escalado (razón de tamaños; con tamaños iguales depthAB = 1, 0).
     float zNear = 0.0f, zFar = 0.0f, zOwn = 0.0f;
     int2 nearT = b + p.base.zw;
-    const bool haveDepth = (flags & VPKN_DEPTH) != 0;
     if (haveDepth) {
-        const int2 dc = int2(floor(float2(b) * e.depthAB.xy + e.depthAB.zw));
-        zOwn = depthAt(depth, int2(floor(float2(b + p.base.zw) * e.depthAB.xy + e.depthAB.zw)), e.slices.y, p.size.z, rev);
+        const int2 dc = int2(floor((float2(b) + 0.5f) * e.depthAB.xy + e.depthAB.zw));
+        zOwn = depthTile(tileD, depth, int2(floor((float2(b + p.base.zw) + 0.5f) * e.depthAB.xy + e.depthAB.zw)), dOrg,
+                         e.slices.y, p.size.z, rev);
         zNear = zFar = zOwn;
-        for (int i = 0; i < 9; ++i) {
-            const int2 o = int2(i % 3, i / 3) - 1;
-            const float z = depthAt(depth, dc + o, e.slices.y, p.size.z, rev);
+        for (int i = 0; i < 5; ++i) {
+            const int2 o = i == 0 ? int2(0) : (i < 3 ? int2(2 * i - 3, 0) : int2(0, 2 * i - 7));  // centro, -x, +x, -y, +y
+            const float z = depthTile(tileD, depth, dc + o, dOrg, e.slices.y, p.size.z, rev);
             if (nearer(z, zNear, rev)) zNear = z, nearT = b + o;
             if (nearer(zFar, z, rev)) zFar = z;
         }
@@ -256,15 +307,12 @@ kernel void vpktaa_native_resolve(texture2d_array<float, access::read> color [[t
         }
         result = mix(rec, h, clamp(keep, 0.0f, p.keep.z));
     }
-    historyOut.write(float4(expand(max(fromYCoCg(result), float3(0.0f))), distOwn), uint2(g), eyeIx);
+    const float3 res = expand(max(fromYCoCg(result), float3(0.0f)));
+    historyOut.write(float4(res, distOwn), uint2(g), eyeIx);
+    eyeOutTex.write(float4(eyeOut(res, flags), 1.0f), uint2(g), eyeIx);
 }
 
-static inline float3 srgbEncode(float3 c) {
-    c = saturate(c);
-    return select(1.055f * pow(c, 1.0f / 2.4f) - 0.055f, c * 12.92f, c <= 0.0031308f);
-}
-
-// Taps del RCAS en espacio perceptual (gamma 2.0): el origen es lineal (historia rgba16f, o el color del
+// Taps del RCAS en espacio perceptual (gamma 2.0): el origen es lineal (el color del
 // ojo sRGB, que el hardware ya decodifica al leer) y FSR espera datos perceptuales. Los taps se sujetan al
 // rectángulo del ojo (crop): lo de fuera del viewport del juego no se mezcla.
 static inline float3 rcasTap(texture2d_array<float, access::read> t, int2 q, int2 lo, int2 hi, uint slice) {
@@ -275,7 +323,7 @@ static inline float3 rcasTap(texture2d_array<float, access::read> t, int2 q, int
 // (probada en Linux, taa_native.h). Cruz de 5 muestras, lóbulo limitado por el min/max local (sin ringing),
 // nitidez en stops (p.keep.w = exp2(-stops), 0 = pase apagado: el host ni lo lanza), denoise opcional
 // (VPKN_RCAS_DENOISE), sin escalado. Donde la máscara de UI vale m > 0: mix(rcas, e, m), la UI intacta.
-// Origen: la historia nueva del TAA (slice = ojo) o, sin TAA, el color del juego (VPKN_RCAS_COLOR, su capa).
+// Origen: el color del juego (VPKN_RCAS_COLOR, su capa). Con TAA el motor ya no afila: lo hace el host.
 kernel void vpktaa_native_rcas(texture2d_array<float, access::read> src [[texture(0)]],
                                texture2d_array<float, access::write> out [[texture(1)]],
                                texture2d_array<float> uiMask [[texture(2)]],

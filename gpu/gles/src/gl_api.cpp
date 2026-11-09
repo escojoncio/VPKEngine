@@ -7,6 +7,8 @@
 #include <algorithm>
 #include <atomic>
 #include <functional>
+#include <mutex>
+#include <set>
 #include <thread>
 #include <chrono>
 #include <cmath>
@@ -45,7 +47,7 @@ GLenum GetError() {
 }
 
 const char* kExtensions[] = {
-    "GL_OES_element_index_uint", "GL_OES_packed_depth_stencil", "GL_OES_depth24", "GL_OES_depth32",
+    "GL_OES_element_index_uint", "GL_OES_packed_depth_stencil", "GL_OES_depth_texture", "GL_OES_depth24", "GL_OES_depth32",
     "GL_OES_rgb8_rgba8", "GL_OES_standard_derivatives", "GL_OES_texture_npot", "GL_OES_vertex_array_object",
     "GL_OES_EGL_image", "GL_OES_EGL_image_external", "GL_OES_EGL_image_external_essl3", "GL_OES_texture_half_float",
     "GL_OES_texture_half_float_linear", "GL_OES_texture_float", "GL_OES_texture_float_linear",
@@ -79,13 +81,17 @@ const std::string& glslVersionString() {
     return v;
 }
 
-// GL_VENDOR / GL_RENDERER follow the Vulkan device's identity (Adreno 740 with VPVulkan's Quest identity, else the Apple
-// GPU's own name), asked on every call: the host may choose the identity after vpgles_init. Lock held.
+// GL_VENDOR / GL_RENDERER follow the Vulkan device's identity (the Adreno VPVulkan's Quest identity names: 740, or what
+// VPVK_QUEST_GPU_NAME says; else the Apple GPU's own name), asked on every call: the host may choose the identity after
+// vpgles_init. Lock held.
 const GLubyte* identityString(bool vendor) {
     Device* d = device();
     VkPhysicalDeviceProperties p{};
     d->vk.vkGetPhysicalDeviceProperties(d->phys, &p);
-    if (p.vendorID == 0x5143) return reinterpret_cast<const GLubyte*>(vendor ? "Qualcomm" : "Adreno (TM) 740");
+    if (p.vendorID == 0x5143) {
+        static const std::string adreno = p.deviceName;  // fixed for the process (VPVulkan latches its properties)
+        return reinterpret_cast<const GLubyte*>(vendor ? "Qualcomm" : adreno.c_str());
+    }
     static const std::string apple = p.deviceName;  // fixed for the process
     return reinterpret_cast<const GLubyte*>(vendor ? "Apple" : apple.c_str());
 }
@@ -127,9 +133,6 @@ int queryStateExtra(Context* c, GLenum p, double* out) {
         {0x8C8A, 64},                          // MAX_TRANSFORM_FEEDBACK_INTERLEAVED_COMPONENTS
         {0x8C8B, 4},                           // MAX_TRANSFORM_FEEDBACK_SEPARATE_ATTRIBS
         {0x8C80, 4},                           // MAX_TRANSFORM_FEEDBACK_SEPARATE_COMPONENTS
-        {0x8E23, 0},                           // TRANSFORM_FEEDBACK_PAUSED
-        {0x8E24, 0},                           // TRANSFORM_FEEDBACK_ACTIVE
-        {0x8E25, 0},                           // TRANSFORM_FEEDBACK_BINDING
         // ES 3.1 compute / atomic counters / images / shader storage
         {0x8262, 32768},                       // MAX_COMPUTE_SHARED_MEMORY_SIZE
         {0x8263, 1024},                        // MAX_COMPUTE_UNIFORM_COMPONENTS
@@ -167,8 +170,8 @@ int queryStateExtra(Context* c, GLenum p, double* out) {
         {0x9316, 16384},                       // MAX_FRAMEBUFFER_HEIGHT
         {0x9317, 2048},                        // MAX_FRAMEBUFFER_LAYERS
         {0x9318, 4},                           // MAX_FRAMEBUFFER_SAMPLES
-        {0x8E5E, -8},                          // MIN_PROGRAM_TEXTURE_GATHER_OFFSET
-        {0x8E5F, 7},                           // MAX_PROGRAM_TEXTURE_GATHER_OFFSET
+        {0x8E5E, -32},                         // MIN_PROGRAM_TEXTURE_GATHER_OFFSET (Quest 3; the compiler moves the coordinate beyond -8..7)
+        {0x8E5F, 31},                          // MAX_PROGRAM_TEXTURE_GATHER_OFFSET
         {0x826E, 1048576},                     // MAX_UNIFORM_LOCATIONS
         {gl::MAX_VERTEX_ATTRIB_RELATIVE_OFFSET, 2047},
         {gl::TEXTURE_BUFFER_OFFSET_ALIGNMENT, 256},
@@ -194,6 +197,9 @@ int queryStateExtra(Context* c, GLenum p, double* out) {
     };
     for (const auto& e : kLimits)
         if (e.p == p) return one(e.v);
+    if (p == 0x8E23) return one(c->curTf().paused);              // TRANSFORM_FEEDBACK_PAUSED
+    if (p == 0x8E24) return one(c->curTf().active);              // TRANSFORM_FEEDBACK_ACTIVE
+    if (p == 0x8E25) return one(c->transformFeedback);           // TRANSFORM_FEEDBACK_BINDING
     switch (p) {
         case 0x825A: return one(double(c->programPipeline));          // PROGRAM_PIPELINE_BINDING
         case gl::MAX_TEXTURE_BUFFER_SIZE: return one(std::min<double>(c->dev->props.limits.maxTexelBufferElements, double(1 << 27)));
@@ -238,10 +244,13 @@ int queryState(Context* c, GLenum p, double* out) {
             default: return f->stencilBits;
         }
     };
-    static const GLenum kCompressed[] = {gl::ETC1_RGB8_OES, gl::COMPRESSED_RGB8_ETC2, gl::COMPRESSED_SRGB8_ETC2,
-                                         gl::COMPRESSED_RGBA8_ETC2_EAC, gl::COMPRESSED_SRGB8_ALPHA8_ETC2_EAC,
-                                         gl::COMPRESSED_R11_EAC, gl::COMPRESSED_RG11_EAC, gl::COMPRESSED_RGB8_PUNCHTHROUGH_ALPHA1_ETC2,
-                                         0x93B0, 0x93B4, 0x93B7, 0x93D0, 0x93D4, 0x93D7};
+    // Every format formats.cpp can create: ETC1, ETC2/EAC, and ASTC LDR (14 block sizes, RGBA then sRGB).
+    static const GLenum kCompressed[] = {
+        gl::ETC1_RGB8_OES, gl::COMPRESSED_RGB8_ETC2, gl::COMPRESSED_SRGB8_ETC2, gl::COMPRESSED_RGB8_PUNCHTHROUGH_ALPHA1_ETC2,
+        gl::COMPRESSED_SRGB8_PUNCHTHROUGH_ALPHA1_ETC2, gl::COMPRESSED_RGBA8_ETC2_EAC, gl::COMPRESSED_SRGB8_ALPHA8_ETC2_EAC,
+        gl::COMPRESSED_R11_EAC, gl::COMPRESSED_SIGNED_R11_EAC, gl::COMPRESSED_RG11_EAC, gl::COMPRESSED_SIGNED_RG11_EAC,
+        0x93B0, 0x93B1, 0x93B2, 0x93B3, 0x93B4, 0x93B5, 0x93B6, 0x93B7, 0x93B8, 0x93B9, 0x93BA, 0x93BB, 0x93BC, 0x93BD,
+        0x93D0, 0x93D1, 0x93D2, 0x93D3, 0x93D4, 0x93D5, 0x93D6, 0x93D7, 0x93D8, 0x93D9, 0x93DA, 0x93DB, 0x93DC, 0x93DD};
     switch (p) {
         case gl::MAX_TEXTURE_SIZE: case gl::MAX_RENDERBUFFER_SIZE: case gl::MAX_CUBE_MAP_TEXTURE_SIZE: return one(16384);
         case gl::MAX_3D_TEXTURE_SIZE: return one(2048);
@@ -250,10 +259,10 @@ int queryState(Context* c, GLenum p, double* out) {
         case gl::MAX_VERTEX_ATTRIBS: return one(kMaxVertexAttribs);
         case gl::MAX_VERTEX_UNIFORM_VECTORS: case gl::MAX_FRAGMENT_UNIFORM_VECTORS: return one(256);
         case gl::MAX_VERTEX_UNIFORM_COMPONENTS: case gl::MAX_FRAGMENT_UNIFORM_COMPONENTS: return one(1024);
-        case gl::MAX_VARYING_VECTORS: return one(15);
-        case gl::MAX_VARYING_COMPONENTS: return one(60);
-        case gl::MAX_VERTEX_OUTPUT_COMPONENTS: return one(64);
-        case gl::MAX_FRAGMENT_INPUT_COMPONENTS: return one(60);
+        case gl::MAX_VARYING_VECTORS: return one(31);
+        case gl::MAX_VARYING_COMPONENTS: return one(124);
+        case gl::MAX_VERTEX_OUTPUT_COMPONENTS: return one(128);
+        case gl::MAX_FRAGMENT_INPUT_COMPONENTS: return one(128);
         case gl::MAX_COMBINED_TEXTURE_IMAGE_UNITS: return one(kMaxTextureUnits);
         case gl::MAX_VERTEX_TEXTURE_IMAGE_UNITS: case gl::MAX_TEXTURE_IMAGE_UNITS: return one(16);
         case gl::MAX_DRAW_BUFFERS: case gl::MAX_COLOR_ATTACHMENTS: return one(kMaxDrawBuffers);
@@ -261,7 +270,7 @@ int queryState(Context* c, GLenum p, double* out) {
         case gl::MAX_UNIFORM_BUFFER_BINDINGS: return one(kMaxUniformBufferBindings);
         case gl::MAX_UNIFORM_BLOCK_SIZE: return one(65536);
         case gl::MAX_VERTEX_UNIFORM_BLOCKS: case gl::MAX_FRAGMENT_UNIFORM_BLOCKS: return one(14);
-        case gl::MAX_COMBINED_UNIFORM_BLOCKS: return one(28);
+        case gl::MAX_COMBINED_UNIFORM_BLOCKS: return one(84);
         case gl::UNIFORM_BUFFER_OFFSET_ALIGNMENT: return one(64);
         case gl::MAX_ELEMENT_INDEX: return one(4294967295.0);
         case gl::MAX_ELEMENTS_INDICES: case gl::MAX_ELEMENTS_VERTICES: return one(1 << 20);
@@ -271,7 +280,7 @@ int queryState(Context* c, GLenum p, double* out) {
         case gl::MAX_TEXTURE_MAX_ANISOTROPY_EXT: return one(16);
         case gl::MAX_VIEWS_OVR: return one(2);
         case gl::MAX_SERVER_WAIT_TIMEOUT: return one(0);
-        case gl::MAX_VERTEX_ATTRIB_BINDINGS: return one(16);
+        case gl::MAX_VERTEX_ATTRIB_BINDINGS: return one(kMaxVertexBindings);
         case gl::MAX_VERTEX_ATTRIB_STRIDE: return one(2048);
         case gl::MAX_SAMPLE_MASK_WORDS: return one(1);
         case gl::ALIASED_LINE_WIDTH_RANGE: out[0] = out[1] = 1; return 2;
@@ -295,8 +304,11 @@ int queryState(Context* c, GLenum p, double* out) {
         case gl::ALPHA_BITS: return one(fbBits(3));
         case gl::DEPTH_BITS: return one(fbBits(4));
         case gl::STENCIL_BITS: return one(fbBits(5));
-        case gl::SAMPLE_BUFFERS: return one(0);
-        case gl::SAMPLES: return one(0);
+        case gl::SAMPLE_BUFFERS: case gl::SAMPLES: {
+            const auto fb = c->resolveFramebuffer(c->drawFbo, true);
+            const GLint n = fb.status == gl::FRAMEBUFFER_COMPLETE && fb.samples > 1 ? GLint(fb.samples) : 0;
+            return one(p == gl::SAMPLES ? n : (n ? 1 : 0));
+        }
         case gl::IMPLEMENTATION_COLOR_READ_FORMAT: return one(gl::RGBA);
         case gl::IMPLEMENTATION_COLOR_READ_TYPE: return one(gl::UNSIGNED_BYTE);
         case gl::VIEWPORT: for (int i = 0; i < 4; ++i) out[i] = c->viewport[i]; return 4;
@@ -408,7 +420,8 @@ bool IsEnabledImpl(Context* c, GLenum cap, bool& ok) {
         case gl::RASTERIZER_DISCARD: return c->rasterizerDiscard;
         case gl::DEBUG_OUTPUT: return c->debugOutput;
         case gl::DEBUG_OUTPUT_SYNCHRONOUS: return c->debugSync;
-        case gl::SAMPLE_MASK: case 0x8C36 /* SAMPLE_SHADING */: case gl::FRAMEBUFFER_SRGB_EXT: return false;
+        case gl::SAMPLE_MASK: return c->sampleMaskEnable;
+        case 0x8C36 /* SAMPLE_SHADING */: case gl::FRAMEBUFFER_SRGB_EXT: return false;
         default: ok = false; return false;
     }
 }
@@ -435,7 +448,15 @@ void GetInteger64v(GLenum p, GLint64* v) {
     CTX()
     double tmp[64];
     int n = queryState(c, p, tmp);
-    if (n < 0) return c->setError(gl::INVALID_ENUM, p);
+    if (n < 0) {
+        bool ok;
+        bool e = IsEnabledImpl(c, p, ok);
+        if (ok) {
+            v[0] = e;
+            return;
+        }
+        return c->setError(gl::INVALID_ENUM, p);
+    }
     for (int i = 0; i < n; ++i) v[i] = GLint64(tmp[i]);
 }
 void GetFloatv(GLenum p, GLfloat* v) {
@@ -487,9 +508,9 @@ int queryIndexed(Context* c, GLenum target, GLuint index, int64_t* out) {
         case gl::ATOMIC_COUNTER_BUFFER_BINDING: return bufferState(c->atomicBindings.data(), c->atomicBindings.size(), 0);
         case 0x92C2: /* ATOMIC_COUNTER_BUFFER_START */ return bufferState(c->atomicBindings.data(), c->atomicBindings.size(), 1);
         case 0x92C3: /* ATOMIC_COUNTER_BUFFER_SIZE */ return bufferState(c->atomicBindings.data(), c->atomicBindings.size(), 2);
-        case gl::TRANSFORM_FEEDBACK_BUFFER_BINDING: return bufferState(c->xfbBindings.data(), c->xfbBindings.size(), 0);
-        case 0x8C84: /* TRANSFORM_FEEDBACK_BUFFER_START */ return bufferState(c->xfbBindings.data(), c->xfbBindings.size(), 1);
-        case 0x8C85: /* TRANSFORM_FEEDBACK_BUFFER_SIZE */ return bufferState(c->xfbBindings.data(), c->xfbBindings.size(), 2);
+        case gl::TRANSFORM_FEEDBACK_BUFFER_BINDING: return bufferState(c->curTf().buffers.data(), c->curTf().buffers.size(), 0);
+        case 0x8C84: /* TRANSFORM_FEEDBACK_BUFFER_START */ return bufferState(c->curTf().buffers.data(), c->curTf().buffers.size(), 1);
+        case 0x8C85: /* TRANSFORM_FEEDBACK_BUFFER_SIZE */ return bufferState(c->curTf().buffers.data(), c->curTf().buffers.size(), 2);
         case gl::MAX_COMPUTE_WORK_GROUP_COUNT:  // 0x91BE
             if (index > 2) return -2;
             return one(65535);
@@ -579,7 +600,8 @@ void Enable_(GLenum cap, bool on) {
         case gl::RASTERIZER_DISCARD: c->rasterizerDiscard = on; break;
         case gl::DEBUG_OUTPUT: c->debugOutput = on; break;
         case gl::DEBUG_OUTPUT_SYNCHRONOUS: c->debugSync = on; break;
-        case gl::SAMPLE_MASK: case 0x8C36 /* SAMPLE_SHADING */: case gl::FRAMEBUFFER_SRGB_EXT: break;
+        case gl::SAMPLE_MASK: c->sampleMaskEnable = on; break;
+        case 0x8C36 /* SAMPLE_SHADING */: case gl::FRAMEBUFFER_SRGB_EXT: break;
         default: c->setError(gl::INVALID_ENUM, cap);
     }
 }
@@ -642,22 +664,32 @@ void Clear(GLbitfield m) {
     CTX()
     c->clear(m);
 }
+// glClearBuffer*: the buffer must suit the type (ENUM) and the draw buffer be valid for it (VALUE) before anything else.
+static bool validClearBuffer(Context* c, GLenum b, GLint i, bool ok) {
+    if (!ok) return c->setError(gl::INVALID_ENUM, b), false;
+    if (i < 0 || (b == gl::COLOR ? i >= kMaxDrawBuffers : i != 0)) return c->setError(gl::INVALID_VALUE, b), false;
+    return true;
+}
 void ClearBufferfv(GLenum b, GLint i, const GLfloat* v) {
     CTX()
+    if (!validClearBuffer(c, b, i, b == gl::COLOR || b == gl::DEPTH)) return;
     if (b == gl::DEPTH) return c->clearBuffer(b, i, nullptr, gl::FLOAT, v[0], 0);
     c->clearBuffer(b, i, v, gl::FLOAT, 0, 0);
 }
 void ClearBufferiv(GLenum b, GLint i, const GLint* v) {
     CTX()
+    if (!validClearBuffer(c, b, i, b == gl::COLOR || b == gl::STENCIL)) return;
     if (b == gl::STENCIL) return c->clearBuffer(b, i, nullptr, gl::INT, 0, v[0]);
     c->clearBuffer(b, i, v, gl::INT, 0, 0);
 }
 void ClearBufferuiv(GLenum b, GLint i, const GLuint* v) {
     CTX()
+    if (!validClearBuffer(c, b, i, b == gl::COLOR)) return;
     c->clearBuffer(b, i, v, gl::UNSIGNED_INT, 0, 0);
 }
 void ClearBufferfi(GLenum b, GLint i, GLfloat d, GLint s) {
     CTX()
+    if (!validClearBuffer(c, b, i, b == gl::DEPTH_STENCIL)) return;
     c->clearBuffer(b, i, nullptr, 0, d, s);
 }
 void ColorMask(GLboolean r, GLboolean g, GLboolean b, GLboolean a) {
@@ -702,42 +734,65 @@ void SampleCoverage(GLfloat v, GLboolean inv) {
     CTX()
     c->sampleCoverageValue = std::clamp(v, 0.0f, 1.0f), c->sampleCoverageInvert = inv;
 }
+// Enum validation of the state setters (INVALID_ENUM before any state changes).
+bool validBlendFactor(GLenum f) { return f == 0 || f == 1 || (f >= 0x300 && f <= 0x308) || (f >= 0x8001 && f <= 0x8004); }
+bool validBlendEq(GLenum e) { return e == 0x8006 || e == 0x8007 || e == 0x8008 || e == 0x800A || e == 0x800B; }
+bool validStencilOp(GLenum o) { return o == 0 || (o >= 0x1E00 && o <= 0x1E03) || o == 0x150A || o == 0x8507 || o == 0x8508; }
+bool validCompare(GLenum f) { return f >= 0x200 && f <= 0x207; }
+bool validFace(GLenum f) { return f == 0x404 || f == 0x405 || f == 0x408; }
+bool validUsage(GLenum u) { return u >= 0x88E0 && u <= 0x88EA && u != 0x88E3 && u != 0x88E7; }
 void Hint(GLenum t, GLenum m) {
     CTX()
+    if ((t != gl::GENERATE_MIPMAP_HINT && t != gl::FRAGMENT_SHADER_DERIVATIVE_HINT) || m < 0x1100 || m > 0x1102)
+        return c->setError(gl::INVALID_ENUM, t);
     if (t == gl::GENERATE_MIPMAP_HINT) c->hints[0] = m;
     else if (t == gl::FRAGMENT_SHADER_DERIVATIVE_HINT) c->hints[1] = m;
 }
 void BlendFunc(GLenum s, GLenum d) {
     CTX()
+    if (!validBlendFactor(s) || !validBlendFactor(d)) return c->setError(gl::INVALID_ENUM, s);
     for (auto& b : c->blend) b.srcRGB = b.srcA = s, b.dstRGB = b.dstA = d;
 }
 void BlendFuncSeparate(GLenum sr, GLenum dr, GLenum sa, GLenum da) {
     CTX()
+    if (!validBlendFactor(sr) || !validBlendFactor(dr) || !validBlendFactor(sa) || !validBlendFactor(da))
+        return c->setError(gl::INVALID_ENUM, sr);
     for (auto& b : c->blend) b.srcRGB = sr, b.dstRGB = dr, b.srcA = sa, b.dstA = da;
 }
 void BlendFunci(GLuint i, GLenum s, GLenum d) {
     CTX()
-    if (i < kMaxDrawBuffers) c->blend[i].srcRGB = c->blend[i].srcA = s, c->blend[i].dstRGB = c->blend[i].dstA = d;
+    if (i >= kMaxDrawBuffers) return c->setError(gl::INVALID_VALUE);
+    if (!validBlendFactor(s) || !validBlendFactor(d)) return c->setError(gl::INVALID_ENUM, s);
+    c->blend[i].srcRGB = c->blend[i].srcA = s, c->blend[i].dstRGB = c->blend[i].dstA = d;
 }
 void BlendFuncSeparatei(GLuint i, GLenum sr, GLenum dr, GLenum sa, GLenum da) {
     CTX()
-    if (i < kMaxDrawBuffers) c->blend[i].srcRGB = sr, c->blend[i].dstRGB = dr, c->blend[i].srcA = sa, c->blend[i].dstA = da;
+    if (i >= kMaxDrawBuffers) return c->setError(gl::INVALID_VALUE);
+    if (!validBlendFactor(sr) || !validBlendFactor(dr) || !validBlendFactor(sa) || !validBlendFactor(da))
+        return c->setError(gl::INVALID_ENUM, sr);
+    c->blend[i].srcRGB = sr, c->blend[i].dstRGB = dr, c->blend[i].srcA = sa, c->blend[i].dstA = da;
 }
 void BlendEquation(GLenum e) {
     CTX()
+    if (!validBlendEq(e)) return c->setError(gl::INVALID_ENUM, e);
     for (auto& b : c->blend) b.eqRGB = b.eqA = e;
 }
 void BlendEquationSeparate(GLenum r, GLenum a) {
     CTX()
+    if (!validBlendEq(r) || !validBlendEq(a)) return c->setError(gl::INVALID_ENUM, r);
     for (auto& b : c->blend) b.eqRGB = r, b.eqA = a;
 }
 void BlendEquationi(GLuint i, GLenum e) {
     CTX()
-    if (i < kMaxDrawBuffers) c->blend[i].eqRGB = c->blend[i].eqA = e;
+    if (i >= kMaxDrawBuffers) return c->setError(gl::INVALID_VALUE);
+    if (!validBlendEq(e)) return c->setError(gl::INVALID_ENUM, e);
+    c->blend[i].eqRGB = c->blend[i].eqA = e;
 }
 void BlendEquationSeparatei(GLuint i, GLenum r, GLenum a) {
     CTX()
-    if (i < kMaxDrawBuffers) c->blend[i].eqRGB = r, c->blend[i].eqA = a;
+    if (i >= kMaxDrawBuffers) return c->setError(gl::INVALID_VALUE);
+    if (!validBlendEq(r) || !validBlendEq(a)) return c->setError(gl::INVALID_ENUM, r);
+    c->blend[i].eqRGB = r, c->blend[i].eqA = a;
 }
 void BlendColor(GLfloat r, GLfloat g, GLfloat b, GLfloat a) {
     CTX()
@@ -745,18 +800,21 @@ void BlendColor(GLfloat r, GLfloat g, GLfloat b, GLfloat a) {
 }
 void StencilFuncSeparate(GLenum face, GLenum f, GLint ref, GLuint mask) {
     CTX()
+    if (!validFace(face) || !validCompare(f)) return c->setError(gl::INVALID_ENUM, face);
     for (int i = 0; i < 2; ++i)
         if (face == gl::FRONT_AND_BACK || (face == gl::FRONT) == (i == 0)) c->stencil[i].func = f, c->stencil[i].ref = ref, c->stencil[i].mask = mask;
 }
 void StencilFunc(GLenum f, GLint ref, GLuint mask) { StencilFuncSeparate(gl::FRONT_AND_BACK, f, ref, mask); }
 void StencilMaskSeparate(GLenum face, GLuint m) {
     CTX()
+    if (!validFace(face)) return c->setError(gl::INVALID_ENUM, face);
     for (int i = 0; i < 2; ++i)
         if (face == gl::FRONT_AND_BACK || (face == gl::FRONT) == (i == 0)) c->stencil[i].writeMask = m;
 }
 void StencilMask(GLuint m) { StencilMaskSeparate(gl::FRONT_AND_BACK, m); }
 void StencilOpSeparate(GLenum face, GLenum sf, GLenum zf, GLenum zp) {
     CTX()
+    if (!validFace(face) || !validStencilOp(sf) || !validStencilOp(zf) || !validStencilOp(zp)) return c->setError(gl::INVALID_ENUM, face);
     for (int i = 0; i < 2; ++i)
         if (face == gl::FRONT_AND_BACK || (face == gl::FRONT) == (i == 0)) c->stencil[i].fail = sf, c->stencil[i].zfail = zf, c->stencil[i].zpass = zp;
 }
@@ -769,6 +827,13 @@ void PixelStorei(GLenum p, GLint v) {
             if (v != 1 && v != 2 && v != 4 && v != 8) return c->setError(gl::INVALID_VALUE, p);
             (p == gl::UNPACK_ALIGNMENT ? c->unpackAlignment : c->packAlignment) = v;
             return;
+        case gl::UNPACK_ROW_LENGTH: case gl::UNPACK_SKIP_ROWS: case gl::UNPACK_SKIP_PIXELS: case gl::UNPACK_IMAGE_HEIGHT:
+        case gl::UNPACK_SKIP_IMAGES: case gl::PACK_ROW_LENGTH: case gl::PACK_SKIP_ROWS: case gl::PACK_SKIP_PIXELS:
+            if (v < 0) return c->setError(gl::INVALID_VALUE, p);
+            break;
+        default: break;
+    }
+    switch (p) {
         case gl::UNPACK_ROW_LENGTH: c->unpackRowLength = v; return;
         case gl::UNPACK_SKIP_ROWS: c->unpackSkipRows = v; return;
         case gl::UNPACK_SKIP_PIXELS: c->unpackSkipPixels = v; return;
@@ -803,6 +868,7 @@ void GenBuffers(GLsizei n, GLuint* out) {
 }
 void DeleteBuffers(GLsizei n, const GLuint* names) {
     CTX()
+    if (n < 0) return c->setError(gl::INVALID_VALUE);
     for (GLsizei i = 0; i < n; ++i) {
         GLuint x = names[i];
         if (!x) continue;
@@ -820,8 +886,9 @@ void DeleteBuffers(GLsizei n, const GLuint* names) {
             if (ub.buffer == x) ub = {};
         for (auto& ub : c->atomicBindings)
             if (ub.buffer == x) ub = {};
-        for (auto& ub : c->xfbBindings)
-            if (ub.buffer == x) ub = {};
+        for (auto& [k, tf] : c->transformFeedbacks)
+            for (auto& ub : tf->buffers)
+                if (ub.buffer == x) ub = {};
         for (auto& [k, va] : c->vaos) {
             if (va->elementBuffer == x) va->elementBuffer = 0;
             for (auto& vb : va->bindings)
@@ -835,7 +902,7 @@ void DeleteBuffers(GLsizei n, const GLuint* names) {
 }
 GLboolean IsBuffer(GLuint n) {
     CTX(0)
-    return c->buffer(n) && c->buffer(n)->storage ? 1 : 0;
+    return c->buffer(n) && c->buffer(n)->bound ? 1 : 0;
 }
 Buffer* bindNamed(Context* c, GLuint name) {
     if (!name) return nullptr;
@@ -848,6 +915,7 @@ Buffer* bindNamed(Context* c, GLuint name) {
         c->share->buffers[name] = std::move(nb);
         c->share->nextName = std::max(c->share->nextName, name + 1);
     }
+    b->bound = true;
     return b;
 }
 void BindBuffer(GLenum target, GLuint name) {
@@ -866,11 +934,13 @@ bool bindIndexedTarget(Context* c, GLenum target, GLuint index, GLuint name, GLi
     switch (target) {
         case gl::SHADER_STORAGE_BUFFER: arr = c->ssboBindings.data(), n = c->ssboBindings.size(), align = 256; break;
         case gl::ATOMIC_COUNTER_BUFFER: arr = c->atomicBindings.data(), n = c->atomicBindings.size(); break;
-        case gl::TRANSFORM_FEEDBACK_BUFFER: arr = c->xfbBindings.data(), n = c->xfbBindings.size(); break;
+        case gl::TRANSFORM_FEEDBACK_BUFFER: arr = c->curTf().buffers.data(), n = c->curTf().buffers.size(); break;
         default: return false;
     }
+    const bool xfb = target == gl::TRANSFORM_FEEDBACK_BUFFER;
     if (index >= n) c->setError(gl::INVALID_VALUE, target);
-    else if (range && name && (off < 0 || size <= 0 || off % align)) c->setError(gl::INVALID_VALUE, target);
+    else if (xfb && c->curTf().active && !c->curTf().paused) c->setError(gl::INVALID_OPERATION, target);
+    else if (range && name && (off < 0 || size <= 0 || off % align || (xfb && size % 4))) c->setError(gl::INVALID_VALUE, target);
     else {
         bindNamed(c, name);
         arr[index] = name ? Context::IndexedBuffer{name, range ? off : 0, range ? size : 0} : Context::IndexedBuffer{};
@@ -881,7 +951,8 @@ bool bindIndexedTarget(Context* c, GLenum target, GLuint index, GLuint name, GLi
 void BindBufferRange(GLenum target, GLuint index, GLuint name, GLintptr off, GLsizeiptr size) {
     CTX()
     if (bindIndexedTarget(c, target, index, name, off, size, true)) return;
-    if (target != gl::UNIFORM_BUFFER || index >= kMaxUniformBufferBindings) return c->setError(gl::INVALID_VALUE, target);
+    if (target != gl::UNIFORM_BUFFER) return c->setError(gl::INVALID_ENUM, target);
+    if (index >= kMaxUniformBufferBindings) return c->setError(gl::INVALID_VALUE, target);
     if (name && (off < 0 || size <= 0 || off % 64)) return c->setError(gl::INVALID_VALUE, target);
     bindNamed(c, name);
     c->uniformBindings[index] = {name, off, size};
@@ -890,7 +961,8 @@ void BindBufferRange(GLenum target, GLuint index, GLuint name, GLintptr off, GLs
 void BindBufferBase(GLenum target, GLuint index, GLuint name) {
     CTX()
     if (bindIndexedTarget(c, target, index, name, 0, 0, false)) return;
-    if (target != gl::UNIFORM_BUFFER || index >= kMaxUniformBufferBindings) return c->setError(gl::INVALID_VALUE, target);
+    if (target != gl::UNIFORM_BUFFER) return c->setError(gl::INVALID_ENUM, target);
+    if (index >= kMaxUniformBufferBindings) return c->setError(gl::INVALID_VALUE, target);
     bindNamed(c, name);
     c->uniformBindings[index] = {name, 0, 0};
     c->uniformBuffer = name;
@@ -905,13 +977,9 @@ Buffer* targetBuffer(Context* c, GLenum target) {
     if (!b) c->setError(gl::INVALID_OPERATION, target);
     return b;
 }
-constexpr VkBufferUsageFlags kAllUsage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
-                                         VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
-                                         VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_UNIFORM_TEXEL_BUFFER_BIT |
-                                         VK_BUFFER_USAGE_STORAGE_TEXEL_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
-                                         VK_BUFFER_USAGE_TRANSFER_DST_BIT;
 void BufferData(GLenum target, GLsizeiptr size, const void* data, GLenum usage) {
     CTX()
+    if (!validUsage(usage)) return c->setError(gl::INVALID_ENUM, target);
     if (size < 0) return c->setError(gl::INVALID_VALUE, target);
     Buffer* b = targetBuffer(c, target);
     if (!b) return;
@@ -934,12 +1002,44 @@ void BufferSubData(GLenum target, GLintptr off, GLsizeiptr size, const void* dat
     c->prepareWrite(*b, off == 0 && size == b->size);
     std::memcpy(b->storage->host + off, data, size_t(size));
 }
+// gles.map_stats: how often a MAP_UNSYNCHRONIZED write found its storage still in use by unfinished GPU work (the race window)
+// and what the copy-on-write cost, every ~5 s while the game maps buffers (720 lines at most); a last line at eglTerminate.
+struct MapStats {
+    std::atomic<uint64_t> maps{0}, unsync{0}, unsyncInuse{0}, cowBytes{0}, maxCowBytes{0}, discardInuse{0};
+    std::atomic<uint64_t> lastNs{0};
+    std::atomic<uint32_t> lines{0};
+    void tick(bool force) {
+        constexpr uint64_t kEveryNs = 5'000'000'000ull;
+        constexpr uint32_t kMaxLines = 720;
+        if (force && !maps.load()) return;
+        const uint64_t now = uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
+        uint64_t last = lastNs.load(std::memory_order_relaxed);
+        if (!force) {
+            if (!last) {
+                lastNs.compare_exchange_strong(last, now);
+                return;
+            }
+            if (now - last < kEveryNs || !lastNs.compare_exchange_strong(last, now)) return;
+        }
+        if (lines.fetch_add(1) >= kMaxLines) return;
+        logf("gles.map_stats maps=%llu unsync=%llu unsync_inuse=%llu cow_bytes=%llu max_cow_bytes=%llu discard_inuse=%llu",
+             static_cast<unsigned long long>(maps.load()), static_cast<unsigned long long>(unsync.load()),
+             static_cast<unsigned long long>(unsyncInuse.load()), static_cast<unsigned long long>(cowBytes.load()),
+             static_cast<unsigned long long>(maxCowBytes.load()), static_cast<unsigned long long>(discardInuse.load()));
+    }
+} mapStats;
 void* MapBufferRange(GLenum target, GLintptr off, GLsizeiptr len, GLbitfield access) {
     CTX(nullptr)
     Buffer* b = targetBuffer(c, target);
     if (!b) return nullptr;
-    if (off < 0 || len < 0 || off + len > b->size || !(access & (gl::MAP_READ_BIT | gl::MAP_WRITE_BIT))) {
+    if (off < 0 || len < 0 || off + len > b->size || (access & ~0x3Fu)) {
         c->setError(gl::INVALID_VALUE, target);
+        return nullptr;
+    }
+    const GLbitfield invalidating = gl::MAP_INVALIDATE_RANGE_BIT | gl::MAP_INVALIDATE_BUFFER_BIT | gl::MAP_UNSYNCHRONIZED_BIT;
+    if (!(access & (gl::MAP_READ_BIT | gl::MAP_WRITE_BIT)) || ((access & gl::MAP_READ_BIT) && (access & invalidating)) ||
+        ((access & gl::MAP_FLUSH_EXPLICIT_BIT) && !(access & gl::MAP_WRITE_BIT))) {
+        c->setError(gl::INVALID_OPERATION, target);
         return nullptr;
     }
     if (b->mapped) {
@@ -950,7 +1050,26 @@ void* MapBufferRange(GLenum target, GLintptr off, GLsizeiptr len, GLbitfield acc
         if (b->storage->lastUse > c->dev->completed) c->flush(true);  // GPU writes visible
     } else if (!(access & gl::MAP_UNSYNCHRONIZED_BIT)) {
         c->prepareWrite(*b, (access & gl::MAP_INVALIDATE_BUFFER_BIT) != 0);
+    } else {
+        // UNSYNCHRONIZED write: the caller promises the GPU is not reading the range, but a draw already sent and not completed
+        // may still read this storage (the GPU here is further behind than the game's buffer ring expects): write to a new one.
+        mapStats.unsync.fetch_add(1, std::memory_order_relaxed);
+        if (b->storage && b->storage->lastUse > c->dev->completed) {
+            const BufferStorage* old = b->storage.get();
+            const uint64_t oldSize = old->size;
+            const bool discard = (access & gl::MAP_INVALIDATE_BUFFER_BIT) != 0;
+            c->prepareWrite(*b, discard);
+            mapStats.unsyncInuse.fetch_add(1, std::memory_order_relaxed);
+            if (discard) mapStats.discardInuse.fetch_add(1, std::memory_order_relaxed);
+            else if (b->storage.get() != old) {
+                mapStats.cowBytes.fetch_add(oldSize, std::memory_order_relaxed);
+                uint64_t mx = mapStats.maxCowBytes.load(std::memory_order_relaxed);
+                while (mx < oldSize && !mapStats.maxCowBytes.compare_exchange_weak(mx, oldSize, std::memory_order_relaxed)) {}
+            }
+        }
     }
+    mapStats.maps.fetch_add(1, std::memory_order_relaxed);
+    mapStats.tick(false);
     b->mapped = true, b->mapAccess = access, b->mapOffset = off, b->mapLength = len;
     return b->storage->host + off;
 }
@@ -1002,6 +1121,7 @@ void CopyBufferSubData(GLenum rt, GLenum wt, GLintptr ro, GLintptr wo, GLsizeipt
     Buffer* w = targetBuffer(c, wt);
     if (!r || !w) return;
     if (ro < 0 || wo < 0 || size < 0 || ro + size > r->size || wo + size > w->size) return c->setError(gl::INVALID_VALUE, rt);
+    if (r == w && ro < wo + size && wo < ro + size) return c->setError(gl::INVALID_VALUE, rt);  // the ranges overlap
     if (!size) return;
     c->useStorage(r->storage);
     c->useStorage(w->storage);
@@ -1014,6 +1134,7 @@ void CopyBufferSubData(GLenum rt, GLenum wt, GLintptr ro, GLintptr wo, GLsizeipt
 // ---- vertex arrays ----------------------------------------------------------------------------------------
 void GenVertexArrays(GLsizei n, GLuint* out) {
     CTX()
+    if (n < 0) return c->setError(gl::INVALID_VALUE);
     for (GLsizei i = 0; i < n; ++i) {
         GLuint name = c->nextVao++;
         c->vaos[name] = std::make_unique<VertexArray>();
@@ -1023,6 +1144,7 @@ void GenVertexArrays(GLsizei n, GLuint* out) {
 }
 void DeleteVertexArrays(GLsizei n, const GLuint* names) {
     CTX()
+    if (n < 0) return c->setError(gl::INVALID_VALUE);
     for (GLsizei i = 0; i < n; ++i) {
         if (!names[i]) continue;
         if (c->vao == names[i]) c->vao = 0;
@@ -1048,8 +1170,19 @@ void DisableVertexAttribArray(GLuint i) {
     if (i >= kMaxVertexAttribs) return c->setError(gl::INVALID_VALUE);
     c->currentVao()->attribs[i].enabled = false;
 }
+// Vertex attribute types: the integer ones for glVertexAttribIPointer / IFormat, those and the float-convertible ones otherwise.
+bool attribTypeOk(GLenum type, bool integer) {
+    switch (type) {
+        case gl::BYTE: case gl::UNSIGNED_BYTE: case gl::SHORT: case gl::UNSIGNED_SHORT: case gl::INT: case gl::UNSIGNED_INT: return true;
+        case gl::FLOAT: case gl::HALF_FLOAT: case gl::HALF_FLOAT_OES: case gl::FIXED:
+        case gl::INT_2_10_10_10_REV: case gl::UNSIGNED_INT_2_10_10_10_REV: return !integer;
+        default: return false;
+    }
+}
 void attribPointer(Context* c, GLuint i, GLint size, GLenum type, bool norm, bool integer, GLsizei stride, const void* ptr) {
+    if (!attribTypeOk(type, integer)) return c->setError(gl::INVALID_ENUM, type);
     if (i >= kMaxVertexAttribs || size < 1 || size > 4 || stride < 0) return c->setError(gl::INVALID_VALUE, type);
+    if ((type == gl::INT_2_10_10_10_REV || type == gl::UNSIGNED_INT_2_10_10_10_REV) && size != 4) return c->setError(gl::INVALID_OPERATION, type);
     if (c->vao && !c->arrayBuffer && ptr) return c->setError(gl::INVALID_OPERATION, type);
     VertexArray* va = c->currentVao();
     VertexAttrib& a = va->attribs[i];
@@ -1076,6 +1209,10 @@ void VertexAttribDivisor(GLuint i, GLuint d) {
 }
 // ARB_vertex_attrib_binding (ES 3.1): separate format and buffer binding.
 bool attribFormatCheck(Context* c, GLuint i, GLint size, GLenum type, GLuint relOffset, bool integer) {
+    if (!c->vao) {  // the attribute binding state is not available on the default vertex array object
+        c->setError(gl::INVALID_OPERATION, type);
+        return false;
+    }
     if (i >= kMaxVertexAttribs || relOffset > 2047) {
         c->setError(gl::INVALID_VALUE, type);
         return false;
@@ -1084,16 +1221,13 @@ bool attribFormatCheck(Context* c, GLuint i, GLint size, GLenum type, GLuint rel
         c->setError(gl::INVALID_VALUE, type);
         return false;
     }
-    switch (type) {
-        case gl::BYTE: case gl::UNSIGNED_BYTE: case gl::SHORT: case gl::UNSIGNED_SHORT: case gl::INT: case gl::UNSIGNED_INT: break;
-        case gl::FLOAT: case gl::HALF_FLOAT: case gl::HALF_FLOAT_OES: case gl::FIXED:
-        case gl::INT_2_10_10_10_REV: case gl::UNSIGNED_INT_2_10_10_10_REV:
-            if (integer) {
-                c->setError(gl::INVALID_ENUM, type);
-                return false;
-            }
-            break;
-        default: c->setError(gl::INVALID_ENUM, type); return false;
+    if (!attribTypeOk(type, integer)) {
+        c->setError(gl::INVALID_ENUM, type);
+        return false;
+    }
+    if ((type == gl::INT_2_10_10_10_REV || type == gl::UNSIGNED_INT_2_10_10_10_REV) && size != 4) {
+        c->setError(gl::INVALID_OPERATION, type);
+        return false;
     }
     return true;
 }
@@ -1111,11 +1245,13 @@ void VertexAttribIFormat(GLuint i, GLint size, GLenum type, GLuint relOffset) {
 }
 void VertexAttribBinding(GLuint i, GLuint binding) {
     CTX()
+    if (!c->vao) return c->setError(gl::INVALID_OPERATION);
     if (i >= kMaxVertexAttribs || binding >= kMaxVertexBindings) return c->setError(gl::INVALID_VALUE);
     c->currentVao()->attribs[i].binding = binding;
 }
 void BindVertexBuffer(GLuint binding, GLuint buffer, GLintptr offset, GLsizei stride) {
     CTX()
+    if (!c->vao) return c->setError(gl::INVALID_OPERATION);
     if (binding >= kMaxVertexBindings || offset < 0 || stride < 0 || stride > 2048) return c->setError(gl::INVALID_VALUE);
     if (buffer && !c->buffer(buffer)) return c->setError(gl::INVALID_OPERATION);
     VertexBinding& b = c->currentVao()->bindings[binding];
@@ -1123,6 +1259,7 @@ void BindVertexBuffer(GLuint binding, GLuint buffer, GLintptr offset, GLsizei st
 }
 void VertexBindingDivisor(GLuint binding, GLuint divisor) {
     CTX()
+    if (!c->vao) return c->setError(gl::INVALID_OPERATION);
     if (binding >= kMaxVertexBindings) return c->setError(gl::INVALID_VALUE);
     c->currentVao()->bindings[binding].divisor = divisor;
 }
@@ -1214,8 +1351,9 @@ void GetVertexAttribfv(GLuint i, GLenum p, GLfloat* v) {
         v[0] = GLfloat(x[0]);
     }
 }
-void GetVertexAttribPointerv(GLuint i, GLenum, void** v) {
+void GetVertexAttribPointerv(GLuint i, GLenum pname, void** v) {
     CTX()
+    if (pname != gl::VERTEX_ATTRIB_ARRAY_POINTER) return c->setError(gl::INVALID_ENUM, pname);
     if (i >= kMaxVertexAttribs) return c->setError(gl::INVALID_VALUE);
     VertexArray* va = c->currentVao();
     const VertexAttrib& a = va->attribs[i];
@@ -1239,8 +1377,9 @@ void DrawElementsInstanced(GLenum m, GLsizei n, GLenum t, const void* idx, GLsiz
     CTX()
     c->drawElements(m, n, t, idx, inst, 0);
 }
-void DrawRangeElements(GLenum m, GLuint, GLuint, GLsizei n, GLenum t, const void* idx) {
+void DrawRangeElements(GLenum m, GLuint start, GLuint end, GLsizei n, GLenum t, const void* idx) {
     CTX()
+    if (end < start) return c->setError(gl::INVALID_VALUE);
     c->drawElements(m, n, t, idx, 1, 0);
 }
 void DrawElementsBaseVertex(GLenum m, GLsizei n, GLenum t, const void* idx, GLint bv) {
@@ -1251,8 +1390,9 @@ void DrawElementsInstancedBaseVertex(GLenum m, GLsizei n, GLenum t, const void* 
     CTX()
     c->drawElements(m, n, t, idx, inst, bv);
 }
-void DrawRangeElementsBaseVertex(GLenum m, GLuint, GLuint, GLsizei n, GLenum t, const void* idx, GLint bv) {
+void DrawRangeElementsBaseVertex(GLenum m, GLuint start, GLuint end, GLsizei n, GLenum t, const void* idx, GLint bv) {
     CTX()
+    if (end < start) return c->setError(gl::INVALID_VALUE);
     c->drawElements(m, n, t, idx, 1, bv);
 }
 void DrawArraysIndirect(GLenum m, const void* indirect) {
@@ -1294,6 +1434,7 @@ void GenTextures(GLsizei n, GLuint* out) {
 }
 void DeleteTextures(GLsizei n, const GLuint* names) {
     CTX()
+    if (n < 0) return c->setError(gl::INVALID_VALUE);
     for (GLsizei i = 0; i < n; ++i) {
         GLuint x = names[i];
         if (!x) continue;
@@ -1303,7 +1444,10 @@ void DeleteTextures(GLsizei n, const GLuint* names) {
         for (auto& u : c->units)
             for (GLuint* b : {&u.tex2D, &u.texCube, &u.tex3D, &u.tex2DArray, &u.texExternal, &u.tex2DMS, &u.texCubeArray, &u.tex2DMSArray, &u.texBuffer})
                 if (*b == x) *b = 0;
+        // Only the bound framebuffers (draw / read) lose the attachment; the others keep the name (they are incomplete until
+        // it is replaced, and still answer attachment queries with it).
         for (auto& [k, f] : c->fbos) {
+            if (k != c->drawFbo && k != c->readFbo) continue;
             for (auto& a : f->color)
                 if (a.kind == Attachment::Tex && a.name == x) a = {};
             if (f->depth.kind == Attachment::Tex && f->depth.name == x) f->depth = {};
@@ -1392,10 +1536,12 @@ void CompressedTexSubImage3D(GLenum target, GLint level, GLint x, GLint y, GLint
 }
 void TexStorage2D(GLenum target, GLsizei levels, GLenum ifmt, GLsizei w, GLsizei h) {
     CTX()
+    if (target != gl::TEXTURE_2D && target != gl::TEXTURE_CUBE_MAP) return c->setError(gl::INVALID_ENUM, target);
     c->texStorage(target, levels, ifmt, w, h, target == gl::TEXTURE_CUBE_MAP ? 6 : 1, 0);
 }
 void TexStorage3D(GLenum target, GLsizei levels, GLenum ifmt, GLsizei w, GLsizei h, GLsizei d) {
     CTX()
+    if (target != gl::TEXTURE_3D && target != gl::TEXTURE_2D_ARRAY && target != gl::TEXTURE_CUBE_MAP_ARRAY) return c->setError(gl::INVALID_ENUM, target);
     c->texStorage(target, levels, ifmt, w, h, d, 0);
 }
 void CopyTexImage2D(GLenum target, GLint level, GLenum ifmt, GLint x, GLint y, GLsizei w, GLsizei h, GLint border) {
@@ -1415,7 +1561,29 @@ void GenerateMipmap(GLenum target) {
     CTX()
     c->generateMipmap(target);
 }
+// The enumerated texture / sampler parameters take only their own values (INVALID_ENUM otherwise).
+bool validTexParamEnum(GLenum p, double v) {
+    switch (p) {
+        case gl::TEXTURE_MIN_FILTER: case gl::TEXTURE_MAG_FILTER: case gl::TEXTURE_WRAP_S: case gl::TEXTURE_WRAP_T:
+        case gl::TEXTURE_WRAP_R: case gl::TEXTURE_COMPARE_MODE: case gl::TEXTURE_COMPARE_FUNC: break;
+        default: return true;  // not an enumerated parameter (LOD, levels, swizzle...)
+    }
+    if (v < 0 || v > 4294967295.0 || v != double(GLenum(v))) return false;
+    const GLenum e = GLenum(v);
+    switch (p) {
+        case gl::TEXTURE_MIN_FILTER:
+            return e == gl::NEAREST || e == gl::LINEAR || e == gl::NEAREST_MIPMAP_NEAREST || e == gl::LINEAR_MIPMAP_NEAREST ||
+                   e == gl::NEAREST_MIPMAP_LINEAR || e == gl::LINEAR_MIPMAP_LINEAR;
+        case gl::TEXTURE_MAG_FILTER: return e == gl::NEAREST || e == gl::LINEAR;
+        case gl::TEXTURE_WRAP_S: case gl::TEXTURE_WRAP_T: case gl::TEXTURE_WRAP_R:
+            return e == gl::REPEAT || e == gl::CLAMP_TO_EDGE || e == gl::MIRRORED_REPEAT || e == gl::CLAMP_TO_BORDER;
+        case gl::TEXTURE_COMPARE_MODE: return e == gl::NONE || e == gl::COMPARE_REF_TO_TEXTURE;
+        case gl::TEXTURE_COMPARE_FUNC: return e >= gl::NEVER && e <= gl::ALWAYS;
+        default: return true;
+    }
+}
 void texParam(Context* c, Texture* t, SamplerParams& s, GLenum p, double v, const double* vv) {
+    if (!validTexParamEnum(p, v)) return c->setError(gl::INVALID_ENUM, p);
     switch (p) {
         case gl::TEXTURE_MIN_FILTER: s.minFilter = GLenum(v); return;
         case gl::TEXTURE_MAG_FILTER: s.magFilter = GLenum(v); return;
@@ -1427,7 +1595,12 @@ void texParam(Context* c, Texture* t, SamplerParams& s, GLenum p, double v, cons
         case gl::TEXTURE_COMPARE_MODE: s.compareMode = GLenum(v); return;
         case gl::TEXTURE_COMPARE_FUNC: s.compareFunc = GLenum(v); return;
         case gl::TEXTURE_MAX_ANISOTROPY_EXT: s.maxAnisotropy = std::clamp(float(v), 1.0f, 16.0f); return;
-        case gl::TEXTURE_BORDER_COLOR: if (vv) for (int i = 0; i < 4; ++i) s.border[i] = float(vv[i]); return;
+        case gl::TEXTURE_BORDER_COLOR:
+            if (vv) {
+                for (int i = 0; i < 4; ++i) s.border[i] = float(vv[i]);
+                s.borderInt = false;
+            }
+            return;
         default: break;
     }
     if (!t) return c->setError(gl::INVALID_ENUM, p);
@@ -1441,6 +1614,16 @@ void texParam(Context* c, Texture* t, SamplerParams& s, GLenum p, double v, cons
         case gl::TEXTURE_SRGB_DECODE_EXT: t->srgbDecode = GLenum(v) == gl::DECODE_EXT; return;
         default: c->setError(gl::INVALID_ENUM, p);
     }
+}
+// Only the border colour differs from the plain forms: its four integers are kept exactly.
+void setBorderInt(SamplerParams& s, const GLint* v) {
+    for (int i = 0; i < 4; ++i) s.borderI[i] = v[i], s.border[i] = float(v[i]);
+    s.borderInt = true;
+}
+// The border colour as four GLint: the stored integers, or the float colour converted with the glGet*iv rule (-1..1 spans the range).
+void borderAsInt(const SamplerParams& s, GLint* v) {
+    for (int i = 0; i < 4; ++i)
+        v[i] = s.borderInt ? s.borderI[i] : GLint(std::clamp(double(s.border[i]) * 2147483647.0, -2147483648.0, 2147483647.0));
 }
 void TexParameteri(GLenum target, GLenum p, GLint v) {
     CTX()
@@ -1496,6 +1679,7 @@ void GetTexParameteriv(GLenum target, GLenum p, GLint* v) {
             return;
         case gl::DEPTH_STENCIL_TEXTURE_MODE: *v = GLint(t->depthStencilMode); return;
         case gl::TEXTURE_MAX_ANISOTROPY_EXT: *v = GLint(s.maxAnisotropy); return;
+        case gl::TEXTURE_BORDER_COLOR: borderAsInt(s, v); return;
         default: c->setError(gl::INVALID_ENUM, target);
     }
 }
@@ -1506,10 +1690,32 @@ void GetTexParameterfv(GLenum target, GLenum p, GLfloat* v) {
     if (p == gl::TEXTURE_MIN_LOD) { *v = t->sampler.minLod; return; }
     if (p == gl::TEXTURE_MAX_LOD) { *v = t->sampler.maxLod; return; }
     if (p == gl::TEXTURE_MAX_ANISOTROPY_EXT) { *v = t->sampler.maxAnisotropy; return; }
+    if (p == gl::TEXTURE_BORDER_COLOR) {
+        for (int i = 0; i < 4; ++i) v[i] = t->sampler.borderInt ? float(t->sampler.borderI[i]) : t->sampler.border[i];
+        return;
+    }
     GLint x = 0;
     GetTexParameteriv(target, p, &x);
     *v = GLfloat(x);
 }
+// ---- pure integer parameters (ES 3.2 / EXT_texture_border_clamp): glTexParameterI[u]iv, glSamplerParameterI[u]iv ------------
+void TexParameterIiv(GLenum target, GLenum p, const GLint* v) {
+    CTX()
+    Texture* t = c->boundTexture(target);
+    if (!t) return c->setError(gl::INVALID_ENUM, target);
+    if (p == gl::TEXTURE_BORDER_COLOR) return setBorderInt(t->sampler, v);
+    texParam(c, t, t->sampler, p, v[0], nullptr);
+}
+void TexParameterIuiv(GLenum target, GLenum p, const GLuint* v) { TexParameterIiv(target, p, reinterpret_cast<const GLint*>(v)); }
+void GetTexParameterIiv(GLenum target, GLenum p, GLint* v) {
+    CTX()
+    Texture* t = c->boundTexture(target);
+    if (!t) return c->setError(gl::INVALID_ENUM, target);
+    if (p == gl::TEXTURE_BORDER_COLOR) return borderAsInt(t->sampler, v);
+    GetTexParameteriv(target, p, v);
+}
+void GetTexParameterIuiv(GLenum target, GLenum p, GLuint* v) { GetTexParameterIiv(target, p, reinterpret_cast<GLint*>(v)); }
+
 void EGLImageTargetTexture2DOES(GLenum target, void* image) {
     CTX()
     Texture* t = c->boundTexture(target);
@@ -1628,7 +1834,7 @@ void GetTexLevelParameterfv(GLenum target, GLint level, GLenum p, GLfloat* v) {
 }
 
 // ---- multisample textures --------------------------------------------------------------------------------
-// The images are 1x (VPKTAA does the AA); the texture reports the samples and fixed-location flag it was given.
+// The image has renderSamples(samples) samples; the texture reports the count it was given and its fixed-location flag.
 void TexStorage2DMultisample(GLenum target, GLsizei samples, GLenum ifmt, GLsizei w, GLsizei h, GLboolean fixed) {
     CTX()
     if (target != gl::TEXTURE_2D_MULTISAMPLE) return c->setError(gl::INVALID_ENUM, target);
@@ -1676,6 +1882,7 @@ void BindImageTexture(GLuint unit, GLuint tex, GLint level, GLboolean layered, G
 // Sampler objects
 void GenSamplers(GLsizei n, GLuint* out) {
     CTX()
+    if (n < 0) return c->setError(gl::INVALID_VALUE);
     for (GLsizei i = 0; i < n; ++i) {
         GLuint name = c->genName();
         c->share->samplers[name] = std::make_unique<SamplerObj>();
@@ -1685,6 +1892,7 @@ void GenSamplers(GLsizei n, GLuint* out) {
 }
 void DeleteSamplers(GLsizei n, const GLuint* names) {
     CTX()
+    if (n < 0) return c->setError(gl::INVALID_VALUE);
     for (GLsizei i = 0; i < n; ++i) {
         for (auto& u : c->units)
             if (u.sampler == names[i]) u.sampler = 0;
@@ -1717,7 +1925,21 @@ void SamplerParameterf(GLuint s, GLenum p, GLfloat v) {
     CTX()
     if (SamplerObj* o = samplerObj(c, s)) texParam(c, nullptr, o->params, p, v, nullptr);
 }
-void SamplerParameteriv(GLuint s, GLenum p, const GLint* v) { SamplerParameteri(s, p, v[0]); }
+void SamplerParameteriv(GLuint s, GLenum p, const GLint* v) {
+    CTX()
+    double vv[4] = {double(v[0]), 0, 0, 0};
+    if (p == gl::TEXTURE_BORDER_COLOR)
+        for (int i = 0; i < 4; ++i) vv[i] = v[i] / 2147483647.0;
+    if (SamplerObj* o = samplerObj(c, s)) texParam(c, nullptr, o->params, p, vv[0], vv);
+}
+void SamplerParameterIiv(GLuint s, GLenum p, const GLint* v) {
+    CTX()
+    SamplerObj* o = samplerObj(c, s);
+    if (!o) return;
+    if (p == gl::TEXTURE_BORDER_COLOR) return setBorderInt(o->params, v);
+    texParam(c, nullptr, o->params, p, v[0], nullptr);
+}
+void SamplerParameterIuiv(GLuint s, GLenum p, const GLuint* v) { SamplerParameterIiv(s, p, reinterpret_cast<const GLint*>(v)); }
 void SamplerParameterfv(GLuint s, GLenum p, const GLfloat* v) {
     CTX()
     double vv[4] = {v[0], 0, 0, 0};
@@ -1739,15 +1961,22 @@ void GetSamplerParameteriv(GLuint s, GLenum p, GLint* v) {
         case gl::TEXTURE_COMPARE_FUNC: *v = GLint(o->params.compareFunc); return;
         case gl::TEXTURE_MIN_LOD: *v = GLint(o->params.minLod); return;
         case gl::TEXTURE_MAX_LOD: *v = GLint(o->params.maxLod); return;
+        case gl::TEXTURE_BORDER_COLOR: borderAsInt(o->params, v); return;
         default: c->setError(gl::INVALID_ENUM, p);
     }
 }
+void GetSamplerParameterIiv(GLuint s, GLenum p, GLint* v) { GetSamplerParameteriv(s, p, v); }
+void GetSamplerParameterIuiv(GLuint s, GLenum p, GLuint* v) { GetSamplerParameteriv(s, p, reinterpret_cast<GLint*>(v)); }
 void GetSamplerParameterfv(GLuint s, GLenum p, GLfloat* v) {
     CTX()
     SamplerObj* o = samplerObj(c, s);
     if (!o) return;
     if (p == gl::TEXTURE_MIN_LOD) { *v = o->params.minLod; return; }
     if (p == gl::TEXTURE_MAX_LOD) { *v = o->params.maxLod; return; }
+    if (p == gl::TEXTURE_BORDER_COLOR) {
+        for (int i = 0; i < 4; ++i) v[i] = o->params.borderInt ? float(o->params.borderI[i]) : o->params.border[i];
+        return;
+    }
     GLint x = 0;
     GetSamplerParameteriv(s, p, &x);
     *v = GLfloat(x);
@@ -1756,6 +1985,7 @@ void GetSamplerParameterfv(GLuint s, GLenum p, GLfloat* v) {
 // ---- renderbuffers / framebuffers ------------------------------------------------------------------------
 void GenRenderbuffers(GLsizei n, GLuint* out) {
     CTX()
+    if (n < 0) return c->setError(gl::INVALID_VALUE);
     for (GLsizei i = 0; i < n; ++i) {
         GLuint name = c->genName();
         c->share->renderbuffers[name] = std::make_unique<Renderbuffer>();
@@ -1765,6 +1995,7 @@ void GenRenderbuffers(GLsizei n, GLuint* out) {
 }
 void DeleteRenderbuffers(GLsizei n, const GLuint* names) {
     CTX()
+    if (n < 0) return c->setError(gl::INVALID_VALUE);
     for (GLsizei i = 0; i < n; ++i) {
         GLuint x = names[i];
         auto it = c->share->renderbuffers.find(x);
@@ -1772,6 +2003,7 @@ void DeleteRenderbuffers(GLsizei n, const GLuint* names) {
         if (it->second->image) c->keep(it->second->image);
         if (c->renderbuffer == x) c->renderbuffer = 0;
         for (auto& [k, f] : c->fbos) {
+            if (k != c->drawFbo && k != c->readFbo) continue;  // see DeleteTextures
             for (auto& a : f->color)
                 if (a.kind == Attachment::Rbo && a.name == x) a = {};
             if (f->depth.kind == Attachment::Rbo && f->depth.name == x) f->depth = {};
@@ -1782,7 +2014,7 @@ void DeleteRenderbuffers(GLsizei n, const GLuint* names) {
 }
 GLboolean IsRenderbuffer(GLuint n) {
     CTX(0)
-    return c->rbo(n) && c->rbo(n)->image ? 1 : 0;
+    return c->rbo(n) && c->rbo(n)->bound ? 1 : 0;
 }
 void BindRenderbuffer(GLenum target, GLuint n) {
     CTX()
@@ -1791,6 +2023,7 @@ void BindRenderbuffer(GLenum target, GLuint n) {
         c->share->renderbuffers[n] = std::make_unique<Renderbuffer>();
         c->share->renderbuffers[n]->name = n;
     }
+    if (n) c->rbo(n)->bound = true;
     c->renderbuffer = n;
 }
 void RenderbufferStorageMultisample(GLenum target, GLsizei samples, GLenum ifmt, GLsizei w, GLsizei h) {
@@ -1798,35 +2031,32 @@ void RenderbufferStorageMultisample(GLenum target, GLsizei samples, GLenum ifmt,
     if (target != gl::RENDERBUFFER) return c->setError(gl::INVALID_ENUM, target);
     Renderbuffer* r = c->rbo(c->renderbuffer);
     if (!r) return c->setError(gl::INVALID_OPERATION, target);
-    if (w < 0 || h < 0 || w > 16384 || h > 16384 || samples < 0 || samples > 4) return c->setError(gl::INVALID_VALUE, target);
+    if (w < 0 || h < 0 || w > 16384 || h > 16384 || samples < 0) return c->setError(gl::INVALID_VALUE, target);
+    if (samples > 4) return c->setError(gl::INVALID_OPERATION, target);  // above MAX_SAMPLES / the format's maximum
+    // Unsized base formats (GL_RGB, GL_DEPTH_COMPONENT, ...) are texture formats, not renderbuffer ones.
+    if (ifmt == gl::RGB || ifmt == gl::RGBA || ifmt == 0x1906 /*ALPHA*/ || ifmt == 0x1909 /*LUMINANCE*/ || ifmt == 0x190A /*LUMINANCE_ALPHA*/ ||
+        ifmt == gl::DEPTH_COMPONENT || ifmt == 0x84F9 /*DEPTH_STENCIL*/)
+        return c->setError(gl::INVALID_ENUM, target);
     const FormatInfo* f = formatFor(ifmt);
     if (!f || f->compressed || (!f->renderable && !(f->depth || f->stencil))) return c->setError(gl::INVALID_ENUM, target);
     if (r->image) c->keep(r->image);
-    // Rendered 1x (VPKTAA does the AA); the renderbuffer reports the samples asked for.
-    auto img = std::make_shared<Image>();
-    img->dev = c->dev;
-    img->format = f;
-    img->width = uint32_t(std::max(w, 1)), img->height = uint32_t(std::max(h, 1));
-    VkImageCreateInfo ci{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
-    ci.imageType = VK_IMAGE_TYPE_2D, ci.format = f->vk, ci.extent = {img->width, img->height, 1};
-    ci.mipLevels = 1, ci.arrayLayers = 1, ci.samples = VK_SAMPLE_COUNT_1_BIT;
-    ci.usage = (f->depth || f->stencil ? VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT : VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) |
-               VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
-    if (c->dev->vk.vkCreateImage(c->dev->device, &ci, nullptr, &img->image) != VK_SUCCESS) return c->setError(gl::OUT_OF_MEMORY, target);
-    VkMemoryRequirements req;
-    c->dev->vk.vkGetImageMemoryRequirements(c->dev->device, img->image, &req);
-    VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
-    mai.allocationSize = req.size;
-    mai.memoryTypeIndex = uint32_t(c->dev->memoryType(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT));
-    c->dev->vk.vkAllocateMemory(c->dev->device, &mai, nullptr, &img->memory);
-    c->dev->vk.vkBindImageMemory(c->dev->device, img->image, img->memory, 0);
+    const uint32_t n = samples > 0 ? renderSamples(uint32_t(samples)) : 1;
+    // Game MSAA is memoryless: a multisample renderbuffer stores only this single-sample image. Its passes render in a transient
+    // multisample twin (Context::msTwin) that resolves into it and is seeded from it (FbTarget::msSamples); the stencil plane of
+    // the seed is read through a stencil view (format views).
+    ImageP img = createImage2D(c->dev, f, uint32_t(std::max(w, 1)), uint32_t(std::max(h, 1)), 1, 1,
+                               (f->depth || f->stencil ? VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT : VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) |
+                                   VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+                               f->stencil && n > 1 ? VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT : 0);
+    if (!img) return c->setError(gl::OUT_OF_MEMORY, target);
     c->imageInit(*img);
     r->image = img;
-    r->internalFormat = ifmt, r->width = w, r->height = h, r->samples = samples;
+    r->internalFormat = ifmt, r->width = w, r->height = h, r->samples = GLsizei(n > 1 ? n : 0);
 }
 void RenderbufferStorage(GLenum target, GLenum ifmt, GLsizei w, GLsizei h) { RenderbufferStorageMultisample(target, 0, ifmt, w, h); }
-void GetRenderbufferParameteriv(GLenum, GLenum p, GLint* v) {
+void GetRenderbufferParameteriv(GLenum target, GLenum p, GLint* v) {
     CTX()
+    if (target != gl::RENDERBUFFER) return c->setError(gl::INVALID_ENUM, target);
     Renderbuffer* r = c->rbo(c->renderbuffer);
     if (!r) return c->setError(gl::INVALID_OPERATION, p);
     const FormatInfo* f = r->image ? r->image->format : nullptr;
@@ -1844,8 +2074,17 @@ void GetRenderbufferParameteriv(GLenum, GLenum p, GLint* v) {
         default: c->setError(gl::INVALID_ENUM, p);
     }
 }
-void GetInternalformativ(GLenum, GLenum ifmt, GLenum p, GLsizei n, GLint* v) {
+void GetInternalformativ(GLenum target, GLenum ifmt, GLenum p, GLsizei n, GLint* v) {
     CTX()
+    if (n < 0) return c->setError(gl::INVALID_VALUE);
+    if (target != 0x8D41 /* RENDERBUFFER */ && target != 0x9100 /* TEXTURE_2D_MULTISAMPLE */ && target != 0x9102 /* TEXTURE_2D_MULTISAMPLE_ARRAY */)
+        return c->setError(gl::INVALID_ENUM, target);
+    if (p != 0x80A9 && p != 0x9380) return c->setError(gl::INVALID_ENUM, p);
+    {
+        const FormatInfo* rf = formatFor(ifmt);
+        const bool unsized = ifmt == 0x1902 || (ifmt >= 0x1906 && ifmt <= 0x190A) || ifmt == 0x84F9;
+        if (unsized || !rf || !(rf->renderable || rf->depth || rf->stencil)) return c->setError(gl::INVALID_ENUM, ifmt);
+    }
     if (n < 1) return;
     if (p == 0x80A9 /* SAMPLES */) {
         const FormatInfo* f = formatFor(ifmt);
@@ -1862,6 +2101,7 @@ void GetInternalformativ(GLenum, GLenum ifmt, GLenum p, GLsizei n, GLint* v) {
 }
 void GenFramebuffers(GLsizei n, GLuint* out) {
     CTX()
+    if (n < 0) return c->setError(gl::INVALID_VALUE);
     for (GLsizei i = 0; i < n; ++i) {
         GLuint name = c->nextFbo++;
         c->fbos[name] = std::make_unique<Framebuffer>();
@@ -1871,6 +2111,7 @@ void GenFramebuffers(GLsizei n, GLuint* out) {
 }
 void DeleteFramebuffers(GLsizei n, const GLuint* names) {
     CTX()
+    if (n < 0) return c->setError(gl::INVALID_VALUE);
     for (GLsizei i = 0; i < n; ++i) {
         if (!names[i] || !c->fbos.count(names[i])) continue;
         c->endPass();
@@ -1881,7 +2122,7 @@ void DeleteFramebuffers(GLsizei n, const GLuint* names) {
 }
 GLboolean IsFramebuffer(GLuint n) {
     CTX(0)
-    return n && c->fbos.count(n) ? 1 : 0;
+    return n && c->fbos.count(n) && c->fbos[n]->bound ? 1 : 0;
 }
 void BindFramebuffer(GLenum target, GLuint n) {
     CTX()
@@ -1892,6 +2133,7 @@ void BindFramebuffer(GLenum target, GLuint n) {
         c->fbos[n]->name = n;
         c->nextFbo = std::max(c->nextFbo, n + 1);
     }
+    if (n) c->fbos[n]->bound = true;
     if (target != gl::READ_FRAMEBUFFER) c->drawFbo = n;
     if (target != gl::DRAW_FRAMEBUFFER) c->readFbo = n;
 }
@@ -1922,7 +2164,34 @@ bool setAttachment(Context* c, Framebuffer* f, GLenum att, const Attachment& a) 
     }
     return true;
 }
+// `samples` > 0: EXT_multisampled_render_to_texture (the single-sample texture is rendered with that many samples).
+static void framebufferTexture2D(GLenum target, GLenum att, GLenum textarget, GLuint tex, GLint level, GLsizei samples) {
+    CTX()
+    Framebuffer* f = targetFbo(c, target);
+    if (!f) return;
+    if (samples < 0 || samples > 4) return c->setError(gl::INVALID_VALUE, target);  // above MAX_SAMPLES_EXT
+    Attachment a;
+    if (tex) {
+        const bool cube = textarget >= gl::TEXTURE_CUBE_MAP_POSITIVE_X && textarget <= gl::TEXTURE_CUBE_MAP_NEGATIVE_Z;
+        if (textarget != gl::TEXTURE_2D && textarget != gl::TEXTURE_2D_MULTISAMPLE && !cube) return c->setError(gl::INVALID_ENUM, textarget);
+        Texture* t = c->texture(tex);
+        if (!t) return c->setError(gl::INVALID_OPERATION, target);
+        if (level < 0 || level > 14) return c->setError(gl::INVALID_VALUE, target);  // log2(MAX_TEXTURE_SIZE)
+        // The target must suit the texture (once it has one: a texture name that was never bound has none yet).
+        if (t->target && (cube ? t->target != gl::TEXTURE_CUBE_MAP : t->target != textarget)) return c->setError(gl::INVALID_OPERATION, target);
+        a.kind = Attachment::Tex, a.name = tex, a.level = level, a.samples = samples;
+        if (textarget >= gl::TEXTURE_CUBE_MAP_POSITIVE_X && textarget <= gl::TEXTURE_CUBE_MAP_NEGATIVE_Z)
+            a.layer = GLint(textarget - gl::TEXTURE_CUBE_MAP_POSITIVE_X);
+        // An implicit-multisample depth / stencil: the seed of a continuing pass reads the texture through format views.
+        if (samples > 0 && (att == gl::DEPTH_ATTACHMENT || att == gl::STENCIL_ATTACHMENT || att == gl::DEPTH_STENCIL_ATTACHMENT))
+            c->makeFormatViews(*t);
+    }
+    setAttachment(c, f, att, a);
+}
 void FramebufferTexture2D(GLenum target, GLenum att, GLenum textarget, GLuint tex, GLint level) {
+    framebufferTexture2D(target, att, textarget, tex, level, 0);
+}
+void FramebufferTextureLayer(GLenum target, GLenum att, GLuint tex, GLint level, GLint layer) {
     CTX()
     Framebuffer* f = targetFbo(c, target);
     if (!f) return;
@@ -1930,22 +2199,25 @@ void FramebufferTexture2D(GLenum target, GLenum att, GLenum textarget, GLuint te
     if (tex) {
         Texture* t = c->texture(tex);
         if (!t) return c->setError(gl::INVALID_OPERATION, target);
-        a.kind = Attachment::Tex, a.name = tex, a.level = level;
-        if (textarget >= gl::TEXTURE_CUBE_MAP_POSITIVE_X && textarget <= gl::TEXTURE_CUBE_MAP_NEGATIVE_Z)
-            a.layer = GLint(textarget - gl::TEXTURE_CUBE_MAP_POSITIVE_X);
+        // A layer of a 3D, 2D array (or cube array / multisample array) texture.
+        if (t->target && t->target != gl::TEXTURE_3D && t->target != gl::TEXTURE_2D_ARRAY && t->target != gl::TEXTURE_CUBE_MAP_ARRAY &&
+            t->target != gl::TEXTURE_2D_MULTISAMPLE_ARRAY)
+            return c->setError(gl::INVALID_OPERATION, target);
+        if (layer < 0 || layer > 2047 || level < 0 || level > 14) return c->setError(gl::INVALID_VALUE, target);  // MAX_3D_TEXTURE_SIZE / MAX_ARRAY_TEXTURE_LAYERS - 1
+        a.kind = Attachment::Tex, a.name = tex, a.level = level, a.layer = layer;
     }
     setAttachment(c, f, att, a);
 }
-void FramebufferTextureLayer(GLenum target, GLenum att, GLuint tex, GLint level, GLint layer) {
+void FramebufferTexture(GLenum target, GLenum att, GLuint tex, GLint level) {
     CTX()
     Framebuffer* f = targetFbo(c, target);
     if (!f) return;
     Attachment a;
-    if (tex) a.kind = Attachment::Tex, a.name = tex, a.level = level, a.layer = layer;
+    if (tex) {
+        if (!c->texture(tex)) return c->setError(gl::INVALID_OPERATION, target);
+        a.kind = Attachment::Tex, a.name = tex, a.level = level;
+    }
     setAttachment(c, f, att, a);
-}
-void FramebufferTexture(GLenum target, GLenum att, GLuint tex, GLint level) {
-    FramebufferTextureLayer(target, att, tex, level, 0);
 }
 void FramebufferTexture3D(GLenum target, GLenum att, GLenum textarget, GLuint tex, GLint level, GLint zoffset) {
     CTX()
@@ -1973,8 +2245,8 @@ void FramebufferTextureMultiviewOVR(GLenum target, GLenum att, GLuint tex, GLint
 void FramebufferTextureMultisampleMultiviewOVR(GLenum target, GLenum att, GLuint tex, GLint level, GLsizei, GLint baseView, GLsizei numViews) {
     FramebufferTextureMultiviewOVR(target, att, tex, level, baseView, numViews);
 }
-void FramebufferTexture2DMultisampleEXT(GLenum target, GLenum att, GLenum textarget, GLuint tex, GLint level, GLsizei) {
-    FramebufferTexture2D(target, att, textarget, tex, level);  // 1x + VPKTAA
+void FramebufferTexture2DMultisampleEXT(GLenum target, GLenum att, GLenum textarget, GLuint tex, GLint level, GLsizei samples) {
+    framebufferTexture2D(target, att, textarget, tex, level, samples);
 }
 void FramebufferRenderbuffer(GLenum target, GLenum att, GLenum rbtarget, GLuint rb) {
     CTX()
@@ -1999,9 +2271,15 @@ GLenum CheckFramebufferStatus(GLenum target) {
 }
 void GetFramebufferAttachmentParameteriv(GLenum target, GLenum att, GLenum p, GLint* v) {
     CTX()
+    if (target != gl::FRAMEBUFFER && target != gl::DRAW_FRAMEBUFFER && target != gl::READ_FRAMEBUFFER) return c->setError(gl::INVALID_ENUM, target);
     GLuint n = target == gl::READ_FRAMEBUFFER ? c->readFbo : c->drawFbo;
     if (n == 0) {
         // Default framebuffer: BACK / DEPTH / STENCIL.
+        if (att != gl::BACK && att != gl::COLOR && att != gl::DEPTH && att != gl::STENCIL) {
+            const bool known = att == gl::DEPTH_ATTACHMENT || att == gl::STENCIL_ATTACHMENT || att == gl::DEPTH_STENCIL_ATTACHMENT ||
+                               (att >= gl::COLOR_ATTACHMENT0 && att < gl::COLOR_ATTACHMENT0 + kMaxDrawBuffers);
+            return c->setError(known ? gl::INVALID_OPERATION : gl::INVALID_ENUM, att);
+        }
         if (p == gl::FRAMEBUFFER_ATTACHMENT_OBJECT_TYPE) { *v = GLint(gl::FRAMEBUFFER_DEFAULT); return; }
         Context::FbInfo fb = c->resolveFramebuffer(0, true);
         const Image* img = att == gl::BACK || att == gl::COLOR ? fb.color[0].image : fb.depth.image;
@@ -2028,16 +2306,29 @@ void GetFramebufferAttachmentParameteriv(GLenum target, GLenum att, GLenum p, GL
         *v = a->kind == Attachment::None ? 0 : a->kind == Attachment::Tex ? GLint(gl::TEXTURE) : GLint(gl::RENDERBUFFER);
         return;
     }
-    if (a->kind == Attachment::None) return c->setError(gl::INVALID_OPERATION, target);
+    if (a->kind == Attachment::None) {
+        if (p == gl::FRAMEBUFFER_ATTACHMENT_OBJECT_NAME) { *v = 0; return; }
+        return c->setError(gl::INVALID_OPERATION, target);
+    }
+    const Texture* tex = a->kind == Attachment::Tex ? c->texture(a->name) : nullptr;
+    if (a->kind == Attachment::Rbo &&
+        (p == gl::FRAMEBUFFER_ATTACHMENT_TEXTURE_LEVEL || p == gl::FRAMEBUFFER_ATTACHMENT_TEXTURE_CUBE_MAP_FACE ||
+         p == gl::FRAMEBUFFER_ATTACHMENT_TEXTURE_LAYER || p == gl::FRAMEBUFFER_ATTACHMENT_TEXTURE_NUM_VIEWS_OVR ||
+         p == gl::FRAMEBUFFER_ATTACHMENT_TEXTURE_BASE_VIEW_INDEX_OVR))
+        return c->setError(gl::INVALID_ENUM, p);
+    const bool layered = tex && (tex->target == gl::TEXTURE_3D || tex->target == gl::TEXTURE_2D_ARRAY);
     Context::FbTarget t;
     uint32_t w, h;
     const FormatInfo* fi = c->targetOf(*a, t, w, h) ? t.image->format : nullptr;
     switch (p) {
         case gl::FRAMEBUFFER_ATTACHMENT_OBJECT_NAME: *v = GLint(a->name); return;
         case gl::FRAMEBUFFER_ATTACHMENT_TEXTURE_LEVEL: *v = a->level; return;
-        case gl::FRAMEBUFFER_ATTACHMENT_TEXTURE_CUBE_MAP_FACE: *v = GLint(gl::TEXTURE_CUBE_MAP_POSITIVE_X) + a->layer; return;
-        case gl::FRAMEBUFFER_ATTACHMENT_TEXTURE_LAYER: *v = a->layer; return;
+        case gl::FRAMEBUFFER_ATTACHMENT_TEXTURE_CUBE_MAP_FACE:
+            *v = tex && tex->target == gl::TEXTURE_CUBE_MAP ? GLint(gl::TEXTURE_CUBE_MAP_POSITIVE_X) + a->layer : 0;
+            return;
+        case gl::FRAMEBUFFER_ATTACHMENT_TEXTURE_LAYER: *v = layered ? a->layer : 0; return;
         case gl::FRAMEBUFFER_ATTACHMENT_TEXTURE_NUM_VIEWS_OVR: *v = a->numViews; return;
+        case 0x8D6C: *v = a->samples; return;  // FRAMEBUFFER_ATTACHMENT_TEXTURE_SAMPLES_EXT
         case gl::FRAMEBUFFER_ATTACHMENT_TEXTURE_BASE_VIEW_INDEX_OVR: *v = a->baseView; return;
         case gl::FRAMEBUFFER_ATTACHMENT_COLOR_ENCODING: *v = fi && fi->srgb ? GLint(gl::SRGB) : GLint(gl::LINEAR_ENC); return;
         case gl::FRAMEBUFFER_ATTACHMENT_COMPONENT_TYPE: *v = fi ? GLint(fi->componentType) : 0; return;
@@ -2159,6 +2450,7 @@ void CompileShader(GLuint n) {
     s->compiled = r.shader != nullptr;
     if (s->compiled) s->compiledSource = s->source;  // the same object: no second copy of the text
     s->log = r.log;
+    logLenient(r.lenient, "shader", n);
     if (!s->compiled) logf("gles.shader compile_failed name=%u log=%s", n, r.log.c_str());
 }
 void GetShaderiv(GLuint n, GLenum p, GLint* v) {
@@ -2186,15 +2478,27 @@ void copyString(const std::string& s, GLsizei max, GLsizei* len, GLchar* out) {
 }
 void GetShaderInfoLog(GLuint n, GLsizei max, GLsizei* len, GLchar* log) {
     CTX()
-    if (Shader* s = shaderOrError(c, n)) copyString(s->log, max, len, log);
+    Shader* s = shaderOrError(c, n);
+    if (!s) return;
+    if (max < 0) return c->setError(gl::INVALID_VALUE);
+    copyString(s->log, max, len, log);
 }
 void GetShaderSource(GLuint n, GLsizei max, GLsizei* len, GLchar* src) {
     CTX()
-    if (Shader* s = shaderOrError(c, n)) copyString(s->sourceText(), max, len, src);
+    Shader* s = shaderOrError(c, n);
+    if (!s) return;
+    if (max < 0) return c->setError(gl::INVALID_VALUE);
+    copyString(s->sourceText(), max, len, src);
 }
-void GetShaderPrecisionFormat(GLenum, GLenum prec, GLint* range, GLint* precision) {
-    if (prec >= gl::LOW_INT) range[0] = range[1] = 31, *precision = 0;
-    else range[0] = range[1] = 127, *precision = 23;
+void GetShaderPrecisionFormat(GLenum shader, GLenum prec, GLint* range, GLint* precision) {
+    CTX()
+    if (shader != gl::VERTEX_SHADER && shader != gl::FRAGMENT_SHADER) return c->setError(gl::INVALID_ENUM, shader);
+    if (prec < gl::LOW_FLOAT || prec > gl::HIGH_INT) return c->setError(gl::INVALID_ENUM, prec);
+    // Adreno: lowp and mediump are 16-bit (fp16: 10 bits of mantissa, range 2^15; int16), highp is 32-bit.
+    const bool high = prec == gl::HIGH_FLOAT || prec == gl::HIGH_INT;
+    if (prec >= gl::LOW_INT) range[0] = high ? 31 : 15, range[1] = high ? 30 : 14, *precision = 0;
+    else if (high) range[0] = range[1] = 127, *precision = 23;
+    else range[0] = range[1] = 15, *precision = 10;
 }
 void ReleaseShaderCompiler() {}
 void ShaderBinary(GLsizei, const GLuint*, GLenum, const void*, GLsizei) {
@@ -2259,6 +2563,7 @@ void GetAttachedShaders(GLuint pn, GLsizei max, GLsizei* count, GLuint* out) {
     CTX()
     Program* p = programOrError(c, pn);
     if (!p) return;
+    if (max < 0) return c->setError(gl::INVALID_VALUE);
     GLsizei n = 0;
     for (GLuint s : {p->vs, p->fs, p->cs})
         if (s && n < max) out[n++] = s;
@@ -2276,6 +2581,7 @@ void LinkProgram(GLuint pn) {
     CTX()
     Program* p = programOrError(c, pn);
     if (!p) return;
+    if (c->curTf().active && pn == c->program) return c->setError(gl::INVALID_OPERATION);  // the program being captured
     static int unwrittenLines = 0, failedLines = 0;  // varying diagnostics per session: at most 64 lines of each kind
     const bool ok = c->linkProgram(*p);
     if (!ok) logf("gles.program link_failed name=%u log=%s", pn, p->log.c_str());
@@ -2286,6 +2592,7 @@ void LinkProgram(GLuint pn) {
 }
 void UseProgram(GLuint pn) {
     CTX()
+    if (c->curTf().active && !c->curTf().paused) return c->setError(gl::INVALID_OPERATION);
     if (pn) {
         Program* p = programOrError(c, pn);
         if (!p) return;
@@ -2339,15 +2646,24 @@ void GetProgramiv(GLuint pn, GLenum q, GLint* v) {
         case gl::PROGRAM_BINARY_LENGTH: *v = GLint(Context::programBinary(*p).size()); return;
         case gl::PROGRAM_BINARY_RETRIEVABLE_HINT: *v = p->binaryRetrievableHint; return;
         case gl::PROGRAM_SEPARABLE: *v = p->separable; return;
-        case gl::TRANSFORM_FEEDBACK_VARYINGS: case gl::TRANSFORM_FEEDBACK_VARYING_MAX_LENGTH: *v = 0; return;
-        case gl::TRANSFORM_FEEDBACK_BUFFER_MODE: *v = 0x8C8D; return;
+        case gl::TRANSFORM_FEEDBACK_VARYINGS: *v = GLint(p->refl.xfb.size()); return;
+        case gl::TRANSFORM_FEEDBACK_VARYING_MAX_LENGTH: {
+            size_t m = 0;
+            for (const auto& x : p->refl.xfb) m = std::max(m, x.name.size() + 1);
+            *v = GLint(m);
+            return;
+        }
+        case gl::TRANSFORM_FEEDBACK_BUFFER_MODE: *v = GLint(p->xfbLinkedMode); return;
         case gl::COMPUTE_WORK_GROUP_SIZE: for (int i = 0; i < 3; ++i) v[i] = GLint(p->refl.localSize[size_t(i)]); return;
         default: c->setError(gl::INVALID_ENUM, q);
     }
 }
 void GetProgramInfoLog(GLuint pn, GLsizei max, GLsizei* len, GLchar* log) {
     CTX()
-    if (Program* p = programOrError(c, pn)) copyString(p->log, max, len, log);
+    Program* p = programOrError(c, pn);
+    if (!p) return;
+    if (max < 0) return c->setError(gl::INVALID_VALUE);
+    copyString(p->log, max, len, log);
 }
 void ProgramParameteri(GLuint pn, GLenum pname, GLint value) {
     CTX()
@@ -2393,7 +2709,8 @@ GLint GetAttribLocation(GLuint pn, const GLchar* name) {
 GLint GetFragDataLocation(GLuint pn, const GLchar* name) {
     CTX(-1)
     Program* p = programOrError(c, pn);
-    if (!p || !p->linked) return -1;
+    if (!p) return -1;
+    if (!p->linked) return c->setError(gl::INVALID_OPERATION), -1;
     for (const auto& o : p->refl.outputs)
         if (o.name == name) return o.location;
     return -1;
@@ -2402,7 +2719,7 @@ void GetActiveAttrib(GLuint pn, GLuint i, GLsizei max, GLsizei* len, GLint* size
     CTX()
     Program* p = programOrError(c, pn);
     if (!p) return;
-    if (i >= p->refl.attributes.size()) return c->setError(gl::INVALID_VALUE);
+    if (max < 0 || i >= p->refl.attributes.size()) return c->setError(gl::INVALID_VALUE);
     const auto& a = p->refl.attributes[i];
     copyString(a.name, max, len, name);
     if (size) *size = a.arraySize;
@@ -2432,7 +2749,7 @@ void GetActiveUniform(GLuint pn, GLuint i, GLsizei max, GLsizei* len, GLint* siz
     Program* p = programOrError(c, pn);
     if (!p) return;
     int block;
-    const vpglsl::Variable* u = activeUniform(*p, i, &block);
+    const vpglsl::Variable* u = max < 0 ? nullptr : activeUniform(*p, i, &block);
     if (!u) return c->setError(gl::INVALID_VALUE);
     copyString(u->name, max, len, name);
     if (size) *size = u->arraySize;
@@ -2486,7 +2803,20 @@ GLint GetUniformLocation(GLuint pn, const GLchar* name) {
         c->setError(gl::INVALID_OPERATION);
         return -1;
     }
-    return uniformLocation(*p, name);
+    const GLint ret = uniformLocation(*p, name);
+    // Diagnostics: the packed-uniform names ([vp]c<N>_[hiu]) the translated shaders use, once per (program, name) (1024 per process).
+    if (name && (name[0] == 'v' || name[0] == 'p') && name[1] == 'c' && name[2] >= '0' && name[2] <= '9') {
+        const char* q = name + 2;
+        while (*q >= '0' && *q <= '9') ++q;
+        if (q[0] == '_' && (q[1] == 'h' || q[1] == 'i' || q[1] == 'u')) {
+            static std::mutex mu;
+            static std::set<std::string> seen;
+            std::lock_guard<std::mutex> g(mu);
+            if (seen.size() < 1024 && seen.insert(std::to_string(pn) + ":" + name).second)
+                logf("gles.uloc prog=%u name=%s ret=%d", unsigned(pn), name, int(ret));
+        }
+    }
+    return ret;
 }
 GLuint GetUniformBlockIndex(GLuint pn, const GLchar* name) {
     CTX(gl::INVALID_INDEX)
@@ -2509,8 +2839,11 @@ void GetActiveUniformBlockiv(GLuint pn, GLuint i, GLenum q, GLint* v) {
         case gl::UNIFORM_BLOCK_NAME_LENGTH: *v = GLint(b.name.size() + 1); return;
         case gl::UNIFORM_BLOCK_ACTIVE_UNIFORMS: *v = GLint(b.members.size()); return;
         case gl::UNIFORM_BLOCK_ACTIVE_UNIFORM_INDICES: {
+            // The members are listed once per declaration: every element of a block array shares the indices of element 0.
+            size_t first = i;
+            while (p->refl.blocks[first].element != 0 && first > 0) --first;
             GLuint k = GLuint(p->refl.uniforms.size());
-            for (size_t x = 0; x < i; ++x)
+            for (size_t x = 0; x < first; ++x)
                 if (p->refl.blocks[x].element == 0) k += GLuint(p->refl.blocks[x].members.size());
             for (size_t m = 0; m < b.members.size(); ++m) v[m] = GLint(k + m);
             return;
@@ -2627,6 +2960,7 @@ bool validInterface(GLenum i) {
 // Buffer variables: the members of every shader storage block, block after block.
 const vpglsl::Variable* bufferVariable(const Program& p, GLuint i, int* block) {
     for (size_t b = 0; b < p.refl.storageBlocks.size(); ++b) {
+        if (p.refl.storageBlocks[b].element != 0) continue;  // block arrays list their members once (element 0)
         const auto& m = p.refl.storageBlocks[b].members;
         if (i < m.size()) {
             *block = int(b);
@@ -2638,7 +2972,8 @@ const vpglsl::Variable* bufferVariable(const Program& p, GLuint i, int* block) {
 }
 GLuint bufferVariableCount(const Program& p) {
     GLuint n = 0;
-    for (const auto& b : p.refl.storageBlocks) n += GLuint(b.members.size());
+    for (const auto& b : p.refl.storageBlocks)
+        if (b.element == 0) n += GLuint(b.members.size());
     return n;
 }
 GLuint resourceCount(const Program& p, GLenum iface) {
@@ -2674,9 +3009,7 @@ const std::string* resourceName(const Program& p, GLenum iface, GLuint i) {
     }
 }
 GLint locationBase(const Program& p, GLuint uniformIndex) {  // first location of default-block uniform `uniformIndex`
-    GLint loc = 0;
-    for (GLuint i = 0; i < uniformIndex; ++i) loc += p.refl.uniforms[i].arraySize;
-    return loc;
+    return p.refl.uniforms[uniformIndex].uniformLocation;
 }
 std::string stripSubscripts(std::string n) {
     while (!n.empty() && n.back() == ']') {
@@ -2857,7 +3190,9 @@ void GetProgramResourceiv(GLuint pn, GLenum iface, GLuint index, GLsizei propCou
                                 if (p->refl.blocks[x].element == 0) first += GLuint(p->refl.blocks[x].members.size());
                         }
                     } else {
-                        for (GLuint x = 0; x < index; ++x) first += GLuint(p->refl.storageBlocks[x].members.size());
+                        const GLuint e0 = index - ub->element;  // elements of a block array share element 0's variables
+                        for (GLuint x = 0; x < e0; ++x)
+                            if (p->refl.storageBlocks[x].element == 0) first += GLuint(p->refl.storageBlocks[x].members.size());
                     }
                     for (size_t m = 0; m < ub->members.size(); ++m) vals.push_back(GLint(first + GLuint(m)));
                 }
@@ -2875,11 +3210,11 @@ void GetProgramResourceiv(GLuint pn, GLenum iface, GLuint index, GLsizei propCou
             }
             case gl::TOP_LEVEL_ARRAY_SIZE:
                 ok = bufvar;
-                if (ok) vals = {var->arraySize == 0 ? 0 : 1};  // only the unsized last array is reported as an array
+                if (ok) vals = {var->topLevelArraySize};
                 break;
             case gl::TOP_LEVEL_ARRAY_STRIDE:
                 ok = bufvar;
-                if (ok) vals = {var->arraySize == 0 ? GLint(var->arrayStride) : 0};
+                if (ok) vals = {GLint(var->topLevelArrayStride)};
                 break;
             case gl::LOCATION:
                 ok = uniform || input || iface == gl::PROGRAM_OUTPUT;
@@ -2898,8 +3233,7 @@ done:
 }
 
 // glCreateShaderProgramv: one shader of `type`, compiled and linked into its own (separable) program.
-// A compute program is usable as-is; vertex / fragment ones need glUseProgramStages pipelines, which this
-// layer does not have (a program holding one graphics stage reports a link failure in its info log).
+// A vertex / fragment one is a single-stage program, used through glUseProgramStages pipelines.
 GLuint CreateShaderProgramv(GLenum type, GLsizei count, const GLchar* const* strings) {
     CTX(0)
     GLuint sh = CreateShader(type);
@@ -2977,8 +3311,8 @@ void UseProgramStages(GLuint pipeline, GLbitfield stages, GLuint program) {
         if (!p->linked || !p->separable) return c->setError(gl::INVALID_OPERATION);
     }
     // A stage the program does not hold is cleared, as the spec says for a program without that executable.
-    if (stages & kVertexShaderBit) pl->vs = p && p->vsModule ? program : 0;
-    if (stages & kFragmentShaderBit) pl->fs = p && p->fsModule ? program : 0;
+    if (stages & kVertexShaderBit) pl->vs = p && p->stageVs ? program : 0;
+    if (stages & kFragmentShaderBit) pl->fs = p && p->stageFs ? program : 0;
     if (stages & kComputeShaderBit) pl->cs = p && p->csModule ? program : 0;
 }
 void ActiveShaderProgram(GLuint pipeline, GLuint program) {
@@ -2992,15 +3326,15 @@ void ActiveShaderProgram(GLuint pipeline, GLuint program) {
     }
     pl->active = program;
 }
-// Valid when something can run: a compute stage alone, or vertex + fragment from the same program.
+// Valid when something can run: a compute stage alone, or a vertex and a fragment stage that link together.
 void ValidateProgramPipeline(GLuint pipeline) {
     CTX()
     ProgramPipeline* pl = pipelineOrError(c, pipeline);
     if (!pl) return;
     const bool compute = pl->cs && !pl->vs && !pl->fs;
-    const bool graphics = pl->vs && pl->vs == pl->fs && !pl->cs;
+    const bool graphics = pl->vs && pl->fs && !pl->cs && (pl->vs == pl->fs || c->pipelineProgram(*pl));
     pl->validated = compute || graphics;
-    pl->log = pl->validated ? "" : "program pipeline: vertex and fragment stages must come from the same program (separate stage programs are not supported)\n";
+    pl->log = pl->validated ? "" : "program pipeline: the vertex and fragment stages are missing or do not link together\n";
 }
 void GetProgramPipelineiv(GLuint pipeline, GLenum pname, GLint* v) {
     CTX()
@@ -3095,29 +3429,33 @@ void SampleMaski(GLuint maskNumber, GLbitfield mask) {
     CTX()
     if (maskNumber >= 1) return c->setError(gl::INVALID_VALUE);  // MAX_SAMPLE_MASK_WORDS = 1
     c->sampleMask = mask;
-    if (!c->sampleMaskWarned && mask != ~0u) {
-        c->sampleMaskWarned = true;
-        logf("gles.warn glSampleMaski mask=0x%x stored but not applied: the pipelines are single-sample", mask);
-    }
 }
-void GetTransformFeedbackVarying(GLuint pn, GLuint, GLsizei max, GLsizei* len, GLsizei* size, GLenum* type, GLchar* name) {
+void GetTransformFeedbackVarying(GLuint pn, GLuint index, GLsizei max, GLsizei* len, GLsizei* size, GLenum* type, GLchar* name) {
     CTX()
-    if (!programOrError(c, pn)) return;
-    c->setError(gl::INVALID_VALUE);  // transform feedback has no varyings here (TRANSFORM_FEEDBACK_VARYINGS = 0)
-    if (len) *len = 0;
-    if (size) *size = 0;
-    if (type) *type = 0;
-    if (max > 0 && name) name[0] = 0;
+    Program* p = programOrError(c, pn);
+    if (!p) return;
+    if (max < 0 || index >= p->refl.xfb.size()) return c->setError(gl::INVALID_VALUE);
+    const auto& x = p->refl.xfb[index];
+    if (size) *size = x.arraySize;
+    if (type) *type = x.glType;
+    const GLsizei n = max > 0 ? std::min<GLsizei>(max - 1, GLsizei(x.name.size())) : 0;
+    if (max > 0 && name) std::memcpy(name, x.name.data(), size_t(n)), name[n] = 0;
+    if (len) *len = n;
 }
-GLboolean IsTransformFeedback(GLuint n) { return n != 0; }  // names are handed out by GenTransformFeedbacks, which keeps no state
+GLboolean IsTransformFeedback(GLuint n) {
+    CTX(0)
+    auto it = c->transformFeedbacks.find(n);
+    return n && it != c->transformFeedbacks.end() && it->second->bound ? 1 : 0;
+}
 
 // ---- queries / sync ---------------------------------------------------------------------------------------
 // Queries are "coherent", not GPU-measured: the occlusion result is 1 when a draw was issued between Begin
 // and End (0 when none was), TIME_ELAPSED is the host time between Begin and End, TIMESTAMP the host clock.
-// Every result is available at once, so a game that polls QUERY_RESULT_AVAILABLE never waits.
+// Occlusion queries with a GPU counter (see queryValue) are available when the GPU has finished them.
 uint64_t nowNs() {
     return uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
 }
+bool isOcclusion(GLenum t) { return t == gl::ANY_SAMPLES_PASSED || t == gl::ANY_SAMPLES_PASSED_CONSERVATIVE; }
 bool validQueryTarget(GLenum t) {
     return t == gl::ANY_SAMPLES_PASSED || t == gl::ANY_SAMPLES_PASSED_CONSERVATIVE || t == gl::TRANSFORM_FEEDBACK_PRIMITIVES_WRITTEN ||
            t == gl::TIME_ELAPSED_EXT;
@@ -3138,7 +3476,8 @@ void DeleteQueries(GLsizei n, const GLuint* names) {
     for (GLsizei i = 0; i < n; ++i) {
         auto it = c->queries.find(names[i]);
         if (it == c->queries.end()) continue;
-        if (it->second->active) c->activeQuery.erase(it->second->target);
+        if (it->second->active) c->occEnd(*it->second), c->activeQuery.erase(it->second->target);
+        if (it->second->slot != UINT32_MAX) c->occBusy_[it->second->slot] = false;
         c->queries.erase(it);
     }
 }
@@ -3155,8 +3494,9 @@ void BeginQuery(GLenum target, GLuint n) {
     if (it == c->queries.end()) return c->setError(gl::INVALID_OPERATION, target);
     Query& q = *it->second;
     if (c->activeQuery.count(target) || q.active || (q.target && q.target != target)) return c->setError(gl::INVALID_OPERATION, target);
-    q.target = target, q.active = true, q.result = 0, q.beginNs = nowNs(), q.beginDraws = c->drawCount;
+    q.target = target, q.active = true, q.result = 0, q.beginNs = nowNs(), q.beginDraws = c->drawCount, q.beginXfb = c->xfbPrimitivesWritten;
     c->activeQuery[target] = n;
+    if (isOcclusion(target)) c->occBegin(q);
 }
 void EndQuery(GLenum target) {
     CTX()
@@ -3166,8 +3506,9 @@ void EndQuery(GLenum target) {
     Query& q = *c->queries[at->second];
     q.active = false;
     if (target == gl::TIME_ELAPSED_EXT) q.result = nowNs() - q.beginNs;
-    else if (target == gl::TRANSFORM_FEEDBACK_PRIMITIVES_WRITTEN) q.result = 0;
+    else if (target == gl::TRANSFORM_FEEDBACK_PRIMITIVES_WRITTEN) q.result = c->xfbPrimitivesWritten - q.beginXfb;
     else q.result = c->drawCount > q.beginDraws ? 1 : 0;
+    if (isOcclusion(target)) c->occEnd(q);
     c->activeQuery.erase(at);
 }
 void QueryCounter(GLuint n, GLenum target) {
@@ -3190,7 +3531,7 @@ void GetQueryiv(GLenum target, GLenum pname, GLint* v) {
         c->setError(gl::INVALID_ENUM, pname);
     }
 }
-const Query* queryObject(Context* c, GLuint n, GLenum pname) {
+Query* queryObject(Context* c, GLuint n, GLenum pname) {
     auto it = c->queries.find(n);
     if (it == c->queries.end() || it->second->active || it->second->target == 0) {
         c->setError(gl::INVALID_OPERATION, pname);
@@ -3202,22 +3543,66 @@ const Query* queryObject(Context* c, GLuint n, GLenum pname) {
     }
     return it->second.get();
 }
-uint64_t queryValue(const Query& q, GLenum pname) { return pname == gl::QUERY_RESULT_AVAILABLE ? 1 : q.result; }
+// vk.query_stats: what the game reads from the occlusion queries, every ~5 s while it reads them (720 lines at most).
+struct OccStats {
+    std::atomic<uint64_t> reads{0}, notReady{0}, zero{0}, positive{0}, expired{0}, skipped{0};
+    std::atomic<uint64_t> lastNs{0};
+    std::atomic<uint32_t> lines{0};
+    void tick() {
+        constexpr uint64_t kEveryNs = 5'000'000'000ull;
+        constexpr uint32_t kMaxLines = 720;
+        const uint64_t now = nowNs();
+        uint64_t last = lastNs.load(std::memory_order_relaxed);
+        if (!last) {
+            lastNs.compare_exchange_strong(last, now);
+            return;
+        }
+        if (now - last < kEveryNs || !lastNs.compare_exchange_strong(last, now)) return;
+        if (lines.fetch_add(1) >= kMaxLines) return;
+        logf("vk.query_stats api=gles reads=%llu not_ready=%llu zero=%llu positive=%llu wait_expired=%llu wait_skipped=%llu",
+             static_cast<unsigned long long>(reads.load()), static_cast<unsigned long long>(notReady.load()),
+             static_cast<unsigned long long>(zero.load()), static_cast<unsigned long long>(positive.load()),
+             static_cast<unsigned long long>(expired.load()), static_cast<unsigned long long>(skipped.load()));
+    }
+} occStats;
+// Occlusion: the draws were counted by the GPU (VPVulkan's visibility results) and the layer saw at least one draw. A query
+// that got no counter (none free, or another one counting) keeps the coherent answer. QUERY_RESULT waits for the count
+// (within Context::kOccWaitNs per serial, then it reads visible without waiting while the GPU is behind): a not-ready count must never read 0, Unreal culls what reads 0.
+uint64_t queryValue(Context* c, Query& q, GLenum pname) {
+    if (isOcclusion(q.target) && q.slot != UINT32_MAX && q.endSerial && c->occPool_) {
+        uint64_t v = 0;
+        Context::OccWait how = Context::OccWait::Done;
+        const bool ready = c->occResult(q, pname == gl::QUERY_RESULT, v, &how);
+        occStats.reads.fetch_add(1, std::memory_order_relaxed);
+        if (how == Context::OccWait::Expired) occStats.expired.fetch_add(1, std::memory_order_relaxed);
+        else if (how == Context::OccWait::Skipped) occStats.skipped.fetch_add(1, std::memory_order_relaxed);
+        else if (!ready) occStats.notReady.fetch_add(1, std::memory_order_relaxed);
+        if (pname == gl::QUERY_RESULT) {
+            const uint64_t visible = how != Context::OccWait::Done || (q.result && v) ? 1 : 0;
+            (visible ? occStats.positive : occStats.zero).fetch_add(1, std::memory_order_relaxed);
+            occStats.tick();
+            return visible;
+        }
+        occStats.tick();
+        return ready ? 1 : 0;
+    }
+    return pname == gl::QUERY_RESULT_AVAILABLE ? 1 : q.result;
+}
 void GetQueryObjectuiv(GLuint n, GLenum p, GLuint* v) {
     CTX()
-    if (const Query* q = queryObject(c, n, p)) *v = GLuint(std::min<uint64_t>(queryValue(*q, p), 0xFFFFFFFFu));
+    if (Query* q = queryObject(c, n, p)) *v = GLuint(std::min<uint64_t>(queryValue(c, *q, p), 0xFFFFFFFFu));
 }
 void GetQueryObjectiv(GLuint n, GLenum p, GLint* v) {
     CTX()
-    if (const Query* q = queryObject(c, n, p)) *v = GLint(std::min<uint64_t>(queryValue(*q, p), 0x7FFFFFFFu));
+    if (Query* q = queryObject(c, n, p)) *v = GLint(std::min<uint64_t>(queryValue(c, *q, p), 0x7FFFFFFFu));
 }
 void GetQueryObjectui64v(GLuint n, GLenum p, GLuint64* v) {
     CTX()
-    if (const Query* q = queryObject(c, n, p)) *v = queryValue(*q, p);
+    if (Query* q = queryObject(c, n, p)) *v = queryValue(c, *q, p);
 }
 void GetQueryObjecti64v(GLuint n, GLenum p, GLint64* v) {
     CTX()
-    if (const Query* q = queryObject(c, n, p)) *v = GLint64(std::min<uint64_t>(queryValue(*q, p), uint64_t(INT64_MAX)));
+    if (Query* q = queryObject(c, n, p)) *v = GLint64(std::min<uint64_t>(queryValue(c, *q, p), uint64_t(INT64_MAX)));
 }
 GLsync FenceSync(GLenum cond, GLbitfield) {
     CTX(nullptr)
@@ -3254,7 +3639,10 @@ GLenum ClientWaitSync(GLsync s, GLbitfield flags, GLuint64 timeout) {
     c->dev->waitSerial(it->second->serial);
     return gl::CONDITION_SATISFIED;
 }
-void WaitSync(GLsync, GLbitfield, GLuint64) {}  // one queue: already ordered
+void WaitSync(GLsync s, GLbitfield flags, GLuint64 timeout) {  // one queue: already ordered
+    CTX()
+    if (!c->share->syncs.count(s) || flags != 0 || timeout != ~0ull) c->setError(gl::INVALID_VALUE);
+}
 void GetSynciv(GLsync s, GLenum p, GLsizei, GLsizei* len, GLint* v) {
     CTX()
     auto it = c->share->syncs.find(s);
@@ -3412,19 +3800,78 @@ void InsertEventMarkerEXT(GLsizei, const GLchar*) {}
 void PushGroupMarkerEXT(GLsizei, const GLchar*) {}
 void PopGroupMarkerEXT() {}
 GLenum GetGraphicsResetStatus() { return gl::NO_ERROR; }
-void PauseTransformFeedback() {}
-void ResumeTransformFeedback() {}
-void BeginTransformFeedback(GLenum) {
+void PauseTransformFeedback() {
     CTX()
-    c->setError(gl::INVALID_OPERATION);
+    Context::TransformFeedback& tf = c->curTf();
+    if (!tf.active || tf.paused) return c->setError(gl::INVALID_OPERATION);
+    tf.paused = true;
 }
-void EndTransformFeedback() {}
+void ResumeTransformFeedback() {
+    CTX()
+    Context::TransformFeedback& tf = c->curTf();
+    if (!tf.active || !tf.paused) return c->setError(gl::INVALID_OPERATION);
+    tf.paused = false;
+}
+void BeginTransformFeedback(GLenum mode) {
+    CTX()
+    if (mode != gl::POINTS && mode != gl::LINES && mode != gl::TRIANGLES) return c->setError(gl::INVALID_ENUM, mode);
+    Context::TransformFeedback& tf = c->curTf();
+    Program* p = c->prog(c->program);
+    if (tf.active || !p || !p->linked || p->refl.xfb.empty()) return c->setError(gl::INVALID_OPERATION);
+    const size_t bindings = p->xfbLinkedMode == 0x8C8D ? p->refl.xfb.size() : 1;
+    for (size_t i = 0; i < bindings; ++i) {
+        Buffer* b = tf.buffers[i].buffer ? c->buffer(tf.buffers[i].buffer) : nullptr;
+        if (!b || !b->storage) return c->setError(gl::INVALID_OPERATION);  // every binding the varyings use needs a buffer
+    }
+    tf.active = true, tf.paused = false, tf.mode = mode, tf.program = p->serial;
+    tf.used = {};
+}
+void EndTransformFeedback() {
+    CTX()
+    Context::TransformFeedback& tf = c->curTf();
+    if (!tf.active) return c->setError(gl::INVALID_OPERATION);
+    tf.active = tf.paused = false;
+}
 void GenTransformFeedbacks(GLsizei n, GLuint* out) {
-    for (GLsizei i = 0; i < n; ++i) out[i] = GLuint(i + 1);
+    CTX()
+    if (n < 0) return c->setError(gl::INVALID_VALUE);
+    for (GLsizei i = 0; i < n; ++i) {
+        const GLuint name = c->nextTransformFeedback++;
+        auto o = std::make_unique<Context::TransformFeedback>();
+        o->name = name;
+        c->transformFeedbacks[name] = std::move(o);
+        out[i] = name;
+    }
 }
-void DeleteTransformFeedbacks(GLsizei, const GLuint*) {}
-void BindTransformFeedback(GLenum, GLuint) {}
-void TransformFeedbackVaryings(GLuint, GLsizei, const GLchar* const*, GLenum) {}
+void DeleteTransformFeedbacks(GLsizei n, const GLuint* names) {
+    CTX()
+    if (n < 0) return c->setError(gl::INVALID_VALUE);
+    for (GLsizei i = 0; i < n; ++i) {
+        auto it = c->transformFeedbacks.find(names[i]);
+        if (!names[i] || it == c->transformFeedbacks.end()) continue;
+        if (it->second->active) return c->setError(gl::INVALID_OPERATION);
+        if (c->transformFeedback == names[i]) c->transformFeedback = 0;
+        c->transformFeedbacks.erase(it);
+    }
+}
+void BindTransformFeedback(GLenum target, GLuint name) {
+    CTX()
+    if (target != gl::TRANSFORM_FEEDBACK) return c->setError(gl::INVALID_ENUM, target);
+    if (c->curTf().active && !c->curTf().paused) return c->setError(gl::INVALID_OPERATION);
+    if (name && !c->transformFeedbacks.count(name)) return c->setError(gl::INVALID_OPERATION);
+    c->transformFeedback = name;
+    c->curTf().bound = true;
+}
+void TransformFeedbackVaryings(GLuint pn, GLsizei count, const GLchar* const* varyings, GLenum mode) {
+    CTX()
+    Program* p = programOrError(c, pn);
+    if (!p) return;
+    if (mode != 0x8C8C && mode != 0x8C8D) return c->setError(gl::INVALID_ENUM, mode);
+    if (count < 0 || (mode == 0x8C8D && count > 4)) return c->setError(gl::INVALID_VALUE);
+    p->xfbVaryings.clear();
+    for (GLsizei i = 0; i < count; ++i) p->xfbVaryings.push_back(varyings[i]);
+    p->xfbMode = mode;
+}
 
 struct Entry {
     const char* name;
@@ -3458,7 +3905,8 @@ const Entry kEntries[] = {
     E(TexParameteri), E(TexParameterf), E(TexParameteriv), E(TexParameterfv), E(GetTexParameteriv),
     E(GetTexParameterfv), E(EGLImageTargetTexture2DOES), E(GenSamplers), E(DeleteSamplers), E(IsSampler),
     E(BindSampler), E(SamplerParameteri), E(SamplerParameterf), E(SamplerParameteriv), E(SamplerParameterfv),
-    E(GetSamplerParameteriv), E(GetSamplerParameterfv), E(GenRenderbuffers), E(DeleteRenderbuffers),
+    E(GetSamplerParameteriv), E(GetSamplerParameterfv), E(TexParameterIiv), E(TexParameterIuiv), E(GetTexParameterIiv),
+    E(GetTexParameterIuiv), E(SamplerParameterIiv), E(SamplerParameterIuiv), E(GetSamplerParameterIiv), E(GetSamplerParameterIuiv), E(GenRenderbuffers), E(DeleteRenderbuffers),
     E(IsRenderbuffer), E(BindRenderbuffer), E(RenderbufferStorage), E(RenderbufferStorageMultisample),
     E(GetRenderbufferParameteriv), E(GetInternalformativ), E(GenFramebuffers), E(DeleteFramebuffers),
     E(IsFramebuffer), E(BindFramebuffer), E(FramebufferTexture2D), E(FramebufferTextureLayer), E(FramebufferTexture),
@@ -3508,6 +3956,8 @@ const Entry kEntries[] = {
 #undef E
 
 }  // namespace
+
+void mapStatsTick(bool force) { mapStats.tick(force); }
 
 const char* Context::errorName(GLenum e) {
     switch (e) {

@@ -142,6 +142,16 @@ void meshMultiview(const std::string& dir, const std::string& v) {
     o.viewCount = 1, o.viewMask = 0b100;
     Result one = run(dir + "/mesh_multiview.vert" + (v.empty() ? "" : ".opt") + ".spv", o);
     CHECK(one.ok && one.msl.source.find("render_target_array_index") != std::string::npos);
+    // VK_EXT_vertex_attribute_divisor: a divided instance binding reads base_instance; divisor 1 does not.
+    o.viewCount = 1, o.viewMask = 0;
+    Result plain = run(dir + "/mesh_multiview.vert" + (v.empty() ? "" : ".opt") + ".spv", o);
+    CHECK(plain.ok && plain.msl.source.find("base_instance") == std::string::npos);
+    for (uint32_t divisor : {4u, 0u}) {
+        o.vertexBuffers[1].divisor = divisor;
+        Result dv = run(dir + "/mesh_multiview.vert" + (v.empty() ? "" : ".opt") + ".spv", o);
+        CHECK(dv.ok && dv.msl.source.find("base_instance") != std::string::npos && dv.msl.source != plain.msl.source);
+    }
+    o.vertexBuffers[1].divisor = 1;
 }
 
 // Fragment shader writing gl_ViewIndex to a uint colour (tests/asm style, assembled with spvasm.py):
@@ -259,6 +269,19 @@ void amplify(const std::string& dir, const std::string& v) {
             return declares;
         };
         CHECK(!layer(false) && layer(true));
+    }
+    {  // declaresSampleBuiltin (forced MSAA leaves a game MSAA pass with such a fragment shader alone): BuiltIn SampleId (18) / SampleMask (20)
+        auto sample = [](uint32_t builtin) {
+            std::vector<uint32_t> w = kViewIndexFrag;
+            for (size_t i = 5; i + 3 < w.size(); ++i)
+                if (w[i] == 0x00040047 && w[i + 2] == 0x0b && w[i + 3] == 0x1158 && builtin) w[i + 3] = builtin;
+            std::string error;
+            spirv::SpirvModule* m = spirv::parse(w.data(), w.size(), error);
+            const bool declares = m && spirv::declaresSampleBuiltin(*m);
+            spirv::release(m);
+            return declares;
+        };
+        CHECK(!sample(0) && sample(18) && sample(20) && !sample(9));
     }
 }
 
@@ -547,7 +570,7 @@ void fixes(const std::string& dir) {
     if (cr.ok) {
         const std::string& m = cr.msl.source;
         CHECK(m.find("log2") == std::string::npos && m.find("exp2") == std::string::npos);  // exact frexp/ldexp
-        CHECK(m.find("simd_broadcast_first(") != std::string::npos && m.find("simd_all(") != std::string::npos);
+        CHECK(m.find("== ctz(simd_or(1u << ") != std::string::npos && m.find("simd_all(") != std::string::npos);  // read-first
     }
     if (failures || std::getenv("VP_PRINT")) std::fprintf(stderr, "%s\n", cr.msl.source.c_str());
 }
@@ -665,11 +688,58 @@ void subgroupCube(const std::string& dir) {
     CHECK(r.ok);
     if (!r.ok) return;
     const std::string& src = r.msl.source;
-    CHECK(src.find("texturecube_array<uint") != std::string::npos);
-    CHECK(src.find(" % ") != std::string::npos);
-    CHECK(src.find("simd_broadcast_first(") != std::string::npos);
+    // Storage cubes are texture2d_array (the driver binds a 2D-array view): slice = layer * 6 + face.
+    CHECK(src.find("texture2d_array<uint") != std::string::npos && src.find("texturecube") == std::string::npos);
+    CHECK(src.find(" % ") != std::string::npos && src.find("* 6u + ") != std::string::npos);
+    CHECK(src.find("== ctz(simd_or(1u << ") != std::string::npos);  // read-first: simd_or of the first lane's bits
     CHECK(src.find("simd_all(") != std::string::npos);
-    CHECK(src.find("simd_broadcast_first(true") == std::string::npos);
+    CHECK(src.find("simd_shuffle(true") == std::string::npos);
+    if (failures || std::getenv("VP_PRINT")) std::fprintf(stderr, "%s\n", src.c_str());
+}
+
+// Relative shuffles (Xor / Up / Down) are a simd_shuffle of the computed lane, the quad broadcast a quad_shuffle.
+// Hand-assembled: gen_subgroup_shuffle.py.
+void subgroupShuffle(const std::string& dir) {
+    spirv::SpirvLowerOptions o;
+    o.entry = "main";
+    o.stage = vpir::Stage::Compute;
+    o.layout = {bind(0, 0, vpgpu::BindKind::Buffer, 0)};
+    Result r = run(dir + "/subgroup_shuffle.comp.spv", o);
+    CHECK(r.ok);
+    if (!r.ok) return;
+    const std::string& src = r.msl.source;
+    size_t shuffles = 0;
+    for (size_t at = src.find("simd_shuffle("); at != std::string::npos; at = src.find("simd_shuffle(", at + 1)) ++shuffles;
+    CHECK(shuffles == 3);
+    CHECK(src.find("quad_shuffle(") != std::string::npos);
+    CHECK(src.find(" ^ ") != std::string::npos);
+    if (failures || std::getenv("VP_PRINT")) std::fprintf(stderr, "%s\n", src.c_str());
+}
+
+// Arithmetic and clustered subgroup operations (vpir subgroup_arith): reductions and the sum / product scans are Metal's
+// simd_* functions, the other scans and the clustered reductions a loop over the lanes of the SIMD group; a boolean
+// LogicalAnd travels as an integer. Hand-assembled: gen_subgroup_arith.py.
+void subgroupArith(const std::string& dir) {
+    spirv::SpirvLowerOptions o;
+    o.entry = "main";
+    o.stage = vpir::Stage::Compute;
+    o.layout = {bind(0, 0, vpgpu::BindKind::Buffer, 0)};
+    Result r = run(dir + "/subgroup_arith.comp.spv", o);
+    CHECK(r.ok);
+    if (!r.ok) return;
+    const std::string& src = r.msl.source;
+    CHECK(src.find("simd_sum(") != std::string::npos);                    // IAdd reduce
+    CHECK(src.find("simd_prefix_inclusive_sum(") != std::string::npos);   // FAdd inclusive scan
+    CHECK(src.find("simd_xor(") != std::string::npos);                    // BitwiseXor reduce
+    CHECK(src.find("simd_and(") != std::string::npos);                    // LogicalAnd reduce (0/1 integers)
+    CHECK(src.find("simd_prefix_exclusive_") == std::string::npos);       // SMin exclusive: the loop, not a builtin
+    // The active mask is a simd_or of one bit per lane (simd_active_threads_mask() / simd_ballot() are merged across divergent branches).
+    CHECK(src.find("simd_or(1u << in_lane)") != std::string::npos && src.find("for (uint sk = 0u; sk < 32u; ++sk)") != std::string::npos);
+    CHECK(src.find("simd_active_threads_mask") == std::string::npos && src.find("simd_ballot") == std::string::npos);
+    CHECK(src.find("min(") != std::string::npos && src.find("max(") != std::string::npos);
+    CHECK(src.find("(sk >> 2u) == (") != std::string::npos);              // clustered by 4
+    CHECK(src.find("sk < ") != std::string::npos);                        // exclusive: lanes below
+    CHECK(src.find("2147483647") != std::string::npos);                   // SMin identity
     if (failures || std::getenv("VP_PRINT")) std::fprintf(stderr, "%s\n", src.c_str());
 }
 
@@ -688,13 +758,13 @@ void robust(const std::string& dir) {
         CHECK(r.ok);
         if (!r.ok) return;
         const std::string& src = r.msl.source;
-        CHECK(src.find("ul <= vp_args.bs") != std::string::npos);
+        CHECK(src.find("ul <= ((vp_args.bs") != std::string::npos);
         bool hasSize = false;
         for (auto& a : r.msl.arguments) hasSize |= a.kind == vpir::ResourceKind::BufferSize;
         CHECK(hasSize);
         if (atomics) CHECK(src.find(") atomic_fetch_") != std::string::npos || src.find(" = atomic_fetch_") != std::string::npos);
         Result plain = run(dir + "/" + file, o);
-        CHECK(plain.ok && plain.msl.source.find("ul <= vp_args.bs") == std::string::npos);
+        CHECK(plain.ok && plain.msl.source.find("ul <= ((vp_args.bs") == std::string::npos);
         CHECK(src.find("// vp:int16") == std::string::npos);  // no 16-bit integers here
         if (failures || std::getenv("VP_PRINT")) std::fprintf(stderr, "%s\n", src.c_str());
     };
@@ -827,6 +897,318 @@ void int8(const std::string& dir) {
     CHECK(got[0] == 144);   // 200 + 200 wraps at 8 bits (uint8)
     CHECK(got[1] == -112);  // int8(-56) * 2, sign-extended
     CHECK(out[8] == 144 && out[9] == 0xAA);
+}
+
+// shaderIntegerDotProduct: packed 4x8-bit OpSDot / OpUDot / OpSUDot and the saturating accumulate forms
+// (dot.comp.spvasm), evaluated. a = bytes {1, 127, 128, 255}, b = bytes {2, 3, 4, 255}.
+void dotProduct(const std::string& dir) {
+    spirv::SpirvLowerOptions o;
+    o.entry = "main";
+    o.stage = vpir::Stage::Compute;
+    o.layout = {bind(0, 0, vpgpu::BindKind::Buffer, 0), bind(0, 1, vpgpu::BindKind::Buffer, 1)};
+    Result r = run(dir + "/dot.comp.spv", o);
+    CHECK(r.ok);
+    if (!r.ok) return;
+    const uint32_t in[5] = {0xFF807F01u, 0xFF040302u, 0x80000010u, 0xFFFFFFF0u, 100u};
+    vpireval::Invocation inv;
+    inv.memory[0].resize(20);
+    std::memcpy(inv.memory[0].data(), in, 20);
+    inv.memory[1].assign(24, 0);
+    std::string err;
+    CHECK(vpireval::run(r.module, inv, err));
+    if (!err.empty()) std::fprintf(stderr, "  eval: %s\n", err.c_str());
+    uint32_t got[6] = {};
+    if (inv.memory[1].size() >= 24) std::memcpy(got, inv.memory[1].data(), 24);
+    CHECK(int32_t(got[0]) == -128);        // 2 + 381 - 512 + 1
+    CHECK(got[1] == 65920u);               // 2 + 381 + 512 + 65025
+    CHECK(int32_t(got[2]) == -384);        // signed a, unsigned b
+    CHECK(got[3] == 0x80000000u);          // INT_MIN + 16 - 128 saturates
+    CHECK(got[4] == 0xFFFFFFFFu);          // UINT_MAX - 15 + 65920 saturates
+    CHECK(int32_t(got[5]) == -284);        // -384 + 100
+}
+
+// OpConvertFToS / OpConvertFToU (ftoi.comp.spvasm), evaluated: out-of-range values saturate, NaN gives 0.
+// in = {NaN, 3e10, -3e10, -1.5, 200.5}.
+void floatToInt(const std::string& dir) {
+    spirv::SpirvLowerOptions o;
+    o.entry = "main";
+    o.stage = vpir::Stage::Compute;
+    o.layout = {bind(0, 0, vpgpu::BindKind::Buffer, 0), bind(0, 1, vpgpu::BindKind::Buffer, 1)};
+    Result r = run(dir + "/ftoi.comp.spv", o);
+    CHECK(r.ok);
+    if (!r.ok) return;
+    // The evaluator's own conversion already saturates; what the lowering must emit for Metal is explicit.
+    const std::string text = vpir::print(r.module);
+    CHECK(text.find("isnan") != std::string::npos && text.find("min") != std::string::npos);
+    const float in[5] = {std::nanf(""), 3e10f, -3e10f, -1.5f, 200.5f};
+    vpireval::Invocation inv;
+    inv.memory[0].resize(20);
+    std::memcpy(inv.memory[0].data(), in, 20);
+    inv.memory[1].assign(60, 0);
+    std::string err;
+    CHECK(vpireval::run(r.module, inv, err));
+    if (!err.empty()) std::fprintf(stderr, "  eval: %s\n", err.c_str());
+    uint32_t got[15] = {};
+    if (inv.memory[1].size() >= 60) std::memcpy(got, inv.memory[1].data(), 60);
+    const uint32_t want[15] = {0, 0x7FFFFFFFu, 0x80000000u, uint32_t(-1), 200,  //
+                               0, 0xFFFFFFFFu, 0,           0,            200,  //
+                               0, 255,         0,           0,            200};
+    for (int i = 0; i < 15; ++i) {
+        CHECK(got[i] == want[i]);
+        if (got[i] != want[i]) std::fprintf(stderr, "  [%d] got %08x want %08x\n", i, got[i], want[i]);
+    }
+}
+
+// OpConvertFToS / OpConvertFToU of values a clamp bounds (ftoi_bounded.comp.spvasm): converted directly, none of the NaN / overflow
+// selects of the general case, same results. in = {3e10, -3e10, 200.25, -1.5}.
+void floatToIntBounded(const std::string& dir) {
+    spirv::SpirvLowerOptions o;
+    o.entry = "main";
+    o.stage = vpir::Stage::Compute;
+    o.layout = {bind(0, 0, vpgpu::BindKind::Buffer, 0), bind(0, 1, vpgpu::BindKind::Buffer, 1)};
+    Result r = run(dir + "/ftoi_bounded.comp.spv", o);
+    CHECK(r.ok);
+    if (!r.ok) return;
+    CHECK(vpir::print(r.module).find("isnan") == std::string::npos);
+    const float in[4] = {3e10f, -3e10f, 200.25f, -1.5f};
+    vpireval::Invocation inv;
+    inv.memory[0].resize(16);
+    std::memcpy(inv.memory[0].data(), in, 16);
+    inv.memory[1].assign(32, 0);
+    std::string err;
+    CHECK(vpireval::run(r.module, inv, err));
+    uint32_t got[8] = {};
+    if (inv.memory[1].size() >= 32) std::memcpy(got, inv.memory[1].data(), 32);
+    const uint32_t want[8] = {255, 0, 200, 0, 100, uint32_t(-100), 100, uint32_t(-1)};
+    for (int i = 0; i < 8; ++i) {
+        CHECK(got[i] == want[i]);
+        if (got[i] != want[i]) std::fprintf(stderr, "  [%d] got %08x want %08x\n", i, got[i], want[i]);
+    }
+}
+
+// 16-bit float GLSL.std.450 functions (f16math.comp.spvasm), evaluated: their constants must be binary16 and their
+// bit tricks / approximations run in 32 bits. in = {180, 1, -2, 11}.
+void f16Math(const std::string& dir) {
+    spirv::SpirvLowerOptions o;
+    o.entry = "main";
+    o.stage = vpir::Stage::Compute;
+    o.layout = {bind(0, 0, vpgpu::BindKind::Buffer, 0), bind(0, 1, vpgpu::BindKind::Buffer, 1)};
+    Result r = run(dir + "/f16math.comp.spv", o);
+    CHECK(r.ok);
+    if (!r.ok) return;
+    const float in[4] = {180.f, 1.f, -2.f, 11.f};
+    vpireval::Invocation inv;
+    inv.memory[0].resize(16);
+    std::memcpy(inv.memory[0].data(), in, 16);
+    inv.memory[1].assign(24, 0);
+    std::string err;
+    CHECK(vpireval::run(r.module, inv, err));
+    if (!err.empty()) std::fprintf(stderr, "  eval: %s\n", err.c_str());
+    float got[6] = {};
+    if (inv.memory[1].size() >= 24) std::memcpy(got, inv.memory[1].data(), 24);
+    const float want[6] = {3.14159265f, 2.71828183f, -1.f, 29937.07f, 0.78539816f, 16.f};
+    for (int i = 0; i < 6; ++i) {
+        const bool good = std::fabs(got[i] - want[i]) <= 2e-3f * std::fabs(want[i]);  // half precision
+        CHECK(good);
+        if (!good) std::fprintf(stderr, "  [%d] got %g want %g\n", i, double(got[i]), double(want[i]));
+    }
+}
+
+// 32-bit ldexp with exponents far outside the float range (ldexp.comp.spvasm), evaluated: the CTS draws them up to
+// 2^30, and a large float scaled by a very negative exponent must flush to zero, not stop at a finite power.
+void ldexpRange(const std::string& dir) {
+    spirv::SpirvLowerOptions o;
+    o.entry = "main";
+    o.stage = vpir::Stage::Compute;
+    o.layout = {bind(0, 0, vpgpu::BindKind::Buffer, 0), bind(0, 1, vpgpu::BindKind::Buffer, 1)};
+    Result r = run(dir + "/ldexp.comp.spv", o);
+    CHECK(r.ok);
+    if (!r.ok) return;
+    struct In { float x; int32_t e; };
+    const In in[4] = {{3.0e38f, -1000000}, {1.5f, 3}, {std::ldexp(1.0f, 127), -252}, {1.25f, -140}};
+    vpireval::Invocation inv;
+    inv.memory[0].resize(sizeof in);
+    std::memcpy(inv.memory[0].data(), in, sizeof in);
+    inv.memory[1].assign(16, 0);
+    std::string err;
+    CHECK(vpireval::run(r.module, inv, err));
+    if (!err.empty()) std::fprintf(stderr, "  eval: %s\n", err.c_str());
+    float got[4] = {};
+    if (inv.memory[1].size() >= 16) std::memcpy(got, inv.memory[1].data(), 16);
+    const float want[4] = {0.f, 12.f, std::ldexp(1.0f, -125), std::ldexp(1.25f, -140)};
+    for (int i = 0; i < 4; ++i) {
+        CHECK(got[i] == want[i]);
+        if (got[i] != want[i]) std::fprintf(stderr, "  [%d] got %g want %g\n", i, double(got[i]), double(want[i]));
+    }
+}
+
+// An Output variable with an initializer (outinit.frag.spvasm: FragDepth = 0.2 never stored to, a lane terminated
+// before the end): the output starts at the initializer, so the surviving lanes write it.
+void outputInit(const std::string& dir) {
+    spirv::SpirvLowerOptions o;
+    o.entry = "main";
+    o.stage = vpir::Stage::Fragment;
+    Result r = run(dir + "/outinit.frag.spv", o);
+    CHECK(r.ok);
+    if (!r.ok) return;
+    if (std::getenv("VP_PRINT")) std::fputs(r.msl.source.c_str(), stderr);
+    CHECK(r.msl.source.find(" = 0.2f;") != std::string::npos);
+}
+
+// A variable pointer returned by a function (varptr_call.comp.spvasm: OpSelect of two pointers to an array of arrays of
+// structs in one buffer, returned through OpFunctionCall, then indexed): the load reads the chosen member (a at byte 0,
+// b at byte 256), evaluated.
+void varPtrCall(const std::string& dir) {
+    spirv::SpirvLowerOptions o;
+    o.entry = "main";
+    o.stage = vpir::Stage::Compute;
+    o.layout = {bind(0, 0, vpgpu::BindKind::Buffer, 0), bind(0, 1, vpgpu::BindKind::Buffer, 1)};
+    Result r = run(dir + "/varptr_call.comp.spv", o);
+    CHECK(r.ok);
+    if (!r.ok) return;
+    float in[128];
+    for (int i = 0; i < 64; ++i) in[i] = 4.f * float(i) / 255.f, in[i + 64] = (4.f * float(i) + 3.f) / 255.f;
+    for (int pickA = 1; pickA >= 0; --pickA) {
+        // The evaluator's memories follow the module's resource order (first use), not the binding numbers.
+        const size_t ib = r.module.resources[0].index == 0 ? 0 : 1, ob = 1 - ib;
+        vpireval::Invocation inv;
+        inv.memory[ib].resize(sizeof in);
+        std::memcpy(inv.memory[ib].data(), in, sizeof in);
+        const float out[2] = {-1.f, float(pickA)};
+        inv.memory[ob].resize(8);
+        std::memcpy(inv.memory[ob].data(), out, 8);
+        std::string err;
+        CHECK(vpireval::run(r.module, inv, err));
+        if (!err.empty()) std::fprintf(stderr, "  eval: %s\n", err.c_str());
+        float got = -1.f;
+        if (inv.memory[ob].size() >= 4) std::memcpy(&got, inv.memory[ob].data(), 4);
+        const float want = in[(pickA ? 0 : 64) + 42];  // [1][0].y[0].z: byte 128 + 32 + 8 of the chosen member
+        CHECK(got == want);
+        if (got != want) std::fprintf(stderr, "  pickA=%d got %g want %g\n", pickA, double(got), double(want));
+    }
+}
+
+// memoryBarrier() / memoryBarrierImage() without the Vulkan memory model (membar_image.comp.spvasm): the image class still
+// fences (Metal needs it for storage-image writes to reach the rest of the threadgroup); a shared-only barrier adds none.
+void memBarImage(const std::string& dir) {
+    spirv::SpirvLowerOptions o;
+    o.entry = "main";
+    o.stage = vpir::Stage::Compute;
+    Result r = run(dir + "/membar_image.comp.spv", o);
+    CHECK(r.ok);
+    if (!r.ok) return;
+    int device = 0, group = 0;
+    std::function<void(const vpir::Block&)> walk = [&](const vpir::Block& b) {
+        for (const vpir::Node& n : b) {
+            device += n.kind == vpir::NodeKind::Inst && n.inst.op == vpir::Op::FenceDevice;
+            group += n.kind == vpir::NodeKind::Inst && n.inst.op == vpir::Op::FenceThreadgroup;
+            walk(n.body);
+            walk(n.elseBody);
+        }
+    };
+    for (const vpir::Function& f : r.module.functions) walk(f.body);
+    CHECK(device == 1 && group == 1);
+}
+
+// OpBitcast between a 32-bit word and a vector of 16-bit integers, both ways (bitcast16.comp.spvasm), evaluated.
+void bitcast16(const std::string& dir) {
+    spirv::SpirvLowerOptions o;
+    o.entry = "main";
+    o.stage = vpir::Stage::Compute;
+    o.layout = {bind(0, 0, vpgpu::BindKind::Buffer, 0), bind(0, 1, vpgpu::BindKind::Buffer, 1)};
+    Result r = run(dir + "/bitcast16.comp.spv", o);
+    CHECK(r.ok);
+    if (!r.ok) return;
+    const uint32_t in = 0x8001FFFEu;
+    vpireval::Invocation inv;
+    inv.memory[0].resize(4);
+    std::memcpy(inv.memory[0].data(), &in, 4);
+    inv.memory[1].assign(12, 0);
+    std::string err;
+    CHECK(vpireval::run(r.module, inv, err));
+    if (!err.empty()) std::fprintf(stderr, "  eval: %s\n", err.c_str());
+    uint32_t got[3] = {};
+    if (inv.memory[1].size() >= 12) std::memcpy(got, inv.memory[1].data(), 12);
+    CHECK(int32_t(got[0]) == -2 && int32_t(got[1]) == -32767 && got[2] == in);
+}
+
+// CTS float16 OpCompositeInsert on a struct{v3f16} read-modify-written through a Uniform buffer (vertex stage), evaluated: the
+// output starts as 0xffffffff words and ends as (0, 1, 2) plus the -1.0 pad.
+void f16Insert(const std::string& dir) {
+    spirv::SpirvLowerOptions o;
+    o.entry = "main";
+    o.stage = vpir::Stage::Vertex;
+    o.layout = {bind(0, 0, vpgpu::BindKind::Buffer, 0), bind(0, 1, vpgpu::BindKind::Buffer, 1)};
+    Result r = run(dir + "/f16_insert.vert.spv", o);
+    CHECK(r.ok);
+    if (!r.ok) return;
+    const uint16_t in[4] = {0x0000, 0x3C00, 0x4000, 0xBC00};
+    vpireval::Invocation inv;
+    inv.memory[0].resize(8);
+    std::memcpy(inv.memory[0].data(), in, 8);
+    inv.memory[1].assign(8, 0xFF);
+    std::string err;
+    CHECK(vpireval::run(r.module, inv, err));
+    if (!err.empty()) std::fprintf(stderr, "  eval: %s\n", err.c_str());
+    uint16_t got[4] = {};
+    if (inv.memory[1].size() >= 8) std::memcpy(got, inv.memory[1].data(), 8);
+    CHECK(got[0] == 0x0000 && got[1] == 0x3C00 && got[2] == 0x4000 && got[3] == 0xBC00);
+    if (failures || std::getenv("VP_PRINT")) std::fprintf(stderr, "%04x %04x %04x %04x\n%s\n", got[0], got[1], got[2], got[3], r.msl.source.c_str());
+}
+
+// gl_Subgroup{Eq,Ge,Gt,Le,Lt}Mask are derived from the lane and the subgroup size (submask.comp.spvasm).
+void subgroupMasks(const std::string& dir) {
+    spirv::SpirvLowerOptions o;
+    o.entry = "main";
+    o.stage = vpir::Stage::Compute;
+    o.layout = {bind(0, 0, vpgpu::BindKind::Buffer, 0)};
+    Result r = run(dir + "/submask.comp.spv", o);
+    CHECK(r.ok);
+    if (!r.ok) return;
+    const std::string& src = r.msl.source;
+    CHECK(src.find("thread_index_in_simdgroup") != std::string::npos && src.find("threads_per_simdgroup") != std::string::npos);
+    if (failures || std::getenv("VP_PRINT")) std::fprintf(stderr, "%s\n", src.c_str());
+}
+
+// The pipeline's VkSampleMask: the fragment shader gets a [[sample_mask]] output holding it (solid.frag declares none); without
+// a mask the MSL has none.
+void sampleMask(const std::string& dir) {
+    spirv::SpirvLowerOptions o;
+    o.entry = "main";
+    o.stage = vpir::Stage::Fragment;
+    Result plain = run(dir + "/solid.frag.spv", o);
+    CHECK(plain.ok && plain.msl.source.find("[[sample_mask]]") == std::string::npos);
+    o.sampleMask = 0x5u;
+    Result r = run(dir + "/solid.frag.spv", o);
+    CHECK(r.ok);
+    if (!r.ok) return;
+    CHECK(r.msl.source.find("[[sample_mask]]") != std::string::npos);
+    CHECK(r.msl.source.find("5u") != std::string::npos || r.msl.source.find("0x5") != std::string::npos);
+    if (failures || std::getenv("VP_PRINT")) std::fprintf(stderr, "%s\n", r.msl.source.c_str());
+}
+
+// shaderZeroInitializeWorkgroupMemory: a Workgroup variable with an OpConstantNull initializer is cleared by a
+// strided loop over the threadgroup array and a barrier before the body (zeroinit.comp.spvasm).
+void zeroInit(const std::string& dir) {
+    spirv::SpirvLowerOptions o;
+    o.entry = "main";
+    o.stage = vpir::Stage::Compute;
+    o.layout = {bind(0, 0, vpgpu::BindKind::Buffer, 0)};
+    Result r = run(dir + "/zeroinit.comp.spv", o);
+    CHECK(r.ok);
+    if (!r.ok) return;
+    CHECK(r.module.sharedBytes == 160);
+    const std::string text = vpir::print(r.module);
+    CHECK(text.find("loop") != std::string::npos && text.find("barrier") != std::string::npos);
+    vpireval::Invocation inv;
+    inv.builtins[vpir::Builtin::LocalInvocationIndex] = {vpir::kU32, {2}};
+    inv.memory[0].assign(16, 0xEE);
+    std::string err;
+    CHECK(vpireval::run(r.module, inv, err));
+    if (!err.empty()) std::fprintf(stderr, "  eval: %s\n", err.c_str());
+    uint32_t got[4] = {};
+    std::memcpy(got, inv.memory[0].data(), 16);
+    CHECK(got[2] == 7u);  // tile[i * 5] read after the clear
 }
 
 // VariablePointersStorageBuffer: OpSelect / OpPhi between pointers into two buffers, a store through
@@ -1162,6 +1544,21 @@ static void correctness(const std::string& dir) {
         CHECK(r.ok);
         CHECK(!r.module.invariantPosition);
         CHECK(r.msl.source.find("invariant") == std::string::npos);
+        // SpirvLowerOptions::invariantPos (VPVK_INVARIANT_POS): the same shader with the position invariant anyway.
+        o.invariantPos = true;
+        Result ri = run(dir + "/pos.vert.spv", o);
+        CHECK(ri.ok);
+        CHECK(ri.module.invariantPosition);
+        CHECK(ri.msl.source.find("[[position, invariant]]") != std::string::npos);
+    }
+    {  // only vertex stages: a fragment shader (FragCoord is a Position input) is untouched
+        spirv::SpirvLowerOptions o;
+        o.entry = "main", o.stage = vpir::Stage::Fragment;
+        o.invariantPos = true;
+        Result r = run(dir + "/outinit.frag.spv", o);
+        CHECK(r.ok);
+        CHECK(!r.module.invariantPosition);
+        CHECK(r.msl.source.find("invariant") == std::string::npos);
     }
     spirv::SpirvLowerOptions f;
     f.entry = "main", f.stage = vpir::Stage::Fragment;
@@ -1456,6 +1853,8 @@ int main(int argc, char** argv) {
     else if (c == "bool_iface") boolIface(dir);
     else if (c == "dyn_buffer") dynBuffer(dir);
     else if (c == "subgroup_cube") subgroupCube(dir);
+    else if (c == "subgroup_shuffle") subgroupShuffle(dir);
+    else if (c == "subgroup_arith") subgroupArith(dir);
     else if (c == "texel_fetch") texelFetch(dir);
     else if (c == "int16") int16(dir);
     else if (c == "storage16") storage16(dir);
@@ -1468,6 +1867,19 @@ int main(int argc, char** argv) {
     else if (c == "bda") bda(dir);
     else if (c == "varptr") varPtr(dir);
     else if (c == "int8") int8(dir);
+    else if (c == "dot") dotProduct(dir);
+    else if (c == "zero_init") zeroInit(dir);
+    else if (c == "float_to_int") floatToInt(dir);
+    else if (c == "float_to_int_bounded") floatToIntBounded(dir);
+    else if (c == "f16_math") f16Math(dir);
+    else if (c == "ldexp_range") ldexpRange(dir);
+    else if (c == "output_init") outputInit(dir);
+    else if (c == "varptr_call") varPtrCall(dir);
+    else if (c == "membar_image") memBarImage(dir);
+    else if (c == "bitcast16") bitcast16(dir);
+    else if (c == "f16_insert") f16Insert(dir);
+    else if (c == "submask") subgroupMasks(dir);
+    else if (c == "sample_mask") sampleMask(dir);
     else if (c == "ycbcr") ycbcr(dir);
     else if (c == "robust") robust(dir);
     else if (c == "correctness") correctness(dir);

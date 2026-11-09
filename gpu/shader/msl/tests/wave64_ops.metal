@@ -9,14 +9,15 @@ struct VpArgs {
 };
 
 [[max_total_threads_per_threadgroup(64)]] kernel void vp_main(constant VpArgs& vp_args [[buffer(0)]],
-        uint in_lid [[thread_index_in_threadgroup]]) {
+        uint in_lid [[thread_index_in_threadgroup]],
+        uint in_lane [[thread_index_in_simdgroup]]) {
     threadgroup uint4 vp_shared[65];
     const uint v30 = in_lid & 63u;
     const uint v32 = v30 << 4u;
     const uint v36 = v30 >> 5u;
     const uint v2 = in_lid & 3u;
     const bool v4 = v2 == 1u;
-    const uint4 v37 = uint4(as_type<uint2>(simd_vote::vote_t(simd_ballot(v4))), 0u, 0u);
+    const uint4 v37 = uint4(simd_or((v4) ? (1u << in_lane) : 0u), 0u, 0u, 0u);
     const uint v40 = v36 << 2u;
     const uint v42 = v40 + 1024u;
     *(threadgroup uint*)((threadgroup uchar*)vp_shared + v42) = v37.x;
@@ -25,7 +26,7 @@ struct VpArgs {
     const uint v46 = *(threadgroup uint*)((threadgroup uchar*)vp_shared + 1028u);
     threadgroup_barrier(mem_flags::mem_threadgroup);
     const uint4 v5 = uint4(v44, v46, 0u, 0u);
-    const uint4 v49 = uint4(as_type<uint2>(simd_vote::vote_t(simd_ballot(v4))), 0u, 0u);
+    const uint4 v49 = uint4(simd_or((v4) ? (1u << in_lane) : 0u), 0u, 0u, 0u);
     *(threadgroup uint*)((threadgroup uchar*)vp_shared + v42) = v49.x;
     threadgroup_barrier(mem_flags::mem_threadgroup);
     const uint v56 = *(threadgroup uint*)((threadgroup uchar*)vp_shared + 1024u);
@@ -33,7 +34,7 @@ struct VpArgs {
     threadgroup_barrier(mem_flags::mem_threadgroup);
     const uint v59 = v56 | v58;
     const bool v6 = v59 != 0u;
-    const uint4 v62 = uint4(as_type<uint2>(simd_vote::vote_t(simd_ballot(v4))), 0u, 0u);
+    const uint4 v62 = uint4(simd_or((v4) ? (1u << in_lane) : 0u), 0u, 0u, 0u);
     *(threadgroup uint*)((threadgroup uchar*)vp_shared + v42) = v62.x;
     threadgroup_barrier(mem_flags::mem_threadgroup);
     const uint v69 = *(threadgroup uint*)((threadgroup uchar*)vp_shared + 1024u);

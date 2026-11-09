@@ -28,6 +28,23 @@
 #include "foveation.h"
 #include "perf.h"
 
+// vpvk_cache_state (the host finds it with dlsym): what the driver knows about whether the game's shader cache is complete. POD,
+// version 1 = these 9 fields; filled in full by the driver (the caller only provides the storage).
+// reason: 0 ok, 1 no pipelines yet, 2 a new pipeline key appeared less than idle time ago, 3 too few frames since it, 4 pipelines
+// still queued / compiling, 5 more than 5 % of the shader modules the game created are referenced by no pipeline.
+struct VpvkCacheState {
+  uint32_t version;
+  uint32_t pipelines_unique;  // distinct pipeline keys the game created or probed in this run
+  uint32_t recipes;           // recipes stored (earlier runs and this one)
+  uint32_t modules_created;   // distinct shader modules (SPIR-V content) the game created
+  uint32_t modules_used;      // ... of those, referenced by a pipeline that was created or probed
+  uint32_t idle_ms;           // since the last new pipeline key
+  uint32_t frames_idle;       // frames submitted since the last new pipeline key
+  uint32_t complete;          // 1 when every condition holds
+  uint32_t reason;
+};
+static_assert(sizeof(VpvkCacheState) == 36, "VpvkCacheState is host ABI");
+
 namespace vpvk {
 
 // Every log line of the driver starts with "vk." (one grep finds them all in the visor log).
@@ -41,9 +58,9 @@ void logf(const char* fmt, ...) __attribute__((format(printf, 1, 2)));
 bool prewarmEnabled();  // config.cpp: vpvk_config_set_prewarm
 // VPVK_ASYNC_PIPELINES: default (unset, or 1) = asynchronous: vkCreate*Pipelines returns at once, translation + compile
 // run in the background and draws whose pipeline is not ready are skipped within a small budget (pipelines.cpp
-// "Asynchronous creation"). =0 is the opt-in synchronous mode: vkCreate*Pipelines returns with the pipelines compiled
-// (pipelines.cpp "Synchronous creation"). The internal GLES device (internalClient()) ignores it: asynchronous unless
-// VPVK_GLES_SYNC_PIPELINES=1. Decided at vkCreateDevice.
+// "Asynchronous creation"). =0 is the opt-in synchronous mode, as a real driver (VQP): vkCreate*Pipelines returns with the
+// pipelines compiled (pipelines.cpp "Synchronous creation"; VPVK_CREATE_WAIT_MS bounds the wait). The internal GLES device
+// (internalClient()) ignores it: asynchronous unless VPVK_GLES_SYNC_PIPELINES=1. Decided at vkCreateDevice.
 bool asyncPipelinesOn();
 // config.cpp: robustBufferAccess in the translated shaders (VPVK_ROBUST: unset = on, "0" = off, "app" = what the app
 // enabled at vkCreateDevice, on while there is no device). robustMode() is "default", "0" or "app" as of the last
@@ -55,11 +72,25 @@ int appRobustBufferAccess();
 bool robustBuffersEffective();
 // config.cpp: harness dump (VPVK_DUMP_MSL / VPVK_DUMP_MSL_FILTER, read at every call): true = write shader `id` into `dir`.
 bool dumpDirFor(uint64_t id, std::string& dir);
-// config.cpp: the pass size is the game's eye target (band of msaaObservePass); false while the eye is unknown.
-bool eyeSizedPass(uint32_t w, uint32_t h, bool* known = nullptr);
+// Size of the most recent eye image the host marked (Device::eyeSize, vpvk_mark_eye_image): width << 40 | height << 16 | layers
+// (width and height 24 bits each); 0 = none marked.
+constexpr uint64_t packEyeSize(uint32_t w, uint32_t h, uint32_t layers) {
+  return uint64_t(w & 0xffffffu) << 40 | uint64_t(h & 0xffffffu) << 16 | (layers & 0xffffu);
+}
+constexpr uint32_t eyeSizeW(uint64_t p) { return uint32_t(p >> 40); }
+constexpr uint32_t eyeSizeH(uint64_t p) { return uint32_t(p >> 16 & 0xffffffu); }
+// config.cpp: the pass size is the game's eye target (band of msaaObservePass); false while the eye is unknown. The eye size is
+// the VPKTAA jitter's, else `markedEye` (packEyeSize of the host-marked eye image), else the detected MSAA eye pass.
+bool eyeSizedPass(uint32_t w, uint32_t h, bool* known = nullptr, uint64_t markedEye = 0);
 bool forceSingleSample();  // config.cpp: vpvk_config_set_force_single_sample; frozen while a device lives
 bool forceSingleSampleLive();
-void holdForceSingleSample(bool acquire);  // vkCreateDevice / vkDestroyDevice
+void holdForceSingleSample(bool acquire);  // vkCreateDevice / vkDestroyDevice (also freezes msaaForce)
+// Forced MSAA of the game's 1x scene passes (VPVK_MSAA_FORCE / vpvk_config_set_msaa_force): 0 = off, else 2 / 4 (clamped to
+// platformMaxSampleCount). Frozen while a VkDevice lives (holdForceSingleSample); msaaForceLive reads the setting now.
+int msaaForce();
+int msaaForceLive();
+bool gameMsaaAuto();  // VPVK_GAME_MSAA_AUTO (default on), frozen like msaaForce
+bool gameMsaaAutoLive();
 
 // ---- MSAA: detection of the game's eye pass and the sample-count override (config.cpp) ----
 // Largest sample count the Metal device renders to (8/4/2 probed with supportsTextureSampleCount;
@@ -83,7 +114,8 @@ int msaaOverride();
 // A pass the game began: its ORIGINAL sample count (before forcing/override), the size of its
 // colour attachment, multiview mask, and whether it has colour and depth. The largest qualifying
 // one is the eye pass (vpvk_msaa_detected, log "vk.msaa detected eye=Nx").
-void msaaObservePass(uint8_t gameSamples, uint32_t w, uint32_t h, uint32_t viewMask, bool hasColor, bool hasDepth);
+void msaaObservePass(uint8_t gameSamples, uint32_t w, uint32_t h, uint32_t viewMask, bool hasColor, bool hasDepth,
+                     uint64_t markedEye = 0);  // markedEye (packEyeSize): the eye size while the VPKTAA jitter has none
 // After each vkQueueSubmit: without eye size or multiview, the largest pass decides after 120.
 void msaaSubmitTick(uint64_t submits);
 
@@ -164,6 +196,12 @@ struct Instance : Dispatchable {
   PhysicalDevice physical;
   std::string appName, engineName;
 };
+
+// The single queue family exposes kQueueCount VkQueues (Quest: queueCount 4). Each has its own submission order; they all
+// execute on the one Metal command queue, in the order their batches become ready (entry.cpp drainDeferred).
+inline constexpr uint32_t kQueueCount = 4;
+// Timestamps are host ticks of limits.timestampPeriod; the bits above this many are 0 (commands.cpp queryEnd). Quest: 48.
+inline constexpr uint32_t kTimestampValidBits = 48;
 
 struct Queue : Dispatchable {
   Device* device = nullptr;
@@ -265,6 +303,9 @@ struct ImageView {
   VkFormat format = VK_FORMAT_UNDEFINED;
   VkImageSubresourceRange range{};
   vpgpu::TextureId view;  // backend view when type/format/range differ from the image (bindings)
+  // Cube / cube-array views of storage images: the same slices as a 2D-array view. Metal has no texture atomics (and the
+  // translator no cube storage access) on cubes: shaders declare these images texture2d_array (msl.cpp textureType).
+  vpgpu::TextureId storageView;
   // Multi-planar image viewed through a Y'CbCr conversion: views of planes 1 and 2 (this view is
   // plane 0's). Owned.
   std::vector<ImageView*> planeViews;
@@ -281,6 +322,20 @@ struct Sampler {
   std::shared_ptr<const YcbcrConversionObj> ycbcr;  // sampler Y'CbCr conversion (immutable samplers only)
 };
 
+// vpvk_dump_pending (pending.cpp): what the host asked about an object. Relaxed atomics inside the object itself.
+inline int64_t pendingNowNs() {  // steady clock, ns
+  return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+struct Polled {
+  std::atomic<uint32_t> n{0};
+  std::atomic<int64_t> ns{0};      // when it was last asked
+  std::atomic<int32_t> result{0};  // what it answered (VkResult)
+  void note(int32_t r) {
+    n.fetch_add(1, std::memory_order_relaxed);
+    ns.store(pendingNowNs(), std::memory_order_relaxed);
+    result.store(r, std::memory_order_relaxed);
+  }
+};
 struct Fence {
   std::atomic<bool> signaled{false};
   // Its submission waits on a timeline value nothing has signaled yet (Device::deferred): not on the
@@ -288,6 +343,9 @@ struct Fence {
   std::atomic<bool> deferred{false};
   std::atomic<bool> submitted{false};  // signaled by a submission: the GPU may still be running it
   std::atomic<uint64_t> frames{0};     // done once every vpgpu frame below this index has finished
+  Polled poll;                         // vkGetFenceStatus / vkWaitForFences
+  std::atomic<int64_t> submitNs{0};    // when the vkQueueSubmit that signals it was made
+  std::atomic<uint32_t> waiting{0};    // threads inside vkWaitForFences on it
 };
 struct Semaphore {
   uint64_t value = 0;
@@ -297,6 +355,10 @@ struct Semaphore {
   std::mutex m;
   uint64_t completed = 0;
   std::vector<std::pair<uint64_t, uint64_t>> pending;  // (value, frames)
+  Polled poll;                                         // vkGetSemaphoreCounterValue
+  std::atomic<uint64_t> waitMax{0};                    // highest value vkWaitSemaphores was asked for
+  std::atomic<int64_t> waitNs{0};                      // when it was last asked
+  std::atomic<uint32_t> waiting{0};                    // threads inside vkWaitSemaphores on it
 };
 // config.cpp: the Quest 3 / Adreno 740 identity (vpvk_config_set_quest_identity, VPVK_QUEST_IDENTITY=1). Off by
 // default: the device then reports what the Apple GPU supports. Not latched (read per query).
@@ -318,6 +380,9 @@ struct Event {
   bool set = false;
   uint64_t frame = 0;
   bool value = false;
+  Polled poll;                                // vkGetEventStatus
+  uint32_t hostSet = 0, hostReset = 0, cmdStamps = 0;  // vkSetEvent / vkResetEvent calls, vkCmdSetEvent / vkCmdResetEvent applied by a submit (m)
+  int64_t stampNs = 0;                        // the last of those (m)
 };
 
 struct RenderPassObj {
@@ -345,6 +410,7 @@ struct ShaderModuleObj {
   // and the store saves the words once, so a later translator version can retranslate them.
   std::shared_ptr<const std::vector<uint32_t>> words;  // null unless recipes are recorded
   uint64_t hash = 0;
+  uint64_t uid = 0;  // spirvHash of the code, always (CacheWatch counts distinct modules by it)
 };
 
 struct SetLayoutBinding {
@@ -355,6 +421,7 @@ struct SetLayoutBinding {
 };
 struct SetLayoutData {
   std::vector<SetLayoutBinding> bindings;  // sorted by binding
+  bool push = false;                       // VK_KHR_push_descriptor layout: never allocated from a pool
   const SetLayoutBinding* find(uint32_t b) const {
     for (const auto& x : bindings)
       if (x.binding == b) return &x;
@@ -407,6 +474,9 @@ struct DescriptorPoolObj {
 
 struct DescriptorUpdateTemplateObj {
   std::vector<VkDescriptorUpdateTemplateEntry> entries;
+  bool push = false;  // VK_DESCRIPTOR_UPDATE_TEMPLATE_TYPE_PUSH_DESCRIPTORS_KHR: bindPoint / set tell where vkCmdPushDescriptorSetWithTemplate goes
+  VkPipelineBindPoint bindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+  uint32_t set = 0;
 };
 
 struct PipelineObj {
@@ -497,9 +567,11 @@ struct PipelineObj {
   };
   std::vector<StageSrc> sources;
   std::vector<spirv::VertexAttribute> attrs;
+  uint32_t sampleMask = ~0u;  // VkSampleMask of the pipeline (pSampleMask[0]) when it clears samples of the game's count, else ~0u
   bool a2cTest = false;  // alpha-to-coverage pipeline created at 1x (MSAA forced off): alpha test in the fragment shader
   uint16_t colorIntKinds = 0;  // SpirvLowerOptions::colorIntKinds of the fragment stage
   uint8_t fragmentOutputs = 0;  // colour outputs the fragment shader writes (a dynamic colour write mask never enables others)
+  bool sampleBuiltin = false;   // the fragment shader declares BuiltIn SampleId / SampleMask (forced MSAA never upgrades a game MSAA pass using it)
   bool dualSource = false;      // the fragment shader writes [[color(0), index(1)]] (Metal: one render target)
   struct TexelVariant {
     std::vector<vpgpu::Format> formats;  // parallel to `texel`
@@ -538,6 +610,8 @@ struct QueryPoolObj {
   uint32_t base = UINT32_MAX;  // first visibility slot
   std::mutex m;
   std::vector<uint64_t> frame;
+  Polled poll;                                          // vkGetQueryPoolResults
+  std::atomic<uint32_t> lastNotReady{UINT32_MAX};       // the last query it had no result for
 };
 
 struct Framebuffer {
@@ -566,6 +640,7 @@ struct DeferredBatch {
   std::vector<const CommandBuffer*> cbs;
   std::vector<std::pair<Semaphore*, uint64_t>> waits, signals;  // timeline semaphores only
   Fence* fence = nullptr;                                     // last batch of its vkQueueSubmit
+  uint32_t queue = 0;                                         // index of the VkQueue it was submitted to
 };
 
 struct CommandPool {
@@ -627,11 +702,130 @@ struct UiMaskState {
   void release();  // vkDestroyDevice
 };
 
+// Forced MSAA (msaaForce, commands.cpp Translator::forceMsaa): the transient N-sample twins the game's 1x scene / eye passes
+// render into (always tile memory: never stored, resolved into the game's image), cached per guest image, plus the counters
+// of the "vk.msaa force" line. submitMutex.
+struct MsaaTwins {
+  struct Twin {
+    vpgpu::TextureId guest, twin;
+    uint8_t samples = 0;
+    uint16_t layers = 0, mip = 0, layer = 0;
+  };
+  std::vector<Twin> twins;
+  // Passes forced, and the passes that qualified as scene passes but were left at 1x, by reason (cumulative).
+  uint32_t passes = 0, skipLoad = 0, skipInput = 0, skipDsb = 0, skipEds = 0, skipFmt = 0, skipSamples = 0, skipArea = 0, skipShape = 0;
+  uint32_t up = 0;  // ... of those passes, the game's own s-sample MSAA passes upgraded to the forced N (included in passes)
+  uint32_t gameAuto = 0;  // attachments of the game's own MSAA passes handled as autoMsaa (VPVK_GAME_MSAA_AUTO)
+  uint32_t skipUnreadable = 0;  // ... and those left alone because their resolve target is not shader-readable (no sampled usage)
+  uint32_t acquires = 0;  // calls of acquire (the sweep of dead guests runs every 256th)
+  // forceMsaa rejections ("vk.msaa force ... rej{...}"): rejN force off (<2 samples), rejEye not an eye scene pass, rejCd no colour 0
+  // / depth, rejSmp the game's own samples, rejStore a game MSAA pass that keeps / loads its samples (not upgradable), rejSmask a pipeline of the pass with a partial sample mask / SampleId / SampleMask (not upgraded), rejRes the
+  // game's own resolve, rejDesc a texture description unavailable.
+  uint32_t rejN = 0, rejEye = 0, rejCd = 0, rejSmp = 0, rejStore = 0, rejSmask = 0, rejRes = 0, rejDesc = 0;
+  // ... rejEye by why taaEyePass said no: no depth attachment, no eye size known (and not multiview), size differs from the
+  // eye's, other (no jitter snapshot / subpass out of range).
+  uint32_t rejEyeBy[4] = {0, 0, 0, 0};
+  // "vk.msaa up_detail" (first upgraded pass) and "vk.msaa rej_first" (first smp / msstore rejection): each once per device.
+  bool upDetailDone = false, rejFirstDone[2] = {false, false};
+  // Rejected passes logged ("vk.msaa rej"): up to 12 distinct (size, layers, reason) under 1 Mpx, and 12 at or above it.
+  struct RejSeen { uint32_t w = 0, h = 0; uint16_t layers = 0; const char* why = nullptr; };
+  RejSeen rejSeen[2][12];
+  uint8_t rejLogged[2] = {0, 0};
+  void noteRej(Device* dev, const vpgpu::RenderPassDesc& d, const char* why);  // logs a rejected pass (see above); count it separately
+  int64_t nextLogNs = 0;
+  // "vk.msaa main force=N samples=S result=up|rej:<why> area=WxH eye=E": the main scene pass forceMsaa judged in the last 5 s window
+  // (an eye scene pass first, else the largest render area), the game's samples S (0 = its texture description was not available)
+  // and what forceMsaa did with it ("up": drawn at N samples). Written only when result / area / samples differ from this device's
+  // previous line, plus a heartbeat every 60 s while they do not; at most kMainLines lines in all per device (this struct is
+  // per device). Per pass, never per draw.
+  static constexpr uint32_t kMainLines = 60;
+  static constexpr int64_t kMainWindowNs = 5'000'000'000LL, kMainBeatNs = 60'000'000'000LL;
+  struct MainPass { uint64_t rank = 0; uint32_t w = 0, h = 0; uint8_t samples = 0, forced = 0; bool eye = false; const char* why = nullptr; };
+  MainPass mainPass;
+  MainPass lastMain;  // the pass of the last line written (valid when mainLines > 0)
+  const char* lastWhy = nullptr;  // the reason noteRej saw last (forceMsaa clears it first)
+  int64_t nextMainNs = 0, lastMainLineNs = 0;
+  uint32_t mainLines = 0, mainTick = 0;
+  // At the end of a window (nowNs): true with `out` = the pass to log, when it differs from the last line or 60 s passed since it.
+  bool takeMainLine(int64_t nowNs, MainPass& out);
+  void noteMain(Device* dev, vpgpu::TextureId game, const VkRect2D& area, bool eye, uint8_t forced);  // end of forceMsaa
+  // The twin of `guest` (texture description `gd`) for a pass of `layers` layers over mip `mip`, layer `layer`; created on the
+  // first use, and entries whose guest image is gone are freed first. {} if it cannot be created.
+  vpgpu::TextureId acquire(Device* dev, vpgpu::TextureId guest, const vpgpu::TextureDesc& gd, uint8_t samples, uint16_t layers,
+                           uint16_t mip, uint16_t layer);
+  void release(Device* dev);  // vkDestroyDevice
+};
+
+// Complete shader cache detector (pipelines.cpp cacheState, vpvk_cache_state, "vk.cache_state"). The rule's thresholds:
+constexpr uint32_t kCacheIdleMs = 20000;       // no new pipeline key for this long ...
+constexpr uint32_t kCacheIdleFrames = 600;     // ... and this many frames submitted since (the game keeps drawing)
+constexpr uint32_t kCacheUnusedPercent = 5;    // more modules created but referenced by no pipeline than this: not complete
+constexpr uint32_t kCacheLogLines = 200;       // "vk.cache_state" lines per process
+constexpr uint32_t kCacheStateVersion = 1;
+enum CacheReason : uint32_t { CacheOk, CacheNoPipelines, CacheRecent, CacheNoFrames, CacheCompiling, CacheUnusedModules };
+
+// (A flush of the Metal pipeline archive is requested when complete turns 1: see CacheWatch::logChange.)
+// The distinct pipeline keys and shader modules of this run, and when the last new key appeared. Written by the creation calls
+// (any thread): one mutex per set, held for an insert; read by evaluate() (vpvk_cache_state, the submit tick).
+struct CacheWatch {
+  static constexpr size_t kMaxKeys = 262144, kMaxModules = 65536;  // sets are bounded (see noteKey / noteModule)
+  std::mutex keyMutex;
+  std::unordered_set<uint64_t> keys;
+  std::atomic<uint32_t> uniqueKeys{0};
+  std::atomic<int64_t> lastNewNs{0};      // clock of the last new key (0 = none yet)
+  std::atomic<uint64_t> lastNewFrame{0};  // gpu->submittedFrames() then
+  std::mutex moduleMutex;
+  std::unordered_map<uint64_t, bool> modules;  // module uid -> referenced by a pipeline
+  uint32_t modulesUsed = 0;
+  std::mutex logMutex;
+  uint32_t lastComplete = UINT32_MAX, lastReason = UINT32_MAX, lines = 0;
+  bool lastFlushable = false;  // complete, or only unused modules hold it back (CacheUnusedModules): the pipelines are all there
+  std::atomic<int64_t> nextTickNs{0};
+  // A key not seen in this run moves lastNewNs / lastNewFrame. A full set counts every key as new (never a false "complete").
+  void noteKey(uint64_t key, int64_t nowNs, uint64_t frame);
+  // A module the game created (used = false) or a pipeline references (used = true). Past kMaxModules new ones are not tracked.
+  void noteModule(uint64_t uid, bool used);
+  // The state at `nowNs` / `frame`. pipelinesIdle: nothing queued or compiling in the pipeline cache.
+  VpvkCacheState evaluate(int64_t nowNs, uint64_t frame, bool pipelinesIdle, uint32_t recipes);
+  std::string modulesCensus();  // " modules_created=N modules_used=N modules_unused=N" (vk.pso.census)
+  // One "vk.cache_state" line when complete or reason changed. True when the state turned flushable (complete, or reason
+  // CacheUnusedModules; from not flushable, or at the first evaluation): the caller asks for the archive flush, once per transition.
+  bool logChange(const VpvkCacheState&);
+  // The archive flush of that transition (pipelines.cpp requestCacheFlush): platform->flushCaches() on a thread of its own, one at
+  // a time (a request while one runs makes it run once more). Joined at vkDestroyDevice (joinCacheFlush). `complete` does not mean
+  // the flush finished: it is only requested when complete turns 1, and the thread may still be writing when the host reads it.
+  std::mutex flushMutex;
+  std::thread flushThread;
+  bool flushRunning = false, flushAgain = false;
+};
+
+// vk.pso.census prewarmed_unused= / requested_not_prewarmed= (pipelines.cpp noteRecipeKey): the pipeline keys the game's creates asked
+// for this session (at most kMax distinct; `overflow` once more arrived, the counts are then lower bounds) against the recipes the
+// prewarm compiled (`prewarmed`, sorted, set by setPrewarmed once the prewarm's refresh() has rekeyed the recipes; creates noted
+// before that are re-counted then).
+struct RecipeUse {
+  static constexpr size_t kMax = 16384, kSample = 10;
+  mutable std::mutex mutex;
+  std::vector<uint64_t> prewarmed;
+  std::unordered_set<uint64_t> requested;
+  uint32_t requestedPrewarmed = 0;  // requested keys that had a prewarmed recipe
+  bool overflow = false;
+  std::vector<std::pair<uint64_t, std::string>> freshSample;  // the first kSample requested keys without a prewarmed recipe
+  void note(uint64_t key, const std::string& label);
+  void setPrewarmed(std::vector<uint64_t> keys);        // replaces `prewarmed` (sorts it) and recounts requestedPrewarmed / freshSample
+  std::string census() const;                           // " prewarmed_unused=N requested_not_prewarmed=N requested=N[ requested_overflow=1]"
+  std::string keysLine(const RecipeStore* recipes) const;  // "prewarmed_unused=[key:label,..] requested_not_prewarmed=[..]" (up to kSample each), "" if both empty
+};
+
 struct Device : Dispatchable {
   PhysicalDevice* physical = nullptr;
   std::unique_ptr<Platform> platform;
   std::unique_ptr<vpgpu::Device> gpu;
   std::unique_ptr<RecipeStore> recipes;  // pipeline recipes for prewarming the next run
+  // Recipes stored by FAIL_ON_PIPELINE_COMPILE_REQUIRED probes of this run (pipelines.cpp noteCompileRequired): not compiled, so
+  // pipelineKnown does not count them.
+  std::mutex probeMutex;
+  std::unordered_set<uint64_t> probed;
   // Recipes stored when this device was created (0 = no recipes / prewarm off) and how the game's own pipeline creates
   // fared against them (pipelines.cpp noteRecipeKey: gpu.pso.recipe game hits/misses). A miss is a key no earlier run
   // recorded: a new pipeline, or recipes that do not match the game's keys.
@@ -641,7 +835,9 @@ struct Device : Dispatchable {
   // prewarm off), recipes the prewarm left ready, and the game's creates no recipe covered (counted with nothing stored too).
   uint32_t recipesLoaded = 0;
   std::atomic<uint32_t> recipesPrewarmed{0}, recipesFresh{0};
-  Queue queue;
+  RecipeUse recipeUse;
+  CacheWatch cacheWatch;
+  Queue queues[kQueueCount];
   bool multiview = false, densityMap = false, metalObjects = false;
   std::mutex submitMutex;
   std::mutex resourceMutex;  // gpu->create*/destroy from recording threads (upload arenas)
@@ -649,10 +845,25 @@ struct Device : Dispatchable {
   // buffers): a small compute kernel run before the render pass (pipelines.cpp indirectPatch).
   std::once_flag indirectPatchOnce;
   vpgpu::PipelineKey indirectPatchKey{};
-  bool indirectPatchOk = false;
+  std::once_flag indexU8Once;  // the 8-bit index widening kernel (pipelines.cpp)
+  vpgpu::PipelineKey indexU8Key{};
+  std::atomic<int64_t> indexU8BackoffNs{0};
+  // A wait for the kernel that timed out arms a backoff: until the deadline (steady clock ns) no draw waits again, they take the
+  // CPU path / skip at once (100 draws must not cost 100 waits). Budgets are fields so tests can shorten them.
+  std::atomic<int64_t> indirectPatchBackoffNs{0};
+  uint32_t indirectPatchWaitMs = 2000, indirectPatchBackoffMs = 3000;
+  // Occlusion WAIT reads (pipelines.cpp vkGetQueryPoolResults): the query frame (+1) of the last wait that ran out (0: none; no
+  // read waits until the GPU is past it) and the ns the reads waited so far within vpgpu frame `occBudgetFrame` (20 ms per
+  // frame in all). `clockNs` replaces the steady clock (tests).
+  std::atomic<uint64_t> occLateFrame{0}, occBudgetFrame{UINT64_MAX}, occBudgetUsedNs{0};
+  int64_t (*clockNs)() = nullptr;
   uint64_t submits = 0;
-  std::vector<DeferredBatch> deferred;  // submitMutex; queue order (front = next to run)
+  std::vector<DeferredBatch> deferred;  // submitMutex; submission order (batches of one queue keep their order, queues are independent)
+  // vpvk_dump_pending: when each vpgpu frame was handed to the backend (by frame index % 64), and how many are noted.
+  std::atomic<int64_t> frameNs[64]{};
+  std::atomic<uint64_t> frameNsNoted{0};
   UiMaskState uiMask;                   // submitMutex
+  MsaaTwins msaaTwins;                  // submitMutex
   FoveationState fovState;              // submitMutex
   HitchLine hitch;                      // vk.hitch (perf.h), submitMutex: this device's slow-frame lines
   struct {
@@ -671,6 +882,7 @@ struct Device : Dispatchable {
     std::weak_ptr<int> flag;  // Image::idOwners (weak: its use_count decides who destroys the texture): nonzero while pending (record time reads it, see zeroPendingImage)
   };
   vpgpu::BufferId zeroBuffer;  // lazily created, submitMutex
+  vpgpu::BufferId zeroAstcBuffer;  // same size, filled with void-extent blocks (transparent black): an all-zero ASTC block is invalid (magenta)
   std::unordered_map<uint64_t, ZeroPending> zeroPending;
   // Host-visible view of the pending set (vpvk_image_zero_pending/_clear): MTLTexture -> zeroPending
   // key, only for textures the host asked for. Own mutex so the query never waits for a submit.
@@ -680,6 +892,18 @@ struct Device : Dispatchable {
   // submitMutex, then eyeMutex. The pipeline gate (pipelines.cpp) soft-gates a pass only when it draws into one.
   std::mutex eyeMutex;
   std::unordered_set<uint64_t> eyeTextures;
+  // Size of the latest image marked by vpvk_mark_eye_image (packEyeSize; written under submitMutex, read lock-free on the hot path).
+  std::atomic<uint64_t> eyeSize{0};
+  // Render targets redrawn every frame (pipelines.cpp stampRedrawnTargets): a "frame" is a submit that has an eye pass, counted
+  // by eyeTick; per target view (texture, mip, layer) the last tick it was rendered in and how many ticks in a row. redrawMutex guards all three.
+  struct RedrawStamp {
+    uint64_t tick = 0;
+    uint32_t streak = 0;
+    bool seen = false;
+  };
+  std::mutex redrawMutex;
+  uint64_t eyeTick = 0, redrawPruneTick = 0;
+  std::unordered_map<uint64_t, RedrawStamp> redrawStamps;
   // Shader ids already handed to the platform (translateStage): a recipe hit registers each once.
   std::mutex shaderMutex;
   std::unordered_set<uint64_t> shadersAdded;
@@ -710,6 +934,7 @@ struct Device : Dispatchable {
   } visibility;
 };
 void releaseVisibility(Device*);  // vkDestroyDevice
+inline uint64_t markedEyeOf(const Device* d) { return d ? d->eyeSize.load(std::memory_order_relaxed) : 0; }  // (packEyeSize)
 // VPVK_ZERO_NEW_IMAGES (default 1): a new image reads as zeros until first written, as on Android.
 bool zeroNewImagesOn();
 // True while the image's texture is zero-init pending (shared by images aliasing one texture). Read
@@ -740,6 +965,10 @@ void markEyeTexture(Device&, vpgpu::TextureId);
 bool isEyeTexture(Device&, vpgpu::TextureId);
 // pipelines.cpp: how long a submit waits for the pipelines of its hard passes (VPVK_PIPELINE_PERSIST_WAIT_MS wins).
 uint32_t persistWaitMs(bool internalClient);
+// pipelines.cpp: the extra wait for the eye's passes (VPVK_PIPELINE_EYE_HARD_WAIT_MS wins; default 0 for every client).
+uint32_t eyeHardWaitMs(bool internalClient);
+// pipelines.cpp (tests): forget which pipelines already had their eye wait and the per-second budget spent.
+void eyeWaitReset();
 // submitMutex held: the image's MTLTexture became known; a pending one becomes queryable by it.
 void zeroNoteNative(Device&, const Image&, void* native);
 void zeroForgetNative(Device&, Device::ZeroPending&);  // drops its host-visible entry (before erasing it)
@@ -747,6 +976,16 @@ size_t zeroInitResolve(Device&, const ZeroLog& log, vpgpu::Frame& pre);
 // entry.cpp: runs the deferred batches whose timeline waits can now be met (takes submitMutex);
 // called after a host vkSignalSemaphore.
 void submitDeferred(Device*);
+// pending.cpp (vpvk_dump_pending): the objects the host polls, listed from create to destroy (Fence, Event,
+// Semaphore (timeline only), QueryPoolObj); submitMutex held: a submit has just advanced the frame count to `frames`.
+template <class T> void pendingTrack(T*);
+template <class T> void pendingUntrack(T*);
+void pendingFrames(Device&, uint64_t frames);
+// vkWaitForFences / vkWaitSemaphores around the real wait: who is inside it, and what it returned.
+void pendingFenceWait(uint32_t n, const VkFence* fs, bool enter, VkBool32 waitAll = VK_FALSE, VkResult r = VK_SUCCESS);
+void pendingSemaphoreWait(const VkSemaphoreWaitInfo&, bool enter);
+// The report vpvk_dump_pending logs, one "vk.pending ..." line each (at most ~40).
+std::vector<std::string> pendingReport(Device&);
 
 // Physical device model (physical_device.cpp).
 const VkPhysicalDeviceProperties& deviceProperties();
@@ -758,6 +997,8 @@ VkFormatFeatureFlags formatFeatures(VkFormat, bool buffer);
 // A format stored as its core format with R and B swapped (B4G4R4A4 as ABGR4).
 bool isSwappedRB(VkFormat f);
 vpgpu::Format toCoreFormat(VkFormat);
+// A 3D image of an ASTC format: created as RGBA8, its buffer->image copies decoded on the CPU (texdecode.h).
+inline bool isDecodedVolume(const Image& im) { return im.info.imageType == VK_IMAGE_TYPE_3D && im.desc.format != toCoreFormat(im.info.format); }
 std::vector<VkExtensionProperties> instanceExtensions();
 std::vector<VkExtensionProperties> deviceExtensions();
 std::vector<VkExtensionProperties> hiddenDeviceExtensions();
@@ -782,3 +1023,4 @@ H to(T* p) { return reinterpret_cast<H>(p); }
 // earlier call. See the definition for what keeps its store.
 extern "C" void vpvk_cmd_pass_drop(VkCommandBuffer cb, uint32_t colorMask, int depth, int stencil);
 extern "C" void vpvk_recipe_stats(VkDevice dv, uint32_t out[4]);  // pipelines.cpp: gles.pso.recipe counters
+extern "C" int vpvk_cache_state(VpvkCacheState* out);  // entry.cpp: 1 = filled from the live device, 0 = no device (out zeroed, version set)

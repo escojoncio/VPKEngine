@@ -1,0 +1,82 @@
+; Compute shader: 16-bit float GLSL.std.450 functions whose lowering needs 32-bit constants or bit tricks (radians, exp,
+; sign, cosh, atan, ldexp), operands narrowed from f32 words. in = {180, 1, -2, 11}; out = f32 words of the results.
+OpCapability Cap:Shader
+OpCapability Cap:Float16
+OpMemoryModel AddrModel:Logical MemModel:GLSL450
+OpEntryPoint Model:GLCompute %main "main"
+OpExecutionMode %main ExecMode:LocalSize 1 1 1
+%glsl = OpExtInstImport "GLSL.std.450"
+OpDecorate %inblk Deco:Block
+OpMemberDecorate %inblk 0 Deco:Offset 0
+OpMemberDecorate %inblk 1 Deco:Offset 4
+OpMemberDecorate %inblk 2 Deco:Offset 8
+OpMemberDecorate %inblk 3 Deco:Offset 12
+OpDecorate %outblk Deco:Block
+OpMemberDecorate %outblk 0 Deco:Offset 0
+OpMemberDecorate %outblk 1 Deco:Offset 4
+OpMemberDecorate %outblk 2 Deco:Offset 8
+OpMemberDecorate %outblk 3 Deco:Offset 12
+OpMemberDecorate %outblk 4 Deco:Offset 16
+OpMemberDecorate %outblk 5 Deco:Offset 20
+OpDecorate %in Deco:DescriptorSet 0
+OpDecorate %in Deco:Binding 0
+OpDecorate %out Deco:DescriptorSet 0
+OpDecorate %out Deco:Binding 1
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%i32 = OpTypeInt 32 1
+%f32 = OpTypeFloat 32
+%f16 = OpTypeFloat 16
+%inblk = OpTypeStruct %f32 %f32 %f32 %f32
+%outblk = OpTypeStruct %f32 %f32 %f32 %f32 %f32 %f32
+%pin = OpTypePointer Storage:StorageBuffer %inblk
+%pout = OpTypePointer Storage:StorageBuffer %outblk
+%pf32 = OpTypePointer Storage:StorageBuffer %f32
+%in = OpVariable %pin Storage:StorageBuffer
+%out = OpVariable %pout Storage:StorageBuffer
+%c0 = OpConstant %i32 0
+%c1 = OpConstant %i32 1
+%c2 = OpConstant %i32 2
+%c3 = OpConstant %i32 3
+%c4 = OpConstant %i32 4
+%c5 = OpConstant %i32 5
+%main = OpFunction %void 0 %fn
+%l = OpLabel
+%pi0 = OpAccessChain %pf32 %in %c0
+%x0 = OpLoad %f32 %pi0
+%h0 = OpFConvert %f16 %x0
+%pi1 = OpAccessChain %pf32 %in %c1
+%x1 = OpLoad %f32 %pi1
+%h1 = OpFConvert %f16 %x1
+%pi2 = OpAccessChain %pf32 %in %c2
+%x2 = OpLoad %f32 %pi2
+%h2 = OpFConvert %f16 %x2
+%pi3 = OpAccessChain %pf32 %in %c3
+%x3 = OpLoad %f32 %pi3
+%h3 = OpFConvert %f16 %x3
+%r0 = OpExtInst %f16 %glsl 11 %h0
+%r1 = OpExtInst %f16 %glsl 27 %h1
+%r2 = OpExtInst %f16 %glsl 6 %h2
+%r3 = OpExtInst %f16 %glsl 20 %h3
+%r4 = OpExtInst %f16 %glsl 18 %h1
+%r5 = OpExtInst %f16 %glsl 53 %h1 %c4
+%w0 = OpFConvert %f32 %r0
+%po0 = OpAccessChain %pf32 %out %c0
+OpStore %po0 %w0
+%w1 = OpFConvert %f32 %r1
+%po1 = OpAccessChain %pf32 %out %c1
+OpStore %po1 %w1
+%w2 = OpFConvert %f32 %r2
+%po2 = OpAccessChain %pf32 %out %c2
+OpStore %po2 %w2
+%w3 = OpFConvert %f32 %r3
+%po3 = OpAccessChain %pf32 %out %c3
+OpStore %po3 %w3
+%w4 = OpFConvert %f32 %r4
+%po4 = OpAccessChain %pf32 %out %c4
+OpStore %po4 %w4
+%w5 = OpFConvert %f32 %r5
+%po5 = OpAccessChain %pf32 %out %c5
+OpStore %po5 %w5
+OpReturn
+OpFunctionEnd

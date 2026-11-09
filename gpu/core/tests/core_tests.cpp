@@ -13,10 +13,13 @@
 #include <random>
 #include <set>
 #include <string>
+#include <thread>
 #include <type_traits>
 #include <thread>
 #include <vector>
 
+#include "vpgpu/core/activity_gauge.h"
+#include "vpgpu/core/archive_harvest.h"
 #include "vpgpu/core/background.h"
 #include "vpgpu/core/device.h"
 #include "vpgpu/core/perf.h"
@@ -2349,6 +2352,57 @@ Copy rectCopy(BufferId src, TextureId dst, uint32_t x, uint32_t y, uint32_t w = 
   return c;
 }
 
+// A GPU-driven chain (copy -> update -> copy -> sort -> copy -> args -> indirect draw), with render passes between:
+// every copy stays after the dispatch that writes its source and before the one that reads its destination, and a
+// barrier orders each dependent pair (a copy is never hoisted above the dispatch it depends on).
+void testGpuChain() {
+  Scene s;
+  const TextureId c = s.rt(), c2 = s.rt();
+  const BufferId up = s.buf(), a = s.buf(), b = s.buf(), d = s.buf(), e = s.buf(), args = s.buf();
+  auto bufCopy = [&](BufferId from, BufferId to) {
+    Copy k;
+    k.kind = CopyKind::BufferToBuffer;
+    k.srcBuffer = Scene::span(from, 0, 256);
+    k.dstBuffer = Scene::span(to, 0, 256);
+    return k;
+  };
+  auto rw = [&](BufferId r, BufferId w) {
+    return Scene::compute({read(ResourceRange::bytes(r, 0, 256), stage::compute), write(ResourceRange::bytes(w, 0, 256), stage::compute)});
+  };
+  for (int variant = 0; variant < 2; ++variant) {
+    Frame f;
+    std::vector<uint32_t> at;  // command index of each chain step
+    auto step = [&] { at.push_back(uint32_t(f.commands().size())); };
+    step(), f.copy(bufCopy(up, a));      // 0 upload
+    step(), f.dispatch(rw(a, b));        // 1 update
+    if (variant) Scene::passWithDraw(f, Scene::pass(c));  // a render pass between (open render encoder at the copy)
+    step(), f.copy(bufCopy(b, d));       // 2 copy of the update's output
+    step(), f.dispatch(rw(d, e));        // 3 sort
+    if (variant) Scene::passWithDraw(f, Scene::pass(c2));
+    step(), f.copy(bufCopy(e, args));    // 4 copy of the sort's output
+    step(), f.dispatch(rw(args, up));    // 5 args builder (reads the copy)
+    step();                              // 6 indirect draw reading what step 5 wrote
+    Scene::passWithDraw(f, Scene::pass(c), {Scene::vsRead(up)});
+    const CompiledFrame cf = compileFrame(f);
+    // execution position of every command
+    std::vector<int> pos(f.commands().size(), -1);
+    std::vector<std::pair<uint32_t, uint32_t>> where(f.commands().size());
+    int n = 0;
+    for (uint32_t en = 0; en < cf.encoders.size(); ++en)
+      for (uint32_t it = 0; it < cf.encoders[en].commands.size(); ++it) {
+        pos[cf.encoders[en].commands[it]] = n++;
+        where[cf.encoders[en].commands[it]] = {en, it};
+      }
+    for (size_t i = 1; i < at.size(); ++i) CHECK(pos[at[i - 1]] >= 0 && pos[at[i]] > pos[at[i - 1]]);
+    for (size_t i = 1; i < at.size(); ++i) {  // each step depends on the previous one: a barrier at its position
+      bool ordered = false;
+      for (const Barrier& br : cf.barriers) ordered |= br.encoder == where[at[i]].first && br.item == where[at[i]].second;
+      // the first command of an encoder the previous step precedes is ordered by the encoder boundary barrier too
+      CHECK(ordered);
+    }
+  }
+}
+
 void testCopyRects() {
   Scene s;
   const TextureId t = s.rt(256, 2);
@@ -2746,6 +2800,7 @@ void testRtMemory() {
     TextureDesc td = *s.res.get(s.rt());
     td.transient = true;
     const TextureId sampledLater = s.res.createTexture(td), loaded = s.res.createTexture(td), clean = s.res.createTexture(td);
+    s.res.setMemValid(loaded, true);  // real contents (memory a frame defined): its first pass Loading them is a violation
     Frame f;
     Scene::passWithDraw(f, Scene::pass(sampledLater, {}, LoadAction::Clear));  // Store
     Scene::passWithDraw(f, Scene::pass(s.rt(), {}, LoadAction::Clear), {Scene::sample(sampledLater)});
@@ -2777,7 +2832,7 @@ void testRtMemory() {
     s.res.destroy(loaded);
     CHECK(!s.res.transientViolated(loaded));
   }
-  {  // the contents a tile-local frame dropped, loaded by a later frame: reported although that load was dropped too
+  {  // a transient's first-attach Load of memory no frame defined (lazily allocated: undefined): DontCare, no violation
     Scene s;
     TextureDesc td = *s.res.get(s.rt());
     td.transient = true;
@@ -2792,6 +2847,13 @@ void testRtMemory() {
     Scene::passWithDraw(g, Scene::pass(t, {}, LoadAction::Load));
     cf = compileFrame(g, &s.res);
     CHECK(cf.encoders[0].tileLocal(0) && cf.encoders[0].pass.colors[0].load == LoadAction::DontCare);
+    CHECK(cf.transientViolations.empty() && cf.stats.transientViolations == 0u);
+    commitMemory(cf, s.res);
+    CHECK(!s.res.transientViolated(t));
+    // ...but Loading memory a frame did define is a real read: violation (the load is kept, the texture is ordinary from then on).
+    s.res.setMemValid(t, true);
+    cf = compileFrame(g, &s.res);
+    CHECK(!cf.encoders[0].tileLocal(0) && cf.encoders[0].pass.colors[0].load == LoadAction::Load);
     CHECK_EQ(cf.transientViolations.size(), size_t{1});
     commitMemory(cf, s.res);
     Frame h;  // now an ordinary texture: the Store the client records is kept
@@ -2975,6 +3037,26 @@ void testBackground() {
     g.waitForeground();
     g.waitForeground();
     CHECK(g.mainThreadPassed() == 2 && g.blockedTotal() == 0);
+  }
+  {  // pause hooks run once per transition to the background (the archive flush), not on resume, and not after removal
+    BackgroundGate g;
+    capture(g);
+    int a = 0, b = 0;
+    const uint64_t ha = g.addPauseHook([&] { ++a; });
+    const uint64_t hb = g.addPauseHook([&] { ++b; });
+    CHECK(ha != hb);
+    g.set(true);
+    g.set(true);  // no second transition
+    CHECK(a == 1 && b == 1);
+    g.set(false);
+    CHECK(a == 1 && b == 1);
+    g.removePauseHook(ha);
+    g.set(true);
+    CHECK(a == 1 && b == 2);
+    g.removePauseHook(hb);
+    g.set(false);
+    g.set(true);
+    CHECK(a == 1 && b == 2);
   }
   {  // C API on the process-wide gate
     CHECK(vpgpu_is_background() == 0);
@@ -3709,6 +3791,525 @@ void testNullRun() {
   CHECK(be.calls.empty() && be.draws.empty() && be.passes.empty() && be.pipelines.empty() && be.waits.empty());
 }
 
+// ActivityGauge: background work (prewarm, archive harvest) waits for the foreground compiles to be quiet.
+void testActivity() {
+  using namespace std::chrono_literals;
+  const auto t0 = ActivityGauge::Clock::now() + 1h;  // nonzero, deterministic times
+  const auto quiet = 1500ms;
+  ActivityGauge g;
+  CHECK(g.idleFor(quiet, t0));  // never used: quiet
+  g.enter();
+  CHECK(g.active() == 1 && !g.idleFor(quiet, t0 + 1h));  // running: never idle
+  g.enter();
+  g.leave(t0);
+  CHECK(g.active() == 1 && !g.idleFor(quiet, t0 + 1h));
+  g.leave(t0 + 100ms);
+  CHECK(g.active() == 0);
+  CHECK(!g.idleFor(quiet, t0 + 100ms + 1499ms));  // ended too recently
+  CHECK(g.idleFor(quiet, t0 + 100ms + 1500ms));
+  {
+    ActivityGauge::Scope off(g, false);  // does nothing
+    CHECK(g.active() == 0);
+    ActivityGauge::Scope on(g);
+    CHECK(g.active() == 1);
+  }
+  CHECK(g.active() == 0 && !g.idleFor(quiet));  // the scope's end is "now"
+}
+
+// Dispatch::required (engine-internal kernels): Device::submit waits for a pipeline still compiling even with the frame hold
+// off, and says so (gpu.required_wait); an ordinary dispatch is left to the client's hold policy (here none).
+void testRequiredDispatch() {
+  for (const bool required : {false, true}) {
+    NullBackend be;
+    be.onCompile = [] { std::this_thread::sleep_for(std::chrono::milliseconds(150)); };
+    std::vector<std::string> log;
+    Device dev(be, 1, [&](const std::string& l) { log.push_back(l); });
+    dev.setHoldMs(0);
+    PipelineState ps;
+    ps.computeShader = 7, ps.label = "k";
+    dev.pipelines().request(ps, Priority::Blocking);  // queued / compiling on the worker
+    Dispatch d = Scene::compute({});
+    d.pipeline = ps.key();
+    d.required = required;
+    Frame f;
+    f.dispatch(d);
+    dev.submit(f);
+    bool waited = false;
+    for (const std::string& l : log) waited = waited || l.starts_with("gpu.required_wait");
+    CHECK(waited == required);
+    if (required) CHECK(dev.pipelines().status(ps.key()) == PipelineCache::Status::Ready);
+    dev.pipelines().waitIdle();
+  }
+}
+
+// Binary-archive harvest policy: demand waiters count (RAII, nested, threads) and the rule that makes the harvest step aside
+// for them, except when the queue is starving (more than 512 entries pending, or the oldest older than 20 s).
+void testHarvest() {
+  using namespace std::chrono_literals;
+  CHECK_EQ(demandWaiters().load(), 0u);
+  {
+    DemandWait a;
+    CHECK_EQ(demandWaiters().load(), 1u);
+    {
+      DemandWait b;
+      CHECK_EQ(demandWaiters().load(), 2u);
+    }
+    CHECK_EQ(demandWaiters().load(), 1u);
+    std::thread t([] {
+      DemandWait c;
+      CHECK_EQ(demandWaiters().load(), 2u);
+    });
+    t.join();
+    CHECK_EQ(demandWaiters().load(), 1u);
+  }
+  CHECK_EQ(demandWaiters().load(), 0u);
+  // No demand wait: never yields, whatever the queue looks like.
+  CHECK(!archiveHarvestYields(0, 0, 0ms));
+  CHECK(!archiveHarvestYields(0, 10000, 1h));
+  // A demand wait and a young, short queue: yields.
+  CHECK(archiveHarvestYields(1, 0, 0ms));
+  CHECK(archiveHarvestYields(3, 16, 5s));
+  // Limits are inclusive for yielding: 512 pending and 20 s still yield; one more of either does not.
+  CHECK(archiveHarvestYields(1, kHarvestStarvePending, kHarvestStarveAge));
+  CHECK(!archiveHarvestYields(1, kHarvestStarvePending + 1, 0ms));
+  CHECK(!archiveHarvestYields(1, 0, kHarvestStarveAge + 1ms));
+  CHECK(!archiveHarvestYields(1, 4000, 25s));
+  // Compile backlog / low memory (archiveHarvestShouldYield): yields regardless of starvation; idle and roomy: runs.
+  CHECK(!archiveHarvestShouldYield(0, 0, 0, 0ms, 4096, 1024));
+  CHECK(archiveHarvestShouldYield(0, 1, 0, 0ms, 4096, 1024));
+  CHECK(archiveHarvestShouldYield(0, 356, 16, 5s, 4096, 1024));
+  CHECK(!archiveHarvestShouldYield(0, 356, kHarvestStarvePending + 1, 0ms, 4096, 1024));  // starving: backlog no longer yields
+  CHECK(!archiveHarvestShouldYield(0, 356, 0, kHarvestStarveAge + 1ms, 4096, 1024));
+  CHECK(archiveHarvestShouldYield(0, 356, 4000, 25s, 0, 1024));  // low memory still yields when starving
+  CHECK(archiveHarvestShouldYield(0, 0, 0, 0ms, 1023, 1024));
+  CHECK(!archiveHarvestShouldYield(0, 0, 0, 0ms, 1024, 1024));
+  CHECK(!archiveHarvestShouldYield(0, 0, 0, 0ms, 0, 0));  // threshold 0 disables the memory check
+  CHECK(archiveHarvestShouldYield(1, 0, 0, 0ms, 4096, 1024));  // demand wait rule unchanged
+  CHECK(!archiveHarvestShouldYield(1, 0, 4000, 25s, 4096, 1024));
+  CHECK_EQ(kHarvestBatch, size_t(16));
+  // Flush budget: the end of the process stays bounded (8 s), the explicit prepare step gets room for thousands of adds
+  // (~80 ms each): the flush that is the only archiver must be able to empty a 2500-entry queue.
+  CHECK(archiveFlushBudget(false) == 8000ms);
+  CHECK(archiveFlushBudget(true) >= 2500 * 80ms);
+  CHECK(archiveFlushContinues(16, 0ms, archiveFlushBudget(false)));
+  CHECK(!archiveFlushContinues(16, 8000ms, archiveFlushBudget(false)));  // budget spent: cut
+  CHECK(archiveFlushContinues(16, 8000ms, archiveFlushBudget(true)));
+  CHECK(!archiveFlushContinues(0, 0ms, archiveFlushBudget(true)));  // queue empty: done
+  // A complete flush waits 200 ms per step while free memory is under the threshold (never skips); the exit flush does not pause.
+  CHECK(archiveFlushPause(true, 100, 512) == 200ms);
+  CHECK(archiveFlushPause(true, 512, 512) == 0ms);
+  CHECK(archiveFlushPause(true, 0, 0) == 0ms);  // threshold 0 disables the check
+  CHECK(archiveFlushPause(false, 100, 512) == 0ms);
+  // A sealed pack (the session file full) is serialized at once, 32 additions or 30 s otherwise; nothing added, nothing due.
+  CHECK(!archiveSerializeDue(0, 32, 32, 1h));
+  CHECK(archiveSerializeDue(1, 32, 32, 0ms));
+  CHECK(!archiveSerializeDue(1, 5, 32, 29s));
+  CHECK(archiveSerializeDue(1, 5, 32, 30s));
+  CHECK(archiveSerializeDue(kSerializeEvery, 5, 64, 0ms));
+  CHECK(!archiveSerializeDue(kSerializeEvery - 1, 5, 64, 0ms));
+}
+
+// Attachment::autoMsaa (VPVulkan forced MSAA): the N-sample twin of a 1x image never gets memory or a sample store, a Load
+// of it is a seed from the 1x, and passes continuing the same twin merge although the encoder resolves.
+void testAutoMsaa() {
+  struct Rig {
+    Scene s;
+    TextureId mc, md, g, gd;
+    Rig() {
+      TextureDesc d;
+      d.format = Format::RGBA8Unorm;
+      d.width = d.height = 256;
+      d.samples = 4;
+      d.usage = usage::colorTarget;
+      d.transient = true;
+      mc = s.res.createTexture(d);
+      d.format = Format::D32Float;
+      d.usage = usage::depthTarget;
+      md = s.res.createTexture(d);
+      g = s.rt();
+      gd = s.depthRt();
+    }
+    RenderPassDesc pass(LoadAction load, StoreAction store = StoreAction::Resolve) const {
+      RenderPassDesc p = Scene::pass(mc, md, load);
+      for (Attachment* a : {&p.colors[0], &p.depth}) {
+        a->autoMsaa = true;
+        a->store = store;
+        a->resolve = a == &p.depth ? gd : g;
+      }
+      return p;
+    }
+  };
+  {  // never memBacked, whatever the geometry; a StoreAndResolve / keepSamples request is not honoured
+    Rig r;
+    RenderPassDesc p = r.pass(LoadAction::Clear, StoreAction::StoreAndResolve);
+    p.colors[0].keepSamples = p.depth.keepSamples = true;
+    Frame f;
+    Scene::passWithDraw(f, p);
+    CompileOptions o;
+    o.tileMaxDraws = 0;  // one draw is already heavy
+    const CompiledFrame cf = compileFrame(f, &r.s.res, o);
+    CHECK_EQ(cf.stats.heavyEncoders, 1u);
+    CHECK(cf.encoders[0].tile[0] == TileVerdict::TileLocal && cf.encoders[0].tile[kDepthSlot] == TileVerdict::TileLocal);
+    CHECK(!cf.encoders[0].memBacked[0] && !cf.encoders[0].memBacked[kDepthSlot]);
+    CHECK(cf.encoders[0].pass.colors[0].store == StoreAction::Resolve && cf.encoders[0].pass.depth.store == StoreAction::Resolve);
+    CHECK(!cf.encoders[0].pass.colors[0].keepSamples && !cf.encoders[0].pass.depth.keepSamples);
+    CHECK_EQ(cf.stats.autoMsaaSlots, 2u);
+    CHECK_EQ(cf.stats.heavyResolve, 0u);
+    // DONT_CARE (the game does not keep the picture): nothing resolved either
+    RenderPassDesc q = r.pass(LoadAction::Clear, StoreAction::DontCare);
+    Frame f2;
+    Scene::passWithDraw(f2, q);
+    const CompiledFrame c2 = compileFrame(f2, &r.s.res, o);
+    CHECK(c2.encoders[0].pass.colors[0].store == StoreAction::DontCare && c2.encoders[0].tileLocal(0));
+    // a regular MSAA candidate of the same heavy encoder still gets memory (the existing behaviour)
+    TextureDesc d;
+    d.format = Format::RGBA8Unorm; d.width = d.height = 256; d.samples = 4; d.usage = usage::colorTarget;
+    const TextureId ms = r.s.res.createTexture(d);
+    RenderPassDesc n = Scene::pass(ms, {}, LoadAction::Clear);
+    n.colors[0].store = StoreAction::Resolve;
+    n.colors[0].resolve = r.g;
+    Frame f3;
+    Scene::passWithDraw(f3, n);
+    CHECK(compileFrame(f3, &r.s.res, o).encoders[0].tile[0] == TileVerdict::HeavyGeometry);
+  }
+  {  // the same twin continued in the next pass: one encoder (no resolveClash), the Load is served by the tile
+    Rig r;
+    Frame f;
+    Scene::passWithDraw(f, r.pass(LoadAction::Clear));
+    Scene::passWithDraw(f, r.pass(LoadAction::Load));
+    const CompiledFrame cf = compileFrame(f, &r.s.res);
+    CHECK_EQ(cf.encoders.size(), 1u);
+    CHECK_EQ(cf.stats.passesMerged, 1u);
+    CHECK(!cf.encoders[0].pass.colors[0].needsSeed && cf.encoders[0].pass.colors[0].load == LoadAction::Clear);
+    CHECK_EQ(cf.stats.seedDraws, 0u);
+    // without the exemption (a regular MSAA attachment that resolves) the second pass starts an encoder of its own
+    RenderPassDesc a = r.pass(LoadAction::Clear), b = r.pass(LoadAction::Load);
+    a.colors[0].autoMsaa = b.colors[0].autoMsaa = a.depth.autoMsaa = b.depth.autoMsaa = false;
+    Frame g;
+    Scene::passWithDraw(g, a);
+    Scene::passWithDraw(g, b);
+    CHECK_EQ(compileFrame(g, &r.s.res).encoders.size(), 2u);
+  }
+  {  // a later encoder that Loads the twin: seeded from the 1x the first one resolved; the seed is a read of it (barrier)
+    Rig r;
+    Frame f;
+    Scene::passWithDraw(f, r.pass(LoadAction::Clear));
+    Scene::passWithDraw(f, Scene::pass(r.s.rt()));  // another encoder in between, unrelated to the 1x
+    Scene::passWithDraw(f, r.pass(LoadAction::Load, StoreAction::DontCare));  // (no resolve write of its own: only the seed reads)
+    CompileOptions o;
+    o.tileMaxDraws = 0;
+    const CompiledFrame cf = compileFrame(f, &r.s.res, o);
+    CHECK_EQ(cf.encoders.size(), 3u);
+    const RenderPassDesc& last = cf.encoders[2].pass;
+    CHECK(last.colors[0].needsSeed && last.depth.needsSeed);
+    CHECK(last.colors[0].load == LoadAction::DontCare && last.depth.load == LoadAction::DontCare);
+    CHECK(last.colors[0].store == StoreAction::DontCare && cf.encoders[2].tileLocal(0) && !cf.encoders[2].memBacked[0]);
+    CHECK_EQ(cf.stats.seedDraws, 2u);
+    CHECK_EQ(cf.stats.seedMissing, 0u);
+    CHECK(!cf.encoders[0].pass.colors[0].needsSeed);
+    // the seed reads the 1x (g, gd) written by the first encoder: ordered by a barrier before the third one
+    bool barrier = false;
+    for (const Barrier& b : cf.barriers) barrier = barrier || b.encoder == 2;
+    CHECK(barrier);
+  }
+  {  // no defined 1x to seed from: the Load starts undefined (counted); with the 1x defined in memory it is a seed
+    Rig r;
+    Frame f;
+    Scene::passWithDraw(f, r.pass(LoadAction::Load));
+    CompiledFrame cf = compileFrame(f, &r.s.res);
+    CHECK(!cf.encoders[0].pass.colors[0].needsSeed && cf.encoders[0].pass.colors[0].load == LoadAction::DontCare);
+    CHECK_EQ(cf.stats.seedMissing, 2u);
+    CHECK_EQ(cf.stats.seedDraws, 0u);
+    r.s.res.setMemValid(r.g, true);
+    cf = compileFrame(f, &r.s.res);
+    CHECK(cf.encoders[0].pass.colors[0].needsSeed && !cf.encoders[0].pass.depth.needsSeed);  // depth 1x still undefined
+    CHECK_EQ(cf.stats.seedDraws, 1u);
+    CHECK_EQ(cf.stats.seedMissing, 1u);
+  }
+  {  // a heavy all-autoMsaa encoder is cut at draw boundaries: every chunk resolves, the next is seeded, nothing gets memory
+    Rig r;
+    RenderPassDesc p = r.pass(LoadAction::Clear);
+    Frame f;
+    f.beginRenderPass(p);
+    for (int i = 0; i < 5; ++i) f.draw(Scene::draw());
+    f.endRenderPass();
+    CompileOptions o;
+    o.tileMaxDraws = 2;  // 5 draws: chunks of 2, 2, 1
+    CompiledFrame cf = compileFrame(f, &r.s.res, o);
+    CHECK_EQ(cf.encoders.size(), 3u);
+    CHECK_EQ(cf.stats.tileSplits, 2u);
+    CHECK(cf.encoders[0].drawBegin == 0 && cf.encoders[0].drawEnd == 2 && cf.encoders[1].drawBegin == 2 && cf.encoders[2].drawEnd == UINT32_MAX);
+    CHECK(cf.encoders[1].reason == CutReason::TileSplit && cf.encoders[0].reason != CutReason::TileSplit);
+    for (uint32_t i = 0; i < 3; ++i) {
+      const RenderPassDesc& q = cf.encoders[i].pass;
+      CHECK(cf.encoders[i].tileLocal(0) && cf.encoders[i].tileLocal(kDepthSlot) && !cf.encoders[i].memBacked[0] && !cf.encoders[i].memBacked[kDepthSlot]);
+      CHECK(q.colors[0].store == StoreAction::Resolve && q.depth.store == StoreAction::Resolve);
+      CHECK(q.colors[0].needsSeed == (i > 0) && q.depth.needsSeed == (i > 0));
+      CHECK(q.colors[0].load == (i ? LoadAction::DontCare : LoadAction::Clear));
+      CHECK(!i || (q.colors[0].seedSrc == r.g && q.depth.seedSrc == r.gd));
+    }
+    CHECK_EQ(cf.stats.seedDraws, 4u);
+    CHECK_EQ(cf.stats.heavyEncoders, 0u);  // each chunk is under the limits
+    // the diagnostic modes do not split
+    o.heavyMode = CompileOptions::HeavyMode::Observe;
+    CHECK_EQ(compileFrame(f, &r.s.res, o).encoders.size(), 1u);
+    // an indirect draw gets a chunk of its own
+    Frame g;
+    g.beginRenderPass(p);
+    g.draw(Scene::draw());
+    Draw ind = Scene::draw();
+    ind.indirect = Indirect{r.s.buf(), 0};
+    g.draw(ind);
+    g.draw(Scene::draw());
+    g.endRenderPass();
+    CompileOptions o2;
+    CompiledFrame cg = compileFrame(g, &r.s.res, o2);
+    CHECK_EQ(cg.encoders.size(), 3u);
+    CHECK(cg.encoders[1].drawBegin == 1 && cg.encoders[1].drawEnd == 2);
+    // an encoder with an attachment that is not autoMsaa stays whole
+    RenderPassDesc mixed = r.pass(LoadAction::Clear);
+    mixed.colors[0].autoMsaa = false;
+    Frame h;
+    h.beginRenderPass(mixed);
+    for (int i = 0; i < 5; ++i) h.draw(Scene::draw());
+    h.endRenderPass();
+    CHECK_EQ(compileFrame(h, &r.s.res, o).encoders.size(), 1u);
+    CHECK_EQ(cf.stats.tileSplitSkipped, 0u);
+  }
+  {  // a heavy encoder whose depth has a stencil aspect is cut when its 1x partner can be read for the stencil (formatView); else whole, counted
+    Rig r;
+    TextureDesc d;
+    d.format = Format::D32FloatS8;
+    d.width = d.height = 256;
+    d.samples = 4;
+    d.usage = usage::depthTarget;
+    d.transient = true;
+    const TextureId ms = r.s.res.createTexture(d);
+    const TextureId gs = r.s.rt(256, 1, 1, Format::D32FloatS8);
+    RenderPassDesc p = r.pass(LoadAction::Clear);
+    p.depth.texture = ms;
+    p.depth.resolve = gs;
+    Frame f;
+    f.beginRenderPass(p);
+    for (int i = 0; i < 5; ++i) f.draw(Scene::draw());
+    f.endRenderPass();
+    CompileOptions o;
+    o.tileMaxDraws = 2;
+    CompiledFrame cf = compileFrame(f, &r.s.res, o);
+    CHECK_EQ(cf.encoders.size(), 1u);
+    CHECK_EQ(cf.stats.tileSplits, 0u);
+    CHECK_EQ(cf.stats.tileSplitSkipped, 1u);
+    CHECK_EQ(cf.stats.tileSplitSkipStencil, 1u);
+    // the same encoder under the limits is not heavy: nothing to skip, nothing counted
+    o.tileMaxDraws = 100;
+    CHECK_EQ(compileFrame(f, &r.s.res, o).stats.tileSplitSkipped, 0u);
+    {  // a 1x partner created with format views: cut like any other, both aspects resolve at every cut
+      TextureDesc fd;
+      fd.format = Format::D32FloatS8;
+      fd.width = fd.height = 256;
+      fd.usage = usage::sampled | usage::depthTarget | usage::formatView;
+      RenderPassDesc ps = p;
+      ps.depth.resolve = r.s.res.createTexture(fd);
+      ps.depth.stencilResolve = ResolveMode::None;
+      Frame fs;
+      fs.beginRenderPass(ps);
+      for (int i = 0; i < 5; ++i) fs.draw(Scene::draw());
+      fs.endRenderPass();
+      o.tileMaxDraws = 2;
+      CompiledFrame cs = compileFrame(fs, &r.s.res, o);
+      CHECK_EQ(cs.encoders.size(), 3u);
+      CHECK_EQ(cs.stats.tileSplitSkipped, 0u);
+      CHECK(cs.encoders[0].pass.depth.stencilResolve == ResolveMode::Sample0 && cs.encoders[1].pass.depth.depthResolve == ResolveMode::Sample0);
+      CHECK(cs.encoders[2].pass.depth.stencilResolve == ResolveMode::None);  // the final chunk keeps the client's mode
+      CHECK(cs.encoders[1].pass.depth.needsSeed && cs.encoders[2].pass.depth.needsSeed);
+    }
+    // without the stencil aspect it is cut (the test above)
+    RenderPassDesc q = r.pass(LoadAction::Clear);
+    Frame g;
+    g.beginRenderPass(q);
+    for (int i = 0; i < 5; ++i) g.draw(Scene::draw());
+    g.endRenderPass();
+    o.tileMaxDraws = 2;
+    CompiledFrame cg = compileFrame(g, &r.s.res, o);
+    CHECK_EQ(cg.encoders.size(), 3u);
+    CHECK_EQ(cg.stats.tileSplitSkipped, 0u);
+    // a heavy encoder of a single (indirect) draw stays whole: counted as single_draw
+    RenderPassDesc s1 = r.pass(LoadAction::Clear);
+    Frame h;
+    h.beginRenderPass(s1);
+    Draw ind = Scene::draw();
+    ind.indirect = Indirect{r.s.buf(), 0};
+    h.draw(ind);
+    h.endRenderPass();
+    CompiledFrame ch = compileFrame(h, &r.s.res, CompileOptions{});
+    CHECK_EQ(ch.encoders.size(), 1u);
+    CHECK_EQ(ch.stats.tileSplitSkipSingle, 1u);
+    CHECK_EQ(ch.stats.tileSplitSkipped, 1u);
+    // more than 32 chunks are still cut (the sanity cap is 1024): beyond it whole, counted as cap
+    Frame w40;
+    w40.beginRenderPass(q);
+    for (int i = 0; i < 40; ++i) w40.draw(Scene::draw());
+    w40.endRenderPass();
+    o.tileMaxDraws = 1;
+    CHECK_EQ(compileFrame(w40, &r.s.res, o).encoders.size(), 40u);
+    Frame w;
+    w.beginRenderPass(q);
+    for (int i = 0; i < 1100; ++i) w.draw(Scene::draw());
+    w.endRenderPass();
+    CompiledFrame cw = compileFrame(w, &r.s.res, o);
+    CHECK_EQ(cw.encoders.size(), 1u);
+    CHECK_EQ(cw.stats.tileSplitSkipCap, 1u);
+    CHECK_EQ(cw.stats.tileSplitSkipped, 1u);
+  }
+  {  // a Load of MSAA samples whose last writer was autoMsaa (same frame, or an earlier committed one) is seeded from its resolve
+    Rig r;
+    RenderPassDesc game = Scene::pass(r.mc, r.md, LoadAction::Load);  // an ordinary attachment of the same samples (game MSAA)
+    game.colors[0].store = StoreAction::StoreAndResolve;
+    game.colors[0].resolve = r.g;
+    Frame f;
+    Scene::passWithDraw(f, r.pass(LoadAction::Clear));
+    Scene::passWithDraw(f, game);
+    CompiledFrame cf = compileFrame(f, &r.s.res);
+    CHECK_EQ(cf.encoders.size(), 2u);
+    const RenderPassDesc& l = cf.encoders[1].pass;
+    CHECK(l.colors[0].needsSeed && !l.colors[0].autoMsaa && l.colors[0].seedSrc == r.g && l.colors[0].load == LoadAction::DontCare);
+    CHECK(l.depth.needsSeed && l.depth.seedSrc == r.gd && cf.stats.seedDraws == 2u);
+    // the chain goes on: the ordinary writer stored samples, a third Load of them is an ordinary Load
+    Frame f3;
+    Scene::passWithDraw(f3, r.pass(LoadAction::Clear));
+    RenderPassDesc w = Scene::pass(r.mc, r.md, LoadAction::Clear);  // a non-auto writer: forgets the auto source
+    w.colors[0].store = w.depth.store = StoreAction::Store;
+    Scene::passWithDraw(f3, w);
+    Scene::passWithDraw(f3, Scene::pass(r.s.rt()));  // (keeps the next pass in an encoder of its own)
+    Scene::passWithDraw(f3, game);
+    CompiledFrame c3 = compileFrame(f3, &r.s.res);
+    CHECK_EQ(c3.encoders.size(), 4u);
+    CHECK(!c3.encoders[3].pass.colors[0].needsSeed && c3.encoders[3].pass.colors[0].load == LoadAction::Load);
+    // across submits: committed after the first frame, the second frame's Load is seeded
+    Frame a;
+    Scene::passWithDraw(a, r.pass(LoadAction::Clear));
+    CompiledFrame ca = compileFrame(a, &r.s.res);
+    commitMemory(ca, r.s.res);
+    CHECK(r.s.res.autoSource(r.mc) && r.s.res.autoSource(r.mc)->src == r.g);
+    Frame b;
+    Scene::passWithDraw(b, game);
+    CompiledFrame cb = compileFrame(b, &r.s.res);
+    CHECK(cb.encoders[0].pass.colors[0].needsSeed && cb.encoders[0].pass.colors[0].seedSrc == r.g);
+    // an ordinary write forgets it
+    Frame c2;
+    Scene::passWithDraw(c2, w);
+    commitMemory(compileFrame(c2, &r.s.res), r.s.res);
+    CHECK(!r.s.res.autoSource(r.mc));
+  }
+  {  // VPVK_TILE_HEAVY: off / observe leave a heavy encoder's regular attachments memoryless; observe lists the encoder
+    Rig r;
+    TextureDesc d;
+    d.format = Format::RGBA8Unorm; d.width = d.height = 256; d.samples = 4; d.usage = usage::colorTarget;
+    const TextureId ms = r.s.res.createTexture(d);
+    RenderPassDesc n = Scene::pass(ms, {}, LoadAction::Clear);
+    n.colors[0].store = StoreAction::Resolve;
+    n.colors[0].resolve = r.g;
+    Frame f;
+    Scene::passWithDraw(f, n);
+    CompileOptions o;
+    o.tileMaxDraws = 0;
+    CHECK(compileFrame(f, &r.s.res, o).encoders[0].tile[0] == TileVerdict::HeavyGeometry);
+    o.heavyMode = CompileOptions::HeavyMode::Off;
+    CompiledFrame off = compileFrame(f, &r.s.res, o);
+    CHECK(off.encoders[0].tileLocal(0) && !off.encoders[0].memBacked[0] && off.heavyObs.empty() && off.stats.heavyObserved == 1u);
+    o.heavyMode = CompileOptions::HeavyMode::Observe;
+    CompiledFrame obs = compileFrame(f, &r.s.res, o);
+    CHECK(obs.encoders[0].tileLocal(0));
+    CHECK(obs.heavyObs.size() == 1 && obs.heavyObs[0].encoder == 0 && obs.heavyObs[0].draws == 1 && obs.heavyObs[0].vertices == 3);
+    o.tileMaxDraws = 2000;  // not heavy: nothing observed
+    CHECK(compileFrame(f, &r.s.res, o).heavyObs.empty());
+  }
+}
+
+// CompileOptions::frameOpt / VPVK_FRAME_OPT: off = no merge, hoist or sink; every command keeps its recorded position.
+void testFrameOpt() {
+  Scene s;
+  const TextureId c = s.rt(), c2 = s.rt();
+  const BufferId ubo = s.buf(), staging = s.buf(), vb = s.buf();
+  Frame f;
+  Scene::passWithDraw(f, Scene::pass(c), {Scene::vsRead(ubo, 0), Scene::vsRead(vb, 0)});  // 0
+  f.copyBuffer(Scene::span(staging), Scene::span(ubo, 256));                               // 1: hoisted
+  Scene::passWithDraw(f, Scene::pass(c), {Scene::vsRead(ubo, 256)});                       // 2: merges
+  f.copyBuffer(Scene::span(staging, 512), Scene::span(vb, 0));                             // 3: WAR on vb -> sunk
+  Scene::passWithDraw(f, Scene::pass(c), {Scene::vsRead(ubo, 512)});                       // 4: merges
+  f.dispatch(Scene::compute({write(ResourceRange::bytes(ubo, 1024, 256), stage::compute)}));  // 5
+  Scene::passWithDraw(f, Scene::pass(c2), {Scene::vsRead(ubo, 1024)});                     // 6
+  const auto& cmds = f.commands();
+
+  CompileOptions on, off;
+  off.frameOpt = false;
+  CHECK(on.frameOpt);
+  const CompiledFrame a = compileFrame(f, &s.res, on), b = compileFrame(f, &s.res, off);
+  CHECK(a.stats.passesMerged > 0 && a.stats.copiesHoisted > 0 && a.stats.copiesSunk > 0);
+  CHECK(b.stats.passesMerged == 0 && b.stats.copiesHoisted == 0 && b.stats.copiesSunk == 0);
+
+  auto accessesOf = [&](uint32_t i) {
+    std::vector<Access> out;
+    if (const auto* rp = std::get_if<RenderPass>(&cmds[i])) {
+      out = attachmentAccesses(rp->desc);
+      for (const Draw& d : rp->draws) for (const Access& x : drawAccesses(d)) out.push_back(x);
+    } else if (const auto* dp = std::get_if<Dispatch>(&cmds[i])) {
+      out = dp->bindings;
+    } else {
+      out = copyAccesses(std::get<Copy>(cmds[i]));
+    }
+    return out;
+  };
+  auto order = [&](const CompiledFrame& cf) {
+    std::vector<uint32_t> o;
+    for (const Encoder& e : cf.encoders) for (uint32_t ci : e.commands) o.push_back(ci);
+    return o;
+  };
+  const std::vector<uint32_t> oa = order(a), ob = order(b);
+  CHECK_EQ(ob.size(), cmds.size());
+  for (uint32_t i = 0; i < ob.size() && i < cmds.size(); ++i) CHECK_EQ(ob[i], i);  // off: the recorded order
+  // Same functional result: every pair of commands that conflicts (one writes what the other touches) runs in the recorded
+  // order, so each resource sees the same writes in the same relative order, with opt on and off.
+  for (const std::vector<uint32_t>* o : {&oa, &ob}) {
+    std::vector<size_t> pos(cmds.size(), 0);
+    for (size_t k = 0; k < o->size(); ++k) pos[(*o)[k]] = k;
+    for (uint32_t i = 0; i < cmds.size(); ++i)
+      for (uint32_t j = i + 1; j < cmds.size(); ++j) {
+        bool conflict = false;
+        for (const Access& x : accessesOf(i))
+          for (const Access& y : accessesOf(j)) conflict = conflict || ((x.write || y.write) && x.range.overlaps(y.range));
+        if (conflict) CHECK(pos[i] < pos[j]);
+      }
+  }
+  CHECK(b.encoders.size() > a.encoders.size());
+  CHECK(!b.barriers.empty());
+
+  {  // Device: VPVK_FRAME_OPT=0 logs gpu.frame_opt enabled=0 and its frames show merged=0 hoisted=0 sunk=0; default is on
+    for (int envOff = 0; envOff < 2; ++envOff) {
+      if (envOff) setenv("VPVK_FRAME_OPT", "0", 1);
+      std::vector<std::string> log;
+      NullBackend be;
+      Device dev(be, 0, [&](const std::string& l) { log.push_back(l); });
+      unsetenv("VPVK_FRAME_OPT");
+      const TextureId dc = dev.createTexture([] {
+        TextureDesc d;
+        d.format = Format::RGBA8Unorm;
+        d.width = d.height = 64;
+        d.usage = usage::colorTarget;
+        return d;
+      }());
+      Frame g;
+      Scene::passWithDraw(g, Scene::pass(dc));
+      Scene::passWithDraw(g, Scene::pass(dc));
+      const FrameReport r = dev.submit(g);
+      CHECK_EQ(r.compile.passesMerged, envOff ? 0u : 1u);
+      size_t lines = 0;
+      for (const std::string& l : log) lines += l == (envOff ? "gpu.frame_opt enabled=0" : "gpu.frame_opt enabled=1");
+      CHECK_EQ(lines, size_t{1});
+    }
+  }
+}
+
 int main(int argc, char** argv) {
   const std::vector<std::pair<const char*, std::function<void()>>> groups = {
       {"resources", testResources}, {"commands", testCommands}, {"merge", testMerge},
@@ -3716,13 +4317,14 @@ int main(int argc, char** argv) {
       {"clearbarrier", testClearBarrier},
       {"cuts", testCuts},           {"diagnostics", testDiagnostics}, {"pipelines", testPipelines},
       {"device", testDevice},       {"tile", testTile},         {"bindings", testBindings},
-      {"astro", testAstroFrame},    {"fuzz", testFuzz},         {"copyrects", testCopyRects},
+      {"astro", testAstroFrame},    {"fuzz", testFuzz},         {"copyrects", testCopyRects}, {"gpuchain", testGpuChain},
       {"bigframe", testBigFrameLog}, {"rectenv", testRectEnv}, {"mipchain", testMipChain},
       {"deadstore", testDeadStore}, {"rtmemory", testRtMemory}, {"scopedpool", testScopedPool},
-      {"background", testBackground}, {"viewsplit", testViewSplit}, {"tilehot", testTileHot},
+      {"background", testBackground}, {"viewsplit", testViewSplit}, {"tilehot", testTileHot}, {"activity", testActivity}, {"harvest", testHarvest},
       {"submit", testSubmit},       {"hoist", testHoist},       {"hold", testHold},
       {"label_queue", testLabelQueue}, {"defaults", testDefaults}, {"locks", testLocks}, {"parallel", testParallel},
-      {"nullrun", testNullRun}};
+      {"nullrun", testNullRun},
+      {"automsaa", testAutoMsaa}, {"required_dispatch", testRequiredDispatch}, {"frameopt", testFrameOpt}};
   bool ran = false;
   for (const auto& [name, fn] : groups) {
     if (argc > 1 && std::strcmp(argv[1], name) != 0) continue;

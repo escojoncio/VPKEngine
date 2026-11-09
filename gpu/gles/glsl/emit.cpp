@@ -107,7 +107,7 @@ private:
     }
     // `layout`: 0 = none (Function/Private/IO), 1 = std140, 2 = std430 (decorated copies of arrays/structs).
     uint32_t typeId(const Type& t, int layout = 0, bool rowMajor = false) {
-        if (!t.isArray() && t.base != Base::Struct) layout = 0, rowMajor = false;  // leaf types are shared
+        if ((!t.isArray() && t.base != Base::Struct) || !layout) layout = 0, rowMajor = false;  // leaf types are shared
         const std::string key = t.str() + "#" + std::to_string(layout) + (t.st ? "#" + std::to_string(t.st->index) : "") +
                                 (rowMajor ? "R" : "");
         return cached(key, [&]() -> uint32_t {
@@ -154,15 +154,15 @@ private:
                 case Base::AtomicUint: fail("atomic counters have no value type");
                 case Base::Struct: {
                     std::vector<uint32_t> w;
-                    for (const Member& m : t.st->members) w.push_back(typeId(m.type, layout, m.rowMajor));
+                    for (const Member& m : t.st->members) w.push_back(typeId(m.type, layout, m.rowMajor || rowMajor));
                     uint32_t r = id();
                     w.insert(w.begin(), r);
                     instV(types_, OpTypeStruct, w);
                     name(r, t.st->name);
                     if (layout) {
                         uint32_t size = 0;
-                        auto off = std140Offsets(t.st->members, &size, layout == 2);
-                        for (size_t i = 0; i < off.size(); ++i) layoutMember(r, uint32_t(i), t.st->members[i], off[i], layout);
+                        auto off = std140Offsets(t.st->members, &size, layout == 2, rowMajor);
+                        for (size_t i = 0; i < off.size(); ++i) layoutMember(r, uint32_t(i), t.st->members[i], off[i], layout, rowMajor);
                     }
                     return r;
                 }
@@ -170,13 +170,14 @@ private:
             fail("unsupported type " + t.str());
         });
     }
-    void layoutMember(uint32_t st, uint32_t i, const Member& m, uint32_t offset, int layout) {
+    void layoutMember(uint32_t st, uint32_t i, const Member& m, uint32_t offset, int layout, bool rowMajor = false) {
         memberDeco(st, i, Deco::Offset, {offset});
         Type inner = m.type;
         while (inner.isArray()) inner = inner.element();
         if (inner.cols) {
-            memberDeco(st, i, m.rowMajor ? Deco::RowMajor : Deco::ColMajor);
-            memberDeco(st, i, Deco::MatrixStride, {std140MatrixStride(inner, m.rowMajor, layout == 2)});
+            const bool rm = m.rowMajor || rowMajor;
+            memberDeco(st, i, rm ? Deco::RowMajor : Deco::ColMajor);
+            memberDeco(st, i, Deco::MatrixStride, {std140MatrixStride(inner, rm, layout == 2)});
         }
     }
     // OpTypeImage of a sampler (Sampled = 1) or a storage image (Sampled = 2, with its format).
@@ -271,7 +272,7 @@ private:
     };
     std::vector<FbOut> fbOuts_;
     std::map<int, uint32_t> attachments_;  // location -> variable
-    uint32_t lastFragDataVar_ = 0, lastFragColorVar_ = 0, workGroupSizeVar_ = 0;
+    uint32_t lastFragDataVar_ = 0, lastFragColorVar_ = 0, workGroupSizeVar_ = 0, maxWorkGroupCountVar_ = 0, maxWorkGroupSizeVar_ = 0;
     Type lastFragDataType_;
 
     // The storage buffer of atomic counter binding `glBinding`: struct { uint counters[]; }.
@@ -431,7 +432,6 @@ private:
                         break;
                     }
                     if (s->type.containsSampler()) {
-                        if (s->type.base == Base::Struct) fail("samplers inside structs are not supported: '" + s->name + "'");
                         auto b = L_.samplerBinding.find(s->name);
                         if (b == L_.samplerBinding.end()) continue;
                         vi.storage = SC::UniformConstant;
@@ -525,6 +525,93 @@ private:
             positionVar_ = globalVar(typeId(tmp.type), SC::Output, "gl_Position");
             deco(positionVar_, Deco::BuiltIn, {uint32_t(BuiltIn::Position)});
         }
+        if (sh_.stage == Stage::Vertex && sh_.invariantPosition) deco(positionVar_, Deco::Invariant);
+        if (sh_.stage == Stage::Vertex && !L_.xfb.empty()) declareXfb();
+    }
+
+    // ---- transform feedback capture (vertex shader variant) --------------------------------------
+    // The storage buffer struct { uint header[kXfbHeaderWords]; uint data[]; } and the vertex / instance index inputs.
+    uint32_t xfbVar_ = 0, xfbVertexId_ = 0, xfbInstanceId_ = 0;
+    std::unique_ptr<StructDef> xfbStruct_;
+    void declareXfb() {
+        xfbStruct_ = std::make_unique<StructDef>();
+        xfbStruct_->name = "vpgl_XfbCapture";
+        xfbStruct_->index = (1 << 23);
+        Type hdr = Type::make(Base::Uint), arr = Type::make(Base::Uint);
+        hdr.dims = {int(kXfbHeaderWords)};
+        arr.dims = {0};
+        xfbStruct_->members.push_back({"header", hdr, false, 0});
+        xfbStruct_->members.push_back({"data", arr, false, 0});
+        Type t;
+        t.base = Base::Struct, t.st = xfbStruct_.get();
+        uint32_t st = typeId(t, 2);
+        deco(st, Deco::Block);
+        xfbVar_ = globalVar(st, SC::StorageBuffer, xfbStruct_->name);
+        deco(xfbVar_, Deco::DescriptorSet, {0});
+        deco(xfbVar_, Deco::Binding, {kXfbBinding});
+        // gl_VertexID / gl_InstanceID: the shader's own variable when it reads them, else new inputs.
+        for (const auto& [sym, vi] : vars_) {
+            if (sym->builtin == BuiltinVar::VertexID) xfbVertexId_ = vi.ptr;
+            if (sym->builtin == BuiltinVar::InstanceID) xfbInstanceId_ = vi.ptr;
+        }
+        const Type it = Type::make(Base::Int);
+        if (!xfbVertexId_) {
+            xfbVertexId_ = globalVar(typeId(it), SC::Input, "vpgl_xfb_VertexIndex");
+            deco(xfbVertexId_, Deco::BuiltIn, {uint32_t(BuiltIn::VertexIndex)});
+        }
+        if (!xfbInstanceId_) {
+            xfbInstanceId_ = globalVar(typeId(it), SC::Input, "vpgl_xfb_InstanceIndex");
+            deco(xfbInstanceId_, Deco::BuiltIn, {uint32_t(BuiltIn::InstanceIndex)});
+        }
+    }
+    // Writes the captured outputs of this vertex into the record of (instance, vertex index); called before the clip-z remap so
+    // gl_Position is what the shader wrote.
+    void xfbCapture() {
+        const Type ut = Type::make(Base::Uint), it = Type::make(Base::Int), ft = Type::make(Base::Float);
+        const uint32_t uT = typeId(ut);
+        uint32_t vid = op(OpBitcast, uT, {load(it, xfbVertexId_)});
+        uint32_t iid = op(OpBitcast, uT, {load(it, xfbInstanceId_)});
+        uint32_t span = op(OpLoad, uT, {op(OpAccessChain, ptrType(SC::StorageBuffer, uT), {xfbVar_, constU(0), constU(0)})});
+        uint32_t base = op(OpLoad, uT, {op(OpAccessChain, ptrType(SC::StorageBuffer, uT), {xfbVar_, constU(0), constU(1)})});
+        uint32_t slot = op(OpIAdd, uT, {op(OpIMul, uT, {iid, span}), op(OpISub, uT, {vid, base})});
+        uint32_t first = op(OpIMul, uT, {slot, constU(L_.xfbRecordWords)});
+        for (const ProgramLayout::XfbItem& item : L_.xfb) {
+            Type vt;            // type of the whole variable
+            uint32_t value = 0;  // its value
+            if (item.name == "gl_Position") {
+                vt = Type::make(Base::Float, 4);
+                value = load(vt, positionVar_);
+            } else if (item.name == "gl_PointSize") {
+                vt = ft;
+                const Symbol* ps = nullptr;
+                for (const auto& [sym, vi] : vars_)
+                    if (sym->builtin == BuiltinVar::PointSize) ps = sym;
+                value = ps ? load(vt, vars_.at(ps).ptr) : constF(1.0f);
+            } else {
+                const Symbol* sym = nullptr;
+                for (const GlobalDecl& g : sh_.globals)
+                    if (g.sym->storage == vpglsl::Storage::Out && g.sym->name == item.name) sym = g.sym;
+                if (!sym || !vars_.count(sym)) fail("transform feedback varying '" + item.name + "' has no variable");
+                vt = sym->type;
+                value = load(vt, vars_.at(sym).ptr);
+            }
+            const Type el = vt.isArray() ? vt.element() : vt;
+            const uint32_t cols = el.cols ? uint32_t(el.cols) : 1, rows = el.vec;
+            uint32_t at = item.offset;
+            for (int e = item.first; e < item.first + item.count; ++e)
+                for (uint32_t c = 0; c < cols; ++c)
+                    for (uint32_t r = 0; r < rows; ++r, ++at) {
+                        std::vector<uint32_t> idx{value};
+                        if (vt.isArray()) idx.push_back(uint32_t(e));
+                        if (el.cols) idx.push_back(c);
+                        if (el.vec > 1) idx.push_back(r);
+                        uint32_t s = idx.size() == 1 ? value : opV(OpCompositeExtract, typeId(el.scalarType()), idx);
+                        if (el.base != Base::Uint) s = op(OpBitcast, uT, {s});
+                        uint32_t ptr = op(OpAccessChain, ptrType(SC::StorageBuffer, uT),
+                                          {xfbVar_, constU(1), op(OpIAdd, uT, {first, constU(at)})});
+                        store(ptr, s);
+                    }
+        }
     }
 
     void interpDeco(uint32_t v, const Symbol& s) {
@@ -557,6 +644,15 @@ private:
                 // The constant uvec3 of the declared local size, stored at entry.
                 vi.storage = SC::Private;
                 vi.ptr = workGroupSizeVar_ = globalVar(typeId(s->type), SC::Private, "gl_WorkGroupSize");
+                break;
+            }
+            case BuiltinVar::MaxComputeWorkGroupCount:
+            case BuiltinVar::MaxComputeWorkGroupSize: {
+                // Constant ivec3, stored at entry (a Private variable like gl_WorkGroupSize).
+                const bool count = s->builtin == BuiltinVar::MaxComputeWorkGroupCount;
+                vi.storage = SC::Private;
+                vi.ptr = globalVar(typeId(s->type), SC::Private, count ? "gl_MaxComputeWorkGroupCount" : "gl_MaxComputeWorkGroupSize");
+                (count ? maxWorkGroupCountVar_ : maxWorkGroupSizeVar_) = vi.ptr;
                 break;
             }
             case BuiltinVar::LastFragData: {
@@ -735,6 +831,10 @@ private:
         if (workGroupSizeVar_)
             store(workGroupSizeVar_, opV(OpCompositeConstruct, typeId(Type::make(Base::Uint, 3)),
                                          {constU(sh_.localSize[0]), constU(sh_.localSize[1]), constU(sh_.localSize[2])}));
+        if (maxWorkGroupCountVar_)
+            store(maxWorkGroupCountVar_, opV(OpCompositeConstruct, typeId(Type::make(Base::Int, 3)), {constI(65535), constI(65535), constI(65535)}));
+        if (maxWorkGroupSizeVar_)
+            store(maxWorkGroupSizeVar_, opV(OpCompositeConstruct, typeId(Type::make(Base::Int, 3)), {constI(1024), constI(1024), constI(64)}));
         // Framebuffer fetch: seed the private copies with the current colour attachments.
         for (const FbOut& f : fbOuts_) {
             const Type& t = f.sym->type;
@@ -756,6 +856,7 @@ private:
         for (auto& [s, e] : initialisers_) store(vars_.at(s).ptr, value(*e));
         op(OpFunctionCall, voidT_, {fnIds_.at(m)});
         for (const FbOut& f : fbOuts_) store(f.out, load(f.sym->type, f.shadow));
+        if (sh_.stage == Stage::Vertex && !L_.xfb.empty()) xfbCapture();
         if (sh_.stage == Stage::Vertex && positionVar_) {
             // GL clip z in [-w, w] -> Vulkan [0, w]: z' = (z + w) / 2.
             Type v4 = Type::make(Base::Float, 4), f = Type::make(Base::Float);
@@ -1017,6 +1118,7 @@ private:
         SC storage = SC::Function;
         Type type;
         int layout = 0;  // 0 none, 1 std140, 2 std430 (memory laid out in a block)
+        bool rowMajor = false;  // matrix layout reaching this pointee (selects the decorated type of structs/arrays)
     };
 
     bool isDefaultUniform(const Symbol* s) const {
@@ -1064,7 +1166,8 @@ private:
                 if (bt.isArray() && base.type.isArray() && base.type.dims.size() > bt.dims.size()) out.type = e.type;
                 out.storage = base.storage;
                 out.layout = base.layout;
-                out.ptr = op(OpAccessChain, ptrType(base.storage, typeId(e.type, base.layout)), {base.ptr, idx});
+                out.rowMajor = base.rowMajor;
+                out.ptr = op(OpAccessChain, ptrType(base.storage, typeId(e.type, base.layout, base.rowMajor)), {base.ptr, idx});
                 return true;
             }
             case EK::Field: {
@@ -1073,17 +1176,17 @@ private:
                 out.type = e.type;
                 out.storage = base.storage;
                 out.layout = base.layout;
-                out.ptr = op(OpAccessChain, ptrType(base.storage, typeId(e.type, base.layout, rowMajorOf(e))),
+                out.rowMajor = rowMajorOf(e, base);
+                out.ptr = op(OpAccessChain, ptrType(base.storage, typeId(e.type, base.layout, out.rowMajor)),
                              {base.ptr, constU(uint32_t(e.field))});
                 return true;
             }
             default: return false;
         }
     }
-    bool rowMajorOfPtr(const Expr& e) const { return e.k == EK::Field && rowMajorOf(e); }
-    bool rowMajorOf(const Expr& field) const {
+    bool rowMajorOf(const Expr& field, const Ptr& base) const {
         const Type& bt = field.a[0]->type;
-        if (bt.base == Base::Struct && bt.st) return bt.st->members[size_t(field.field)].rowMajor;
+        if (bt.base == Base::Struct && bt.st) return base.rowMajor || bt.st->members[size_t(field.field)].rowMajor;
         if (field.a[0]->k == EK::Var && field.a[0]->sym->block) return field.a[0]->sym->block->members[size_t(field.field)].rowMajor;
         if (field.a[0]->k == EK::Index && field.a[0]->a[0]->k == EK::Var && field.a[0]->a[0]->sym->block)
             return field.a[0]->a[0]->sym->block->members[size_t(field.field)].rowMajor;
@@ -1098,18 +1201,18 @@ private:
         if (!p.layout) return load(p.type, p.ptr);
         // Leaf types (scalars/vectors/matrices) are the same ids with or without layout.
         if (!p.type.isArray() && p.type.base != Base::Struct) return load(p.type, p.ptr);
-        uint32_t laid = op(OpLoad, typeId(p.type, p.layout), {p.ptr});
-        return relayout(laid, p.type, p.layout);
+        uint32_t laid = op(OpLoad, typeId(p.type, p.layout, p.rowMajor), {p.ptr});
+        return relayout(laid, p.type, p.layout, p.rowMajor);
     }
     // Rebuilds a value of a layout-decorated aggregate type as the undecorated type.
-    uint32_t relayout(uint32_t v, const Type& t, int layout) {
+    uint32_t relayout(uint32_t v, const Type& t, int layout, bool rowMajor = false) {
         if (t.isArray()) {
             std::vector<uint32_t> parts;
             Type el = t.element();
             for (int i = 0; i < t.dims[0]; ++i) {
                 const bool agg = el.isArray() || el.base == Base::Struct;
-                uint32_t x = op(OpCompositeExtract, typeId(el, agg ? layout : 0), {v, uint32_t(i)});
-                parts.push_back(agg ? relayout(x, el, layout) : x);
+                uint32_t x = op(OpCompositeExtract, typeId(el, agg ? layout : 0, rowMajor), {v, uint32_t(i)});
+                parts.push_back(agg ? relayout(x, el, layout, rowMajor) : x);
             }
             return opV(OpCompositeConstruct, typeId(t), parts);
         }
@@ -1118,8 +1221,9 @@ private:
             for (size_t i = 0; i < t.st->members.size(); ++i) {
                 const Type& mt = t.st->members[i].type;
                 const bool agg = mt.isArray() || mt.base == Base::Struct;
-                uint32_t x = op(OpCompositeExtract, typeId(mt, agg ? layout : 0, t.st->members[i].rowMajor), {v, uint32_t(i)});
-                parts.push_back(agg ? relayout(x, mt, layout) : x);
+                const bool rm = t.st->members[i].rowMajor || rowMajor;
+                uint32_t x = op(OpCompositeExtract, typeId(mt, agg ? layout : 0, rm), {v, uint32_t(i)});
+                parts.push_back(agg ? relayout(x, mt, layout, rm) : x);
             }
             return opV(OpCompositeConstruct, typeId(t), parts);
         }
@@ -1143,7 +1247,7 @@ private:
                 const Type& mt = t.st->members[i].type;
                 const bool agg = mt.isArray() || mt.base == Base::Struct;
                 uint32_t x = op(OpCompositeExtract, typeId(mt), {v, uint32_t(i)});
-                parts.push_back(agg ? applyLayout(x, mt, layout, t.st->members[i].rowMajor) : x);
+                parts.push_back(agg ? applyLayout(x, mt, layout, t.st->members[i].rowMajor || rowMajor) : x);
             }
             return opV(OpCompositeConstruct, typeId(t, layout, rowMajor), parts);
         }
@@ -1178,7 +1282,7 @@ private:
         }
         Ptr p;
         if (!pointer(e, p)) fail("assignment to a non-l-value");
-        if (p.layout && (p.type.isArray() || p.type.base == Base::Struct)) v = applyLayout(v, p.type, p.layout, rowMajorOfPtr(e));
+        if (p.layout && (p.type.isArray() || p.type.base == Base::Struct)) v = applyLayout(v, p.type, p.layout, p.rowMajor);
         store(p.ptr, v);
     }
 
@@ -1815,9 +1919,63 @@ private:
             std::vector<uint32_t> ops;
             if (tc.offset) {
                 const Expr& o = *e.a[i];
-                ops.push_back(value(o));
-                mask |= constantExpr(o) ? ImgOp::ConstOffset : ImgOp::Offset;
-                ++i;
+                int off[2];
+                if ((st.dim == SDim::D2 || st.dim == SDim::D2Array) && constIVec2(o, off) &&
+                    (off[0] < -8 || off[0] > 7 || off[1] < -8 || off[1] > 7)) {
+                    // Adreno gathers with offsets of -32..31; Metal's constant offset only has -8..7: move the
+                    // coordinate by whole texels instead (the footprint of the gather moves with it).
+                    caps_.insert(50);  // ImageQuery
+                    const bool arr = st.dim == SDim::D2Array;
+                    const Type f2 = Type::make(Base::Float, 2), i2 = Type::make(Base::Int, 2);
+                    uint32_t img = op(OpImage, imageOf(st), {si});
+                    uint32_t size = op(OpImageQuerySizeLod, typeId(Type::make(Base::Int, arr ? 3 : 2)), {img, constI(0)});
+                    if (arr) size = opV(OpVectorShuffle, typeId(i2), {size, size, 0, 1});
+                    uint32_t sizeF = op(OpConvertSToF, typeId(f2), {size});
+                    uint32_t offF = op(OpConvertSToF, typeId(f2), {value(o)});
+                    uint32_t xy = arr ? opV(OpVectorShuffle, typeId(f2), {coord, coord, 0, 1}) : coord;
+                    xy = op(OpFAdd, typeId(f2), {xy, op(OpFDiv, typeId(f2), {offF, sizeF})});
+                    coord = arr ? opV(OpCompositeConstruct, typeId(Type::make(Base::Float, 3)),
+                                      {xy, op(OpCompositeExtract, typeId(f), {coord, 2})})
+                                : xy;
+                    w[1] = coord;
+                    ++i;
+                } else if ((st.dim == SDim::D2 || st.dim == SDim::D2Array) && !constantExpr(o)) {
+                    // A dynamic offset: Metal's hardware offset is 4 bits wide (-8..7), the advertised range is
+                    // -32..31. Offsets outside -8..7 move the coordinate by whole texels and the operand becomes
+                    // zero; the others keep the hardware offset (exact, no float rounding).
+                    caps_.insert(50);  // ImageQuery
+                    const bool arr = st.dim == SDim::D2Array;
+                    const Type f2 = Type::make(Base::Float, 2), i2 = Type::make(Base::Int, 2), b2 = Type::make(Base::Bool, 2);
+                    const Type bs = Type::make(Base::Bool);
+                    uint32_t ov = value(o);
+                    uint32_t lo = constI(-8), hi = constI(7);
+                    uint32_t outside = op(OpLogicalOr, typeId(b2),
+                                          {op(OpSLessThan, typeId(b2), {ov, opV(OpCompositeConstruct, typeId(i2), {lo, lo})}),
+                                           op(OpSGreaterThan, typeId(b2), {ov, opV(OpCompositeConstruct, typeId(i2), {hi, hi})})});
+                    uint32_t anyOut = op(OpAny, typeId(bs), {outside});
+                    uint32_t img = op(OpImage, imageOf(st), {si});
+                    uint32_t size = op(OpImageQuerySizeLod, typeId(Type::make(Base::Int, arr ? 3 : 2)), {img, constI(0)});
+                    if (arr) size = opV(OpVectorShuffle, typeId(i2), {size, size, 0, 1});
+                    uint32_t sizeF = op(OpConvertSToF, typeId(f2), {size});
+                    uint32_t offF = op(OpConvertSToF, typeId(f2), {ov});
+                    uint32_t scale = op(OpSelect, typeId(f), {anyOut, constF(1.0f), constF(0.0f)});
+                    uint32_t shift = op(OpVectorTimesScalar, typeId(f2), {op(OpFDiv, typeId(f2), {offF, sizeF}), scale});
+                    uint32_t xy = arr ? opV(OpVectorShuffle, typeId(f2), {coord, coord, 0, 1}) : coord;
+                    xy = op(OpFAdd, typeId(f2), {xy, shift});
+                    coord = arr ? opV(OpCompositeConstruct, typeId(Type::make(Base::Float, 3)),
+                                      {xy, op(OpCompositeExtract, typeId(f), {coord, 2})})
+                                : xy;
+                    w[1] = coord;
+                    uint32_t zero = opV(OpCompositeConstruct, typeId(i2), {constI(0), constI(0)});
+                    uint32_t any2 = opV(OpCompositeConstruct, typeId(b2), {anyOut, anyOut});
+                    ops.push_back(op(OpSelect, typeId(i2), {any2, zero, ov}));
+                    mask |= ImgOp::Offset;
+                    ++i;
+                } else {
+                    ops.push_back(value(o));
+                    mask |= constantExpr(o) ? ImgOp::ConstOffset : ImgOp::Offset;
+                    ++i;
+                }
             }
             uint32_t comp = constI(0);
             if (!st.shadow && i < e.a.size()) comp = arg();
@@ -1882,6 +2040,20 @@ private:
             w.insert(w.end(), ops.begin(), ops.end());
         }
         return opV(opc, rid, w);
+    }
+
+    // The two components of a constant ivec2 expression (ivec2(a, b) / ivec2(a) of constants).
+    static bool constIVec2(const Expr& e, int out[2]) {
+        if (e.k != EK::Ctor || e.type.vec != 2 || e.type.base != Base::Int) return false;
+        std::vector<int> v;
+        for (const ExprP& a : e.a) {
+            if (!a->hasConst || !a->type.isScalar()) return false;
+            v.push_back(int(a->constI));
+        }
+        if (v.size() == 1) v.push_back(v[0]);
+        if (v.size() != 2) return false;
+        out[0] = v[0], out[1] = v[1];
+        return true;
     }
 
     static bool constantExpr(const Expr& e) {

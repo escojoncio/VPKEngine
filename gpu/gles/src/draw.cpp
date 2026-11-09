@@ -4,11 +4,14 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <map>
 #include <set>
 
 #include "context.h"
 #include "egl_internal.h"
 #include "vpgpu/core/perf.h"
+
+#include "xfb.h"
 
 namespace vpgles {
 
@@ -62,6 +65,11 @@ GLuint* Context::textureBinding(GLenum target, int unit) {
     }
 }
 
+Texture* Context::defaultTexture(GLenum target) {
+    auto it = share->textures.find(0xFFFF0000u | (target & 0xFFFF));
+    return it == share->textures.end() ? nullptr : it->second.get();
+}
+
 Texture* Context::boundTexture(GLenum target) {
     GLuint* b = textureBinding(target, activeUnit);
     if (!b) return nullptr;
@@ -88,6 +96,11 @@ bool Context::targetOf(const Attachment& a, FbTarget& out, uint32_t& w, uint32_t
         Texture* t = texture(a.name);
         if (!t || !t->image) return false;
         if (uint32_t(a.level) >= t->image->levels) return false;
+        // A layer the texture does not have (3D: of the level's depth; array: of its layers) leaves the attachment incomplete.
+        if (!a.numViews) {
+            if (t->target == gl::TEXTURE_3D && uint32_t(a.layer) >= std::max(1u, t->image->depth >> a.level)) return false;
+            if (t->target == gl::TEXTURE_2D_ARRAY && uint32_t(a.layer) >= t->image->layers) return false;
+        }
         out.image = t->image.get();
         out.level = uint32_t(a.level);
         out.layer = uint32_t(a.numViews ? a.baseView : a.layer);
@@ -102,6 +115,7 @@ bool Context::targetOf(const Attachment& a, FbTarget& out, uint32_t& w, uint32_t
         if (!r || !r->image) return false;
         out.image = r->image.get();
         out.level = 0, out.layer = 0, out.layers = 1;
+        if (r->samples > 1) out.implicit = true, out.seedImage = r->image, out.msSamples = uint32_t(r->samples);
         w = uint32_t(r->width), h = uint32_t(r->height);
         return true;
     }
@@ -119,9 +133,18 @@ Context::FbInfo Context::resolveFramebuffer(GLuint name, bool forDraw) {
         }
         fb.width = s->width, fb.height = s->height;
         fb.color[0].image = s->color.get();
+        if (s->msSamples > 1) {  // rendered multisampled in a transient twin, resolved into the presented image when the pass ends
+            fb.color[0].implicit = true;
+            fb.color[0].seedImage = s->color;
+            fb.samples = s->msSamples;
+        }
         if (s->depthStencil) {
             fb.depth.image = s->depthStencil.get();
             if (s->depthStencil->format->stencil) fb.stencil.image = s->depthStencil.get();
+            if (s->msSamples > 1) {  // same twin scheme; the backend seeds a continuing pass from the resolved image
+                fb.depth.implicit = true, fb.depth.seedImage = s->depthStencil;
+                if (fb.stencil.image) fb.stencil.implicit = true, fb.stencil.seedImage = s->depthStencil;
+            }
         }
         return fb;
     }
@@ -131,8 +154,9 @@ Context::FbInfo Context::resolveFramebuffer(GLuint name, bool forDraw) {
         return fb;
     }
     bool any = false, first = true;
-    uint32_t views = 0;
-    auto take = [&](const Attachment& a, FbTarget& t, bool color) -> bool {
+    uint32_t views = 0, samples = 1;
+    // kind: 0 colour, 1 depth, 2 stencil (the attached format must be renderable for that attachment point).
+    auto take = [&](const Attachment& a, FbTarget& t, int kind) -> bool {
         if (a.kind == Attachment::None) return true;
         uint32_t w = 0, h = 0;
         if (!targetOf(a, t, w, h)) {
@@ -140,14 +164,23 @@ Context::FbInfo Context::resolveFramebuffer(GLuint name, bool forDraw) {
             return false;
         }
         const FormatInfo* fi = t.image->format;
-        if (color ? (fi->depth || fi->stencil || (!fi->renderable && fi->baseFormat != gl::RGB && !fi->integer))
-                  : !(fi->depth || fi->stencil)) {
+        if (kind == 0 ? (fi->depth || fi->stencil || !fi->renderable) : kind == 1 ? !fi->depth : !fi->stencil) {
             fb.status = gl::FRAMEBUFFER_INCOMPLETE_ATTACHMENT;
             return false;
         }
         const uint32_t v = t.multiview ? t.layers : 0;
-        if (first) fb.width = w, fb.height = h, views = v, first = false;
+        // EXT_multisampled_render_to_texture: a single-sample texture rendered with the samples the attachment asked for.
+        if (a.kind == Attachment::Tex && a.samples > 0 && t.image->samples == VK_SAMPLE_COUNT_1_BIT) {
+            t.implicit = true;
+            t.tex = a.name;
+        }
+        const uint32_t n = t.msSamples ? t.msSamples : t.implicit ? renderSamples(uint32_t(a.samples)) : uint32_t(t.image->samples);
+        if (first) fb.width = w, fb.height = h, views = v, samples = n, first = false;
         else {
+            if (n != samples) {
+                fb.status = 0x8D56;  // FRAMEBUFFER_INCOMPLETE_MULTISAMPLE
+                return false;
+            }
             // GLES 3: the framebuffer is the intersection of its attachments.
             fb.width = std::min(fb.width, w), fb.height = std::min(fb.height, h);
             if (v != views) {
@@ -159,9 +192,9 @@ Context::FbInfo Context::resolveFramebuffer(GLuint name, bool forDraw) {
         return true;
     };
     for (int i = 0; i < kMaxDrawBuffers; ++i)
-        if (!take(f->color[size_t(i)], fb.color[size_t(i)], true)) return fb;
-    if (!take(f->depth, fb.depth, false)) return fb;
-    if (!take(f->stencil, fb.stencil, false)) return fb;
+        if (!take(f->color[size_t(i)], fb.color[size_t(i)], 0)) return fb;
+    if (!take(f->depth, fb.depth, 1)) return fb;
+    if (!take(f->stencil, fb.stencil, 2)) return fb;
     if (fb.depth.image && fb.stencil.image && fb.depth.image != fb.stencil.image) {
         fb.status = gl::FRAMEBUFFER_UNSUPPORTED;  // separate depth and stencil images
         return fb;
@@ -175,17 +208,21 @@ Context::FbInfo Context::resolveFramebuffer(GLuint name, bool forDraw) {
         return fb;
     }
     fb.viewCount = views;
+    fb.samples = samples;
     return fb;
 }
 
 bool Context::PassKey::operator==(const PassKey& o) const {
-    return color == o.color && depth == o.depth && stencil == o.stencil && w == o.w && h == o.h && viewMask == o.viewMask;
+    return color == o.color && colorResolve == o.colorResolve && depth == o.depth && stencil == o.stencil &&
+           depthResolve == o.depthResolve && stencilResolve == o.stencilResolve && w == o.w && h == o.h && viewMask == o.viewMask &&
+           samples == o.samples;
 }
 
 Context::PassKey Context::passKeyFor(const FbInfo& fb) {
     PassKey key;
     key.w = fb.width, key.h = fb.height;
     key.viewMask = fb.viewCount > 1 ? (1u << fb.viewCount) - 1 : 0;
+    key.samples = fb.samples;
     const uint32_t layerCount = fb.viewCount > 1 ? fb.viewCount : 1;
     std::array<GLenum, kMaxDrawBuffers> bufs{};
     if (fb.defaultFb) {
@@ -193,14 +230,26 @@ Context::PassKey Context::passKeyFor(const FbInfo& fb) {
     } else {
         bufs = fbo(drawFbo)->drawBuffers;
     }
+    ++msTwinEpoch_;  // the twins asked for below are in use: msTwin never evicts them
+    // The view a pass renders into: the attachment's own, or for an implicit-multisample one its twin (`resolve`: the
+    // attachment's own view, what the pass resolves into).
+    auto view = [&](const FbTarget& t, uint32_t slot, VkImageView& resolve) -> VkImageView {
+        const VkImageView own = t.image->attachmentView(t.level, t.layer, layerCount);
+        if (!t.implicit) return own;
+        ImageP twin = msTwin(slot, t.image->format, std::max(1u, t.image->width >> t.level), std::max(1u, t.image->height >> t.level),
+                             layerCount, fb.samples);
+        if (!twin) return logf("gles.err what=ms_twin samples=%u", fb.samples), own;
+        resolve = own;
+        return twin->attachmentView(0, 0, layerCount);
+    };
     for (int i = 0; i < kMaxDrawBuffers; ++i) {
         // Draw buffer i writes colour attachment drawBuffers[i] (GLES: must be COLOR_ATTACHMENTi or NONE).
         if (bufs[size_t(i)] == gl::NONE) continue;
         const FbTarget& t = fb.color[size_t(i)];
-        if (t.image) key.color[size_t(i)] = t.image->attachmentView(t.level, t.layer, layerCount);
+        if (t.image) key.color[size_t(i)] = view(t, uint32_t(i), key.colorResolve[size_t(i)]);
     }
-    if (fb.depth.image) key.depth = fb.depth.image->attachmentView(fb.depth.level, fb.depth.layer, layerCount);
-    if (fb.stencil.image) key.stencil = fb.stencil.image->attachmentView(fb.stencil.level, fb.stencil.layer, layerCount);
+    if (fb.depth.image) key.depth = view(fb.depth, kMaxDrawBuffers, key.depthResolve);
+    if (fb.stencil.image) key.stencil = view(fb.stencil, kMaxDrawBuffers, key.stencilResolve);
     return key;
 }
 
@@ -235,10 +284,13 @@ bool Context::beginPass(const FbInfo& fb, std::vector<VkClearAttachment>* firstC
         it->second &= uint8_t(~bit);
         if (!it->second) t.image->invalid.erase(it);
     };
+    // The invalidation marks are on the attachment's own view (an implicit-multisample twin has no marks).
+    auto own = [](const FbTarget& t, VkImageView v, VkImageView resolve) { return t.implicit ? resolve : v; };
     auto touch = [&](bool fresh) {
-        for (int i = 0; i < kMaxDrawBuffers; ++i) written(fb.color[size_t(i)], key.color[size_t(i)], 1, size_t(i), fresh);
-        written(fb.depth, key.depth, 2, kMaxDrawBuffers, fresh);
-        written(fb.stencil, key.stencil, 4, kMaxDrawBuffers + 1, fresh);
+        for (int i = 0; i < kMaxDrawBuffers; ++i)
+            written(fb.color[size_t(i)], own(fb.color[size_t(i)], key.color[size_t(i)], key.colorResolve[size_t(i)]), 1, size_t(i), fresh);
+        written(fb.depth, own(fb.depth, key.depth, key.depthResolve), 2, kMaxDrawBuffers, fresh);
+        written(fb.stencil, own(fb.stencil, key.stencil, key.stencilResolve), 4, kMaxDrawBuffers + 1, fresh);
     };
     if (passOpen_ && key == pass_) {
         touch(false);
@@ -270,23 +322,83 @@ bool Context::beginPass(const FbInfo& fb, std::vector<VkClearAttachment>* firstC
         }
         *firstClear = std::move(rest);
     }
-    auto fill = [&](VkRenderingAttachmentInfo& a, VkImageView v, size_t idx) {
+    // `resolve`: the single-sample view a multisample attachment is resolved into at the end of the pass (a multisample default
+    // framebuffer stores its samples too: the next pass loads them).
+    // An implicit-multisample attachment (`implicit`) is not stored (its twin stays on the tile) and starts from what the seed
+    // draw copies into it: its LOAD becomes DONT_CARE. The depth / stencil of the default framebuffer, of a renderbuffer and of
+    // a texture (`seeded`) keep their LOAD: the twin is an autoMsaa slot of the backend, which seeds it from the image the
+    // previous pass resolved into (the attachment's own, single-sample one).
+    uint32_t seedMask = 0;
+    auto fill = [&](VkRenderingAttachmentInfo& a, VkImageView v, size_t idx, VkImageView resolve = VK_NULL_HANDLE, bool integer = false,
+                    bool implicit = false, bool seeded = false) {
         a.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
         a.imageView = v;
         a.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
         a.loadOp = load[idx];
-        a.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+        a.storeOp = implicit ? VK_ATTACHMENT_STORE_OP_DONT_CARE : VK_ATTACHMENT_STORE_OP_STORE;
         a.clearValue = clearValue[idx];
+        if (implicit && !seeded && a.loadOp == VK_ATTACHMENT_LOAD_OP_LOAD) {
+            a.loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+            if (idx < size_t(kMaxDrawBuffers)) seedMask |= 1u << idx;
+        }
+        if (resolve) {
+            a.resolveMode = integer ? VK_RESOLVE_MODE_SAMPLE_ZERO_BIT : VK_RESOLVE_MODE_AVERAGE_BIT;
+            a.resolveImageView = resolve;
+            a.resolveImageLayout = VK_IMAGE_LAYOUT_GENERAL;
+        }
     };
     VkRenderingAttachmentInfo colors[kMaxDrawBuffers]{};
     uint32_t colorCount = 0;
     for (int i = 0; i < kMaxDrawBuffers; ++i) {
-        fill(colors[i], key.color[size_t(i)], size_t(i));
+        fill(colors[i], key.color[size_t(i)], size_t(i), key.colorResolve[size_t(i)],
+             fb.color[size_t(i)].image && fb.color[size_t(i)].image->format->integer, fb.color[size_t(i)].implicit);
         if (colors[i].imageView) colorCount = uint32_t(i + 1);
     }
     VkRenderingAttachmentInfo depth{}, stencil{};
-    fill(depth, key.depth, kMaxDrawBuffers);
-    fill(stencil, key.stencil, kMaxDrawBuffers + 1);
+    fill(depth, key.depth, kMaxDrawBuffers, key.depthResolve, true, fb.depth.implicit, bool(fb.depth.seedImage || fb.depth.tex));
+    fill(stencil, key.stencil, kMaxDrawBuffers + 1, key.stencilResolve, true, fb.stencil.implicit, bool(fb.stencil.seedImage || fb.stencil.tex));
+    // Diagnostics: a pass that goes on (the depth / stencil is not cleared) from the depth / stencil of an implicit-multisample texture.
+    // Counted (gles.census msrtt_ds_continued, per tick too) and the first 64 distinct cases logged: the format, what is attached, the
+    // load of each aspect (inv: loaded as DONT_CARE because glInvalidateFramebuffer left it undefined) and whether the backend is
+    // expected to seed the twin from the texture (commands.cpp gameAuto: a format with a stencil plane needs a stencil resolve target
+    // and a texture with format views; only what GLES can see: the area / TAA checks of the backend are not known here).
+    {
+        const bool dCont = key.depth && fb.depth.implicit && fb.depth.tex && load[kMaxDrawBuffers] != VK_ATTACHMENT_LOAD_OP_CLEAR;
+        const bool sCont = key.stencil && fb.stencil.implicit && fb.stencil.tex && load[kMaxDrawBuffers + 1] != VK_ATTACHMENT_LOAD_OP_CLEAR;
+        if (dCont || sCont) {
+            diagCount(DiagCounter::MsrttDsContinued);
+            const FbTarget& ft = fb.depth.image ? fb.depth : fb.stencil;
+            const FormatInfo* fi = ft.image->format;
+            const VkFormat vkf = fi->vk;
+            const bool vkStencil = vkf == VK_FORMAT_D24_UNORM_S8_UINT || vkf == VK_FORMAT_D32_SFLOAT_S8_UINT || vkf == VK_FORMAT_D16_UNORM_S8_UINT ||
+                                   vkf == VK_FORMAT_S8_UINT;
+            const char* why = !key.depthResolve && !key.stencilResolve ? "no_resolve"
+                              : vkStencil && !key.stencilResolve       ? "stencil_not_attached"
+                              : vkStencil && !ft.image->formatViews    ? "no_format_views"
+                                                                       : nullptr;
+            auto state = [&](bool cont, size_t idx) {
+                return !cont ? "-" : load[idx] == VK_ATTACHMENT_LOAD_OP_DONT_CARE ? "inv" : "load";
+            };
+            auto name = [](GLenum f) {
+                switch (f) {
+                    case gl::DEPTH24_STENCIL8: return "D24S8";
+                    case gl::DEPTH32F_STENCIL8: return "D32FS8";
+                    case gl::DEPTH_COMPONENT32F: return "D32F";
+                    case gl::DEPTH_COMPONENT24: return "D24";
+                    case gl::DEPTH_COMPONENT16: return "D16";
+                    case gl::STENCIL_INDEX8: return "S8";
+                    default: return "other";
+                }
+            };
+            char line[256];
+            std::snprintf(line, sizeof line, "tex=%u fmt=%s(0x%04x) attach=%s depth=%s stencil=%s serve=%s%s%s fb=%ux%u samples=%u", ft.tex,
+                          name(fi->internal), fi->internal, fb.depth.image && fb.stencil.image ? "depth_stencil" : fb.depth.image ? "depth" : "stencil",
+                          state(dCont, kMaxDrawBuffers), state(sCont, kMaxDrawBuffers + 1), why ? "no" : "yes", why ? " why=" : "", why ? why : "",
+                          fb.width, fb.height, fb.samples);
+            static std::set<std::string> seen;
+            if (seen.size() < 64 && seen.insert(line).second) logf("gles.msrtt_ds %s", line);
+        }
+    }
     VkRenderingInfo ri{VK_STRUCTURE_TYPE_RENDERING_INFO};
     ri.renderArea = {{0, 0}, {fb.width, fb.height}};
     ri.layerCount = key.viewMask ? 1 : 1;
@@ -299,6 +411,12 @@ bool Context::beginPass(const FbInfo& fb, std::vector<VkClearAttachment>* firstC
     passOpen_ = true;
     pass_ = key;
     passDrop_ = 0;
+    if (seedMask) {
+        ClearDraw cd;
+        cd.seed = true, cd.colorBits = seedMask;
+        const VkRect2D full{{0, 0}, {fb.width, fb.height}};
+        if (!clearByDraw(fb, full, cd)) logf("gles.warn msrtt seed draw not built: the multisample twin starts undefined");
+    }
     return true;
 }
 
@@ -326,8 +444,11 @@ void Context::invalidateFramebuffer(GLenum target, GLsizei n, const GLenum* atts
         if (!t.image || t.image->external) return;
         const VkImageView v = t.image->attachmentView(t.level, t.layer, layerCount);
         t.image->invalid[v] |= bit;
-        if (passOpen_ && (idx < size_t(kMaxDrawBuffers) ? pass_.color[idx] : idx == size_t(kMaxDrawBuffers) ? pass_.depth : pass_.stencil) == v)
-            drop |= 1u << idx;
+        // (An implicit-multisample attachment's pass view is its twin: its own view is the pass's resolve target.)
+        const bool depthSlot = idx == size_t(kMaxDrawBuffers);
+        const VkImageView passView = idx < size_t(kMaxDrawBuffers) ? pass_.color[idx] : depthSlot ? pass_.depth : pass_.stencil;
+        const VkImageView passResolve = idx < size_t(kMaxDrawBuffers) ? pass_.colorResolve[idx] : depthSlot ? pass_.depthResolve : pass_.stencilResolve;
+        if (passOpen_ && (passView == v || passResolve == v)) drop |= 1u << idx;
     };
     GLenum bad = 0;
     for (GLsizei i = 0; i < n && !bad; ++i) {
@@ -354,11 +475,15 @@ Program::~Program() {
     Device* d = device();
     if (!d || !d->device) return;
     for (auto& [k, p] : pipelines) d->vk.vkDestroyPipeline(d->device, p, nullptr);
+    for (auto& [k, p] : xfbPipelines) d->vk.vkDestroyPipeline(d->device, p, nullptr);
     d->vk.vkDestroyShaderModule(d->device, vsModule, nullptr);
     d->vk.vkDestroyShaderModule(d->device, fsModule, nullptr);
     d->vk.vkDestroyShaderModule(d->device, csModule, nullptr);
+    d->vk.vkDestroyShaderModule(d->device, xfbModule, nullptr);
     d->vk.vkDestroyPipelineLayout(d->device, pipeLayout, nullptr);
+    d->vk.vkDestroyPipelineLayout(d->device, xfbPipeLayout, nullptr);
     d->vk.vkDestroyDescriptorSetLayout(d->device, setLayout, nullptr);
+    d->vk.vkDestroyDescriptorSetLayout(d->device, xfbSetLayout, nullptr);
 }
 
 // samplerBuffer / isamplerBuffer / usamplerBuffer: a texel buffer descriptor instead of a combined image sampler.
@@ -372,6 +497,99 @@ static bool isImageType(uint32_t t) { return t >= 0x904C && t <= 0x906A; }
 static int imageDim(uint32_t t) {
     const uint32_t base = t >= 0x9062 ? 0x9062 : t >= 0x9057 ? 0x9057 : 0x904C;
     return int(t - base);
+}
+
+// The 13 formats of glBindImageTexture (ES 3.1 table 8.27) as the Vulkan format a view reads them with; UNDEFINED otherwise.
+static VkFormat imageViewFormat(GLenum f) {
+    switch (f) {
+        case 0x8814: return VK_FORMAT_R32G32B32A32_SFLOAT;  // RGBA32F
+        case 0x881A: return VK_FORMAT_R16G16B16A16_SFLOAT;  // RGBA16F
+        case 0x822E: return VK_FORMAT_R32_SFLOAT;           // R32F
+        case 0x8058: return VK_FORMAT_R8G8B8A8_UNORM;       // RGBA8
+        case 0x8F97: return VK_FORMAT_R8G8B8A8_SNORM;       // RGBA8_SNORM
+        case 0x8D82: return VK_FORMAT_R32G32B32A32_SINT;    // RGBA32I
+        case 0x8D88: return VK_FORMAT_R16G16B16A16_SINT;    // RGBA16I
+        case 0x8D8E: return VK_FORMAT_R8G8B8A8_SINT;        // RGBA8I
+        case 0x8235: return VK_FORMAT_R32_SINT;             // R32I
+        case 0x8D70: return VK_FORMAT_R32G32B32A32_UINT;    // RGBA32UI
+        case 0x8D76: return VK_FORMAT_R16G16B16A16_UINT;    // RGBA16UI
+        case 0x8D7C: return VK_FORMAT_R8G8B8A8_UINT;        // RGBA8UI
+        case 0x8236: return VK_FORMAT_R32_UINT;             // R32UI
+        default: return VK_FORMAT_UNDEFINED;
+    }
+}
+// Texel size of those formats (a view may only reinterpret between equal sizes).
+static uint32_t imageFormatBytes(VkFormat f) {
+    switch (f) {
+        case VK_FORMAT_R32G32B32A32_SFLOAT: case VK_FORMAT_R32G32B32A32_SINT: case VK_FORMAT_R32G32B32A32_UINT: return 16;
+        case VK_FORMAT_R16G16B16A16_SFLOAT: case VK_FORMAT_R16G16B16A16_SINT: case VK_FORMAT_R16G16B16A16_UINT: return 8;
+        default: return 4;
+    }
+}
+
+VkImageView Context::sliceView(Texture& t, uint32_t level, GLint layer, GLenum access, VkFormat format) {
+    Image& im = *t.image;
+    const uint32_t w = std::max(1u, im.width >> level), h = std::max(1u, im.height >> level), depth = std::max(1u, im.depth >> level);
+    if (!dispatching_ || layer < 0 || uint32_t(layer) >= depth) {
+        static std::atomic<int> said{0};
+        if (said.fetch_add(1) < 8)
+            logf("gles.warn what=image2d_of_3d_unsupported texture=%u level=%u layer=%d dispatch=%d (the image reads as zero)", t.name, level, int(layer), int(dispatching_));
+        return VK_NULL_HANDLE;
+    }
+    // One 2D proxy per (3D image, level): the slice is copied into it before the dispatch and back after it.
+    auto& proxy = sliceProxies_[{&im, level}];
+    if (proxy && (proxy->format != im.format || proxy->width != w || proxy->height != h)) {
+        keep(proxy);
+        proxy.reset();
+    }
+    if (!proxy) {
+        if (sliceProxies_.size() > 16) {
+            for (auto it = sliceProxies_.begin(); it != sliceProxies_.end();) {
+                if (&it->second == &proxy) { ++it; continue; }
+                keep(it->second);
+                it = sliceProxies_.erase(it);
+            }
+        }
+        proxy = createImage2D(dev, im.format, w, h, 1, 1,
+                              VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                              VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT);
+        if (!proxy) return VK_NULL_HANDLE;
+        proxy->storage = true;
+        imageInit(*proxy);
+    }
+    VkImageCopy r{};
+    r.srcSubresource = {im.aspect(), level, 0, 1};
+    r.srcOffset = {0, 0, layer};
+    r.dstSubresource = {im.aspect(), 0, 0, 1};
+    r.extent = {w, h, 1};
+    dev->vk.vkCmdCopyImage(cmd(), im.image, VK_IMAGE_LAYOUT_GENERAL, proxy->image, VK_IMAGE_LAYOUT_GENERAL, 1, &r);
+    barrier();
+    SliceSync s;
+    s.proxy = proxy;
+    s.source = t.image;
+    s.level = level, s.slice = uint32_t(layer);
+    s.writeBack = access != gl::READ_ONLY;
+    if (s.writeBack) sliceBack_.push_back(s);
+    keep(proxy);
+    return proxy->storageView(0, 0, 1, VK_IMAGE_VIEW_TYPE_2D, format);
+}
+
+// After a dispatch that used slice proxies: the written ones go back into their 3D texture.
+void Context::syncSlicesBack() {
+    if (sliceBack_.empty()) return;
+    barrier();
+    for (const SliceSync& s : sliceBack_) {
+        const Image& im = *s.source;
+        VkImageCopy r{};
+        r.srcSubresource = {im.aspect(), 0, 0, 1};
+        r.dstSubresource = {im.aspect(), s.level, 0, 1};
+        r.dstOffset = {0, 0, int32_t(s.slice)};
+        r.extent = {s.proxy->width, s.proxy->height, 1};
+        dev->vk.vkCmdCopyImage(cmd(), s.proxy->image, VK_IMAGE_LAYOUT_GENERAL, im.image, VK_IMAGE_LAYOUT_GENERAL, 1, &r);
+        keep(s.source);
+    }
+    sliceBack_.clear();
+    barrier();
 }
 
 // ---- program binary ---------------------------------------------------------------------------------
@@ -491,21 +709,30 @@ bool Context::linkShaders(Program& p, Shader* vs, Shader* fs, Shader* cs) {
         flush(true);
         for (auto& [k, pl] : p.pipelines) dev->vk.vkDestroyPipeline(dev->device, pl, nullptr);
         p.pipelines.clear();
+        for (auto& [k, pl] : p.xfbPipelines) dev->vk.vkDestroyPipeline(dev->device, pl, nullptr);
+        p.xfbPipelines.clear();
         dev->vk.vkDestroyShaderModule(dev->device, p.vsModule, nullptr);
         dev->vk.vkDestroyShaderModule(dev->device, p.fsModule, nullptr);
         dev->vk.vkDestroyShaderModule(dev->device, p.csModule, nullptr);
+        dev->vk.vkDestroyShaderModule(dev->device, p.xfbModule, nullptr);
         dev->vk.vkDestroyPipelineLayout(dev->device, p.pipeLayout, nullptr);
+        dev->vk.vkDestroyPipelineLayout(dev->device, p.xfbPipeLayout, nullptr);
         dev->vk.vkDestroyDescriptorSetLayout(dev->device, p.setLayout, nullptr);
-        p.vsModule = p.fsModule = p.csModule = VK_NULL_HANDLE;
-        p.pipeLayout = VK_NULL_HANDLE, p.setLayout = VK_NULL_HANDLE;
+        dev->vk.vkDestroyDescriptorSetLayout(dev->device, p.xfbSetLayout, nullptr);
+        p.vsModule = p.fsModule = p.csModule = p.xfbModule = VK_NULL_HANDLE;
+        p.pipeLayout = p.xfbPipeLayout = VK_NULL_HANDLE, p.setLayout = p.xfbSetLayout = VK_NULL_HANDLE;
     }
     p.linked = false;
+    p.singleStage = false;
     p.bin = {};
     p.log.clear();
     p.varyingDiag.clear();
     vpglsl::LinkResult lr;
+    Shader stub;  // the missing stage of a single-stage separable program
     vpglsl::LinkOptions lo;
     lo.attribBindings = p.attribBindings;
+    lo.xfbVaryings = p.xfbVaryings;
+    lo.xfbSeparate = p.xfbMode == 0x8C8D;  // GL_SEPARATE_ATTRIBS
     if (cs) {
         if (!cs->compiled) {
             p.log = "ERROR: compute shader not compiled\n";
@@ -513,14 +740,31 @@ bool Context::linkShaders(Program& p, Shader* vs, Shader* fs, Shader* cs) {
         }
         lr = vpglsl::link(cs->parsed, nullptr, lo);
     } else {
+        // A separable program may hold one graphics stage: linked with a stub of the other, for its reflection.
+        p.singleStage = p.separable && (vs ? !fs : fs != nullptr);
+        if (p.singleStage) {
+            Shader* have = vs ? vs : fs;
+            if (!have->compiled) {
+                p.log = "ERROR: shader not compiled\n";
+                return false;
+            }
+            const std::string v = std::to_string(vpglsl::shaderVersion(*have->parsed)) + " es\n";
+            vpglsl::ParseResult r = vs ? vpglsl::parse(vpglsl::Stage::Fragment, "#version " + v + "precision mediump float;\nvoid main() {}\n")
+                                       : vpglsl::parse(vpglsl::Stage::Vertex, "#version " + v + "void main() { gl_Position = vec4(0.0); }\n");
+            stub.parsed = r.shader, stub.compiled = r.shader != nullptr;
+            (vs ? fs : vs) = &stub;
+        }
         if (!vs || !fs || !vs->compiled || !fs->compiled) {
             p.log = "ERROR: a vertex and a fragment shader, both compiled, must be attached\n";
             return false;
         }
+        lo.separable = p.separable;
+        lo.pipeline = p.pipelineLink;
         lr = vpglsl::link(vs->parsed, fs->parsed, lo);
     }
     p.log = lr.log;
     p.varyingDiag = lr.varyingDiag;
+    logLenient(lr.lenient, "program", p.name);
     if (!lr.ok) return false;
     p.refl = lr.reflection;
     auto module = [&](const std::vector<uint32_t>& w) {
@@ -559,6 +803,15 @@ bool Context::linkShaders(Program& p, Shader* vs, Shader* fs, Shader* cs) {
     VkPipelineLayoutCreateInfo pci{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
     pci.setLayoutCount = 1, pci.pSetLayouts = &p.setLayout;
     dev->vk.vkCreatePipelineLayout(dev->device, &pci, nullptr, &p.pipeLayout);
+    if (!lr.xfbVertexSpirv.empty()) {  // transform feedback: the capture variant of the vertex shader and a layout that adds its scratch buffer
+        p.xfbModule = module(lr.xfbVertexSpirv);
+        binds.push_back({vpglsl::kXfbBinding, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_VERTEX_BIT, nullptr});
+        dci.bindingCount = uint32_t(binds.size()), dci.pBindings = binds.data();
+        dev->vk.vkCreateDescriptorSetLayout(dev->device, &dci, nullptr, &p.xfbSetLayout);
+        pci.pSetLayouts = &p.xfbSetLayout;
+        dev->vk.vkCreatePipelineLayout(dev->device, &pci, nullptr, &p.xfbPipeLayout);
+    }
+    p.xfbLinkedMode = p.xfbMode;
     // Uniform storage, locations (one per array element; struct leaves flattened), sampler units.
     p.defaultBlock.assign(std::max<uint32_t>(16, p.refl.defaultBlockSize), 0);
     p.defaultDirty = true;
@@ -566,7 +819,10 @@ bool Context::linkShaders(Program& p, Shader* vs, Shader* fs, Shader* cs) {
     p.samplerUnits.assign(p.refl.uniforms.size(), {});
     for (size_t i = 0; i < p.refl.uniforms.size(); ++i) {
         const auto& u = p.refl.uniforms[i];
-        for (int e = 0; e < u.arraySize; ++e) p.locations.push_back({int(i), e});
+        if (u.uniformLocation >= 0) {
+            if (p.locations.size() < size_t(u.uniformLocation + u.arraySize)) p.locations.resize(size_t(u.uniformLocation + u.arraySize), {-1, 0});
+            for (int e = 0; e < u.arraySize; ++e) p.locations[size_t(u.uniformLocation + e)] = {int(i), e};
+        }
         if (u.binding >= 0) {
             // layout(binding = N) gives the initial unit (consecutive for arrays).
             p.samplerUnits[i].assign(size_t(u.arraySize), 0);
@@ -582,6 +838,8 @@ bool Context::linkShaders(Program& p, Shader* vs, Shader* fs, Shader* cs) {
         if (p.refl.storageBlocks[i].initialBinding >= 0) p.storageBindings[i] = GLuint(p.refl.storageBlocks[i].initialBinding);
     p.serial = ++serials;
     p.linked = true;
+    p.stageVs = vs && vs != &stub ? vs->parsed : nullptr;
+    p.stageFs = fs && fs != &stub ? fs->parsed : nullptr;
     p.bin.valid = true, p.bin.separable = p.separable, p.bin.attribBindings = p.attribBindings;
     p.bin.sources[0] = vs ? vs->compiledSource : nullptr;
     p.bin.sources[1] = fs ? fs->compiledSource : nullptr;
@@ -599,12 +857,10 @@ static GLint locationOf(const Program& p, const std::string& name) {
         element = std::atoi(base.c_str() + lb + 1);
         base = base.substr(0, lb);
     }
-    GLint loc = 0;
     for (const auto& u : p.refl.uniforms) {
         std::string un = u.name;
         if (u.isArray && un.size() > 3 && un.compare(un.size() - 3, 3, "[0]") == 0) un.resize(un.size() - 3);
-        if (un == base && element < u.arraySize && (element == 0 || u.isArray)) return loc + element;
-        loc += u.arraySize;
+        if (un == base && element < u.arraySize && (element == 0 || u.isArray)) return u.uniformLocation < 0 ? -1 : u.uniformLocation + element;
     }
     return -1;
 }
@@ -644,18 +900,59 @@ static std::string callTypeName(int comps, int cols, bool isInt, bool isUint) {
     return std::string(isInt ? "i" : isUint ? "u" : "") + "vec" + std::to_string(comps);
 }
 
+// Repetition counter behind the two uniform diagnostics below: counts every sighting of `key` (at most 512 keys) and says
+// whether its line is due: the first one, then again at the 100th, 1000th and 10000th (`n` = sightings so far).
+static bool uniformLogDue(std::map<std::string, uint32_t>& seen, const std::string& key, uint32_t& n) {
+    auto it = seen.find(key);
+    if (it == seen.end()) {
+        if (seen.size() >= 512) return false;
+        it = seen.emplace(key, 0u).first;
+    }
+    n = ++it->second;
+    return n == 1 || n == 100 || n == 1000 || n == 10000;
+}
+
 // Diagnostics: a glUniform* the layer rejected, with the uniform that was addressed (gles.diag only says which source
-// line rejected it). At most 64 lines per process, one per uniform name (per reason and location when it is unknown).
-static void logUniformErr(const vpglsl::Variable* u, GLint location, GLsizei count, int comps, int cols, bool isInt,
-                          bool isUint, const char* reason) {
+// line rejected it). At most 512 keys per process, one line per (program, uniform name, called type) (per reason and location
+// when the uniform is unknown), repeated with n= at the 100th, 1000th and 10000th repetition.
+static void logUniformErr(const Program* p, const vpglsl::Variable* u, GLint location, GLsizei count, int comps, int cols,
+                          bool isInt, bool isUint, const char* reason, int element = -1) {
     static std::mutex mu;
-    static std::set<std::string> seen;
+    static std::map<std::string, uint32_t> seen;
+    const std::string name = u ? u->name : std::string("?");
+    const std::string callType = callTypeName(comps, cols, isInt, isUint);
+    const unsigned prog = p ? unsigned(p->name) : 0u;
+    std::lock_guard<std::mutex> g(mu);
+    uint32_t n = 0;
+    if (!uniformLogDue(seen, std::to_string(prog) + ":" + name + ":" + callType + (u ? "" : std::string(reason) + std::to_string(location)), n))
+        return;
+    logf("gles.uniform_err name=%s decl_type=%s call_type=%s count=%d arraySize=%d loc=%d reason=%s element=%d base=%d prog=%u%s", name.c_str(),
+         u ? uniformTypeName(u->glType).c_str() : "?", callType.c_str(), int(count), u ? u->arraySize : 0, int(location), reason,
+         element, element >= 0 ? int(location) - element : -1, prog, n > 1 ? (" n=" + std::to_string(n)).c_str() : "");
+}
+
+// Diagnostics: a glUniform* the layer let through as Adreno does in lenient mode: a base type that differs from the declared one
+// (UE4 uploads packed ints with glUniform4iv onto `highp vec4 x[N]`, stored raw), a count > 1 on a non-array (`reason`: only the first
+// element is applied) or a location past the program's range (`u` null, `reason`: ignored). One line per (program, uniform name,
+// called type, reason) (per location when the uniform is unknown), at most 512 keys, repeated with n= at the 100th, 1000th and
+// 10000th repetition. A sampler set through a call that is not glUniform1i (UE4 sends glUniform4* with the unit as first
+// component) takes that first component as its unit (`reason`: sampler_first_component).
+static void logUniformLenient(const Program* p, const vpglsl::Variable* u, int comps, bool isInt, bool isUint, const char* reason = nullptr,
+                              GLint location = -1) {
+    static std::mutex mu;
+    static std::map<std::string, uint32_t> seen;
+    const std::string callType = callTypeName(comps, 0, isInt, isUint);
+    const unsigned prog = p ? unsigned(p->name) : 0u;
     const std::string name = u ? u->name : std::string("?");
     std::lock_guard<std::mutex> g(mu);
-    if (seen.size() >= 64 || !seen.insert(u ? name : name + reason + std::to_string(location)).second) return;
-    logf("gles.uniform_err name=%s decl_type=%s call_type=%s count=%d arraySize=%d loc=%d reason=%s", name.c_str(),
-         u ? uniformTypeName(u->glType).c_str() : "?", callTypeName(comps, cols, isInt, isUint).c_str(), int(count),
-         u ? u->arraySize : 0, int(location), reason);
+    uint32_t n = 0;
+    if (!uniformLogDue(seen, std::to_string(prog) + ":" + name + ":" + callType + (reason ? reason : "") + (u ? "" : std::to_string(location)), n))
+        return;
+    std::string extra = reason ? std::string(" reason=") + reason : std::string();
+    if (!u) extra += " loc=" + std::to_string(location);
+    if (n > 1) extra += " n=" + std::to_string(n);
+    logf("gles.uniform_lenient prog=%u name=%s decl=%s call=%s%s", prog, name.c_str(), u ? uniformTypeName(u->glType).c_str() : "?", callType.c_str(),
+         extra.c_str());
 }
 
 void Context::setUniform(GLint location, int comps, Kind kind, GLsizei count, const void* v, int cols, bool transpose,
@@ -663,28 +960,49 @@ void Context::setUniform(GLint location, int comps, Kind kind, GLsizei count, co
     Program* p = target ? target : uniformProgram();
     const bool isInt = kind == Kind::Int, isUint = kind == Kind::Uint;
     if (!p || !p->linked) {
-        logUniformErr(nullptr, location, count, comps, cols, isInt, isUint, "no_linked_program");
+        logUniformErr(p, nullptr, location, count, comps, cols, isInt, isUint, "no_linked_program");
         return setError(gl::INVALID_OPERATION);
     }
     if (location == -1) return;
+    if (location >= 0 && size_t(location) >= p->locations.size() && !vpglsl::strictMode())
+        return logUniformLenient(p, nullptr, comps, isInt, isUint, "location_out_of_range", location);  // Adreno ignores it (UE4 sets uniforms of other permutations)
     if (location < 0 || size_t(location) >= p->locations.size()) {
-        logUniformErr(nullptr, location, count, comps, cols, isInt, isUint, "location_out_of_range");
+        logUniformErr(p, nullptr, location, count, comps, cols, isInt, isUint, "location_out_of_range");
         return setError(gl::INVALID_OPERATION);
     }
     const Program::Loc loc = p->locations[size_t(location)];
+    if (loc.uniform < 0) {  // a gap between explicit locations
+        logUniformErr(p, nullptr, location, count, comps, cols, isInt, isUint, "location_unused");
+        return setError(gl::INVALID_OPERATION);
+    }
     const vpglsl::Variable& u = p->refl.uniforms[size_t(loc.uniform)];
-    auto note = [&](const char* reason) { logUniformErr(&u, location, count, comps, cols, isInt, isUint, reason); };
-    if (count > 1 && !u.isArray) return note("count_on_non_array"), setError(gl::INVALID_OPERATION);
+    auto note = [&](const char* reason) { logUniformErr(p, &u, location, count, comps, cols, isInt, isUint, reason, loc.element); };
+    if (count > 1 && !u.isArray) {
+        if (vpglsl::strictMode()) return note("count_on_non_array"), setError(gl::INVALID_OPERATION);
+        logUniformLenient(p, &u, comps, isInt, isUint, "count_on_non_array");  // Adreno applies the first element
+        count = 1;
+    }
     const int n = std::min<int>(count, u.arraySize - loc.element);
-    // Samplers: glUniform1i(v) sets the texture unit.
+    // Samplers: glUniform1i(v) sets the texture unit. Lenient mode (Adreno) also takes any other vector call (UE4: glUniform4*)
+    // and reads its first component per element as the unit (a float is converted to int, int/uint words are used as they are).
     if (u.binding >= 0) {
-        if (kind != Kind::Int || comps != 1 || cols) return note("sampler_needs_1i"), setError(gl::INVALID_OPERATION);
-        const GLint* iv = static_cast<const GLint*>(v);
+        const bool exact = kind == Kind::Int && comps == 1;
+        if (cols || (!exact && (vpglsl::strictMode() || comps == 1))) return note("sampler_needs_1i"), setError(gl::INVALID_OPERATION);
         for (int i = 0; i < n; ++i) {
-            if (iv[i] < 0 || iv[i] >= (isImageType(u.glType) ? kMaxImageUnits : kMaxTextureUnits))
+            const uint8_t* src = static_cast<const uint8_t*>(v) + size_t(i) * size_t(comps) * 4;
+            GLint unit;
+            if (kind == Kind::Float) {
+                float f;
+                std::memcpy(&f, src, 4);
+                unit = f >= 0.0f && f < 65536.0f ? GLint(f) : -1;  // NaN / out of range: rejected below
+            } else {
+                std::memcpy(&unit, src, 4);
+            }
+            if (unit < 0 || unit >= (isImageType(u.glType) ? kMaxImageUnits : kMaxTextureUnits))
                 return note("sampler_unit_out_of_range"), setError(gl::INVALID_VALUE);
-            p->samplerUnits[size_t(loc.uniform)][size_t(loc.element + i)] = iv[i];
+            p->samplerUnits[size_t(loc.uniform)][size_t(loc.element + i)] = unit;
         }
+        if (!exact) logUniformLenient(p, &u, comps, isInt, isUint, "sampler_first_component");
         return;
     }
     // Type check: components and base type (bool accepts any of float/int/uint).
@@ -720,7 +1038,10 @@ void Context::setUniform(GLint location, int comps, Kind kind, GLsizei count, co
         default: return note("uniform_type_not_settable"), setError(gl::INVALID_OPERATION);
     }
     if (ucols != cols || ucomps != comps) return note("size_mismatch"), setError(gl::INVALID_OPERATION);
-    if (ukind != Kind::Bool && ukind != kind) return note("base_type_mismatch"), setError(gl::INVALID_OPERATION);
+    if (ukind != Kind::Bool && ukind != kind) {
+        if (cols || vpglsl::strictMode()) return note("base_type_mismatch"), setError(gl::INVALID_OPERATION);
+        logUniformLenient(p, &u, comps, isInt, isUint);
+    }
     if (ukind == Kind::Bool && cols) return note("matrix_on_bool"), setError(gl::INVALID_OPERATION);
     const uint32_t stride = u.arrayStride ? u.arrayStride : 16;
     for (int i = 0; i < n; ++i) {
@@ -759,6 +1080,7 @@ void Context::setUniform(GLint location, int comps, Kind kind, GLsizei count, co
 void Context::getUniform(Program& p, GLint location, void* out, Kind kind) {
     if (location < 0 || size_t(location) >= p.locations.size()) return setError(gl::INVALID_OPERATION);
     const Program::Loc loc = p.locations[size_t(location)];
+    if (loc.uniform < 0) return setError(gl::INVALID_OPERATION);
     const vpglsl::Variable& u = p.refl.uniforms[size_t(loc.uniform)];
     if (u.binding >= 0) {
         GLint unit = p.samplerUnits[size_t(loc.uniform)][size_t(loc.element)];
@@ -779,6 +1101,10 @@ void Context::getUniform(Program& p, GLint location, void* out, Kind kind) {
     else if (t == 0x8B5A) cols = 2, comps = 2;
     else if (t == 0x8B5B) cols = 3, comps = 3;
     else if (t == 0x8B5C) cols = 4, comps = 4;
+    else if (t >= 0x8B65 && t <= 0x8B6A) {
+        static const int kCols[] = {2, 2, 3, 3, 4, 4}, kRows[] = {3, 4, 2, 4, 2, 3};  // mat2x3 mat2x4 mat3x2 mat3x4 mat4x2 mat4x3
+        cols = kCols[t - 0x8B65], comps = kRows[t - 0x8B65];
+    }
     const bool isFloat = t == 0x1406 || (t >= 0x8B50 && t <= 0x8B52) || (t >= 0x8B5A && t <= 0x8B5C) || (t >= 0x8B65 && t <= 0x8B6A);
     const bool isUint = t == 0x1405 || (t >= 0x8DC6 && t <= 0x8DC8);
     const uint8_t* src = p.defaultBlock.data() + u.offset + uint32_t(loc.element) * (u.arrayStride ? u.arrayStride : 16);
@@ -856,7 +1182,7 @@ struct Hasher {
 
 VkPipeline Context::pipelineFor(Program& p, const FbInfo& fb, VkPrimitiveTopology topo,
                                 const std::vector<VkVertexInputBindingDescription>& binds,
-                                const std::vector<VkVertexInputAttributeDescription>& attrs) {
+                                const std::vector<VkVertexInputAttributeDescription>& attrs, bool xfb) {
     // Formats of the attachments the pass has.
     std::array<VkFormat, kMaxDrawBuffers> colorFmt{};
     uint32_t colorCount = 0;
@@ -875,8 +1201,20 @@ VkPipeline Context::pipelineFor(Program& p, const FbInfo& fb, VkPrimitiveTopolog
     h.add(depthFmt), h.add(stencilFmt), h.add(pass_.viewMask);
     for (auto& b : binds) h.add(b);
     for (auto& a : attrs) h.add(a);
-    h.add(rasterizerDiscard), h.add(cullFace), h.add(cullMode), h.add(frontFace), h.add(polygonOffsetFill);
+    h.add(xfb), h.add(rasterizerDiscard), h.add(cullFace), h.add(cullMode), h.add(frontFace), h.add(polygonOffsetFill);
     h.add(primitiveRestart), h.add(sampleAlphaToCoverage);
+    // Multisample: the sample count of the pass and the mask GL_SAMPLE_MASK / GL_SAMPLE_COVERAGE leave (all ones: none).
+    const uint32_t full = fb.samples >= 32 ? ~0u : (1u << fb.samples) - 1;
+    VkSampleMask sampleMaskBits = full;
+    if (fb.samples > 1) {
+        if (sampleMaskEnable) sampleMaskBits &= sampleMask;
+        if (sampleCoverage) {
+            const uint32_t n = uint32_t(std::lround(sampleCoverageValue * float(fb.samples)));
+            const uint32_t cov = (1u << n) - 1;
+            sampleMaskBits &= sampleCoverageInvert ? ~cov : cov;
+        }
+    }
+    h.add(fb.samples), h.add(sampleMaskBits);
     const bool dt = depthTest && hasDepth, st = stencilTest && hasStencil;
     h.add(dt), h.add(dt ? depthFunc : 0u), h.add(dt && depthMask), h.add(st);
     if (st)
@@ -888,11 +1226,13 @@ VkPipeline Context::pipelineFor(Program& p, const FbInfo& fb, VkPrimitiveTopolog
         h.add(b.mask);
     }
     const uint64_t key = h.h;
-    auto it = p.pipelines.find(key);
-    if (it != p.pipelines.end()) return it->second;
+    auto& cache = xfb ? p.xfbPipelines : p.pipelines;
+    auto it = cache.find(key);
+    if (it != cache.end()) return it->second;
 
     VkPipelineShaderStageCreateInfo stages[2]{};
-    stages[0] = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_VERTEX_BIT, p.vsModule, "main", nullptr};
+    stages[0] = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_VERTEX_BIT,
+                 xfb ? p.xfbModule : p.vsModule, "main", nullptr};
     stages[1] = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_FRAGMENT_BIT, p.fsModule, "main", nullptr};
     VkPipelineVertexInputStateCreateInfo vi{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
     vi.vertexBindingDescriptionCount = uint32_t(binds.size()), vi.pVertexBindingDescriptions = binds.data();
@@ -905,7 +1245,7 @@ VkPipeline Context::pipelineFor(Program& p, const FbInfo& fb, VkPrimitiveTopolog
     VkPipelineViewportStateCreateInfo vp{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
     vp.viewportCount = 1, vp.scissorCount = 1;
     VkPipelineRasterizationStateCreateInfo rs{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
-    rs.rasterizerDiscardEnable = rasterizerDiscard;
+    rs.rasterizerDiscardEnable = rasterizerDiscard || xfb;  // the capture pass only runs the vertex shader
     rs.polygonMode = VK_POLYGON_MODE_FILL;
     rs.cullMode = !cullFace ? VK_CULL_MODE_NONE
                   : cullMode == gl::FRONT ? VK_CULL_MODE_FRONT_BIT
@@ -915,7 +1255,8 @@ VkPipeline Context::pipelineFor(Program& p, const FbInfo& fb, VkPrimitiveTopolog
     rs.depthBiasEnable = polygonOffsetFill;
     rs.lineWidth = 1.0f;
     VkPipelineMultisampleStateCreateInfo ms{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
-    ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+    ms.rasterizationSamples = VkSampleCountFlagBits(fb.samples);
+    if (sampleMaskBits != full) ms.pSampleMask = &sampleMaskBits;
     ms.alphaToCoverageEnable = sampleAlphaToCoverage;
     VkPipelineDepthStencilStateCreateInfo ds{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
     ds.depthTestEnable = dt;
@@ -955,13 +1296,13 @@ VkPipeline Context::pipelineFor(Program& p, const FbInfo& fb, VkPrimitiveTopolog
     pr.depthAttachmentFormat = hasDepth ? depthFmt : VK_FORMAT_UNDEFINED;
     pr.stencilAttachmentFormat = hasStencil ? stencilFmt : VK_FORMAT_UNDEFINED;
     VkGraphicsPipelineCreateInfo ci{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, &pr};
-    ci.stageCount = 2, ci.pStages = stages;
+    ci.stageCount = xfb ? 1 : 2, ci.pStages = stages;
     ci.pVertexInputState = &vi, ci.pInputAssemblyState = &ia, ci.pViewportState = &vp, ci.pRasterizationState = &rs;
     ci.pMultisampleState = &ms, ci.pDepthStencilState = &ds, ci.pColorBlendState = &cb, ci.pDynamicState = &dy;
-    ci.layout = p.pipeLayout;
+    ci.layout = xfb ? p.xfbPipeLayout : p.pipeLayout;
     VkPipeline pl = VK_NULL_HANDLE;
     if (dev->vk.vkCreateGraphicsPipelines(dev->device, VK_NULL_HANDLE, 1, &ci, nullptr, &pl) != VK_SUCCESS) pl = VK_NULL_HANDLE;
-    p.pipelines[key] = pl;
+    cache[key] = pl;
     recipeStatsTick(false);  // a new pipeline: the log must not wait for a swap the host never calls
     return pl;
 }
@@ -979,24 +1320,82 @@ static GLuint unitTexture(const Context::Unit& u, const vpglsl::Variable& v) {
     }
 }
 
+// The texture target a sampler uniform reads (the same mapping as unitTexture).
+static GLenum samplerTarget(const vpglsl::Variable& v) {
+    switch (v.glType) {
+        case 0x8B60: case 0x8DC5: case 0x8DCC: case 0x8DD4: return gl::TEXTURE_CUBE_MAP;
+        case 0x8B5F: case 0x8DCB: case 0x8DD3: return gl::TEXTURE_3D;
+        case 0x8DC1: case 0x8DC4: case 0x8DCF: case 0x8DD7: return gl::TEXTURE_2D_ARRAY;
+        case 0x8D66: return gl::TEXTURE_EXTERNAL_OES;
+        case 0x9108: case 0x9109: case 0x910A: return gl::TEXTURE_2D_MULTISAMPLE;
+        default: return gl::TEXTURE_2D;
+    }
+}
+
 // Texture completeness (GLES 3.0 §8.17): an incomplete texture samples as (0, 0, 0, 1). `sp` are the sampling parameters
-// the unit really uses (a sampler object bound to the unit replaces the texture's own).
-static bool complete(const Texture& t, const SamplerParams& sp) {
-    if (!t.image || t.levels.empty() || !t.levels[0].format) return false;
+// the unit really uses (a sampler object bound to the unit replaces the texture's own). `why` (diagnostics): the rule that failed
+// and the first level it failed at (-1: none).
+struct Incomplete {
+    const char* reason = "";
+    int level = -1;
+};
+static bool complete(const Texture& t, const SamplerParams& sp, Incomplete* why = nullptr) {
+    auto no = [&](const char* reason, int level = -1) {
+        if (why) why->reason = reason, why->level = level;
+        return false;
+    };
+    if (!t.image || t.levels.empty()) return no(t.image ? "no_levels" : "no_image");
     const bool mip = sp.minFilter != gl::NEAREST && sp.minFilter != gl::LINEAR;
-    if (!mip || t.immutable) return true;
+    if (mip && t.maxLevel < t.baseLevel) return no("max_lt_base");  // no level in [base, max]
+    if (t.immutable) return t.levels[0].format != nullptr ? true : no("immutable_no_format", 0);
+    // The base level array must be defined (level 0 may not be: UE4 mip streaming moves GL_TEXTURE_BASE_LEVEL up).
     const uint32_t base = uint32_t(std::max(0, t.baseLevel));
-    if (base >= t.levels.size()) return false;
-    const uint32_t last = std::min<uint32_t>(uint32_t(t.maxLevel), t.image->levels - 1);
+    if (base >= t.levels.size() || !t.levels[base].format) return no("base_undefined", int(base));
+    const uint32_t last = mip ? std::min<uint32_t>(uint32_t(t.maxLevel), t.image->levels - 1) : base;
+    if (t.target == gl::TEXTURE_CUBE_MAP) {
+        // Every face has the same size and format at the base level, and (mipmapped) at every level up to the last.
+        for (const auto& fl : t.faceLevels) {
+            if (base >= fl.size()) return no("cube_base_missing", int(base));
+            for (uint32_t l = base; l <= last; ++l) {
+                if (l >= fl.size()) return no("cube_level_missing", int(l));
+                if (fl[l].format != t.image->format) return no("cube_level_format", int(l));
+                if (fl[l].w != std::max(1u, t.image->width >> l) || fl[l].h != std::max(1u, t.image->height >> l)) return no("cube_level_size", int(l));
+            }
+        }
+        return true;
+    }
+    if (!mip) return true;
+    if (base >= t.levels.size()) return no("base_undefined", int(base));
     for (uint32_t l = base; l <= last; ++l) {
-        if (l >= t.levels.size() || t.levels[l].format != t.image->format) return false;
-        if (t.levels[l].w != std::max(1u, t.image->width >> l) || t.levels[l].h != std::max(1u, t.image->height >> l)) return false;
+        if (l >= t.levels.size()) return no("level_missing", int(l));
+        if (t.levels[l].format != t.image->format) return no("level_format", int(l));
+        if (t.levels[l].w != std::max(1u, t.image->width >> l) || t.levels[l].h != std::max(1u, t.image->height >> l)) return no("level_size", int(l));
     }
     return true;
 }
 
-bool Context::bindResources(Program& p) {
-    VkDescriptorSet set = allocSet(p.setLayout);
+// Diagnostics: a bound texture that reads as the black stand-in because complete() said no. Counted (gles.census) and the first
+// 64 distinct textures logged, with what the sampling would have used: the effective base / max level (as Texture::sampledView clamps them).
+static void noteIncomplete(const Texture& t, const SamplerParams& sp, const Incomplete& why) {
+    diagCount(DiagCounter::Incomplete);
+    static std::set<GLuint> seen;
+    if (seen.size() >= 64 || !seen.insert(t.name).second) return;
+    std::string lv;
+    for (size_t l = 0; l < t.levels.size() && l < 16; ++l)
+        if (t.levels[l].format) lv += (lv.empty() ? "" : ",") + std::to_string(l) + ":" + std::to_string(t.levels[l].w) + "x" + std::to_string(t.levels[l].h);
+    const bool integer = t.image && t.image->format->integer;
+    const bool linear = sp.magFilter == gl::LINEAR || (sp.minFilter != gl::NEAREST && sp.minFilter != gl::NEAREST_MIPMAP_NEAREST && sp.minFilter != gl::NEAREST_MIPMAP_LINEAR);
+    const GLint imgLevels = t.image ? GLint(t.image->levels) : 1;
+    const GLint effBase = std::min(t.baseLevel, imgLevels - 1), effMax = std::max(effBase, std::min(t.maxLevel, imgLevels - 1));
+    logf("gles.incomplete tex=%u target=0x%x fmt=0x%04x img=%ux%u img_levels=%d base=%d max=%d eff_base=%d eff_max=%d defined=[%s] min_filter=0x%x "
+         "immutable=%d integer=%d int_linear=%d fail=%s level=%d",
+         t.name, t.target, t.image ? t.image->format->internal : 0u, t.image ? t.image->width : 0u, t.image ? t.image->height : 0u, int(imgLevels),
+         t.baseLevel, t.maxLevel, int(effBase), int(effMax), lv.c_str(), sp.minFilter, int(t.immutable), int(integer), int(integer && linear), why.reason,
+         why.level);
+}
+
+bool Context::bindResources(Program& p, const StorageP& xfbScratch) {
+    VkDescriptorSet set = allocSet(xfbScratch ? p.xfbSetLayout : p.setLayout);
     if (!set) return false;
     std::vector<VkWriteDescriptorSet> writes;
     std::vector<VkDescriptorBufferInfo> bufInfos;
@@ -1007,7 +1406,7 @@ bool Context::bindResources(Program& p) {
     for (const auto& u : p.refl.uniforms)
         if (u.binding >= 0)
             (isBufferSampler(u.glType) || (isImageType(u.glType) && imageDim(u.glType) == 5) ? texelCount : imgCount) += size_t(u.arraySize);
-    bufInfos.reserve(1 + p.refl.blocks.size() + p.refl.storageBlocks.size() + p.refl.atomicBuffers.size());
+    bufInfos.reserve(2 + p.refl.blocks.size() + p.refl.storageBlocks.size() + p.refl.atomicBuffers.size());
     imgInfos.reserve(imgCount);
     texelViews.reserve(texelCount);
     // Default block: this draw's copy in the stream (offset passed as the dynamic offset).
@@ -1057,10 +1456,16 @@ bool Context::bindResources(Program& p) {
                 if (t && t->image && t->image->storage && dim != 5 && uint32_t(iu.level) < t->image->levels) {
                     Image& im = *t->image;
                     im.invalid.clear();
+                    // The texel format the shader reads / writes with (glBindImageTexture's format) when it differs from the
+                    // texture's: a view of the same texel size.
+                    const VkFormat vf = imageViewFormat(iu.format);
+                    const VkFormat fmt = vf != VK_FORMAT_UNDEFINED && imageFormatBytes(vf) == imageFormatBytes(im.format->vk) ? vf : VK_FORMAT_UNDEFINED;
                     // image3D: the whole 3D level; layered image2DArray / imageCube: all layers; image2D: one layer.
-                    if (dim == 2) ii.imageView = im.storageView(uint32_t(iu.level), 0, 1, VK_IMAGE_VIEW_TYPE_3D);
-                    else if (dim == 7 || dim == 4 || dim == 8) ii.imageView = im.storageView(uint32_t(iu.level), 0, im.layers, VK_IMAGE_VIEW_TYPE_2D_ARRAY);
-                    else ii.imageView = im.storageView(uint32_t(iu.level), im.layers > 1 && !iu.layered ? uint32_t(iu.layer) : 0, 1, VK_IMAGE_VIEW_TYPE_2D);
+                    if (dim == 2) ii.imageView = im.storageView(uint32_t(iu.level), 0, 1, VK_IMAGE_VIEW_TYPE_3D, fmt);
+                    else if (dim == 7 || dim == 4 || dim == 8) ii.imageView = im.storageView(uint32_t(iu.level), 0, im.layers, VK_IMAGE_VIEW_TYPE_2D_ARRAY, fmt);
+                    else if (im.type == VK_IMAGE_TYPE_3D) ii.imageView = sliceView(*t, iu.level, iu.layered ? 0 : iu.layer, iu.access, fmt);
+                    else ii.imageView = im.storageView(uint32_t(iu.level), im.layers > 1 && !iu.layered ? uint32_t(iu.layer) : 0, 1, VK_IMAGE_VIEW_TYPE_2D, fmt);
+                    if (!ii.imageView) ii.imageView = blackTexture().image->storageView(0, 0, 1, VK_IMAGE_VIEW_TYPE_2D);
                     keep(t->image);
                 } else {
                     ii.imageView = blackTexture().image->storageView(0, 0, 1, VK_IMAGE_VIEW_TYPE_2D);  // unbound unit: reads 0 (undefined in GL)
@@ -1096,7 +1501,9 @@ bool Context::bindResources(Program& p) {
             const int unit = p.samplerUnits[i][size_t(e)];
             const Unit& un = units[size_t(unit)];
             GLuint name = unitTexture(un, u);
-            Texture* t = name ? texture(name) : nullptr;
+            Texture* t = name ? texture(name) : defaultTexture(samplerTarget(u));  // name 0: the target's default texture object
+            // Levels defined from BASE_LEVEL up without level 0 (mip streaming): the image is made from them now.
+            if (t && !t->image && !t->immutable && !t->levels.empty() && !t->levels[0].format && realizeTexture(*t)) flushPending(*t);
             VkDescriptorImageInfo ii{};
             ii.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
             SamplerParams sp;
@@ -1105,12 +1512,14 @@ bool Context::bindResources(Program& p) {
                 if (un.sampler)
                     if (auto it = share->samplers.find(un.sampler); it != share->samplers.end()) sp = it->second->params;
             }
-            if (t && complete(*t, sp)) {
+            Incomplete why;
+            if (t && complete(*t, sp, &why)) {
                 ii.sampler = samplerFor(sp, *t);
                 ii.imageView = t->sampledView();
                 keep(t->image);
                 t->image->invalid.clear();
             } else {
+                if (t) noteIncomplete(*t, sp, why);
                 // Incomplete/missing: a 1x1 black opaque texture.
                 Texture& b = blackTexture();
                 ii.sampler = samplerFor(b.sampler, b);
@@ -1175,10 +1584,18 @@ bool Context::bindResources(Program& p) {
         storageWrite(ssboBindings[p.storageBindings[i] % kMaxShaderStorageBindings], b.binding, b.element, b.size);
     }
     for (const auto& a : p.refl.atomicBuffers) storageWrite(atomicBindings[size_t(a.glBinding) % kMaxAtomicCounterBindings], a.binding, 0, a.size);
+    if (xfbScratch) {  // the transform feedback capture buffer
+        bufInfos.push_back({xfbScratch->buffer, 0, xfbScratch->size});
+        VkWriteDescriptorSet s{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+        s.dstSet = set, s.dstBinding = vpglsl::kXfbBinding, s.descriptorCount = 1;
+        s.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        s.pBufferInfo = &bufInfos.back();
+        writes.push_back(s);
+    }
     dev->vk.vkUpdateDescriptorSets(dev->device, uint32_t(writes.size()), writes.data(), 0, nullptr);
     const uint32_t dynOff = uint32_t(ub.offset);
     dev->vk.vkCmdBindDescriptorSets(cmd(), p.csModule ? VK_PIPELINE_BIND_POINT_COMPUTE : VK_PIPELINE_BIND_POINT_GRAPHICS,
-                                    p.pipeLayout, 0, 1, &set, 1, &dynOff);
+                                    xfbScratch ? p.xfbPipeLayout : p.pipeLayout, 0, 1, &set, 1, &dynOff);
     return true;
 }
 
@@ -1249,8 +1666,9 @@ void Context::setDynamicState(const FbInfo& fb) {
         s = {{x0, y0}, {uint32_t(std::max(0, x1 - x0)), uint32_t(std::max(0, y1 - y0))}};
     }
     dev->vk.vkCmdSetScissor(c, 0, 1, &s);
-    dev->vk.vkCmdSetStencilReference(c, VK_STENCIL_FACE_FRONT_BIT, uint32_t(stencil[0].ref));
-    dev->vk.vkCmdSetStencilReference(c, VK_STENCIL_FACE_BACK_BIT, uint32_t(stencil[1].ref));
+    // GL clamps the reference to the stencil range (Vulkan keeps the low 8 bits: 256 would compare as 0).
+    dev->vk.vkCmdSetStencilReference(c, VK_STENCIL_FACE_FRONT_BIT, uint32_t(std::clamp(stencil[0].ref, 0, 255)));
+    dev->vk.vkCmdSetStencilReference(c, VK_STENCIL_FACE_BACK_BIT, uint32_t(std::clamp(stencil[1].ref, 0, 255)));
     dev->vk.vkCmdSetStencilCompareMask(c, VK_STENCIL_FACE_FRONT_BIT, stencil[0].mask);
     dev->vk.vkCmdSetStencilCompareMask(c, VK_STENCIL_FACE_BACK_BIT, stencil[1].mask);
     dev->vk.vkCmdSetStencilWriteMask(c, VK_STENCIL_FACE_FRONT_BIT, stencil[0].writeMask);
@@ -1315,7 +1733,7 @@ static bool needsCpuConversion(const VertexAttrib& a, VkFormat f) {
            f == VK_FORMAT_R16_USCALED || f == VK_FORMAT_R16_SSCALED || f == VK_FORMAT_R16G16_USCALED ||
            f == VK_FORMAT_R16G16_SSCALED || f == VK_FORMAT_R16G16B16_USCALED || f == VK_FORMAT_R16G16B16_SSCALED ||
            f == VK_FORMAT_R16G16B16A16_USCALED || f == VK_FORMAT_R16G16B16A16_SSCALED ||
-           f == VK_FORMAT_A2B10G10R10_SSCALED_PACK32 || f == VK_FORMAT_A2B10G10R10_USCALED_PACK32 ||
+           f == VK_FORMAT_A2B10G10R10_SSCALED_PACK32 || f == VK_FORMAT_A2B10G10R10_USCALED_PACK32 || f == VK_FORMAT_A2B10G10R10_SNORM_PACK32 ||
            f == VK_FORMAT_R16G16B16_UNORM || f == VK_FORMAT_R16G16B16_SNORM || f == VK_FORMAT_R8G8B8_SINT ||
            f == VK_FORMAT_R8G8B8_UINT || f == VK_FORMAT_R16G16B16_SINT || f == VK_FORMAT_R16G16B16_UINT ||
            (a.type == gl::FIXED);
@@ -1358,15 +1776,100 @@ Program* Context::graphicsProgram() {
     if (it == programPipelines.end()) return nullptr;
     const ProgramPipeline& pl = *it->second;
     if (pl.vs && pl.vs == pl.fs) return prog(pl.vs);
-    if (pl.vs && pl.fs) {
-        static bool warned = false;
-        if (!warned) {
-            warned = true;
-            logf("gles.warn program_pipeline vs=%u fs=%u are different programs: separate vertex/fragment programs are not "
-                 "supported (the linker needs both stages together), draws with this pipeline are skipped", pl.vs, pl.fs);
+    if (pl.vs && pl.fs) return pipelineProgram(pl);
+    return nullptr;
+}
+
+// Bytes a default-block uniform occupies (its elements at the array stride; a matrix takes 16 bytes per column).
+static size_t uniformBytes(const vpglsl::Variable& u) {
+    const uint32_t t = u.glType;
+    const uint32_t cols = t == 0x8B5A || t == 0x8B65 || t == 0x8B66 ? 2 : t == 0x8B5B || t == 0x8B67 || t == 0x8B68 ? 3
+                          : t == 0x8B5C || t == 0x8B69 || t == 0x8B6A ? 4 : 1;
+    return size_t(std::max(1, u.arraySize)) * (u.arrayStride ? u.arrayStride : 16 * cols);
+}
+
+Program* Context::pipelineProgram(const ProgramPipeline& pl) {
+    Program* a = prog(pl.vs);
+    Program* b = prog(pl.fs);
+    if (!a || !b || !a->linked || !b->linked || !a->stageVs || !b->stageFs) return nullptr;
+    const auto key = std::make_pair(a->serial, b->serial);
+    auto it = pipelinePrograms_.find(key);
+    if (it == pipelinePrograms_.end()) {
+        if (pipelinePrograms_.size() >= 32) {  // pairs of programs that were relinked or deleted: recorded work may still use them
+            flush(true);
+            pipelinePrograms_.clear();
+        }
+        auto c = std::make_unique<Program>();
+        c->attribBindings = a->attribBindings;
+        c->name = 0;
+        c->pipelineLink = true;
+        Shader sv, sf;
+        sv.parsed = a->stageVs, sv.compiled = true, sf.parsed = b->stageFs, sf.compiled = true;
+        // A uniform both programs declare is two uniforms (each program has its own value), but one name for a linker that
+        // merges the stages' uniforms: the fragment program's copy is renamed (vpgl_fs_<name>) when its source is parsed again.
+        auto root = [](const std::string& n) { return n.substr(0, n.find_first_of(".[")); };
+        std::set<std::string> dups;
+        for (const auto& ua : a->refl.uniforms)
+            for (const auto& ub : b->refl.uniforms)
+                if (ua.atomicBinding < 0 && ub.atomicBinding < 0 && root(ua.name) == root(ub.name)) dups.insert(root(ua.name));
+        if (!dups.empty() && b->bin.sources[1]) {
+            std::string text = *b->bin.sources[1];
+            const size_t eol = text.find('\n', text.find("#version"));
+            std::string defs;
+            for (const std::string& d : dups) defs += "#define " + d + " vpgl_fs_" + d + "\n";
+            if (eol != std::string::npos) {
+                text.insert(eol + 1, defs);
+                if (auto r = vpglsl::parse(vpglsl::Stage::Fragment, text); r.shader) sf.parsed = r.shader;
+            }
+        }
+        if (!linkShaders(*c, &sv, &sf, nullptr)) {
+            logf("gles.warn what=pipeline_link vs=%u fs=%u log=%s", pl.vs, pl.fs, c->log.c_str());
+            c->linked = false;
+        }
+        it = pipelinePrograms_.emplace(key, std::move(c)).first;
+    }
+    Program& c = *it->second;
+    if (!c.linked) return nullptr;
+    // The two programs keep their own uniform values and bindings: copy them in by name (a uniform both stages declare
+    // takes the vertex program's value).
+    auto find = [](const Program& p, const std::string& name) -> int {
+        for (size_t i = 0; i < p.refl.uniforms.size(); ++i)
+            if (p.refl.uniforms[i].name == name) return int(i);
+        return -1;
+    };
+    for (size_t i = 0; i < c.refl.uniforms.size(); ++i) {
+        const vpglsl::Variable& u = c.refl.uniforms[i];
+        const bool renamed = u.name.compare(0, 8, "vpgl_fs_") == 0;  // the fragment program's copy of a uniform both declare
+        const Program* from = !renamed && find(*a, u.name) >= 0 ? a : b;
+        const int j = find(*from, renamed ? u.name.substr(8) : u.name);
+        if (j < 0) continue;
+        const vpglsl::Variable& s = from->refl.uniforms[size_t(j)];
+        if (u.binding >= 0) {
+            if (i < c.samplerUnits.size() && size_t(j) < from->samplerUnits.size()) c.samplerUnits[i] = from->samplerUnits[size_t(j)];
+        } else if (u.atomicBinding < 0) {
+            const size_t n = std::min({uniformBytes(u), uniformBytes(s), c.defaultBlock.size() - std::min<size_t>(c.defaultBlock.size(), u.offset),
+                                       from->defaultBlock.size() - std::min<size_t>(from->defaultBlock.size(), s.offset)});
+            if (n) std::memcpy(c.defaultBlock.data() + u.offset, from->defaultBlock.data() + s.offset, n);
         }
     }
-    return nullptr;
+    for (size_t i = 0; i < c.refl.blocks.size(); ++i) {
+        const Program* from = a;
+        int j = -1;
+        for (const Program* p : {a, b})
+            for (size_t k = 0; k < p->refl.blocks.size() && j < 0; ++k)
+                if (p->refl.blocks[k].name == c.refl.blocks[i].name) j = int(k), from = p;
+        if (j >= 0) c.blockBindings[i] = from->blockBindings[size_t(j)];
+    }
+    for (size_t i = 0; i < c.refl.storageBlocks.size(); ++i) {
+        const Program* from = a;
+        int j = -1;
+        for (const Program* p : {a, b})
+            for (size_t k = 0; k < p->refl.storageBlocks.size() && j < 0; ++k)
+                if (p->refl.storageBlocks[k].name == c.refl.storageBlocks[i].name) j = int(k), from = p;
+        if (j >= 0) c.storageBindings[i] = from->storageBindings[size_t(j)];
+    }
+    c.defaultDirty = true;
+    return &c;
 }
 
 Program* Context::computeProgram() {
@@ -1377,11 +1880,8 @@ Program* Context::computeProgram() {
 
 bool Context::prepareDraw(GLenum mode, VkPrimitiveTopology& topo, uint32_t vertexCount, uint32_t firstVertex,
                           uint32_t instances, bool indexed, VkBuffer&) {
-    Program* p = graphicsProgram();
-    if (!p || !p->linked || !p->vsModule) {
-        setError(gl::INVALID_OPERATION);
-        return false;
-    }
+    const bool provokeOk = provokeOk_;
+    provokeOk_ = false;
     switch (mode) {
         case gl::POINTS: topo = VK_PRIMITIVE_TOPOLOGY_POINT_LIST; break;
         case gl::LINES: topo = VK_PRIMITIVE_TOPOLOGY_LINE_LIST; break;
@@ -1392,10 +1892,33 @@ bool Context::prepareDraw(GLenum mode, VkPrimitiveTopology& topo, uint32_t verte
         case gl::TRIANGLE_FAN: topo = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN; break;
         default: setError(gl::INVALID_ENUM); return false;
     }
+    // Errors in the order of the spec: mode, framebuffer completeness, transform feedback, then the program.
     drawFb_ = resolveFramebuffer(drawFbo, true);
     if (drawFb_.status != gl::FRAMEBUFFER_COMPLETE) {
         setError(gl::INVALID_FRAMEBUFFER_OPERATION);
         return false;
+    }
+    if (indexed && curTf().active && !curTf().paused) {
+        setError(gl::INVALID_OPERATION);  // no GL_EXT_geometry_shader: indexed draws are not allowed while capturing
+        return false;
+    }
+    Program* p = graphicsProgram();
+    if (!p || !p->linked || !p->vsModule) {
+        setError(gl::INVALID_OPERATION);
+        return false;
+    }
+    // `flat` varyings: GL takes the value from a primitive's LAST vertex, Vulkan/Metal from the FIRST. The draw becomes a
+    // triangle/line list whose primitives are rotated so the last vertex comes first (a cyclic rotation keeps the winding).
+    // (An indexed strip with primitive restart keeps its topology: the restart cannot be rotated here.)
+    provoke_ = false;
+    if (provokeOk && p->refl.flatVaryings) {
+        const bool strip = mode == gl::TRIANGLE_STRIP || mode == gl::TRIANGLE_FAN || mode == gl::LINE_STRIP || mode == gl::LINE_LOOP;
+        if (!(indexed && strip && primitiveRestart)) {
+            if (mode == gl::TRIANGLES || mode == gl::TRIANGLE_STRIP || mode == gl::TRIANGLE_FAN)
+                provoke_ = true, topo = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+            else if (mode == gl::LINES || mode == gl::LINE_STRIP || mode == gl::LINE_LOOP)
+                provoke_ = true, topo = VK_PRIMITIVE_TOPOLOGY_LINE_LIST;
+        }
     }
     if (drawFb_.viewCount && drawFb_.viewCount != std::max(1u, p->refl.numViews) && p->refl.numViews > 1) {
         setError(gl::INVALID_OPERATION);  // OVR_multiview: num_views must match the framebuffer
@@ -1412,7 +1935,7 @@ bool Context::prepareDraw(GLenum mode, VkPrimitiveTopology& topo, uint32_t verte
                          : (av.glType >= 0x8B65 && av.glType <= 0x8B6A) ? int((av.glType - 0x8B65) / 2 + 2) : 1;
         for (int c = 0; c < cols * av.arraySize; ++c) {
             const uint32_t loc = uint32_t(av.location + c);
-            if (loc >= kMaxVertexAttribs) continue;
+            if (loc >= kHwVertexAttribs) continue;
             const VertexAttrib& a = va->attribs[loc];
             const uint32_t binding = uint32_t(binds.size());
             VkVertexInputAttributeDescription ad{loc, binding, VK_FORMAT_UNDEFINED, 0};
@@ -1454,8 +1977,9 @@ bool Context::prepareDraw(GLenum mode, VkPrimitiveTopology& topo, uint32_t verte
                     return false;
                 }
                 const bool convert = needsCpuConversion(a, f) || (perInstance && divisor > 1);
-                if (convert || !vb) {
-                    // Client arrays and formats needing conversion: copied into the stream, tightly.
+                // A buffer range that does not start on a 4-byte boundary (glVertexAttribPointer accepts any byte offset) is not bound in place.
+                if (convert || !vb || (where & 3)) {
+                    // Client arrays, unaligned buffer offsets and formats needing conversion: copied into the stream, tightly.
                     const uint32_t outSize = convert ? 16u : esize;
                     Alloc s = stream(VkDeviceSize(rows) * outSize + 16, 16);
                     for (uint32_t r = firstRow; r < rows; ++r) {
@@ -1491,8 +2015,9 @@ bool Context::prepareDraw(GLenum mode, VkPrimitiveTopology& topo, uint32_t verte
             attrs.push_back(ad);
         }
     }
+    blackTexture();  // created before the pass: its upload ends the pass it is made in (a draw would be dropped)
     if (!beginPass(drawFb_)) return false;
-    VkPipeline pl = pipelineFor(*p, drawFb_, topo, binds, attrs);
+    VkPipeline pl = pipelineFor(*p, drawFb_, topo, binds, attrs, bool(xfbScratch_));
     if (!pl) {
         setError(gl::INVALID_OPERATION);
         logf("gles.err what=pipeline program=%u", p->name);
@@ -1501,19 +2026,192 @@ bool Context::prepareDraw(GLenum mode, VkPrimitiveTopology& topo, uint32_t verte
     VkCommandBuffer c = cmd();
     dev->vk.vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_GRAPHICS, pl);
     if (!bufs.empty()) dev->vk.vkCmdBindVertexBuffers(c, 0, uint32_t(bufs.size()), bufs.data(), offs.data());
-    if (!bindResources(*p)) return false;
+    if (!bindResources(*p, xfbScratch_)) return false;
     setDynamicState(drawFb_);
-    if (!rasterizerDiscard) ++drawCount;  // occlusion queries (see Query)
+    if (!rasterizerDiscard && !xfbScratch_) ++drawCount;  // occlusion queries (see Query)
+    return true;
+}
+
+// The vertex list of `mode` as triangles/lines with each primitive's last vertex first (see prepareDraw).
+static void provokeList(GLenum mode, const std::vector<uint32_t>& in, std::vector<uint32_t>& out) {
+    const size_t n = in.size();
+    switch (mode) {
+        case gl::TRIANGLES:
+            for (size_t i = 0; i + 2 < n; i += 3) out.insert(out.end(), {in[i + 2], in[i], in[i + 1]});
+            break;
+        case gl::TRIANGLE_STRIP:
+            for (size_t i = 0; i + 2 < n; ++i) {
+                uint32_t a = in[i], b = in[i + 1];
+                if (i & 1) std::swap(a, b);  // odd triangles keep the winding
+                out.insert(out.end(), {in[i + 2], a, b});
+            }
+            break;
+        case gl::TRIANGLE_FAN:
+            for (size_t i = 1; i + 1 < n; ++i) out.insert(out.end(), {in[i + 1], in[0], in[i]});
+            break;
+        case gl::LINES:
+            for (size_t i = 0; i + 1 < n; i += 2) out.insert(out.end(), {in[i + 1], in[i]});
+            break;
+        case gl::LINE_STRIP: case gl::LINE_LOOP:
+            for (size_t i = 0; i + 1 < n; ++i) out.insert(out.end(), {in[i + 1], in[i]});
+            if (mode == gl::LINE_LOOP && n > 1) out.insert(out.end(), {in[0], in[n - 1]});
+            break;
+        default: break;
+    }
+}
+
+// Transform feedback records a draw whose mode is of the primitive type it began with.
+static bool xfbModeMatches(GLenum began, GLenum draw) {
+    switch (began) {
+        case gl::POINTS: return draw == gl::POINTS;
+        case gl::LINES: return draw == gl::LINES || draw == gl::LINE_STRIP || draw == gl::LINE_LOOP;
+        case gl::TRIANGLES: return draw == gl::TRIANGLES || draw == gl::TRIANGLE_STRIP || draw == gl::TRIANGLE_FAN;
+        default: return false;
+    }
+}
+
+Context::TransformFeedback& Context::curTf() {
+    auto it = transformFeedbacks.find(transformFeedback);
+    if (it == transformFeedbacks.end()) {
+        auto o = std::make_unique<TransformFeedback>();
+        o->name = transformFeedback;
+        it = transformFeedbacks.emplace(transformFeedback, std::move(o)).first;
+    }
+    return *it->second;
+}
+
+// The capture pass of a draw while transform feedback is active: the vertex shader variant runs once per vertex of the draw
+// as a point list (rasterizer off) and writes each vertex's record into a scratch buffer; the records are then put in primitive
+// order into the bound buffers on the CPU (buffers are host-visible), which makes the draw wait for the GPU (flush(true)). Lists of
+// points / lines / triangles that are not indexed need no reordering: the GPU copies their records, no wait (see below).
+bool Context::captureTransformFeedback(GLenum mode, uint32_t count, uint32_t first, uint32_t instances, bool indexed,
+                                       const std::vector<uint32_t>& indices, int32_t baseVertex) {
+    Program* p = graphicsProgram();
+    if (!p || !p->linked || !p->xfbModule || p->refl.xfb.empty()) return true;
+    TransformFeedback& tf = curTf();
+    // The vertex range the draw reads, and its vertices in draw order relative to the range's start.
+    uint32_t lo = first, n = count;
+    std::vector<uint32_t> seq;
+    if (indexed) {
+        lo = 0xFFFFFFFFu;
+        uint32_t hi = 0;
+        for (uint32_t v : indices)
+            if (v != 0xFFFFFFFFu) lo = std::min(lo, v), hi = std::max(hi, v);
+        if (lo > hi) return true;
+        n = hi - lo + 1;
+        seq = indices;
+        for (uint32_t& v : seq)
+            if (v != 0xFFFFFFFFu) v -= lo;
+    } else {
+        seq.resize(count);
+        for (uint32_t i = 0; i < count; ++i) seq[i] = i;
+    }
+    const int64_t baseV = int64_t(lo) + baseVertex;
+    if (baseV < 0) return true;
+    const uint32_t W = p->refl.xfbRecordWords;
+    const VkDeviceSize bytes = (vpglsl::kXfbHeaderWords + VkDeviceSize(n) * instances * W) * 4;
+    StorageP scratch = dev->newStorage(bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+    if (!scratch) return setError(gl::OUT_OF_MEMORY), false;
+    auto* head = reinterpret_cast<uint32_t*>(scratch->host);
+    head[0] = n, head[1] = uint32_t(baseV);
+    xfbScratch_ = scratch;
+    VkPrimitiveTopology topo;
+    VkBuffer unused;
+    indexMax_ = 0;
+    provokeOk_ = true;
+    const bool ok = prepareDraw(gl::POINTS, topo, n, uint32_t(baseV), instances, false, unused);
+    xfbScratch_ = nullptr;
+    if (!ok) return false;
+    useStorage(scratch);
+    dev->vk.vkCmdDraw(cmd(), n, instances, uint32_t(baseV), 0);
+    const uint32_t perPrim = tf.mode == gl::POINTS ? 1 : tf.mode == gl::LINES ? 2 : 3;
+    // The bound buffers: interleaved takes every varying in binding 0, separate one per binding.
+    const bool separate = p->xfbLinkedMode == 0x8C8D;
+    const size_t nb = separate ? p->refl.xfb.size() : 1;
+    std::vector<XfbOut> outs(nb);
+    std::vector<Buffer*> bufs(nb, nullptr);
+    for (size_t b = 0; b < nb; ++b) {
+        const auto& ib = tf.buffers[b];
+        Buffer* buf = ib.buffer ? buffer(ib.buffer) : nullptr;
+        if (!buf || !buf->storage) return true;
+        bufs[b] = buf;
+        const uint64_t avail = ib.size ? uint64_t(ib.size) : uint64_t(buf->size) - uint64_t(ib.offset);
+        XfbOut& o = outs[b];
+        o.dst = buf->storage->host + ib.offset;
+        o.room = std::min<uint64_t>(avail, uint64_t(buf->size) - uint64_t(ib.offset));
+        o.used = tf.used[b];
+        for (size_t v = 0; v < p->refl.xfb.size(); ++v) {
+            if (separate && v != b) continue;
+            const auto& xv = p->refl.xfb[v];
+            o.parts.push_back({xv.offset, xv.words * uint32_t(xv.arraySize)});
+            o.stride += xv.words * uint32_t(xv.arraySize) * 4;
+        }
+    }
+    // The records are already in the order GL writes them when the draw is a list of points / lines / triangles, not indexed, whole
+    // primitives per instance, and the one output takes the record as is (interleaved, or a single varying): the GPU copies them
+    // into the buffer, with no wait (Unity's GPU skinning does this every frame). Anything else is put in order on the CPU.
+    bool direct = !indexed && nb == 1 && (mode == gl::POINTS || mode == gl::LINES || mode == gl::TRIANGLES) && count % perPrim == 0 &&
+                  outs[0].stride == W * 4;
+    uint32_t at = 0;
+    for (const auto& [offset, words] : outs[0].parts) direct = direct && offset == at, at += words;
+    direct = direct && at == W;
+    if (direct) {
+        XfbOut& o = outs[0];
+        const uint64_t prims = uint64_t(count / perPrim) * instances;
+        const uint64_t fit = std::min<uint64_t>(prims, (o.room - std::min(o.room, o.used)) / (uint64_t(perPrim) * o.stride));
+        if (fit) {
+            const uint64_t bytes = fit * perPrim * o.stride;
+            Buffer* buf = bufs[0];
+            useStorage(buf->storage);
+            barrier();  // the capture draw's records are visible to the copy
+            const VkBufferCopy bc{vpglsl::kXfbHeaderWords * 4, VkDeviceSize(tf.buffers[0].offset) + o.used, bytes};
+            dev->vk.vkCmdCopyBuffer(cmd(), scratch->buffer, buf->storage->buffer, 1, &bc);
+            barrier();  // ... and its output to whatever reads the buffer next
+            tf.used[0] += bytes;
+            xfbPrimitivesWritten += fit;
+        }
+        return true;
+    }
+    flush(true);
+    // Primitive order: assembled per instance, instance after instance.
+    std::vector<uint32_t> prims;
+    xfbAssemble(mode, seq.data(), seq.size(), indexed && primitiveRestart, 0xFFFFFFFFu, prims);
+    std::vector<uint32_t> order;
+    order.reserve(prims.size() * instances);
+    for (uint32_t i = 0; i < instances; ++i)
+        for (uint32_t v : prims) order.push_back(i * n + v);
+    const uint64_t done = xfbWrite(order, perPrim, reinterpret_cast<const uint32_t*>(scratch->host) + vpglsl::kXfbHeaderWords, W, outs);
+    for (size_t b = 0; b < nb; ++b) tf.used[b] = outs[b].used;
+    xfbPrimitivesWritten += done;
     return true;
 }
 
 void Context::drawArrays(GLenum mode, GLint first, GLsizei count, GLsizei instances) {
     if (first < 0 || count < 0 || instances < 0) return setError(gl::INVALID_VALUE, mode);
+    const TransformFeedback& tf = curTf();
+    const bool capture = tf.active && !tf.paused;
+    if (capture && mode <= gl::TRIANGLE_FAN && !xfbModeMatches(tf.mode, mode)) return setError(gl::INVALID_OPERATION, mode);
     if (count == 0 || instances == 0) return;
+    if (capture && mode <= gl::TRIANGLE_FAN &&
+        !captureTransformFeedback(mode, uint32_t(count), uint32_t(first), uint32_t(instances), false, {}, 0))
+        return;
     VkPrimitiveTopology topo;
     VkBuffer unused;
     indexMax_ = 0;
+    provokeOk_ = true;
     if (!prepareDraw(mode, topo, uint32_t(count), uint32_t(first), uint32_t(instances), false, unused)) return;
+    if (provoke_) {
+        std::vector<uint32_t> verts, list;
+        verts.resize(size_t(count));
+        for (GLsizei i = 0; i < count; ++i) verts[size_t(i)] = uint32_t(first + i);
+        provokeList(mode, verts, list);
+        if (list.empty()) return;
+        Alloc s = stream(list.size() * 4, 4);
+        std::memcpy(s.host, list.data(), list.size() * 4);
+        dev->vk.vkCmdBindIndexBuffer(cmd(), s.buffer, s.offset, VK_INDEX_TYPE_UINT32);
+        dev->vk.vkCmdDrawIndexed(cmd(), uint32_t(list.size()), uint32_t(instances), 0, 0, 0);
+        return;
+    }
     if (mode == gl::LINE_LOOP) {
         // A strip with the first vertex repeated at the end: an index list over the arrays.
         Alloc s = stream(size_t(count + 1) * 4, 4);
@@ -1565,9 +2263,67 @@ void Context::drawElements(GLenum mode, GLsizei count, GLenum type, const void* 
         maxIdx = std::max(maxIdx, v);
     }
     indexMax_ = maxIdx + uint32_t(std::max(0, baseVertex));
+    const TransformFeedback& tf = curTf();
+    if (tf.active && !tf.paused && mode <= gl::TRIANGLE_FAN) {
+        if (!xfbModeMatches(tf.mode, mode)) return setError(gl::INVALID_OPERATION, mode);
+        std::vector<uint32_t> list;
+        list.resize(size_t(count));
+        for (GLsizei i = 0; i < count; ++i) {
+            const uint32_t v = at(i);
+            list[size_t(i)] = primitiveRestart && v == restart ? 0xFFFFFFFFu : v;
+        }
+        if (!captureTransformFeedback(mode, uint32_t(count), 0, uint32_t(instances), true, list, baseVertex)) return;
+    }
     VkPrimitiveTopology topo;
     VkBuffer unused;
-    if (!prepareDraw(mode, topo, 0, 0, uint32_t(instances), true, unused)) return;
+    provokeOk_ = true;
+    // Vulkan ignores primitiveRestartEnable on list topologies (and line loops are strips closed by the caller): with restart
+    // on, those modes are split at the restart index here and drawn as a plain list.
+    const bool splitRestart = primitiveRestart && (mode == gl::POINTS || mode == gl::LINES || mode == gl::TRIANGLES || mode == gl::LINE_LOOP);
+    const GLenum dm = splitRestart && mode == gl::LINE_LOOP ? GLenum(gl::LINES) : mode;
+    if (!prepareDraw(dm, topo, 0, 0, uint32_t(instances), true, unused)) return;
+    if (splitRestart) {
+        const size_t per = mode == gl::POINTS ? 1 : mode == gl::TRIANGLES ? 3 : 2;
+        std::vector<uint32_t> list, seg;
+        auto flush = [&]() {
+            if (mode == gl::LINE_LOOP) {
+                if (seg.size() >= 2)
+                    for (size_t i = 0; i < seg.size(); ++i) list.insert(list.end(), {seg[i], seg[(i + 1) % seg.size()]});
+            } else {
+                for (size_t i = 0; i + per <= seg.size(); i += per) list.insert(list.end(), seg.begin() + i, seg.begin() + i + per);
+            }
+            seg.clear();
+        };
+        for (GLsizei i = 0; i < count; ++i) {
+            const uint32_t v = at(i);
+            if (v == restart) flush();
+            else seg.push_back(v);
+        }
+        flush();
+        if (provoke_) {
+            std::vector<uint32_t> rot;
+            provokeList(dm, list, rot);
+            list.swap(rot);
+        }
+        if (list.empty()) return;
+        Alloc s = stream(list.size() * 4, 4);
+        std::memcpy(s.host, list.data(), list.size() * 4);
+        dev->vk.vkCmdBindIndexBuffer(cmd(), s.buffer, s.offset, VK_INDEX_TYPE_UINT32);
+        dev->vk.vkCmdDrawIndexed(cmd(), uint32_t(list.size()), uint32_t(instances), 0, baseVertex, 0);
+        return;
+    }
+    if (provoke_) {
+        std::vector<uint32_t> verts, list;
+        verts.resize(size_t(count));
+        for (GLsizei i = 0; i < count; ++i) verts[size_t(i)] = at(i);
+        provokeList(mode, verts, list);
+        if (list.empty()) return;
+        Alloc s = stream(list.size() * 4, 4);
+        std::memcpy(s.host, list.data(), list.size() * 4);
+        dev->vk.vkCmdBindIndexBuffer(cmd(), s.buffer, s.offset, VK_INDEX_TYPE_UINT32);
+        dev->vk.vkCmdDrawIndexed(cmd(), uint32_t(list.size()), uint32_t(instances), 0, baseVertex, 0);
+        return;
+    }
     // Indices are copied into the stream (8-bit widened to 16, line loops closed).
     const bool widen = isz == 1;
     const uint32_t osz = widen ? 2 : isz;
@@ -1614,7 +2370,13 @@ bool Context::beginDispatch(Program*& pp) {
         return false;
     }
     dev->vk.vkCmdBindPipeline(cmd(), VK_PIPELINE_BIND_POINT_COMPUTE, pl);
-    if (!bindResources(*p)) return false;
+    dispatching_ = true;
+    const bool bound = bindResources(*p);
+    dispatching_ = false;
+    if (!bound) {
+        sliceBack_.clear();
+        return false;
+    }
     pp = p;
     return true;
 }
@@ -1626,6 +2388,7 @@ void Context::dispatch(GLuint x, GLuint y, GLuint z) {
     if (!beginDispatch(p)) return;
     dev->vk.vkCmdDispatch(cmd(), x, y, z);
     barrier();
+    syncSlicesBack();
 }
 
 void Context::dispatchIndirect(GLintptr offset) {
@@ -1638,6 +2401,7 @@ void Context::dispatchIndirect(GLintptr offset) {
     useStorage(ib->storage);
     dev->vk.vkCmdDispatchIndirect(cmd(), ib->storage->buffer, VkDeviceSize(offset));
     barrier();
+    syncSlicesBack();
 }
 
 // ---- indirect draws -----------------------------------------------------------------------------------
@@ -1650,13 +2414,13 @@ bool Context::attribsDirect(Program& p, VertexArray* va) {
                          : (av.glType >= 0x8B65 && av.glType <= 0x8B6A) ? int((av.glType - 0x8B65) / 2 + 2) : 1;
         for (int c = 0; c < cols * av.arraySize; ++c) {
             const uint32_t loc = uint32_t(av.location + c);
-            if (loc >= kMaxVertexAttribs) continue;
+            if (loc >= kHwVertexAttribs) continue;
             const VertexAttrib& a = va->attribs[loc];
             if (!a.enabled) continue;
             const VertexBinding& vb = va->bindings[a.binding % kMaxVertexBindings];
             Buffer* b = vb.buffer ? buffer(vb.buffer) : nullptr;
             if (!b || !b->storage) return false;
-            if (needsCpuConversion(a, attribFormat(a)) || vb.divisor > 1) return false;
+            if (needsCpuConversion(a, attribFormat(a)) || vb.divisor > 1 || ((vb.offset + a.relativeOffset) & 3)) return false;
         }
     }
     return true;
@@ -1676,12 +2440,13 @@ void Context::drawIndirect(GLenum mode, GLenum indexType, const void* indirect) 
     if (indexType && indexType != gl::UNSIGNED_BYTE && indexType != gl::UNSIGNED_SHORT && indexType != gl::UNSIGNED_INT)
         return setError(gl::INVALID_ENUM, indexType);
     if (mode > gl::TRIANGLE_FAN) return setError(gl::INVALID_ENUM, mode);
+    if (!vao) return setError(gl::INVALID_OPERATION, mode);  // indirect draws need a vertex array object
     Program* p = graphicsProgram();
     if (!p || !p->linked || !p->vsModule) return setError(gl::INVALID_OPERATION);
     VertexArray* va = currentVao();
     Buffer* eb = indexType && va->elementBuffer ? buffer(va->elementBuffer) : nullptr;
     if (indexType && (!eb || !eb->storage)) return setError(gl::INVALID_OPERATION, mode);
-    const bool direct = mode != gl::LINE_LOOP && mode != gl::TRIANGLE_FAN && (!indexType || indexType != gl::UNSIGNED_BYTE) &&
+    const bool direct = !(curTf().active && !curTf().paused) && mode != gl::LINE_LOOP && mode != gl::TRIANGLE_FAN && (!indexType || indexType != gl::UNSIGNED_BYTE) &&
                         attribsDirect(*p, va);
     if (direct) {
         VkPrimitiveTopology topo;
@@ -1711,16 +2476,23 @@ void Context::drawIndirect(GLenum mode, GLenum indexType, const void* indirect) 
 // The program of a masked clear: a vertex shader that makes one triangle covering the target, and a fragment shader that
 // writes one uniform colour per draw buffer slot (`kinds`: 'f' / 'i' / 'u' = float / signed / unsigned integer output).
 // Null (and not retried) when it does not build.
-Program* Context::clearProgram(const std::string& kinds) {
-    if (auto it = clearProgs_.find(kinds); it != clearProgs_.end()) return it->second.get();
+// `seed`: the colour of output i is not the uniform c<i> but the texel of the sampler c<i> at the fragment's pixel (copies a
+// texture into an implicit-multisample twin).
+Program* Context::clearProgram(const std::string& kinds, bool seed) {
+    const std::string cacheKey = (seed ? "s" : "c") + kinds;
+    if (auto it = clearProgs_.find(cacheKey); it != clearProgs_.end()) return it->second.get();
     std::string fs = "#version 300 es\nprecision highp float;\nprecision highp int;\n";
     for (size_t i = 0; i < kinds.size(); ++i) {
         const char* t = kinds[i] == 'i' ? "ivec4" : kinds[i] == 'u' ? "uvec4" : "vec4";
+        const char* sm = kinds[i] == 'i' ? "isampler2D" : kinds[i] == 'u' ? "usampler2D" : "sampler2D";
         const std::string n = std::to_string(i);
-        fs += std::string("uniform ") + t + " c" + n + ";\nlayout(location = " + n + ") out " + t + " o" + n + ";\n";
+        fs += std::string("uniform ") + (seed ? sm : t) + " c" + n + ";\nlayout(location = " + n + ") out " + t + " o" + n + ";\n";
     }
     fs += "void main() {\n";
-    for (size_t i = 0; i < kinds.size(); ++i) fs += "  o" + std::to_string(i) + " = c" + std::to_string(i) + ";\n";
+    for (size_t i = 0; i < kinds.size(); ++i) {
+        const std::string n = std::to_string(i);
+        fs += "  o" + n + " = " + (seed ? "texelFetch(c" + n + ", ivec2(gl_FragCoord.xy), 0)" : "c" + n) + ";\n";
+    }
     fs += "}\n";
     const std::string vs =
         "#version 300 es\nvoid main() {\n  gl_Position = gl_VertexID == 0 ? vec4(-1.0, -1.0, 0.0, 1.0) : "
@@ -1737,7 +2509,7 @@ Program* Context::clearProgram(const std::string& kinds) {
         logf("gles.err what=clear_program kinds=%s log=%s%s%s", kinds.c_str(), sv.log.c_str(), sf.log.c_str(), p->log.c_str());
         p.reset();
     }
-    return (clearProgs_[kinds] = std::move(p)).get();
+    return (clearProgs_[cacheKey] = std::move(p)).get();
 }
 
 // Draws the clear described by `cd` over `rect` of the draw framebuffer `fb`, with the GL write masks: the colour write
@@ -1752,27 +2524,61 @@ bool Context::clearByDraw(const FbInfo& fb, const VkRect2D& rect, const ClearDra
         kinds.resize(size_t(i) + 1, 'f');
         kinds[size_t(i)] = !fi->integer ? 'f' : fi->componentType == gl::UNSIGNED_INT ? 'u' : 'i';
     }
-    Program* p = clearProgram(kinds);
+    Program* p = clearProgram(kinds, cd.seed);
     if (!p) return false;
-    for (int i = 0; i < kMaxDrawBuffers; ++i)
-        if ((cd.colorBits >> i & 1) && size_t(i) < kinds.size())
-            setUniform(uniformLocation(*p, ("c" + std::to_string(i)).c_str()), 4,
+    // Seed: each source texture is bound, as a transient texture object that samples only the attached level, to the unit of
+    // its slot (the application's own bindings are put back below).
+    std::array<std::array<GLuint, 2>, kMaxDrawBuffers> savedUnit{};
+    uint32_t seeded = 0;
+    for (int i = 0; i < kMaxDrawBuffers; ++i) {
+        if (!(cd.colorBits >> i & 1) || size_t(i) >= kinds.size()) continue;
+        const std::string name = "c" + std::to_string(i);
+        if (!cd.seed) {
+            setUniform(uniformLocation(*p, name.c_str()), 4,
                        kinds[size_t(i)] == 'i' ? Kind::Int : kinds[size_t(i)] == 'u' ? Kind::Uint : Kind::Float, 1,
                        cd.value[size_t(i)].data(), 0, false, p);
+            continue;
+        }
+        const FbTarget& t = fb.color[size_t(i)];
+        // The source: the attached texture's image, or (default framebuffer) the surface's presented image.
+        const Texture* src = t.implicit && t.tex ? texture(t.tex) : nullptr;
+        ImageP srcImage = src ? src->image : t.implicit ? t.seedImage : nullptr;
+        if (!srcImage || (src && src->target != gl::TEXTURE_2D) || t.layer != 0) {  // no seed for these: they start undefined
+            logf("gles.warn msrtt seed skipped for colour %d (not a 2D texture)", i);
+            continue;
+        }
+        auto tmp = std::make_unique<Texture>();
+        const GLuint tname = 0xFFFE0000u + GLuint(i);
+        tmp->name = tname, tmp->target = gl::TEXTURE_2D, tmp->image = srcImage;
+        if (src) tmp->levels = src->levels;
+        else tmp->levels = {Texture::Level{srcImage->width, srcImage->height, 1, srcImage->format}};
+        tmp->immutable = true, tmp->immutableLevels = GLint(srcImage->levels);
+        tmp->baseLevel = tmp->maxLevel = GLint(t.level);
+        tmp->sampler.minFilter = tmp->sampler.magFilter = gl::NEAREST;
+        share->textures[tname] = std::move(tmp);
+        savedUnit[size_t(i)] = {units[size_t(i)].tex2D, units[size_t(i)].sampler};
+        units[size_t(i)].tex2D = tname, units[size_t(i)].sampler = 0;
+        seeded |= 1u << i;
+        const GLint unit = i;
+        setUniform(uniformLocation(*p, name.c_str()), 1, Kind::Int, 1, &unit, 0, false, p);
+    }
+    if (cd.seed && !seeded) return true;
+    ClearDraw masks = cd;
+    if (cd.seed) masks.colorBits = seeded;
     const auto sBlend = blend;
     const StencilFace sStencil[2] = {stencil[0], stencil[1]};
     GLint sViewport[4], sScissor[4];
     std::copy(viewport, viewport + 4, sViewport);
     std::copy(scissor, scissor + 4, sScissor);
     const bool sDiscard = rasterizerDiscard, sCull = cullFace, sOffset = polygonOffsetFill, sRestart = primitiveRestart,
-               sCoverage = sampleAlphaToCoverage, sDepth = depthTest, sStencilTest = stencilTest, sScissorTest = scissorTest;
+               sCoverage = sampleAlphaToCoverage, sSampleCov = sampleCoverage, sSampleMask = sampleMaskEnable, sDepth = depthTest, sStencilTest = stencilTest, sScissorTest = scissorTest;
     const GLenum sError = error;
     const uint64_t sDraws = drawCount;
     for (size_t i = 0; i < blend.size(); ++i) {
         blend[i].enabled = false;
-        if (!(cd.colorBits >> i & 1)) blend[i].mask[0] = blend[i].mask[1] = blend[i].mask[2] = blend[i].mask[3] = false;
+        if (!(masks.colorBits >> i & 1)) blend[i].mask[0] = blend[i].mask[1] = blend[i].mask[2] = blend[i].mask[3] = false;
     }
-    rasterizerDiscard = cullFace = polygonOffsetFill = primitiveRestart = sampleAlphaToCoverage = depthTest = false;
+    rasterizerDiscard = cullFace = polygonOffsetFill = primitiveRestart = sampleAlphaToCoverage = sampleCoverage = sampleMaskEnable = depthTest = false;
     stencilTest = cd.stencil;
     if (cd.stencil)
         for (int f = 0; f < 2; ++f)
@@ -1781,7 +2587,9 @@ bool Context::clearByDraw(const FbInfo& fb, const VkRect2D& rect, const ClearDra
     scissorTest = true;
     scissor[0] = rect.offset.x, scissor[1] = rect.offset.y, scissor[2] = GLint(rect.extent.width), scissor[3] = GLint(rect.extent.height);
     forcedProgram_ = p;
+    occPause();  // the clear is not an app draw
     drawArrays(gl::TRIANGLES, 0, 3, 1);
+    occResume();
     forcedProgram_ = nullptr;
     if (error != sError) logf("gles.err what=clear_draw error=0x%x", error);
     error = sError;  // an internal draw never raises a GL error of the app's
@@ -1791,7 +2599,13 @@ bool Context::clearByDraw(const FbInfo& fb, const VkRect2D& rect, const ClearDra
     std::copy(sViewport, sViewport + 4, viewport);
     std::copy(sScissor, sScissor + 4, scissor);
     rasterizerDiscard = sDiscard, cullFace = sCull, polygonOffsetFill = sOffset, primitiveRestart = sRestart;
-    sampleAlphaToCoverage = sCoverage, depthTest = sDepth, stencilTest = sStencilTest, scissorTest = sScissorTest;
+    sampleAlphaToCoverage = sCoverage, sampleCoverage = sSampleCov, sampleMaskEnable = sSampleMask, depthTest = sDepth, stencilTest = sStencilTest, scissorTest = sScissorTest;
+    for (int i = 0; i < kMaxDrawBuffers; ++i) {
+        if (!(seeded >> i & 1)) continue;
+        units[size_t(i)].tex2D = savedUnit[size_t(i)][0], units[size_t(i)].sampler = savedUnit[size_t(i)][1];
+        keep(share->textures[0xFFFE0000u + GLuint(i)]->image);  // the recorded draw samples it
+        share->textures.erase(0xFFFE0000u + GLuint(i));
+    }
     return true;
 }
 
@@ -1935,7 +2749,8 @@ void Context::readPixels(GLint x, GLint y, GLsizei w, GLsizei h, GLenum format, 
         if (f->readBuffer == gl::NONE) return setError(gl::INVALID_OPERATION, format);
         idx = int(f->readBuffer - gl::COLOR_ATTACHMENT0);
     }
-    const FbTarget src = fb.color[size_t(idx)];
+    FbTarget src = fb.color[size_t(idx)];
+    if (src.image && (src.image->samples > 1 || src.msSamples)) return setError(gl::INVALID_OPERATION, format);
     if (!src.image) return setError(gl::INVALID_OPERATION, format);
     const uint32_t outPx = clientPixelBytes(format, type);
     if (!outPx) return setError(gl::INVALID_ENUM, format);
@@ -1978,34 +2793,232 @@ void Context::readPixels(GLint x, GLint y, GLsizei w, GLsizei h, GLenum format, 
     }
 }
 
+// One axis of a blit rectangle (source s0..s1 onto destination d0..d1, either may run backwards) cut to [0, sSize] and [0, dSize]
+// with the same scale; the cut ends are rounded to pixels. False when nothing is left.
+static bool clipBlitAxis(int32_t& s0, int32_t& s1, int32_t& d0, int32_t& d1, int32_t sSize, int32_t dSize) {
+    const double ds = double(s1) - s0, dd = double(d1) - d0;
+    if (ds == 0 || dd == 0) return false;
+    double lo = 0, hi = 1;  // the position along the destination rectangle: d0 + u * dd
+    auto limit = [&](double a, double span, double size) {
+        double u0 = (0 - a) / span, u1 = (size - a) / span;
+        if (u0 > u1) std::swap(u0, u1);
+        lo = std::max(lo, u0), hi = std::min(hi, u1);
+    };
+    limit(d0, dd, dSize);
+    limit(s0, ds, sSize);
+    if (hi <= lo) return false;
+    const int32_t nd0 = int32_t(std::lround(d0 + lo * dd)), nd1 = int32_t(std::lround(d0 + hi * dd));
+    const int32_t ns0 = int32_t(std::lround(s0 + lo * ds)), ns1 = int32_t(std::lround(s0 + hi * ds));
+    if (nd0 == nd1 || ns0 == ns1) return false;
+    s0 = ns0, s1 = ns1, d0 = nd0, d1 = nd1;
+    return true;
+}
+
 void Context::blitFramebuffer(GLint sx0, GLint sy0, GLint sx1, GLint sy1, GLint dx0, GLint dy0, GLint dx1, GLint dy1,
                               GLbitfield mask, GLenum filter) {
     FbInfo rf = resolveFramebuffer(readFbo, false), df = resolveFramebuffer(drawFbo, true);
     if (rf.status != gl::FRAMEBUFFER_COMPLETE || df.status != gl::FRAMEBUFFER_COMPLETE)
         return setError(gl::INVALID_FRAMEBUFFER_OPERATION);
     if ((mask & (gl::DEPTH_BUFFER_BIT | gl::STENCIL_BUFFER_BIT)) && filter != gl::NEAREST) return setError(gl::INVALID_OPERATION);
+    // ES 3.0: a multisample draw framebuffer is an error; a multisample read framebuffer is resolved (identical rectangles,
+    // same formats). The multisample default framebuffer's colour is read through the single-sample image it resolves into.
+    int ri = 0;
+    if (readFbo) ri = int(fbo(readFbo)->readBuffer - gl::COLOR_ATTACHMENT0);
+    FbTarget& rc = rf.color[size_t(std::clamp(ri, 0, kMaxDrawBuffers - 1))];
+    const auto& bufs = drawFbo ? fbo(drawFbo)->drawBuffers : fbos[0]->drawBuffers;
+    auto multisampled = [](const FbTarget& t) { return t.image && (t.image->samples > 1 || t.msSamples); };
+    // (The depth / stencil of a multisample default framebuffer is a single-sample image its twin resolves into.)
+    auto multisampledDs = [&](const FbTarget& t) { return multisampled(t) || (t.implicit && t.seedImage); };
+    bool dstMS = ((mask & gl::DEPTH_BUFFER_BIT) && multisampledDs(df.depth)) || ((mask & gl::STENCIL_BUFFER_BIT) && multisampledDs(df.stencil));
+    if (mask & gl::COLOR_BUFFER_BIT)
+        for (int i = 0; i < kMaxDrawBuffers; ++i) dstMS = dstMS || (bufs[size_t(i)] != gl::NONE && multisampled(df.color[size_t(i)]));
+    if (dstMS) return setError(gl::INVALID_OPERATION);
+    const bool msColor = (mask & gl::COLOR_BUFFER_BIT) && multisampled(rc);
+    const bool msDepth = (mask & gl::DEPTH_BUFFER_BIT) && multisampledDs(rf.depth);
+    const bool msStencil = (mask & gl::STENCIL_BUFFER_BIT) && multisampledDs(rf.stencil);
+    if (msColor || msDepth || msStencil) {
+        if (sx1 - sx0 != dx1 - dx0 || sy1 - sy0 != dy1 - dy0) return setError(gl::INVALID_OPERATION);
+        if (msColor)
+            for (int i = 0; i < kMaxDrawBuffers; ++i)
+                if (bufs[size_t(i)] != gl::NONE && df.color[size_t(i)].image && df.color[size_t(i)].image->format != rc.image->format)
+                    return setError(gl::INVALID_OPERATION);
+        if ((msDepth && df.depth.image && df.depth.image->format != rf.depth.image->format) ||
+            (msStencil && df.stencil.image && df.stencil.image->format != rf.stencil.image->format))
+            return setError(gl::INVALID_OPERATION);
+        filter = gl::NEAREST;  // 1:1 (checked above): the filter is moot, and a multisample read always clipped like NEAREST
+    }
     barrier();
+    int32_t blitDst[4] = {0, 0, 0, 0};  // the destination rectangle the last single-sample blit wrote (clipped)
     auto blit = [&](const FbTarget& s, const FbTarget& d, VkImageAspectFlags aspect) {
         if (!s.image || !d.image) return;
         s.image->invalid.clear(), d.image->invalid.clear();
+        if (s.image->samples > 1) {
+            const int32_t x0 = std::min(sx0, sx1), y0 = std::min(sy0, sy1), w = std::abs(sx1 - sx0), h = std::abs(sy1 - sy0);
+            const int32_t ox = std::min(dx0, dx1), oy = std::min(dy0, dy1);
+            const int32_t sw = int32_t(std::max(1u, s.image->width >> s.level)), sh = int32_t(std::max(1u, s.image->height >> s.level));
+            const int32_t dw = int32_t(std::max(1u, d.image->width >> d.level)), dh = int32_t(std::max(1u, d.image->height >> d.level));
+            // The part of the rectangle inside both images.
+            const int32_t cx0 = std::max({0, -x0, -ox}), cx1 = std::min({w, sw - x0, dw - ox});
+            const int32_t cy0 = std::max({0, -y0, -oy}), cy1 = std::min({h, sh - y0, dh - oy});
+            if (cx1 <= cx0 || cy1 <= cy0) return;
+            if (aspect == VK_IMAGE_ASPECT_COLOR_BIT) {
+                VkImageResolve r{};
+                r.srcSubresource = {aspect, s.level, s.layer, 1};
+                r.dstSubresource = {aspect, d.level, d.layer, 1};
+                r.srcOffset = {x0 + cx0, y0 + cy0, 0}, r.dstOffset = {ox + cx0, oy + cy0, 0};
+                r.extent = {uint32_t(cx1 - cx0), uint32_t(cy1 - cy0), 1};
+                dev->vk.vkCmdResolveImage(cmd(), s.image->image, VK_IMAGE_LAYOUT_GENERAL, d.image->image, VK_IMAGE_LAYOUT_GENERAL, 1, &r);
+                return;
+            }
+            // Depth / stencil: vkCmdResolveImage is colour-only. An empty pass resolves the whole level; a pass resolve needs the
+            // same size as its attachment, so a destination of another size (the default framebuffer) or a partial rectangle
+            // resolves into a single-sample image of the source's size first and a blit copies the rectangle.
+            const bool direct = x0 == ox && y0 == oy && w == sw && h == sh && sw == dw && sh == dh;
+            ImageP tmp = direct ? nullptr : createImage2D(dev, s.image->format, uint32_t(sw), uint32_t(sh), 1, 1,
+                                       VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
+            if (!direct) {
+                if (!tmp) return setError(gl::OUT_OF_MEMORY);
+                imageInit(*tmp);
+                keep(tmp);
+            }
+            endPass();
+            VkRenderingAttachmentInfo a{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+            a.imageView = s.image->attachmentView(s.level, s.layer, 1);
+            a.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+            a.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD, a.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+            a.resolveMode = VK_RESOLVE_MODE_SAMPLE_ZERO_BIT;
+            a.resolveImageView = direct ? d.image->attachmentView(d.level, d.layer, 1) : tmp->attachmentView(0, 0, 1);
+            a.resolveImageLayout = VK_IMAGE_LAYOUT_GENERAL;
+            VkRenderingInfo info{VK_STRUCTURE_TYPE_RENDERING_INFO};
+            info.renderArea = {{0, 0}, {uint32_t(sw), uint32_t(sh)}};
+            info.layerCount = 1;
+            if (aspect == VK_IMAGE_ASPECT_DEPTH_BIT) info.pDepthAttachment = &a;
+            else info.pStencilAttachment = &a;
+            dev->vk.vkCmdBeginRendering(cmd(), &info);
+            dev->vk.vkCmdEndRendering(cmd());
+            if (direct) return;
+            barrier();
+            VkImageBlit cp{};
+            cp.srcSubresource = {aspect, 0, 0, 1};
+            cp.dstSubresource = {aspect, d.level, d.layer, 1};
+            cp.srcOffsets[0] = {x0 + cx0, y0 + cy0, 0}, cp.srcOffsets[1] = {x0 + cx1, y0 + cy1, 1};
+            cp.dstOffsets[0] = {ox + cx0, oy + cy0, 0}, cp.dstOffsets[1] = {ox + cx1, oy + cy1, 1};
+            dev->vk.vkCmdBlitImage(cmd(), tmp->image, VK_IMAGE_LAYOUT_GENERAL, d.image->image, VK_IMAGE_LAYOUT_GENERAL, 1, &cp, VK_FILTER_NEAREST);
+            return;
+        }
+        // GL clips both rectangles to their framebuffers keeping the scale (the destination pixels whose source lies outside are
+        // not written); the backend would clamp instead. A destination cut at its far edge only is the backend's (exact) job.
+        int32_t bx0 = sx0, by0 = sy0, bx1 = sx1, by1 = sy1, cx0 = dx0, cy0 = dy0, cx1 = dx1, cy1 = dy1;
+        const int32_t sw = int32_t(std::max(1u, s.image->width >> s.level)), sh = int32_t(std::max(1u, s.image->height >> s.level));
+        const int32_t dw = int32_t(std::max(1u, d.image->width >> d.level)), dh = int32_t(std::max(1u, d.image->height >> d.level));
+        auto outside = [](int32_t a, int32_t b, int32_t size) { return std::min(a, b) < 0 || std::max(a, b) > size; };
+        if (outside(sx0, sx1, sw) || outside(sy0, sy1, sh) || std::min(dx0, dx1) < 0 || std::min(dy0, dy1) < 0)
+            if (filter == gl::NEAREST && (!clipBlitAxis(bx0, bx1, cx0, cx1, sw, dw) || !clipBlitAxis(by0, by1, cy0, cy1, sh, dh))) return;
+        blitDst[0] = std::min(cx0, cx1), blitDst[1] = std::min(cy0, cy1), blitDst[2] = std::max(cx0, cx1), blitDst[3] = std::max(cy0, cy1);
+        if (aspect != VK_IMAGE_ASPECT_COLOR_BIT) {
+            const bool packed = s.image->format->depth && s.image->format->stencil;
+            const VkImageAspectFlags other = aspect == VK_IMAGE_ASPECT_DEPTH_BIT ? VK_IMAGE_ASPECT_STENCIL_BIT : VK_IMAGE_ASPECT_DEPTH_BIT;
+            const uint32_t tb = s.image->format->vk == VK_FORMAT_D16_UNORM ? 2 : 4;  // bytes per texel of a depth plane
+            auto plane = [&](VkImageAspectFlags a) { return a == VK_IMAGE_ASPECT_STENCIL_BIT ? 1u : tb; };
+            if ((bx1 - bx0) != (cx1 - cx0) || (by1 - by0) != (cy1 - cy0)) {
+                // Scaled or mirrored depth / stencil: vkCmdBlitImage cannot do it, so one plane goes through the host (nearest).
+                const int32_t ax0 = std::min(bx0, bx1), ax1 = std::max(bx0, bx1), ay0 = std::min(by0, by1), ay1 = std::max(by0, by1);
+                const uint32_t cw = uint32_t(ax1 - ax0), ch = uint32_t(ay1 - ay0), px = plane(aspect);
+                const int32_t ex0 = blitDst[0], ey0 = blitDst[1];
+                const uint32_t ew = uint32_t(blitDst[2] - ex0), eh = uint32_t(blitDst[3] - ey0);
+                Alloc rb = stream(VkDeviceSize(cw) * ch * px, 16);
+                barrier();
+                VkBufferImageCopy rc2{};
+                rc2.bufferOffset = rb.offset;
+                rc2.imageSubresource = {aspect, s.level, s.layer, 1};
+                rc2.imageOffset = {ax0, ay0, 0};
+                rc2.imageExtent = {cw, ch, 1};
+                dev->vk.vkCmdCopyImageToBuffer(cmd(), s.image->image, VK_IMAGE_LAYOUT_GENERAL, rb.buffer, 1, &rc2);
+                const uint8_t* host = rb.host;
+                StorageP keepAlive = chunks_.back().storage;  // the chunk survives the flush
+                flush(true);
+                Alloc wb = stream(VkDeviceSize(ew) * eh * px, 16);
+                for (uint32_t y = 0; y < eh; ++y)
+                    for (uint32_t x = 0; x < ew; ++x) {
+                        const double u = (double(ex0) + x + 0.5 - cx0) / double(cx1 - cx0), v = (double(ey0) + y + 0.5 - cy0) / double(cy1 - cy0);
+                        const int32_t px0 = std::clamp<int32_t>(int32_t(std::floor(bx0 + u * (bx1 - bx0))), ax0, ax1 - 1);
+                        const int32_t py0 = std::clamp<int32_t>(int32_t(std::floor(by0 + v * (by1 - by0))), ay0, ay1 - 1);
+                        std::memcpy(wb.host + (size_t(y) * ew + x) * px, host + (size_t(py0 - ay0) * cw + size_t(px0 - ax0)) * px, px);
+                    }
+                barrier();
+                VkBufferImageCopy wc{};
+                wc.bufferOffset = wb.offset;
+                wc.imageSubresource = {aspect, d.level, d.layer, 1};
+                wc.imageOffset = {ex0, ey0, 0};
+                wc.imageExtent = {ew, eh, 1};
+                dev->vk.vkCmdCopyBufferToImage(cmd(), wb.buffer, d.image->image, VK_IMAGE_LAYOUT_GENERAL, 1, &wc);
+                return;
+            }
+            // One plane of a packed depth/stencil image: the backend's copy moves both, so the other one is saved and put back.
+            if (packed && aspect == VK_IMAGE_ASPECT_DEPTH_BIT && !(mask & gl::STENCIL_BUFFER_BIT)) {
+                const int32_t ex0 = blitDst[0], ey0 = blitDst[1];
+                const uint32_t ew = uint32_t(blitDst[2] - ex0), eh = uint32_t(blitDst[3] - ey0), px = plane(other);
+                Alloc sv = stream(VkDeviceSize(ew) * eh * px, 16);
+                VkBufferImageCopy sc{};
+                sc.bufferOffset = sv.offset;
+                sc.imageSubresource = {other, d.level, d.layer, 1};
+                sc.imageOffset = {ex0, ey0, 0};
+                sc.imageExtent = {ew, eh, 1};
+                barrier();
+                dev->vk.vkCmdCopyImageToBuffer(cmd(), d.image->image, VK_IMAGE_LAYOUT_GENERAL, sv.buffer, 1, &sc);
+                barrier();
+                VkImageBlit bb{};
+                bb.srcSubresource = {aspect, s.level, s.layer, 1};
+                bb.dstSubresource = {aspect, d.level, d.layer, 1};
+                bb.srcOffsets[0] = {bx0, by0, 0}, bb.srcOffsets[1] = {bx1, by1, 1};
+                bb.dstOffsets[0] = {cx0, cy0, 0}, bb.dstOffsets[1] = {cx1, cy1, 1};
+                dev->vk.vkCmdBlitImage(cmd(), s.image->image, VK_IMAGE_LAYOUT_GENERAL, d.image->image, VK_IMAGE_LAYOUT_GENERAL, 1, &bb,
+                                       VK_FILTER_NEAREST);
+                barrier();
+                dev->vk.vkCmdCopyBufferToImage(cmd(), sv.buffer, d.image->image, VK_IMAGE_LAYOUT_GENERAL, 1, &sc);
+                return;
+            }
+        }
         VkImageBlit b{};
         b.srcSubresource = {aspect, s.level, s.layer, 1};
         b.dstSubresource = {aspect, d.level, d.layer, 1};
-        b.srcOffsets[0] = {sx0, sy0, 0}, b.srcOffsets[1] = {sx1, sy1, 1};
-        b.dstOffsets[0] = {dx0, dy0, 0}, b.dstOffsets[1] = {dx1, dy1, 1};
+        b.srcOffsets[0] = {bx0, by0, 0}, b.srcOffsets[1] = {bx1, by1, 1};
+        b.dstOffsets[0] = {cx0, cy0, 0}, b.dstOffsets[1] = {cx1, cy1, 1};
         dev->vk.vkCmdBlitImage(cmd(), s.image->image, VK_IMAGE_LAYOUT_GENERAL, d.image->image, VK_IMAGE_LAYOUT_GENERAL, 1, &b,
                                filter == gl::LINEAR ? VK_FILTER_LINEAR : VK_FILTER_NEAREST);
     };
-    if (mask & gl::COLOR_BUFFER_BIT) {
-        int ri = 0;
-        if (readFbo) ri = int(fbo(readFbo)->readBuffer - gl::COLOR_ATTACHMENT0);
-        const auto& bufs = drawFbo ? fbo(drawFbo)->drawBuffers : fbos[0]->drawBuffers;
+    int32_t alphaRect[4] = {0, 0, 0, 0};
+    uint32_t alphaOne = 0;  // draw buffers that get alpha 1: a source without alpha reads 1
+    if (mask & gl::COLOR_BUFFER_BIT)
         for (int i = 0; i < kMaxDrawBuffers; ++i)
-            if (bufs[size_t(i)] != gl::NONE) blit(rf.color[size_t(std::clamp(ri, 0, kMaxDrawBuffers - 1))], df.color[size_t(i)], VK_IMAGE_ASPECT_COLOR_BIT);
-    }
+            if (bufs[size_t(i)] != gl::NONE) {
+                blitDst[2] = blitDst[0] = 0;
+                blit(rc, df.color[size_t(i)], VK_IMAGE_ASPECT_COLOR_BIT);
+                const FbTarget& dc = df.color[size_t(i)];
+                if (rc.image && dc.image && blitDst[2] > blitDst[0] && !rc.image->format->integer && !dc.image->format->integer &&
+                    rc.image->format->alphaBits == 0 && dc.image->format->alphaBits > 0 && rc.image->samples <= 1) {
+                    alphaOne |= 1u << i;
+                    std::copy(blitDst, blitDst + 4, alphaRect);
+                }
+            }
     if (mask & gl::DEPTH_BUFFER_BIT) blit(rf.depth, df.depth, VK_IMAGE_ASPECT_DEPTH_BIT);
     if (mask & gl::STENCIL_BUFFER_BIT) blit(rf.stencil, df.stencil, VK_IMAGE_ASPECT_STENCIL_BIT);
     barrier();
+    if (alphaOne) {
+        // Alpha 1 over the rectangle, through the clear draw with only the alpha channel writable.
+        ClearDraw cd;
+        const auto savedBlend = blend;
+        for (int i = 0; i < kMaxDrawBuffers; ++i)
+            if (alphaOne >> i & 1) {
+                cd.colorBits |= 1u << i;
+                const float v[4] = {0, 0, 0, 1};
+                std::memcpy(cd.value[size_t(i)].data(), v, 16);
+                blend[size_t(i)].mask[0] = blend[size_t(i)].mask[1] = blend[size_t(i)].mask[2] = false, blend[size_t(i)].mask[3] = true;
+            }
+        VkRect2D rect{{alphaRect[0], alphaRect[1]}, {uint32_t(alphaRect[2] - alphaRect[0]), uint32_t(alphaRect[3] - alphaRect[1])}};
+        clearByDraw(df, rect, cd);
+        blend = savedBlend;
+    }
 }
 
 }  // namespace vpgles

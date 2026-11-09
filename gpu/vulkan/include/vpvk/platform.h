@@ -3,6 +3,7 @@
 #pragma once
 
 #include <array>
+#include <functional>
 #include <memory>
 #include <string>
 #include <utility>
@@ -54,8 +55,12 @@ class Platform {
   }
   // Blocks until the speculative shader-library compiles queued so far (addShader) have run.
   virtual void drainCompiles() {}
-  // Writes pending on-disk caches (pipeline binary archive).
-  virtual void flushCaches() {}
+  // Writes pending on-disk caches (pipeline binary archive). `complete`: the explicit prepare step (vpvk_prewarm, the host's
+  // replay drain), which has nobody waiting and leaves nothing queued; the default is bounded to 8 s (end of process).
+  // `progress(done, total)` (complete flushes only): entries archived so far of those queued when it started, from this thread.
+  virtual void flushCaches(bool complete = false, const std::function<void(uint32_t, uint32_t)>& progress = nullptr) {
+    (void)complete, (void)progress;
+  }
   // Texture views (VkImageView with another type, format or subresource range). Null: unsupported,
   // the image itself is bound.
   struct ViewInfo {
@@ -76,6 +81,8 @@ class Platform {
   // Every vpgpu::Device frame with an index below `frames` finished (fences). 0 ns polls.
   virtual WaitResult waitFrames(uint64_t /*frames*/, uint64_t /*timeoutNs*/) { return WaitResult::Done; }
   virtual bool lost() const { return false; }
+  // vpvk_dump_pending: logs the command buffers in flight (names, age, pipelines); nothing where there is no queue.
+  virtual void dumpInFlight(const char* /*why*/) {}
   // Bytes the process may still allocate before the OS ends it (visionOS: os_proc_available_memory), 0 = unknown.
   // VK_EXT_memory_budget reports usage + this as the heap budget.
   virtual uint64_t availableMemory() { return 0; }
@@ -89,6 +96,10 @@ class Platform {
   // slot, that no frame in flight reads (`minIdleMs` is no longer a gate). Called with the device's submit mutex held
   // (try-lock). Bytes released; 0 where there is nothing / it is not safe now.
   virtual size_t drainRetired(uint32_t /*minIdleMs*/, std::string& /*report*/) { return 0; }
+  // vpvk_trim_memory, after trimMemory and under the same submit mutex: does at once what trimMemory can only queue for the next
+  // submit (transient MSAA backings, idle slots' chained argument buffers -> the backend's graveyard, which drainRetired then
+  // empties). Bytes moved; appends "key=MiB ..." to `report`. 0 where there is nothing.
+  virtual size_t trimSerialized(std::string& /*report*/) { return 0; }
   // vpvk_diag_line: cumulative backend counters (key, value); keys starting "g_" are gauges. Any thread, lock-free.
   virtual void diagCounters(std::vector<std::pair<const char*, uint64_t>>& /*out*/) const {}
   // vpvk_diag_ranges (kind 1): CPU-visible (address, length) of the buffers the backend allocated itself.
@@ -101,9 +112,10 @@ class Platform {
   // from the archives, `compiled` (compiled_in_session) were compiled in full; of those, `archived` are in this session's
   // archive (the depth-only ones are in their own file, pipelines-depth-<n>.metalar), `depthOnly` (not_archived_depth_only)
   // are depth-only ones that stayed out because that archive failed, `dup` repeat a descriptor already archived and `other`
-  // were refused or lost. False (out untouched) where there is no archive.
+  // were refused or lost. `archived` counts the entries already serialized to disk; `pending` those queued or added but
+  // not on disk yet; `spilled` those refused at the queue's fuse. False (out untouched) where there is no archive.
   struct ArchiveCensus {
-    uint32_t hits = 0, compiled = 0, archived = 0, depthOnly = 0, dup = 0, other = 0;
+    uint32_t hits = 0, compiled = 0, archived = 0, depthOnly = 0, dup = 0, other = 0, pending = 0, spilled = 0, trimDropped = 0;
   };
   virtual bool archiveCensus(ArchiveCensus&) { return false; }
   // vpvk_native_submit: a native command buffer (id<MTLCommandBuffer>, unretained) on the queue of

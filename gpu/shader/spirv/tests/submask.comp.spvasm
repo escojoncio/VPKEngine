@@ -1,0 +1,81 @@
+; Compute shader: gl_SubgroupEqMask / Ge / Gt / Le / LtMask stored as (x, y) words: out[2 * k], out[2 * k + 1].
+OpCapability Cap:Shader
+OpCapability Cap:GroupNonUniform
+OpCapability Cap:GroupNonUniformBallot
+OpMemoryModel AddrModel:Logical MemModel:GLSL450
+OpEntryPoint Model:GLCompute %main "main" %eq %ge %gt %le %lt
+OpExecutionMode %main ExecMode:LocalSize 32 1 1
+OpDecorate %eq Deco:BuiltIn BuiltIn:SubgroupEqMask
+OpDecorate %ge Deco:BuiltIn BuiltIn:SubgroupGeMask
+OpDecorate %gt Deco:BuiltIn BuiltIn:SubgroupGtMask
+OpDecorate %le Deco:BuiltIn BuiltIn:SubgroupLeMask
+OpDecorate %lt Deco:BuiltIn BuiltIn:SubgroupLtMask
+OpDecorate %arr Deco:ArrayStride 4
+OpDecorate %blk Deco:Block
+OpMemberDecorate %blk 0 Deco:Offset 0
+OpDecorate %out Deco:DescriptorSet 0
+OpDecorate %out Deco:Binding 0
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%u32 = OpTypeInt 32 0
+%v4u32 = OpTypeVector %u32 4
+%pin = OpTypePointer Storage:Input %v4u32
+%eq = OpVariable %pin Storage:Input
+%ge = OpVariable %pin Storage:Input
+%gt = OpVariable %pin Storage:Input
+%le = OpVariable %pin Storage:Input
+%lt = OpVariable %pin Storage:Input
+%arr = OpTypeRuntimeArray %u32
+%blk = OpTypeStruct %arr
+%pout = OpTypePointer Storage:StorageBuffer %blk
+%pu32 = OpTypePointer Storage:StorageBuffer %u32
+%out = OpVariable %pout Storage:StorageBuffer
+%c0 = OpConstant %u32 0
+%c1 = OpConstant %u32 1
+%c2 = OpConstant %u32 2
+%c3 = OpConstant %u32 3
+%c4 = OpConstant %u32 4
+%c5 = OpConstant %u32 5
+%c6 = OpConstant %u32 6
+%c7 = OpConstant %u32 7
+%c8 = OpConstant %u32 8
+%c9 = OpConstant %u32 9
+%main = OpFunction %void 0 %fn
+%l = OpLabel
+%a0 = OpLoad %v4u32 %eq
+%a1 = OpLoad %v4u32 %ge
+%a2 = OpLoad %v4u32 %gt
+%a3 = OpLoad %v4u32 %le
+%a4 = OpLoad %v4u32 %lt
+%x0 = OpCompositeExtract %u32 %a0 0
+%y0 = OpCompositeExtract %u32 %a0 1
+%x1 = OpCompositeExtract %u32 %a1 0
+%y1 = OpCompositeExtract %u32 %a1 1
+%x2 = OpCompositeExtract %u32 %a2 0
+%y2 = OpCompositeExtract %u32 %a2 1
+%x3 = OpCompositeExtract %u32 %a3 0
+%y3 = OpCompositeExtract %u32 %a3 1
+%x4 = OpCompositeExtract %u32 %a4 0
+%y4 = OpCompositeExtract %u32 %a4 1
+%p0 = OpAccessChain %pu32 %out %c0 %c0
+OpStore %p0 %x0
+%p1 = OpAccessChain %pu32 %out %c0 %c1
+OpStore %p1 %y0
+%p2 = OpAccessChain %pu32 %out %c0 %c2
+OpStore %p2 %x1
+%p3 = OpAccessChain %pu32 %out %c0 %c3
+OpStore %p3 %y1
+%p4 = OpAccessChain %pu32 %out %c0 %c4
+OpStore %p4 %x2
+%p5 = OpAccessChain %pu32 %out %c0 %c5
+OpStore %p5 %y2
+%p6 = OpAccessChain %pu32 %out %c0 %c6
+OpStore %p6 %x3
+%p7 = OpAccessChain %pu32 %out %c0 %c7
+OpStore %p7 %y3
+%p8 = OpAccessChain %pu32 %out %c0 %c8
+OpStore %p8 %x4
+%p9 = OpAccessChain %pu32 %out %c0 %c9
+OpStore %p9 %y4
+OpReturn
+OpFunctionEnd

@@ -37,6 +37,9 @@
 namespace vpgles {
 
 void logf(const char* fmt, ...) __attribute__((format(printf, 1, 2)));
+// One `gles.glsl.lenient rule=... <what>=<name>` line per rule a shader (what "shader") or program ("program") broke that
+// strict GLSL (VPGLES_STRICT_GLSL=1) would have rejected and the default lenient mode let through.
+void logLenient(const std::vector<std::string>& rules, const char* what, unsigned name);
 
 // Diagnostics: textures defined per sized internal format ("gles.tex fmt=0x.... count=N"); texStatsTick prints the
 // changed counts every 10 s (force: now, at eglTerminate / device shutdown; called from eglSwapBuffers and vpgles_flush),
@@ -44,20 +47,34 @@ void logf(const char* fmt, ...) __attribute__((format(printf, 1, 2)));
 void texStatsCount(GLenum internalFormat);
 void texStatsTick(bool force);
 
+// Diagnostics: counters of events that should not happen, kept per tick (the texStatsTick calls: eglSwapBuffers / vpgles_flush)
+// and in all, printed with the texture census as "gles.census incomplete= ... " (max per tick, total) when they changed. Needs Device::lock.
+enum class DiagCounter { Incomplete, MsrttDsContinued, TexRealloc, kCount };
+void diagCount(DiagCounter c, uint64_t n = 1);
+
 // Diagnostics: "gles.pso.recipe saved= loaded= prewarmed= miss_in_game=" (VPVulkan's pipeline-recipe store, see vpvk_recipe_stats):
 // printed when the counters changed and 10 s passed since the last line (force: now, even unchanged, at eglTerminate / device
 // shutdown; called from eglSwapBuffers, vpgles_flush and the creation of a new pipeline). Needs Device::lock.
 void recipeStatsTick(bool force);
 
-constexpr int kMaxTextureUnits = 32;
-constexpr int kMaxVertexAttribs = 16;
+// Diagnostics: "gles.map_stats maps= unsync= unsync_inuse= cow_bytes= max_cow_bytes= discard_inuse=" (glMapBufferRange with
+// MAP_UNSYNCHRONIZED over storage the GPU may still read; see MapBufferRange): every ~5 s while maps happen (force: now, at
+// eglTerminate / device shutdown, if any map happened); at most 720 lines. Needs Device::lock.
+void mapStatsTick(bool force);
+
+constexpr int kMaxTextureUnits = 96;  // Quest 3 (Adreno 740): GL_MAX_COMBINED_TEXTURE_IMAGE_UNITS
+constexpr int kMaxVertexAttribs = 32;  // Quest 3: GL_MAX_VERTEX_ATTRIBS
+constexpr int kHwVertexAttribs = 31;   // VPVulkan maxVertexInputAttributes (Metal vertex buffer table): locations above are dropped
 constexpr int kMaxDrawBuffers = 8;
-constexpr int kMaxUniformBufferBindings = 36;
+constexpr int kMaxUniformBufferBindings = 84;  // Quest 3: GL_MAX_UNIFORM_BUFFER_BINDINGS
 constexpr int kMaxVertexBindings = kMaxVertexAttribs;
-constexpr int kMaxShaderStorageBindings = 16;
+constexpr int kMaxShaderStorageBindings = 36;  // Quest 3: GL_MAX_SHADER_STORAGE_BUFFER_BINDINGS
 constexpr int kMaxAtomicCounterBindings = 8;
 constexpr int kMaxTransformFeedbackBindings = 4;
 constexpr int kMaxImageUnits = 8;
+static_assert(kMaxTextureUnits == vpglsl::kBindingSamplers && kMaxImageUnits == vpglsl::kBindingImages && kMaxAtomicCounterBindings == vpglsl::kBindingAtomics &&
+                  kMaxUniformBufferBindings == vpglsl::kBindingUniform && kMaxShaderStorageBindings == vpglsl::kBindingStorage,
+              "GLSL binding limits and GL limits must agree");
 
 // ---- device ---------------------------------------------------------------------------------------
 struct Device;
@@ -73,6 +90,12 @@ struct BufferStorage {
     ~BufferStorage();
 };
 using StorageP = std::shared_ptr<BufferStorage>;
+// Usage of a GL buffer object's storage (glBufferData, and the copy-on-write storage of Context::prepareWrite).
+constexpr VkBufferUsageFlags kAllUsage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
+                                         VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                                         VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_UNIFORM_TEXEL_BUFFER_BIT |
+                                         VK_BUFFER_USAGE_STORAGE_TEXEL_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
+                                         VK_BUFFER_USAGE_TRANSFER_DST_BIT;
 
 struct Device {
     Vk vk;
@@ -89,6 +112,11 @@ struct Device {
     // Submission serials: the n-th vkQueueSubmit has serial n; `completed` is the highest one whose
     // fence signalled.
     uint64_t submitted = 0, completed = 0;
+    // QUERY_RESULT waits on occlusion counts (Context::occResult), under `lock`: the serial of the last wait that ran out
+    // (0: none; no read waits until the GPU is past it) and what the reads waited so far under serial `occBudgetSerial`
+    // (one budget per submission serial). `clockNs` replaces the steady clock (tests).
+    uint64_t occLateSerial = 0, occBudgetSerial = 0, occBudgetUsedNs = 0;
+    uint64_t (*clockNs)() = nullptr;
     struct InFlight {
         uint64_t serial;
         VkFence fence;
@@ -113,6 +141,7 @@ Device* device();  // the process device (null before vpgles_init)
 // ---- objects --------------------------------------------------------------------------------------
 struct Buffer {
     GLuint name = 0;
+    bool bound = false;  // bound once: only then glIsBuffer says it is a buffer object
     StorageP storage;
     GLsizeiptr size = 0;
     GLenum usage = gl::STATIC_DRAW;
@@ -129,6 +158,8 @@ struct SamplerParams {
     float minLod = -1000.0f, maxLod = 1000.0f, maxAnisotropy = 1.0f;
     GLenum compareMode = gl::NONE, compareFunc = gl::LEQUAL;
     float border[4] = {0, 0, 0, 0};
+    int32_t borderI[4] = {0, 0, 0, 0};  // glTexParameterI[u]iv: the border colour as the pure integers the app gave
+    bool borderInt = false;             // the last write of the border colour was an integer one (borderI is the exact value)
     bool operator==(const SamplerParams& o) const;
 };
 
@@ -143,6 +174,7 @@ struct Image {  // a VkImage with its memory
     VkSampleCountFlagBits samples = VK_SAMPLE_COUNT_1_BIT;
     bool cube = false;
     bool storage = false;  // created with STORAGE_BIT (only textures used with glBindImageTexture pay for it)
+    bool formatViews = false;  // a depth/stencil image created with MUTABLE_FORMAT (only multisampled-render-to-texture attachments pay for it)
     std::map<uint64_t, VkImageView> views;  // cached views
     // glInvalidateFramebuffer: attachment views (and aspects: 1 colour, 2 depth, 4 stencil) whose contents are undefined.
     // The next pass that begins on one of them loads DONT_CARE; any other use of the image defines it again.
@@ -152,9 +184,18 @@ struct Image {  // a VkImage with its memory
     // A 2D (array) view of one level and `layerCount` layers from `layer`, for attachments.
     VkImageView attachmentView(uint32_t level, uint32_t layer, uint32_t layerCount);
     // A view for a storage image descriptor: `type` 2D / 2D_ARRAY / 3D over one level and `layerCount` layers.
-    VkImageView storageView(uint32_t level, uint32_t layer, uint32_t layerCount, VkImageViewType type);
+    // `format` (when not UNDEFINED and not the image's own): the texel format the view reinterprets the image with
+    // (glBindImageTexture with an image format other than the texture's, of the same size).
+    VkImageView storageView(uint32_t level, uint32_t layer, uint32_t layerCount, VkImageViewType type,
+                            VkFormat format = VK_FORMAT_UNDEFINED);
 };
 using ImageP = std::shared_ptr<Image>;
+// The sample count a request of `n` (> 1) samples is rendered with: 2 or 4 (MAX_SAMPLES).
+inline uint32_t renderSamples(uint32_t n) { return n <= 2 ? 2u : 4u; }
+// A 2D (array) image of `samples` samples with its device-local memory bound; null when Vulkan refuses it. The caller
+// records Context::imageInit.
+ImageP createImage2D(Device* dev, const FormatInfo* f, uint32_t w, uint32_t h, uint32_t layers, uint32_t samples,
+                     VkImageUsageFlags usage, VkImageCreateFlags flags = 0);
 
 struct TexelBufferView;
 
@@ -164,6 +205,7 @@ struct Texture {
     ImageP image;
     bool immutable = false;
     bool wantStorage = false;  // glBindImageTexture used it: its image is (re)created with STORAGE_BIT
+    bool wantFormatViews = false;  // attached as a depth / stencil with EXT_multisampled_render_to_texture: its image is (re)created with MUTABLE_FORMAT
     GLint immutableLevels = 0;
     // Level definitions (glTexImage*): per level, the size and format the app defined.
     struct Level {
@@ -171,6 +213,8 @@ struct Texture {
         const FormatInfo* format = nullptr;
     };
     std::vector<Level> levels;
+    // Cube maps: the same definitions per face (a face's level can differ from the others', which makes the cube incomplete).
+    std::array<std::vector<Level>, 6> faceLevels;
     // Uploads to levels above 0 that arrived before level 0 defined the image (UE4 streams the small mips first): kept
     // here (already converted, ready to copy) until the base creates the image, then uploaded and freed.
     struct PendingUpload {
@@ -186,7 +230,7 @@ struct Texture {
     GLenum swizzle[4] = {gl::RED, gl::GREEN, gl::BLUE, gl::ALPHA};
     GLenum depthStencilMode = gl::DEPTH_COMPONENT;
     bool srgbDecode = true;
-    GLint samples = 0;          // glTexStorage2DMultisample / glTexImage2DMultisample (the image itself is 1x)
+    GLint samples = 0;          // glTexStorage2DMultisample / glTexImage2DMultisample (the image has renderSamples(samples))
     bool fixedSampleLocations = false;
     // Buffer texture (glTexBuffer / glTexBufferRange): the data store is a range of a buffer object.
     GLuint bufferName = 0;
@@ -211,6 +255,7 @@ struct TexelBufferView {
 
 struct Renderbuffer {
     GLuint name = 0;
+    bool bound = false;  // glIsRenderbuffer
     ImageP image;
     GLenum internalFormat = gl::RGBA4;
     GLsizei width = 0, height = 0, samples = 0;
@@ -221,14 +266,16 @@ struct Attachment {
     GLuint name = 0;
     GLint level = 0, layer = 0;     // layer: cube face / array layer
     GLint numViews = 0, baseView = 0;  // OVR_multiview
+    GLint samples = 0;                 // EXT_multisampled_render_to_texture: samples a single-sample texture is rendered with (0 = none)
     bool operator==(const Attachment& o) const {
         return kind == o.kind && name == o.name && level == o.level && layer == o.layer && numViews == o.numViews &&
-               baseView == o.baseView;
+               baseView == o.baseView && samples == o.samples;
     }
 };
 
 struct Framebuffer {
     GLuint name = 0;
+    bool bound = false;  // glIsFramebuffer
     std::array<Attachment, kMaxDrawBuffers> color{};
     Attachment depth, stencil;
     std::array<GLenum, kMaxDrawBuffers> drawBuffers{};
@@ -333,6 +380,20 @@ struct Program {
         int element;
     };
     bool binaryRetrievableHint = false, separable = false;
+    // A separable program with one graphics stage is linked with a stub of the other (for its reflection); the stage it really
+    // holds is kept here, to link it with another program's stage when a program pipeline draws.
+    std::shared_ptr<vpglsl::Shader> stageVs, stageFs;
+    bool singleStage = false;
+    bool pipelineLink = false;  // the combined program of a program pipeline (see Context::pipelineProgram)
+    // Transform feedback: glTransformFeedbackVaryings state (taken by the next link) and what the last link made of it.
+    std::vector<std::string> xfbVaryings;
+    GLenum xfbMode = 0x8C8C;  // GL_INTERLEAVED_ATTRIBS
+    GLenum xfbLinkedMode = 0x8C8C;
+    // The vertex shader variant that also writes the capture record (see vpglsl::kXfbBinding), its layouts and pipelines.
+    VkShaderModule xfbModule = VK_NULL_HANDLE;
+    VkDescriptorSetLayout xfbSetLayout = VK_NULL_HANDLE;
+    VkPipelineLayout xfbPipeLayout = VK_NULL_HANDLE;
+    std::unordered_map<uint64_t, VkPipeline> xfbPipelines;
     std::vector<Loc> locations;
     std::vector<std::vector<GLint>> samplerUnits;  // per reflected uniform (samplers only): unit per element
     std::vector<GLuint> blockBindings;              // per reflection.blocks entry: GL binding point
@@ -355,7 +416,9 @@ struct Query {
     GLenum target = 0;
     bool active = false;
     uint64_t result = 0;
-    uint64_t beginNs = 0, beginDraws = 0;
+    uint64_t beginNs = 0, beginDraws = 0, beginXfb = 0;
+    uint32_t slot = UINT32_MAX;  // occlusion: its counter in Context::occPool_ (UINT32_MAX = none: coherent)
+    uint64_t endSerial = 0;      // occlusion: the submission that holds its end
 };
 
 struct Sync {
@@ -442,7 +505,21 @@ public:
     // Indexed binding points of the targets the compute / transform feedback paths consume.
     std::array<IndexedBuffer, kMaxShaderStorageBindings> ssboBindings{};
     std::array<IndexedBuffer, kMaxAtomicCounterBindings> atomicBindings{};
-    std::array<IndexedBuffer, kMaxTransformFeedbackBindings> xfbBindings{};
+    // Transform feedback objects (not shared between contexts; 0 is the default object, always there). The indexed buffer
+    // bindings, the active / paused state and the capture position belong to the object.
+    struct TransformFeedback {
+        GLuint name = 0;
+        bool bound = false;  // bound once: glIsTransformFeedback
+        std::array<IndexedBuffer, kMaxTransformFeedbackBindings> buffers{};
+        bool active = false, paused = false;
+        GLenum mode = 0;                     // glBeginTransformFeedback's primitiveMode
+        uint64_t program = 0;                // Program::serial it began with
+        std::array<uint64_t, kMaxTransformFeedbackBindings> used{};  // bytes captured into each binding since Begin
+    };
+    std::unordered_map<GLuint, std::unique_ptr<TransformFeedback>> transformFeedbacks;
+    GLuint transformFeedback = 0, nextTransformFeedback = 1;
+    TransformFeedback& curTf();
+    uint64_t xfbPrimitivesWritten = 0;  // running count GL_TRANSFORM_FEEDBACK_PRIMITIVES_WRITTEN queries difference
     // glBindImageTexture units.
     struct ImageUnit {
         GLuint texture = 0;
@@ -454,6 +531,21 @@ public:
     // Queries: the active query of each target, and the draw counter occlusion queries compare.
     std::map<GLenum, GLuint> activeQuery;
     uint64_t drawCount = 0;
+    // Occlusion queries are measured by VPVulkan's visibility counters: one pool per context, a slot per query object.
+    VkQueryPool occPool_ = VK_NULL_HANDLE;
+    std::vector<bool> occBusy_;
+    uint32_t occActive_ = UINT32_MAX;  // the slot counting draws now
+    uint32_t occSlot();                // a free slot (UINT32_MAX: none)
+    void occBegin(Query& q);
+    void occEnd(Query& q);
+    static constexpr uint64_t kOccWaitNs = 20'000'000;  // QUERY_RESULT waits for the GPU count: 20 ms in all per serial (Device)
+    // How a waiting occlusion read ended when the count was not there: Expired = the wait ran out, Skipped = it did not
+    // wait (the GPU is behind, or the budget is spent); both report the query visible (value 1).
+    enum class OccWait : uint8_t { Done, Expired, Skipped };
+    // false: not available. wait: blocks within the budget (Device::occBudgetUsedNs), else reports visible (*how).
+    bool occResult(Query& q, bool wait, uint64_t& value, OccWait* how = nullptr);
+    void occPause();                   // internal draws (clears) do not count
+    void occResume();
     // KHR_debug.
     using DebugProc = void (*)(GLenum, GLenum, GLuint, GLenum, GLsizei, const GLchar*, const void*);
     DebugProc debugCb = nullptr;
@@ -477,7 +569,7 @@ public:
     GLuint programPipeline = 0, nextProgramPipeline = 1;
     // glSampleMaski: stored only (rendering is 1x, the coverage mask has nothing to apply to).
     GLbitfield sampleMask = ~0u;
-    bool sampleMaskWarned = false;
+    bool sampleMaskEnable = false;  // GL_SAMPLE_MASK
     int activeUnit = 0;
     struct Unit {
         GLuint tex2D = 0, texCube = 0, tex3D = 0, tex2DArray = 0, texExternal = 0, tex2DMS = 0, sampler = 0;
@@ -539,6 +631,16 @@ public:
     uint64_t flush(bool wait);         // submits; returns the submission serial (0 if nothing)
     void keep(std::shared_ptr<void> p) { keep_.push_back(std::move(p)); }
     void useStorage(const StorageP& s);  // marks it used by the open command buffer
+    // image2D bound to one slice of a 3D texture: Metal cannot view a 3D texture as 2D, so the dispatch works on a 2D
+    // copy of the slice (copied in before, back after: syncSlicesBack).
+    struct SliceSync {
+        ImageP proxy, source;
+        uint32_t level = 0, slice = 0;
+        bool writeBack = false;
+    };
+    std::vector<SliceSync> sliceBack_;
+    std::map<std::pair<const Image*, uint64_t>, ImageP> sliceProxies_;
+    void syncSlicesBack();
     // Transient upload memory for this submission (vertex/index streaming, uniforms, staging).
     struct Alloc {
         VkBuffer buffer;
@@ -552,9 +654,15 @@ public:
     void prepareWrite(Buffer& b, bool discard);
 
     // Images
-    bool realizeTexture(Texture& t);  // (re)creates t.image from its level definitions
+    // (Re)creates t.image from its level definitions. `carries`: the caller copies the old texels over (carryTexels), so a new image
+    // of the same shape loses nothing (gles.tex_realloc does not count it).
+    bool realizeTexture(Texture& t, bool carries = false);
     // Gives t an image with STORAGE_BIT (glBindImageTexture), keeping the contents. False when it cannot be image-bound.
     bool makeStorage(Texture& t);
+    // Gives a depth/stencil texture an image with MUTABLE_FORMAT (the seed of a continuing multisampled-render-to-texture pass reads
+    // its stencil plane through a stencil view), keeping the contents. Without an image yet: the image is created with it later.
+    void makeFormatViews(Texture& t);
+    void carryTexels(const ImageP& old, Texture& t);  // copies every level of `old` into t.image (same shape)
     void imageInit(Image& img);       // UNDEFINED -> GENERAL
     VkSampler samplerFor(const SamplerParams& p, const Texture& t);
 
@@ -563,11 +671,20 @@ public:
         Image* image = nullptr;
         uint32_t level = 0, layer = 0, layers = 1;
         bool multiview = false;
+        // EXT_multisampled_render_to_texture: `image` is single-sample and the pass renders in a transient multisample twin of it,
+        // resolved into it when the pass ends (the twin is never stored: it stays on the tile). The colour of a multisample default
+        // framebuffer is the same: `image` is the surface's presented image.
+        bool implicit = false;
+        GLuint tex = 0;  // the texture of such an attachment (its contents seed the twin)
+        ImageP seedImage;  // ... or, with no texture (the default framebuffer), the image that seeds the twin
+        // A multisample renderbuffer: `image` is its single-sample image (the only one it has), the same twin scheme with
+        // `seedImage` = `image`. Its sample count (the application still sees a multisample attachment).
+        uint32_t msSamples = 0;
     };
     struct FbInfo {
         std::array<FbTarget, kMaxDrawBuffers> color{};
         FbTarget depth, stencil;
-        uint32_t width = 0, height = 0, viewCount = 0;
+        uint32_t width = 0, height = 0, viewCount = 0, samples = 1;
         GLenum status = gl::FRAMEBUFFER_COMPLETE;
         bool defaultFb = false;
     };
@@ -611,7 +728,7 @@ public:
                       bool sub, GLint xo, GLint yo, GLint zo);
     void generateMipmap(GLenum target);
     void copyBufferToImage(Image& img, uint32_t level, uint32_t layer, int32_t x, int32_t y, int32_t z, uint32_t w,
-                           uint32_t h, uint32_t d, const uint8_t* data, size_t bytes);
+                           uint32_t h, uint32_t d, const uint8_t* data, size_t bytes, bool stencilPlane = false);
     // Keeps an upload to a level above 0 until level 0 defines the image (Texture::pending) / uploads the kept ones.
     void queuePending(Texture& t, uint32_t level, uint32_t layer, int32_t x, int32_t y, int32_t z, uint32_t w, uint32_t h,
                       uint32_t d, const uint8_t* data, size_t bytes);
@@ -622,6 +739,10 @@ public:
     bool linkProgram(Program& p);
     // The link of linkProgram on explicit shaders (glProgramBinary re-links unregistered ones).
     bool linkShaders(Program& p, Shader* vs, Shader* fs, Shader* cs);
+    // The program a draw with a program pipeline whose vertex and fragment stages come from two programs runs: those two
+    // stages linked together (cached per pair), with the uniform values / bindings of the two programs copied in.
+    Program* pipelineProgram(const ProgramPipeline& pl);
+    std::map<std::pair<uint64_t, uint64_t>, std::unique_ptr<Program>> pipelinePrograms_;
     // glProgramBinary: false (link status false, log set) for a foreign / corrupt blob; never a GL error.
     bool loadProgramBinary(Program& p, GLenum format, const void* data, size_t bytes);
     // The glGetProgramBinary blob of `p`'s last successful link, built now (empty = no linked program).
@@ -644,12 +765,22 @@ private:
     uint32_t passDrop_ = 0;
     void setPassDrop(uint32_t mask);
     struct PassKey {
-        std::array<VkImageView, kMaxDrawBuffers> color{};
-        VkImageView depth = VK_NULL_HANDLE, stencil = VK_NULL_HANDLE;
-        uint32_t w = 0, h = 0, viewMask = 0;
+        std::array<VkImageView, kMaxDrawBuffers> color{}, colorResolve{};  // resolve: the 1x view a multisample colour is resolved into
+        VkImageView depth = VK_NULL_HANDLE, stencil = VK_NULL_HANDLE, depthResolve = VK_NULL_HANDLE, stencilResolve = VK_NULL_HANDLE;
+        uint32_t w = 0, h = 0, viewMask = 0, samples = 1;
         bool operator==(const PassKey& o) const;
     } pass_;
     PassKey passKeyFor(const FbInfo& fb);  // the attachments a pass on `fb` would have
+    // The transient multisample image an implicit-multisample attachment is rendered in: shared by attachment slot (colour
+    // index; kMaxDrawBuffers = depth / stencil, one image) / format / size / layers / samples (every pass starts it anew:
+    // cleared, or seeded from the texture). Two attachments of one framebuffer never share a twin.
+    ImageP msTwin(uint32_t slot, const FormatInfo* f, uint32_t w, uint32_t h, uint32_t layers, uint32_t samples);
+    struct MsTwin {
+        ImageP image;
+        uint64_t use = 0;  // msTwinEpoch_ of the last passKeyFor that asked for it
+    };
+    std::map<std::string, MsTwin> msTwins_;
+    uint64_t msTwinEpoch_ = 0;
     // Streaming ring (per submission chunks).
     struct Chunk {
         StorageP storage;
@@ -664,9 +795,17 @@ private:
     bool prepareDraw(GLenum mode, VkPrimitiveTopology& topo, uint32_t vertexCount, uint32_t firstVertex,
                      uint32_t instances, bool indexed, VkBuffer& vbufs0);
     VkPipeline pipelineFor(Program& p, const FbInfo& fb, VkPrimitiveTopology topo, const std::vector<VkVertexInputBindingDescription>& binds,
-                           const std::vector<VkVertexInputAttributeDescription>& attrs);
-    bool bindResources(Program& p);
+                           const std::vector<VkVertexInputAttributeDescription>& attrs, bool xfb = false);
+    bool bindResources(Program& p, const StorageP& xfbScratch = nullptr);
+    // Transform feedback while a draw is recorded: the capture pass (vertex shader variant writing the scratch buffer with the
+    // rasterizer off), then the captured vertices are put in primitive order into the bound buffers (see captureTransformFeedback).
+    bool captureTransformFeedback(GLenum mode, uint32_t count, uint32_t first, uint32_t instances, bool indexed,
+                                  const std::vector<uint32_t>& indices, int32_t baseVertex);
+    StorageP xfbScratch_;  // set while the capture draw is prepared
     bool beginDispatch(Program*& p);
+    bool dispatching_ = false;  // bindResources runs for a dispatch (copies may be recorded)
+    // The 2D storage view for image2D bound to slice `layer` of a 3D texture (see SliceSync); null when it cannot be had.
+    VkImageView sliceView(Texture& t, uint32_t level, GLint layer, GLenum access, VkFormat format);
     bool attribsDirect(Program& p, VertexArray* va);
     // glClear / glClearBuffer with a colour or stencil write mask: vkCmdClearAttachments cannot mask channels or bits, so
     // those are a full-target triangle drawn with the mask as the pipeline's write mask (what ANGLE does). `forcedProgram_`
@@ -676,18 +815,22 @@ private:
         std::array<std::array<uint32_t, 4>, kMaxDrawBuffers> value{};  // their clear values (float / int / uint bits)
         bool stencil = false;
         uint32_t stencilValue = 0;
+        bool seed = false;  // colorBits are not cleared but copied from the textures of the implicit-multisample attachments
     };
     Program* forcedProgram_ = nullptr;
     std::map<std::string, std::unique_ptr<Program>> clearProgs_;  // per colour output layout ("f" / "i" / "u" per slot)
-    Program* clearProgram(const std::string& kinds);
+    Program* clearProgram(const std::string& kinds, bool seed = false);
     bool clearByDraw(const FbInfo& fb, const VkRect2D& rect, const ClearDraw& cd);
     StorageP blackTexelStorage_;
     std::shared_ptr<TexelBufferView> blackTexelView_;
     void setDynamicState(const FbInfo& fb);
     FbInfo drawFb_;
     uint32_t indexMax_ = 0;
+    bool provokeOk_ = false;  // set by drawArrays/drawElements, the draws that can run as a rotated list; read once by prepareDraw
+    bool provoke_ = false;  // this draw runs as an index list with each primitive's last vertex first (flat varyings, see prepareDraw)
     std::unique_ptr<Texture> black_;
     Texture& blackTexture();
+    Texture* defaultTexture(GLenum target);  // texture object 0 of the target if the app ever used it, else null
 };
 
 GLint uniformLocation(const Program& p, const char* name);

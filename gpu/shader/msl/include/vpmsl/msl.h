@@ -15,6 +15,7 @@
 //                               textures sampled with `compare` need the sampler's compareFunction)
 //       BufferSize              ulong: byte size of the range bound to Buffer slot `index` (SPIR-V
 //                               OpArrayLength); last kind, so shaders without it keep their layout
+//       SamplerBias             float: lod bias of the Sampler with the same index (EmitOptions::samplerBias)
 //   * Alignment: constant-buffer addresses must be 16-byte aligned (vector reads from them are
 //     emitted as aligned vector loads); device buffers only need 4 (vectors at offsets not known to
 //     be aligned go through packed_* types).
@@ -132,6 +133,10 @@ struct EmitOptions {
     // for each such slot; a null or missing buffer has size 0). Out of range: loads give 0,
     // stores and atomics do nothing (atomics return 0). Constant buffers are not checked.
     bool robustBuffers = false;
+    // A SamplerBias argument (float, written by the backend) for every sampler used by a sample, added to
+    // its lod: level(l + bias), bias(b + bias), gradients scaled by exp2(bias). Fragment-stage implicit
+    // sampling only; gather and query_lod are unaffected.
+    bool samplerBias = false;
     // Constant-only private arrays become program-scope `constant` tables (emitter: planConstTables).
     // VPMSL_CONST_TABLES=0 turns it off.
     bool constTables = true;

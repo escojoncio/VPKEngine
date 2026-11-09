@@ -45,7 +45,7 @@ fragment VpOut vp_main(constant VpArgs& vp_args [[buffer(0)]],
     const float v34 = exp2(v33);
     const float3 v35 = v29.xyz;
     const float3 v36 = float3(v34);
-    const float3 v37 = mix(v35, v27, v36);
+    const float3 v37 = fma(v27, v36, fma(v35, -v36, v35));
     const float4 v39 = float4(v37, v3.w);
     const half4 v40 = half4(v39);
     vp_out.lit = v40;

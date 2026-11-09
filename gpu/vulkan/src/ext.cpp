@@ -2,9 +2,7 @@
 // VK_KHR_timeline_semaphore and VK_EXT_multi_draw. Each entry point maps onto what the driver
 // already does (one in-order queue, per-frame completion tracking), so none adds GPU work of its own.
 //
-// With the Quest identity (questIdentity()) they are advertised only with VPVK_EXTRA_EXTENSIONS=1
-// (physical_device.cpp), which the conformance run sets: a game that sees them may switch to code paths
-// the Vulkan CTS has to validate first. Without it they are always advertised.
+// They are advertised with every identity (the Quest identity has one profile, for games and for the CTS alike).
 // The functions resolve either way (vkGetDeviceProcAddr), as for any unadvertised extension.
 #include <algorithm>
 #include <chrono>
@@ -40,7 +38,7 @@ bool extraExtensions() {
   if (tInternal) return true;
   const char* e = std::getenv("VPVK_EXTRA_EXTENSIONS");
   if (!questIdentity()) return !(e && *e == '0');  // native: on, unless explicitly turned off
-  return e && *e == '1';
+  return true;  // Quest identity: one profile, the same for games and the conformance run (VPVK_EXTRA_EXTENSIONS is ignored)
 }
 
 bool nativeExtras() {
@@ -53,14 +51,16 @@ bool nativeExtras() {
 }
 
 namespace {
-// Moves the semaphore's finished submissions into `completed` (non-blocking).
+// Moves the semaphore's finished submissions into `completed` (non-blocking). In value order, smallest first, stopping at
+// the first unfinished one: batches of different queues can run (and so be appended) out of value order, and a counter
+// value promises that the work signaling it or any smaller value has finished.
 void advance(Platform& p, Semaphore& s) {
-  auto it = s.pending.begin();
-  while (it != s.pending.end()) {
-    // Submissions append in order, so their frames only grow: the first unfinished one ends it.
+  while (!s.pending.empty()) {
+    const auto it = std::min_element(s.pending.begin(), s.pending.end(),
+                                     [](const auto& a, const auto& b) { return a.first < b.first; });
     if (p.waitFrames(it->second, 0) != Platform::WaitResult::Done) break;
     s.completed = std::max(s.completed, it->first);
-    it = s.pending.erase(it);
+    s.pending.erase(it);
   }
 }
 }  // namespace
@@ -77,6 +77,7 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkGetSemaphoreCounterValue(VkDevice d
   std::lock_guard<std::mutex> l(s->m);
   advance(*d->platform, *s);
   *value = s->completed;
+  s->poll.note(VK_SUCCESS);  // vk.pending (pending.cpp)
   return VK_SUCCESS;
 }
 
@@ -92,7 +93,7 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkSignalSemaphore(VkDevice dv, const 
 
 // Waits by the frames the awaited values depend on; a value only the host will signal (no pending
 // submission reaches it) is polled until the timeout.
-VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkWaitSemaphores(VkDevice dv, const VkSemaphoreWaitInfo* info, uint64_t timeout) {
+static VkResult waitSemaphores(VkDevice dv, const VkSemaphoreWaitInfo* info, uint64_t timeout) {
   Device* d = from<Device>(dv);
   using Clock = std::chrono::steady_clock;
   const auto start = Clock::now();
@@ -110,10 +111,16 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkWaitSemaphores(VkDevice dv, const V
         ++done;
         continue;
       }
-      // The earliest pending submission that reaches the value.
+      // The earliest frame after which the counter reaches the value: some pending signal v >= value completes once the
+      // frames of every pending signal up to v have (advance completes in value order).
       uint64_t best = UINT64_MAX;
-      for (const auto& [v, f] : s->pending)
-        if (v >= info->pValues[i]) best = std::min(best, f);
+      for (const auto& [v, f] : s->pending) {
+        if (v < info->pValues[i]) continue;
+        uint64_t need = f;
+        for (const auto& [v2, f2] : s->pending)
+          if (v2 <= v) need = std::max(need, f2);
+        best = std::min(best, need);
+      }
       if (best != UINT64_MAX) {
         needFrames = frameWait ? (any ? std::min(needFrames, best) : std::max(needFrames, best)) : best;
         frameWait = true;
@@ -136,6 +143,12 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkWaitSemaphores(VkDevice dv, const V
       std::this_thread::sleep_for(std::chrono::nanoseconds(std::min<uint64_t>(left, 1'000'000)));
     }
   }
+}
+VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkWaitSemaphores(VkDevice dv, const VkSemaphoreWaitInfo* info, uint64_t timeout) {
+  pendingSemaphoreWait(*info, true);  // vk.pending (pending.cpp)
+  const VkResult r = waitSemaphores(dv, info, timeout);
+  pendingSemaphoreWait(*info, false);
+  return r;
 }
 
 // ---- VK_KHR_copy_commands2 -----------------------------------------------------------------------

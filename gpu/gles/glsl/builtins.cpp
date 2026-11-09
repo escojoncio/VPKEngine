@@ -454,11 +454,12 @@ static std::optional<T> textureSig(const std::string& name, const TexCall& tc, c
                    d3 = name.find("3D") != std::string::npos;
         if (cube != (s.dim == SDim::Cube) || shadow != s.shadow || d3 != (s.dim == SDim::D3)) return std::nullopt;
         if (!cube && !d3 && s.dim != SDim::D2 && s.dim != SDim::External) return std::nullopt;
-        if (name.find("EXT") != std::string::npos && name.rfind("shadow", 0) != 0 && !c.ext("GL_EXT_shader_texture_lod")) {
+        if (name.find("EXT") != std::string::npos && name.rfind("shadow", 0) != 0 && !c.ext("GL_EXT_shader_texture_lod") &&
+            !c.lenientAllows("extension_not_enabled")) {
             why = "needs GL_EXT_shader_texture_lod";
             return std::nullopt;
         }
-        if (shadow && !c.ext("GL_EXT_shadow_samplers")) {
+        if (shadow && !c.ext("GL_EXT_shadow_samplers") && !c.lenientAllows("extension_not_enabled")) {
             why = "needs GL_EXT_shadow_samplers";
             return std::nullopt;
         }
@@ -470,6 +471,13 @@ static std::optional<T> textureSig(const std::string& name, const TexCall& tc, c
         return std::nullopt;
     }
     if (s.ms && !tc.fetch && !tc.size) return std::nullopt;
+    // Not in the GLSL ES 3.00 / 3.10 tables (3.20 and the shadow cube / array extensions add them).
+    if (!tc.legacy && !tc.gather && c.version < 320 && s.shadow && !tc.size) {
+        const bool arr = s.dim == SDim::D2Array, cube = s.dim == SDim::Cube;
+        if (((arr || cube) && tc.lod) || (arr && tc.offset) || (arr && !tc.lod && !tc.grad && a.size() > 2)) {
+            if (!c.lenientAllows("shadow_overload")) return std::nullopt;
+        }
+    }
     // samplerBuffer: only texelFetch(sampler, int) and textureSize(sampler) (no lod, no filtering).
     if (s.dim == SDim::Buffer) {
         if (tc.size) return a.size() == 1 ? std::optional<T>(I()) : std::nullopt;

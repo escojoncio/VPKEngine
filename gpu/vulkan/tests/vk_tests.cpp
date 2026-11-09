@@ -19,10 +19,15 @@
 #include <vector>
 
 #include "commands.h"
+#include "vpgpu/core/archive_harvest.h"
 #include "foveation.h"
 #include "perf.h"
 #include "taa_native.h"
 #include <cmath>
+#include <condition_variable>
+#include <mutex>
+
+#include "texdecode.h"
 #include "vpvk.h"
 
 using namespace vpvk;
@@ -82,6 +87,8 @@ void testExports() {
   CHECK(gipa && dlsym(h, "vkGetDeviceProcAddr") && dlsym(h, "vk_icdGetInstanceProcAddr"));
   CHECK(dlsym(h, "vkCmdCopyBufferToImage") != nullptr);  // kl_vulkan.c dlsyms some vkCmd* directly
   CHECK(dlsym(h, "vkGetMTLTextureMVK") != nullptr);      // klvk_overlay_mtl_texture (MoltenVK API)
+  if (auto dump = reinterpret_cast<void (*)()>(dlsym(h, "vpvk_dump_pending"))) dump();  // no live device in that copy: silent
+  else CHECK(false);
   CHECK(dlsym(h, "vpvk_msaa_detected") && dlsym(h, "vpvk_msaa_device_max") && dlsym(h, "vpvk_config_set_msaa_override"));
   CHECK(dlsym(h, "_ZN4vpvk6lookupEPKcb") == nullptr);   // internals stay hidden
   {  // memory trim / UI mask exports: without a live device they answer 0 / NULL and leave out clean
@@ -90,6 +97,14 @@ void testExports() {
     CHECK(trim && mask);
     char out[16] = "x";
     CHECK(trim(2, out, sizeof out) == 0 && out[0] == 0 && trim(1, nullptr, 0) == 0);
+    {  // light memory line for a periodic telemetry thread: no device -> 0 and the buffer untouched; null/0 cap safe
+      auto brief = reinterpret_cast<size_t (*)(char*, size_t)>(dlsym(h, "vpvk_mem_brief"));
+      CHECK(brief);
+      if (brief) {
+        char b[16] = "x";
+        CHECK(brief(b, sizeof b) == 0 && b[0] == 'x' && brief(nullptr, 0) == 0 && brief(b, 0) == 0);
+      }
+    }
     int w = 7, hh = 7, sl = 7;
     CHECK(mask(0, &w, &hh, &sl) == nullptr && w == 0 && hh == 0 && sl == 0);
     CHECK(mask(2, nullptr, nullptr, nullptr) == nullptr);
@@ -154,6 +169,32 @@ struct Ctx {
   vpgpu::Device& gpu() { return *from<Device>(dev)->gpu; }
 };
 
+// The driver's log has no sink (vpvk::log writes to stderr): what fn makes it write, read back from a temporary file that stands in for fd 2.
+std::string captureStderr(const std::function<void()>& fn) {
+  std::fflush(stderr);
+  char path[] = "/tmp/vpvk_stderr_XXXXXX";
+  const int fd = mkstemp(path);
+  const int saved = dup(2);
+  dup2(fd, 2);
+  fn();
+  std::fflush(stderr);
+  dup2(saved, 2);
+  close(saved);
+  std::string out;
+  char buf[4096];
+  lseek(fd, 0, SEEK_SET);
+  for (ssize_t n; (n = read(fd, buf, sizeof buf)) > 0;) out.append(buf, size_t(n));
+  close(fd);
+  unlink(path);
+  return out;
+}
+
+size_t countOf(const std::string& text, const std::string& needle) {
+  size_t n = 0;
+  for (size_t at = text.find(needle); at != std::string::npos; at = text.find(needle, at + 1)) ++n;
+  return n;
+}
+
 void testPhysical() {
   vpvk_config_set_quest_identity(1);  // asserts the Quest 3 / Adreno 740 profile: opt-in
   Ctx c;
@@ -185,11 +226,12 @@ void testPhysical() {
   CHECK(fp.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT);
   vkGetPhysicalDeviceFormatProperties(c.pd, VK_FORMAT_ASTC_8x6_SRGB_BLOCK, &fp);
   CHECK(fp.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT);  // every ASTC block size
-  // No BCn at all (Adreno 740): the format and the feature are both absent.
+  // BCn as the Adreno 740 reports it: sampled, filtered, blit source, transfers (the platform samples it).
   vkGetPhysicalDeviceFormatProperties(c.pd, VK_FORMAT_BC1_RGBA_UNORM_BLOCK, &fp);
-  CHECK(fp.optimalTilingFeatures == 0 && fp.bufferFeatures == 0);
+  CHECK((fp.optimalTilingFeatures & (VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT | VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT)) ==
+        (VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT | VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT));
   vkGetPhysicalDeviceFormatProperties(c.pd, VK_FORMAT_BC7_SRGB_BLOCK, &fp);
-  CHECK(fp.optimalTilingFeatures == 0);
+  CHECK(fp.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT);
   // Mandatory atomics on R32 integer storage images and texel buffers.
   for (VkFormat af : {VK_FORMAT_R32_UINT, VK_FORMAT_R32_SINT}) {
     vkGetPhysicalDeviceFormatProperties(c.pd, af, &fp);
@@ -205,6 +247,23 @@ void testPhysical() {
   CHECK(vkGetPhysicalDeviceImageFormatProperties(c.pd, VK_FORMAT_R8G8B8A8_SRGB, VK_IMAGE_TYPE_2D,
                                                  VK_IMAGE_TILING_OPTIMAL, VK_IMAGE_USAGE_STORAGE_BIT, 0,
                                                  &ip) == VK_ERROR_FORMAT_NOT_SUPPORTED);
+  // EXTENDED_USAGE + MUTABLE_FORMAT: storage is valid on the sRGB image through a compatible UNORM view (no format list);
+  // a format without a compatible one that supports the usage stays refused.
+  CHECK(vkGetPhysicalDeviceImageFormatProperties(c.pd, VK_FORMAT_R8G8B8A8_SRGB, VK_IMAGE_TYPE_2D, VK_IMAGE_TILING_OPTIMAL,
+                                                 VK_IMAGE_USAGE_STORAGE_BIT,
+                                                 VK_IMAGE_CREATE_EXTENDED_USAGE_BIT | VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT,
+                                                 &ip) == VK_SUCCESS);
+  CHECK(vkGetPhysicalDeviceImageFormatProperties(c.pd, VK_FORMAT_R8G8B8A8_SRGB, VK_IMAGE_TYPE_2D, VK_IMAGE_TILING_OPTIMAL,
+                                                 VK_IMAGE_USAGE_STORAGE_BIT, VK_IMAGE_CREATE_EXTENDED_USAGE_BIT,
+                                                 &ip) == VK_ERROR_FORMAT_NOT_SUPPORTED);
+  {
+    VkPhysicalDeviceImageFormatInfo2 info{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_FORMAT_INFO_2};
+    VkImageFormatProperties2 ip2{VK_STRUCTURE_TYPE_IMAGE_FORMAT_PROPERTIES_2};
+    info.format = VK_FORMAT_R8G8B8A8_SRGB, info.type = VK_IMAGE_TYPE_2D, info.tiling = VK_IMAGE_TILING_OPTIMAL;
+    info.usage = VK_IMAGE_USAGE_STORAGE_BIT;
+    info.flags = VK_IMAGE_CREATE_EXTENDED_USAGE_BIT | VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
+    CHECK(vkGetPhysicalDeviceImageFormatProperties2(c.pd, &info, &ip2) == VK_SUCCESS);
+  }
   // Extension enumeration and device creation with the VR set.
   uint32_t n = 0;
   vkEnumerateDeviceExtensionProperties(c.pd, nullptr, &n, nullptr);
@@ -409,7 +468,7 @@ void testMemory() {
     vkDestroyImage(c.dev, li, nullptr);
     vkFreeMemory(c.dev, lazy, nullptr);
   }
-  CHECK(image(c, VK_FORMAT_BC1_RGBA_UNORM_BLOCK, 64, 1, VK_IMAGE_USAGE_SAMPLED_BIT, 0) == VK_NULL_HANDLE);
+  CHECK(image(c, VK_FORMAT_BC1_RGBA_UNORM_BLOCK, 64, 1, VK_IMAGE_USAGE_SAMPLED_BIT, 0) != VK_NULL_HANDLE);
   {
     // Non-square ASTC: rows are counted in block heights (8x6 over 64x64 -> 8 x 11 blocks of 16 bytes).
     VkImage a = image(c, VK_FORMAT_ASTC_8x6_UNORM_BLOCK, 64, 1, VK_IMAGE_USAGE_SAMPLED_BIT, 0);
@@ -594,7 +653,7 @@ void testPasses() {
 
   CHECK(toStore(VK_ATTACHMENT_STORE_OP_NONE, false) == vpgpu::StoreAction::Store);  // NONE keeps contents
   CHECK(toStore(VK_ATTACHMENT_STORE_OP_DONT_CARE, true) == vpgpu::StoreAction::Resolve);
-  CHECK(toLoad(VK_ATTACHMENT_LOAD_OP_NONE_KHR) == vpgpu::LoadAction::DontCare);
+  CHECK(toLoad(VK_ATTACHMENT_LOAD_OP_NONE_KHR) == vpgpu::LoadAction::Load);  // NONE keeps the contents
 }
 
 // Upload + clear + copies through vkQueueSubmit, fences, and the deferred list reaching the core.
@@ -1115,6 +1174,24 @@ void testVertexStores() {
   unsetenv("VPVK_EXTRA_EXTENSIONS");
 }
 
+// VPVK_QUEST_GPU_NAME names the Adreno of the Quest identity (the host presents a Quest 2 as "Adreno (TM) 650"): only the
+// name changes, vendor / device id / limits stay the profile's. Properties are latched at the first query, so ctest runs
+// this group twice: without the variable (740) and with it (gpu_vulkan.quest_gpu_name_650).
+void testQuestGpuName() {
+  vpvk_config_set_quest_identity(1);
+  const char* env = getenv("VPVK_QUEST_GPU_NAME");
+  const char* want = env && *env ? env : "Adreno (TM) 740";
+  Ctx c;
+  CHECK(c.dev != nullptr);
+  VkPhysicalDeviceProperties p;
+  vkGetPhysicalDeviceProperties(c.pd, &p);
+  VkPhysicalDeviceProperties2 p2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
+  vkGetPhysicalDeviceProperties2(c.pd, &p2);
+  CHECK(std::strcmp(p.deviceName, want) == 0);
+  CHECK(std::strcmp(p2.properties.deviceName, want) == 0);
+  CHECK(p.vendorID == 0x5143 && p.deviceID == 0x43051401 && p.limits.maxPerStageDescriptorSamplers == 16);
+}
+
 // Default identity (no Quest identity): what the Apple GPU supports, honestly. The Adreno 740 profile is opt-in
 // (vpvk_config_set_quest_identity) and read per query, so a host may choose it after the device exists.
 void testNativeIdentity() {
@@ -1188,6 +1265,38 @@ void testNativeIdentity() {
   VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &f13};
   vkGetPhysicalDeviceFeatures2(c.pd, &f2);
   CHECK(f13.dynamicRendering && f13.synchronization2);
+  {  // Vulkan 1.3 mandatory features of the Quest 3 (info.device_mandatory_features), through the Vulkan 1.2/1.3 and the extension structs
+    VkPhysicalDeviceVulkan12Features f12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
+    VkPhysicalDeviceShaderSubgroupExtendedTypesFeatures set{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_SUBGROUP_EXTENDED_TYPES_FEATURES, &f12};
+    VkPhysicalDeviceImageRobustnessFeatures irf{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_ROBUSTNESS_FEATURES, &set};
+    VkPhysicalDevicePipelineCreationCacheControlFeatures pcc{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_CREATION_CACHE_CONTROL_FEATURES, &irf};
+    VkPhysicalDeviceShaderIntegerDotProductFeatures idp{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_INTEGER_DOT_PRODUCT_FEATURES, &pcc};
+    VkPhysicalDeviceZeroInitializeWorkgroupMemoryFeatures zi{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ZERO_INITIALIZE_WORKGROUP_MEMORY_FEATURES, &idp};
+    VkPhysicalDeviceFeatures2 fm{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &zi};
+    vkGetPhysicalDeviceFeatures2(c.pd, &fm);
+    CHECK(set.shaderSubgroupExtendedTypes && f12.shaderSubgroupExtendedTypes);
+    CHECK(irf.robustImageAccess && f13.robustImageAccess);
+    CHECK(pcc.pipelineCreationCacheControl && f13.pipelineCreationCacheControl);
+    CHECK(idp.shaderIntegerDotProduct && f13.shaderIntegerDotProduct);
+    CHECK(zi.shaderZeroInitializeWorkgroupMemory && f13.shaderZeroInitializeWorkgroupMemory);
+    CHECK(has(VK_KHR_SHADER_INTEGER_DOT_PRODUCT_EXTENSION_NAME) && has(VK_EXT_IMAGE_ROBUSTNESS_EXTENSION_NAME) &&
+          has(VK_EXT_PIPELINE_CREATION_CACHE_CONTROL_EXTENSION_NAME) && has(VK_KHR_ZERO_INITIALIZE_WORKGROUP_MEMORY_EXTENSION_NAME) &&
+          has(VK_KHR_SHADER_SUBGROUP_EXTENDED_TYPES_EXTENSION_NAME));
+    // Linear multi-planar 4:2:0: transfers only, one mip level and one layer.
+    VkFormatProperties pf;
+    vkGetPhysicalDeviceFormatProperties(c.pd, VK_FORMAT_G8_B8R8_2PLANE_420_UNORM, &pf);
+    CHECK((pf.linearTilingFeatures & (VK_FORMAT_FEATURE_TRANSFER_SRC_BIT | VK_FORMAT_FEATURE_TRANSFER_DST_BIT)) ==
+          (VK_FORMAT_FEATURE_TRANSFER_SRC_BIT | VK_FORMAT_FEATURE_TRANSFER_DST_BIT));
+    VkImageFormatProperties lp{};
+    CHECK(vkGetPhysicalDeviceImageFormatProperties(c.pd, VK_FORMAT_G8_B8R8_2PLANE_420_UNORM, VK_IMAGE_TYPE_2D,
+                                                   VK_IMAGE_TILING_LINEAR,
+                                                   VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, 0,
+                                                   &lp) == VK_SUCCESS &&
+          lp.maxMipLevels == 1 && lp.maxArrayLayers == 1);
+    CHECK(vkGetPhysicalDeviceImageFormatProperties(c.pd, VK_FORMAT_G8_B8R8_2PLANE_420_UNORM, VK_IMAGE_TYPE_2D,
+                                                   VK_IMAGE_TILING_LINEAR, VK_IMAGE_USAGE_SAMPLED_BIT, 0, &lp) ==
+          VK_ERROR_FORMAT_NOT_SUPPORTED);
+  }
   // Explicit VPVK_EXTRA_EXTENSIONS=0 turns the extras off even here; the API version stays 1.3.
   setenv("VPVK_EXTRA_EXTENSIONS", "0", 1);
   vkGetPhysicalDeviceProperties(c.pd, &p);
@@ -1197,7 +1306,7 @@ void testNativeIdentity() {
   // Chosen late (the device exists): the next query answers as the Quest 3.
   vpvk_config_set_quest_identity(1);
   vkGetPhysicalDeviceProperties(c.pd, &p);
-  CHECK(p.vendorID == 0x5143 && std::strcmp(p.deviceName, "Adreno (TM) 740") == 0 && p.apiVersion == VK_API_VERSION_1_1);
+  CHECK(p.vendorID == 0x5143 && std::strcmp(p.deviceName, "Adreno (TM) 740") == 0 && p.apiVersion == VK_API_VERSION_1_3);
   CHECK(p.limits.maxPerStageDescriptorSamplers == 16);
   // Quest identity: none of the phase 1b extensions, not even with VPVK_EXTRA_EXTENSIONS=1.
   for (const char* v : {"0", "1"}) {
@@ -1213,18 +1322,18 @@ void testNativeIdentity() {
   }
   unsetenv("VPVK_EXTRA_EXTENSIONS");
   vkGetPhysicalDeviceFeatures(c.pd, &f);
-  CHECK(!f.textureCompressionBC);
+  CHECK(f.textureCompressionBC);
   vpvk_config_set_quest_identity(0);
 }
 
 // The Adreno 740 identity seen through Properties2 / Features2 (Vulkan 1.1/1.2/1.3 structs,
 // driver properties) and the VP_ANDROID_baseline_2022 extensions. What the CTS has not validated
-// (shaderInt16, draw parameters, the 1.2/1.3 extensions and structs) answers only with
-// VPVK_EXTRA_EXTENSIONS=1; games see the pre-profile answers.
+// (shaderInt16, draw parameters, the 1.2/1.3 extensions and structs) answers the same for games and for the CTS.
 void testProfile() {
   vpvk_config_set_quest_identity(1);  // asserts the Quest 3 / Adreno 740 profile: opt-in
   unsetenv("VPVK_EXTRA_EXTENSIONS");
   {
+    // One profile: without VPVK_EXTRA_EXTENSIONS (a game) the answers are the conformance run's, and the variable is ignored.
     Ctx g;
     VkPhysicalDeviceShaderDrawParametersFeatures dp{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_DRAW_PARAMETERS_FEATURES};
     VkPhysicalDeviceVulkan12Features f12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES, &dp};
@@ -1232,10 +1341,9 @@ void testProfile() {
     VkPhysicalDeviceTimelineSemaphoreFeatures tl{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES, &f13};
     VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &tl};
     vkGetPhysicalDeviceFeatures2(g.pd, &f2);
-    CHECK(!f2.features.shaderInt16 && !f2.features.vertexPipelineStoresAndAtomics);
-    CHECK(!dp.shaderDrawParameters && !tl.timelineSemaphore && !f12.drawIndirectCount && !f13.dynamicRendering);
-    CHECK(f2.features.robustBufferAccess && !f2.features.textureCompressionBC);
-    // Games see Vulkan 1.1; the conformance run sees 1.3 (below).
+    CHECK(f2.features.shaderInt16 && f2.features.vertexPipelineStoresAndAtomics);
+    CHECK(dp.shaderDrawParameters && tl.timelineSemaphore && f12.drawIndirectCount && f13.dynamicRendering);
+    CHECK(f2.features.robustBufferAccess && f2.features.textureCompressionBC);
     VkPhysicalDeviceProperties gp;
     vkGetPhysicalDeviceProperties(g.pd, &gp);
     uint32_t iv = 0;
@@ -1243,21 +1351,26 @@ void testProfile() {
     VkPhysicalDeviceDriverProperties gd{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES};
     VkPhysicalDeviceProperties2 gp2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &gd};
     vkGetPhysicalDeviceProperties2(g.pd, &gp2);
-    CHECK(gp.apiVersion == VK_API_VERSION_1_1 && iv == VK_API_VERSION_1_1);
-    CHECK(gd.conformanceVersion.major == 1 && gd.conformanceVersion.minor == 1);
+    CHECK(gp.apiVersion == VK_API_VERSION_1_3 && iv == VK_API_VERSION_1_3);
+    CHECK(gd.conformanceVersion.major == 1 && gd.conformanceVersion.minor == 3 && gd.conformanceVersion.patch == 6);
     uint32_t n = 0;
     vkEnumerateDeviceExtensionProperties(g.pd, nullptr, &n, nullptr);
     std::vector<VkExtensionProperties> e(n);
     vkEnumerateDeviceExtensionProperties(g.pd, nullptr, &n, e.data());
-    bool hidden = true, base = false;
-    for (const auto& x : e) {
+    int listed = 0;
+    for (const auto& x : e)
       for (const char* h : {VK_KHR_SHADER_DRAW_PARAMETERS_EXTENSION_NAME, VK_KHR_DYNAMIC_RENDERING_EXTENSION_NAME,
                             VK_KHR_TIMELINE_SEMAPHORE_EXTENSION_NAME, VK_KHR_SYNCHRONIZATION_2_EXTENSION_NAME,
-                            VK_EXT_MULTI_DRAW_EXTENSION_NAME})
-        if (!std::strcmp(x.extensionName, h)) hidden = false;
-      if (!std::strcmp(x.extensionName, VK_KHR_MAINTENANCE_2_EXTENSION_NAME)) base = true;
-    }
-    CHECK(hidden && base);
+                            VK_KHR_MAINTENANCE_2_EXTENSION_NAME})
+        if (!std::strcmp(x.extensionName, h)) ++listed;
+    CHECK(listed == 5);
+    // VPVK_EXTRA_EXTENSIONS=0 has no effect with the Quest identity.
+    setenv("VPVK_EXTRA_EXTENSIONS", "0", 1);
+    VkPhysicalDeviceProperties zp;
+    vkGetPhysicalDeviceProperties(g.pd, &zp);
+    vkGetPhysicalDeviceFeatures2(g.pd, &f2);
+    CHECK(zp.apiVersion == VK_API_VERSION_1_3 && f13.dynamicRendering && tl.timelineSemaphore);
+    unsetenv("VPVK_EXTRA_EXTENSIONS");
   }
   setenv("VPVK_EXTRA_EXTENSIONS", "1", 1);
   Ctx c;
@@ -1346,7 +1459,7 @@ void testProfile() {
   VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &f13};
   vkGetPhysicalDeviceFeatures2(c.pd, &f2);
   CHECK(f2.features.shaderInt16 && f2.features.shaderStorageImageArrayDynamicIndexing);
-  CHECK(!f2.features.textureCompressionBC && f2.features.textureCompressionASTC_LDR);
+  CHECK(f2.features.textureCompressionBC && f2.features.textureCompressionASTC_LDR);
   CHECK(dp.shaderDrawParameters && f11.shaderDrawParameters && f11.multiview);
   CHECK(f11.samplerYcbcrConversion && f11.variablePointersStorageBuffer && !f11.variablePointers && f11.storageBuffer16BitAccess && !f11.storageInputOutput16);
   CHECK(f12.timelineSemaphore && f12.scalarBlockLayout && f12.drawIndirectCount && f12.bufferDeviceAddress && !f12.bufferDeviceAddressCaptureReplay);
@@ -1488,6 +1601,107 @@ void testPipelinePolicy() {
 // Host-side Vulkan 1.3 pieces behind the CTS gate: private data, maintenance4 requirements,
 // imageless framebuffers (views from VkRenderPassAttachmentBeginInfo), subgroup size control and
 // B4G4R4A4 (ABGR4 with R/B swapped; only its mandatory features). Hidden from games.
+// Quest identity = one profile: the extensions and feature structs that were added for Quest 3 parity are all there,
+// with no environment switch. Each entry is a feature the driver implements (see the comments in physical_device.cpp).
+void testQuestExtras() {
+  vpvk_config_set_quest_identity(1);
+  unsetenv("VPVK_EXTRA_EXTENSIONS");
+  Ctx c;
+  uint32_t n = 0;
+  vkEnumerateDeviceExtensionProperties(c.pd, nullptr, &n, nullptr);
+  std::vector<VkExtensionProperties> e(n);
+  vkEnumerateDeviceExtensionProperties(c.pd, nullptr, &n, e.data());
+  auto has = [&](const char* name) {
+    for (const auto& x : e)
+      if (std::strcmp(x.extensionName, name) == 0) return true;
+    return false;
+  };
+  for (const char* name :
+       {VK_KHR_SHADER_TERMINATE_INVOCATION_EXTENSION_NAME, VK_KHR_FORMAT_FEATURE_FLAGS_2_EXTENSION_NAME,
+        VK_KHR_RELAXED_BLOCK_LAYOUT_EXTENSION_NAME, VK_EXT_PIPELINE_CREATION_FEEDBACK_EXTENSION_NAME,
+        VK_EXT_TOOLING_INFO_EXTENSION_NAME, VK_EXT_LOAD_STORE_OP_NONE_EXTENSION_NAME,
+        VK_KHR_SHADER_NON_SEMANTIC_INFO_EXTENSION_NAME, VK_KHR_SPIRV_1_4_EXTENSION_NAME,
+        VK_KHR_SHADER_FLOAT_CONTROLS_EXTENSION_NAME, VK_EXT_TEXEL_BUFFER_ALIGNMENT_EXTENSION_NAME,
+        VK_EXT_DEPTH_CLIP_ENABLE_EXTENSION_NAME, VK_EXT_VERTEX_ATTRIBUTE_DIVISOR_EXTENSION_NAME,
+        VK_EXT_ASTC_DECODE_MODE_EXTENSION_NAME})
+    CHECK(has(name));
+  CHECK(!has(VK_EXT_FRAGMENT_DENSITY_MAP_EXTENSION_NAME) && !has(VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME));
+
+  VkPhysicalDeviceTexelBufferAlignmentFeaturesEXT tba{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TEXEL_BUFFER_ALIGNMENT_FEATURES_EXT};
+  VkPhysicalDeviceDepthClipEnableFeaturesEXT dce{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_CLIP_ENABLE_FEATURES_EXT, &tba};
+  VkPhysicalDeviceVertexAttributeDivisorFeaturesEXT vad{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_ATTRIBUTE_DIVISOR_FEATURES_EXT, &dce};
+  VkPhysicalDeviceASTCDecodeFeaturesEXT astc{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ASTC_DECODE_FEATURES_EXT, &vad};
+  VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &astc};
+  vkGetPhysicalDeviceFeatures2(c.pd, &f2);
+  CHECK(tba.texelBufferAlignment && dce.depthClipEnable);
+  CHECK(vad.vertexAttributeInstanceRateDivisor && vad.vertexAttributeInstanceRateZeroDivisor);
+  CHECK(!astc.decodeModeSharedExponent);
+  VkPhysicalDeviceVertexAttributeDivisorPropertiesEXT vap{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_ATTRIBUTE_DIVISOR_PROPERTIES_EXT};
+  VkPhysicalDeviceProperties2 p2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &vap};
+  vkGetPhysicalDeviceProperties2(c.pd, &p2);
+  CHECK(vap.maxVertexAttribDivisor == 65535);
+  {
+    // Subgroup operations the translator implements (arithmetic / clustered: vpir subgroup_arith).
+    VkPhysicalDeviceSubgroupProperties sgp{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES};
+    VkPhysicalDeviceProperties2 sp2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &sgp};
+    vkGetPhysicalDeviceProperties2(c.pd, &sp2);
+    const VkSubgroupFeatureFlags want = VK_SUBGROUP_FEATURE_BASIC_BIT | VK_SUBGROUP_FEATURE_VOTE_BIT |
+                                        VK_SUBGROUP_FEATURE_BALLOT_BIT | VK_SUBGROUP_FEATURE_SHUFFLE_BIT |
+                                        VK_SUBGROUP_FEATURE_SHUFFLE_RELATIVE_BIT | VK_SUBGROUP_FEATURE_QUAD_BIT |
+                                        VK_SUBGROUP_FEATURE_ARITHMETIC_BIT | VK_SUBGROUP_FEATURE_CLUSTERED_BIT;
+    CHECK(sgp.supportedOperations == want && sgp.subgroupSize == 32);
+    // Timestamps are host nanoseconds divided by the period: Adreno's 19.2 MHz tick under the Quest identity.
+    CHECK(std::fabs(p2.properties.limits.timestampPeriod - 52.083336f) < 1e-3f);
+    CHECK(p2.properties.limits.maxStorageBufferRange == 134217728u);
+  }
+  {
+    // The divisor is part of the stage key (a different divisor is a different translation); divisor 1 keeps the old bytes.
+    StageInput a;
+    a.spirv = 1, a.opt.vertexBuffers = {{0, 16, true, 3}};
+    const uint64_t h1 = a.hash();
+    StageInput b = a;
+    b.opt.vertexBuffers[0].divisor = 4;
+    StageInput z = a;
+    z.opt.vertexBuffers[0].divisor = 0;
+    CHECK(h1 != b.hash() && h1 != z.hash() && b.hash() != z.hash());
+    b.opt.vertexBuffers[0].divisor = 1;
+    CHECK(h1 == b.hash());
+  }
+  {
+    // Formats added for Quest parity.
+    const VkFormatFeatureFlags colour = VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT | VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT |
+                                        VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT | VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT |
+                                        VK_FORMAT_FEATURE_BLIT_SRC_BIT | VK_FORMAT_FEATURE_BLIT_DST_BIT;
+    VkFormatProperties fp;
+    for (VkFormat f : {VK_FORMAT_R8_SRGB, VK_FORMAT_R8G8_SRGB}) {
+      vkGetPhysicalDeviceFormatProperties(c.pd, f, &fp);
+      CHECK((fp.optimalTilingFeatures & colour) == colour && !(fp.optimalTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT));
+      VkImageFormatProperties ip;
+      CHECK(vkGetPhysicalDeviceImageFormatProperties(c.pd, f, VK_IMAGE_TYPE_2D, VK_IMAGE_TILING_OPTIMAL,
+                                                     VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, 0, &ip) == VK_SUCCESS);
+    }
+    // A2R10G10B10 is the R/B-swapped twin of A2B10G10R10: sampled and transferred (the unorm one also filtered), not rendered.
+    vkGetPhysicalDeviceFormatProperties(c.pd, VK_FORMAT_A2R10G10B10_UNORM_PACK32, &fp);
+    CHECK((fp.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT) &&
+          (fp.optimalTilingFeatures & VK_FORMAT_FEATURE_BLIT_SRC_BIT) && !(fp.optimalTilingFeatures & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT));
+    vkGetPhysicalDeviceFormatProperties(c.pd, VK_FORMAT_B5G6R5_UNORM_PACK16, &fp);
+    CHECK((fp.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT) && !(fp.optimalTilingFeatures & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT));
+    vkGetPhysicalDeviceFormatProperties(c.pd, VK_FORMAT_A2R10G10B10_UINT_PACK32, &fp);
+    CHECK((fp.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT) &&
+          !(fp.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT));
+    // Linear tiling is the same texture: filtered sampling and blit sources, like Quest; depth stays out.
+    vkGetPhysicalDeviceFormatProperties(c.pd, VK_FORMAT_R8G8B8A8_UNORM, &fp);
+    CHECK((fp.linearTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT) &&
+          (fp.linearTilingFeatures & VK_FORMAT_FEATURE_BLIT_SRC_BIT) && !(fp.linearTilingFeatures & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT));
+    vkGetPhysicalDeviceFormatProperties(c.pd, VK_FORMAT_D32_SFLOAT, &fp);
+    CHECK(!(fp.linearTilingFeatures & VK_FORMAT_FEATURE_BLIT_SRC_BIT));
+    // BCn is offered (the Quest report lists BC1-7 as sampled).
+    vkGetPhysicalDeviceFormatProperties(c.pd, VK_FORMAT_BC7_UNORM_BLOCK, &fp);
+    CHECK(fp.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT);
+  }
+  vpvk_config_set_quest_identity(0);
+}
+
 void testProfile13() {
   vpvk_config_set_quest_identity(1);  // asserts the Quest 3 / Adreno 740 profile: opt-in
   unsetenv("VPVK_EXTRA_EXTENSIONS");
@@ -1495,11 +1709,11 @@ void testProfile13() {
     Ctx g;
     VkFormatProperties fp;
     vkGetPhysicalDeviceFormatProperties(g.pd, VK_FORMAT_B4G4R4A4_UNORM_PACK16, &fp);
-    CHECK(fp.optimalTilingFeatures == 0);
+    CHECK(fp.optimalTilingFeatures != 0);
     VkPhysicalDevicePrivateDataFeatures pdf{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRIVATE_DATA_FEATURES};
     VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &pdf};
     vkGetPhysicalDeviceFeatures2(g.pd, &f2);
-    CHECK(!pdf.privateData);
+    CHECK(pdf.privateData);
   }
   setenv("VPVK_EXTRA_EXTENSIONS", "1", 1);
   Ctx c({VK_EXT_PRIVATE_DATA_EXTENSION_NAME, VK_KHR_MAINTENANCE_4_EXTENSION_NAME,
@@ -1801,11 +2015,19 @@ void testRecipes() {
     RecipeStore s(dir2, 8);
     std::unique_ptr<Platform> platform = createPlatform();
     PrewarmResult r;
+    const std::vector<uint64_t> before = s.keys();  // keys under the old translator's MSL id
+    RecipeUse use;
+    PrewarmHooks hooks;
+    hooks.afterRefresh = [&] { use.setPrewarmed(s.keys()); };  // what vkCreateDevice does: the keys after the refresh
     {
       vpgpu::Device gpu(platform->backend(), 2, [](const std::string&) {});
-      r = prewarm(*platform, gpu.pipelines(), s, nullptr);
+      r = prewarm(*platform, gpu.pipelines(), s, nullptr, 0.0, hooks);
       CHECK(gpu.pipelines().status({key}) == vpgpu::PipelineCache::Status::Ready);
     }
+    CHECK(before.size() == 1 && before[0] != key);
+    CHECK(use.prewarmed == std::vector<uint64_t>({key}));  // the refreshed key, not the stale one
+    use.note(key, "cull");  // the key the runtime computes: a prewarmed one
+    CHECK(use.census() == " prewarmed_unused=0 requested_not_prewarmed=0 requested=1");
     CHECK(r.retranslated == 1 && r.recipes == 1 && r.failed == 0);
     vpgpu::PipelineState now;
     CHECK(s.keys().size() == 1 && s.stateFor(key, now) && now.computeShader == msl);
@@ -1846,6 +2068,244 @@ void testRecipes() {
   std::filesystem::remove_all(dir, ec);
 }
 
+// The keys a game gets back from vkGetPipelineCacheData (Unreal passes the blob to the next launch) must still name
+// recipes then: the same graphics pipeline made by a later launch, whose shader modules / layouts / render passes
+// have other handle values and are created in another order, has the same key, and the stored recipe resolves with
+// its shaders. (Device log, Into The Radius 2: 6998 keys in the blob, 1 of them found.)
+void recipeKeysScenario(bool async) {
+  char tmpl[] = "/tmp/vpvk_recipekeys_XXXXXX";
+  const char* dir = mkdtemp(tmpl);
+  CHECK(dir != nullptr);
+  if (!dir) return;
+  setenv("VP_PIPELINE_CACHE_DIR", dir, 1);
+  setenv("VPVK_ASYNC_PIPELINES", async ? "1" : "0", 1);
+  unsetenv("VPVK_REPORT_GEOM");
+  struct Run {
+    std::vector<uint64_t> keys;  // one per pipeline, in creation order
+    std::vector<uint8_t> blob;   // vkGetPipelineCacheData at the end
+    std::vector<uint64_t> shaderIds;
+    unsigned resolved = 0, withShaders = 0;  // blob keys the next launch's store resolves (stateFor, with the MSL)
+    bool allOk = true;
+  };
+  auto launch = [&](unsigned skew, const std::vector<uint8_t>* prevBlob) {
+    Run r;
+    Ctx c;
+    Device* d = from<Device>(c.dev);
+    if (prevBlob) {  // what the game does at startup: hands the saved blob back
+      VkPipelineCacheCreateInfo pci{VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO};
+      pci.initialDataSize = prevBlob->size(), pci.pInitialData = prevBlob->data();
+      VkPipelineCache pc;
+      CHECK(vkCreatePipelineCache(c.dev, &pci, nullptr, &pc) == VK_SUCCESS);
+      const uint32_t count = *reinterpret_cast<const uint32_t*>(prevBlob->data() + 36);
+      for (uint32_t i = 0; i < count; ++i) {
+        uint64_t k;
+        std::memcpy(&k, prevBlob->data() + 40 + size_t(i) * 8, 8);
+        vpgpu::PipelineState s;
+        std::vector<std::pair<uint64_t, ShaderBlob>> shaders;
+        uint64_t key = 0;
+        if (!d->recipes->resolve(k, key)) continue;
+        r.resolved += d->recipes->stateFor(key, s);
+        r.withShaders += d->recipes->stateFor(key, s, &shaders);
+      }
+      vkDestroyPipelineCache(c.dev, pc, nullptr);
+    }
+    // Objects the game made first: later handles / ids / counters differ from the previous launch.
+    std::vector<VkShaderModule> junkModules;
+    std::vector<VkRenderPass> junkPasses;
+    std::vector<VkPipelineLayout> junkLayouts;
+    for (unsigned i = 0; i < skew; ++i) {
+      junkModules.push_back(module(c, i % 2 ? "solid.frag.spv" : "uimask.frag.spv"));
+      VkPipelineLayoutCreateInfo jl{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+      VkPipelineLayout l;
+      vkCreatePipelineLayout(c.dev, &jl, nullptr, &l);
+      junkLayouts.push_back(l);
+    }
+    auto makePass = [&](VkFormat fmt) {
+      VkAttachmentDescription att{};
+      att.format = fmt, att.samples = VK_SAMPLE_COUNT_1_BIT;
+      att.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR, att.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+      VkAttachmentReference cref{0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
+      VkSubpassDescription sp{};
+      sp.colorAttachmentCount = 1, sp.pColorAttachments = &cref;
+      VkRenderPassCreateInfo rpi{VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO};
+      rpi.attachmentCount = 1, rpi.pAttachments = &att, rpi.subpassCount = 1, rpi.pSubpasses = &sp;
+      VkRenderPass rp;
+      vkCreateRenderPass(c.dev, &rpi, nullptr, &rp);
+      return rp;
+    };
+    for (unsigned i = 0; i < skew; ++i) junkPasses.push_back(makePass(VK_FORMAT_R16G16B16A16_SFLOAT));
+    VkRenderPass rp[2] = {makePass(VK_FORMAT_R8G8B8A8_UNORM), makePass(VK_FORMAT_B8G8R8A8_SRGB)};
+    VkPipelineLayoutCreateInfo plci{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    VkPipelineLayout pl;
+    vkCreatePipelineLayout(c.dev, &plci, nullptr, &pl);
+    VkShaderModule vs = module(c, "uimask.vert.spv"), fs = module(c, "uimask.frag.spv");
+    VkPipelineShaderStageCreateInfo stg[2]{{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO},
+                                           {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO}};
+    stg[0].stage = VK_SHADER_STAGE_VERTEX_BIT, stg[0].module = vs, stg[0].pName = "main";
+    stg[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT, stg[1].module = fs, stg[1].pName = "main";
+    VkPipelineVertexInputStateCreateInfo vis{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+    VkPipelineInputAssemblyStateCreateInfo ias{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
+    ias.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    VkPipelineRasterizationStateCreateInfo rs{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
+    rs.lineWidth = 1;
+    VkPipelineMultisampleStateCreateInfo ms{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
+    ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+    VkPipelineColorBlendAttachmentState cba{};
+    cba.colorWriteMask = 0xF;
+    VkPipelineColorBlendStateCreateInfo cbs{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
+    cbs.attachmentCount = 1, cbs.pAttachments = &cba;
+    VkViewport vp{0, 0, 64, 64, 0, 1};
+    VkRect2D sc{{0, 0}, {64, 64}};
+    VkPipelineViewportStateCreateInfo vps{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
+    vps.viewportCount = 1, vps.pViewports = &vp, vps.scissorCount = 1, vps.pScissors = &sc;
+    VkGraphicsPipelineCreateInfo gp{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
+    gp.stageCount = 2, gp.pStages = stg, gp.pVertexInputState = &vis, gp.pInputAssemblyState = &ias;
+    gp.pViewportState = &vps, gp.pRasterizationState = &rs, gp.pMultisampleState = &ms, gp.pColorBlendState = &cbs;
+    gp.layout = pl;
+    std::vector<VkPipeline> pipes;
+    for (int variant = 0; variant < 4; ++variant) {  // render pass format x blend
+      gp.renderPass = rp[variant & 1];
+      cba.blendEnable = variant >> 1;
+      cba.srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA, cba.dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+      VkPipeline p;
+      CHECK(vkCreateGraphicsPipelines(c.dev, VK_NULL_HANDLE, 1, &gp, nullptr, &p) == VK_SUCCESS);
+      const PipelineObj* po = from<PipelineObj>(p);
+      while (!po->resolved.load(std::memory_order_acquire)) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      r.allOk = r.allOk && po->ok;
+      r.keys.push_back(po->key.value);
+      r.shaderIds.push_back(po->state.vertexShader), r.shaderIds.push_back(po->state.fragmentShader);
+      pipes.push_back(p);
+    }
+    // A game-like pipeline: two descriptor sets, push constants, two vertex buffers, multiview, depth-less, dynamic viewport.
+    VkDescriptorSetLayoutBinding b0[7] = {
+        {0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_VERTEX_BIT, nullptr},
+        {1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr},
+        {2, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr},
+        {3, VK_DESCRIPTOR_TYPE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr},
+        {4, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr},
+        {5, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr},
+        {6, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr}};
+    VkDescriptorSetLayoutBinding b1 = {0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 1, VK_SHADER_STAGE_VERTEX_BIT, nullptr};
+    VkDescriptorSetLayoutCreateInfo lci{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+    VkDescriptorSetLayout sl[2];
+    lci.bindingCount = 7, lci.pBindings = b0;
+    vkCreateDescriptorSetLayout(c.dev, &lci, nullptr, &sl[0]);
+    lci.bindingCount = 1, lci.pBindings = &b1;
+    vkCreateDescriptorSetLayout(c.dev, &lci, nullptr, &sl[1]);
+    VkPushConstantRange pcr{VK_SHADER_STAGE_VERTEX_BIT, 0, 20};
+    VkPipelineLayoutCreateInfo plci2{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    plci2.setLayoutCount = 2, plci2.pSetLayouts = sl, plci2.pushConstantRangeCount = 1, plci2.pPushConstantRanges = &pcr;
+    VkPipelineLayout pl2;
+    vkCreatePipelineLayout(c.dev, &plci2, nullptr, &pl2);
+    const uint32_t mask = 0b11;
+    VkAttachmentDescription att{};
+    att.format = VK_FORMAT_R8G8B8A8_SRGB, att.samples = VK_SAMPLE_COUNT_1_BIT;
+    att.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR, att.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    VkAttachmentReference cref{0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
+    VkSubpassDescription sp{};
+    sp.colorAttachmentCount = 1, sp.pColorAttachments = &cref;
+    VkRenderPassMultiviewCreateInfo mv{VK_STRUCTURE_TYPE_RENDER_PASS_MULTIVIEW_CREATE_INFO};
+    mv.subpassCount = 1, mv.pViewMasks = &mask;
+    VkRenderPassCreateInfo rpi{VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO, &mv};
+    rpi.attachmentCount = 1, rpi.pAttachments = &att, rpi.subpassCount = 1, rpi.pSubpasses = &sp;
+    VkRenderPass rpMv;
+    vkCreateRenderPass(c.dev, &rpi, nullptr, &rpMv);
+    VkShaderModule vs2 = module(c, "mesh_multiview.vert.opt.spv"), fs2 = module(c, "lit.frag.opt.spv");
+    VkPipelineShaderStageCreateInfo stages[2] = {{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO},
+                                                 {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO}};
+    stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT, stages[0].module = vs2, stages[0].pName = "main";
+    stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT, stages[1].module = fs2, stages[1].pName = "main";
+    VkVertexInputBindingDescription vbd[2] = {{0, 32, VK_VERTEX_INPUT_RATE_VERTEX}, {1, 16, VK_VERTEX_INPUT_RATE_INSTANCE}};
+    VkVertexInputAttributeDescription vad[4] = {{0, 0, VK_FORMAT_R32G32B32_SFLOAT, 0},
+                                                {1, 0, VK_FORMAT_R8G8B8A8_SNORM, 12},
+                                                {2, 0, VK_FORMAT_R16G16_SFLOAT, 16},
+                                                {3, 1, VK_FORMAT_R32G32B32A32_SFLOAT, 0}};
+    VkPipelineVertexInputStateCreateInfo vis2{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+    vis2.vertexBindingDescriptionCount = 2, vis2.pVertexBindingDescriptions = vbd;
+    vis2.vertexAttributeDescriptionCount = 4, vis2.pVertexAttributeDescriptions = vad;
+    VkDynamicState dyn[2] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
+    VkPipelineDynamicStateCreateInfo dys{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
+    dys.dynamicStateCount = 2, dys.pDynamicStates = dyn;
+    VkGraphicsPipelineCreateInfo gp2 = gp;
+    gp2.pStages = stages, gp2.pVertexInputState = &vis2, gp2.pDynamicState = &dys, gp2.layout = pl2, gp2.renderPass = rpMv;
+    cba.blendEnable = VK_TRUE;
+    {
+      VkPipeline p;
+      CHECK(vkCreateGraphicsPipelines(c.dev, VK_NULL_HANDLE, 1, &gp2, nullptr, &p) == VK_SUCCESS);
+      const PipelineObj* po = from<PipelineObj>(p);
+      while (!po->resolved.load(std::memory_order_acquire)) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      r.allOk = r.allOk && po->ok;
+      r.keys.push_back(po->key.value);
+      r.shaderIds.push_back(po->state.vertexShader), r.shaderIds.push_back(po->state.fragmentShader);
+      pipes.push_back(p);
+    }
+    c.gpu().pipelines().waitIdle();
+    vkDestroyPipelineLayout(c.dev, pl2, nullptr);
+    vkDestroyDescriptorSetLayout(c.dev, sl[0], nullptr);
+    vkDestroyDescriptorSetLayout(c.dev, sl[1], nullptr);
+    vkDestroyRenderPass(c.dev, rpMv, nullptr);
+    vkDestroyShaderModule(c.dev, vs2, nullptr);
+    vkDestroyShaderModule(c.dev, fs2, nullptr);
+    size_t n = 0;
+    vkGetPipelineCacheData(c.dev, VK_NULL_HANDLE, &n, nullptr);
+    r.blob.resize(n);
+    vkGetPipelineCacheData(c.dev, VK_NULL_HANDLE, &n, r.blob.data());
+    for (VkPipeline p : pipes) vkDestroyPipeline(c.dev, p, nullptr);
+    vkDestroyShaderModule(c.dev, vs, nullptr);
+    vkDestroyShaderModule(c.dev, fs, nullptr);
+    vkDestroyPipelineLayout(c.dev, pl, nullptr);
+    for (VkRenderPass p : rp) vkDestroyRenderPass(c.dev, p, nullptr);
+    for (VkRenderPass p : junkPasses) vkDestroyRenderPass(c.dev, p, nullptr);
+    for (VkPipelineLayout l : junkLayouts) vkDestroyPipelineLayout(c.dev, l, nullptr);
+    for (VkShaderModule m : junkModules) vkDestroyShaderModule(c.dev, m, nullptr);
+    return r;
+  };
+  const Run first = launch(0, nullptr);
+  CHECK(first.allOk && first.keys.size() == 5);
+  const Run second = launch(5, &first.blob);
+  CHECK(second.allOk && second.keys == first.keys && second.shaderIds == first.shaderIds);
+  CHECK(second.resolved == first.keys.size() && second.withShaders == first.keys.size());
+  const Run third = launch(1, &second.blob);  // the file grew by nothing: the same recipes again
+  CHECK(third.keys == first.keys && third.resolved == first.keys.size() && third.withShaders == first.keys.size());
+  {  // a blob written before the identity existed holds pipeline keys: still resolved
+    std::vector<uint8_t> legacy(first.blob.begin(), first.blob.begin() + 40);
+    for (uint64_t k : first.keys) legacy.insert(legacy.end(), reinterpret_cast<const uint8_t*>(&k), reinterpret_cast<const uint8_t*>(&k) + 8);
+    const Run old = launch(0, &legacy);
+    CHECK(old.resolved == first.keys.size() && old.withShaders == first.keys.size());
+  }
+  {  // a translator bump retranslates the stored inputs: the MSL is the same, so every key still resolves
+    RecipeStore s(dir, kTranslatorVersion + 1);
+    CHECK(s.needsRefresh());
+    const RecipeStore::RefreshResult rr = s.refresh(2);
+    CHECK(rr.retranslated == 4 && rr.failed == 0 && rr.droppedPipelines == 0 && rr.sameMsl == 4);
+    vpgpu::PipelineState st;
+    for (uint64_t k : first.keys) CHECK(s.stateFor(k, st));
+    uint64_t key = 0;
+    for (const uint8_t* q = first.blob.data() + 40; q < first.blob.data() + first.blob.size(); q += 8) {
+      uint64_t id;
+      std::memcpy(&id, q, 8);
+      CHECK(s.resolve(id, key) && s.stateFor(key, st));
+    }
+  }
+  {  // a translator mode (VPVK_AMPLIFY) changes the MSL of the stored multiview vertex shader: the refresh re-keys that
+     // recipe, and the blob of the earlier launch still resolves every recipe, that one included
+    setenv("VPVK_AMPLIFY", "1", 1);
+    const Run amp = launch(2, &first.blob);
+    unsetenv("VPVK_AMPLIFY");
+    CHECK(amp.allOk && amp.keys.size() == 5);
+    CHECK(amp.keys[4] != first.keys[4]);  // the pipeline itself has another key now (another vertex shader)
+    CHECK(amp.resolved == first.keys.size() && amp.withShaders == first.keys.size());
+  }
+  unsetenv("VP_PIPELINE_CACHE_DIR");
+  setenv("VPVK_ASYNC_PIPELINES", "0", 1);
+  std::error_code ec;
+  std::filesystem::remove_all(dir, ec);
+}
+void testRecipeKeys() {
+  recipeKeysScenario(false);
+  recipeKeysScenario(true);
+}
+
 // Translator modes (VPVK_AMPLIFY, VPVK_FETCH_NATIVE): read from the environment, part of the recipe store's translator id
 // (a mode change retranslates the stored stages), and the stage interface keeps whether a vertex stage is amplified.
 void testTranslatorModes() {
@@ -1855,6 +2315,49 @@ void testTranslatorModes() {
   spirv::SpirvLowerOptions o;
   applyTranslatorMode(o);
   CHECK(!o.amplify && !o.nativeFetch && !o.unpackFetch && o.killExit);  // kill exit is on by default (mode bit = off)
+  CHECK(o.invariantPos);  // so is the invariant position (VPVK_INVARIANT_POS, mode bit 4 = off)
+  setenv("VPVK_INVARIANT_POS", "0", 1);
+  CHECK(refreshTranslatorMode() == 16 && translatorId() == (kTranslatorVersion | 16u << 16));
+  applyTranslatorMode(o);
+  CHECK(!o.invariantPos && o.killExit);
+  {  // the MSL a vertex shader gets through the recipe path: [[position, invariant]] unless the mode turns it off
+    const std::vector<uint32_t> w = spirvFile("pos.vert.spv");
+    std::string error;
+    std::shared_ptr<spirv::SpirvModule> m(spirv::parse(w.data(), w.size(), error), spirv::release);
+    CHECK(m != nullptr);
+    if (m) {
+      spirv::SpirvLowerOptions vo;
+      vo.entry = "main", vo.stage = vpir::Stage::Vertex;
+      uint64_t idOff = 0, idOn = 0;
+      ShaderBlob off, on;
+      CHECK(translateRecipeStage(*m, vo, idOff, off, error, nullptr));  // VPVK_INVARIANT_POS=0 still set
+      setenv("VPVK_INVARIANT_POS", "1", 1);
+      CHECK(refreshTranslatorMode() == 0);
+      CHECK(translateRecipeStage(*m, vo, idOn, on, error, nullptr));
+      CHECK(off.source.find("invariant") == std::string::npos);
+      CHECK(on.source.find("[[position, invariant]]") != std::string::npos && idOn != idOff);
+    }
+  }
+  setenv("VPVK_INVARIANT_POS", "1", 1);
+  CHECK(refreshTranslatorMode() == 0);
+  {  // strict parsing: only "0" / "off" / "false" (blanks around ignored) turn it off; anything else leaves it on
+    const struct { const char* v; uint32_t mode; } cases[] = {
+        {"", 0}, {"0", 16}, {"00", 0}, {"off", 16}, {" 0", 16}, {"0 ", 16}, {" false\t", 16}, {"1", 0}, {"x", 0}, {"OFF", 0}};
+    for (const auto& c : cases) {
+      setenv("VPVK_INVARIANT_POS", c.v, 1);
+      CHECK(refreshTranslatorMode() == c.mode);
+    }
+    setenv("VPVK_INVARIANT_POS", "0", 1);
+    setenv("VPSPV_KILL_EXIT", "0", 1);
+    CHECK(refreshTranslatorMode() == 24);  // both "off" bits
+    applyTranslatorMode(o);
+    CHECK(!o.invariantPos && !o.killExit);
+    unsetenv("VPSPV_KILL_EXIT");
+  }
+  unsetenv("VPVK_INVARIANT_POS");
+  CHECK(refreshTranslatorMode() == 0);
+  applyTranslatorMode(o);
+  CHECK(o.invariantPos);
   setenv("VPVK_AMPLIFY", "1", 1);
   CHECK(refreshTranslatorMode() == 2 && translatorId() == (kTranslatorVersion | 2u << 16));
   applyTranslatorMode(o);
@@ -1960,6 +2463,7 @@ void testTranslatorModes() {
   unsetenv("VPVK_AMPLIFY");
   unsetenv("VPVK_FETCH_NATIVE");
   unsetenv("VPSPV_KILL_EXIT");
+  unsetenv("VPVK_INVARIANT_POS");
   refreshTranslatorMode();
   std::error_code ec;
   std::filesystem::remove_all(dir, ec);
@@ -2174,6 +2678,7 @@ void testTaaNative() {
     for (float w : r.weights) sum += w;
     CHECK(near(sum, 1.0f) && r.base[0] == 0 && r.base[1] == 0 && r.nearest[0] == 0);
     CHECK(r.weights[4] > r.weights[3] && near(r.weights[3], r.weights[5]) && near(r.weights[0], r.weights[8]));
+    CHECK(near(r.weights[3] / r.weights[4], std::exp(-3.125f), 1e-4f));  // sigma 0.40
     const auto q = taa::reconstruction(0.4f, -0.45f);  // contenido 0.4 px a la derecha
     CHECK(q.base[0] == 0 && q.base[1] == 0 && q.weights[5] > q.weights[3] && q.weights[1] > q.weights[7]);
     const auto z = taa::reconstruction(0.6f, 0);
@@ -2417,6 +2922,7 @@ void testQueries() {
                                 VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT | VK_QUERY_RESULT_WAIT_BIT) ==
           VK_SUCCESS);
     CHECK(t[0] > 0 && t[2] > t[0] && t[1] == 1 && t[3] == 1);
+    CHECK((t[0] >> kTimestampValidBits) == 0 && (t[2] >> kTimestampValidBits) == 0);  // only the valid bits are set
     vkDestroyQueryPool(c.dev, tp, nullptr);
   }
   vkDestroyQueryPool(c.dev, qp, nullptr);
@@ -2542,6 +3048,383 @@ void testTimeline() {
   vkDestroyCommandPool(c.dev, pool, nullptr);
   vkDestroyBuffer(c.dev, b, nullptr);
   vkFreeMemory(c.dev, m, nullptr);
+}
+
+// Several VkQueues of the one family (Quest: queueCount 4, timestampValidBits 48): each keeps its own submission order,
+// a queue held back on a timeline wait does not hold back the others, and a wait on a value another queue signals later
+// is met once that queue's batch has run.
+void testQueues() {
+  Ctx c;
+  uint32_t nf = 0;
+  vkGetPhysicalDeviceQueueFamilyProperties(c.pd, &nf, nullptr);
+  VkQueueFamilyProperties qf{};
+  nf = 1;
+  vkGetPhysicalDeviceQueueFamilyProperties(c.pd, &nf, &qf);
+  CHECK(qf.queueCount == 4 && qf.timestampValidBits == 48);
+  VkQueue q[4];
+  for (uint32_t i = 0; i < 4; ++i) vkGetDeviceQueue(c.dev, 0, i, &q[i]);
+  CHECK(q[0] == c.queue && q[1] != q[0] && q[2] != q[1] && q[3] != q[2]);
+  VkQueue again;
+  vkGetDeviceQueue(c.dev, 0, 2, &again);
+  CHECK(again == q[2]);
+
+  VkCommandPoolCreateInfo pi{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+  VkCommandPool pool;
+  vkCreateCommandPool(c.dev, &pi, nullptr, &pool);
+  VkCommandBufferAllocateInfo ai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+  ai.commandPool = pool;
+  ai.commandBufferCount = 1;
+  VkDeviceMemory m = alloc(c, 1 << 16, 1);
+  VkBuffer b = buffer(c, 4096, m, 0);
+  VkCommandBuffer cb[4];
+  for (VkCommandBuffer& x : cb) {
+    vkAllocateCommandBuffers(c.dev, &ai, &x);
+    VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    vkBeginCommandBuffer(x, &bi);
+    vkCmdFillBuffer(x, b, 0, 256, 7);
+    vkEndCommandBuffer(x);
+  }
+  VkSemaphoreTypeCreateInfo ti{VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO};
+  ti.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
+  VkSemaphoreCreateInfo sci{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
+  sci.pNext = &ti;
+  VkSemaphore sem;
+  vkCreateSemaphore(c.dev, &sci, nullptr, &sem);
+  VkFenceCreateInfo fci{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+  VkFence f1, f2;
+  vkCreateFence(c.dev, &fci, nullptr, &f1);
+  vkCreateFence(c.dev, &fci, nullptr, &f2);
+  Device* dev = from<Device>(c.dev);
+  const VkPipelineStageFlags stage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+  // `wait`/`signal` of 0 mean none.
+  auto submit = [&](VkQueue queue, VkCommandBuffer cmd, uint64_t wait, uint64_t signal, VkFence fence) {
+    VkTimelineSemaphoreSubmitInfo t{VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO};
+    t.waitSemaphoreValueCount = wait ? 1 : 0, t.pWaitSemaphoreValues = &wait;
+    t.signalSemaphoreValueCount = signal ? 1 : 0, t.pSignalSemaphoreValues = &signal;
+    VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+    si.pNext = &t, si.waitSemaphoreCount = wait ? 1 : 0, si.pWaitSemaphores = &sem, si.pWaitDstStageMask = &stage;
+    si.commandBufferCount = 1, si.pCommandBuffers = &cmd, si.signalSemaphoreCount = signal ? 1 : 0, si.pSignalSemaphores = &sem;
+    return vkQueueSubmit(queue, 1, &si, fence);
+  };
+  const uint64_t frames0 = c.gpu().submittedFrames();
+  // q0: waits on 5 (the host), signals 6. q0 again, behind it, with no wait: stays held (its queue's order).
+  CHECK(submit(q[0], cb[0], 5, 6, VK_NULL_HANDLE) == VK_SUCCESS);
+  CHECK(submit(q[0], cb[1], 0, 0, f1) == VK_SUCCESS);
+  CHECK(dev->deferred.size() == 2 && c.gpu().submittedFrames() == frames0);
+  CHECK(vkGetFenceStatus(c.dev, f1) == VK_NOT_READY);
+  // q1 has no wait: it runs at once, past the held q0 batches.
+  CHECK(submit(q[1], cb[2], 0, 0, f2) == VK_SUCCESS);
+  CHECK(dev->deferred.size() == 2 && c.gpu().submittedFrames() == frames0 + 1);
+  CHECK(vkWaitForFences(c.dev, 1, &f2, VK_TRUE, UINT64_MAX) == VK_SUCCESS);
+  CHECK(vkGetFenceStatus(c.dev, f1) == VK_NOT_READY);
+  // q2 waits on 6, which q0's held batch signals: held too. vkQueueWaitIdle(q1) does not wait for the held ones.
+  CHECK(submit(q[2], cb[3], 6, 0, VK_NULL_HANDLE) == VK_SUCCESS);
+  CHECK(dev->deferred.size() == 3);
+  CHECK(vkQueueWaitIdle(q[1]) == VK_SUCCESS && dev->deferred.size() == 3);
+  VkSemaphoreSignalInfo sig{VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO};
+  sig.semaphore = sem, sig.value = 5;
+  CHECK(vkSignalSemaphore(c.dev, &sig) == VK_SUCCESS);
+  CHECK(dev->deferred.empty());  // q0's two batches, then q2's (its wait is met by the first)
+  CHECK(vkWaitForFences(c.dev, 1, &f1, VK_TRUE, UINT64_MAX) == VK_SUCCESS);
+  CHECK(vkDeviceWaitIdle(c.dev) == VK_SUCCESS);
+
+  vkDestroyFence(c.dev, f1, nullptr);
+  vkDestroyFence(c.dev, f2, nullptr);
+  vkDestroySemaphore(c.dev, sem, nullptr);
+  vkDestroyCommandPool(c.dev, pool, nullptr);
+  vkDestroyBuffer(c.dev, b, nullptr);
+  vkFreeMemory(c.dev, m, nullptr);
+}
+
+// A platform whose GPU has finished exactly the frames below `done`.
+struct GatedGpu final : Platform {
+  std::unique_ptr<Platform> inner;
+  uint64_t done = 0;
+  vpgpu::Backend& backend() override { return inner->backend(); }
+  WaitResult waitFrames(uint64_t frames, uint64_t) override { return frames <= done ? WaitResult::Done : WaitResult::Timeout; }
+};
+
+// CTS synchronization2.signal_order.timeline_semaphore: batches of one queue run in submission order (a batch held on an
+// unsignaled wait holds every later batch of that queue, so its later timeline signal cannot overtake it), other queues
+// may overtake; a semaphore's counter never passes the value of a signal whose GPU work has not finished (values
+// complete in order even when the batches ran in another one).
+void testTimelineOrder() {
+  Ctx c;
+  Device* dev = from<Device>(c.dev);
+  auto gatedOwner = std::make_unique<GatedGpu>();
+  GatedGpu* gpu = gatedOwner.get();
+  gpu->inner = std::move(dev->platform);
+  dev->platform = std::move(gatedOwner);
+  gpu->done = c.gpu().submittedFrames();  // everything so far is finished
+  VkQueue q[2];
+  for (uint32_t i = 0; i < 2; ++i) vkGetDeviceQueue(c.dev, 0, i, &q[i]);
+  VkCommandPoolCreateInfo pi{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+  VkCommandPool pool;
+  vkCreateCommandPool(c.dev, &pi, nullptr, &pool);
+  VkCommandBufferAllocateInfo ai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+  ai.commandPool = pool;
+  ai.commandBufferCount = 1;
+  VkDeviceMemory m = alloc(c, 1 << 16, 1);
+  VkBuffer b = buffer(c, 4096, m, 0);
+  VkCommandBuffer cb[2];
+  for (VkCommandBuffer& x : cb) {
+    vkAllocateCommandBuffers(c.dev, &ai, &x);
+    VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    vkBeginCommandBuffer(x, &bi);
+    vkCmdFillBuffer(x, b, 0, 256, 7);
+    vkEndCommandBuffer(x);
+  }
+  VkSemaphoreTypeCreateInfo ti{VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO};
+  ti.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
+  VkSemaphoreCreateInfo sci{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
+  sci.pNext = &ti;
+  VkSemaphore a, bs;
+  vkCreateSemaphore(c.dev, &sci, nullptr, &a);
+  vkCreateSemaphore(c.dev, &sci, nullptr, &bs);
+  const VkPipelineStageFlags stage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+  // A null semaphore means no wait / no signal.
+  auto submit = [&](VkQueue queue, VkCommandBuffer cmd, VkSemaphore ws, uint64_t wait, VkSemaphore ss, uint64_t signal) {
+    VkTimelineSemaphoreSubmitInfo t{VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO};
+    t.waitSemaphoreValueCount = ws ? 1 : 0, t.pWaitSemaphoreValues = &wait;
+    t.signalSemaphoreValueCount = ss ? 1 : 0, t.pSignalSemaphoreValues = &signal;
+    VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+    si.pNext = &t, si.waitSemaphoreCount = ws ? 1 : 0, si.pWaitSemaphores = &ws, si.pWaitDstStageMask = &stage;
+    si.commandBufferCount = 1, si.pCommandBuffers = &cmd, si.signalSemaphoreCount = ss ? 1 : 0, si.pSignalSemaphores = &ss;
+    return vkQueueSubmit(queue, 1, &si, VK_NULL_HANDLE);
+  };
+  auto value = [&](VkSemaphore s) {
+    uint64_t v = ~0ull;
+    vkGetSemaphoreCounterValue(c.dev, s, &v);
+    return v;
+  };
+  auto hostSignal = [&](VkSemaphore s, uint64_t v) {
+    VkSemaphoreSignalInfo sig{VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO};
+    sig.semaphore = s, sig.value = v;
+    return vkSignalSemaphore(c.dev, &sig);
+  };
+  auto drain = [&] {
+    gpu->done = c.gpu().submittedFrames();
+    CHECK(vkDeviceWaitIdle(c.dev) == VK_SUCCESS);
+  };
+
+  // Same queue: the first batch waits on A=1 (unsignaled), the second signals B=5. B must not reach 5 before the first
+  // batch has run.
+  uint64_t frames0 = c.gpu().submittedFrames();
+  CHECK(submit(q[0], cb[0], a, 1, nullptr, 0) == VK_SUCCESS);
+  CHECK(submit(q[0], cb[1], nullptr, 0, bs, 5) == VK_SUCCESS);
+  CHECK(dev->deferred.size() == 2 && c.gpu().submittedFrames() == frames0);
+  gpu->done = c.gpu().submittedFrames();
+  CHECK(value(bs) == 0);
+  CHECK(hostSignal(a, 1) == VK_SUCCESS);
+  CHECK(dev->deferred.empty() && c.gpu().submittedFrames() == frames0 + 1);  // both, in one frame, first one first
+  gpu->done = c.gpu().submittedFrames();
+  CHECK(value(a) == 1 && value(bs) == 5);
+
+  // Two queues: the second batch is on another queue and goes ahead of the held one.
+  frames0 = c.gpu().submittedFrames();
+  CHECK(submit(q[0], cb[0], a, 2, nullptr, 0) == VK_SUCCESS);
+  CHECK(submit(q[1], cb[1], nullptr, 0, bs, 9) == VK_SUCCESS);
+  CHECK(dev->deferred.size() == 1 && c.gpu().submittedFrames() == frames0 + 1);
+  gpu->done = c.gpu().submittedFrames();
+  CHECK(value(bs) == 9);
+  CHECK(hostSignal(a, 2) == VK_SUCCESS);
+  CHECK(dev->deferred.empty());
+  drain();
+
+  // Out-of-order execution across queues: q0 waits on W=1 (host) and signals T=2 (submitted first); q1 signals T=3
+  // (submitted second) and runs first. While the T=2 frame is unfinished the counter must stay below 2, though the T=3 frame is done.
+  VkSemaphore t, w;
+  vkCreateSemaphore(c.dev, &sci, nullptr, &t);
+  vkCreateSemaphore(c.dev, &sci, nullptr, &w);
+  CHECK(submit(q[0], cb[0], w, 1, t, 2) == VK_SUCCESS);
+  CHECK(submit(q[1], cb[1], nullptr, 0, t, 3) == VK_SUCCESS);
+  const uint64_t fY = c.gpu().submittedFrames();  // the T=3 frame
+  CHECK(dev->deferred.size() == 1);
+  CHECK(hostSignal(w, 1) == VK_SUCCESS);  // q0's batch runs now, after the T=3 one
+  CHECK(dev->deferred.empty() && c.gpu().submittedFrames() == fY + 1);
+  gpu->done = fY;  // T=3 finished, T=2 not
+  CHECK(value(t) == 0);
+  VkSemaphoreWaitInfo wi{VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO};
+  uint64_t want = 2;
+  wi.semaphoreCount = 1, wi.pSemaphores = &t, wi.pValues = &want;
+  CHECK(vkWaitSemaphores(c.dev, &wi, 0) == VK_TIMEOUT);
+  gpu->done = fY + 1;
+  CHECK(vkWaitSemaphores(c.dev, &wi, 0) == VK_SUCCESS);
+  CHECK(value(t) == 3);
+
+  drain();
+  vkDestroySemaphore(c.dev, t, nullptr);
+  vkDestroySemaphore(c.dev, w, nullptr);
+  vkDestroySemaphore(c.dev, a, nullptr);
+  vkDestroySemaphore(c.dev, bs, nullptr);
+  vkDestroyCommandPool(c.dev, pool, nullptr);
+  vkDestroyBuffer(c.dev, b, nullptr);
+  vkFreeMemory(c.dev, m, nullptr);
+  dev->platform = std::move(gpu->inner);  // the stand-in goes before the device does
+}
+
+// A platform whose GPU has finished the frames below `done`. A blocking wait (timeout != 0) costs no real time: it advances
+// the device's injected clock (`clock`) by the timeout, or by `finishAfterNs` when the GPU finishes (`done` = `finishTo`) first.
+int64_t lateClock = 0;
+int64_t lateClockNs() { return lateClock; }
+struct LateGpu final : Platform {
+  std::unique_ptr<Platform> inner;
+  std::atomic<uint64_t> done{0};
+  int blocked = 0;                  // waits made with a timeout
+  int64_t finishAfterNs = -1;       // >= 0: a blocking wait that lasts this long sees the GPU finish
+  uint64_t finishTo = 0;
+  vpgpu::Backend& backend() override { return inner->backend(); }
+  WaitResult waitFrames(uint64_t frames, uint64_t timeoutNs) override {
+    if (frames <= done.load()) return WaitResult::Done;
+    if (!timeoutNs) return WaitResult::Timeout;
+    ++blocked;
+    if (finishAfterNs >= 0 && uint64_t(finishAfterNs) <= timeoutNs) {
+      lateClock += finishAfterNs, done = finishTo;
+      return frames <= finishTo ? WaitResult::Done : WaitResult::Timeout;
+    }
+    lateClock += int64_t(timeoutNs);
+    return WaitResult::Timeout;
+  }
+};
+
+// vkGetQueryPoolResults on an occlusion query whose frame the GPU has not finished: without WAIT it is VK_NOT_READY and
+// writes nothing (Vulkan: the app's value is not touched; availability 0); with WAIT it waits and returns the count. A wait
+// that runs out reports the query visible (non-zero), never 0, and the reads after it do not wait while the GPU is behind;
+// all the waits of a frame together take 20 ms; once the GPU is past, waits are normal again.
+void testQueryNotReady() {
+  constexpr int kQ = 52;
+  constexpr int64_t kMs = 1'000'000;
+  constexpr VkQueryResultFlags kWait = VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT | VK_QUERY_RESULT_WAIT_BIT;
+  Ctx c;
+  Device* dev = from<Device>(c.dev);
+  auto lateOwner = std::make_unique<LateGpu>();
+  LateGpu* gpu = lateOwner.get();
+  gpu->inner = std::move(dev->platform);
+  dev->platform = std::move(lateOwner);
+  dev->clockNs = lateClockNs;
+  lateClock = 0;
+  gpu->done = c.gpu().submittedFrames();
+  VkQueryPoolCreateInfo qi{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+  qi.queryType = VK_QUERY_TYPE_OCCLUSION;
+  qi.queryCount = kQ;
+  VkQueryPool qp;
+  CHECK(vkCreateQueryPool(c.dev, &qi, nullptr, &qp) == VK_SUCCESS);
+  QueryPoolObj* p = from<QueryPoolObj>(qp);
+  VkCommandPoolCreateInfo pi{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+  VkCommandPool pool;
+  vkCreateCommandPool(c.dev, &pi, nullptr, &pool);
+  VkCommandBufferAllocateInfo ai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+  ai.commandPool = pool;
+  ai.commandBufferCount = 1;
+  VkCommandBuffer cb;
+  vkAllocateCommandBuffers(c.dev, &ai, &cb);
+  // Queries 1..kQ-1 end in one submission whose frame is not finished (done stays below it).
+  auto submitEnding = [&](uint32_t first, uint32_t n) {
+    VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    vkResetCommandBuffer(cb, 0);
+    vkBeginCommandBuffer(cb, &bi);
+    vkCmdResetQueryPool(cb, qp, first, n);
+    for (uint32_t i = first; i < first + n; ++i) vkCmdBeginQuery(cb, qp, i, 0), vkCmdEndQuery(cb, qp, i);
+    vkEndCommandBuffer(cb);
+    VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+    si.commandBufferCount = 1;
+    si.pCommandBuffers = &cb;
+    CHECK(vkQueueSubmit(c.queue, 1, &si, VK_NULL_HANDLE) == VK_SUCCESS);
+  };
+  submitEnding(1, kQ - 1);
+  CHECK(p->frame[1] != 0 && p->frame[kQ - 1] != 0);
+  const uint64_t samples = 77;
+  for (int i = 1; i < kQ; ++i) std::memcpy(dev->visibility.host + size_t(p->base + i) * 8, &samples, 8);
+
+  // No WAIT: not ready, the destination is not written.
+  uint64_t r[2] = {0xAAAA, 0xBBBB};
+  CHECK(vkGetQueryPoolResults(c.dev, qp, 1, 1, sizeof r, r, 16, VK_QUERY_RESULT_64_BIT) == VK_NOT_READY);
+  CHECK(r[0] == 0xAAAA);
+  CHECK(vkGetQueryPoolResults(c.dev, qp, 1, 1, sizeof r, r, 16, VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT) ==
+        VK_NOT_READY);
+  CHECK(r[0] == 0xAAAA && r[1] == 0);
+  CHECK(gpu->blocked == 0 && dev->occLateFrame == 0);
+
+  // WAIT while the GPU finishes (after 3 ms): waits, then the count; the 3 ms count against the frame's 20.
+  gpu->finishAfterNs = 3 * kMs, gpu->finishTo = c.gpu().submittedFrames();
+  r[0] = r[1] = 0xAAAA;
+  CHECK(vkGetQueryPoolResults(c.dev, qp, 1, 1, sizeof r, r, 16, kWait) == VK_SUCCESS);
+  CHECK(r[0] == 77 && r[1] == 1 && gpu->blocked == 1 && lateClock == 3 * kMs && dev->occBudgetUsedNs == uint64_t(3 * kMs));
+  CHECK(dev->occLateFrame == 0);
+
+  // A GPU that is stuck: the first read waits up to what is left of the 20 ms and reads visible; the other 49 (each in its
+  // own call, then 3 in one call) read visible at once, with no wait of their own: ~20 ms in all, not 50 x 20 ms.
+  gpu->done = 0, gpu->finishAfterNs = -1, gpu->blocked = 0, lateClock = 0, dev->occBudgetUsedNs = 0;
+  for (int i = 2; i < kQ; ++i) {
+    r[0] = r[1] = 0xAAAA;
+    CHECK(vkGetQueryPoolResults(c.dev, qp, i, 1, sizeof r, r, 16, kWait) == VK_SUCCESS);
+    CHECK(r[0] == 1 && r[1] == 1);
+  }
+  CHECK(gpu->blocked == 1 && lateClock == 20 * kMs && dev->occLateFrame == p->frame[2]);
+  uint64_t many[6] = {};
+  CHECK(vkGetQueryPoolResults(c.dev, qp, 1, 3, sizeof many, many, 16, kWait) == VK_SUCCESS);
+  CHECK(many[0] == 1 && many[1] == 1 && many[2] == 1 && many[3] == 1 && many[4] == 1 && many[5] == 1);
+  CHECK(gpu->blocked == 1 && lateClock == 20 * kMs);
+  // Without WAIT the late state changes nothing: still not ready.
+  r[0] = r[1] = 0xAAAA;
+  CHECK(vkGetQueryPoolResults(c.dev, qp, 1, 1, sizeof r, r, 16, kWait & ~VK_QUERY_RESULT_WAIT_BIT) == VK_NOT_READY);
+  CHECK(r[0] == 0xAAAA && r[1] == 0);
+
+  // The GPU gets past the late frame: the real counts again, the late state is gone.
+  gpu->done = c.gpu().submittedFrames();
+  r[0] = r[1] = 0xAAAA;
+  CHECK(vkGetQueryPoolResults(c.dev, qp, 1, 1, sizeof r, r, 16, kWait) == VK_SUCCESS);
+  CHECK(r[0] == 77 && r[1] == 1 && dev->occLateFrame == 0 && gpu->blocked == 1);
+
+  // A new frame is a fresh budget, and waits are normal again: the GPU is late once more, so this one waits (and runs out).
+  submitEnding(0, 1);
+  gpu->done = c.gpu().submittedFrames() - 1;
+  lateClock = 0;
+  r[0] = r[1] = 0xAAAA;
+  CHECK(vkGetQueryPoolResults(c.dev, qp, 0, 1, sizeof r, r, 16, kWait) == VK_SUCCESS);
+  CHECK(r[0] == 1 && r[1] == 1 && gpu->blocked == 2 && lateClock == 20 * kMs && dev->occLateFrame == p->frame[0]);
+
+  // The budget alone (the GPU is not late, waits that succeed): 8 ms + 8 ms, then the third gets 4 ms and runs out; after
+  // it nothing waits. Then, with the late state cleared by hand, a read still finds the budget spent and does not wait.
+  submitEnding(1, 3);
+  for (int i = 1; i <= 3; ++i) std::memcpy(dev->visibility.host + size_t(p->base + i) * 8, &samples, 8);
+  const uint64_t doneBefore = c.gpu().submittedFrames() - 1;
+  gpu->done = doneBefore, gpu->finishAfterNs = 8 * kMs, gpu->finishTo = doneBefore + 1;
+  dev->occLateFrame = 0, gpu->blocked = 0, lateClock = 0;
+  for (int i = 1; i <= 2; ++i) {
+    gpu->done = doneBefore;
+    r[0] = r[1] = 0xAAAA;
+    CHECK(vkGetQueryPoolResults(c.dev, qp, i, 1, sizeof r, r, 16, kWait) == VK_SUCCESS);
+    CHECK(r[0] == 77 && r[1] == 1);
+  }
+  CHECK(gpu->blocked == 2 && lateClock == 16 * kMs && dev->occLateFrame == 0);
+  gpu->done = doneBefore;
+  r[0] = r[1] = 0xAAAA;
+  CHECK(vkGetQueryPoolResults(c.dev, qp, 3, 1, sizeof r, r, 16, kWait) == VK_SUCCESS);
+  CHECK(r[0] == 1 && r[1] == 1 && gpu->blocked == 3 && lateClock == 20 * kMs && dev->occBudgetUsedNs == uint64_t(20 * kMs));
+  dev->occLateFrame = 0;
+  gpu->done = doneBefore;
+  r[0] = r[1] = 0xAAAA;
+  CHECK(vkGetQueryPoolResults(c.dev, qp, 2, 1, sizeof r, r, 16, kWait) == VK_SUCCESS);
+  CHECK(r[0] == 1 && r[1] == 1 && gpu->blocked == 3 && lateClock == 20 * kMs);  // budget spent: no wait
+  gpu->done = doneBefore + 1;
+  r[0] = r[1] = 0xAAAA;
+  CHECK(vkGetQueryPoolResults(c.dev, qp, 2, 1, sizeof r, r, 16, kWait) == VK_SUCCESS);
+  CHECK(r[0] == 77 && r[1] == 1);  // spent budget, but the GPU is done: the real count
+
+  // A query never ended: WAIT does not hang, not ready (late state or not).
+  r[0] = r[1] = 0xAAAA;
+  VkQueryPool qp2;
+  CHECK(vkCreateQueryPool(c.dev, &qi, nullptr, &qp2) == VK_SUCCESS);
+  CHECK(vkGetQueryPoolResults(c.dev, qp2, 0, 1, sizeof r, r, 16, kWait) == VK_NOT_READY);
+  CHECK(r[0] == 0xAAAA && r[1] == 0);
+  vkDestroyQueryPool(c.dev, qp2, nullptr);
+
+  gpu->done = c.gpu().submittedFrames();
+  dev->clockNs = nullptr;
+  vkDestroyQueryPool(c.dev, qp, nullptr);
+  vkDestroyCommandPool(c.dev, pool, nullptr);
+  dev->platform = std::move(gpu->inner);  // the stand-in goes before the device does
 }
 
 // Render-pass load/store rules Metal's whole-attachment actions cannot express directly (CTS
@@ -3328,7 +4211,7 @@ void testExtendedDynamicState() {
     VkPhysicalDeviceExtendedDynamicState2FeaturesEXT e2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_2_FEATURES_EXT, &e1};
     VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &e2};
     vkGetPhysicalDeviceFeatures2(g.pd, &f2);
-    CHECK(!e1.extendedDynamicState && !e2.extendedDynamicState2);  // games: behind the gate
+    CHECK(e1.extendedDynamicState && e2.extendedDynamicState2);  // games see the same profile
   }
   setenv("VPVK_EXTRA_EXTENSIONS", "1", 1);
   Ctx c({VK_EXT_EXTENDED_DYNAMIC_STATE_EXTENSION_NAME, VK_EXT_EXTENDED_DYNAMIC_STATE_2_EXTENSION_NAME});
@@ -3476,7 +4359,7 @@ void testInlineUniformBlock() {
     VkPhysicalDeviceInlineUniformBlockFeatures iu{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_INLINE_UNIFORM_BLOCK_FEATURES};
     VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &iu};
     vkGetPhysicalDeviceFeatures2(g.pd, &f2);
-    CHECK(!iu.inlineUniformBlock);
+    CHECK(iu.inlineUniformBlock);
   }
   setenv("VPVK_EXTRA_EXTENSIONS", "1", 1);
   Ctx c({VK_EXT_INLINE_UNIFORM_BLOCK_EXTENSION_NAME});
@@ -3586,6 +4469,86 @@ void testInlineUniformBlock() {
   unsetenv("VPVK_EXTRA_EXTENSIONS");
 }
 
+// VK_KHR_push_descriptor: pushes write a set the command buffer owns; each draw sees the descriptors pushed before it, a
+// later push (writes or template) does not reach the draws already recorded.
+void testPushDescriptor() {
+  vpvk_config_set_quest_identity(1);
+  unsetenv("VPVK_EXTRA_EXTENSIONS");
+  Ctx c({VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME});
+  CHECK(c.dev != nullptr);
+  VkPhysicalDevicePushDescriptorPropertiesKHR pp{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PUSH_DESCRIPTOR_PROPERTIES_KHR};
+  VkPhysicalDeviceProperties2 p2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &pp};
+  vkGetPhysicalDeviceProperties2(c.pd, &p2);
+  CHECK(pp.maxPushDescriptors == 32);
+  auto push = reinterpret_cast<PFN_vkCmdPushDescriptorSetKHR>(vkGetDeviceProcAddr(c.dev, "vkCmdPushDescriptorSetKHR"));
+  auto pushTpl = reinterpret_cast<PFN_vkCmdPushDescriptorSetWithTemplateKHR>(
+      vkGetDeviceProcAddr(c.dev, "vkCmdPushDescriptorSetWithTemplateKHR"));
+  CHECK(push && pushTpl);
+  if (!push || !pushTpl) return;
+
+  DrawRig rig(c);
+  VkShaderModule vs = module(c, "pos.vert.spv"), fs = module(c, "inline_ubo.frag.spv");
+  VkDescriptorSetLayoutBinding b{3, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr};
+  VkDescriptorSetLayoutCreateInfo lci{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+  lci.flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR, lci.bindingCount = 1, lci.pBindings = &b;
+  VkDescriptorSetLayout sl;
+  vkCreateDescriptorSetLayout(c.dev, &lci, nullptr, &sl);
+  VkPipelineLayoutCreateInfo plci{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+  plci.setLayoutCount = 1, plci.pSetLayouts = &sl;
+  VkPipelineLayout pl;
+  vkCreatePipelineLayout(c.dev, &plci, nullptr, &pl);
+  VkDescriptorUpdateTemplateEntry te{3, 0, 1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 0, sizeof(VkDescriptorBufferInfo)};
+  VkDescriptorUpdateTemplateCreateInfo tci{VK_STRUCTURE_TYPE_DESCRIPTOR_UPDATE_TEMPLATE_CREATE_INFO};
+  tci.descriptorUpdateEntryCount = 1, tci.pDescriptorUpdateEntries = &te;
+  tci.templateType = VK_DESCRIPTOR_UPDATE_TEMPLATE_TYPE_PUSH_DESCRIPTORS_KHR;
+  tci.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS, tci.pipelineLayout = pl, tci.set = 0;
+  VkDescriptorUpdateTemplate tpl;
+  vkCreateDescriptorUpdateTemplate(c.dev, &tci, nullptr, &tpl);
+
+  PipeOpts o;
+  VkPipeline pipe = makePosPipeline(c, rig, pl, o, vs, fs);
+  CHECK(from<PipelineObj>(pipe) && from<PipelineObj>(pipe)->ok);
+  rig.begin();
+  vkCmdBindPipeline(rig.cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
+  VkDeviceMemory bm = alloc(c, 1 << 20, 0);
+  VkBuffer vb = buffer(c, 4096, bm, 0), ub = buffer(c, 4096, bm, 8192);
+  VkDeviceSize zero = 0;
+  vkCmdBindVertexBuffers(rig.cb, 0, 1, &vb, &zero);
+  VkDescriptorBufferInfo bi{ub, 0, 16};
+  VkWriteDescriptorSet w{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+  w.dstBinding = 3, w.descriptorCount = 1, w.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, w.pBufferInfo = &bi;
+  push(rig.cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pl, 0, 1, &w);
+  vkCmdDraw(rig.cb, 3, 1, 0, 0);
+  bi.offset = 256;
+  push(rig.cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pl, 0, 1, &w);
+  vkCmdDraw(rig.cb, 3, 1, 0, 0);
+  bi.offset = 512;
+  pushTpl(rig.cb, tpl, pl, 0, &bi);
+  vkCmdDraw(rig.cb, 3, 1, 0, 0);
+  vpgpu::Frame frame;
+  TranslateStats ts;
+  const std::vector<vpgpu::Draw> d = rig.finish(frame, ts);
+  CHECK(d.size() == 3 && ts.skippedDraws == 0);
+  uint64_t begin[3] = {};
+  for (size_t i = 0; i < d.size() && i < 3; ++i) {
+    int found = 0;
+    for (const vpgpu::Access& a : d[i].bindings)
+      if (a.kind == vpgpu::BindKind::ConstantBuffer && a.slot == 0) ++found, begin[i] = a.range.begin;
+    CHECK(found == 1);
+  }
+  CHECK(begin[1] == begin[0] + 256 && begin[2] == begin[0] + 512);
+  vkDestroyPipeline(c.dev, pipe, nullptr);
+  vkDestroyDescriptorUpdateTemplate(c.dev, tpl, nullptr);
+  vkDestroyPipelineLayout(c.dev, pl, nullptr);
+  vkDestroyDescriptorSetLayout(c.dev, sl, nullptr);
+  vkDestroyBuffer(c.dev, vb, nullptr);
+  vkDestroyBuffer(c.dev, ub, nullptr);
+  vkFreeMemory(c.dev, bm, nullptr);
+  vkDestroyShaderModule(c.dev, vs, nullptr);
+  vkDestroyShaderModule(c.dev, fs, nullptr);
+  vpvk_config_set_quest_identity(0);
+}
+
 // VK_KHR_buffer_device_address / Vulkan 1.2: addresses of bound buffers (the backend's, here the null
 // backend's distinct fake ones), the aliases, and a compute pipeline that dereferences a pointer.
 void testBufferDeviceAddress() {
@@ -3596,7 +4559,7 @@ void testBufferDeviceAddress() {
     VkPhysicalDeviceBufferDeviceAddressFeatures ba{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES};
     VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &ba};
     vkGetPhysicalDeviceFeatures2(g.pd, &f2);
-    CHECK(!ba.bufferDeviceAddress);
+    CHECK(ba.bufferDeviceAddress);
   }
   setenv("VPVK_EXTRA_EXTENSIONS", "1", 1);
   Ctx c({VK_KHR_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME});
@@ -3675,10 +4638,10 @@ void testYcbcr() {
     VkPhysicalDeviceSamplerYcbcrConversionFeatures yf{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SAMPLER_YCBCR_CONVERSION_FEATURES};
     VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &yf};
     vkGetPhysicalDeviceFeatures2(g.pd, &f2);
-    CHECK(!yf.samplerYcbcrConversion);
+    CHECK(yf.samplerYcbcrConversion);
     VkFormatProperties fp;
     vkGetPhysicalDeviceFormatProperties(g.pd, VK_FORMAT_G8_B8R8_2PLANE_420_UNORM, &fp);
-    CHECK(fp.optimalTilingFeatures == 0);
+    CHECK(fp.optimalTilingFeatures != 0);
   }
   setenv("VPVK_EXTRA_EXTENSIONS", "1", 1);
   Ctx c({VK_KHR_SAMPLER_YCBCR_CONVERSION_EXTENSION_NAME});
@@ -3702,7 +4665,7 @@ void testYcbcr() {
     CHECK((fp.optimalTilingFeatures & want) == want);
     CHECK(!(fp.optimalTilingFeatures & (VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT | VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT |
                                         VK_FORMAT_FEATURE_SAMPLED_IMAGE_YCBCR_CONVERSION_SEPARATE_RECONSTRUCTION_FILTER_BIT)));
-    CHECK(fp.linearTilingFeatures == 0 && fp.bufferFeatures == 0);
+    CHECK(fp.linearTilingFeatures == (VK_FORMAT_FEATURE_TRANSFER_SRC_BIT | VK_FORMAT_FEATURE_TRANSFER_DST_BIT) && fp.bufferFeatures == 0);
     VkSamplerYcbcrConversionImageFormatProperties yp{VK_STRUCTURE_TYPE_SAMPLER_YCBCR_CONVERSION_IMAGE_FORMAT_PROPERTIES};
     VkImageFormatProperties2 ip{VK_STRUCTURE_TYPE_IMAGE_FORMAT_PROPERTIES_2, &yp};
     VkPhysicalDeviceImageFormatInfo2 info{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_FORMAT_INFO_2};
@@ -4037,6 +5000,870 @@ void testTaaEyeDepth() {
     c.gpu().destroy(otherDepth);
   }
   vpvk_config_set_taa_native(0);
+}
+
+// Prewarm with forced MSAA: besides the recipes it compiles the variants the runtime asks for ('.msN', '.ums', '.umu' of
+// a recorded mask variant) under the keys pipelineFor / maskPipelineKey compute; without forcing nothing is added.
+void testPrewarmVariants() {
+  char tmpl[] = "/tmp/vpvk_prewarmv_XXXXXX";
+  const char* dir = mkdtemp(tmpl);
+  CHECK(dir != nullptr);
+  if (!dir) return;
+  const std::string recipeDir = std::string(dir) + "/store", ctxDir = std::string(dir) + "/ctx";
+  std::filesystem::create_directories(ctxDir);
+  setenv("VP_PIPELINE_CACHE_DIR", ctxDir.c_str(), 1);  // (the device of the runtime half records its own recipes here)
+  vpvk_config_set_taa_native(1);
+  vpgpu::PipelineState eye;  // colour 0 + depth at 1x: what forceMsaa can serve
+  eye.colorFormats[0] = vpgpu::Format::RGBA8Unorm, eye.depthFormat = vpgpu::Format::D32Float;
+  eye.depthTest = eye.depthWrite = true, eye.label = "test.eye";
+  vpgpu::PipelineState shadow = eye;  // depth only: no colour 0, never a forced pass
+  shadow.colorFormats[0] = vpgpu::Format::Undefined, shadow.label = "test.shadow";
+  vpgpu::PipelineState gbuf = eye;  // two colour attachments: forceMsaa rejects the pass ("shape")
+  gbuf.colorFormats[1] = vpgpu::Format::RGBA8Unorm, gbuf.label = "test.gbuf";
+  vpgpu::PipelineState ui = eye;  // a recorded '.umu' (the fragment shader writes the mask) of another pipeline, at 1x
+  ui.depthTest = false, ui.label = "test.ui";
+  applyUiMaskTarget(ui, true);
+  RecipeStore store(recipeDir);
+  for (const vpgpu::PipelineState* s : {&eye, &shadow, &gbuf, &ui}) store.addPipeline(*s, {0, 0, 0});
+  CHECK(store.pipelineCount() == 4);
+  auto run = [&](std::vector<uint64_t> watch, std::vector<vpgpu::PipelineCache::Status>& status, uint32_t maxVariants = 0) {
+    std::unique_ptr<Platform> platform = createPlatform();
+    vpgpu::Device gpu(platform->backend(), 2, [](const std::string&) {});
+    PrewarmHooks hooks;
+    hooks.maxVariants = maxVariants;
+    const PrewarmResult r = prewarm(*platform, gpu.pipelines(), store, nullptr, 0.0, hooks);
+    for (uint64_t k : watch) status.push_back(gpu.pipelines().status({k}));
+    return r;
+  };
+  const uint8_t N = 4;
+  vpgpu::PipelineState ms = msaaVariantState(eye, N), ums = eye, umu = ui;
+  ums.samples = N, applyUiMaskTarget(ums, false);
+  umu.samples = N;
+  const std::vector<uint64_t> watch = {eye.key().value, ms.key().value, ums.key().value, umu.key().value,
+                                       msaaVariantState(shadow, N).key().value, msaaVariantState(gbuf, N).key().value};
+  using St = vpgpu::PipelineCache::Status;
+  std::vector<St> st;
+  vpvk_config_set_msaa_force(0);
+  PrewarmResult r = run(watch, st);  // no forcing: only the recipes
+  CHECK(r.recipes == 4 && r.variants == 0 && r.failed == 0);
+  CHECK(st[0] == St::Ready && st[1] == St::Missing && st[2] == St::Missing && st[3] == St::Missing);
+  vpvk_config_set_msaa_force(N);
+  st.clear();
+  r = run(watch, st);  // forced 4x: eye -> .ms4 + .ums, the recorded .umu -> its 4x; shadow and the two-attachment pass add nothing
+  CHECK(r.recipes == 4 && r.variants == 3 && r.variantsFailed == 0 && r.failed == 0);
+  CHECK(st[0] == St::Ready && st[1] == St::Ready && st[2] == St::Ready && st[3] == St::Ready);
+  CHECK(st[4] == St::Missing && st[5] == St::Missing);
+  CHECK(store.pipelineCount() == 4);  // the prewarm adds no recipe to the store: the variants do not accumulate across runs
+  st.clear();
+  r = run(watch, st, 1);  // cap of 1 variant (the first in snapshot order): exactly one of the three is compiled, the rest is left out
+  CHECK(r.recipes == 4 && r.variants == 1 && r.variantsFailed == 0 && r.failed == 0);
+  CHECK(st[0] == St::Ready && int(st[1] == St::Ready) + int(st[2] == St::Ready) + int(st[3] == St::Ready) == 1);
+  CHECK(store.pipelineCount() == 4);
+  {
+    // The runtime's keys for the same pipeline under forced 4x are the ones the prewarm compiled.
+    Ctx c;
+    Device* d = from<Device>(c.dev);
+    PipelineObj p;
+    p.ok = true, p.state = eye, p.key = eye.key();
+    CHECK(pipelineFor(d, p, N).value == watch[1]);
+    vpgpu::PipelineKey k;
+    CHECK(maskPipelineKey(d, p, nullptr, N, false, k) && k.value == watch[2]);
+    c.gpu().pipelines().waitIdle();
+    for (uint64_t key : p.ownedKeys) c.gpu().pipelines().release({key});
+  }
+  vpvk_config_set_msaa_force(0);
+  vpvk_config_set_taa_native(0);
+  unsetenv("VP_PIPELINE_CACHE_DIR");
+  std::error_code ec;
+  std::filesystem::remove_all(dir, ec);
+}
+
+// Forced MSAA (VPVK_MSAA_FORCE / vpvk_config_set_msaa_force): the eye / scene pass the game renders at 1x draws into N-sample
+// autoMsaa twins resolved into the game's images; what it cannot serve stays at 1x and is counted. Host side only (null backend).
+// "vk.msaa main" throttle: a line only when result / area / samples differ from the previous one, plus a 60 s heartbeat, at
+// most kMainLines per device; the window is 5 s.
+void testMsaaMainLog() {
+  MsaaTwins mt;
+  const int64_t s = 1'000'000'000LL;
+  auto pass = [&](uint8_t forced, uint32_t w, uint32_t h, uint8_t samples, const char* why = nullptr) {
+    mt.mainPass = {uint64_t(w) * h, w, h, samples, forced, true, why};
+  };
+  MsaaTwins::MainPass out;
+  CHECK(!mt.takeMainLine(0, out));  // nothing judged yet
+  pass(0, 1920, 1824, 1, "eye");
+  CHECK(!mt.takeMainLine(1 * s, out));  // the window opens with the first pass: 5 s to go
+  CHECK(!mt.takeMainLine(5 * s, out));
+  CHECK(mt.takeMainLine(6 * s, out) && out.w == 1920 && mt.mainLines == 1 && !mt.mainPass.rank);
+  // Menus: the same verdict every window, nothing written until the 60 s heartbeat.
+  int64_t t = 6 * s;
+  for (int i = 0; i < 11; ++i) {  // up to 55 s after the line
+    pass(0, 1920, 1824, 1, "eye");
+    t += 5 * s;
+    CHECK(!mt.takeMainLine(t, out));
+  }
+  CHECK(mt.mainLines == 1);
+  pass(0, 1920, 1824, 1, "eye");
+  t += 5 * s;  // 60 s after the line
+  CHECK(t - mt.lastMainLineNs >= 60 * s && mt.takeMainLine(t, out) && mt.mainLines == 2);
+  // A change of result, of area and of samples each writes at once (at the next window).
+  pass(4, 1920, 1824, 1);
+  t += 5 * s;
+  CHECK(mt.takeMainLine(t, out) && out.forced == 4);
+  pass(4, 1920, 1824, 1);
+  t += 5 * s;
+  CHECK(!mt.takeMainLine(t, out));
+  pass(4, 1536, 1536, 1);
+  t += 5 * s;
+  CHECK(mt.takeMainLine(t, out) && out.w == 1536);
+  pass(4, 1536, 1536, 2);
+  t += 5 * s;
+  CHECK(mt.takeMainLine(t, out) && out.samples == 2);
+  pass(0, 1536, 1536, 2, "smp");  // another rejection reason
+  t += 5 * s;
+  CHECK(mt.takeMainLine(t, out));
+  pass(0, 1536, 1536, 2, "smp");
+  t += 5 * s;
+  CHECK(!mt.takeMainLine(t, out));
+  pass(0, 1536, 1536, 2, "eye");
+  t += 5 * s;
+  CHECK(mt.takeMainLine(t, out) && std::string(out.why) == "eye");
+  // The total cap per device: alternating verdicts (every window a change) stop at kMainLines.
+  for (int i = 0; i < 200; ++i) {
+    pass(uint8_t(i & 1 ? 4 : 0), 1920, 1824, 1, "eye");
+    t += 5 * s;
+    mt.takeMainLine(t, out);
+  }
+  CHECK(mt.mainLines == MsaaTwins::kMainLines);
+  pass(4, 100, 100, 1);
+  t += 5 * s;
+  CHECK(!mt.takeMainLine(t, out) && mt.mainLines == MsaaTwins::kMainLines);
+}
+
+void testMsaaForce() {
+  testMsaaMainLog();
+  vpvk_taa_jitter eyeOnly{0, 1920, 1824, 0, 0, 0};  // jitter off, eye size known: the eye passes are found by size alone
+  vpvk_taa_set_jitter(&eyeOnly);
+  vpvk_config_set_msaa_force(4);
+  CHECK(msaaForceLive() == 4);
+  {
+    Ctx c;  // (the setting is frozen from here until the device is destroyed)
+    Device* d = from<Device>(c.dev);
+    CHECK(msaaForce() == 4);
+    vpvk_config_set_msaa_force(0);  // a change in the middle of a device's life does not apply
+    CHECK(msaaForce() == 4 && msaaForceLive() == 0);
+    auto mk = [&](vpgpu::Format f, uint8_t samples, bool transient = false, uint32_t w = 1920, uint32_t h = 1824) {
+      vpgpu::TextureDesc td;
+      td.format = f, td.width = w, td.height = h, td.samples = samples, td.transient = transient;
+      td.usage = vpgpu::formatInfo(f).depth() ? vpgpu::usage::depthTarget : vpgpu::usage::colorTarget | vpgpu::usage::sampled;
+      return c.gpu().createTexture(td);
+    };
+    const vpgpu::TextureId color = mk(vpgpu::Format::RGBA8Unorm, 1), depth = mk(vpgpu::Format::D32Float, 1, true);
+    PipelineObj po;  // not ok: pipelineFor makes the variant key without asking the (null) driver for it
+    po.ok = false;
+    po.state.samples = 1;
+    po.state.label = "game";
+    po.key = po.state.key();
+    OpDraw geo;
+    geo.ok = true;
+    geo.pipe = &po;
+    geo.draw.pipeline = po.key;
+    geo.draw.count = 300, geo.draw.index = vpgpu::IndexBuffer{};
+    geo.draw.viewport = {0, 0, 1920, 1824, 0, 1};
+    geo.depthTested = geo.vertexBuffers = true;
+    auto scene = [&](vpgpu::LoadAction load, vpgpu::StoreAction store, vpgpu::StoreAction dstore) {
+      OpBeginRendering b;
+      b.area = {{0, 0}, {1920, 1824}};
+      b.depthWidth = 1920, b.depthHeight = 1824;
+      b.desc.colors[0].texture = color, b.desc.colors[0].load = load, b.desc.colors[0].store = store;
+      b.desc.depth.texture = depth, b.desc.depth.load = load, b.desc.depth.store = dstore;
+      return b;
+    };
+    auto run = [&](const OpBeginRendering& b, const OpDraw& draw, vpgpu::Frame& f, bool localRead = false, const TaaJitter* taa = nullptr) {
+      Recorder rec;
+      rec.hasLocalRead = localRead;
+      rec.ops.emplace_back(b), rec.ops.emplace_back(draw), rec.ops.emplace_back(OpEndPass{});
+      TranslateStats st;
+      translate(rec, f, st, taa, nullptr, nullptr, nullptr, d);
+    };
+    auto pass = [](const vpgpu::Frame& f) { return std::get<vpgpu::RenderPass>(f.commands().at(0)); };
+    vpgpu::PipelineState v = po.state;
+    v.samples = 4, v.label += ".ms4";
+    // 1. A Clear + STORE scene pass: colour and depth twins of 4 samples, resolved into the game's images, the draw on the
+    // 4-sample pipeline variant; DONT_CARE depth stays discarded (no VPKTAA here).
+    vpgpu::TextureId twinC, twinD;
+    {
+      vpgpu::Frame f;
+      run(scene(vpgpu::LoadAction::Clear, vpgpu::StoreAction::Store, vpgpu::StoreAction::DontCare), geo, f);
+      const vpgpu::RenderPass rp = pass(f);
+      const vpgpu::Attachment &c0 = rp.desc.colors[0], &z = rp.desc.depth;
+      CHECK(c0.autoMsaa && z.autoMsaa && c0.texture != color && z.texture != depth);
+      CHECK(c0.resolve == color && z.resolve == depth && c0.store == vpgpu::StoreAction::Resolve);
+      CHECK(z.store == vpgpu::StoreAction::DontCare && c0.load == vpgpu::LoadAction::Clear && !c0.keepSamples && !z.keepSamples);
+      twinC = c0.texture, twinD = z.texture;
+      const vpgpu::TextureDesc *tc = c.gpu().resources().get(twinC), *tz = c.gpu().resources().get(twinD);
+      CHECK(tc && tz && tc->samples == 4 && tz->samples == 4 && tc->transient && tz->transient && !tc->persistent);
+      CHECK(tc->width == 1920 && tc->height == 1824 && tc->format == vpgpu::Format::RGBA8Unorm && tz->format == vpgpu::Format::D32Float);
+      CHECK(rp.draws.size() == 1 && rp.draws[0].pipeline == v.key() && rp.draws[0].pipeline != po.key);
+      CHECK(d->msaaTwins.passes == 1);
+      // "vk.msaa main": the pass forced to 4 samples, the game's 1x
+      const MsaaTwins::MainPass& mp = d->msaaTwins.mainPass;
+      CHECK(mp.forced == 4 && mp.samples == 1 && mp.w == 1920 && mp.h == 1824 && mp.why == nullptr);
+    }
+    // 2. The twins are reused by the next pass (a LOAD of the picture: the frame compiler seeds it); the game's depth store is
+    // honoured as a resolve.
+    {
+      vpgpu::Frame f;
+      run(scene(vpgpu::LoadAction::Load, vpgpu::StoreAction::Store, vpgpu::StoreAction::Store), geo, f);
+      const vpgpu::RenderPass rp = pass(f);
+      CHECK(rp.desc.colors[0].texture == twinC && rp.desc.depth.texture == twinD);
+      CHECK(rp.desc.colors[0].load == vpgpu::LoadAction::Load && rp.desc.depth.store == vpgpu::StoreAction::Resolve);
+      CHECK(d->msaaTwins.passes == 2 && d->msaaTwins.twins.size() == 2);
+    }
+    // 3. VPKTAA reads the eye depth after the frame: a discarded game depth is resolved into the game's image anyway, and a
+    // transient one is marked so it keeps its memory.
+    {
+      vpgpu::Frame f;
+      TaaJitter j;
+      j.enabled = true, j.width = 1920, j.height = 1824;
+      CHECK(!c.gpu().resources().transientViolated(depth));
+      run(scene(vpgpu::LoadAction::Clear, vpgpu::StoreAction::Store, vpgpu::StoreAction::DontCare), geo, f, false, &j);
+      const vpgpu::RenderPass rp = pass(f);
+      CHECK(rp.desc.depth.autoMsaa && rp.desc.depth.store == vpgpu::StoreAction::Resolve && rp.desc.depth.resolve == depth);
+      CHECK(c.gpu().resources().transientViolated(depth));
+    }
+    // 4. Passes left at 1x, counted by reason: nothing in them changes.
+    auto untouched = [&](const vpgpu::Frame& f) {
+      const vpgpu::RenderPass rp = pass(f);
+      return !rp.desc.colors[0].autoMsaa && !rp.desc.depth.autoMsaa && rp.desc.colors[0].texture == color &&
+             rp.desc.depth.texture == depth && rp.draws[0].pipeline == po.key;
+    };
+    {
+      MsaaTwins& mt = d->msaaTwins;
+      vpgpu::Frame f1;  // local read (input attachments)
+      run(scene(vpgpu::LoadAction::Clear, vpgpu::StoreAction::Store, vpgpu::StoreAction::Store), geo, f1, true);
+      CHECK(untouched(f1) && mt.skipInput == 1);
+      vpgpu::Frame f2;  // dual-source blending
+      PipelineObj dsb;
+      dsb.ok = false, dsb.dualSource = true, dsb.state = po.state, dsb.key = po.key;
+      OpDraw dd = geo;
+      dd.pipe = &dsb;
+      run(scene(vpgpu::LoadAction::Clear, vpgpu::StoreAction::Store, vpgpu::StoreAction::Store), dd, f2);
+      CHECK(untouched(f2) && mt.skipDsb == 1);
+      vpgpu::Frame f3;  // extended dynamic state draw
+      OpDraw ed = geo;
+      ed.edsVariant = true;
+      run(scene(vpgpu::LoadAction::Clear, vpgpu::StoreAction::Store, vpgpu::StoreAction::Store), ed, f3);
+      CHECK(untouched(f3) && mt.skipEds == 1);
+      vpgpu::Frame f4;  // render area smaller than the attachments: the resolve would overwrite the rest
+      OpBeginRendering part = scene(vpgpu::LoadAction::Clear, vpgpu::StoreAction::Store, vpgpu::StoreAction::Store);
+      part.area = {{0, 0}, {960, 912}};
+      run(part, geo, f4);
+      CHECK(untouched(f4) && mt.skipArea == 1);
+      vpgpu::Frame f5;  // integer colour
+      const vpgpu::TextureId ic = mk(vpgpu::Format::RGBA8Uint, 1);
+      OpBeginRendering ib = scene(vpgpu::LoadAction::Clear, vpgpu::StoreAction::Store, vpgpu::StoreAction::Store);
+      ib.desc.colors[0].texture = ic;
+      run(ib, geo, f5);
+      CHECK(pass(f5).desc.colors[0].texture == ic && !pass(f5).desc.colors[0].autoMsaa && mt.skipFmt == 1);
+      c.gpu().destroy(ic);
+      vpgpu::Frame f6;  // stencil that must be loaded: the seed cannot restore it
+      const vpgpu::TextureId ds = mk(vpgpu::Format::D32FloatS8, 1);
+      OpBeginRendering sb = scene(vpgpu::LoadAction::Load, vpgpu::StoreAction::Store, vpgpu::StoreAction::Store);
+      sb.desc.depth.texture = ds;
+      run(sb, geo, f6);
+      CHECK(!pass(f6).desc.depth.autoMsaa && mt.skipLoad == 1);
+      c.gpu().destroy(ds);
+      vpgpu::Frame f7;  // the game's own MSAA is not touched
+      const vpgpu::TextureId mc = mk(vpgpu::Format::RGBA8Unorm, 4), md = mk(vpgpu::Format::D32Float, 4);
+      OpBeginRendering mb = scene(vpgpu::LoadAction::Clear, vpgpu::StoreAction::DontCare, vpgpu::StoreAction::DontCare);
+      mb.desc.colors[0].texture = mc, mb.desc.depth.texture = md;
+      const std::string smpLog = captureStderr([&] { run(mb, geo, f7); });
+      // vk.msaa rej_first reason=smp: the first pass of that reason (the game's own 4x here, forced 4).
+      CHECK(countOf(smpLog, "vk.msaa rej_first reason=smp w=1920 h=1824 ") == 1 &&
+            smpLog.find(" fmt=RGBA8Unorm/D32Float samples=4/4 forced=4 store=") != std::string::npos);
+      CHECK(pass(f7).desc.colors[0].texture == mc && !pass(f7).desc.colors[0].autoMsaa && mt.passes == 3);
+      c.gpu().destroy(mc);
+      c.gpu().destroy(md);
+    }
+    // 5. A pass that is not an eye pass (a shadow map: other size, no colour) is not forced.
+    {
+      vpgpu::Frame f;
+      const vpgpu::TextureId sm = mk(vpgpu::Format::D32Float, 1, false, 512, 512);
+      OpBeginRendering shadow;
+      shadow.area = {{0, 0}, {512, 512}};
+      shadow.depthWidth = shadow.depthHeight = 512;
+      shadow.desc.depth.texture = sm;
+      Recorder rec;
+      rec.ops.emplace_back(shadow), rec.ops.emplace_back(geo), rec.ops.emplace_back(OpEndPass{});
+      TranslateStats st;
+      translate(rec, f, st, nullptr, nullptr, nullptr, nullptr, d);
+      CHECK(!pass(f).desc.depth.autoMsaa && d->msaaTwins.passes == 3);
+      c.gpu().destroy(sm);
+    }
+    // 6. Twins go with their image (swept every 256th acquire).
+    {
+      MsaaTwins& mt = d->msaaTwins;
+      const vpgpu::TextureId a = mk(vpgpu::Format::RGBA8Unorm, 1), b = mk(vpgpu::Format::RGBA8Unorm, 1);
+      vpgpu::TextureDesc ad, bd;
+      CHECK(c.gpu().textureDesc(a, ad) && c.gpu().textureDesc(b, bd));
+      const vpgpu::TextureId ta = mt.acquire(d, a, ad, 4, 1, 0, 0), tb = mt.acquire(d, b, bd, 4, 1, 0, 0);
+      CHECK(ta && tb && ta != tb && mt.acquire(d, a, ad, 4, 1, 0, 0) == ta && mt.acquire(d, a, ad, 2, 1, 0, 0) != ta);
+      c.gpu().destroy(a);
+      for (int i = 0; i < 300; ++i) mt.acquire(d, b, bd, 4, 1, 0, 0);
+      vpgpu::TextureDesc gone;
+      CHECK(!c.gpu().textureDesc(ta, gone) && c.gpu().textureDesc(tb, gone));
+      c.gpu().destroy(b);
+    }
+    // 6b. The game's own MSAA below the forced N (2x eye pass, forced 4): upgraded. The 4-sample twins resolve into the game's own
+    // 1x targets, the game's 2x images are not touched, the draw uses the 4-sample pipeline variant of the 2x game pipeline.
+    {
+      MsaaTwins& mt = d->msaaTwins;
+      const uint32_t passes0 = mt.passes, up0 = mt.up, store0 = mt.rejStore, smp0 = mt.rejSmp;
+      const vpgpu::TextureId mc = mk(vpgpu::Format::RGBA8Unorm, 2, true), md = mk(vpgpu::Format::D32Float, 2, true);
+      auto mkx = [&](vpgpu::Format f, uint8_t samples, uint16_t layers, uint16_t mips, uint8_t extra) {
+        vpgpu::TextureDesc td;
+        td.format = f, td.width = 1920, td.height = 1824, td.samples = samples, td.layers = layers, td.mips = mips;
+        td.transient = samples > 1;
+        td.usage = (vpgpu::formatInfo(f).depth() ? vpgpu::usage::depthTarget : vpgpu::usage::colorTarget) | extra;
+        return c.gpu().createTexture(td);
+      };
+      const vpgpu::TextureId rd = mkx(vpgpu::Format::D32Float, 1, 1, 1, vpgpu::usage::sampled);  // the game's depth resolve target
+      PipelineObj p2;
+      p2.ok = false;
+      p2.state.samples = 2;
+      p2.state.label = "game2";
+      p2.key = p2.state.key();
+      OpDraw g2 = geo;
+      g2.pipe = &p2, g2.draw.pipeline = p2.key;
+      vpgpu::PipelineState v4 = p2.state;
+      v4.samples = 4, v4.label += ".ms4";
+      auto msPass = [&](vpgpu::StoreAction cstore, vpgpu::StoreAction dstore, bool depthResolve, vpgpu::LoadAction load) {
+        OpBeginRendering b = scene(load, cstore, dstore);
+        b.desc.colors[0].texture = mc, b.desc.colors[0].resolve = color;
+        b.desc.depth.texture = md;
+        if (depthResolve) b.desc.depth.resolve = rd;
+        return b;
+      };
+      {  // colour: memoryless Resolve into the game's 1x; depth: DONT_CARE (gets a 1x partner of ours as resolve target)
+        vpgpu::Frame f;
+        const std::string upLog = captureStderr([&] { run(msPass(vpgpu::StoreAction::Resolve, vpgpu::StoreAction::DontCare, false, vpgpu::LoadAction::Clear), g2, f); });
+        // vk.msaa up_detail: the first upgraded pass (size, formats incl. the resolve targets, samples before -> after, multiview).
+        CHECK(countOf(upLog, "vk.msaa up_detail ") == 1 && mt.upDetailDone);
+        CHECK(upLog.find("vk.msaa up_detail w=1920 h=1824 layers=1 color=RGBA8Unorm depth=D32Float resolve=RGBA8Unorm/D32Float samples=2->4 multiview=0 viewMask=0x0\n") !=
+              std::string::npos);
+        const vpgpu::RenderPass rp = pass(f);
+        const vpgpu::Attachment &c0 = rp.desc.colors[0], &z = rp.desc.depth;
+        CHECK(c0.autoMsaa && z.autoMsaa && c0.texture != mc && z.texture != md && !c0.keepSamples && !z.keepSamples);
+        CHECK(c0.resolve == color && c0.store == vpgpu::StoreAction::Resolve && z.store == vpgpu::StoreAction::DontCare);
+        const vpgpu::TextureDesc *tc = c.gpu().resources().get(c0.texture), *tz = c.gpu().resources().get(z.texture);
+        const vpgpu::TextureDesc* pz = c.gpu().resources().get(z.resolve);
+        CHECK(tc && tz && tc->samples == 4 && tz->samples == 4 && tc->transient && tz->transient && !tc->persistent);
+        CHECK(pz && pz->samples == 1 && z.resolve != rd && z.resolve != md);
+        CHECK(rp.draws.size() == 1 && rp.draws[0].pipeline == v4.key() && rp.draws[0].pipeline != p2.key);
+        CHECK(mt.passes == passes0 + 1 && mt.up == up0 + 1 && mt.rejStore == store0 && mt.rejSmp == smp0);
+      }
+      {  // depth the game resolves: the twin resolves into the game's own depth resolve target
+        vpgpu::Frame f;
+        CHECK(captureStderr([&] { run(msPass(vpgpu::StoreAction::Resolve, vpgpu::StoreAction::Resolve, true, vpgpu::LoadAction::Clear), g2, f); })
+                  .find("up_detail") == std::string::npos);  // once per session
+        const vpgpu::RenderPass rp = pass(f);
+        CHECK(rp.desc.depth.autoMsaa && rp.desc.depth.resolve == rd && rp.desc.depth.store == vpgpu::StoreAction::Resolve);
+        CHECK(rp.desc.colors[0].resolve == color && mt.passes == passes0 + 2 && mt.up == up0 + 2);
+      }
+      auto untouched2 = [&](const vpgpu::Frame& f) {
+        const vpgpu::RenderPass rp = pass(f);
+        return !rp.desc.colors[0].autoMsaa && !rp.desc.depth.autoMsaa && rp.desc.colors[0].texture == mc &&
+               rp.desc.depth.texture == md && rp.draws[0].pipeline == p2.key;
+      };
+      {  // the game stores its MS colour (StoreAndResolve), or its MS depth: its samples are read later, not upgraded
+        vpgpu::Frame f1, f2, f3;
+        const std::string first = captureStderr([&] { run(msPass(vpgpu::StoreAction::StoreAndResolve, vpgpu::StoreAction::DontCare, false, vpgpu::LoadAction::Clear), g2, f1); });
+        CHECK(untouched2(f1) && mt.rejStore == store0 + 1);
+        // vk.msaa rej_first: the first pass of each reason, with the rej_detail fields (eye size 1920x1824 from the jitter) and the pass's actions.
+        CHECK(countOf(first, "vk.msaa rej_first ") == 1);
+        CHECK(first.find("vk.msaa rej_first reason=msstore w=1920 h=1824 fbW=0 fbH=0 depthW=1920 depthH=1824 viewMask=0x0 eyeW=1920 eyeH=1824 jit=1 "
+                         "fmt=RGBA8Unorm/D32Float samples=2/2 forced=4 store=") != std::string::npos);
+        CHECK(captureStderr([&] { run(msPass(vpgpu::StoreAction::Resolve, vpgpu::StoreAction::Store, false, vpgpu::LoadAction::Clear), g2, f2); })
+                  .find("rej_first") == std::string::npos);  // the same reason again: not repeated
+        CHECK(untouched2(f2) && mt.rejStore == store0 + 2);
+        run(msPass(vpgpu::StoreAction::Resolve, vpgpu::StoreAction::DontCare, false, vpgpu::LoadAction::Load), g2, f3);  // continues stored samples
+        CHECK(untouched2(f3) && mt.rejStore == store0 + 3);
+        CHECK(mt.passes == passes0 + 2 && mt.up == up0 + 2 && mt.rejSmp == smp0);
+      }
+      {  // already at the forced count: the game's own
+        vpgpu::Frame f;
+        const vpgpu::TextureId qc = mk(vpgpu::Format::RGBA8Unorm, 4, true), qd = mk(vpgpu::Format::D32Float, 4, true);
+        OpBeginRendering qb = msPass(vpgpu::StoreAction::Resolve, vpgpu::StoreAction::DontCare, false, vpgpu::LoadAction::Clear);
+        qb.desc.colors[0].texture = qc, qb.desc.depth.texture = qd;
+        CHECK(captureStderr([&] { run(qb, g2, f); }).find("rej_first") == std::string::npos);  // (reason smp was reported above)
+        CHECK(pass(f).desc.colors[0].texture == qc && !pass(f).desc.colors[0].autoMsaa && mt.rejSmp == smp0 + 1 && mt.up == up0 + 2);
+        c.gpu().destroy(qc);
+        c.gpu().destroy(qd);
+      }
+      {  // a resolve target the later seed could not read (no sampled usage): not upgraded, counted
+        vpgpu::Frame f;
+        const uint32_t un0 = mt.skipUnreadable;
+        const vpgpu::TextureId ru = mkx(vpgpu::Format::RGBA8Unorm, 1, 1, 1, 0);
+        OpBeginRendering ub = msPass(vpgpu::StoreAction::Resolve, vpgpu::StoreAction::DontCare, false, vpgpu::LoadAction::Clear);
+        ub.desc.colors[0].resolve = ru;
+        run(ub, g2, f);
+        CHECK(untouched2(f) && mt.skipUnreadable == un0 + 1 && mt.passes == passes0 + 2);
+        c.gpu().destroy(ru);
+      }
+      {  // a pipeline with a baked partial sample mask, or a fragment shader on SampleId / SampleMask: the game's count matters
+        const uint32_t sm0 = mt.rejSmask;
+        PipelineObj pm, ps;  // (not copyable)
+        for (PipelineObj* q : {&pm, &ps}) q->ok = false, q->state = p2.state, q->key = p2.key;
+        pm.sampleMask = 0x1;
+        ps.sampleBuiltin = true;
+        OpDraw dm = g2, ds = g2;
+        dm.pipe = &pm, ds.pipe = &ps;
+        vpgpu::Frame f1, f2;
+        run(msPass(vpgpu::StoreAction::Resolve, vpgpu::StoreAction::DontCare, false, vpgpu::LoadAction::Clear), dm, f1);
+        CHECK(untouched2(f1) && mt.rejSmask == sm0 + 1);
+        run(msPass(vpgpu::StoreAction::Resolve, vpgpu::StoreAction::DontCare, false, vpgpu::LoadAction::Clear), ds, f2);
+        CHECK(untouched2(f2) && mt.rejSmask == sm0 + 2 && mt.passes == passes0 + 2 && mt.up == up0 + 2);
+      }
+      {  // stencil format: the game's resolve modes stay (stencil None included), the stencil plane needs a format-view resolve target
+        const vpgpu::TextureId sd = mkx(vpgpu::Format::D32FloatS8, 2, 1, 1, 0);
+        const vpgpu::TextureId sr = mkx(vpgpu::Format::D32FloatS8, 1, 1, 1, vpgpu::usage::sampled | vpgpu::usage::formatView);
+        const vpgpu::TextureId sn = mkx(vpgpu::Format::D32FloatS8, 1, 1, 1, vpgpu::usage::sampled);
+        auto stencilPass = [&](vpgpu::TextureId target) {
+          OpBeginRendering b = msPass(vpgpu::StoreAction::Resolve, vpgpu::StoreAction::Resolve, true, vpgpu::LoadAction::Clear);
+          b.desc.depth.texture = sd, b.desc.depth.resolve = target;
+          b.desc.depth.depthResolve = vpgpu::ResolveMode::Max, b.desc.depth.stencilResolve = vpgpu::ResolveMode::None;
+          return b;
+        };
+        vpgpu::Frame f1, f2;
+        run(stencilPass(sr), g2, f1);
+        const vpgpu::Attachment& z = pass(f1).desc.depth;
+        CHECK(z.autoMsaa && z.texture != sd && z.resolve == sr && z.depthResolve == vpgpu::ResolveMode::Max &&
+              z.stencilResolve == vpgpu::ResolveMode::None && mt.up == up0 + 3);
+        const uint32_t un0 = mt.skipUnreadable;
+        run(stencilPass(sn), g2, f2);
+        CHECK(!pass(f2).desc.depth.autoMsaa && pass(f2).desc.depth.texture == sd && mt.skipUnreadable == un0 + 1 && mt.up == up0 + 3);
+        c.gpu().destroy(sd);
+        c.gpu().destroy(sr);
+        c.gpu().destroy(sn);
+      }
+      {  // two layers (multiview eye): twins of 2 layers; the game's resolve mip / layer are kept
+        const uint32_t up1 = mt.up;
+        const vpgpu::TextureId lc = mkx(vpgpu::Format::RGBA8Unorm, 2, 2, 1, 0), ld = mkx(vpgpu::Format::D32Float, 2, 2, 1, 0);
+        const vpgpu::TextureId lrc = mkx(vpgpu::Format::RGBA8Unorm, 1, 3, 2, vpgpu::usage::sampled);
+        const vpgpu::TextureId lrd = mkx(vpgpu::Format::D32Float, 1, 3, 2, vpgpu::usage::sampled);
+        OpBeginRendering lb = msPass(vpgpu::StoreAction::Resolve, vpgpu::StoreAction::Resolve, true, vpgpu::LoadAction::Clear);
+        lb.desc.layerCount = 2;
+        lb.desc.colors[0].texture = lc, lb.desc.colors[0].resolve = lrc, lb.desc.colors[0].resolveLayer = 1, lb.desc.colors[0].resolveMip = 1;
+        lb.desc.depth.texture = ld, lb.desc.depth.resolve = lrd, lb.desc.depth.resolveLayer = 1, lb.desc.depth.resolveMip = 1;
+        vpgpu::Frame f;
+        run(lb, g2, f);
+        const vpgpu::RenderPass rp = pass(f);
+        const vpgpu::Attachment &c0 = rp.desc.colors[0], &z = rp.desc.depth;
+        CHECK(c0.autoMsaa && z.autoMsaa && c0.resolve == lrc && z.resolve == lrd && c0.resolveLayer == 1 && z.resolveLayer == 1 &&
+              c0.resolveMip == 1 && z.resolveMip == 1 && mt.up == up1 + 1);
+        const vpgpu::TextureDesc *tc = c.gpu().resources().get(c0.texture), *tz = c.gpu().resources().get(z.texture);
+        CHECK(tc && tz && tc->layers == 2 && tz->layers == 2 && tc->samples == 4 && tz->samples == 4);
+        c.gpu().destroy(lc);
+        c.gpu().destroy(ld);
+        c.gpu().destroy(lrc);
+        c.gpu().destroy(lrd);
+      }
+      c.gpu().destroy(mc);
+      c.gpu().destroy(md);
+      c.gpu().destroy(rd);
+    }
+  }
+  // 6c. Forced 2 with the game at 4x: untouched (the game already has more).
+  {
+    vpvk_config_set_msaa_force(2);
+    Ctx c;
+    Device* d = from<Device>(c.dev);
+    CHECK(msaaForce() == 2);
+    auto mk = [&](vpgpu::Format f, uint8_t samples) {
+      vpgpu::TextureDesc td;
+      td.format = f, td.width = 1920, td.height = 1824, td.samples = samples, td.transient = samples > 1;
+      td.usage = vpgpu::formatInfo(f).depth() ? vpgpu::usage::depthTarget : vpgpu::usage::colorTarget | vpgpu::usage::sampled;
+      return c.gpu().createTexture(td);
+    };
+    const vpgpu::TextureId mc = mk(vpgpu::Format::RGBA8Unorm, 4), md = mk(vpgpu::Format::D32Float, 4), rc = mk(vpgpu::Format::RGBA8Unorm, 1);
+    PipelineObj p4;
+    p4.ok = false;
+    p4.state.samples = 4;
+    p4.state.label = "game4";
+    p4.key = p4.state.key();
+    OpDraw g4;
+    g4.ok = true;
+    g4.pipe = &p4;
+    g4.draw.pipeline = p4.key;
+    g4.draw.count = 300, g4.draw.index = vpgpu::IndexBuffer{};
+    g4.draw.viewport = {0, 0, 1920, 1824, 0, 1};
+    g4.depthTested = g4.vertexBuffers = true;
+    OpBeginRendering b;
+    b.area = {{0, 0}, {1920, 1824}};
+    b.depthWidth = 1920, b.depthHeight = 1824;
+    b.desc.colors[0].texture = mc, b.desc.colors[0].resolve = rc, b.desc.colors[0].load = vpgpu::LoadAction::Clear;
+    b.desc.colors[0].store = vpgpu::StoreAction::Resolve;
+    b.desc.depth.texture = md, b.desc.depth.load = vpgpu::LoadAction::Clear, b.desc.depth.store = vpgpu::StoreAction::DontCare;
+    Recorder rec;
+    rec.ops.emplace_back(b), rec.ops.emplace_back(g4), rec.ops.emplace_back(OpEndPass{});
+    vpgpu::Frame f;
+    TranslateStats st;
+    translate(rec, f, st, nullptr, nullptr, nullptr, nullptr, d);
+    const vpgpu::RenderPass rp = std::get<vpgpu::RenderPass>(f.commands().at(0));
+    CHECK(rp.desc.colors[0].texture == mc && rp.desc.depth.texture == md && !rp.desc.colors[0].autoMsaa && !rp.desc.depth.autoMsaa);
+    CHECK(rp.draws[0].pipeline == p4.key && d->msaaTwins.passes == 0 && d->msaaTwins.up == 0 && d->msaaTwins.rejSmp == 1);
+    {  // "vk.msaa main": the game's own 4x pass left alone, with the reason
+      const MsaaTwins::MainPass& mp = d->msaaTwins.mainPass;
+      CHECK(mp.forced == 0 && mp.samples == 4 && mp.w == 1920 && mp.h == 1824 && mp.why && std::string(mp.why) == "smp");
+    }
+    vpvk_config_set_msaa_force(0);
+  }
+  // 7. Off (the default): a game's 1x pass is not touched at all.
+  {
+    vpvk_config_set_msaa_force(0);
+    Ctx c;
+    Device* d = from<Device>(c.dev);
+    CHECK(msaaForce() == 0);
+    vpgpu::TextureDesc td;
+    td.format = vpgpu::Format::RGBA8Unorm, td.width = 1920, td.height = 1824, td.usage = vpgpu::usage::colorTarget;
+    const vpgpu::TextureId color = c.gpu().createTexture(td);
+    td.format = vpgpu::Format::D32Float, td.usage = vpgpu::usage::depthTarget;
+    const vpgpu::TextureId depth = c.gpu().createTexture(td);
+    OpBeginRendering b;
+    b.area = {{0, 0}, {1920, 1824}};
+    b.depthWidth = 1920, b.depthHeight = 1824;
+    b.desc.colors[0].texture = color, b.desc.depth.texture = depth;
+    OpDraw geo;
+    geo.draw.count = 3;
+    Recorder rec;
+    rec.ops.emplace_back(b), rec.ops.emplace_back(geo), rec.ops.emplace_back(OpEndPass{});
+    vpgpu::Frame f;
+    TranslateStats st;
+    translate(rec, f, st, nullptr, nullptr, nullptr, nullptr, d);
+    const vpgpu::RenderPass rp = std::get<vpgpu::RenderPass>(f.commands().at(0));
+    CHECK(rp.desc.colors[0].texture == color && rp.desc.depth.texture == depth && !rp.desc.colors[0].autoMsaa);
+    CHECK(d->msaaTwins.passes == 0 && d->msaaTwins.twins.empty());
+  }
+  // 7b. The game's own MSAA (VPVK_GAME_MSAA_AUTO, default on): a resolved colour 0 / depth attachment whose samples the game can
+  // never read becomes autoMsaa (Resolve only, no kept samples); anything else is left as it was.
+  {
+    Ctx c;
+    Device* d = from<Device>(c.dev);
+    auto mk = [&](vpgpu::Format f, uint8_t samples, bool readable) {
+      vpgpu::TextureDesc td;
+      td.format = f, td.width = 640, td.height = 480, td.samples = samples, td.samplesReadable = readable;
+      td.usage = vpgpu::formatInfo(f).depth() ? vpgpu::usage::depthTarget : vpgpu::usage::colorTarget;
+      if (samples == 1 && readable) td.usage |= vpgpu::usage::sampled;  // (a 1x image: `readable` = shader-readable)
+      return c.gpu().createTexture(td);
+    };
+    const vpgpu::TextureId g1 = mk(vpgpu::Format::RGBA8Unorm, 1, true), gd1 = mk(vpgpu::Format::D32Float, 1, true);
+    const vpgpu::TextureId g1u = mk(vpgpu::Format::RGBA8Unorm, 1, false), gd1u = mk(vpgpu::Format::D32Float, 1, false);  // not sampled
+    auto run = [&](vpgpu::TextureId mc, vpgpu::TextureId md, vpgpu::StoreAction store, bool resolve, bool partial,
+                   vpgpu::TextureId rc1 = {}, vpgpu::TextureId rd1 = {}) {
+      OpBeginRendering b;
+      b.area = {{0, 0}, {partial ? 320u : 640u, 480}};
+      b.desc.colors[0].texture = mc, b.desc.colors[0].store = store, b.desc.colors[0].load = vpgpu::LoadAction::Clear;
+      b.desc.depth.texture = md, b.desc.depth.store = store, b.desc.depth.load = vpgpu::LoadAction::Clear;
+      if (resolve) {
+        b.desc.colors[0].resolve = rc1 ? rc1 : g1;
+        b.desc.depth.resolve = rd1 ? rd1 : gd1;
+      }
+      if (store == vpgpu::StoreAction::StoreAndResolve) b.desc.colors[0].keepSamples = b.desc.depth.keepSamples = true;
+      OpDraw geo;
+      geo.draw.count = 3;
+      Recorder rec;
+      rec.ops.emplace_back(b), rec.ops.emplace_back(geo), rec.ops.emplace_back(OpEndPass{});
+      vpgpu::Frame f;
+      TranslateStats st;
+      translate(rec, f, st, nullptr, nullptr, nullptr, nullptr, d);
+      return std::get<vpgpu::RenderPass>(f.commands().at(0)).desc;
+    };
+    const vpgpu::TextureId mc = mk(vpgpu::Format::RGBA8Unorm, 4, false), md = mk(vpgpu::Format::D32Float, 4, false);
+    const vpgpu::TextureId rc = mk(vpgpu::Format::RGBA8Unorm, 4, true), rd = mk(vpgpu::Format::D32Float, 4, true);
+    {  // eligible
+      const vpgpu::RenderPassDesc r = run(mc, md, vpgpu::StoreAction::StoreAndResolve, true, false);
+      CHECK(r.colors[0].autoMsaa && r.depth.autoMsaa && r.colors[0].texture == mc && r.colors[0].resolve == g1);
+      CHECK(r.colors[0].store == vpgpu::StoreAction::Resolve && r.depth.store == vpgpu::StoreAction::Resolve);
+      CHECK(!r.colors[0].keepSamples && !r.depth.keepSamples && d->msaaTwins.gameAuto == 2);
+    }
+    {  // the samples may be read (SAMPLED / INPUT / TRANSFER_SRC / STORAGE): untouched
+      const vpgpu::RenderPassDesc r = run(rc, rd, vpgpu::StoreAction::StoreAndResolve, true, false);
+      CHECK(!r.colors[0].autoMsaa && !r.depth.autoMsaa && r.colors[0].store == vpgpu::StoreAction::StoreAndResolve &&
+            r.colors[0].keepSamples);
+    }
+    {  // no resolve target: the samples are the data
+      const vpgpu::RenderPassDesc r = run(mc, md, vpgpu::StoreAction::Store, false, false);
+      CHECK(!r.colors[0].autoMsaa && !r.depth.autoMsaa && r.colors[0].store == vpgpu::StoreAction::Store);
+    }
+    {  // a partial render area (the resolve would overwrite the rest of the target)
+      const vpgpu::RenderPassDesc r = run(mc, md, vpgpu::StoreAction::StoreAndResolve, true, true);
+      CHECK(!r.colors[0].autoMsaa && !r.depth.autoMsaa);
+    }
+    {  // a resolve target the shaders cannot read (no sampled usage: the seed could not read it): left alone and counted
+      const uint32_t before = d->msaaTwins.gameAuto, skipped = d->msaaTwins.skipUnreadable;
+      const vpgpu::RenderPassDesc r = run(mc, md, vpgpu::StoreAction::StoreAndResolve, true, false, g1u, gd1u);
+      CHECK(!r.colors[0].autoMsaa && !r.depth.autoMsaa && r.colors[0].store == vpgpu::StoreAction::StoreAndResolve && r.colors[0].keepSamples);
+      CHECK(d->msaaTwins.gameAuto == before && d->msaaTwins.skipUnreadable == skipped + 2);
+      // each attachment is judged on its own resolve target: readable colour, unreadable depth
+      const vpgpu::RenderPassDesc m = run(mc, md, vpgpu::StoreAction::StoreAndResolve, true, false, g1, gd1u);
+      CHECK(m.colors[0].autoMsaa && !m.depth.autoMsaa && d->msaaTwins.gameAuto == before + 1 && d->msaaTwins.skipUnreadable == skipped + 3);
+    }
+    {  // a pass that LOADs the samples (an earlier pass stored them): never ours, even with a resolve target
+      auto loading = [&]() {
+        OpBeginRendering b;
+        b.area = {{0, 0}, {640, 480}};
+        b.desc.colors[0].texture = mc, b.desc.colors[0].store = vpgpu::StoreAction::StoreAndResolve, b.desc.colors[0].resolve = g1;
+        b.desc.colors[0].load = vpgpu::LoadAction::Load;
+        b.desc.depth.texture = md, b.desc.depth.store = vpgpu::StoreAction::StoreAndResolve, b.desc.depth.resolve = gd1;
+        b.desc.depth.load = vpgpu::LoadAction::Load;
+        OpDraw geo;
+        geo.draw.count = 3;
+        Recorder rec;
+        rec.ops.emplace_back(b), rec.ops.emplace_back(geo), rec.ops.emplace_back(OpEndPass{});
+        vpgpu::Frame f;
+        TranslateStats st;
+        translate(rec, f, st, nullptr, nullptr, nullptr, nullptr, d);
+        return std::get<vpgpu::RenderPass>(f.commands().at(0)).desc;
+      };
+      const vpgpu::RenderPassDesc r = loading();
+      CHECK(!r.colors[0].autoMsaa && !r.depth.autoMsaa && r.colors[0].load == vpgpu::LoadAction::Load);
+    }
+    CHECK(d->msaaTwins.gameAuto == 3);  // the eligible pass (2) and the colour of the mixed one
+    {  // a depth the game never resolves and discards (the usual MSAA depth), beside an autoMsaa colour, gets a 1x partner of ours
+       // as its resolve target: nothing resolves into it unless the frame compiler cuts a heavy encoder
+      auto discarding = [&](vpgpu::TextureId color, vpgpu::TextureId colorResolve, vpgpu::TextureId depth, vpgpu::StoreAction depthStore,
+                            vpgpu::TextureId depthResolve = {}) {
+        OpBeginRendering b;
+        b.area = {{0, 0}, {640, 480}};
+        b.desc.colors[0].texture = color, b.desc.colors[0].store = vpgpu::StoreAction::Resolve, b.desc.colors[0].resolve = colorResolve;
+        b.desc.colors[0].load = vpgpu::LoadAction::Clear;
+        b.desc.depth.texture = depth, b.desc.depth.store = depthStore, b.desc.depth.resolve = depthResolve;
+        b.desc.depth.load = vpgpu::LoadAction::Clear;
+        OpDraw geo;
+        geo.draw.count = 3;
+        Recorder rec;
+        rec.ops.emplace_back(b), rec.ops.emplace_back(geo), rec.ops.emplace_back(OpEndPass{});
+        vpgpu::Frame f;
+        TranslateStats st;
+        translate(rec, f, st, nullptr, nullptr, nullptr, nullptr, d);
+        return std::get<vpgpu::RenderPass>(f.commands().at(0)).desc;
+      };
+      const vpgpu::RenderPassDesc r = discarding(mc, g1, md, vpgpu::StoreAction::DontCare);
+      vpgpu::TextureDesc pd;
+      CHECK(r.colors[0].autoMsaa && r.depth.autoMsaa && r.depth.resolve && r.depth.store == vpgpu::StoreAction::DontCare);
+      CHECK(c.gpu().textureDesc(r.depth.resolve, pd) && pd.samples == 1 && (pd.usage & vpgpu::usage::sampled) && pd.format == vpgpu::Format::D32Float);
+      CHECK(r.depth.depthResolve == vpgpu::ResolveMode::Sample0);
+      CHECK(discarding(mc, g1, md, vpgpu::StoreAction::DontCare).depth.resolve == r.depth.resolve);  // one partner per depth image
+      // the depth is kept (Store): the samples are the data
+      CHECK(!discarding(mc, g1, md, vpgpu::StoreAction::Store).depth.autoMsaa);
+      // not beside a colour that is not autoMsaa (a memoryless depth next to memory-backed samples would meet the tiler's flush)
+      CHECK(!discarding(rc, g1, md, vpgpu::StoreAction::DontCare).depth.autoMsaa);
+      // a stencil aspect: the partner is created with format views (the stencil plane is read through a stencil view) ...
+      const vpgpu::TextureId sd = mk(vpgpu::Format::D32FloatS8, 4, false);
+      const vpgpu::RenderPassDesc rs = discarding(mc, g1, sd, vpgpu::StoreAction::DontCare);
+      CHECK(rs.depth.autoMsaa && c.gpu().textureDesc(rs.depth.resolve, pd) && (pd.usage & vpgpu::usage::formatView) &&
+            rs.depth.stencilResolve == vpgpu::ResolveMode::Sample0);
+      // ... and a game resolve target without them cannot serve a stencil seed: left alone (also without a resolved stencil)
+      const vpgpu::TextureId gs = mk(vpgpu::Format::D32FloatS8, 1, true);
+      CHECK(!discarding(mc, g1, sd, vpgpu::StoreAction::Resolve, gs).depth.autoMsaa);
+      for (vpgpu::TextureId t : {sd, gs}) c.gpu().destroy(t);
+    }
+    {  // a transient image (the GLES layer's multisample twin) never keeps its samples: a Load is a seed from the resolve target
+      auto mkT = [&](vpgpu::Format f) {
+        vpgpu::TextureDesc td;
+        td.format = f, td.width = 640, td.height = 480, td.samples = 4, td.samplesReadable = false, td.transient = true;
+        td.usage = vpgpu::formatInfo(f).depth() ? vpgpu::usage::depthTarget : vpgpu::usage::colorTarget;
+        return c.gpu().createTexture(td);
+      };
+      const vpgpu::TextureId tc = mkT(vpgpu::Format::RGBA8Unorm), tz = mkT(vpgpu::Format::D32Float);
+      OpBeginRendering b;
+      b.area = {{0, 0}, {640, 480}};
+      b.desc.colors[0].texture = tc, b.desc.colors[0].store = vpgpu::StoreAction::Resolve, b.desc.colors[0].resolve = g1;
+      b.desc.colors[0].load = vpgpu::LoadAction::Load;
+      b.desc.depth.texture = tz, b.desc.depth.store = vpgpu::StoreAction::Resolve, b.desc.depth.resolve = gd1;
+      b.desc.depth.load = vpgpu::LoadAction::Load;
+      OpDraw geo;
+      geo.draw.count = 3;
+      Recorder rec;
+      rec.ops.emplace_back(b), rec.ops.emplace_back(geo), rec.ops.emplace_back(OpEndPass{});
+      vpgpu::Frame f;
+      TranslateStats st;
+      translate(rec, f, st, nullptr, nullptr, nullptr, nullptr, d);
+      const vpgpu::RenderPassDesc r = std::get<vpgpu::RenderPass>(f.commands().at(0)).desc;
+      CHECK(!r.colors[0].autoMsaa && !r.depth.autoMsaa);  // a Vulkan guest's transient image keeps its Load
+      d->internalClient = true;
+      vpgpu::Frame f2;
+      translate(rec, f2, st, nullptr, nullptr, nullptr, nullptr, d);
+      d->internalClient = false;
+      const vpgpu::RenderPassDesc r2 = std::get<vpgpu::RenderPass>(f2.commands().at(0)).desc;
+      CHECK(r2.colors[0].autoMsaa && r2.depth.autoMsaa && r2.depth.resolve == gd1 && r2.depth.store == vpgpu::StoreAction::Resolve);
+      for (vpgpu::TextureId t : {tc, tz}) c.gpu().destroy(t);
+    }
+    // The 1x attachment images get no extra usage from the game's own MSAA (a resolve target that is not readable is skipped above).
+    auto img = [&](VkImageUsageFlags u, VkSampleCountFlagBits n) {
+      VkImageCreateInfo ii{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+      ii.imageType = VK_IMAGE_TYPE_2D, ii.format = VK_FORMAT_R8G8B8A8_UNORM, ii.extent = {64, 64, 1}, ii.mipLevels = 1, ii.arrayLayers = 1;
+      ii.samples = n, ii.tiling = VK_IMAGE_TILING_OPTIMAL, ii.usage = u;
+      VkImage i = VK_NULL_HANDLE;
+      return vkCreateImage(c.dev, &ii, nullptr, &i) == VK_SUCCESS ? i : VK_NULL_HANDLE;
+    };
+    {
+      VkImage a = img(VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT, VK_SAMPLE_COUNT_1_BIT);
+      VkImage t = img(VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT, VK_SAMPLE_COUNT_1_BIT);
+      VkImage m = img(VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, VK_SAMPLE_COUNT_4_BIT);
+      CHECK(a && t && m);
+      CHECK(!(from<Image>(a)->desc.usage & vpgpu::usage::sampled));  // gameMsaaAuto alone: as the game created it
+      CHECK(!(from<Image>(t)->desc.usage & vpgpu::usage::sampled));
+      CHECK(!(from<Image>(m)->desc.usage & vpgpu::usage::sampled) || from<Image>(m)->desc.samples > 1);  // (MSAA colour is readable anyway)
+      vkDestroyImage(c.dev, a, nullptr), vkDestroyImage(c.dev, t, nullptr), vkDestroyImage(c.dev, m, nullptr);
+    }
+    for (vpgpu::TextureId t : {g1, gd1, g1u, gd1u, mc, md, rc, rd}) c.gpu().destroy(t);
+  }
+  {  // msaaForce on: the 1x attachment images the twins resolve into / seed from are created readable (tile-only ones stay unreadable)
+    vpvk_config_set_msaa_force(4);
+    {
+      Ctx c;
+      auto img = [&](VkImageUsageFlags u) {
+        VkImageCreateInfo ii{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+        ii.imageType = VK_IMAGE_TYPE_2D, ii.format = VK_FORMAT_R8G8B8A8_UNORM, ii.extent = {64, 64, 1}, ii.mipLevels = 1, ii.arrayLayers = 1;
+        ii.samples = VK_SAMPLE_COUNT_1_BIT, ii.tiling = VK_IMAGE_TILING_OPTIMAL, ii.usage = u;
+        VkImage i = VK_NULL_HANDLE;
+        return vkCreateImage(c.dev, &ii, nullptr, &i) == VK_SUCCESS ? i : VK_NULL_HANDLE;
+      };
+      VkImage a = img(VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT);
+      VkImage t = img(VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT);
+      CHECK(a && t);
+      CHECK(msaaForce() == 4 && (from<Image>(a)->desc.usage & vpgpu::usage::sampled));
+      CHECK(!(from<Image>(t)->desc.usage & vpgpu::usage::sampled));
+      vkDestroyImage(c.dev, a, nullptr), vkDestroyImage(c.dev, t, nullptr);
+    }
+    vpvk_config_set_msaa_force(0);
+  }
+  {  // VPVK_GAME_MSAA_AUTO=0 (read when the device is created): no autoMsaa for the game's MSAA, and the 1x images stay as they were
+    setenv("VPVK_GAME_MSAA_AUTO", "0", 1);
+    vpvk_config_set_msaa_force(0);
+    Ctx c;
+    Device* d = from<Device>(c.dev);
+    CHECK(!gameMsaaAuto());
+    vpgpu::TextureDesc td;
+    td.format = vpgpu::Format::RGBA8Unorm, td.width = 640, td.height = 480, td.samples = 4, td.samplesReadable = false;
+    td.usage = vpgpu::usage::colorTarget;
+    const vpgpu::TextureId mc = c.gpu().createTexture(td);
+    td.samples = 1, td.samplesReadable = true;
+    const vpgpu::TextureId g1 = c.gpu().createTexture(td);
+    OpBeginRendering b;
+    b.area = {{0, 0}, {640, 480}};
+    b.desc.colors[0].texture = mc, b.desc.colors[0].store = vpgpu::StoreAction::StoreAndResolve, b.desc.colors[0].resolve = g1;
+    b.desc.colors[0].keepSamples = true;
+    b.desc.colors[0].load = vpgpu::LoadAction::Clear;
+    OpDraw geo;
+    geo.draw.count = 3;
+    Recorder rec;
+    rec.ops.emplace_back(b), rec.ops.emplace_back(geo), rec.ops.emplace_back(OpEndPass{});
+    vpgpu::Frame f;
+    TranslateStats st;
+    translate(rec, f, st, nullptr, nullptr, nullptr, nullptr, d);
+    const vpgpu::RenderPassDesc r = std::get<vpgpu::RenderPass>(f.commands().at(0)).desc;
+    CHECK(!r.colors[0].autoMsaa && r.colors[0].keepSamples && d->msaaTwins.gameAuto == 0);
+    VkImageCreateInfo ii{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+    ii.imageType = VK_IMAGE_TYPE_2D, ii.format = VK_FORMAT_R8G8B8A8_UNORM, ii.extent = {64, 64, 1}, ii.mipLevels = 1, ii.arrayLayers = 1;
+    ii.samples = VK_SAMPLE_COUNT_1_BIT, ii.tiling = VK_IMAGE_TILING_OPTIMAL, ii.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+    VkImage i = VK_NULL_HANDLE;
+    CHECK(vkCreateImage(c.dev, &ii, nullptr, &i) == VK_SUCCESS && !(from<Image>(i)->desc.usage & vpgpu::usage::sampled));
+    vkDestroyImage(c.dev, i, nullptr);
+    c.gpu().destroy(mc);
+    c.gpu().destroy(g1);
+    unsetenv("VPVK_GAME_MSAA_AUTO");
+  }
+  // 8. The setting: 2 / 4 only, 8 and more is 4, clamped to the device (4 on the null platform), < 2 is off.
+  {
+    vpvk_config_set_msaa_force(8);
+    CHECK(msaaForceLive() == 4);
+    vpvk_config_set_msaa_force(2);
+    CHECK(msaaForceLive() == 2);
+    vpvk_config_set_msaa_force(1);
+    CHECK(msaaForceLive() == 0);
+    vpvk_config_set_msaa_force(0);
+  }
+  vpvk_taa_jitter none{0, 0, 0, 0, 0, 0};
+  vpvk_taa_set_jitter(&none);
+}
+
+// Forced MSAA finds the eye pass by the size of the image the host marked (vpvk_mark_eye_image) when no jitter size is set
+// (VPKTAA gone from the client): an eye-sized depth pass is forced, a quarter-size one is not.
+void testMsaaForceMarkedEye() {
+  vpvk_taa_jitter none{0, 0, 0, 0, 0, 0};
+  vpvk_taa_set_jitter(&none);
+  vpvk_config_set_msaa_force(4);
+  {
+    Ctx c;
+    Device* d = from<Device>(c.dev);
+    CHECK(d->eyeSize.load() == 0);
+    VkImageCreateInfo ii{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+    ii.imageType = VK_IMAGE_TYPE_2D, ii.format = VK_FORMAT_R8G8B8A8_UNORM, ii.extent = {256, 256, 1}, ii.mipLevels = 1;
+    ii.arrayLayers = 2, ii.samples = VK_SAMPLE_COUNT_1_BIT, ii.tiling = VK_IMAGE_TILING_OPTIMAL;
+    ii.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+    VkImage eye = VK_NULL_HANDLE;
+    CHECK(vkCreateImage(c.dev, &ii, nullptr, &eye) == VK_SUCCESS && eye);
+    vpvk_mark_eye_image(eye);  // (unbound: 0, the size is recorded all the same)
+    CHECK(d->eyeSize.load() == packEyeSize(256, 256, 2));
+    CHECK(eyeSizeW(d->eyeSize.load()) == 256 && eyeSizeH(d->eyeSize.load()) == 256);
+    auto mk = [&](vpgpu::Format f, uint32_t w, uint32_t h) {
+      vpgpu::TextureDesc td;
+      td.format = f, td.width = w, td.height = h;
+      td.usage = vpgpu::formatInfo(f).depth() ? vpgpu::usage::depthTarget : vpgpu::usage::colorTarget | vpgpu::usage::sampled;
+      return c.gpu().createTexture(td);
+    };
+    PipelineObj po;
+    po.ok = false;
+    po.state.samples = 1;
+    po.state.label = "game";
+    po.key = po.state.key();
+    OpDraw geo;
+    geo.ok = true;
+    geo.pipe = &po;
+    geo.draw.pipeline = po.key;
+    geo.draw.count = 300, geo.draw.index = vpgpu::IndexBuffer{};
+    geo.depthTested = geo.vertexBuffers = true;
+    auto run = [&](uint32_t w, uint32_t h, uint32_t viewMask = 0) {
+      OpBeginRendering b;
+      b.viewMask = viewMask;
+      b.area = {{0, 0}, {w, h}};
+      b.depthWidth = w, b.depthHeight = h;
+      b.desc.colors[0].texture = mk(vpgpu::Format::RGBA8Unorm, w, h);
+      b.desc.depth.texture = mk(vpgpu::Format::D32Float, w, h);
+      b.desc.colors[0].store = vpgpu::StoreAction::Store;
+      Recorder rec;
+      rec.ops.emplace_back(b), rec.ops.emplace_back(geo), rec.ops.emplace_back(OpEndPass{});
+      vpgpu::Frame f;
+      TranslateStats st;
+      translate(rec, f, st, nullptr, nullptr, nullptr, nullptr, d);
+    };
+    run(256, 256);
+    CHECK(d->msaaTwins.passes == 1 && d->msaaTwins.rejEye == 0);
+    // (vk.msaa rej_detail keeps its fields after sharing its builder with rej_first.)
+    const std::string detail = captureStderr([&] { run(128, 128); });  // not the eye size: a non-multiview pass must match it exactly
+    CHECK(detail.find("vk.msaa rej_detail reason=size w=128 h=128 ") != std::string::npos &&
+          detail.find(" viewMask=0x0 eyeW=256 eyeH=256 jit=0 fmt=RGBA8Unorm/D32Float\n") != std::string::npos);
+    CHECK(d->msaaTwins.passes == 1 && d->msaaTwins.rejEye == 1);
+    // The marked size only adds detections: a multiview pass of any size is still an eye pass, as without it.
+    run(1024, 1024, 0x3);
+    CHECK(d->msaaTwins.passes == 2 && d->msaaTwins.rejEye == 1);
+    // The same size rules for the pipeline gate's eye-sized test (config.cpp eyeSizedPass): the marked size, the 50-200 % band.
+    bool known = false;
+    const uint64_t mark = d->eyeSize.load();
+    CHECK(eyeSizedPass(256, 256, &known, mark) && known && eyeSizedPass(128, 128, nullptr, mark) && eyeSizedPass(512, 512, nullptr, mark));
+    CHECK(!eyeSizedPass(64, 64, &known, mark) && known && !eyeSizedPass(1024, 1024, nullptr, mark));
+    // The MSAA eye detection (msaaObservePass) uses the marked size too: a 1024x1024 pass is outside the band, a 256x256 one is the eye.
+    msaaObservePass(2, 1024, 1024, 0, true, true, mark);
+    CHECK(vpvk_msaa_detected() == 0);
+    msaaObservePass(4, 1024, 1024, 0x3, true, true, mark);  // multiview keeps its rank whatever the marked size says
+    CHECK(vpvk_msaa_detected() == 4);
+    msaaObservePass(2, 256, 256, 0, true, true, mark);  // the eye-size rule outranks it
+    CHECK(vpvk_msaa_detected() == 2);
+    vkDestroyImage(c.dev, eye, nullptr);
+  }
+  vpvk_config_set_msaa_force(0);
 }
 
 void testTaaUiMask() {
@@ -4506,6 +6333,168 @@ void testArchiveIndex() {
   fs::remove_all(dir);
 }
 
+// A pending image is zeroed whole (every mip and layer / 3D slice) before the first read of any one subresource, with a
+// valid "black" for every format: an all-zero ASTC block is not one (reserved block mode -> the decoder's error colour,
+// magenta), so ASTC images are cleared from a buffer of void-extent blocks (transparent black, what zeroed memory shows
+// on Android); ETC2 / EAC blocks of zeros are valid.
+void testZeroInitWhole() {
+  Ctx c;
+  Device* d = from<Device>(c.dev);
+  VkDeviceMemory m = alloc(c, 64 << 20, 1);
+  VkBuffer buf = buffer(c, 1 << 20, m, 32 << 20);
+  auto mk = [&](VkFormat f, VkImageType type, uint32_t w, uint32_t depth, uint32_t mips, uint32_t layers, VkImageUsageFlags usage) {
+    VkImageCreateInfo ii{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+    ii.imageType = type, ii.format = f, ii.extent = {w, w, depth}, ii.mipLevels = mips, ii.arrayLayers = layers;
+    ii.samples = VK_SAMPLE_COUNT_1_BIT, ii.tiling = VK_IMAGE_TILING_OPTIMAL, ii.usage = usage;
+    VkImage i = VK_NULL_HANDLE;
+    CHECK(vkCreateImage(c.dev, &ii, nullptr, &i) == VK_SUCCESS);
+    CHECK(vkBindImageMemory(c.dev, i, alloc(c, 1 << 20, 1), 0) == VK_SUCCESS);
+    return i;
+  };
+  const VkImageUsageFlags xfer = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+  const VkImageUsageFlags rt = xfer | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+  VkImage arr = mk(VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_TYPE_2D, 8, 1, 4, 20, xfer);    // 80 subresources: not trackable
+  VkImage arrRt = mk(VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_TYPE_2D, 8, 1, 4, 20, rt);    // the same, cleared by passes
+  VkImage vol = mk(VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_TYPE_3D, 8, 4, 3, 1, xfer);     // 3D: not trackable
+  VkImage few = mk(VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_TYPE_2D, 8, 1, 3, 2, xfer);     // 6 subresources: tracked
+  VkImage astc = mk(VK_FORMAT_ASTC_4x4_UNORM_BLOCK, VK_IMAGE_TYPE_2D, 16, 1, 3, 1, xfer);
+  VkImage astcS = mk(VK_FORMAT_ASTC_8x8_SRGB_BLOCK, VK_IMAGE_TYPE_2D, 16, 1, 2, 1, xfer);
+  VkImage etc = mk(VK_FORMAT_ETC2_R8G8B8A8_UNORM_BLOCK, VK_IMAGE_TYPE_2D, 16, 1, 3, 1, xfer);
+  CHECK(arr && arrRt && vol && few && astc && astcS && etc);
+  auto tex = [&](VkImage i) { return from<Image>(i)->id; };
+
+  VkCommandPoolCreateInfo pi{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+  VkCommandPool pool;
+  vkCreateCommandPool(c.dev, &pi, nullptr, &pool);
+  VkCommandBufferAllocateInfo ai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+  ai.commandPool = pool;
+  ai.commandBufferCount = 1;
+  VkCommandBuffer cb;
+  vkAllocateCommandBuffers(c.dev, &ai, &cb);
+  VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+  vkBeginCommandBuffer(cb, &bi);
+  auto readTop = [&](VkImage i, uint32_t extent, uint32_t mip = 0, uint32_t layer = 0) {  // reads ONE subresource
+    VkBufferImageCopy r{};
+    r.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, mip, layer, 1};
+    r.imageExtent = {extent, extent, 1};
+    vkCmdCopyImageToBuffer(cb, i, VK_IMAGE_LAYOUT_GENERAL, buf, 1, &r);
+  };
+  readTop(arr, 8), readTop(arrRt, 8), readTop(vol, 8), readTop(astc, 16), readTop(astcS, 16), readTop(etc, 16);
+  {  // few: both layers of mip 0 overwritten, then a never-written subresource (mip 2, layer 1) is read
+    VkBufferImageCopy w{};
+    w.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 2};
+    w.imageExtent = {8, 8, 1};
+    vkCmdCopyBufferToImage(cb, buf, few, VK_IMAGE_LAYOUT_GENERAL, 1, &w);
+    readTop(few, 2, 2, 1);
+  }
+  vkEndCommandBuffer(cb);
+
+  vpgpu::Frame frame, pre;
+  TranslateStats st;
+  ZeroLog zl;
+  zl.dev = d;
+  translate(*from<CommandBuffer>(cb)->rec, frame, st, nullptr, nullptr, &zl);
+  CHECK(zeroInitResolve(*d, zl, pre) == 7);
+
+  // What the clears write: (texture, mip, layer or 3D slice) of every pass / copy, and the bytes the copies read.
+  std::map<uint32_t, std::vector<uint8_t>> mem;  // pre's buffer contents, by buffer index (0xEE: nothing wrote it)
+  auto bytesOf = [&](vpgpu::BufferId b) -> std::vector<uint8_t>& {
+    auto& v = mem[b.index];
+    if (v.empty()) v.assign(9u << 20, 0xEE);
+    return v;
+  };
+  std::map<uint32_t, std::set<std::tuple<uint32_t, uint32_t>>> cleared;  // texture index -> (mip, layer / slice)
+  std::map<uint32_t, std::vector<uint8_t>> sourced;  // texture index -> every byte its copies read
+  for (const vpgpu::Command& cmd : pre.commands()) {
+    if (const auto* rp = std::get_if<vpgpu::RenderPass>(&cmd)) {
+      const vpgpu::Attachment& a = rp->desc.colors[0];
+      cleared[a.texture.index].insert({a.mip, a.layer});
+    } else if (const auto* cp = std::get_if<vpgpu::Copy>(&cmd)) {
+      if (cp->kind == vpgpu::CopyKind::FillBuffer) {
+        std::memset(bytesOf(cp->dstBuffer.buffer).data() + cp->dstBuffer.offset, cp->fillByte, cp->dstBuffer.size);
+      } else if (cp->kind == vpgpu::CopyKind::BufferToBuffer) {
+        CHECK(cp->srcBuffer.size == cp->dstBuffer.size);
+        std::memmove(bytesOf(cp->dstBuffer.buffer).data() + cp->dstBuffer.offset, bytesOf(cp->srcBuffer.buffer).data() + cp->srcBuffer.offset,
+                     cp->srcBuffer.size);
+      } else if (cp->kind == vpgpu::CopyKind::BufferToTexture) {
+        const vpgpu::TextureSpan& t = cp->dstTexture;
+        cleared[t.texture.index].insert({t.mip, t.z ? t.z : t.layer});
+        const uint8_t* p = bytesOf(cp->srcBuffer.buffer).data() + cp->srcBuffer.offset;
+        auto& s = sourced[t.texture.index];
+        s.insert(s.end(), p, p + size_t(cp->srcBuffer.bytesPerRow) * cp->srcBuffer.rowsPerImage);
+      }
+    }
+  }
+  CHECK(cleared[tex(arr).index].size() == 80);    // 4 mips x 20 layers, though only mip 0 / layer 0 was read
+  CHECK(cleared[tex(arrRt).index].size() == 80);
+  CHECK(cleared[tex(vol).index].size() == 7);     // 4 + 2 + 1 slices
+  CHECK(cleared[tex(few).index].size() == 6);     // 3 mips x 2 layers: the whole image, not just the subresource read
+  CHECK(cleared[tex(astc).index].size() == 3 && cleared[tex(astcS).index].size() == 2 && cleared[tex(etc).index].size() == 3);
+  // ASTC: every block read is the void-extent block of colour (0, 0, 0, 0); ETC2: zeros (valid).
+  auto allBlocks = [&](VkImage i, auto&& ok) {
+    const auto& s = sourced[tex(i).index];
+    bool good = !s.empty() && s.size() % 16 == 0;
+    for (size_t o = 0; good && o + 16 <= s.size(); o += 16) good = ok(&s[o]);
+    return good;
+  };
+  auto voidBlock = [](const uint8_t* b) {
+    if (b[0] != 0xFC || b[1] != 0xFD) return false;
+    for (int k = 2; k < 8; ++k) if (b[k] != 0xFF) return false;
+    for (int k = 8; k < 16; ++k) if (b[k] != 0) return false;
+    return true;
+  };
+  CHECK(allBlocks(astc, voidBlock) && allBlocks(astcS, voidBlock));
+  CHECK(allBlocks(etc, [](const uint8_t* b) { for (int k = 0; k < 16; ++k) if (b[k]) return false; return true; }));
+  {  // and the decoder agrees that block is a valid transparent black (not the error colour)
+    const auto& s = sourced[tex(astc).index];
+    uint8_t px[16 * 4];
+    CHECK(s.size() >= 16 && astcDecodeBlock(s.data(), 4, 4, false, px));
+    bool zero = true;
+    for (uint8_t v : px) zero = zero && v == 0;
+    CHECK(zero);
+  }
+  CHECK(d->zeroPending.empty());
+  vkDestroyCommandPool(c.dev, pool, nullptr);
+}
+
+// Host side of the zero-init (Klepton's compositor reads the eye image outside the Vulkan flow): the eye image stays pending, so
+// vpvk_image_zero_pending keeps saying 1 and the host keeps skipping it, until vpvk_image_zero_clear has really cleared it; a
+// clear that finds the submit lock taken returns -1 and leaves it pending.
+struct NativeIds final : Platform {
+  std::unique_ptr<Platform> inner;
+  vpgpu::Backend& backend() override { return inner->backend(); }
+  void* nativeTexture(vpgpu::TextureId t) override { return reinterpret_cast<void*>(uintptr_t{0x1000} + uintptr_t{t.index} * 16); }
+};
+void testZeroInitHost() {
+  Ctx c;
+  Device* d = from<Device>(c.dev);
+  auto owner = std::make_unique<NativeIds>();
+  NativeIds* plat = owner.get();
+  plat->inner = std::move(d->platform);
+  d->platform = std::move(owner);
+  const VkImageUsageFlags usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+  VkImageCreateInfo ii{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+  ii.imageType = VK_IMAGE_TYPE_2D, ii.format = VK_FORMAT_R8G8B8A8_UNORM, ii.extent = {16, 16, 1}, ii.mipLevels = 1, ii.arrayLayers = 2;
+  ii.samples = VK_SAMPLE_COUNT_1_BIT, ii.tiling = VK_IMAGE_TILING_OPTIMAL, ii.usage = usage;
+  VkImage eye = VK_NULL_HANDLE;
+  CHECK(vkCreateImage(c.dev, &ii, nullptr, &eye) == VK_SUCCESS);
+  CHECK(vkBindImageMemory(c.dev, eye, alloc(c, 1 << 20, 1), 0) == VK_SUCCESS);
+  CHECK(vpvk_mark_eye_image(eye) == 1);
+  void* mtl = from<Image>(eye)->native;
+  CHECK(mtl && vpvk_image_zero_pending(mtl) == 1);
+  {  // a submit holds the lock: the clear does not wait, and the image is still pending (the host must not present it)
+    int r = 0;
+    std::lock_guard<std::mutex> lock(d->submitMutex);
+    std::thread([&] { r = vpvk_image_zero_clear(mtl); }).join();
+    CHECK(r == -1 && vpvk_image_zero_pending(mtl) == 1);
+  }
+  const uint64_t before = d->zeroCleared;
+  CHECK(vpvk_image_zero_clear(mtl) == 1);
+  CHECK(vpvk_image_zero_pending(mtl) == 0 && d->zeroPending.empty() && d->zeroCleared == before + 1);
+  CHECK(vpvk_image_zero_clear(mtl) == 0);  // settled: nothing left to clear
+  d->platform = std::move(plat->inner);  // the stand-in goes before the device does
+}
+
 // New images read as zeros until first written (Android's zeroed memory): bind marks the texture
 // pending; the submit's frame decides which pending images need a clear pass (null backend: the
 // frame the clears go in is inspected).
@@ -4589,9 +6578,10 @@ void testZeroInit() {
       clearsP = clearsP || at.texture == from<Image>(p)->id;
     }
     else if (const auto* cp = std::get_if<vpgpu::Copy>(&cmd)) {
-      if (cp->kind == vpgpu::CopyKind::FillBuffer) fillsZeros = cp->fillByte == 0 && cp->dstBuffer.buffer == d->zeroBuffer;
+      if (cp->kind == vpgpu::CopyKind::FillBuffer) fillsZeros = fillsZeros || (cp->fillByte == 0 && cp->dstBuffer.buffer == d->zeroBuffer);
       if (cp->kind != vpgpu::CopyKind::BufferToTexture) continue;
-      CHECK(cp->srcBuffer.buffer == d->zeroBuffer && cp->dstTexture.width == 16 && cp->dstTexture.height == 16);
+      CHECK(cp->srcBuffer.buffer == (cp->dstTexture.texture == from<Image>(bc)->id ? d->zeroAstcBuffer : d->zeroBuffer) &&
+            cp->dstTexture.width == 16 && cp->dstTexture.height == 16);  // ASTC: void-extent blocks, not zeros (testZeroInitWhole)
       if (cp->dstTexture.texture == from<Image>(so)->id) {  // RGBA8: 16 texels x 4 bytes, 16 rows
         copiesSo = true;
         CHECK(cp->srcBuffer.bytesPerRow == 64 && cp->srcBuffer.rowsPerImage == 16);
@@ -4619,6 +6609,8 @@ void testZeroInit() {
   vkDestroyImage(c.dev, z, nullptr);  // destroying a pending image forgets it
   CHECK(d->zeroPending.empty());
   vkDestroyCommandPool(c.dev, pool, nullptr);
+  testZeroInitWhole();
+  testZeroInitHost();
 }
 
 // Foveado propio: matemática del perfil, interruptor, pases de ojo con mapa en el traductor, separación de la UI.
@@ -4808,7 +6800,7 @@ void testFoveation() {
 // CMake source fingerprint: a refactor that leaves the output alone keeps the digest (and every cache), a change of
 // output moves it. When this test fails the translator's OUTPUT changed: bump kLowerVersion (SPIR-V -> VPIR) or
 // kEmitVersion (VPIR -> MSL) in recipes.h, then update kCorpusDigest to the printed value in the same change.
-constexpr uint64_t kCorpusDigest = 0x9293a3ef024461d7ull;  // the "corpus digest" line the test prints
+constexpr uint64_t kCorpusDigest = 0x2bf74b975e022b22ull;  // the "corpus digest" line the test prints
 
 uint64_t corpusDigest(unsigned& modules, unsigned& failed) {
   std::vector<std::string> names;
@@ -4980,6 +6972,12 @@ void testStageKeys() {
   StageInput noRobust = in;
   noRobust.opt.robustBuffers = false;  // VPVK_ROBUST=0 / app: other MSL, so other key (the default one is unchanged, above)
   CHECK(noRobust.hash() != h && noRobust.hash() != other.hash());
+  StageInput masked = in;
+  masked.opt.sampleMask = 0x5u;  // the pipeline's VkSampleMask: other MSL, other key; survives the file, also with robustBuffers off
+  CHECK(masked.hash() != h && masked.hash() != noRobust.hash());
+  StageInput maskedNoRobust = masked;
+  maskedNoRobust.opt.robustBuffers = false;
+  CHECK(maskedNoRobust.hash() != masked.hash() && maskedNoRobust.hash() != noRobust.hash());
   {
     RecipeStore s(dir);
     ShaderBlob b;
@@ -4987,6 +6985,8 @@ void testStageKeys() {
     StageIface f;
     s.addStage(in, h, cull, 0x1234, b, &f);
     s.addStage(noRobust, noRobust.hash(), cull, 0x5678, b, &f);
+    s.addStage(masked, masked.hash(), cull, 0x9abc, b, &f);
+    s.addStage(maskedNoRobust, maskedNoRobust.hash(), cull, 0xdef0, b, &f);
   }
   {
     RecipeStore s(dir);
@@ -4996,7 +6996,10 @@ void testStageKeys() {
     CHECK(s.lookupStage(noRobust.hash(), hit, &miss, in.spirv) && hit.mslId == 0x5678);
     int off = 0;  // the option survives the file: a retranslation keeps it
     for (const StageInput& si : s.stageInputs()) off += !si.opt.robustBuffers;
-    CHECK(s.stageInputs().size() == 2 && off == 1);
+    CHECK(s.stageInputs().size() == 4 && off == 2);
+    int masks = 0;
+    for (const StageInput& si : s.stageInputs()) masks += si.opt.sampleMask == 0x5u ? 1 : si.opt.sampleMask == ~0u ? 0 : 100;
+    CHECK(masks == 2);
     CHECK(!s.lookupStage(other.hash(), hit, &miss, in.spirv) && miss.why == RecipeStore::StageMiss::NewOptions);
     CHECK(!s.lookupStage(h ^ 1, hit, &miss, in.spirv ^ 1) && miss.why == RecipeStore::StageMiss::NewContent);
   }
@@ -5266,6 +7269,145 @@ void testAsyncPipelines() {
     const GateResult r = gateFramePipelines(d, f, 2);
     CHECK(r.hardPending == 1 && r.softPending == 0 && r.skipped == 1);
   }
+  // 4c. VPVK_PIPELINE_EYE_HARD_WAIT_MS: the eye waits for its pipelines too. Default 0 (vpgles too) leaves the soft
+  // behaviour; with a budget the wait counts as a demand waiter (the archive harvest steps aside), and a timeout drops the draws.
+  {
+    unsetenv("VPVK_PIPELINE_EYE_HARD_WAIT_MS");
+    CHECK(eyeHardWaitMs(false) == 0 && eyeHardWaitMs(true) == 0);
+    setenv("VPVK_PIPELINE_EYE_HARD_WAIT_MS", "40", 1);
+    CHECK(eyeHardWaitMs(false) == 40 && eyeHardWaitMs(true) == 40);
+    setenv("VPVK_PIPELINE_EYE_HARD_WAIT_MS", "0", 1);
+    CHECK(eyeHardWaitMs(false) == 0 && eyeHardWaitMs(true) == 0);
+    {  // 0: unchanged, dropped after the small soft wait
+      vpgpu::Frame f = frameOf(soft, p0->key, 2);
+      const GateResult r = gateFramePipelines(d, f, 5);
+      CHECK(r.softPending == 1 && r.hardPending == 0 && r.skipped == 2 && drawsIn(f) == 0 && r.waitedMs < 60);
+    }
+    setenv("VPVK_PIPELINE_EYE_HARD_WAIT_MS", "120", 1);
+    double spentEye = 0;  // what the waits of this block really took: a loaded runner oversleeps, and the window budget is in real time
+    {  // the compile never comes within the budget: waits for it, then drops the draw
+      std::atomic<bool> sawWaiter{false}, stop{false};
+      std::thread probe([&] {
+        while (!stop.load()) {
+          if (vpgpu::demandWaiters().load() > 0) sawWaiter = true;
+          std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+      });
+      vpgpu::Frame f = frameOf(soft, p0->key, 1);
+      const GateResult r = gateFramePipelines(d, f, 5);
+      stop = true;
+      probe.join();
+      CHECK(r.softPending == 1 && r.hardPending == 0 && r.skipped == 1 && drawsIn(f) == 0 && r.waitedMs >= 100);
+      spentEye += r.waitedMs;
+      CHECK(r.skippedByClass[0] == 1);
+      CHECK(sawWaiter.load() && vpgpu::demandWaiters().load() == 0);
+    }
+    {  // the same pipeline in the next frames: its wait is spent, the draws are dropped as with the soft wait
+      vpgpu::Frame f = frameOf(soft, p0->key, 1);
+      const GateResult r = gateFramePipelines(d, f, 6);
+      CHECK(r.softPending == 1 && r.skipped == 1 && drawsIn(f) == 0 && r.waitedMs < 60);
+    }
+    {  // another pipeline still gets its wait, but the second's budget is all that is left of the 2x budget per second
+      vpgpu::Frame f = frameOf(soft, from<PipelineObj>(pipes[2])->key, 1);
+      const GateResult r = gateFramePipelines(d, f, 7);
+      const double left = 240.0 - spentEye;
+      CHECK(r.softPending == 1 && r.skipped == 1);
+      if (left >= 100) CHECK(r.waitedMs >= 90 && r.waitedMs < 400);
+      else CHECK(r.waitedMs < left + 250);
+    }
+    {  // a third one finds the window's budget (2 x 120 ms) spent: no wait
+      vpgpu::Frame f = frameOf(soft, from<PipelineObj>(pipes[3])->key, 1);
+      const GateResult r = gateFramePipelines(d, f, 8);
+      CHECK(r.softPending == 1 && r.skipped == 1 && r.waitedMs < 60);
+    }
+    unsetenv("VPVK_PIPELINE_EYE_HARD_WAIT_MS");
+    eyeWaitReset();
+  }
+  // 4d. vpgles (internalClient) follows the Vulkan soft path for the eye by default: dropped after the small soft wait
+  // (no 1500 ms eye wait), while a persistent non-eye pass still waits for its pipeline (persistWaitMs, 300 ms here).
+  {
+    unsetenv("VPVK_PIPELINE_EYE_HARD_WAIT_MS");
+    eyeWaitReset();
+    d->internalClient = true;
+    {
+      vpgpu::Frame f = frameOf(soft, p0->key, 2);
+      const GateResult r = gateFramePipelines(d, f, 9);
+      CHECK(r.softPending == 1 && r.hardPending == 0 && r.skipped == 2 && drawsIn(f) == 0 && r.waitedMs < 60);
+      CHECK(r.skippedByClass[0] == 2);
+    }
+    {
+      vpgpu::Frame f = frameOf(hard, p0->key, 1);
+      const GateResult r = gateFramePipelines(d, f, 10);
+      CHECK(r.hardPending == 1 && r.hardWaitedMs >= 250 && r.skipped == 1 && drawsIn(f) == 0);
+    }
+    d->internalClient = false;
+    eyeWaitReset();
+  }
+  // 4e. A render target cleared and drawn in each of the last 3 frames (a frame = a submit with an eye pass) is redrawn every
+  // frame: soft like the eye. One drawn once, or loaded (accumulating) instead of cleared, keeps the hard wait.
+  {
+    eyeWaitReset();
+    vpgpu::TextureDesc rtd = td;
+    rtd.persistent = true;
+    const vpgpu::TextureId rt = c.gpu().createTexture(rtd), rtOnce = c.gpu().createTexture(rtd), rtLoad = c.gpu().createTexture(rtd),
+                           rtGap = c.gpu().createTexture(rtd);
+    CHECK(rt && rtOnce && rtLoad && rtGap && !isEyeTexture(*d, rt));
+    // One submit: the eye pass, then `target`'s pass (k null = no draw; a null target = eye only).
+    auto eyeAndRt = [&](vpgpu::TextureId target, vpgpu::PipelineKey k, vpgpu::LoadAction load) {
+      vpgpu::Frame f;
+      vpgpu::RenderPassDesc eye;
+      eye.colors[0].texture = soft, eye.colors[0].store = vpgpu::StoreAction::Store;
+      f.beginRenderPass(eye);
+      f.endRenderPass();
+      if (!target) return f;
+      vpgpu::RenderPassDesc rd;
+      rd.colors[0].texture = target, rd.colors[0].store = vpgpu::StoreAction::Store, rd.colors[0].load = load;
+      f.beginRenderPass(rd);
+      if (k.value) {
+        vpgpu::Draw dr;
+        dr.pipeline = k, dr.count = 3;
+        f.draw(dr);
+      }
+      f.endRenderPass();
+      return f;
+    };
+    const vpgpu::LoadAction kClear = vpgpu::LoadAction::Clear, kLoad = vpgpu::LoadAction::Load;
+    uint64_t no = 20;
+    auto frames = [&](vpgpu::TextureId t, vpgpu::LoadAction ld, int n) {
+      for (int i = 0; i < n; ++i) {
+        vpgpu::Frame f = eyeAndRt(t, vpgpu::PipelineKey{}, ld);
+        gateFramePipelines(d, f, no++);
+      }
+    };
+    frames(rt, kClear, 3);
+    {  // frame 4: the pipeline is still compiling: dropped after the small soft wait, no hard wait
+      vpgpu::Frame f = eyeAndRt(rt, p0->key, kClear);
+      const GateResult r = gateFramePipelines(d, f, no++);
+      CHECK(r.softPending == 1 && r.hardPending == 0 && r.skipped == 1 && drawsIn(f) == 0);
+      CHECK(r.hardWaitedMs == 0 && r.waitedMs < 60);
+    }
+    {  // one tick without the target (one submit per eye) is tolerated
+      frames(rtGap, kClear, 2);
+      frames(vpgpu::TextureId{}, kClear, 1);
+      frames(rtGap, kClear, 1);
+      vpgpu::Frame f = eyeAndRt(rtGap, p0->key, kClear);
+      const GateResult r = gateFramePipelines(d, f, no++);
+      CHECK(r.softPending == 1 && r.hardPending == 0 && r.skipped == 1 && r.hardWaitedMs == 0);
+    }
+    {  // Load every frame (accumulates): hard
+      frames(rtLoad, kLoad, 3);
+      vpgpu::Frame f = eyeAndRt(rtLoad, p0->key, kLoad);
+      const GateResult r = gateFramePipelines(d, f, no++);
+      CHECK(r.hardPending == 1 && r.softPending == 0 && r.hardWaitedMs >= 250 && r.skipped == 1);
+    }
+    {  // rendered for the first time with a pending pipeline: hard
+      vpgpu::Frame f = eyeAndRt(rtOnce, p0->key, kClear);
+      const GateResult r = gateFramePipelines(d, f, no++);
+      CHECK(r.hardPending == 1 && r.softPending == 0 && r.hardWaitedMs >= 250 && r.skipped == 1);
+    }
+    for (vpgpu::TextureId t : {rt, rtOnce, rtLoad, rtGap}) c.gpu().destroy(t);
+    eyeWaitReset();
+  }
   // 5. The compile finishes while the hard wait runs: the draw stays, nothing skipped.
   {
     std::thread opener([&] {
@@ -5276,6 +7418,29 @@ void testAsyncPipelines() {
     const GateResult r = gateFramePipelines(d, f, 3);
     opener.join();
     CHECK(r.hardPending == 1 && r.skipped == 0 && drawsIn(f) == 2 && r.hardWaitedMs < 290);
+  }
+  // 5b. The same for the eye with VPVK_PIPELINE_EYE_HARD_WAIT_MS: a pipeline whose compile is held again finishes inside
+  // the budget, so the eye draws stay (nothing skipped).
+  {
+    cache.waitIdle();
+    compileGate = false;
+    vpgpu::PipelineState held = p0->state;
+    held.primitive = vpgpu::Primitive::Lines;  // no pipeline above is made of lines: a key nobody compiled yet
+    const vpgpu::PipelineKey hk = held.key();
+    cache.request(held, hk, vpgpu::Priority::Visible);
+    for (int i = 0; i < 400 && cache.idle(); ++i) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    CHECK(!cache.idle());
+    setenv("VPVK_PIPELINE_EYE_HARD_WAIT_MS", "2000", 1);
+    std::thread opener([&] {
+      std::this_thread::sleep_for(std::chrono::milliseconds(60));
+      compileGate = true;
+    });
+    vpgpu::Frame f = frameOf(soft, hk, 2);
+    const GateResult r = gateFramePipelines(d, f, 6);
+    opener.join();
+    unsetenv("VPVK_PIPELINE_EYE_HARD_WAIT_MS");
+    CHECK(r.softPending == 1 && r.hardPending == 0 && r.skipped == 0 && drawsIn(f) == 2);
+    CHECK(r.waitedMs >= 40 && r.waitedMs < 1500);
   }
   // 6. Everything compiled: the gate is free (no wait, no drop).
   cache.waitIdle();
@@ -5334,11 +7499,22 @@ void testAsyncPipelines() {
 
 // ---- synchronous creation, opt-in with VPVK_ASYNC_PIPELINES=0 (pipelines.cpp "compile policy") ---------------------------------------------
 // vkCreateGraphicsPipelines does not return while a pipeline of the batch is still compiling, and with
-// VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT a pipeline nobody compiled is not requested at all.
+// VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT a pipeline nobody compiled is refused to the game (COMPILE_REQUIRED, no
+// handle), but its recipe is stored (noteCompileRequired); nothing is compiled until the recipes are (prewarm).
 void testSyncPipelines() {
   setenv("VPVK_ASYNC_PIPELINES", "0", 1);  // main() pins it for every group already; explicit here
   unsetenv("VPVK_REPORT_GEOM");
-  unsetenv("VP_PIPELINE_CACHE_DIR");  // no recipe store: no pipeline is "known" beforehand
+  struct RecipeDir {  // an empty recipe store: nothing is "known" beforehand, and the probes' recipes land in it (destroyed after the device)
+    char path[32] = "/tmp/vpvk_probe_XXXXXX";
+    RecipeDir() {
+      CHECK(mkdtemp(path) != nullptr);
+      setenv("VP_PIPELINE_CACHE_DIR", path, 1);
+    }
+    ~RecipeDir() {
+      unsetenv("VP_PIPELINE_CACHE_DIR");
+      std::filesystem::remove_all(path);
+    }
+  } recipeDir;
   CHECK(!asyncPipelinesOn());
   Ctx c;
   Device* d = from<Device>(c.dev);
@@ -5414,31 +7590,133 @@ void testSyncPipelines() {
   CHECK(pc.createTimedOut.load() == timed0);
   nb.onCompile = nullptr;
 
-  // 2. FAIL_ON_PIPELINE_COMPILE_REQUIRED: cull front was never created, so it is refused and nothing is requested.
+  // 2. FAIL_ON_PIPELINE_COMPILE_REQUIRED: cull front was never created, so the game is refused (COMPILE_REQUIRED, no handle). Only its
+  // recipe is stored: nothing is compiled, and the same state probed again is refused again.
   VkGraphicsPipelineCreateInfo fail = gp[2];
   fail.flags = VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT;
+  cache.waitIdle();  // background compiles of the device (engine kernels) are not part of the count
+  CHECK(d->recipes != nullptr);
   const uint32_t compiled0 = cache.totals().compiled;
+  const size_t recipes0 = d->recipes->pipelineCount();
+  const uint64_t gfx0 = pc.probeGraphics.load(), rec0 = pc.probeRecorded.load(), dup0 = pc.probeDup.load(), cap0 = pc.probeCapped.load();
   VkPipeline refused = batch[0];  // overwritten with VK_NULL_HANDLE
   CHECK(vkCreateGraphicsPipelines(c.dev, VK_NULL_HANDLE, 1, &fail, nullptr, &refused) == VK_PIPELINE_COMPILE_REQUIRED);
   CHECK(refused == VK_NULL_HANDLE);
+  CHECK(pc.probeGraphics.load() == gfx0 + 1 && pc.probeRecorded.load() == rec0 + 1);
+  CHECK(pc.probeDup.load() == dup0 && pc.probeCapped.load() == cap0);
+  CHECK(d->recipes->pipelineCount() == recipes0 + 1);
   cache.waitIdle();
-  CHECK(cache.totals().compiled == compiled0);
-  // A batch: the pipeline the cache holds is created, the other one is refused (the call reports the error).
-  VkGraphicsPipelineCreateInfo mixed[2] = {gp[1], fail};
+  CHECK(cache.totals().compiled == compiled0);  // nothing compiled, in the background either
+  VkPipeline again = batch[1];
+  CHECK(vkCreateGraphicsPipelines(c.dev, VK_NULL_HANDLE, 1, &fail, nullptr, &again) == VK_PIPELINE_COMPILE_REQUIRED);
+  CHECK(again == VK_NULL_HANDLE);
+  CHECK(pc.probeGraphics.load() == gfx0 + 2 && pc.probeDup.load() == dup0 + 1);  // a second probe of the state: counted, not stored twice
+  CHECK(pc.probeRecorded.load() == rec0 + 1 && d->recipes->pipelineCount() == recipes0 + 1);
+  // A batch: the pipeline the cache holds is created, the other one (blending on) is refused (the call reports the error) and recorded.
+  VkPipelineColorBlendAttachmentState cbaBlend = cba;
+  cbaBlend.blendEnable = VK_TRUE, cbaBlend.srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA;
+  cbaBlend.dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+  VkPipelineColorBlendStateCreateInfo cbsBlend = cbs;
+  cbsBlend.pAttachments = &cbaBlend;
+  VkGraphicsPipelineCreateInfo unknown = gp[0];
+  unknown.pColorBlendState = &cbsBlend;
+  unknown.flags = VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT;
+  VkGraphicsPipelineCreateInfo mixed[2] = {gp[1], unknown};
   mixed[0].flags = VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT;
   VkPipeline mix[2] = {};
   CHECK(vkCreateGraphicsPipelines(c.dev, VK_NULL_HANDLE, 2, mixed, nullptr, mix) == VK_PIPELINE_COMPILE_REQUIRED);
   CHECK(mix[0] != VK_NULL_HANDLE && mix[1] == VK_NULL_HANDLE);
+  CHECK(pc.probeRecorded.load() == rec0 + 2 && d->recipes->pipelineCount() == recipes0 + 2);
   cache.waitIdle();
   CHECK(cache.totals().compiled == compiled0);
-  // Without the flag it is compiled; asked again with the flag it is known now.
-  VkPipeline front = VK_NULL_HANDLE, again = VK_NULL_HANDLE;
-  CHECK(vkCreateGraphicsPipelines(c.dev, VK_NULL_HANDLE, 1, &gp[2], nullptr, &front) == VK_SUCCESS);
-  CHECK(front && cache.totals().compiled == compiled0 + 1);
-  CHECK(vkCreateGraphicsPipelines(c.dev, VK_NULL_HANDLE, 1, &fail, nullptr, &again) == VK_SUCCESS);
-  CHECK(again != VK_NULL_HANDLE);
+  // The cap: past it nothing more is recorded, and the game is refused all the same.
+  VkPipelineColorBlendAttachmentState cbaCap = cbaBlend;
+  cbaCap.dstColorBlendFactor = VK_BLEND_FACTOR_ZERO;
+  VkPipelineColorBlendStateCreateInfo cbsCap = cbsBlend;
+  cbsCap.pAttachments = &cbaCap;
+  VkGraphicsPipelineCreateInfo capped = unknown;
+  capped.pColorBlendState = &cbsCap;
+  size_t probed = 0;
+  {
+    std::lock_guard<std::mutex> lock(d->probeMutex);
+    probed = d->probed.size();
+  }
+  setProbeRecipeCap(uint32_t(probed));  // full
+  VkPipeline over = batch[1];
+  CHECK(vkCreateGraphicsPipelines(c.dev, VK_NULL_HANDLE, 1, &capped, nullptr, &over) == VK_PIPELINE_COMPILE_REQUIRED);
+  setProbeRecipeCap(32768);  // kProbeRecipeCap
+  CHECK(over == VK_NULL_HANDLE);
+  CHECK(pc.probeCapped.load() == cap0 + 1 && pc.probeRecorded.load() == rec0 + 2 && d->recipes->pipelineCount() == recipes0 + 2);
+  CHECK(vkCreateGraphicsPipelines(c.dev, VK_NULL_HANDLE, 1, &capped, nullptr, &over) == VK_PIPELINE_COMPILE_REQUIRED);  // room again
+  CHECK(pc.probeRecorded.load() == rec0 + 3 && d->recipes->pipelineCount() == recipes0 + 3);
 
-  for (VkPipeline p : {batch[0], batch[1], mix[0], front, again}) vkDestroyPipeline(c.dev, p, nullptr);
+  // 3. Compute: the same (recipe with the stage input {0, 0, input}, nothing compiled, refused again).
+  VkDescriptorSetLayoutBinding sb[4] = {
+      {0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+      {1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+      {2, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+      {3, VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr}};
+  VkDescriptorSetLayoutCreateInfo slci{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+  slci.bindingCount = 4, slci.pBindings = sb;
+  VkDescriptorSetLayout sl;
+  vkCreateDescriptorSetLayout(c.dev, &slci, nullptr, &sl);
+  VkPushConstantRange pcr{VK_SHADER_STAGE_COMPUTE_BIT, 0, 100};
+  VkPipelineLayoutCreateInfo cplci{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+  cplci.setLayoutCount = 1, cplci.pSetLayouts = &sl, cplci.pushConstantRangeCount = 1, cplci.pPushConstantRanges = &pcr;
+  VkPipelineLayout cpl;
+  vkCreatePipelineLayout(c.dev, &cplci, nullptr, &cpl);
+  VkShaderModule cs = module(c, "cull.comp.opt.spv");
+  VkComputePipelineCreateInfo cci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+  cci.flags = VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT;
+  cci.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+  cci.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT, cci.stage.module = cs, cci.stage.pName = "main";
+  cci.layout = cpl;
+  const uint64_t cmp0 = pc.probeCompute.load();
+  VkPipeline cprobe = batch[0];
+  CHECK(vkCreateComputePipelines(c.dev, VK_NULL_HANDLE, 1, &cci, nullptr, &cprobe) == VK_PIPELINE_COMPILE_REQUIRED);
+  CHECK(cprobe == VK_NULL_HANDLE);
+  CHECK(pc.probeCompute.load() == cmp0 + 1 && pc.probeRecorded.load() == rec0 + 4 && d->recipes->pipelineCount() == recipes0 + 4);
+  cache.waitIdle();
+  CHECK(cache.totals().compiled == compiled0);
+  CHECK(vkCreateComputePipelines(c.dev, VK_NULL_HANDLE, 1, &cci, nullptr, &cprobe) == VK_PIPELINE_COMPILE_REQUIRED);  // still not in the cache
+  CHECK(cprobe == VK_NULL_HANDLE && pc.probeCompute.load() == cmp0 + 2 && pc.probeRecorded.load() == rec0 + 4);
+
+  // The game then creates a probed state for real: its recipe is stored but not compiled, so it is a fresh recipe, not a hit
+  // (noteRecipeKey: recipesFresh feeds vpvk_recipe_stats / warm.stamp).
+  const uint32_t fresh0 = d->recipesFresh.load();
+  VkGraphicsPipelineCreateInfo plain = capped;
+  plain.flags = 0;
+  VkPipeline real = VK_NULL_HANDLE;
+  CHECK(vkCreateGraphicsPipelines(c.dev, VK_NULL_HANDLE, 1, &plain, nullptr, &real) == VK_SUCCESS);
+  CHECK(real != VK_NULL_HANDLE && d->recipesFresh.load() == fresh0 + 1);
+  vkDestroyPipeline(c.dev, real, nullptr);
+
+  // 4. Once the recorded recipes are compiled (the pre-launch prewarm), the same probes succeed: known, a hit.
+  const PrewarmResult pr = prewarm(*d->platform, cache, *d->recipes, nullptr, 0.0);
+  CHECK(pr.failed == 0);
+  cache.waitIdle();
+  CHECK(cache.totals().compiled >= compiled0 + 4);
+  const uint64_t gfx1 = pc.probeGraphics.load(), cmp1 = pc.probeCompute.load();
+  VkPipeline hit[3] = {}, hitCompute = VK_NULL_HANDLE;
+  VkGraphicsPipelineCreateInfo retry[3] = {fail, unknown, capped};
+  CHECK(vkCreateGraphicsPipelines(c.dev, VK_NULL_HANDLE, 3, retry, nullptr, hit) == VK_SUCCESS);
+  CHECK(hit[0] && hit[1] && hit[2]);
+  CHECK(vkCreateComputePipelines(c.dev, VK_NULL_HANDLE, 1, &cci, nullptr, &hitCompute) == VK_SUCCESS);
+  CHECK(hitCompute != VK_NULL_HANDLE);
+  CHECK(pc.probeGraphics.load() == gfx1 && pc.probeCompute.load() == cmp1);  // no probe was refused
+  for (VkPipeline p : {hit[0], hit[1], hit[2], hitCompute}) vkDestroyPipeline(c.dev, p, nullptr);
+  vkDestroyShaderModule(c.dev, cs, nullptr);
+  vkDestroyPipelineLayout(c.dev, cpl, nullptr);
+  vkDestroyDescriptorSetLayout(c.dev, sl, nullptr);
+  // vk.pso.census carries the refused creates.
+  const std::string census = psoCensusLine(pc, cache.totals(), Platform::ArchiveCensus{});
+  CHECK(census.find(" compile_required=" + std::to_string(pc.probeGraphics.load() + pc.probeCompute.load())) != std::string::npos);
+  VkPipeline front = VK_NULL_HANDLE;
+  const uint32_t fresh1 = d->recipesFresh.load();
+  CHECK(vkCreateGraphicsPipelines(c.dev, VK_NULL_HANDLE, 1, &gp[2], nullptr, &front) == VK_SUCCESS);  // without the flag: a hit now
+  CHECK(front && d->recipesFresh.load() == fresh1);  // compiled by the prewarm: no longer a fresh recipe
+
+  for (VkPipeline p : {batch[0], batch[1], mix[0], front}) vkDestroyPipeline(c.dev, p, nullptr);
   vkDestroyShaderModule(c.dev, vs, nullptr);
   vkDestroyShaderModule(c.dev, fs, nullptr);
   vkDestroyPipelineLayout(c.dev, pl, nullptr);
@@ -5446,11 +7724,219 @@ void testSyncPipelines() {
   setenv("VPVK_ASYNC_PIPELINES", "0", 1);
 }
 
+// ---- Quest-faithful creation (VPVK_ASYNC_PIPELINES=0, what VisionQuestPro sets): vkCreate*Pipelines returns with the pipeline ready ----
+// A real driver compiles inside the call, so an engine counting returned creates (Unreal's PSO precache) is told "warm" only when
+// it is. VPVK_CREATE_WAIT_MS bounds the wait; past it the call still succeeds (the draw gate protects).
+namespace vpvk {
+uint32_t createWaitMs();   // pipelines.cpp
+void resetCreateWaitMs();  // pipelines.cpp (tests)
+}
+void testCreateDefault() {
+  unsetenv("VPVK_GLES_SYNC_PIPELINES");
+  unsetenv("VPVK_PIPELINE_CREATE_WAIT_MS");
+  unsetenv("VPVK_REPORT_GEOM");
+  unsetenv("VP_PIPELINE_CACHE_DIR");
+  unsetenv("VPVK_ASYNC_PIPELINES");
+  CHECK(asyncPipelinesOn());  // the engine default stays asynchronous (AVP / Source 2)
+  setenv("VPVK_ASYNC_PIPELINES", "0", 1);
+  CHECK(!asyncPipelinesOn());
+  // The wait is read once (a create is hot): later changes of the environment do not move it until it is reset.
+  resetCreateWaitMs();
+  setenv("VPVK_CREATE_WAIT_MS", "700", 1);
+  CHECK(createWaitMs() == 700);
+  setenv("VPVK_CREATE_WAIT_MS", "1234", 1);
+  CHECK(createWaitMs() == 700);
+  resetCreateWaitMs();
+  CHECK(createWaitMs() == 1234);
+  unsetenv("VPVK_CREATE_WAIT_MS");
+  setenv("VPVK_PIPELINE_CREATE_WAIT_MS", "77", 1);  // the older name still works
+  resetCreateWaitMs();
+  CHECK(createWaitMs() == 77);
+  unsetenv("VPVK_PIPELINE_CREATE_WAIT_MS");
+  resetCreateWaitMs();
+  CHECK(createWaitMs() == 60000);
+  setenv("VPVK_CREATE_WAIT_MS", "700", 1);
+  resetCreateWaitMs();
+  Ctx c;
+  Device* d = from<Device>(c.dev);
+  CHECK(d->translator == nullptr);
+  VkAttachmentDescription att{};
+  att.format = VK_FORMAT_R8G8B8A8_UNORM, att.samples = VK_SAMPLE_COUNT_1_BIT;
+  att.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR, att.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+  VkAttachmentReference cref{0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
+  VkSubpassDescription sp{};
+  sp.colorAttachmentCount = 1, sp.pColorAttachments = &cref;
+  VkRenderPassCreateInfo rpi{VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO};
+  rpi.attachmentCount = 1, rpi.pAttachments = &att, rpi.subpassCount = 1, rpi.pSubpasses = &sp;
+  VkRenderPass rp;
+  vkCreateRenderPass(c.dev, &rpi, nullptr, &rp);
+  VkPipelineLayoutCreateInfo plci{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+  VkPipelineLayout pl;
+  vkCreatePipelineLayout(c.dev, &plci, nullptr, &pl);
+  VkShaderModule vs = module(c, "uimask.vert.spv"), fs = module(c, "uimask.frag.spv");
+  VkPipelineShaderStageCreateInfo stg[2]{{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO},
+                                         {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO}};
+  stg[0].stage = VK_SHADER_STAGE_VERTEX_BIT, stg[0].module = vs, stg[0].pName = "main";
+  stg[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT, stg[1].module = fs, stg[1].pName = "main";
+  VkPipelineVertexInputStateCreateInfo vis{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+  VkPipelineInputAssemblyStateCreateInfo ias{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
+  ias.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+  VkPipelineRasterizationStateCreateInfo rs[3];  // cull none / back / front: three distinct keys
+  const VkCullModeFlags cull[3] = {VK_CULL_MODE_NONE, VK_CULL_MODE_BACK_BIT, VK_CULL_MODE_FRONT_BIT};
+  for (int i = 0; i < 3; ++i) {
+    rs[i] = {VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
+    rs[i].lineWidth = 1, rs[i].cullMode = cull[i];
+  }
+  VkPipelineMultisampleStateCreateInfo ms{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
+  ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+  VkPipelineColorBlendAttachmentState cba{};
+  cba.colorWriteMask = 0xF;
+  VkPipelineColorBlendStateCreateInfo cbs{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
+  cbs.attachmentCount = 1, cbs.pAttachments = &cba;
+  VkViewport vp{0, 0, 64, 64, 0, 1};
+  VkRect2D sc{{0, 0}, {64, 64}};
+  VkPipelineViewportStateCreateInfo vps{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
+  vps.viewportCount = 1, vps.pViewports = &vp, vps.scissorCount = 1, vps.pScissors = &sc;
+  VkGraphicsPipelineCreateInfo gp[3];
+  for (int i = 0; i < 3; ++i) {
+    gp[i] = {VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
+    gp[i].stageCount = 2, gp[i].pStages = stg, gp[i].pVertexInputState = &vis, gp[i].pInputAssemblyState = &ias;
+    gp[i].pViewportState = &vps, gp[i].pRasterizationState = &rs[i], gp[i].pMultisampleState = &ms;
+    gp[i].pColorBlendState = &cbs, gp[i].layout = pl, gp[i].renderPass = rp;
+  }
+  vpgpu::NullBackend& nb = static_cast<vpgpu::NullBackend&>(d->platform->backend());
+  vpgpu::PipelineCache& cache = c.gpu().pipelines();
+  PipelineCounters& pc = pipelineCounters();
+
+  // 1. The compile takes 80 ms: the call returns only after it, translated, resolved and Ready.
+  std::atomic<bool> gate{false};
+  nb.onCompile = [&] {
+    while (!gate) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  };
+  std::thread opener([&] {
+    std::this_thread::sleep_for(std::chrono::milliseconds(30));
+    gate = true;
+  });
+  const auto t0 = std::chrono::steady_clock::now();
+  VkPipeline ready = VK_NULL_HANDLE;
+  CHECK(vkCreateGraphicsPipelines(c.dev, VK_NULL_HANDLE, 1, &gp[0], nullptr, &ready) == VK_SUCCESS);
+  CHECK(std::chrono::steady_clock::now() - t0 >= std::chrono::milliseconds(25));
+  opener.join();
+  const PipelineObj* po = ready ? from<PipelineObj>(ready) : nullptr;
+  CHECK(po && po->ok && po->resolved.load() && !po->job);
+  if (po) CHECK(cache.status(po->key) == vpgpu::PipelineCache::Status::Ready);
+  nb.onCompile = nullptr;
+
+  // 2. A compile that outlasts VPVK_CREATE_WAIT_MS (700 ms): the call still returns VK_SUCCESS, counted as timed out. The next
+  // create waits its full budget too: no 500 ms backoff window after a timeout (a draw / variant wait would still get one).
+  const uint64_t timed0 = pc.createTimedOut.load();
+  std::atomic<bool> release{false};
+  nb.onCompile = [&] {
+    while (!release) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  };
+  VkPipeline slow[2] = {VK_NULL_HANDLE, VK_NULL_HANDLE};
+  for (int i = 0; i < 2; ++i) {
+    const auto t1 = std::chrono::steady_clock::now();
+    CHECK(vkCreateGraphicsPipelines(c.dev, VK_NULL_HANDLE, 1, &gp[i + 1], nullptr, &slow[i]) == VK_SUCCESS);
+    const auto waited = std::chrono::steady_clock::now() - t1;
+    CHECK(waited >= std::chrono::milliseconds(650) && waited < std::chrono::milliseconds(5000));
+    CHECK(slow[i] != VK_NULL_HANDLE && pc.createTimedOut.load() == timed0 + uint64_t(i) + 1);
+    if (slow[i]) CHECK(cache.status(from<PipelineObj>(slow[i])->key) != vpgpu::PipelineCache::Status::Ready);
+  }
+  CHECK(d->pipelineBackoffUntilNs.load() == 0);  // creates neither start nor honour the backoff window
+
+  // 3. FAIL_ON_PIPELINE_COMPILE_REQUIRED for a pipeline nobody has compiled (blending on): refused at once, even with the compiler stuck.
+  VkPipelineColorBlendAttachmentState cbaBlend = cba;
+  cbaBlend.blendEnable = VK_TRUE, cbaBlend.srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA;
+  cbaBlend.dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+  VkPipelineColorBlendStateCreateInfo cbsBlend = cbs;
+  cbsBlend.pAttachments = &cbaBlend;
+  VkGraphicsPipelineCreateInfo fail = gp[0];
+  fail.pColorBlendState = &cbsBlend;
+  fail.flags = VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT;
+  VkPipeline refused = ready;
+  const auto t2 = std::chrono::steady_clock::now();
+  CHECK(vkCreateGraphicsPipelines(c.dev, VK_NULL_HANDLE, 1, &fail, nullptr, &refused) == VK_PIPELINE_COMPILE_REQUIRED);
+  CHECK(refused == VK_NULL_HANDLE && std::chrono::steady_clock::now() - t2 < std::chrono::milliseconds(50));
+  release = true;
+  nb.onCompile = nullptr;
+  cache.waitIdle();
+  for (VkPipeline p : {ready, slow[0], slow[1]}) vkDestroyPipeline(c.dev, p, nullptr);
+  vkDestroyShaderModule(c.dev, vs, nullptr);
+  vkDestroyShaderModule(c.dev, fs, nullptr);
+  vkDestroyPipelineLayout(c.dev, pl, nullptr);
+  vkDestroyRenderPass(c.dev, rp, nullptr);
+  unsetenv("VPVK_CREATE_WAIT_MS");
+  resetCreateWaitMs();
+}
+
+// RecipeUse (vk.pso.census prewarmed_unused= / requested_not_prewarmed=) and the line of gpu.pso.miss_detail (describePipelineState).
+void testRecipeUseAndMissDetail() {
+  {
+    RecipeUse ru;
+    ru.prewarmed = {1, 2, 3};
+    ru.note(2, "b"), ru.note(2, "b"), ru.note(9, "nine x"), ru.note(7, "seven");  // a repeat counts once
+    CHECK(ru.requestedPrewarmed == 1 && ru.requested.size() == 3 && !ru.overflow);
+    CHECK(ru.census() == " prewarmed_unused=2 requested_not_prewarmed=2 requested=3");
+    CHECK(ru.keysLine(nullptr) == "prewarmed_unused=[0000000000000001:-,0000000000000003:-] requested_not_prewarmed=[0000000000000009:nine_x,0000000000000007:seven]");
+    // prewarmed keys that arrive after the game's first creates (the prewarm's refresh() rekeyed the recipes): recounted.
+    RecipeUse late;
+    late.note(5, "five"), late.note(6, "six");
+    late.setPrewarmed({9, 6, 7});
+    CHECK(late.prewarmed == std::vector<uint64_t>({6, 7, 9}) && late.requestedPrewarmed == 1);
+    CHECK(late.census() == " prewarmed_unused=2 requested_not_prewarmed=1 requested=2");
+    CHECK(late.keysLine(nullptr) == "prewarmed_unused=[0000000000000007:-,0000000000000009:-] requested_not_prewarmed=[0000000000000005:five]");
+    late.setPrewarmed({5, 6});  // set again: not additive
+    CHECK(late.requestedPrewarmed == 2 && late.census() == " prewarmed_unused=0 requested_not_prewarmed=0 requested=2" && late.keysLine(nullptr).empty());
+    RecipeUse none;
+    CHECK(none.census() == " prewarmed_unused=0 requested_not_prewarmed=0 requested=0" && none.keysLine(nullptr).empty());
+  }
+  {  // 10 keys at most of each group; the counts still say how many
+    RecipeUse ru;
+    for (uint64_t k = 1; k <= 12; ++k) ru.prewarmed.push_back(k);
+    for (uint64_t k = 100; k < 120; ++k) ru.note(k, "f" + std::to_string(k));
+    CHECK(ru.census() == " prewarmed_unused=12 requested_not_prewarmed=20 requested=20");
+    const std::string keys = ru.keysLine(nullptr);
+    CHECK(countOf(keys, ":-") == 10 && countOf(keys, ":f1") == 10 && keys.find("000000000000000b") == std::string::npos &&
+          keys.find("000000000000006e") == std::string::npos);  // key 11 and the 11th fresh key (110 = 0x6e) are cut
+  }
+  {  // bounded: past kMax distinct keys nothing more is kept, and the census says so
+    RecipeUse ru;
+    for (uint64_t k = 0; k < RecipeUse::kMax + 5; ++k) ru.note(k + 1, "x");
+    CHECK(ru.requested.size() == RecipeUse::kMax && ru.overflow);
+    CHECK(ru.census().find(" requested=16384 requested_overflow=1") != std::string::npos);
+    ru.note(1, "x");  // a key already held is not an overflow
+    CHECK(ru.requested.size() == RecipeUse::kMax);
+  }
+  {  // describePipelineState: every field key() hashes, and the key
+    vpgpu::PipelineState s;
+    s.label = "my pipe", s.samples = 4, s.colorFormats[0] = vpgpu::Format::RGBA8Unorm, s.colorFormats[2] = vpgpu::Format::RGBA16Float;
+    s.depthFormat = vpgpu::Format::D32Float, s.primitive = vpgpu::Primitive::TriangleStrip, s.vertexShader = 0xAB, s.fragmentShader = 0xCD;
+    s.blend[0].enabled = true, s.blend[0].srcColor = vpgpu::BlendFactor::SrcAlpha, s.blend[0].dstColor = vpgpu::BlendFactor::OneMinusSrcAlpha;
+    s.depthTest = s.depthWrite = true, s.depthCompare = vpgpu::CompareOp::LessEqual, s.cull = vpgpu::CullMode::Back, s.alphaToCoverage = true;
+    char want[512];
+    std::snprintf(want, sizeof want,
+                  "key=%016llx label=my_pipe samples=4 colorFormats=RGBA8Unorm/RGBA16Float depthFormat=D32Float primitive=triangle_strip "
+                  "vs=00000000000000ab fs=00000000000000cd extra{cs=0000000000000000 blend0=1:4.5.0/1.0.0:mf blend2=0:1.0.0/1.0.0:mf "
+                  "depth=11:3 cull=2 a2c=1 fetch=0 src=test}",
+                  (unsigned long long)s.key().value);
+    CHECK(vpgpu::describePipelineState(s, "src=test") == want);
+    CHECK(vpgpu::describePipelineState(s).find(" fetch=0}") != std::string::npos);  // no extra: nothing appended
+    vpgpu::PipelineState t = s;  // a different blend is a different key and a different line
+    t.blend[0].dstColor = vpgpu::BlendFactor::One;
+    CHECK(t.key() != s.key() && vpgpu::describePipelineState(t).find("blend0=1:4.1.0/") != std::string::npos);
+    s.stencilTest = true, s.stencilFront.compare = vpgpu::CompareOp::Equal, s.stencilFront.readMask = 0x0F;
+    CHECK(vpgpu::describePipelineState(s).find(" stencilF=0.0.0:2:f.ff stencilB=0.0.0:7:ff.ff") != std::string::npos);
+  }
+}
+
 // vk.pso.census: the counters the creation calls and awaitPipelines move (created, translation failures, timeouts).
 namespace vpvk {
-unsigned awaitPipelines(Device*, const std::vector<vpgpu::PipelineKey>&, uint32_t, const char*);  // pipelines.cpp
+unsigned awaitPipelines(Device*, const std::vector<vpgpu::PipelineKey>&, uint32_t, const char*, bool backoff);  // pipelines.cpp
+
 }
 void testPsoCensus() {
+  testRecipeUseAndMissDetail();
   Ctx c;
   Device* d = from<Device>(c.dev);
   VkAttachmentDescription att{};
@@ -5496,8 +7982,27 @@ void testPsoCensus() {
   PipelineCounters& pc = pipelineCounters();
   const uint64_t created0 = pc.pipelinesCreated.load(), failed0 = pc.translateFailed.load(), timed0 = pc.createTimedOut.load();
   VkPipeline good = VK_NULL_HANDLE, bad = VK_NULL_HANDLE;
-  CHECK(vkCreateGraphicsPipelines(c.dev, VK_NULL_HANDLE, 1, &gp, nullptr, &good) == VK_SUCCESS);
+  // gpu.pso.miss_detail: with recipes prewarmed, a create whose key nothing knew is a miss and logs every field of its state.
+  d->prewarmedRecipes = 1;
+  d->recipeUse.prewarmed = {0x1111, 0x2222};  // vk.pso.census prewarmed_unused: two recipes the game never asks for
+  const std::string made = captureStderr([&] { CHECK(vkCreateGraphicsPipelines(c.dev, VK_NULL_HANDLE, 1, &gp, nullptr, &good) == VK_SUCCESS); });
   CHECK(good && from<PipelineObj>(good)->ok);
+  {
+    const PipelineObj* po = from<PipelineObj>(good);
+    char want[512];
+    std::snprintf(want, sizeof want, "gpu.pso.miss_detail key=%016llx label=%s samples=1 colorFormats=RGBA8Unorm depthFormat=",
+                  (unsigned long long)po->key.value, po->state.label.c_str());
+    CHECK(countOf(made, "gpu.pso.miss_detail ") == 1 && made.find(want) != std::string::npos);
+    std::snprintf(want, sizeof want, " primitive=triangles vs=%016llx fs=%016llx extra{cs=0000000000000000 blend0=0:0.0.0/0.0.0:mf depth=00:7 cull=0",
+                  (unsigned long long)po->state.vertexShader, (unsigned long long)po->state.fragmentShader);
+    CHECK(made.find(want) != std::string::npos);
+    // Creation inputs that are not PipelineState fields: view count / mask, sample mask, vertex input hash (the hash's start value: no inputs).
+    // key_dec = the key in decimal, to match the Metal gpu.pso.miss line (key=<decimal>).
+    std::snprintf(want, sizeof want, "src=vk_recipe key_dec=%llu views=1 viewMask=0x0 sampleMask=0xffffffff a2cTest=0 gameSamples=1 topology=3 vbs=0 vi=14650fb0739d0383}",
+                  (unsigned long long)po->key.value);
+    CHECK(made.find(want) != std::string::npos);
+    CHECK(made.find("gpu.pso.recipe game miss key=") != std::string::npos);  // (the older line is still there)
+  }
   CHECK(pc.pipelinesCreated.load() - created0 == 1 && pc.translateFailed.load() == failed0 && pc.createTimedOut.load() == timed0);
   gp.stageCount = 3;
   CHECK(vkCreateGraphicsPipelines(c.dev, VK_NULL_HANDLE, 1, &gp, nullptr, &bad) == VK_SUCCESS);  // always VK_SUCCESS
@@ -5514,17 +8019,266 @@ void testPsoCensus() {
   held.cull = vpgpu::CullMode::Front;  // a state nobody compiled yet
   const vpgpu::PipelineKey k = held.key();
   c.gpu().pipelines().request(held, k, vpgpu::Priority::Visible);
-  CHECK(awaitPipelines(d, {k}, 40, "test") == 1);
+  CHECK(awaitPipelines(d, {k}, 40, "test", true) == 1);
   gate = true;
   c.gpu().pipelines().waitIdle();
   nb.onCompile = nullptr;
-  CHECK(awaitPipelines(d, {k}, 40, "test") == 0);
+  CHECK(awaitPipelines(d, {k}, 40, "test", true) == 0);
 
   Platform::ArchiveCensus a;
   CHECK(!d->platform->archiveCensus(a));  // the null platform has no archive
-  psoCensus(d, true);                     // prints one vk.pso.census line
+  CHECK(a.pending == 0 && a.spilled == 0);
+  // vk.pso.census prewarmed_unused= / requested_not_prewarmed=: the 2 recipes nobody asked for, and the keys the game's creates asked for
+  // without a prewarmed recipe (the created pipeline and one more noted here), each group's keys on a line of their own.
+  d->recipeUse.note(0xfeed, "test fresh");
+  const size_t asked = d->recipeUse.requested.size();
+  CHECK(asked >= 2 && d->recipeUse.requested.count(from<PipelineObj>(good)->key.value) && d->recipeUse.requestedPrewarmed == 0);
+  const std::string census = captureStderr([&] { psoCensus(d, true); });  // prints one vk.pso.census line
+  char wantCensus[128];
+  std::snprintf(wantCensus, sizeof wantCensus, " prewarmed_unused=2 requested_not_prewarmed=%zu requested=%zu\n", asked, asked);
+  CHECK(census.find("vk.pso.census created=") != std::string::npos && census.find(wantCensus) != std::string::npos);
+  // modules_created= modules_used= modules_unused=: the 2 distinct modules made above (the geometry stage reuses the fragment one), both in a pipeline.
+  CHECK(census.find(" modules_created=2 modules_used=2 modules_unused=0 prewarmed_unused=2 ") != std::string::npos);
+  CHECK(census.find("vk.pso.census_keys prewarmed_unused=[0000000000001111:-,0000000000002222:-] requested_not_prewarmed=[") != std::string::npos);
+  CHECK(census.find(",000000000000feed:test_fresh]\n") != std::string::npos);
+  // The archive fields: archived = serialized, plus how many are still pending and how many spilled at the queue's fuse.
+  a.archived = 1696, a.pending = 5000, a.spilled = 7, a.trimDropped = 9, a.other = 2, a.dup = 3;
+  const std::string line = psoCensusLine(pc, c.gpu().pipelines().totals(), a);
+  CHECK(line.find(" archived=1696 ") != std::string::npos);
+  CHECK(line.find("not_archived_other=2 ") != std::string::npos && line.find("archive_dup=3 ") != std::string::npos);
+  CHECK(line.find(" archive_pending=5000 archive_spilled=7 archive_trim_dropped=9") != std::string::npos);
+  // gpu.pso.miss_detail is logged for the first 20 misses only (the created pipeline was the first): 25 more states, distinct by blend.
+  {
+    VkPipelineColorBlendAttachmentState blend = cba;
+    VkPipelineColorBlendStateCreateInfo bs = cbs;
+    bs.pAttachments = &blend;
+    gp.pColorBlendState = &bs;
+    gp.stageCount = 2;
+    VkPipeline again = VK_NULL_HANDLE;  // the first create once more: known now, no miss
+    gp.pColorBlendState = &cbs;
+    CHECK(captureStderr([&] { vkCreateGraphicsPipelines(c.dev, VK_NULL_HANDLE, 1, &gp, nullptr, &again); }).find("gpu.pso.miss_detail") ==
+          std::string::npos);
+    vkDestroyPipeline(c.dev, again, nullptr);
+    gp.pColorBlendState = &bs;
+    VkPipeline many[25];
+    const std::string log25 = captureStderr([&] {
+      for (int i = 0; i < 25; ++i) {
+        blend.blendEnable = VK_TRUE, blend.colorWriteMask = 1u + unsigned(i % 15);
+        blend.srcColorBlendFactor = i / 15 ? VK_BLEND_FACTOR_SRC_ALPHA : VK_BLEND_FACTOR_ONE;
+        blend.dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+        vkCreateGraphicsPipelines(c.dev, VK_NULL_HANDLE, 1, &gp, nullptr, &many[i]);
+      }
+    });
+    CHECK(countOf(log25, "gpu.pso.miss_detail ") == 19 && countOf(log25, "gpu.pso.recipe game miss key=") == 7);
+    // The blend is a PipelineState field, so it is in the key and in the line: src ONE (1) / SRC_ALPHA (4), dst ONE_MINUS_SRC_ALPHA (5).
+    CHECK(log25.find(" blend0=1:1.5.0/0.0.0:m1 ") != std::string::npos && log25.find(" blend0=1:1.5.0/0.0.0:mf ") != std::string::npos &&
+          log25.find(" blend0=1:4.5.0/0.0.0:m1 ") != std::string::npos);
+    CHECK(from<PipelineObj>(many[0])->key.value != from<PipelineObj>(many[1])->key.value);
+    CHECK(d->recipeMisses.load() == 26 && d->recipeUse.requested.size() == asked + 25);
+    for (VkPipeline p : many) vkDestroyPipeline(c.dev, p, nullptr);
+  }
   vkDestroyPipeline(c.dev, good, nullptr);
   vkDestroyPipeline(c.dev, bad, nullptr);
+}
+
+int64_t gCacheClock = 0;
+int64_t cacheClock() { return gCacheClock; }
+
+// Counts the archive flushes the driver asks of the platform (complete turning 1 requests one, on a thread of its own).
+struct FlushCountPlatform final : Platform {
+  std::unique_ptr<Platform> inner;
+  std::atomic<int> flushes{0};
+  vpgpu::Backend& backend() override { return inner->backend(); }
+  void flushCaches(bool, const std::function<void(uint32_t, uint32_t)>&) override { ++flushes; }
+  // The flush runs asynchronously: waits until `n` were made, then a moment more to see none extra.
+  bool flushesSettle(int n) {
+    for (int i = 0; i < 2000 && flushes.load() < n; ++i) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    return flushes.load() == n;
+  }
+};
+
+// The complete shader cache detector (CacheWatch, vpvk_cache_state, "vk.cache_state"): the rule with injected time and frames, the
+// log lines, then the same through a device with Device::clockNs (a created pipeline, a probed key, modules) and the exported call.
+void testCacheState() {
+  constexpr int64_t kSec = 1'000'000'000;
+  {  // 1. The rule.
+    CacheWatch w;
+    const auto ev = [&](int64_t t, uint64_t frame, bool idle = true) { return w.evaluate(t, frame, idle, 7); };
+    VpvkCacheState s = ev(100 * kSec, 5000);
+    CHECK(!s.complete && s.reason == CacheNoPipelines && s.pipelines_unique == 0 && s.recipes == 7 && s.version == kCacheStateVersion);
+    CHECK(s.idle_ms == 0 && s.frames_idle == 0);
+    w.noteKey(0xA, 10 * kSec, 100);
+    s = ev(10 * kSec + 19'999'000'000, 100 + 5000);  // enough frames, 1 ms short of the idle time
+    CHECK(!s.complete && s.reason == CacheRecent && s.idle_ms == 19999 && s.pipelines_unique == 1);
+    s = ev(30 * kSec, 100 + 599);  // idle time reached, one frame short
+    CHECK(!s.complete && s.reason == CacheNoFrames && s.idle_ms == 20000 && s.frames_idle == 599);
+    s = ev(30 * kSec, 100 + 600, false);  // everything but the pipeline cache still compiling
+    CHECK(!s.complete && s.reason == CacheCompiling);
+    s = ev(30 * kSec, 100 + 600);
+    CHECK(s.complete == 1 && s.reason == CacheOk && s.idle_ms == 20000 && s.frames_idle == 600);
+    w.noteKey(0xA, 30 * kSec, 700);  // a key already seen: nothing moves
+    s = ev(30 * kSec, 700);
+    CHECK(s.complete == 1 && s.pipelines_unique == 1);
+    w.noteKey(0xB, 30 * kSec, 700);  // a new key: back to "recent"
+    s = ev(30 * kSec, 700);
+    CHECK(!s.complete && s.reason == CacheRecent && s.pipelines_unique == 2 && s.idle_ms == 0 && s.frames_idle == 0);
+    s = ev(50 * kSec, 1300);
+    CHECK(s.complete == 1);
+    // Modules: 100 created; the unused ones may be 5 % at most. Referencing a module twice, or one never created, counts nothing more.
+    for (uint64_t u = 1; u <= 100; ++u) w.noteModule(u, false);
+    w.noteModule(5, false);  // created twice: one module
+    s = ev(50 * kSec, 1300);
+    CHECK(s.modules_created == 100 && s.modules_used == 0 && s.reason == CacheUnusedModules && !s.complete);
+    for (uint64_t u = 1; u <= 94; ++u) w.noteModule(u, true);
+    w.noteModule(1, true), w.noteModule(999, true);
+    s = ev(50 * kSec, 1300);
+    CHECK(s.modules_created == 100 && s.modules_used == 94 && s.reason == CacheUnusedModules);  // 6 % unused
+    s = ev(50 * kSec, 1300, false);
+    CHECK(s.reason == CacheCompiling);  // compiling is reported before the modules
+    w.noteModule(95, true);
+    s = ev(50 * kSec, 1300);
+    CHECK(s.modules_used == 95 && s.complete == 1 && s.reason == CacheOk);  // 5 % exactly is allowed
+    // Bounded sets: modules past the cap are not tracked; keys past the cap count as new.
+    for (uint64_t u = 1000; u < 1000 + CacheWatch::kMaxModules + 10; ++u) w.noteModule(u, false);
+    CHECK(w.evaluate(50 * kSec, 1300, true, 0).modules_created == CacheWatch::kMaxModules);
+    CacheWatch full;
+    for (uint64_t k = 1; k <= CacheWatch::kMaxKeys; ++k) full.noteKey(k, kSec, 1);
+    CHECK(full.evaluate(kSec, 1, true, 0).pipelines_unique == CacheWatch::kMaxKeys);
+    full.noteKey(CacheWatch::kMaxKeys + 1, 5 * kSec, 9);
+    CHECK(full.evaluate(5 * kSec, 9, true, 0).idle_ms == 0 && full.evaluate(5 * kSec, 9, true, 0).pipelines_unique == CacheWatch::kMaxKeys);
+    full.noteKey(1, 7 * kSec, 11);  // seen key: not new
+    CHECK(full.evaluate(7 * kSec, 11, true, 0).idle_ms == 2000);
+  }
+  {  // 2. The log: one line per change of complete / reason, at most kCacheLogLines.
+    CacheWatch w;
+    VpvkCacheState s{};
+    s.pipelines_unique = 3, s.modules_created = 10, s.modules_used = 9, s.idle_ms = 123, s.complete = 0, s.reason = CacheRecent;
+    std::string out = captureStderr([&] { w.logChange(s), w.logChange(s), s.idle_ms = 456, w.logChange(s); });
+    CHECK(countOf(out, "vk.cache_state ") == 1);
+    CHECK(out.find("vk.cache_state complete=0 reason=2 pipelines=3 modules_created=10 modules_used=9 idle_ms=123\n") != std::string::npos);
+    s.complete = 1, s.reason = CacheOk;
+    bool became = false;
+    out = captureStderr([&] { became = w.logChange(s); });
+    CHECK(out.find("vk.cache_state complete=1 reason=0 ") != std::string::npos && became);  // the flush is requested on 0 -> 1 only
+    CHECK(!w.logChange(s));
+    s.complete = 0, s.reason = CacheRecent;
+    CHECK(!w.logChange(s));
+    s.complete = 1, s.reason = CacheOk;
+    CHECK(w.logChange(s));
+    out = captureStderr([&] {
+      for (uint32_t i = 0; i < 300; ++i) s.complete = i & 1, s.reason = i & 1 ? CacheOk : CacheNoFrames, w.logChange(s);
+    });
+    CHECK(countOf(out, "vk.cache_state ") == kCacheLogLines - 4);
+  }
+  {  // 2b. CacheUnusedModules (all pipelines there, only unused modules left) is flushable too: one request on entering it.
+    CacheWatch w;
+    VpvkCacheState s{};
+    s.pipelines_unique = 3, s.complete = 0, s.reason = CacheRecent;
+    CHECK(!w.logChange(s));
+    s.reason = CacheUnusedModules;
+    CHECK(w.logChange(s));  // not flushable -> flushable
+    CHECK(!w.logChange(s));
+    s.complete = 1, s.reason = CacheOk;
+    CHECK(!w.logChange(s));  // still flushable: no second request
+    s.complete = 0, s.reason = CacheRecent;
+    CHECK(!w.logChange(s));
+    s.reason = CacheUnusedModules;
+    CHECK(w.logChange(s));  // left flushable and came back: once more
+    CacheWatch first;
+    s.reason = CacheUnusedModules;
+    CHECK(first.logChange(s));  // at the first evaluation
+  }
+  // 3. Through a device: pipelines, probes and modules; the exported call; the submit tick.
+  Ctx c;
+  Device* d = from<Device>(c.dev);
+  auto flushOwner = std::make_unique<FlushCountPlatform>();
+  FlushCountPlatform* flushPlatform = flushOwner.get();
+  flushOwner->inner = std::move(d->platform);
+  d->platform = std::move(flushOwner);
+  d->clockNs = cacheClock;
+  gCacheClock = 1000 * kSec;
+  VpvkCacheState s{};
+  CHECK(vpvk_cache_state(nullptr) == 0);
+  std::string out = captureStderr([&] { CHECK(vpvk_cache_state(&s) == 1); });
+  CHECK(s.version == kCacheStateVersion && s.reason == CacheNoPipelines && !s.complete && s.pipelines_unique == 0 && s.modules_created == 0);
+  CHECK(out.find("vk.cache_state complete=0 reason=1 pipelines=0 modules_created=0 modules_used=0 idle_ms=0\n") != std::string::npos);
+  VkDescriptorSetLayoutBinding b[2] = {{0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+                                       {1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr}};
+  VkDescriptorSetLayoutCreateInfo lci{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+  lci.bindingCount = 2, lci.pBindings = b;
+  VkDescriptorSetLayout sl;
+  vkCreateDescriptorSetLayout(c.dev, &lci, nullptr, &sl);
+  VkPipelineLayoutCreateInfo plci{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+  plci.setLayoutCount = 1, plci.pSetLayouts = &sl;
+  VkPipelineLayout pl;
+  vkCreatePipelineLayout(c.dev, &plci, nullptr, &pl);
+  const auto createCompute = [&](VkShaderModule m, VkPipeline& pipe) {
+    VkComputePipelineCreateInfo ci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+    ci.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+    ci.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT, ci.stage.module = m, ci.stage.pName = "main";
+    ci.layout = pl;
+    vkCreateComputePipelines(c.dev, VK_NULL_HANDLE, 1, &ci, nullptr, &pipe);
+    resolvePipeline(d, *from<PipelineObj>(pipe));  // (asynchronous creation: the key is known once the job ran)
+    c.gpu().pipelines().waitIdle();
+  };
+  VkShaderModule bda = module(c, "bda.comp.spv"), cull = module(c, "cull.comp.opt.spv");
+  s = {};
+  vpvk_cache_state(&s);
+  CHECK(s.modules_created == 2 && s.modules_used == 0 && s.pipelines_unique == 0 && s.reason == CacheNoPipelines);
+  VkPipeline pipe = VK_NULL_HANDLE;
+  createCompute(bda, pipe);
+  CHECK(from<PipelineObj>(pipe)->ok);
+  vpvk_cache_state(&s);
+  CHECK(s.pipelines_unique == 1 && s.modules_created == 2 && s.modules_used == 1 && s.reason == CacheRecent && s.idle_ms == 0);
+  gCacheClock += 20 * kSec;
+  vpvk_cache_state(&s);
+  CHECK(s.idle_ms == 20000 && s.reason == CacheNoFrames && s.frames_idle == 0);
+  for (uint32_t i = 0; i < kCacheIdleFrames; ++i) c.gpu().submit(vpgpu::Frame{});
+  out = captureStderr([&] { vpvk_cache_state(&s); });
+  CHECK(s.frames_idle == kCacheIdleFrames && s.reason == CacheUnusedModules && !s.complete);  // `cull` is in no pipeline: 50 % unused
+  // CacheUnusedModules requests the archive flush too (the host may never see complete=1): exactly one, on entering it.
+  CHECK(countOf(out, "vk.cache_state flush=requested") == 1 && flushPlatform->flushesSettle(1));
+  VkPipeline pipe2 = VK_NULL_HANDLE;
+  createCompute(cull, pipe2);  // (it may not translate with this layout: the module is referenced either way)
+  out = captureStderr([&] { vpvk_cache_state(&s); });
+  if (from<PipelineObj>(pipe2)->ok) CHECK(s.pipelines_unique == 2 && s.reason == CacheRecent);
+  else CHECK(s.pipelines_unique == 1 && s.modules_used == 2 && s.complete == 1 && s.reason == CacheOk &&
+             out.find("vk.cache_state complete=1 reason=0 ") != std::string::npos);
+  // unused-modules -> complete: already flushable, no second request (and none for polls that change nothing).
+  CHECK(countOf(out, "vk.cache_state flush=requested") == 0 && flushPlatform->flushesSettle(1));
+  gCacheClock += 20 * kSec;
+  for (uint32_t i = 0; i < kCacheIdleFrames; ++i) c.gpu().submit(vpgpu::Frame{});
+  out = captureStderr([&] { CHECK(vpvk_cache_state(&s) == 1); });
+  CHECK(s.complete == 1 && s.reason == CacheOk && s.modules_used == 2 && s.recipes == 0);
+  CHECK(out.find("vk.cache_state") == std::string::npos);  // unchanged since the last poll: no new line
+  CHECK(flushPlatform->flushesSettle(1));
+  // A probed key (FAIL_ON_PIPELINE_COMPILE_REQUIRED, noteCompileRequired) is a new key too: complete goes back to 0.
+  noteCompileRequired(d, vpgpu::PipelineState{}, vpgpu::PipelineKey{0x1234}, {0, 0, 0}, false);
+  noteCompileRequired(d, vpgpu::PipelineState{}, vpgpu::PipelineKey{0x1234}, {0, 0, 0}, false);  // the same key again
+  const uint32_t unique = s.pipelines_unique;
+  // The submit tick evaluates at most once a second.
+  gCacheClock += 2 * kSec;
+  out = captureStderr([&] { cacheStateTick(d); });
+  CHECK(out.find("vk.cache_state complete=0 reason=2 pipelines=") != std::string::npos);
+  vpvk_cache_state(&s);
+  CHECK(!s.complete && s.reason == CacheRecent && s.pipelines_unique == unique + 1 && s.idle_ms == 2000);
+  CHECK(out.find("flush=requested") == std::string::npos && flushPlatform->flushesSettle(1));  // back to 0: no flush
+  gCacheClock += 20 * kSec;
+  for (uint32_t i = 0; i < kCacheIdleFrames; ++i) c.gpu().submit(vpgpu::Frame{});
+  out = captureStderr([&] { cacheStateTick(d); });  // 20 s after the last tick
+  CHECK(out.find("vk.cache_state complete=1 reason=0 ") != std::string::npos);
+  CHECK(countOf(out, "vk.cache_state flush=requested") == 1 && flushPlatform->flushesSettle(2));  // 0 -> 1 again: one more
+  out = captureStderr([&] { cacheStateTick(d), cacheStateTick(d); });
+  CHECK(out.find("vk.cache_state") == std::string::npos);  // no change
+  CHECK(flushPlatform->flushesSettle(2));
+  d->clockNs = nullptr;
+  vkDestroyPipeline(c.dev, pipe, nullptr);
+  vkDestroyPipeline(c.dev, pipe2, nullptr);
+  vkDestroyShaderModule(c.dev, bda, nullptr);
+  vkDestroyShaderModule(c.dev, cull, nullptr);
+  vkDestroyPipelineLayout(c.dev, pl, nullptr);
+  vkDestroyDescriptorSetLayout(c.dev, sl, nullptr);
 }
 
 // vpvk_cmd_pass_drop: the host (vpgles' glInvalidateFramebuffer) learns after vkCmdBeginRendering that an attachment is
@@ -5880,6 +8634,9 @@ void testSkipReasons() {
     VkDeviceMemory am = alloc(c, 1 << 16, 1);  // host-visible
     VkBuffer ab = buffer(c, 4096, am, 0);
     void* ap = nullptr;
+    PipelineCounters& ipc = pipelineCounters();  // vk.indirect_stats: moved by the commands recorded below
+    const uint64_t draws0 = ipc.indirectDraws.load(), readable0 = ipc.indirectCpuReadable.load(), unread0 = ipc.indirectNotReadable.load(),
+                   over0 = ipc.indirectOverCap.load(), countDraws0 = ipc.indirectCountDraws.load();
     CHECK(vkMapMemory(c.dev, am, 0, VK_WHOLE_SIZE, 0, &ap) == VK_SUCCESS);
     const uint32_t rec[4][4] = {{3, 1, 0, 0}, {0x7fffffffu, 1, 0, 0}, {3, 0x7fffffffu, 0, 0}, {6, 2, 0, 0}};
     std::memcpy(ap, rec, sizeof rec);
@@ -5893,6 +8650,81 @@ void testSkipReasons() {
     const std::vector<vpgpu::Draw> drawn = rig.finish(f2, s2);
     CHECK(drawn.size() == 2 && drawn[0].count == 3 && drawn[1].count == 6 && drawn[1].instances == 2);
     CHECK(s2.draws == 2 && s2.skippedBy[size_t(SkipReason::Indirect)] == 2);
+    // The 4 records sit in host-visible memory: one readable command, two of its records past the caps, the largest values seen.
+    CHECK(ipc.indirectDraws - draws0 == 1 && ipc.indirectCpuReadable - readable0 == 1 && ipc.indirectNotReadable == unread0);
+    CHECK(ipc.indirectOverCap - over0 == 2 && ipc.indirectCountDraws == countDraws0);
+    CHECK(ipc.indirectMaxCount.load() == 0x7fffffffu && ipc.indirectMaxInstances.load() == 0x7fffffffu);
+    // Triangle fan: Metal has none, each record becomes a direct draw of the converted index list (5 vertices = 3
+    // triangles, 4 vertices from vertex 1 x 2 instances = 2 triangles), whatever the GPU indirect setting.
+    PipeOpts fo;
+    fo.topo = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN;
+    VkPipeline fan = makePosPipeline(c, rig, pl, fo, vs, fs);
+    CHECK(from<PipelineObj>(fan)->ok);
+    c.gpu().pipelines().waitIdle();
+    ap = nullptr;
+    CHECK(vkMapMemory(c.dev, am, 0, VK_WHOLE_SIZE, 0, &ap) == VK_SUCCESS);
+    const uint32_t frec[2][4] = {{5, 1, 0, 0}, {4, 2, 1, 0}};
+    std::memcpy(ap, frec, sizeof frec);
+    vkUnmapMemory(c.dev, am);
+    rig.begin();
+    vkCmdBindPipeline(rig.cb, VK_PIPELINE_BIND_POINT_GRAPHICS, fan);
+    vkCmdDrawIndirect(rig.cb, ab, 0, 2, 16);
+    vpgpu::Frame f3;
+    TranslateStats s3;
+    const std::vector<vpgpu::Draw> fd = rig.finish(f3, s3);
+    CHECK(fd.size() == 2 && fd[0].count == 9 && fd[0].index && fd[0].drawIndex == 0 && fd[1].count == 6 &&
+          fd[1].instances == 2 && fd[1].baseVertex == 1 && fd[1].drawIndex == 1 && !fd[0].indirect);
+    CHECK(ipc.indirectDraws - draws0 == 2 && ipc.indirectCpuReadable - readable0 == 2 && ipc.indirectOverCap - over0 == 2);  // the fan's records are fine
+    // A device-local argument buffer is only counted (no readback); a Count draw scans the records its count word allows (here 2 of 3).
+    VkDeviceMemory dm = alloc(c, 1 << 16, 0);
+    VkBuffer db = buffer(c, 4096, dm, 0);
+    DeviceMemory* dmem = from<Buffer>(db)->memory;  // (the null platform maps all memory: take the host pointer away, as for private storage)
+    uint8_t* const dhost = dmem->host;
+    dmem->host = nullptr;
+    ap = nullptr;
+    CHECK(vkMapMemory(c.dev, am, 0, VK_WHOLE_SIZE, 0, &ap) == VK_SUCCESS);
+    const uint32_t crec[3][4] = {{3, 1, 0, 0}, {0x7fffffffu, 1, 0, 0}, {7, 0x7fffffffu, 0, 0}};
+    std::memcpy(ap, crec, sizeof crec);
+    const uint32_t live = 2;
+    std::memcpy(static_cast<uint8_t*>(ap) + 256, &live, sizeof live);
+    vkUnmapMemory(c.dev, am);
+    rig.begin();
+    vkCmdBindPipeline(rig.cb, VK_PIPELINE_BIND_POINT_GRAPHICS, scissored);
+    vkCmdSetScissor(rig.cb, 0, 1, &fine);
+    vkCmdDrawIndirect(rig.cb, db, 0, 2, 16);                  // device-local records
+    vkCmdDrawIndirectCount(rig.cb, ab, 0, ab, 256, 3, 16);    // count word 2: records 0 and 1 are looked at, 2 is not
+    vkCmdDrawIndirectCount(rig.cb, ab, 0, db, 0, 3, 16);      // device-local count word: not readable
+    vpgpu::Frame f4;
+    TranslateStats s4;
+    rig.finish(f4, s4);
+    CHECK(ipc.indirectDraws - draws0 == 5 && ipc.indirectCountDraws - countDraws0 == 2);
+    CHECK(ipc.indirectCpuReadable - readable0 == 3 && ipc.indirectNotReadable - unread0 == 2 && ipc.indirectOverCap - over0 == 3);
+    // The line: cumulative values, every 5 s, only when a draw was recorded since the previous one, 720 lines at most.
+    const std::string body = indirectStatsLine(ipc);
+    char want[256];
+    std::snprintf(want, sizeof want,
+                  "draws=%llu count_variants=%llu max_count=2147483647 max_instances=2147483647 cpu_readable=%llu not_readable=%llu over_cap_seen=%llu",
+                  (unsigned long long)ipc.indirectDraws.load(), (unsigned long long)ipc.indirectCountDraws.load(),
+                  (unsigned long long)ipc.indirectCpuReadable.load(), (unsigned long long)ipc.indirectNotReadable.load(),
+                  (unsigned long long)ipc.indirectOverCap.load());
+    CHECK(body == want);
+    const std::string first = captureStderr([&] { indirectStatsLog(10'000'000'000LL); });
+    CHECK(first == "vk.indirect_stats " + body + "\n");
+    ++ipc.indirectDraws;
+    CHECK(captureStderr([&] { indirectStatsLog(14'000'000'000LL); }).empty());                 // 4 s later: too soon
+    CHECK(countOf(captureStderr([&] { indirectStatsLog(15'000'000'000LL); }), "vk.indirect_stats draws=") == 1);  // 5 s
+    CHECK(captureStderr([&] { indirectStatsLog(30'000'000'000LL); }).empty());                 // nothing recorded since
+    const std::string flood = captureStderr([&] {
+      for (int i = 0; i < 800; ++i) {
+        ++ipc.indirectDraws;
+        indirectStatsLog(40'000'000'000LL + i * 5'000'000'000LL);
+      }
+    });
+    CHECK(countOf(flood, "vk.indirect_stats ") == 718);  // 720 in all (2 above)
+    vkDestroyPipeline(c.dev, fan, nullptr);
+    dmem->host = dhost;
+    vkDestroyBuffer(c.dev, db, nullptr);
+    vkFreeMemory(c.dev, dm, nullptr);
     vkDestroyBuffer(c.dev, ab, nullptr);
     vkFreeMemory(c.dev, am, nullptr);
   }
@@ -5967,6 +8799,362 @@ void testSkipReasons() {
     vkEndCommandBuffer(rig.cb);
   }
   vkDestroyPipelineLayout(c.dev, pl, nullptr);
+}
+
+// GPU indirect draws that need their arguments rewritten (multiview: instances x views; draw-count buffers): the patch kernel
+// (vk.indirect_patch) is dispatched before the pass begins, requested when the device is created, never silently skipped; a kernel that
+// is not there sends the draw to the CPU path (counted, logged), and a draw-count draw, which has none, is skipped with a reason.
+// indirectPatchRef mirrors the kernel's MSL (vp_main): the expected vectors are the multiview doubling and the garbage-count guard.
+void testIndirectPatch() {
+  // The reference against known records (words: count, instances, first, base vertex, first instance), 2 views, 5 words each.
+  {
+    const uint32_t prm[8] = {5, 5, 5, 2, 0, 0, 0, 0};
+    const uint32_t src[25] = {408, 2, 0, 0, 0,           // instances x 2
+                              6, 2183, 0, 0, 0,          // 2183 x 2 = 4366
+                              6, 1, 0, -3u, 7,           // first instance 7 -> 14, base vertex untouched
+                              0xFFFFFFFFu, 1, 0, 0, 3,   // garbage count: an empty draw (the first instance is still scaled)
+                              6, 1048577u, 0, 0, 9};     // garbage instance count: an empty draw
+    const uint32_t want[25] = {408, 4, 0, 0, 0, 6, 4366, 0, 0, 0, 6, 2, 0, -3u, 14, 0, 0, 0, 0, 6, 0, 0, 0, 0, 18};
+    uint32_t got[25] = {};
+    for (uint32_t i = 0; i < 5; ++i) indirectPatchRef(i, prm, src, nullptr, got + i * 5);
+    for (int i = 0; i < 25; ++i) CHECK(got[i] == want[i]);
+    // Draw-count draws (non-indexed, 4 words): the records at or past the GPU count lose their instances; one view: unchanged otherwise.
+    const uint32_t prmC[8] = {3, 4, 4, 1, 1, 0, 0, 0};
+    const uint32_t srcC[12] = {3, 1, 0, 0, 3, 2, 0, 1, 3, 4, 0, 2};
+    const uint32_t cnt[1] = {2};
+    uint32_t outC[12] = {};
+    for (uint32_t i = 0; i < 3; ++i) indirectPatchRef(i, prmC, srcC, cnt, outC + i * 4);
+    const uint32_t wantC[12] = {3, 1, 0, 0, 3, 2, 0, 1, 3, 0, 0, 2};
+    for (int i = 0; i < 12; ++i) CHECK(outC[i] == wantC[i]);
+    // The reference follows the shader source: the guards and the multiplications are the ones the kernel has.
+    const std::string msl = indirectPatchMsl();
+    for (const char* line : {"if (i >= cnt) o[1] = 0u;", "if (o[0] > 33554432u || o[1] > 1048576u) o[0] = 0u, o[1] = 0u;",
+                             "o[1] = o[1] * views;", "o[words - 1u] = o[words - 1u] * views;",
+                             "const uint cnt = prm[4] != 0u ? a.count[prm[5]] : n;"})
+      CHECK(msl.find(line) != std::string::npos);
+  }
+
+  Ctx c({VK_KHR_MULTIVIEW_EXTENSION_NAME});
+  Device* dev = from<Device>(c.dev);
+  // Requested at vkCreateDevice, before any indirect draw.
+  CHECK(dev->indirectPatchKey.value != 0 && dev->gpu->pipelines().status(dev->indirectPatchKey) != vpgpu::PipelineCache::Status::Missing);
+  DrawRig rig(c);
+  VkDeviceMemory m = alloc(c, 8 << 20, 0), hm = alloc(c, 1 << 16, 1);
+  VkImage color = image(c, VK_FORMAT_R8G8B8A8_UNORM, 64, 2, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT, m);
+  VkImageViewCreateInfo vi{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+  vi.image = color, vi.viewType = VK_IMAGE_VIEW_TYPE_2D_ARRAY, vi.format = VK_FORMAT_R8G8B8A8_UNORM;
+  vi.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 2};
+  VkImageView cv;
+  vkCreateImageView(c.dev, &vi, nullptr, &cv);
+  VkAttachmentDescription att{};
+  att.format = VK_FORMAT_R8G8B8A8_UNORM, att.samples = VK_SAMPLE_COUNT_1_BIT;
+  att.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR, att.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+  VkAttachmentReference cref{0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
+  VkSubpassDescription sp{};
+  sp.colorAttachmentCount = 1, sp.pColorAttachments = &cref;
+  const uint32_t mask = 0b11;
+  VkRenderPassMultiviewCreateInfo mv{VK_STRUCTURE_TYPE_RENDER_PASS_MULTIVIEW_CREATE_INFO};
+  mv.subpassCount = 1, mv.pViewMasks = &mask;
+  VkRenderPassCreateInfo rpi{VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO, &mv};
+  rpi.attachmentCount = 1, rpi.pAttachments = &att, rpi.subpassCount = 1, rpi.pSubpasses = &sp;
+  VkRenderPass mrp;
+  vkCreateRenderPass(c.dev, &rpi, nullptr, &mrp);
+  VkFramebufferCreateInfo fi{VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO};
+  fi.renderPass = mrp, fi.attachmentCount = 1, fi.pAttachments = &cv, fi.width = 64, fi.height = 64, fi.layers = 1;
+  VkFramebuffer mfb;
+  vkCreateFramebuffer(c.dev, &fi, nullptr, &mfb);
+  VkPipelineLayoutCreateInfo plci{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+  VkPipelineLayout pl;
+  vkCreatePipelineLayout(c.dev, &plci, nullptr, &pl);
+  VkShaderModule vs = module(c, "pos.vert.spv"), fs = module(c, "solid.frag.spv");
+  const VkRenderPass flat = rig.rp;
+  rig.rp = mrp;  // makePosPipeline builds against the rig's pass: the multiview one for this pipeline
+  VkPipeline pipe = makePosPipeline(c, rig, pl, PipeOpts{}, vs, fs);
+  rig.rp = flat;
+  CHECK(from<PipelineObj>(pipe)->ok && from<PipelineObj>(pipe)->viewCount == 2);
+  c.gpu().pipelines().waitIdle();
+  VkBuffer args = buffer(c, 4096, hm, 0), counts = buffer(c, 256, hm, 4096), ib = buffer(c, 4096, hm, 8192),
+           vb = buffer(c, 4096, hm, 12288);
+
+  enum class Kind { Indexed, IndexedCount };
+  // Records one indirect draw in a multiview pass and returns the recorder's ops.
+  auto record = [&](Kind kind) -> std::vector<Op>& {
+    VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    vkBeginCommandBuffer(rig.cb, &bi);
+    VkClearValue clear{};
+    VkRenderPassBeginInfo rbi{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
+    rbi.renderPass = mrp, rbi.framebuffer = mfb, rbi.renderArea = {{0, 0}, {64, 64}}, rbi.clearValueCount = 1, rbi.pClearValues = &clear;
+    vkCmdBeginRenderPass(rig.cb, &rbi, VK_SUBPASS_CONTENTS_INLINE);
+    vkCmdBindPipeline(rig.cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
+    const VkDeviceSize zero = 0;
+    vkCmdBindVertexBuffers(rig.cb, 0, 1, &vb, &zero);
+    vkCmdBindIndexBuffer(rig.cb, ib, 0, VK_INDEX_TYPE_UINT16);
+    if (kind == Kind::Indexed) vkCmdDrawIndexedIndirect(rig.cb, args, 256, 3, 20);
+    else vkCmdDrawIndexedIndirectCount(rig.cb, args, 256, counts, 0, 4, 20);
+    vkCmdEndRenderPass(rig.cb);
+    vkEndCommandBuffer(rig.cb);
+    return from<CommandBuffer>(rig.cb)->rec->ops;
+  };
+  auto find = [](std::vector<Op>& ops, auto tag) -> size_t {
+    for (size_t i = 0; i < ops.size(); ++i)
+      if (std::holds_alternative<decltype(tag)>(ops[i])) return i;
+    return SIZE_MAX;
+  };
+
+  // Indexed indirect, view mask 0b11: patch dispatch, then the pass; the parameter block is {n, stride/4, 5 words, 2 views, no count}.
+  {
+    std::vector<Op>& ops = record(Kind::Indexed);
+    const size_t di = find(ops, OpDispatch{}), bi = find(ops, OpBeginPass{}), dr = find(ops, OpDraw{});
+    CHECK(di != SIZE_MAX && bi != SIZE_MAX && dr != SIZE_MAX && di < bi && bi < dr);
+    if (di != SIZE_MAX && dr != SIZE_MAX) {
+      const OpDispatch& dp = std::get<OpDispatch>(ops[di]);
+      const OpDraw& draw = std::get<OpDraw>(ops[dr]);
+      CHECK(dp.ok && dp.dispatch.required && dp.dispatch.label == "vk.indirect_patch" && dp.dispatch.pipeline == dev->indirectPatchKey);
+      CHECK(dp.dispatch.groups[0] == 1 && dp.dispatch.bindings.size() == 3);
+      CHECK(draw.gpuIndirect && draw.indirectCount == 3 && draw.indirectStride == 20);
+      if (dp.dispatch.bindings.size() == 3) {
+        const vpgpu::ResourceRange& blobRange = dp.dispatch.bindings[1].range;
+        const uint32_t* blob = nullptr;
+        for (const auto& ch : from<CommandBuffer>(rig.cb)->rec->arena.chunks)
+          if (ch.id.index == blobRange.index && ch.id.generation == blobRange.generation) blob = reinterpret_cast<const uint32_t*>(ch.host + blobRange.begin);
+        CHECK(blob != nullptr);
+        if (blob) {
+          const uint32_t want[6] = {3, 5, 5, 2, 0, 0};  // n, stride/4, words, views, hasCount, countWord
+          for (int i = 0; i < 6; ++i) CHECK(blob[i] == want[i]);
+        }
+        CHECK(draw.gpuBuffer.index == blobRange.index && draw.gpuOffset == blobRange.begin + 32);  // the patched records follow the block
+      }
+    }
+  }
+  // Draw count: the count word is bound as the third buffer and flagged in the block.
+  {
+    std::vector<Op>& ops = record(Kind::IndexedCount);
+    const size_t di = find(ops, OpDispatch{});
+    CHECK(di != SIZE_MAX);
+    if (di != SIZE_MAX) {
+      const OpDispatch& dp = std::get<OpDispatch>(ops[di]);
+      CHECK(dp.dispatch.required && dp.dispatch.groups[0] == 1 && dp.dispatch.bindings.size() == 3);
+    }
+  }
+  // The kernel is not there (a failed compile / a key nobody built): the multiview draw falls back to the CPU path and a draw-count
+  // draw is skipped with its reason, both counted: the draw is never recorded behind a dispatch that cannot run.
+  {
+    const vpgpu::PipelineKey real = dev->indirectPatchKey;
+    dev->indirectPatchKey = vpgpu::PipelineKey{0xdeadbeefull};
+    const uint64_t fb0 = pipelineCounters().indirectPatchFallback.load();
+    std::vector<Op>& plain = record(Kind::Indexed);
+    CHECK(find(plain, OpDispatch{}) == SIZE_MAX);
+    const size_t dr = find(plain, OpDraw{});
+    CHECK(dr != SIZE_MAX && !std::get<OpDraw>(plain[dr]).gpuIndirect && std::get<OpDraw>(plain[dr]).indirect != nullptr);
+    std::vector<Op>& counted = record(Kind::IndexedCount);
+    CHECK(find(counted, OpDispatch{}) == SIZE_MAX);
+    const size_t dc = find(counted, OpDraw{});
+    CHECK(dc != SIZE_MAX && !std::get<OpDraw>(counted[dc]).ok && std::get<OpDraw>(counted[dc]).reason == SkipReason::Indirect);
+    CHECK(pipelineCounters().indirectPatchFallback.load() == fb0 + 2);
+    dev->indirectPatchKey = real;
+  }
+
+  // A kernel that is still compiling: the first draw waits the budget and times out, the following ones (inside the backoff) do not
+  // wait at all; once the compile ends and the backoff has passed the kernel is used again.
+  {
+    auto& nb = static_cast<vpgpu::NullBackend&>(dev->platform->backend());
+    std::mutex gm;
+    std::condition_variable gcv;
+    bool open = false;
+    nb.onCompile = [&] {
+      std::unique_lock lock(gm);
+      gcv.wait(lock, [&] { return open; });
+    };
+    vpgpu::PipelineState held;
+    held.computeShader = 0x1234567ull, held.label = "test.held_kernel";
+    dev->gpu->pipelines().request(held, vpgpu::Priority::Blocking);
+    const vpgpu::PipelineKey real = dev->indirectPatchKey;
+    dev->indirectPatchKey = held.key();
+    dev->indirectPatchWaitMs = 150, dev->indirectPatchBackoffMs = 60000;
+    vpgpu::PipelineKey k;
+    using Clock = std::chrono::steady_clock;
+    auto t0 = Clock::now();
+    CHECK(!indirectPatch(dev, k) && k == held.key());
+    const double first = std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
+    CHECK(first >= 100.0);  // it waited
+    t0 = Clock::now();
+    for (int i = 0; i < 50; ++i) CHECK(!indirectPatch(dev, k));
+    const double fifty = std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
+    CHECK(fifty < 100.0);  // 50 draws, no wait: backoff
+    CHECK(dev->indirectPatchBackoffNs.load() != 0);
+    {
+      std::lock_guard lock(gm);
+      open = true;
+    }
+    gcv.notify_all();
+    dev->gpu->pipelines().waitIdle();
+    CHECK(indirectPatch(dev, k));  // ready now: used even inside the backoff
+    nb.onCompile = nullptr;
+    dev->indirectPatchKey = real;
+    dev->indirectPatchWaitMs = 2000, dev->indirectPatchBackoffMs = 3000;
+  }
+
+  vkDestroyPipeline(c.dev, pipe, nullptr);
+  vkDestroyShaderModule(c.dev, vs, nullptr), vkDestroyShaderModule(c.dev, fs, nullptr);
+  vkDestroyPipelineLayout(c.dev, pl, nullptr);
+  vkDestroyFramebuffer(c.dev, mfb, nullptr);
+  vkDestroyRenderPass(c.dev, mrp, nullptr);
+  vkDestroyImageView(c.dev, cv, nullptr);
+  vkDestroyImage(c.dev, color, nullptr);
+  for (VkBuffer b : {args, counts, ib, vb}) vkDestroyBuffer(c.dev, b, nullptr);
+  vkFreeMemory(c.dev, m, nullptr);
+  vkFreeMemory(c.dev, hm, nullptr);
+}
+
+// 3D ASTC images (texdecode.h): Metal has no 3D ASTC, so the volume is created as RGBA8 and the buffer->image copy is decoded
+// on the CPU at submit. The decoder is checked against blocks built by hand from the specification: a void-extent block, a
+// 6x6 block with a 6x6 weight grid of 1-bit weights (every texel is endpoint 0 or 1 exactly, UNORM and sRGB), and the structural
+// invariants of the integer sequence encoding (every trit / quint combination reachable, unquantisation tables symmetric and
+// distinct). The multi-partition, dual-plane and trit/quint-weight paths are NOT covered by a hand-computed block (only by the
+// table invariants): see the report.
+void testAstc3d() {
+  // Trit / quint groups: all 3^5 and 5^3 digit combinations come out of the 8 / 7 bit codes.
+  {
+    std::set<int> seen;
+    for (unsigned t = 0; t < 256; ++t) {
+      int d[5];
+      astcTritDecode(t, d);
+      for (int i = 0; i < 5; ++i) CHECK(d[i] >= 0 && d[i] <= 2);
+      seen.insert(d[0] + 3 * d[1] + 9 * d[2] + 27 * d[3] + 81 * d[4]);
+    }
+    CHECK(seen.size() == 243);
+    seen.clear();
+    for (unsigned q = 0; q < 128; ++q) {
+      int d[3];
+      astcQuintDecode(q, d);
+      for (int i = 0; i < 3; ++i) CHECK(d[i] >= 0 && d[i] <= 4);
+      seen.insert(d[0] + 5 * d[1] + 25 * d[2]);
+    }
+    CHECK(seen.size() == 125);
+  }
+  // Unquantisation: distinct, symmetric (x <-> 255 - x, 64 - x for weights), ends at 0 and 255 / 64, as the specification lists them.
+  for (int levels : {6, 8, 10, 12, 16, 20, 24, 32, 40, 48, 64, 80, 96, 128, 160, 192, 256}) {
+    std::set<int> u;
+    for (int v = 0; v < levels; ++v) u.insert(astcUnquantColor(levels, v));
+    CHECK(int(u.size()) == levels && *u.begin() == 0 && *u.rbegin() == 255);
+    for (int x : u) CHECK(u.count(255 - x) == 1);
+  }
+  CHECK(astcUnquantColor(6, 0) == 0 && astcUnquantColor(6, 1) == 255 && astcUnquantColor(6, 2) == 51 && astcUnquantColor(6, 3) == 204 &&
+        astcUnquantColor(6, 4) == 102 && astcUnquantColor(6, 5) == 153);
+  for (int levels : {2, 3, 4, 5, 6, 8, 10, 12, 16, 20, 24, 32}) {
+    std::set<int> u;
+    for (int v = 0; v < levels; ++v) u.insert(astcUnquantWeight(levels, v));
+    CHECK(int(u.size()) == levels && *u.begin() == 0 && *u.rbegin() == 64);
+    for (int x : u) CHECK(u.count(64 - x) == 1);
+  }
+  // Void extent: R = 0x1234, G = 0xFFFF, B = 0, A = 0x8000, no extent information.
+  {
+    uint8_t blk[16] = {0xFC, 0xFD, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x34, 0x12, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x80};
+    uint8_t px[6 * 6 * 4];
+    CHECK(vpvk::astcDecodeBlock(blk, 6, 6, false, px));
+    for (int i = 0; i < 36; ++i) CHECK(px[i * 4] == 18 && px[i * 4 + 1] == 255 && px[i * 4 + 2] == 0 && px[i * 4 + 3] == 128);
+    CHECK(vpvk::astcDecodeBlock(blk, 6, 6, true, px));  // sRGB: the top byte of each colour channel, alpha unchanged
+    for (int i = 0; i < 36; ++i) CHECK(px[i * 4] == 0x12 && px[i * 4 + 1] == 255 && px[i * 4 + 2] == 0 && px[i * 4 + 3] == 128);
+    blk[1] = 0xFF;  // bit 9 set: an HDR void extent is an error in an LDR decode
+    CHECK(!vpvk::astcDecodeBlock(blk, 6, 6, false, px) && px[0] == 255 && px[1] == 0 && px[2] == 255);
+  }
+  // 6x6 block, one partition, CEM 8 (RGB direct), 6x6 weight grid of 1-bit weights, block mode 0x104. Endpoint bytes (8 bits each:
+  // 6 values leave 75 bits): e0 = (10,20,30), e1 = (250,200,150). Weight i (row-major) = i & 1: stored from bit 127 downwards.
+  {
+    uint8_t blk[16] = {};
+    auto setBits = [&](int pos, int n, unsigned v) {
+      for (int i = 0; i < n; ++i)
+        if ((v >> i) & 1) blk[(pos + i) >> 3] |= uint8_t(1u << ((pos + i) & 7));
+    };
+    setBits(0, 11, 0x104), setBits(11, 2, 0), setBits(13, 4, 8);
+    const unsigned v[6] = {10, 250, 20, 200, 30, 150};  // r0 r1 g0 g1 b0 b1
+    for (int i = 0; i < 6; ++i) setBits(17 + i * 8, 8, v[i]);
+    for (int i = 0; i < 36; ++i)
+      if (i & 1) setBits(127 - i, 1, 1);
+    uint8_t px[36 * 4];
+    CHECK(vpvk::astcDecodeBlock(blk, 6, 6, false, px));
+    for (int i = 0; i < 36; ++i) {
+      const bool one = i & 1;
+      CHECK(px[i * 4] == (one ? 250 : 10) && px[i * 4 + 1] == (one ? 200 : 20) && px[i * 4 + 2] == (one ? 150 : 30) && px[i * 4 + 3] == 255);
+    }
+    CHECK(vpvk::astcDecodeBlock(blk, 6, 6, true, px));  // sRGB: endpoints are the stored values
+    for (int i = 0; i < 36; ++i) {
+      const bool one = i & 1;
+      CHECK(px[i * 4] == (one ? 250 : 10) && px[i * 4 + 1] == (one ? 200 : 20) && px[i * 4 + 2] == (one ? 150 : 30) && px[i * 4 + 3] == 255);
+    }
+    // The same block decoded as 5x5 is a different footprint: the weight grid is stretched, still no crash and endpoints bounded.
+    uint8_t small[5 * 5 * 4];
+    vpvk::astcDecodeBlock(blk, 5, 5, false, small);
+  }
+
+  // Through the driver: a 3D ASTC 6x6 image is RGBA8, a copy from a host buffer of void-extent blocks arrives decoded.
+  Ctx c;
+  VkImageCreateInfo ii{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+  ii.imageType = VK_IMAGE_TYPE_3D, ii.format = VK_FORMAT_ASTC_6x6_UNORM_BLOCK, ii.extent = {12, 12, 2}, ii.mipLevels = 1, ii.arrayLayers = 1;
+  ii.samples = VK_SAMPLE_COUNT_1_BIT, ii.tiling = VK_IMAGE_TILING_OPTIMAL;
+  ii.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+  VkImage vol = VK_NULL_HANDLE;
+  CHECK(vkCreateImage(c.dev, &ii, nullptr, &vol) == VK_SUCCESS);
+  VkDeviceMemory m = alloc(c, 8 << 20, 0), hm = alloc(c, 1 << 16, 1);
+  vkBindImageMemory(c.dev, vol, m, 0);
+  const Image* im = from<Image>(vol);
+  CHECK(im->desc.format == vpgpu::Format::RGBA8Unorm && im->desc.type == vpgpu::TextureType::Tex3D && im->id);
+  VkImageViewCreateInfo vi{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+  vi.image = vol, vi.viewType = VK_IMAGE_VIEW_TYPE_3D, vi.format = VK_FORMAT_ASTC_6x6_UNORM_BLOCK;
+  vi.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+  VkImageView view = VK_NULL_HANDLE;
+  CHECK(vkCreateImageView(c.dev, &vi, nullptr, &view) == VK_SUCCESS && from<ImageView>(view)->view.index == 0);  // the volume itself
+  VkBuffer src = buffer(c, 4096, hm, 0);
+  void* mp = nullptr;
+  CHECK(vkMapMemory(c.dev, hm, 0, VK_WHOLE_SIZE, 0, &mp) == VK_SUCCESS);
+  for (int b = 0; b < 8; ++b) {  // 2 x 2 x 2 blocks; red = 10 * (b + 1) as 16 bits (v * 257), green 255 - b
+    uint8_t blk[16] = {0xFC, 0xFD, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+    const unsigned r = unsigned(10 * (b + 1)) * 257, g = unsigned(255 - b) * 257;
+    blk[8] = uint8_t(r), blk[9] = uint8_t(r >> 8), blk[10] = uint8_t(g), blk[11] = uint8_t(g >> 8), blk[14] = 0xFF, blk[15] = 0xFF;
+    std::memcpy(static_cast<uint8_t*>(mp) + b * 16, blk, 16);  // z-major, then rows of blocks (2 per row)
+  }
+  vkUnmapMemory(c.dev, hm);
+  VkCommandPoolCreateInfo cpi{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+  VkCommandPool cp;
+  vkCreateCommandPool(c.dev, &cpi, nullptr, &cp);
+  VkCommandBufferAllocateInfo ai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+  ai.commandPool = cp, ai.commandBufferCount = 1;
+  VkCommandBuffer cb;
+  vkAllocateCommandBuffers(c.dev, &ai, &cb);
+  VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+  vkBeginCommandBuffer(cb, &bi);
+  VkBufferImageCopy region{};
+  region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+  region.imageExtent = {12, 12, 2};
+  vkCmdCopyBufferToImage(cb, src, vol, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+  vkEndCommandBuffer(cb);
+  vpgpu::Frame frame;
+  TranslateStats st;
+  translate(*from<CommandBuffer>(cb)->rec, frame, st);
+  CHECK(st.copies == 1 && st.dropped == 0 && frame.commands().size() == 1);
+  const auto* cp0 = frame.commands().empty() ? nullptr : std::get_if<vpgpu::Copy>(&frame.commands()[0]);
+  CHECK(cp0 && cp0->kind == vpgpu::CopyKind::BufferToTexture && cp0->dstTexture.width == 12 && cp0->dstTexture.height == 12 &&
+        cp0->dstTexture.depth == 2 && cp0->srcBuffer.bytesPerRow == 48 && cp0->srcBuffer.rowsPerImage == 12);
+  const OpCopyBufferToImage* op = nullptr;
+  for (const Op& o : from<CommandBuffer>(cb)->rec->ops)
+    if (const auto* x = std::get_if<OpCopyBufferToImage>(&o)) op = x;
+  CHECK(op && op->decodedHost);
+  if (op && op->decodedHost) {
+    int bad = 0;
+    for (int z = 0; z < 2; ++z)
+      for (int y = 0; y < 12; ++y)
+        for (int x = 0; x < 12; ++x) {
+          const int b = z * 4 + (y / 6) * 2 + x / 6;
+          const uint8_t* t = op->decodedHost + ((size_t(z) * 12 + y) * 12 + x) * 4;
+          bad += !(t[0] == 10 * (b + 1) && t[1] == 255 - b && t[2] == 0 && t[3] == 255);
+        }
+    CHECK(bad == 0);
+  }
+  vkDestroyImageView(c.dev, view, nullptr);
+  vkDestroyImage(c.dev, vol, nullptr);
+  vkDestroyBuffer(c.dev, src, nullptr);
+  vkFreeMemory(c.dev, m, nullptr), vkFreeMemory(c.dev, hm, nullptr);
+  vkDestroyCommandPool(c.dev, cp, nullptr);
 }
 
 // vk.perf (perf.h): the draw counters of the replay (instanced, indirect by where the arguments are read, secondary), the
@@ -6255,6 +9443,59 @@ void testPhase1b() {
     CHECK(fp3.optimalTilingFeatures & VK_FORMAT_FEATURE_2_HOST_IMAGE_TRANSFER_BIT_EXT);
     vkDestroyImage(c.dev, im, nullptr);
     vkFreeMemory(c.dev, m, nullptr);
+  }
+  {  // VkFormatProperties3 carries every VkFormatProperties flag (CTS format_props_3 / unsupported_image_usage)
+    Ctx c({});
+    CHECK(c.dev != nullptr);
+    for (VkFormat f : {VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_R5G6B5_UNORM_PACK16, VK_FORMAT_A2B10G10R10_UINT_PACK32,
+                       VK_FORMAT_ASTC_4x4_UNORM_BLOCK, VK_FORMAT_D32_SFLOAT, VK_FORMAT_R32G32B32_SFLOAT}) {
+      VkFormatProperties3 q3{VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_3};
+      VkFormatProperties2 q2{VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_2, &q3};
+      vkGetPhysicalDeviceFormatProperties2(c.pd, f, &q2);
+      const VkFormatProperties& b = q2.formatProperties;
+      CHECK((VkFlags64(b.linearTilingFeatures) & q3.linearTilingFeatures) == b.linearTilingFeatures);
+      CHECK((VkFlags64(b.optimalTilingFeatures) & q3.optimalTilingFeatures) == b.optimalTilingFeatures);
+      CHECK((VkFlags64(b.bufferFeatures) & q3.bufferFeatures) == b.bufferFeatures);
+    }
+    VkFormatProperties3 d3{VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_3};
+    VkFormatProperties2 d2{VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_2, &d3};
+    vkGetPhysicalDeviceFormatProperties2(c.pd, VK_FORMAT_D32_SFLOAT, &d2);
+    CHECK(d3.optimalTilingFeatures & VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_DEPTH_COMPARISON_BIT);
+    CHECK(d3.linearTilingFeatures & VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_DEPTH_COMPARISON_BIT);
+    // The core 1.2 / 1.3 feature structs agree with Vulkan12/13Features (each is written, not left as the caller's bytes).
+    VkPhysicalDeviceShaderTerminateInvocationFeatures ti{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_TERMINATE_INVOCATION_FEATURES};
+    VkPhysicalDeviceVulkan13Features v13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES, &ti};
+    VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &v13};
+    ti.shaderTerminateInvocation = 0xcdcdcdcd;
+    vkGetPhysicalDeviceFeatures2(c.pd, &f2);
+    CHECK(ti.shaderTerminateInvocation == v13.shaderTerminateInvocation);
+    VkPhysicalDeviceDescriptorIndexingFeatures di{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_FEATURES};
+    VkPhysicalDeviceImageRobustnessFeatures ir{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_ROBUSTNESS_FEATURES, &di};
+    VkPhysicalDeviceShaderAtomicInt64Features a64{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_INT64_FEATURES, &ir};
+    f2.pNext = &a64;
+    di.runtimeDescriptorArray = ir.robustImageAccess = a64.shaderBufferInt64Atomics = 0xcdcdcdcd;
+    vkGetPhysicalDeviceFeatures2(c.pd, &f2);
+    CHECK(!di.runtimeDescriptorArray && ir.robustImageAccess == v13.robustImageAccess && !a64.shaderBufferInt64Atomics);
+    VkPhysicalDeviceFloatControlsProperties fc{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FLOAT_CONTROLS_PROPERTIES};
+    VkPhysicalDeviceVulkan12Properties p12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_PROPERTIES, &fc};
+    VkPhysicalDeviceProperties2 pp{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &p12};
+    vkGetPhysicalDeviceProperties2(c.pd, &pp);
+    VkPhysicalDeviceDescriptorIndexingProperties dp{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_PROPERTIES};
+    dp.maxUpdateAfterBindDescriptorsInAllPools = 0xcdcdcdcd;
+    pp.pNext = &dp;
+    vkGetPhysicalDeviceProperties2(c.pd, &pp);
+    CHECK(dp.maxUpdateAfterBindDescriptorsInAllPools == 0);
+    VkPhysicalDeviceSamplerFilterMinmaxProperties mm{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SAMPLER_FILTER_MINMAX_PROPERTIES};
+    VkPhysicalDeviceShaderIntegerDotProductProperties dot{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_INTEGER_DOT_PRODUCT_PROPERTIES, &mm};
+    mm.filterMinmaxSingleComponentFormats = dot.integerDotProduct8BitUnsignedAccelerated = 0xcdcdcdcd;
+    pp.pNext = &dot;
+    vkGetPhysicalDeviceProperties2(c.pd, &pp);
+    CHECK(!mm.filterMinmaxSingleComponentFormats && !dot.integerDotProduct8BitUnsignedAccelerated);
+    pp.pNext = &p12;
+    vkGetPhysicalDeviceProperties2(c.pd, &pp);
+    CHECK(fc.denormBehaviorIndependence == p12.denormBehaviorIndependence &&
+          fc.roundingModeIndependence == p12.roundingModeIndependence &&
+          fc.shaderRoundingModeRTEFloat32 == p12.shaderRoundingModeRTEFloat32);
   }
   {  // dynamic rendering local read
     Ctx c({VK_KHR_DYNAMIC_RENDERING_EXTENSION_NAME, VK_KHR_DYNAMIC_RENDERING_LOCAL_READ_EXTENSION_NAME});
@@ -7684,6 +10925,39 @@ void testCaptureEnvHost() {
   CHECK(files == 1);
 }
 
+// VPVK_CAPTURE=1 VPVK_CAPTURE_DIR=<dir> and no VPVK_CAPTURE_FRAME (set by the test registration): an on-demand request without
+// a path writes into the directory (the directory used to be read only together with VPVK_CAPTURE_FRAME, so it fell back to ".").
+void testCaptureEnvDir() {
+  const char* dir = std::getenv("VPVK_CAPTURE_DIR");
+  if (!dir || std::getenv("VPVK_CAPTURE_FRAME")) {
+    std::puts("  skipped: run by ctest gpu_vulkan.capture_env_dir");
+    return;
+  }
+  for (auto& e : std::filesystem::directory_iterator(dir)) std::filesystem::remove(e.path());
+  {
+    CapRig r;  // tracking came from VPVK_CAPTURE=1: no vpvk_capture_track call
+    r.fillBuffers(1);
+    r.record(r.cb[0], true);
+    r.submit({r.cb[0]});
+    CHECK(vpvk_capture_request(1, nullptr) == 1);
+    r.submit({r.cb[0]});  // the boundary: the capture starts when it returns
+    r.record(r.cb[1], true);
+    r.submit({r.cb[1]});  // its one frame
+    CHECK(vpvk_capture_state() == 0);
+  }
+  int files = 0;
+  for (auto& e : std::filesystem::directory_iterator(dir)) {
+    ++files;
+    vpcap::Reader rd;
+    CHECK(rd.open(e.path().string()));
+    vpcap::Call c;
+    int frameEnds = 0;
+    while (rd.next(c)) frameEnds += c.id == vpcap::id::vpcapFrameEnd;
+    CHECK(rd.error().empty() && frameEnds == 1);
+  }
+  CHECK(files == 1);
+}
+
 // ---- capture: the device filter, state calls without a recording hook, the image budget, the locks ----
 struct CapFile {
   struct Rec {
@@ -7787,9 +11061,10 @@ void testCaptureUnhooked() {
     const auto dispatchBase = reinterpret_cast<PFN_vkCmdDispatchBase>(fn("vkCmdDispatchBase"));
     const auto drawMulti = reinterpret_cast<PFN_vkCmdDrawMultiEXT>(fn("vkCmdDrawMultiEXT"));
     const auto setEvent = reinterpret_cast<PFN_vkSetEvent>(fn("vkSetEvent"));
-    // The driver does not offer these: no game can call them, so there is nothing to record.
-    CHECK(vkGetInstanceProcAddr(r.inst, "vkCmdPushDescriptorSetKHR") == nullptr);
-    CHECK(vkGetInstanceProcAddr(r.inst, "vkCmdPushDescriptorSetWithTemplateKHR") == nullptr);
+    // Push descriptors are offered (counted as unhooked, the replay cannot reproduce them); the fragment shading rate is not:
+    // no game can call it, so there is nothing to record.
+    CHECK(vkGetInstanceProcAddr(r.inst, "vkCmdPushDescriptorSetKHR") != nullptr);
+    CHECK(vkGetInstanceProcAddr(r.inst, "vkCmdPushDescriptorSetWithTemplateKHR") != nullptr);
     CHECK(vkGetInstanceProcAddr(r.inst, "vkCmdSetFragmentShadingRateKHR") == nullptr);
 
     VkDescriptorUpdateTemplateEntry te{0, 0, 1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 0, sizeof(VkDescriptorBufferInfo)};
@@ -8091,6 +11366,52 @@ H fake(uintptr_t v) {
 void testCaptureCodec() {
   namespace I = vpcap::id;
   using vpcap::idOfHandle;
+  // Imageless framebuffer (UE5): vkCreateFramebuffer keeps the VkFramebufferAttachmentsCreateInfo of its chain (no pAttachments
+  // read), and vkCmdBeginRenderPass / BeginRenderPass2 keep the VkRenderPassAttachmentBeginInfo with the views of that pass:
+  // nothing of either chain is dropped.
+  {
+    const VkFormat fmt = VK_FORMAT_R8G8B8A8_UNORM;
+    VkFramebufferAttachmentImageInfo ai{VK_STRUCTURE_TYPE_FRAMEBUFFER_ATTACHMENT_IMAGE_INFO};
+    ai.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT, ai.width = 64, ai.height = 32, ai.layerCount = 2, ai.viewFormatCount = 1, ai.pViewFormats = &fmt;
+    VkFramebufferAttachmentsCreateInfo fa{VK_STRUCTURE_TYPE_FRAMEBUFFER_ATTACHMENTS_CREATE_INFO};
+    fa.attachmentImageInfoCount = 1, fa.pAttachmentImageInfos = &ai;
+    VkFramebufferCreateInfo fci{VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO, &fa};
+    fci.flags = VK_FRAMEBUFFER_CREATE_IMAGELESS_BIT, fci.renderPass = fake<VkRenderPass>(0x30), fci.attachmentCount = 1;
+    fci.pAttachments = reinterpret_cast<const VkImageView*>(0x1);  // ignored for an imageless framebuffer: never dereferenced
+    fci.width = 64, fci.height = 32, fci.layers = 1;
+    VkFramebuffer out = VK_NULL_HANDLE;
+    uint32_t dropped = 99;
+    auto d = codecRoundTrip<I::vkCreateFramebuffer>(&dropped, 0, fake<VkDevice>(0x10), &fci, nullptr, &out);
+    CHECK(d && d->ok && dropped == 0);
+    if (d && d->ok) {
+      const VkFramebufferCreateInfo* got = std::get<1>(d->args);
+      CHECK(got && (got->flags & VK_FRAMEBUFFER_CREATE_IMAGELESS_BIT) && got->attachmentCount == 1 && got->pAttachments == nullptr);
+      const auto* gfa = got ? static_cast<const VkFramebufferAttachmentsCreateInfo*>(got->pNext) : nullptr;
+      CHECK(gfa && gfa->sType == VK_STRUCTURE_TYPE_FRAMEBUFFER_ATTACHMENTS_CREATE_INFO && gfa->attachmentImageInfoCount == 1);
+      if (gfa && gfa->attachmentImageInfoCount == 1) {
+        const VkFramebufferAttachmentImageInfo& g = gfa->pAttachmentImageInfos[0];
+        CHECK(g.width == 64 && g.height == 32 && g.layerCount == 2 && g.usage == VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT &&
+              g.viewFormatCount == 1 && g.pViewFormats[0] == fmt);
+      }
+    }
+    VkImageView views[2] = {fake<VkImageView>(0x41), fake<VkImageView>(0x42)};
+    VkRenderPassAttachmentBeginInfo ab{VK_STRUCTURE_TYPE_RENDER_PASS_ATTACHMENT_BEGIN_INFO};
+    ab.attachmentCount = 2, ab.pAttachments = views;
+    VkClearValue clear{};
+    VkRenderPassBeginInfo bi{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO, &ab};
+    bi.renderPass = fake<VkRenderPass>(0x30), bi.framebuffer = fake<VkFramebuffer>(0x31), bi.renderArea = {{0, 0}, {64, 32}};
+    bi.clearValueCount = 1, bi.pClearValues = &clear;
+    auto b1 = codecRoundTrip<I::vkCmdBeginRenderPass>(&dropped, 0, fake<VkCommandBuffer>(0x20), &bi, VK_SUBPASS_CONTENTS_INLINE);
+    CHECK(b1 && b1->ok && dropped == 0);
+    VkSubpassBeginInfo sbi{VK_STRUCTURE_TYPE_SUBPASS_BEGIN_INFO};
+    auto b2 = codecRoundTrip<I::vkCmdBeginRenderPass2>(&dropped, 0, fake<VkCommandBuffer>(0x20), &bi, &sbi);
+    CHECK(b2 && b2->ok && dropped == 0);
+    for (const VkRenderPassBeginInfo* got : {b1 && b1->ok ? std::get<1>(b1->args) : nullptr, b2 && b2->ok ? std::get<1>(b2->args) : nullptr}) {
+      const auto* gab = got ? static_cast<const VkRenderPassAttachmentBeginInfo*>(got->pNext) : nullptr;
+      CHECK(gab && gab->sType == VK_STRUCTURE_TYPE_RENDER_PASS_ATTACHMENT_BEGIN_INFO && gab->attachmentCount == 2);
+      if (gab && gab->attachmentCount == 2) CHECK(idOfHandle(gab->pAttachments[0]) != idOfHandle(gab->pAttachments[1]));
+    }
+  }
   // vkCreateRenderPass: multiview kept, an unknown pNext struct in the chain dropped and counted.
   {
     VkAttachmentDescription att{};
@@ -9302,6 +12623,129 @@ void testRefCaps() {
   }
 }
 
+// A platform whose GPU never finishes a frame while `stuck`: its submits stay in flight.
+struct StuckGpu final : Platform {
+  std::unique_ptr<Platform> inner;
+  bool stuck = true;
+  vpgpu::Backend& backend() override { return inner->backend(); }
+  WaitResult waitFrames(uint64_t, uint64_t) override { return stuck ? WaitResult::Timeout : WaitResult::Done; }
+};
+
+// vpvk_dump_pending (pending.cpp): what the game polled and was told "not yet" is listed with the submit that should
+// signal it; what is done is not.
+void testPending() {
+  Ctx c;
+  Device* d = from<Device>(c.dev);
+  auto stuckOwner = std::make_unique<StuckGpu>();
+  StuckGpu* gpu = stuckOwner.get();
+  gpu->inner = std::move(d->platform);
+  d->platform = std::move(stuckOwner);
+  auto has = [&](const std::string& what) {
+    for (const std::string& l : pendingReport(*d))
+      if (l.find(what) != std::string::npos) return true;
+    return false;
+  };
+  auto ptr = [](const char* key, const void* p) {
+    char b[64];
+    std::snprintf(b, sizeof b, "%s=%p ", key, p);
+    return std::string(b);
+  };
+  auto fenceKey = [&](VkFence f) { return ptr("fence", from<Fence>(f)); };
+
+  VkCommandPoolCreateInfo pi{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+  VkCommandPool pool;
+  vkCreateCommandPool(c.dev, &pi, nullptr, &pool);
+  VkCommandBufferAllocateInfo ai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+  ai.commandPool = pool;
+  ai.commandBufferCount = 1;
+  VkDeviceMemory m = alloc(c, 1 << 16, 1);
+  VkBuffer b = buffer(c, 4096, m, 0);
+  VkCommandBuffer cb[2];
+  for (VkCommandBuffer& x : cb) {
+    vkAllocateCommandBuffers(c.dev, &ai, &x);
+    VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    vkBeginCommandBuffer(x, &bi);
+    vkCmdFillBuffer(x, b, 0, 256, 7);
+    vkEndCommandBuffer(x);
+  }
+  VkSemaphoreTypeCreateInfo ti{VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO};
+  ti.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
+  VkSemaphoreCreateInfo sci{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
+  sci.pNext = &ti;
+  VkSemaphore sem;
+  vkCreateSemaphore(c.dev, &sci, nullptr, &sem);
+  VkFenceCreateInfo fci{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+  VkFence onGpu, held, never, quiet;
+  vkCreateFence(c.dev, &fci, nullptr, &onGpu);
+  vkCreateFence(c.dev, &fci, nullptr, &held);
+  vkCreateFence(c.dev, &fci, nullptr, &never);
+  vkCreateFence(c.dev, &fci, nullptr, &quiet);
+
+  // onGpu: submitted, the GPU has not finished it. held: waits on timeline value 5 that nothing has signaled.
+  VkSubmitInfo plain{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+  plain.commandBufferCount = 1, plain.pCommandBuffers = &cb[0];
+  CHECK(vkQueueSubmit(c.queue, 1, &plain, onGpu) == VK_SUCCESS);
+  const uint64_t w = 5;
+  VkPipelineStageFlags stage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+  VkTimelineSemaphoreSubmitInfo t{VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO};
+  t.waitSemaphoreValueCount = 1, t.pWaitSemaphoreValues = &w;
+  VkSubmitInfo waits{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+  waits.pNext = &t, waits.waitSemaphoreCount = 1, waits.pWaitSemaphores = &sem, waits.pWaitDstStageMask = &stage;
+  waits.commandBufferCount = 1, waits.pCommandBuffers = &cb[1];
+  CHECK(vkQueueSubmit(c.queue, 1, &waits, held) == VK_SUCCESS);
+  CHECK(!has(fenceKey(onGpu)));  // nobody asked yet
+  CHECK(vkGetFenceStatus(c.dev, onGpu) == VK_NOT_READY);
+  CHECK(vkGetFenceStatus(c.dev, held) == VK_NOT_READY);
+  CHECK(vkGetFenceStatus(c.dev, never) == VK_NOT_READY);  // never submitted
+  CHECK(has(fenceKey(onGpu) + "polls=1 last=NOT_READY") && has("gpu(frames=1 gpu_done=0)"));
+  CHECK(has(fenceKey(held)) && has("submit=held(timeline_wait_unsignaled)") && has("vk.pending deferred #0 "));
+  CHECK(has(fenceKey(never)) && has("submit=none(unsubmitted_or_reset)"));
+  CHECK(!has(fenceKey(quiet)));  // never polled
+  CHECK(has("vk.pending gpu frames=1 inflight=1 "));
+
+  // The GPU catches up and the timeline value arrives: the fences are done and drop out of the report.
+  gpu->stuck = false;
+  CHECK(vkGetFenceStatus(c.dev, onGpu) == VK_SUCCESS);
+  CHECK(!has(fenceKey(onGpu)));
+  uint64_t v = 0;
+  vkGetSemaphoreCounterValue(c.dev, sem, &v);
+  VkSemaphoreWaitInfo wi{VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO};
+  const uint64_t want = 9;
+  wi.semaphoreCount = 1, wi.pSemaphores = &sem, wi.pValues = &want;
+  CHECK(vkWaitSemaphores(c.dev, &wi, 0) == VK_TIMEOUT);
+  CHECK(has(ptr("timeline", from<Semaphore>(sem)) + "completed=0 wait_max=9 "));
+  VkSemaphoreSignalInfo sig{VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO};
+  sig.semaphore = sem, sig.value = 5;
+  CHECK(vkSignalSemaphore(c.dev, &sig) == VK_SUCCESS);
+  CHECK(vkWaitForFences(c.dev, 1, &held, VK_TRUE, UINT64_MAX) == VK_SUCCESS);
+  CHECK(!has(fenceKey(held)) && !has("vk.pending deferred #"));
+
+  // An event nobody has set: listed with who could (host calls, submitted vkCmdSetEvent), until it is set.
+  VkEventCreateInfo eci{VK_STRUCTURE_TYPE_EVENT_CREATE_INFO};
+  VkEvent ev;
+  vkCreateEvent(c.dev, &eci, nullptr, &ev);
+  CHECK(vkGetEventStatus(c.dev, ev) == VK_EVENT_RESET);
+  CHECK(has(ptr("event", from<Event>(ev))) && has("host_set=0 host_reset=0 cmd_stamps=0 "));
+  vkSetEvent(c.dev, ev);
+  CHECK(vkGetEventStatus(c.dev, ev) == VK_EVENT_SET);
+  CHECK(!has(ptr("event", from<Event>(ev))));
+
+  // A destroyed object is gone from the registry.
+  const std::string never_s = fenceKey(never);
+  vkDestroyFence(c.dev, never, nullptr);
+  CHECK(!has(never_s));
+
+  vkDestroyEvent(c.dev, ev, nullptr);
+  vkDestroyFence(c.dev, onGpu, nullptr);
+  vkDestroyFence(c.dev, held, nullptr);
+  vkDestroyFence(c.dev, quiet, nullptr);
+  vkDestroySemaphore(c.dev, sem, nullptr);
+  vkDestroyCommandPool(c.dev, pool, nullptr);
+  vkDestroyBuffer(c.dev, b, nullptr);
+  vkFreeMemory(c.dev, m, nullptr);
+  d->platform = std::move(gpu->inner);  // the stand-in goes before the device does
+}
+
 int main(int argc, char** argv) {
   gLib = argc > 2 ? argv[2] : "libVPVulkan.so";
   gReplay = argc > 3 ? argv[3] : nullptr;
@@ -9312,13 +12756,13 @@ int main(int argc, char** argv) {
   const std::vector<std::pair<const char*, std::function<void()>>> groups = {
       {"exports", testExports}, {"physical", testPhysical}, {"memory", testMemory}, {"msaa_tile_off", testMsaaTileOff},
       {"passes", testPasses},   {"submit", testSubmit}, {"pipeline", testPipeline},
-      {"recipes", testRecipes}, {"taa", testTaa}, {"msaa", testMsaa}, {"queries", testQueries},
-      {"timeline", testTimeline}, {"renderpass_ops", testRenderPassOps}, {"linear", testLinear}, {"images", testImages}, {"image_lifetime", testImageLifetime},
-      {"vertex_stores", testVertexStores}, {"profile", testProfile}, {"profile13", testProfile13}, {"report_geom", testReportGeomInterpolators}, {"pipeline_policy", testPipelinePolicy}, {"eds", testExtendedDynamicState},
-      {"native_identity", testNativeIdentity}, {"inline_uniform", testInlineUniformBlock}, {"bda", testBufferDeviceAddress}, {"ycbcr", testYcbcr},
-      {"taa_native", testTaaNative}, {"taa_eye_depth", testTaaEyeDepth}, {"taa_uimask", testTaaUiMask}, {"aot", testAot}, {"aniso", testAniso}, {"zeroinit", testZeroInit}, {"archive_index", testArchiveIndex}, {"foveation", testFoveation},
-      {"stage_keys", testStageKeys}, {"async_pipelines", testAsyncPipelines}, {"sync_pipelines", testSyncPipelines}, {"pso_census", testPsoCensus}, {"pass_drop", testPassDrop}, {"skip_reasons", testSkipReasons},
-      {"perf", testPerf}, {"phase1b", testPhase1b}, {"suspend_resume", testSuspendResume}, {"translator_modes", testTranslatorModes}, {"capture", testCapture}, {"capture_images", testCaptureImages}, {"capture_hooks", testCaptureHooks}, {"capture_codec", testCaptureCodec}, {"capture_env", testCaptureEnv}, {"capture_pools", testCapturePools}, {"capture_host_frames", testCaptureHostFrames}, {"capture_corrupt", testCaptureCorrupt}, {"capture_env_host", testCaptureEnvHost}, {"capture_devices", testCaptureDevices}, {"capture_unhooked", testCaptureUnhooked}, {"capture_budget", testCaptureBudget}, {"capture_locks", testCaptureLocks}, {"png", testPng}, {"imgdiff", testImgDiff}, {"replay", testReplay}, {"replay_lvp", testReplayLvp}, {"refcaps", testRefCaps}};
+      {"recipes", testRecipes}, {"recipe_keys", testRecipeKeys}, {"taa", testTaa}, {"msaa", testMsaa}, {"queries", testQueries}, {"query_not_ready", testQueryNotReady},
+      {"timeline", testTimeline}, {"queues", testQueues}, {"timeline_order", testTimelineOrder}, {"pending", testPending}, {"renderpass_ops", testRenderPassOps}, {"linear", testLinear}, {"images", testImages}, {"image_lifetime", testImageLifetime},
+      {"vertex_stores", testVertexStores}, {"profile", testProfile}, {"profile13", testProfile13}, {"quest_extras", testQuestExtras}, {"push_descriptor", testPushDescriptor}, {"report_geom", testReportGeomInterpolators}, {"pipeline_policy", testPipelinePolicy}, {"eds", testExtendedDynamicState},
+      {"quest_gpu_name", testQuestGpuName}, {"native_identity", testNativeIdentity}, {"inline_uniform", testInlineUniformBlock}, {"bda", testBufferDeviceAddress}, {"ycbcr", testYcbcr},
+      {"taa_native", testTaaNative}, {"taa_eye_depth", testTaaEyeDepth}, {"taa_uimask", testTaaUiMask}, {"msaa_force", testMsaaForce}, {"prewarm_variants", testPrewarmVariants}, {"msaa_force_marked", testMsaaForceMarkedEye}, {"aot", testAot}, {"aniso", testAniso}, {"zeroinit", testZeroInit}, {"archive_index", testArchiveIndex}, {"foveation", testFoveation},
+      {"stage_keys", testStageKeys}, {"async_pipelines", testAsyncPipelines}, {"sync_pipelines", testSyncPipelines}, {"create_default", testCreateDefault}, {"pso_census", testPsoCensus}, {"cache_state", testCacheState}, {"pass_drop", testPassDrop}, {"skip_reasons", testSkipReasons}, {"indirect_patch", testIndirectPatch}, {"astc3d", testAstc3d},
+      {"perf", testPerf}, {"phase1b", testPhase1b}, {"suspend_resume", testSuspendResume}, {"translator_modes", testTranslatorModes}, {"capture", testCapture}, {"capture_images", testCaptureImages}, {"capture_hooks", testCaptureHooks}, {"capture_codec", testCaptureCodec}, {"capture_env", testCaptureEnv}, {"capture_pools", testCapturePools}, {"capture_host_frames", testCaptureHostFrames}, {"capture_corrupt", testCaptureCorrupt}, {"capture_env_host", testCaptureEnvHost}, {"capture_env_dir", testCaptureEnvDir}, {"capture_devices", testCaptureDevices}, {"capture_unhooked", testCaptureUnhooked}, {"capture_budget", testCaptureBudget}, {"capture_locks", testCaptureLocks}, {"png", testPng}, {"imgdiff", testImgDiff}, {"replay", testReplay}, {"replay_lvp", testReplayLvp}, {"refcaps", testRefCaps}};
   bool ran = false;
   for (const auto& [name, fn] : groups) {
     if (argc > 1 && std::strcmp(argv[1], name) != 0) continue;

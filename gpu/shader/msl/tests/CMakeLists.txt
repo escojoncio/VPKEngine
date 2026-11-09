@@ -8,6 +8,8 @@ foreach(f ${cases})
   get_filename_component(n ${f} NAME_WE)
   if(n STREQUAL "rate_map_fs")  # emitted with Module::rateMapPosition (foveation)
     add_test(NAME vpmsl.golden.${n} COMMAND vpmsl_golden ${f} ${CMAKE_CURRENT_SOURCE_DIR}/${n}.metal --rate-map)
+  elseif(n STREQUAL "sampler_bias_fs")  # emitted with EmitOptions::samplerBias
+    add_test(NAME vpmsl.golden.${n} COMMAND vpmsl_golden ${f} ${CMAKE_CURRENT_SOURCE_DIR}/${n}.metal --sampler-bias)
   else()
     add_test(NAME vpmsl.golden.${n} COMMAND vpmsl_golden ${f} ${CMAKE_CURRENT_SOURCE_DIR}/${n}.metal)
   endif()

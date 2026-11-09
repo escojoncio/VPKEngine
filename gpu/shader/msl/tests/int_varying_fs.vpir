@@ -1,0 +1,15 @@
+module fragment
+
+input id : vec2<i32> location(0) flat
+input pid : i32 location(1) flat
+output color : vec4<f32> location(0)
+
+func main() {
+  %0 = load_input id : vec2<i32>
+  %1 = load_input pid : i32
+  %2 = extract %0, 1 : i32
+  %3 = add %2, %1 : i32
+  %4 = convert %3 : f32
+  %5 = construct %4, %4, %4, %4 : vec4<f32>
+  store_output color, %5
+}

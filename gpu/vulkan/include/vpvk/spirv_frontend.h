@@ -50,6 +50,9 @@ void release(SpirvModule*);
 // Does the module decorate a variable or a member BuiltIn Layer? A vertex shader that does cannot use vertex amplification
 // (SpirvInterface::amplified): the reason a multiview draw is not amplified is "layer" then, else the ClipDistance it writes.
 bool declaresLayer(const SpirvModule&);
+// Does the module decorate a variable or a member BuiltIn SampleId or SampleMask? (A fragment shader that reads / writes
+// per-sample state: its result depends on the sample count and positions, which forced MSAA changes.)
+bool declaresSampleBuiltin(const SpirvModule&);
 
 // Set value for vertex-buffer bindings in SpirvBinding::set.
 inline constexpr uint32_t kVertexBufferSet = 0xFFFFFFFFu;
@@ -77,6 +80,7 @@ struct VertexBufferBinding {
   uint32_t binding = 0, stride = 0;
   bool perInstance = false;
   uint16_t slot = 0;  // Buffer slot assigned by the driver
+  uint32_t divisor = 1;  // VK_EXT_vertex_attribute_divisor: instances per element (0: always the first instance's element)
 };
 
 struct SpirvLowerOptions {
@@ -108,6 +112,10 @@ struct SpirvLowerOptions {
   // test, every invocation whose colour output 0 alpha (float vec4) is < 0.5 is discarded at the end
   // of main. false = the MSL is byte-identical to before. Recipes: flags bit 5.
   bool alphaTest = false;
+  // Fragment: the pipeline's VkSampleMask (pSampleMask[0], limited to the sample count) when it clears samples: the shader's
+  // [[sample_mask]] output (added when it declares none) is ANDed with it. ~0u = none, the MSL is then byte-identical to
+  // before. Recipes: emit flags bit 1.
+  uint32_t sampleMask = ~0u;
   // Foveation (gpu/vulkan/src/foveation.h): a multiview vertex shader also writes [[viewport_array_index]] = the
   // view (a rasterization rate map's layer follows the viewport index, not the render target layer), and a multiview
   // fragment shader that reads FragCoord sees it mapped back from physical to screen space through the pass's
@@ -125,6 +133,10 @@ struct SpirvLowerOptions {
   bool nativeFetch = false;
   bool unpackFetch = false;
   bool killExit = false;
+  // Vertex: the Position output is [[position, invariant]] even when the shader does not decorate it (VPVulkan's
+  // VPVK_INVARIANT_POS, on by default; the mode bit is "off"): a depth prepass and the main pass then compute the same z
+  // for the same vertex, whatever the compiler does to each shader. false = the MSL is byte-identical to before.
+  bool invariantPos = false;
   // robustBufferAccess in the emitted MSL (vpmsl::EmitOptions::robustBuffers): every storage buffer access is checked
   // against the buffer's size. Not a lowering input, but it changes the MSL, so it is part of a recipe input: VPVK_ROBUST
   // (config.cpp) decides it per translation. true = the MSL is byte-identical to before. Recipes: trailing, if false.

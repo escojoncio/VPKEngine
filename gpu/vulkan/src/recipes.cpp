@@ -9,6 +9,7 @@
 #include <memory>
 #include <thread>
 
+#include "taa_native.h"
 #include "vpvk.h"
 #include "vpmsl/msl.h"
 #include "vpvk/config.h"
@@ -127,19 +128,23 @@ void encodeInput(Writer& w, const StageInput& in) {
     w.pod(uint32_t(a.location)), w.pod(uint32_t(a.binding)), w.pod(uint32_t(a.offset)), w.pod(uint32_t(a.format)),
         w.pod(uint8_t(a.components));
   w.pod(uint32_t(o.vertexBuffers.size()));
-  for (const spirv::VertexBufferBinding& v : o.vertexBuffers)
-    w.pod(uint32_t(v.binding)), w.pod(uint32_t(v.stride)), w.pod(uint8_t(v.perInstance)), w.pod(uint16_t(v.slot));
+  for (const spirv::VertexBufferBinding& v : o.vertexBuffers) {
+    const bool divided = v.perInstance && v.divisor != 1;  // bit 0 per instance, bit 1 a divisor (uint32) follows the slot
+    w.pod(uint32_t(v.binding)), w.pod(uint32_t(v.stride)), w.pod(uint8_t((v.perInstance ? 1 : 0) | (divided ? 2 : 0))),
+        w.pod(uint16_t(v.slot));
+    if (divided) w.pod(uint32_t(v.divisor));
+  }
   // Trailing and only when set: inputs recorded before these fields keep their bytes (and hashes).
   // Flags byte: bit 0 multisampleAsSingle, bit 1 a viewMask (uint32) follows, bit 2 colorIntKinds
   // (uint16) follows, bit 3 the Y'CbCr conversions follow (count, then per binding its layout
   // index and fields), bit 4 uiMaskSlot (uint8) and uiMaskAlpha (uint8) follow, bit 5 alphaTest (no payload), bit 6
-  // viewportIndex, bit 7 rateMapPosition (no payload). After all payloads, one more byte only when robustBuffers is off.
+  // viewportIndex, bit 7 rateMapPosition (no payload). After all payloads, one more byte only when robustBuffers is off or a sampleMask is set (bit 1: its uint32 follows).
   uint32_t nYcbcr = 0;
   for (const spirv::SpirvBinding& b : o.layout) nYcbcr += b.ycbcr.planes != 0;
   const uint8_t ext =
       uint8_t((o.multisampleAsSingle ? 1 : 0) | (o.viewMask ? 2 : 0) | (o.colorIntKinds ? 4 : 0) | (nYcbcr ? 8 : 0) |
                 (o.uiMaskSlot >= 0 ? 16 : 0) | (o.alphaTest ? 32 : 0) | (o.viewportIndex ? 64 : 0) | (o.rateMapPosition ? 128 : 0));
-  if (ext || !o.robustBuffers) w.pod(ext);
+  if (ext || !o.robustBuffers || o.sampleMask != ~0u) w.pod(ext);
   if (o.viewMask) w.pod(uint32_t(o.viewMask));
   if (o.colorIntKinds) w.pod(uint16_t(o.colorIntKinds));
   if (nYcbcr) {
@@ -154,7 +159,9 @@ void encodeInput(Writer& w, const StageInput& in) {
     }
   }
   if (o.uiMaskSlot >= 0) w.pod(uint8_t(o.uiMaskSlot)), w.pod(uint8_t(o.uiMaskAlpha ? 1 : 0));
-  if (!o.robustBuffers) w.pod(uint8_t(1));  // last: emit flags, bit 0 robustBuffers off
+  // last: emit flags, bit 0 robustBuffers off, bit 1 a sampleMask (uint32) follows
+  if (!o.robustBuffers || o.sampleMask != ~0u) w.pod(uint8_t((o.robustBuffers ? 0 : 1) | (o.sampleMask != ~0u ? 2 : 0)));
+  if (o.sampleMask != ~0u) w.pod(uint32_t(o.sampleMask));
 }
 
 bool decodeInput(Reader& r, StageInput& in) {
@@ -187,8 +194,10 @@ bool decodeInput(Reader& r, StageInput& in) {
   for (uint32_t i = 0, n = r.count(4096); r.ok && i < n; ++i) {
     spirv::VertexBufferBinding v;
     v.binding = r.pod<uint32_t>(), v.stride = r.pod<uint32_t>();
-    v.perInstance = r.pod<uint8_t>() != 0;
+    const uint8_t rate = r.pod<uint8_t>();  // bit 0 per instance, bit 1 a divisor (uint32) follows the slot
+    v.perInstance = (rate & 1) != 0;
     v.slot = r.pod<uint16_t>();
+    if (rate & 2) v.divisor = r.pod<uint32_t>();
     o.vertexBuffers.push_back(v);
   }
   if (r.ok && r.p < r.end) {
@@ -219,7 +228,11 @@ bool decodeInput(Reader& r, StageInput& in) {
     o.viewportIndex = (ext & 64) != 0;
     o.rateMapPosition = (ext & 128) != 0;
   }
-  if (r.ok && r.p < r.end) o.robustBuffers = !(r.pod<uint8_t>() & 1);
+  if (r.ok && r.p < r.end) {
+    const uint8_t f = r.pod<uint8_t>();
+    o.robustBuffers = !(f & 1);
+    if (f & 2) o.sampleMask = r.pod<uint32_t>();
+  }
   return r.ok && in.spirv != 0;
 }
 
@@ -243,10 +256,27 @@ uint32_t refreshTranslatorMode() {
   }
   // VPSPV_KILL_EXIT (default on): only 0 turns it off. The bit is set for "off" so the default stays mode 0.
   const char* kill = std::getenv("VPSPV_KILL_EXIT");
-  const uint32_t m = (fetch & 1) | (flag("VPVK_AMPLIFY") ? 2u : 0u) | ((fetch & 2) << 1) | (kill && *kill == '0' ? 8u : 0u);
-  if (gTranslatorMode.exchange(m) != m)
+  // VPVK_INVARIANT_POS (default on): only "0" / "off" / "false" (surrounding blanks ignored) turn it off (bit set for
+  // "off", the default stays mode 0); any other value, empty included, leaves it on. Every vertex
+  // position becomes [[position, invariant]] (Metal preserveInvariance for that MSL), so a depth prepass and the main
+  // pass get the same z. Cost: the compiler may not reassociate / contract the math that feeds the position; expected
+  // negligible next to the rest of a vertex shader (not measured on the headset: compare vk.hitch / gpu_ms with =0).
+  bool invOff = false;
+  if (const char* e = std::getenv("VPVK_INVARIANT_POS")) {
+    std::string v(e);
+    const size_t b = v.find_first_not_of(" \t\r\n"), l = v.find_last_not_of(" \t\r\n");
+    v = b == std::string::npos ? std::string() : v.substr(b, l - b + 1);
+    invOff = v == "0" || v == "off" || v == "false";
+  }
+  const uint32_t m = (fetch & 1) | (flag("VPVK_AMPLIFY") ? 2u : 0u) | ((fetch & 2) << 1) | (kill && *kill == '0' ? 8u : 0u) |
+                     (invOff ? 16u : 0u);
+  if (gTranslatorMode.exchange(m) != m) {
     logf("vk.translator mode=%u native_fetch=%u amplify=%u unpack_fetch=%u kill_exit=%u id=%u", m, m & 1, (m >> 1) & 1,
          (m >> 2) & 1, (~m >> 3) & 1, kTranslatorVersion | m << 16);
+    // math=fast is metal_backend.mm's MTLMathModeFast. Whether a library really compiled with preserveInvariance
+    // (and how many fell back without it) is in the gpu.shader.lib lines: invariant= / invariant_retries=.
+    logf("gpu.shaderfx invariant_pos=%u math=fast", (~m >> 4) & 1);
+  }
   return m;
 }
 
@@ -263,6 +293,7 @@ void applyTranslatorMode(spirv::SpirvLowerOptions& o) {
   o.amplify = (m & 2) != 0;
   o.unpackFetch = (m & 4) != 0;
   o.killExit = (m & 8) == 0;
+  o.invariantPos = (m & 16) == 0;
 }
 
 uint8_t translatorDiff(uint64_t stored, uint64_t current) {
@@ -519,6 +550,53 @@ void degradeSrc1Blend(vpgpu::PipelineState& st, bool dualSource) {
   }
 }
 
+vpgpu::PipelineState msaaVariantState(const vpgpu::PipelineState& base, uint8_t samples) {
+  vpgpu::PipelineState st = base;
+  st.samples = samples;
+  st.label += ".ms" + std::to_string(samples);
+  return st;
+}
+
+void applyUiMaskTarget(vpgpu::PipelineState& st, bool writes) {
+  constexpr int slot = taa::kUiMaskSlot;
+  st.colorFormats[slot] = vpgpu::Format::R8Unorm;
+  vpgpu::BlendState& b = st.blend[slot];
+  b = vpgpu::BlendState{};
+  if (writes) {  // coverage accumulates: the largest value over the draws that touch the pixel
+    b.enabled = true;
+    b.colorOp = b.alphaOp = vpgpu::BlendOp::Max;
+    b.srcColor = b.srcAlpha = b.dstColor = b.dstAlpha = vpgpu::BlendFactor::One;
+    b.writeMask = 1;
+  } else {
+    b.writeMask = 0;
+  }
+  st.label += writes ? ".umu" : ".ums";
+}
+
+void forcedMsaaVariants(const vpgpu::PipelineState& s, int n, bool masks, std::vector<vpgpu::PipelineState>& out) {
+  constexpr int slot = taa::kUiMaskSlot;
+  if (n < 2 || s.computeShader || s.samples >= n) return;
+  if (s.colorFormats[slot] != vpgpu::Format::Undefined) {  // a mask variant of a recorded run: the runtime wants it at n samples
+    if (!masks) return;
+    out.push_back(s);
+    out.back().samples = uint8_t(n);
+    return;
+  }
+  // forceMsaa serves colour 0 + depth passes only (no other colour attachment, no integer / depth colour 0).
+  if (s.colorFormats[0] == vpgpu::Format::Undefined || s.depthFormat == vpgpu::Format::Undefined) return;
+  for (int i = 1; i < vpgpu::kMaxColorAttachments; ++i)
+    if (s.colorFormats[i] != vpgpu::Format::Undefined) return;
+  const vpgpu::FormatInfo& fc = vpgpu::formatInfo(s.colorFormats[0]);
+  if (fc.integer() || fc.depth()) return;
+  out.push_back(msaaVariantState(s, uint8_t(n)));
+  if (masks) {
+    vpgpu::PipelineState m = s;
+    m.samples = uint8_t(n);
+    applyUiMaskTarget(m, false);
+    out.push_back(std::move(m));
+  }
+}
+
 bool RecipeStore::remapLocked(PipeRec& p) const {
   for (int s = 0; s < 3; ++s) {
     uint64_t* id = shaderField(p.state, s);
@@ -543,7 +621,9 @@ bool RecipeStore::remapLocked(PipeRec& p) const {
 
 void RecipeStore::insertPipelineLocked(PipeRec p) {
   const uint64_t key = p.state.key().value;
+  const uint64_t id = recipeId(p.state, p.inputs);
   if (!pipelines_.emplace(key, std::move(p)).second) ++deadRecords_;
+  else byId_[id] = key;
 }
 
 void RecipeStore::write(uint8_t tag, const std::vector<uint8_t>& payload, uint64_t* payloadOffset) {
@@ -694,6 +774,7 @@ void RecipeStore::addPipeline(const vpgpu::PipelineState& s, const std::array<ui
   encodePipeline(w, s, inputs);
   write(kTagPipeline, w.b);
   pipelines_[key] = PipeRec{s, inputs};
+  byId_[recipeId(s, inputs)] = key;
   ++storedThisRun_;
 }
 
@@ -803,6 +884,7 @@ RecipeStore::RefreshResult RecipeStore::refresh(unsigned threads) {
   // Pipelines follow their inputs to the new MSL ids (new keys); those that lost an input go.
   std::unordered_map<uint64_t, PipeRec> old = std::move(pipelines_);
   pipelines_.clear();
+  byId_.clear();
   for (auto& [key, p] : old) {
     if (!remapLocked(p)) {
       ++r.droppedPipelines;
@@ -971,6 +1053,27 @@ std::vector<uint64_t> RecipeStore::keys() const {
   return k;
 }
 
+uint64_t RecipeStore::recipeId(const vpgpu::PipelineState& s, const std::array<uint64_t, 3>& inputs) {
+  vpgpu::PipelineState bare = s;
+  bare.vertexShader = bare.fragmentShader = bare.computeShader = 0;
+  const uint64_t parts[4] = {bare.key().value, inputs[0], inputs[1], inputs[2]};
+  return fnvBytes(reinterpret_cast<const uint8_t*>(parts), sizeof parts);
+}
+
+std::vector<uint64_t> RecipeStore::ids() const {
+  std::lock_guard lock(mutex_);
+  std::vector<uint64_t> k;
+  k.reserve(byId_.size());
+  for (const auto& [id, key] : byId_) k.push_back(id);
+  return k;
+}
+
+bool RecipeStore::resolve(uint64_t idOrKey, uint64_t& key) const {
+  std::lock_guard lock(mutex_);
+  if (auto it = byId_.find(idOrKey); it != byId_.end()) return key = it->second, true;
+  return pipelines_.count(idOrKey) != 0 && (key = idOrKey, true);
+}
+
 bool RecipeStore::stateFor(uint64_t key, vpgpu::PipelineState& out,
                            std::vector<std::pair<uint64_t, ShaderBlob>>* shaders) const {
   std::lock_guard lock(mutex_);
@@ -1040,6 +1143,7 @@ PrewarmResult prewarm(Platform& platform, vpgpu::PipelineCache& cache, RecipeSto
   const RecipeStore::RefreshResult rf =
       store.refresh(hooks.refreshThreads ? hooks.refreshThreads : std::max(2u, std::thread::hardware_concurrency()));
   r.retranslated = rf.retranslated;
+  if (hooks.afterRefresh) hooks.afterRefresh();  // refresh() rekeys the pipelines of a changed translator: keys read earlier are stale
   if (cancelled()) return r;
   RecipeStore::Snapshot snap = store.snapshot();
   logf("gpu.pso.recipe loaded shaders=%zu pipelines=%zu retranslated=%u same_msl=%u failed=%u ms=%.0f",
@@ -1063,17 +1167,43 @@ PrewarmResult prewarm(Platform& platform, vpgpu::PipelineCache& cache, RecipeSto
     keys.push_back(k.value);
     if (cache.request(s, k, vpgpu::Priority::Prefetch) == vpgpu::PipelineCache::Status::Ready) ++r.hits;
   }
+  // Forced MSAA: the variants the runtime will ask for on top of the recipes (pipelines.cpp pipelineFor / maskPipelineKey build
+  // the same states through msaaVariantState / applyUiMaskTarget, so the keys agree). Without forcing nothing is added.
+  uint32_t variantHits = 0;
+  if (const int force = msaaForce(); force >= 2) {
+    const bool masks = taaUiMaskOn();
+    std::unordered_set<uint64_t> seen(keys.begin(), keys.end());
+    std::vector<vpgpu::PipelineState> extra;
+    for (const auto& s : snap.pipelines) forcedMsaaVariants(s, force, masks, extra);
+    // Every variant stays resident with no owner: at most `cap`, in recipe order (the rest is only counted).
+    const size_t cap = hooks.maxVariants ? hooks.maxVariants : kPrewarmMaxVariants;
+    size_t total = 0;
+    for (const auto& v : extra) {
+      const vpgpu::PipelineKey k = v.key();
+      if (!seen.insert(k.value).second) continue;
+      if (++total > cap) continue;
+      keys.push_back(k.value);
+      if (cache.request(v, k, vpgpu::Priority::Prefetch) == vpgpu::PipelineCache::Status::Ready) ++variantHits;
+    }
+    r.variants = uint32_t(keys.size() - snap.pipelines.size());
+    if (total > cap) logf("gpu.prewarm variants_capped=%u of %zu", r.variants, total);
+    logf("gpu.prewarm variants=%u msaa=%d masks=%d hits=%u", r.variants, force, masks ? 1 : 0, variantHits);
+  }
   for (;;) {
-    uint32_t done = 0, failed = 0;
-    for (uint64_t k : keys) {
-      const auto st = cache.status({k});
-      if (st == vpgpu::PipelineCache::Status::Ready) ++done;
-      else if (st == vpgpu::PipelineCache::Status::Failed) ++done, ++failed;
-      else if (st == vpgpu::PipelineCache::Status::Missing) ++done;  // compiled, then released by the game: no longer ours to wait for
+    uint32_t done = 0, failed = 0, doneV = 0, failedV = 0;
+    for (size_t i = 0; i < keys.size(); ++i) {
+      const bool variant = i >= r.recipes;
+      uint32_t& d = variant ? doneV : done;
+      uint32_t& f = variant ? failedV : failed;
+      const auto st = cache.status({keys[i]});
+      if (st == vpgpu::PipelineCache::Status::Ready) ++d;
+      else if (st == vpgpu::PipelineCache::Status::Failed) ++d, ++f;
+      else if (st == vpgpu::PipelineCache::Status::Missing) ++d;  // compiled, then released by the game: no longer ours to wait for
     }
     if (progress) progress(done, r.recipes);
     r.ready = done - failed;
-    if (done == r.recipes) {
+    r.variantsFailed = failedV;
+    if (done == r.recipes && doneV == r.variants) {
       r.failed = failed;
       break;
     }
@@ -1083,7 +1213,8 @@ PrewarmResult prewarm(Platform& platform, vpgpu::PipelineCache& cache, RecipeSto
     }
     // Bounded wait (game boot / watchdog): the rest keeps compiling on the workers.
     if (maxSeconds > 0 && std::chrono::duration<double>(Clock::now() - start).count() > maxSeconds) {
-      logf("gpu.prewarm timeout done=%u of %u after %.0f s (rest continues in background)", done, r.recipes, maxSeconds);
+      logf("gpu.prewarm timeout done=%u of %u after %.0f s (rest continues in background)", done + doneV, r.recipes + r.variants,
+           maxSeconds);
       r.failed = failed;
       break;
     }
@@ -1094,6 +1225,7 @@ PrewarmResult prewarm(Platform& platform, vpgpu::PipelineCache& cache, RecipeSto
   // hits = already compiled in memory; ar_* = the Metal binary archive (hits there skip the compile).
   logf("gpu.prewarm recipes=%u compiled=%u hits=%u failed=%u retranslated=%u ms=%.0f %s", r.recipes, r.compiled, r.hits,
        r.failed, r.retranslated, r.ms, platform.archiveSummary().c_str());
+  if (r.variants) logf("gpu.prewarm variants_failed=%u of %u", r.variantsFailed, r.variants);
   return r;
 }
 
@@ -1119,6 +1251,12 @@ __attribute__((visibility("default"))) const char* vpvk_translator_tag() {
   return tag.c_str();
 }
 
+namespace {
+std::atomic<uint32_t> gPrewarmPhase{0};
+}
+// 0 = compiling the recipes, 1 = saving the pipeline archive (the progress callback of vpvk_prewarm counts entries archived).
+__attribute__((visibility("default"))) uint32_t vpvk_prewarm_phase(void) { return gPrewarmPhase.load(); }
+
 __attribute__((visibility("default"))) uint32_t vpvk_prewarm(vpvk_prewarm_progress progress, void* user) {
   const std::string dir = vpvk::RecipeStore::defaultDir();
   if (dir.empty()) {
@@ -1141,6 +1279,18 @@ __attribute__((visibility("default"))) uint32_t vpvk_prewarm(vpvk_prewarm_progre
       if (progress) progress(done, total, user);
     });
   }
+  // Workers are gone: the harvest (which never yields here, no frame waits for a pipeline) is flushed in full (`complete`: not
+  // the 8 s of the end of a process, ~100 entries, which left ~2400 misses to compile again at every launch) and the archive
+  // written before the platform goes, so the line below shows what became of every miss.
+  const auto tf = std::chrono::steady_clock::now();
+  gPrewarmPhase = 1;  // the progress callback now counts archived entries (vpvk_prewarm_phase)
+  platform->flushCaches(true, [&](uint32_t done, uint32_t total) {
+    if (progress) progress(done, total, user);
+  });
+  gPrewarmPhase = 0;
+  vpvk::logf("gpu.prewarm archive_saved ms=%.0f %s",
+             std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tf).count(),
+             platform->archiveSummary().c_str());
   platform.reset();
   vpvk::logf("gpu.prewarm app done recipes=%u workers=%u", r.recipes, workers);
   return r.recipes;

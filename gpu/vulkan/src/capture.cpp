@@ -796,7 +796,7 @@ void prepareImage(Device* dev, uint64_t id, std::vector<ImageJob>& jobs) {
           s.width = std::max(1u, d.width >> mip), s.height = std::max(1u, d.height >> mip);
           s.depth = d.type == vpgpu::TextureType::Tex3D ? std::max(1u, d.depth >> mip) : 1;
           sb.aspect = a.vk;
-          sb.store = isSwappedRB(im->info.format) ? kStoreSwappedRB4 : kStoreVulkan;
+          sb.store = im->info.format == VK_FORMAT_B4G4R4A4_UNORM_PACK16 ? kStoreSwappedRB4 : kStoreVulkan;
           j.subs.push_back(std::move(sb));
         }
   }
@@ -1298,7 +1298,7 @@ void VKAPI_CALL dispatchBaseHook(VkCommandBuffer cb, uint32_t bx, uint32_t by, u
   X(vkDestroyPrivateDataSlot, false) X(vkCreatePipelineCache, false) X(vkDestroyPipelineCache, false)                  \
   X(vkCreateDescriptorUpdateTemplate, false) X(vkDestroyDescriptorUpdateTemplate, false)                               \
   X(vkDestroySamplerYcbcrConversion, false) X(vkCmdSetDeviceMask, false) X(vkCmdSetLogicOpEXT, false)                  \
-  X(vkCmdSetPatchControlPointsEXT, false)
+  X(vkCmdSetPatchControlPointsEXT, false) X(vkCmdPushDescriptorSetKHR, true) X(vkCmdPushDescriptorSetWithTemplateKHR, true)
 struct Unhooked {
   const char* name;
   bool invalid;
@@ -1392,10 +1392,11 @@ void initOnce() {
     const char* t = std::getenv("VPVK_CAPTURE");
     const char* f = std::getenv("VPVK_CAPTURE_FRAME");
     if ((t && *t && *t != '0') || (f && std::atoll(f) > 0)) s.mode.fetch_or(kTrack);
+    // Also the directory of on-demand requests (vpvk_capture_request without a path), not only of VPVK_CAPTURE_FRAME.
+    if (const char* d = std::getenv("VPVK_CAPTURE_DIR")) s.autoDir = d;
     if (f && std::atoll(f) > 0) {
       s.autoFrame = static_cast<uint64_t>(std::atoll(f));
       if (const char* n = std::getenv("VPVK_CAPTURE_FRAMES")) s.autoFrames = std::max(1, std::atoi(n));
-      if (const char* d = std::getenv("VPVK_CAPTURE_DIR")) s.autoDir = d;
       logf("vk.capture armed frame=%llu frames=%u dir=%s", static_cast<unsigned long long>(s.autoFrame), s.autoFrames,
            s.autoDir.empty() ? "." : s.autoDir.c_str());
     }

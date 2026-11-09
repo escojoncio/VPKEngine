@@ -1,0 +1,1 @@
+# Cases or patterns (fnmatch) that fail for a known reason: not regressions in tools/cts/diff.py.

@@ -84,6 +84,12 @@ int vpvk_msaa_device_max(void);
 // is used until this is called. Applies to images and pipelines created afterwards; draws always
 // use a pipeline whose sample count matches the pass they land in.
 void vpvk_config_set_msaa_override(int samples);
+// Forced MSAA on the scene / eye passes the game renders at 1x (colour + depth, no input attachments, no dual-source
+// blending): VPVulkan draws them into N-sample twins that are always tile memory (never stored, never materialised) and
+// resolves them into the game's 1x images. 0 = off, 2 / 4 (anything >= 4 is 4), clamped to vpvk_msaa_device_max. Independent
+// of vpvk_config_set_msaa_override (that one only changes where the game itself asks for MSAA). Env VPVK_MSAA_FORCE is used
+// until this is called. Read when a VkDevice is created and frozen for its life (call it before vkCreateDevice).
+void vpvk_config_set_msaa_force(int samples);
 // Snapshot of the current configuration (clamped values). Never null-filled: defaults are
 // foveation OFF, VPKTAA off (50 %, 0.5), scale 1, ASW disabled, Quest 3 profile on.
 void vpvk_config_get(vpvk_config* out);
@@ -100,6 +106,9 @@ uint32_t vpvk_prewarm_count(void);
 // called from the calling thread. Returns the number of recipes (0 = nothing to do).
 typedef void (*vpvk_prewarm_progress)(uint32_t done, uint32_t total, void* user);
 uint32_t vpvk_prewarm(vpvk_prewarm_progress progress, void* user);
+// Phase of the running vpvk_prewarm, read from its progress callback: 0 = compiling recipes (done/total = pipelines ready),
+// 1 = saving the pipeline archive (done/total = entries archived; minutes on a first run).
+uint32_t vpvk_prewarm_phase(void);
 // Ahead-of-time build (gate: env VPVK_AOT=1, off by default; else returns 0): translates every
 // <spirv_dir>/*.spv to MSL and Metal libraries, compiles every stored recipe and every compute
 // variant, and serializes them all into the MTLBinaryArchive of VP_PIPELINE_CACHE_DIR, plus
@@ -153,9 +162,21 @@ void* vpvk_native_device(void);
 unsigned vpvk_gpu_backlog_ms(void);
 unsigned vpvk_gpu_last_frame_chunks(void);
 int vpvk_gpu_lost(void);
-// Memory pressure: frees rebuildable GPU memory (idle PSOs / libraries, staging, arg rings). level 1 = OS
-// warning, 2 = critical. Writes a short key=value report into out (NUL-terminated, cut at cap; may be
-// NULL/0) and returns the bytes freed; 0 without a live device. Any thread.
+// Stall diagnostics ("what is the game waiting for"): logs the "vk.pending ..." lines (about 40 at most; formats in
+// gpu/vulkan/src/pending.cpp): frames in flight and the oldest, pipelines still compiling, submits held on a timeline
+// wait, and the fences / events / timeline semaphores / query pools the game polled in the last 2 s that still answered
+// "not yet" (with the submit that should signal them), then the backend's command-buffer dump. Any thread; never waits
+// for the submit mutex (a busy one is reported as such).
+void vpvk_dump_pending(void);
+// Memory pressure: frees rebuildable GPU memory that nothing live uses: libraries no pipeline holds, transient MSAA backings
+// not used by the last frame, idle slots' chained argument buffers, and what the guest destroyed that no frame in flight reads
+// (graveyard). Pipeline states and the libraries/functions of live pipelines are never touched. level 1 = OS warning,
+// 2 = critical. Writes a short key=value report into out (NUL-terminated, cut at cap; may be NULL/0): libs= (MiB freed now),
+// msaa_live / args_live (MiB alive), msaa_freed_since_last / args_freed_since_last / *_freed_total, held, staging,
+// serialized_msaa / serialized_args (MiB moved to the graveyard now), retired_released / retired_mib (MiB returned), and
+// submit_busy=1 when the submit mutex could not be taken in ~50 ms (the MSAA / args / graveyard part then waits for the
+// next submit). Returns the bytes freed (libraries + retired objects); 0 without a live device. Any thread; may wait up to
+// ~50 ms for the submit mutex (never blocks on it).
 size_t vpvk_trim_memory(int level, char* out, size_t cap);
 // Releases what the guest destroyed that the backend keeps until a frame reuses a slot (the graveyard, and the
 // leftovers of frames that completed), without waiting for the GPU to go idle; min_idle_ms no longer gates it.
@@ -194,6 +215,10 @@ size_t vpvk_diag_ranges(int kind, vpvk_range* out, size_t max);
 // attr_top=tag:MiB/live (12 largest tags), attr_obj=tag:~MiB/live (pipelines / libraries: allocation growth seen around their
 // creation, cumulative and approximate), attr_cnt=tag:live (views, functions). Allocations >= 32 MiB log gpu.bigalloc at once.
 size_t vpvk_mem_stats(char* out, size_t cap);
+// The same counters without the object-table walk, the recipe store and the ledger, for a periodic telemetry thread: the first
+// part of vpvk_mem_stats (alloc ... fov_b: texture bytes by kind, buffers, pso / fn / lib counts, held_b, args_b, buf_int_b).
+// Never waits for the device mutex: a busy one returns 0 (the caller skips this sample). 0 (out untouched) without a live device.
+size_t vpvk_mem_brief(char* out, size_t cap);
 // Imágenes nuevas a cero (VPVK_ZERO_NEW_IMAGES): se limpian de forma perezosa en el siguiente submit
 // que las usa. Un host que lee una textura fuera del flujo Vulkan (el compositor) pregunta antes con el
 // id<MTLTexture> que obtuvo (vkGetMTLTextureMVK / vkExportMetalObjectsEXT). Barata, sin esperar submits.
@@ -234,9 +259,10 @@ void vpvk_config_set_taa_native(int on);
 void* vpvk_ui_mask_texture(int eye, int* w, int* h, int* slice);
 
 // ---- RCAS: el afilado del pipeline (taa_native.h «RCAS»), siempre activo si la intensidad > 0 ----
-// Un pase propio (vpktaa_native_rcas) sobre el 3D del ojo, en TODOS los modos de AA (VPKTAA, MSAA del
-// juego, Off) y rutas (Vulkan, vpgles; ovrp, OpenXR): con VPKTAA es su último paso; sin él, el host lo
-// llama por el mismo gancho de fin de frame con `rcas_only` = 1 (vpvk_taa_native_encode). La UI/2D queda
+// Un pase propio (vpktaa_native_rcas) sobre el 3D del ojo SIN VPKTAA (MSAA del juego, Off) y en todas las
+// rutas (Vulkan, vpgles; ovrp, OpenXR): el host lo llama por el gancho de fin de frame con `rcas_only` = 1
+// (vpvk_taa_native_encode). CON VPKTAA (rcas_only = 0) el motor NO afila: `output` sale sin afilar y el host
+// aplica su propio RCAS con vpvk_rcas_intensity() y la máscara de vpvk_ui_mask_texture(). La UI/2D queda
 // intacta (máscara R8; con MSAA del juego no hay máscara y se afila todo el ojo).
 // intensity 0..1 (0 = pase apagado, sin coste). Env VPVK_RCAS=0..1 gana. Sin llamada: sigue a
 // vpvk_vpktaa.sharpness mientras corre VPKTAA y 0 sin él. VPVK_RCAS_DENOISE=1 activa el denoise de FSR.
@@ -274,7 +300,8 @@ typedef struct {
 } vpvk_taa_native_frame;
 
 // Codifica el pase en `mtl_command_buffer` (id<MTLCommandBuffer>): resolve de ambos ojos (un
-// dispatch si comparten textura) + RCAS a `output`. Usa el jitter que el motor aplicó a los envíos
+// dispatch si comparten textura) que escribe la historia y `output` SIN afilar (con rcas_only = 1: solo RCAS
+// del color a `output`). Usa el jitter que el motor aplicó a los envíos
 // desde la llamada anterior y avanza la fase. Mide el tiempo de GPU del command buffer y lo escribe
 // en el log ("vk.taa native gpu_ms ..."). 1 = codificado; 0 = apagado, entradas inválidas o sin Metal.
 int vpvk_taa_native_encode(const vpvk_taa_native_frame* frame, void* mtl_command_buffer);

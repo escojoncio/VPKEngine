@@ -1,0 +1,131 @@
+; Compute shader: OpConvertFToS / OpConvertFToU saturate out-of-range values and map NaN to 0 (32-bit and 8-bit
+; results). in = {NaN, 3e10, -3e10, -1.5, 200.5}; out = FToS x5, FToU x5, FToU u8 (widened) x5, stored as words.
+OpCapability Cap:Shader
+OpCapability Cap:Int8
+OpMemoryModel AddrModel:Logical MemModel:GLSL450
+OpEntryPoint Model:GLCompute %main "main"
+OpExecutionMode %main ExecMode:LocalSize 1 1 1
+OpDecorate %inblk Deco:Block
+OpMemberDecorate %inblk 0 Deco:Offset 0
+OpMemberDecorate %inblk 1 Deco:Offset 4
+OpMemberDecorate %inblk 2 Deco:Offset 8
+OpMemberDecorate %inblk 3 Deco:Offset 12
+OpMemberDecorate %inblk 4 Deco:Offset 16
+OpDecorate %outblk Deco:Block
+OpMemberDecorate %outblk 0 Deco:Offset 0
+OpMemberDecorate %outblk 1 Deco:Offset 4
+OpMemberDecorate %outblk 2 Deco:Offset 8
+OpMemberDecorate %outblk 3 Deco:Offset 12
+OpMemberDecorate %outblk 4 Deco:Offset 16
+OpMemberDecorate %outblk 5 Deco:Offset 20
+OpMemberDecorate %outblk 6 Deco:Offset 24
+OpMemberDecorate %outblk 7 Deco:Offset 28
+OpMemberDecorate %outblk 8 Deco:Offset 32
+OpMemberDecorate %outblk 9 Deco:Offset 36
+OpMemberDecorate %outblk 10 Deco:Offset 40
+OpMemberDecorate %outblk 11 Deco:Offset 44
+OpMemberDecorate %outblk 12 Deco:Offset 48
+OpMemberDecorate %outblk 13 Deco:Offset 52
+OpMemberDecorate %outblk 14 Deco:Offset 56
+OpDecorate %in Deco:DescriptorSet 0
+OpDecorate %in Deco:Binding 0
+OpDecorate %out Deco:DescriptorSet 0
+OpDecorate %out Deco:Binding 1
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%u32 = OpTypeInt 32 0
+%i32 = OpTypeInt 32 1
+%u8 = OpTypeInt 8 0
+%f32 = OpTypeFloat 32
+%inblk = OpTypeStruct %f32 %f32 %f32 %f32 %f32
+%outblk = OpTypeStruct %u32 %u32 %u32 %u32 %u32 %u32 %u32 %u32 %u32 %u32 %u32 %u32 %u32 %u32 %u32
+%pin = OpTypePointer Storage:StorageBuffer %inblk
+%pout = OpTypePointer Storage:StorageBuffer %outblk
+%pf32 = OpTypePointer Storage:StorageBuffer %f32
+%pu32 = OpTypePointer Storage:StorageBuffer %u32
+%in = OpVariable %pin Storage:StorageBuffer
+%out = OpVariable %pout Storage:StorageBuffer
+%c0 = OpConstant %i32 0
+%c1 = OpConstant %i32 1
+%c2 = OpConstant %i32 2
+%c3 = OpConstant %i32 3
+%c4 = OpConstant %i32 4
+%c5 = OpConstant %i32 5
+%c6 = OpConstant %i32 6
+%c7 = OpConstant %i32 7
+%c8 = OpConstant %i32 8
+%c9 = OpConstant %i32 9
+%c10 = OpConstant %i32 10
+%c11 = OpConstant %i32 11
+%c12 = OpConstant %i32 12
+%c13 = OpConstant %i32 13
+%c14 = OpConstant %i32 14
+%main = OpFunction %void 0 %fn
+%l = OpLabel
+%pi0 = OpAccessChain %pf32 %in %c0
+%x0 = OpLoad %f32 %pi0
+%s0 = OpConvertFToS %i32 %x0
+%sw0 = OpBitcast %u32 %s0
+%u0 = OpConvertFToU %u32 %x0
+%b0 = OpConvertFToU %u8 %x0
+%bw0 = OpUConvert %u32 %b0
+%po0 = OpAccessChain %pu32 %out %c0
+OpStore %po0 %sw0
+%pq0 = OpAccessChain %pu32 %out %c5
+OpStore %pq0 %u0
+%pr0 = OpAccessChain %pu32 %out %c10
+OpStore %pr0 %bw0
+%pi1 = OpAccessChain %pf32 %in %c1
+%x1 = OpLoad %f32 %pi1
+%s1 = OpConvertFToS %i32 %x1
+%sw1 = OpBitcast %u32 %s1
+%u1 = OpConvertFToU %u32 %x1
+%b1 = OpConvertFToU %u8 %x1
+%bw1 = OpUConvert %u32 %b1
+%po1 = OpAccessChain %pu32 %out %c1
+OpStore %po1 %sw1
+%pq1 = OpAccessChain %pu32 %out %c6
+OpStore %pq1 %u1
+%pr1 = OpAccessChain %pu32 %out %c11
+OpStore %pr1 %bw1
+%pi2 = OpAccessChain %pf32 %in %c2
+%x2 = OpLoad %f32 %pi2
+%s2 = OpConvertFToS %i32 %x2
+%sw2 = OpBitcast %u32 %s2
+%u2 = OpConvertFToU %u32 %x2
+%b2 = OpConvertFToU %u8 %x2
+%bw2 = OpUConvert %u32 %b2
+%po2 = OpAccessChain %pu32 %out %c2
+OpStore %po2 %sw2
+%pq2 = OpAccessChain %pu32 %out %c7
+OpStore %pq2 %u2
+%pr2 = OpAccessChain %pu32 %out %c12
+OpStore %pr2 %bw2
+%pi3 = OpAccessChain %pf32 %in %c3
+%x3 = OpLoad %f32 %pi3
+%s3 = OpConvertFToS %i32 %x3
+%sw3 = OpBitcast %u32 %s3
+%u3 = OpConvertFToU %u32 %x3
+%b3 = OpConvertFToU %u8 %x3
+%bw3 = OpUConvert %u32 %b3
+%po3 = OpAccessChain %pu32 %out %c3
+OpStore %po3 %sw3
+%pq3 = OpAccessChain %pu32 %out %c8
+OpStore %pq3 %u3
+%pr3 = OpAccessChain %pu32 %out %c13
+OpStore %pr3 %bw3
+%pi4 = OpAccessChain %pf32 %in %c4
+%x4 = OpLoad %f32 %pi4
+%s4 = OpConvertFToS %i32 %x4
+%sw4 = OpBitcast %u32 %s4
+%u4 = OpConvertFToU %u32 %x4
+%b4 = OpConvertFToU %u8 %x4
+%bw4 = OpUConvert %u32 %b4
+%po4 = OpAccessChain %pu32 %out %c4
+OpStore %po4 %sw4
+%pq4 = OpAccessChain %pu32 %out %c9
+OpStore %pq4 %u4
+%pr4 = OpAccessChain %pu32 %out %c14
+OpStore %pr4 %bw4
+OpReturn
+OpFunctionEnd

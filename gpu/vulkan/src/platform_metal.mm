@@ -1,4 +1,4 @@
-// visionOS platform: gpu/metal2 (VPVulkan copy of gpu/metal).
+// visionOS (and macOS, for the Vulkan CTS on CI) platform: gpu/metal2 (VPVulkan copy of gpu/metal).
 // Shaders reach the backend through `shaders_` (pipelines.cpp: SPIR-V -> VPIR -> MSL).
 #import <Metal/Metal.h>
 #import <TargetConditionals.h>
@@ -12,7 +12,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <mutex>
-#include <os/proc.h>
+#if TARGET_OS_VISION || TARGET_OS_IOS
+#include <os/proc.h>  // os_proc_available_memory: not on macOS
+#endif
 #include <unordered_set>
 
 namespace vpvk {
@@ -33,19 +35,28 @@ class MetalPlatform final : public Platform {
     { std::lock_guard<std::mutex> l(livePlatformsMutex()); livePlatforms().erase(this); }
     backend_.saveArchive();
   }
-  void flushCaches() override { backend_.saveArchive(); }  // pipeline binary archive, if any is pending
+  // Defaults repeated: they do not carry over to an override, and livePlatforms() holds this type (vpvk_flush_caches).
+  void flushCaches(bool complete = false, const std::function<void(uint32_t, uint32_t)>& progress = nullptr) override {
+    backend_.saveArchive(complete, progress);
+  }  // pipeline binary archive, if any is pending
   void drainCompiles() override { backend_.drainShaderPrewarm(); }
   vpgpu::Backend& backend() override { return backend_; }
   WaitResult waitIdle(uint64_t timeoutNs) override { return map(backend_.waitIdle(timeoutNs)); }
+#if TARGET_OS_VISION || TARGET_OS_IOS
   uint64_t availableMemory() override { return os_proc_available_memory(); }
+#else
+  uint64_t availableMemory() override { return 0; }  // macOS: no jetsam limit, unknown
+#endif
   WaitResult waitFrames(uint64_t frames, uint64_t timeoutNs) override {
     return map(backend_.waitFrames(frames, timeoutNs));
   }
   bool lost() const override { return backend_.lost(); }
+  void dumpInFlight(const char* why) override { backend_.dumpInFlight(why); }
   uint32_t gpuBacklogMs() const override { return backend_.gpuBacklogMs(); }
   uint32_t lastFrameChunks() const override { return backend_.lastFrameHangSplits(); }
   size_t trimMemory(int level, std::string& report) override { return backend_.trimMemory(level, report); }
   size_t drainRetired(uint32_t minIdleMs, std::string& report) override { return backend_.drainRetired(minIdleMs, report); }
+  size_t trimSerialized(std::string& report) override { return backend_.trimSerialized(report); }
   void diagCounters(std::vector<std::pair<const char*, uint64_t>>& out) const override { backend_.diagCounters(out); }
   void diagRanges(std::vector<std::pair<uintptr_t, uint64_t>>& out) const override { backend_.diagRanges(out); }
   std::string archiveSummary() override {
@@ -62,8 +73,9 @@ class MetalPlatform final : public Platform {
   }
   bool archiveCensus(ArchiveCensus& out) override {
     const auto s = backend_.memStats();
-    out.hits = s.archiveHits, out.compiled = s.archiveMisses, out.archived = s.archiveAdded;
+    out.hits = s.archiveHits, out.compiled = s.archiveMisses, out.archived = s.archiveSerialized;
     out.depthOnly = s.archiveSkipDepth, out.dup = s.archiveDup, out.other = s.archiveSkipOther;
+    out.pending = s.archivePending, out.spilled = s.archiveSpilled, out.trimDropped = s.archiveTrimDropped;
     return true;
   }
   std::string memStats() override {

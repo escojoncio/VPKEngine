@@ -1,6 +1,7 @@
 // Lexer and preprocessor (GLSL ES 3.20 §3, which ES 1.00 and 3.00 are subsets of).
 #include "pp.h"
 
+#include <algorithm>
 #include <atomic>
 #include <cctype>
 #include <cstdlib>
@@ -77,7 +78,7 @@ std::vector<Token> lex(const std::string& in, std::string& log) {
             for (size_t k = i; k < e + 2 && k < s.size(); ++k)
                 if (s[k] == '\n') {
                     Token t;
-                    t.kind = Tok::Newline, t.line = lineAt(k);
+                    t.kind = Tok::Newline, t.line = lineAt(k), t.ival = 1;  // ival 1: inside a comment
                     out.push_back(t);
                 }
             i = e + 2, space = true;
@@ -117,19 +118,37 @@ std::vector<Token> lex(const std::string& in, std::string& log) {
                 }
             }
             std::string num = s.substr(b, i - b);
+            int badKind = 0;  // Bad token after the number: 3 = `1f`, 4 = a digit 8 or 9 in an octal number
             if (isFloat || (i < s.size() && (s[i] == 'f' || s[i] == 'F') && num.find_first_of("xX") == std::string::npos)) {
                 t.kind = Tok::FloatLit;
                 t.fval = std::strtod(num.c_str(), nullptr);
-                if (i < s.size() && (s[i] == 'f' || s[i] == 'F')) ++i;
+                if (i < s.size() && (s[i] == 'f' || s[i] == 'F')) {
+                    if (!isFloat) badKind = 3;  // "1f": the suffix needs a decimal point or an exponent
+                    ++i;
+                }
                 // "hf"/"HF" (half suffix of desktop GLSL) is not ES.
             } else {
                 t.kind = Tok::IntLit;
                 const bool octal = num.size() > 1 && num[0] == '0' && num.find_first_of("xX") == std::string::npos;
+                if (octal && num.find_first_of("89") != std::string::npos) badKind = 4;
                 t.ival = std::strtoull(num.c_str(), nullptr, octal ? 8 : 0);
                 if (i < s.size() && (s[i] == 'u' || s[i] == 'U')) t.kind = Tok::UintLit, ++i;
             }
             t.text = s.substr(b, i - b);
             out.push_back(t);
+            if (badKind) {
+                Token bad;
+                bad.kind = Tok::Bad, bad.line = t.line, bad.ival = uint64_t(badKind), bad.text = t.text;
+                out.push_back(bad);
+            }
+            if (i < s.size() && identChar(s[i])) {  // "1e", "12abc": an invalid pp-number (the number, then the junk as a Bad token)
+                Token bad;
+                bad.kind = Tok::Bad, bad.line = t.line, bad.ival = 1;
+                const size_t sb = i;
+                while (i < s.size() && identChar(s[i])) ++i;
+                bad.text = s.substr(sb, i - sb);
+                out.push_back(bad);
+            }
             continue;
         }
         bool matched = false;
@@ -144,8 +163,9 @@ std::vector<Token> lex(const std::string& in, std::string& log) {
             }
         }
         if (!matched) {
-            log += "ERROR: 0:" + std::to_string(t.line) + ": '" + std::string(1, c) + "' : unexpected character\n";
+            t.kind = Tok::Bad, t.text = std::string(1, c);  // an error unless it sits in a #pragma line
             ++i;
+            out.push_back(t);
             continue;
         }
         out.push_back(t);
@@ -196,9 +216,12 @@ public:
     Pp(Stage /*stage*/, std::string& log) : log_(log) {}
 
     PpResult run(const std::string& source) {
+        const size_t logBefore = log_.size();
         std::vector<Token> toks = lex(source, log_);
+        if (log_.size() != logBefore) ok_ = false;  // a character or literal the language does not have
         // Defaults before #version is seen.
         defineSimple("GL_ES", "1");
+        defineSimple("__VERSION__", "100");  // a shader without #version is ES 1.00 (#if __VERSION__ ... is valid)
         defineSimple("GL_FRAGMENT_PRECISION_HIGH", "1");
         for (const char* e : supportedExtensions()) defineSimple(e, "1");
         size_t i = 0;
@@ -206,9 +229,28 @@ public:
         while (toks[i].kind != Tok::End) {
             // Gather one line.
             std::vector<Token> line;
-            while (toks[i].kind != Tok::End && toks[i].kind != Tok::Newline) line.push_back(toks[i++]);
+            // (a newline inside a comment does not end a directive: the comment is one space)
+            while (toks[i].kind != Tok::End && (toks[i].kind != Tok::Newline || (toks[i].ival == 1 && !line.empty() && line[0].kind == Tok::Hash))) {
+                if (toks[i].kind != Tok::Newline) line.push_back(toks[i]);
+                ++i;
+            }
             if (toks[i].kind == Tok::Newline) ++i;
             if (line.empty()) continue;
+            for (Token& t : line) t.line += lineDelta_;
+            if (!(line[0].kind == Tok::Hash && line.size() > 1 && line[1].text == "pragma")) {
+                if (active())
+                    for (const Token& t : line)
+                        if (t.kind == Tok::Bad) {
+                            strict("character", t.line,
+                                   t.ival == 3   ? "'" + t.text + "' : the f suffix needs a decimal point or an exponent"
+                                   : t.ival == 4 ? "'" + t.text + "' : invalid octal digit"
+                                   : t.ival      ? "'" + t.text + "' : invalid numeric literal"
+                                                 : "'" + t.text + "' : unexpected character");
+                            break;
+                        }
+                line.erase(std::remove_if(line.begin(), line.end(), [](const Token& t) { return t.kind == Tok::Bad; }), line.end());
+                if (line.empty()) continue;
+            }
             if (line[0].kind == Tok::Hash) {
                 directive(line, firstToken);
                 firstToken = false;
@@ -216,13 +258,13 @@ public:
             }
             firstToken = false;
             if (!active()) continue;
+            sawToken_ = true;
             pending_.insert(pending_.end(), line.begin(), line.end());
             // A function-like macro call may span lines: expand once the text is complete.
             flushPending(false);
         }
         flushPending(true);
-        if (!conds_.empty()) error(toks.back().line, "unterminated #if");
-        if (!defines_.count("__VERSION__")) defineSimple("__VERSION__", "100");
+        if (!conds_.empty()) strict("unbalanced_conditional", toks.back().line, "unterminated #if");
         Token end;
         end.kind = Tok::End, end.line = toks.back().line;
         res_.tokens.push_back(end);
@@ -240,6 +282,16 @@ private:
     void error(int line, const std::string& m) {
         log_ += "ERROR: 0:" + std::to_string(line) + ": " + m + "\n";
         ok_ = false;
+    }
+    // A rule of the language that a lenient driver lets through: an error in strict mode, otherwise noted and ignored.
+    // True when it was an error.
+    bool strict(const char* rule, int line, const std::string& m) {
+        if (strictMode()) {
+            error(line, m);
+            return true;
+        }
+        if (std::find(res_.lenient.begin(), res_.lenient.end(), rule) == res_.lenient.end()) res_.lenient.push_back(rule);
+        return false;
     }
 
     void defineSimple(const std::string& name, const std::string& value) {
@@ -322,7 +374,7 @@ private:
             }
             if (t.text == "__FILE__") {
                 Token n = t;
-                n.kind = Tok::IntLit, n.ival = 0, n.text = "0";
+                n.kind = Tok::IntLit, n.ival = uint64_t(fileNo_), n.text = std::to_string(fileNo_);
                 out.push_back(n), ++i;
                 continue;
             }
@@ -416,6 +468,8 @@ private:
         const std::vector<Token>& t;
         size_t i = 0;
         bool bad = false;
+        int skip = 0;                    // > 0 inside the operand a && / || short-circuits away: nothing in it is evaluated
+        const Token* undef = nullptr;    // first undefined identifier that was evaluated
         const Token* peek() { return i < t.size() ? &t[i] : nullptr; }
         bool is(const char* p) { return peek() && peek()->kind == Tok::Punct && peek()->text == p; }
         int64_t primary() {
@@ -433,7 +487,7 @@ private:
             if (is("+")) return ++i, primary();
             if (is("~")) return ++i, ~primary();
             if (k->kind == Tok::IntLit || k->kind == Tok::UintLit || k->kind == Tok::BoolLit) return ++i, int64_t(k->ival);
-            if (k->kind == Tok::Ident) return ++i, 0;  // undefined identifier: 0
+            if (k->kind == Tok::Ident) return ++i, (!skip && !undef ? (undef = k) : nullptr), 0;  // undefined identifier: 0
             bad = true;
             return 0;
         }
@@ -459,7 +513,10 @@ private:
                 if (p < 0 || p < minPrec) break;
                 std::string op = k->text;
                 ++i;
+                const bool skipped = (op == "&&" && !l) || (op == "||" && l);
+                skip += skipped;
                 int64_t r = expr(p + 1);
+                skip -= skipped;
                 if (op == "||") l = l || r;
                 else if (op == "&&") l = l && r;
                 else if (op == "|") l |= r;
@@ -476,12 +533,14 @@ private:
                 else if (op == "+") l += r;
                 else if (op == "-") l -= r;
                 else if (op == "*") l *= r;
-                else if (op == "/") l = r ? l / r : (bad = true, 0);
-                else if (op == "%") l = r ? l % r : (bad = true, 0);
+                else if (op == "/") l = r ? l / r : (skip ? 0 : (bad = true, 0));
+                else if (op == "%") l = r ? l % r : (skip ? 0 : (bad = true, 0));
             }
             return l;
         }
     };
+
+    static bool isPredefined(const std::string& n) { return n == "__LINE__" || n == "__FILE__" || n == "__VERSION__"; }
 
     bool evalIf(const std::vector<Token>& line, size_t from) {
         // `defined X` / `defined(X)` first, then macro expansion.
@@ -493,7 +552,14 @@ private:
                 if (paren) ++j;
                 Token n;
                 n.kind = Tok::IntLit, n.line = line[i].line;
-                n.ival = j < line.size() && defines_.count(line[j].text) ? 1 : 0;
+                if (j >= line.size() || line[j].kind != Tok::Ident || (paren && (j + 1 >= line.size() || line[j + 1].text != ")"))) {
+                    if (strict("defined", line[0].line, "'defined' needs an identifier" + std::string(paren ? " and a closing ')'" : "")))
+                        return false;
+                    pre.push_back(n);  // 0
+                    i = j - 1;
+                    continue;
+                }
+                n.ival = defines_.count(line[j].text) || isPredefined(line[j].text) ? 1 : 0;
                 pre.push_back(n);
                 i = j + (paren ? 1 : 0);
                 continue;
@@ -505,6 +571,9 @@ private:
         expand(pre, ex, hide);
         Eval e{ex};
         int64_t v = e.expr(0);
+        // GLSL ES: an identifier that is not a macro is an error, not 0 (only when it is evaluated: `0 && AAA` is valid).
+        if (e.undef && strict("undefined_identifier", line[0].line, "'" + e.undef->text + "' : undefined identifier in a preprocessor expression"))
+            return false;
         if (e.bad || e.i != ex.size()) error(line[0].line, "invalid #if expression");
         return v != 0;
     }
@@ -518,8 +587,11 @@ private:
             bool v = false;
             if (parent) {
                 if (d == "if") v = evalIf(line, 2);
-                else if (line.size() < 3) error(ln, "#" + d + " needs a name");
-                else v = (defines_.count(line[2].text) != 0) == (d == "ifdef");
+                else if (line.size() < 3 || line[2].kind != Tok::Ident) strict("ifdef_name", ln, "#" + d + " needs a name");
+                else {
+                    if (line.size() > 3) strict("extra_tokens", ln, "#" + d + ": extra tokens after the name");
+                    v = (defines_.count(line[2].text) != 0 || isPredefined(line[2].text)) == (d == "ifdef");
+                }
             }
             conds_.push_back({parent && v, v, parent, false});
             return;
@@ -537,26 +609,40 @@ private:
             return;
         }
         if (d == "else") {
-            if (conds_.empty()) return error(ln, "#else without #if");
+            if (conds_.empty()) {
+                strict("unbalanced_conditional", ln, "#else without #if");
+                return;
+            }
             Cond& c = conds_.back();
             if (c.sawElse) return error(ln, "duplicate #else");
+            if (line.size() > 2 && strict("extra_tokens", ln, "#else: extra tokens")) return;
             c.sawElse = true;
             c.active = c.parentActive && !c.taken;
             c.taken = true;
             return;
         }
         if (d == "endif") {
-            if (conds_.empty()) return error(ln, "#endif without #if");
+            if (conds_.empty()) {
+                strict("unbalanced_conditional", ln, "#endif without #if");
+                return;
+            }
+            if (line.size() > 2 && strict("extra_tokens", ln, "#endif: extra tokens")) return;
             conds_.pop_back();
             return;
         }
         if (!active()) return;
         flushPending(true);
         if (d == "version") {
-            if (!first) error(ln, "#version must be the first directive");
+            if (!first) strict("version_position", ln, "#version must be the first directive");
             if (line.size() < 3 || line[2].kind != Tok::IntLit) return error(ln, "bad #version");
             res_.version = int(line[2].ival);
-            res_.es = line.size() < 4 || line[3].text == "es";
+            if ((line.size() > 4 || (line.size() == 4 && line[3].text != "es")) &&
+                strict("version_profile", ln, "#version: only 'es' may follow the number"))
+                return;
+            if (line.size() < 4 && res_.version >= 300 &&
+                strict("version_profile", ln, "#version " + std::to_string(res_.version) + " needs 'es'"))
+                return;
+            res_.es = true;
             if (res_.version != 100 && res_.version != 300 && res_.version != 310 && res_.version != 320)
                 return error(ln, "unsupported #version " + std::to_string(res_.version));
             if (res_.version >= 300 && !res_.es) return error(ln, "only ES profiles are supported");
@@ -568,48 +654,116 @@ private:
             const std::string& name = line[2].text;
             if (name.rfind("GL_", 0) == 0 || name.find("__") != std::string::npos) {
                 // Reserved names: allowed (warning) for "__" ones by many compilers; GL_ is an error.
-                if (name.rfind("GL_", 0) == 0) return error(ln, "'" + name + "' : reserved macro name");
+                if (name.rfind("GL_", 0) == 0 && strict("reserved_macro", ln, "'" + name + "' : reserved macro name")) return;
+            }
+            if (isPredefined(name)) {
+                strict("predefined_macro", ln, "'" + name + "' : predefined macro");  // lenient: the directive is ignored
+                return;
             }
             Macro m;
             size_t i = 3;
-            if (i < line.size() && line[i].text == "(" && !line[i].spaceBefore) {
+            if (i < line.size() && line[i].text == "(" && !line[i].spaceBefore && line[i].kind == Tok::Punct) {
                 m.function = true;
                 ++i;
-                while (i < line.size() && line[i].text != ")") {
-                    if (line[i].kind == Tok::Ident) m.params.push_back(line[i].text);
-                    ++i;
+                // ( [ident {, ident}] ) : identifiers separated by commas, all different, closed by ')'
+                if (i < line.size() && line[i].text == ")") ++i;
+                else {
+                    for (;;) {
+                        if (i >= line.size() || line[i].kind != Tok::Ident) {
+                            strict("macro_params", ln, "#define: macro parameter name expected");
+                            return;  // lenient: the directive is ignored
+                        }
+                        for (const std::string& q : m.params)
+                            if (q == line[i].text) {
+                                strict("macro_params", ln, "#define: duplicate macro parameter '" + q + "'");
+                                return;
+                            }
+                        m.params.push_back(line[i++].text);
+                        if (i < line.size() && line[i].text == ",") { ++i; continue; }
+                        if (i < line.size() && line[i].text == ")") { ++i; break; }
+                        strict("macro_params", ln, "#define: ',' or ')' expected in the macro parameters");
+                        return;
+                    }
                 }
-                ++i;
             }
             for (; i < line.size(); ++i) m.body.push_back(line[i]);
+            auto prev = defines_.find(name);
+            if (prev != defines_.end()) {  // a redefinition must be identical (same parameters, same tokens, same spacing)
+                const Macro& o = prev->second;
+                bool same = o.function == m.function && o.params == m.params && o.body.size() == m.body.size();
+                for (size_t k = 0; same && k < m.body.size(); ++k)
+                    same = o.body[k].kind == m.body[k].kind && o.body[k].text == m.body[k].text &&
+                           (k == 0 || o.body[k].spaceBefore == m.body[k].spaceBefore);
+                if (!same && strict("macro_redefinition", ln, "'" + name + "' : redefinition of a macro with a different definition")) return;
+            }
             defines_[name] = m;
             return;
         }
         if (d == "undef") {
-            if (line.size() >= 3) defines_.erase(line[2].text);
+            if (line.size() < 3 || line[2].kind != Tok::Ident) {
+                strict("undef", ln, "#undef needs a macro name");
+                return;
+            }
+            if (line.size() > 3 && strict("extra_tokens", ln, "#undef: extra tokens after the name")) return;
+            if (isPredefined(line[2].text) || line[2].text.rfind("GL_", 0) == 0) {
+                strict("undef", ln, "'" + line[2].text + "' : cannot undefine a predefined macro");
+                return;
+            }
+            defines_.erase(line[2].text);
             return;
         }
         if (d == "extension") {
             // #extension name : behavior
-            if (line.size() < 5) return error(ln, "bad #extension");
+            if (line.size() != 5 || line[2].kind != Tok::Ident || line[3].text != ":" || line[4].kind != Tok::Ident) {
+                strict("extension_syntax", ln, "#extension: 'name : behavior' expected");
+                return;
+            }
             const std::string& name = line[2].text;
             const std::string& beh = line[4].text;
+            if (beh != "require" && beh != "enable" && beh != "warn" && beh != "disable") {
+                strict("extension_syntax", ln, "#extension: unknown behavior '" + beh + "'");
+                return;
+            }
+            if (sawToken_ && strict("extension_position", ln, "#extension must come before any non-preprocessor token")) return;
+            if (name == "all" && (beh == "require" || beh == "enable") &&
+                strict("extension_all", ln, "#extension all: only 'warn' and 'disable' are allowed"))
+                return;
             bool known = name == "all";
             for (const char* e : supportedExtensions()) known |= name == e;
             for (const char* e : kAcceptedExtensions) known |= name == e;
-            if (!known && beh == "require") return error(ln, "extension '" + name + "' is not supported");
+            if (!known && beh == "require" && strict("extension_unsupported", ln, "extension '" + name + "' is not supported")) return;
             if (!known) log_ += "WARNING: 0:" + std::to_string(ln) + ": extension '" + name + "' is not supported\n";
             if (beh == "disable") res_.extensions.erase(name);
             else res_.extensions.insert(name);
             return;
         }
-        if (d == "pragma" || d == "line") return;
+        if (d == "pragma") {
+            if (line.size() == 7 && line[2].text == "STDGL" && line[3].text == "invariant" && line[4].text == "(" &&
+                line[5].text == "all" && line[6].text == ")")
+                res_.invariantAll = true;
+            return;
+        }
+        if (d == "line") {
+            // #line line [source-string-number] : plain decimal integers
+            // The operands are macro-expanded first (`#define A 4` / `#line A`).
+            std::vector<Token> args(line.begin() + 2, line.end()), ex;
+            std::set<std::string> hide;
+            expand(args, ex, hide);
+            auto num = [&](size_t k) { return k < ex.size() && ex[k].kind == Tok::IntLit; };
+            if (!num(0) || ex.size() > 2 || (ex.size() == 2 && !num(1))) {
+                strict("line_syntax", ln, "#line: 'line [source-string-number]' expected");
+                return;
+            }
+            lineDelta_ = int(ex[0].ival) - (ln - lineDelta_ + 1);
+            if (ex.size() == 2) fileNo_ = int(ex[1].ival);
+            return;
+        }
         if (d == "error") {
             std::string msg;
             for (size_t i = 2; i < line.size(); ++i) msg += (i > 2 ? " " : "") + line[i].text;
             return error(ln, "#error " + msg);
         }
-        error(ln, "unknown directive #" + d);
+        strict("unknown_directive", ln, "unknown directive #" + d);
     }
 
     std::string& log_;
@@ -618,6 +772,10 @@ private:
     std::vector<Token> pending_;
     PpResult res_;
     bool ok_ = true;
+    int lineDelta_ = 0;       // #line: added to the line of every following token
+    int fileNo_ = 0;          // #line's source string number: what __FILE__ expands to
+    bool sawToken_ = false;   // a non-directive token has been seen (#extension must come before)
+    int physLine_ = 0;
 };
 
 }  // namespace
@@ -626,6 +784,22 @@ void setCaps(const Caps& c) {
     gFramebufferFetch = c.framebufferFetch;
     gCubeMapArray = c.cubeMapArray;
 }
+
+namespace {
+std::atomic<int> gStrictOverride{-1};
+}  // namespace
+
+bool strictMode() {
+    const int o = gStrictOverride.load();
+    if (o >= 0) return o != 0;
+    static const bool env = [] {
+        const char* e = std::getenv("VPGLES_STRICT_GLSL");
+        return e && e[0] && e[0] != '0';
+    }();
+    return env;
+}
+
+void setStrictMode(int mode) { gStrictOverride = mode; }
 
 Caps caps() {
     Caps c;

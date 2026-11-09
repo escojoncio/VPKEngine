@@ -39,7 +39,7 @@ struct Lowered {
 };
 
 // Lowers one stage with the layout the GLES layer uses (vpglsl::Reflection).
-Lowered lowerStage(const std::vector<uint32_t>& words, Stage stage, const vpglsl::Reflection& refl) {
+Lowered lowerStage(const std::vector<uint32_t>& words, Stage stage, const vpglsl::Reflection& refl, bool xfb = false) {
     Lowered r;
     std::string error;
     spirv::SpirvModule* m = spirv::parse(words.data(), words.size(), error);
@@ -75,6 +75,7 @@ Lowered lowerStage(const std::vector<uint32_t>& words, Stage stage, const vpglsl
     for (const auto& b : refl.storageBlocks) storageCount[b.binding] = std::max(storageCount[b.binding], b.element + 1);
     for (auto [binding, n] : storageCount) add(binding, vpgpu::BindKind::Buffer, n);
     for (const auto& a : refl.atomicBuffers) add(a.binding, vpgpu::BindKind::Buffer, 1);
+    if (xfb) add(vpglsl::kXfbBinding, vpgpu::BindKind::Buffer, 1);
     for (uint32_t k = 0; k < 8; ++k)
         if (refl.framebufferFetchMask & (1u << k)) add(vpglsl::kAttachmentBase + k, vpgpu::BindKind::Texture, 1);
     std::map<uint32_t, uint32_t> blockCount;
@@ -172,6 +173,14 @@ const vpglsl::Variable* uniform(const Program& p, const std::string& n) {
 void testPp() {
     std::string log;
     int version = 0;
+    {  // #line takes macros; __LINE__ follows it, __FILE__ is its second operand
+        std::string l2;
+        int v2 = 0;
+        std::string o2 = vpglsl::preprocess("#define A 10\n#line 234 A\nx __LINE__ __FILE__\ny __LINE__\n", Stage::Vertex, l2, v2);
+        CHECK(o2.find("x 234 10") != std::string::npos && o2.find("y 235") != std::string::npos);
+        o2 = vpglsl::preprocess("#define A 4\n#line A\nz __LINE__ __FILE__\n", Stage::Vertex, l2, v2);
+        CHECK(o2.find("z 4 0") != std::string::npos);
+    }
     std::string out = vpglsl::preprocess(
         "#version 300 es\n"
         "#define A 2\n"
@@ -240,7 +249,7 @@ void testErrors() {
     CHECK(compileFails(Stage::Vertex, "void main() { float x = 1; }", "cannot convert"));
     CHECK(compileFails(Stage::Vertex, "void main() { undefinedThing = 1.0; }", "undeclared identifier"));
     CHECK(compileFails(Stage::Vertex, "void foo() {}", "missing main"));
-    CHECK(compileFails(Stage::Fragment, "uniform float u; void main() { u = 1.0; }", "l-value"));
+    CHECK(compileFails(Stage::Fragment, "precision mediump float; uniform float u; void main() { u = 1.0; }", "l-value"));
     CHECK(compileFails(Stage::Vertex, "void main() { vec2 v; v.xz = vec2(1.0); }", "swizzle"));
     CHECK(compileFails(Stage::Vertex, "#version 300 es\nvoid main() { float a[2]; a[2] = 1.0; }", "out of range"));
     CHECK(compileFails(Stage::Vertex, "#version 300 es\nattribute vec4 p; void main() {}", "attribute"));
@@ -251,6 +260,77 @@ void testErrors() {
     CHECK(compileFails(Stage::Vertex, "void main() { float x = float(1u); }", "unsigned"));
     CHECK(compileFails(Stage::Vertex, "#version 300 es\nvoid main() { gl_ViewID_OVR; }", "GL_OVR_multiview"));
     CHECK(compileFails(Stage::Vertex, "float gl_x; void main() {}", "reserved"));
+    // Keywords and reserved words cannot be identifiers; the preprocessor is strict.
+    CHECK(compileFails(Stage::Vertex, "#version 300 es\nvoid main() { float else = 1.0; }", "reserved word"));
+    CHECK(compileFails(Stage::Vertex, "void main() { float class = 1.0; }", "reserved word"));
+    CHECK(compileFails(Stage::Vertex, "#define A 1\n#define A 2\nvoid main() {}", "redefinition"));
+    CHECK(compileFails(Stage::Vertex, "#define F(a,a) a\nvoid main() {}", "duplicate"));
+    CHECK(compileFails(Stage::Vertex, "#if A\n#endif\nvoid main() {}", "undefined identifier"));
+    CHECK(compileFails(Stage::Vertex, "#ifdef A B\n#endif\nvoid main() {}", "extra tokens"));
+    CHECK(compileFails(Stage::Vertex, "#undef __LINE__\nvoid main() {}", "predefined"));
+    // __VERSION__ is 100 without #version; `0 && AAA` / `1 || AAA` never evaluate AAA; a comment spanning lines does not end its #define.
+    CHECK(vpglsl::parse(Stage::Vertex, "#if __VERSION__ != 100\nfloat bad = ;\n#endif\nvoid main() { gl_Position = vec4(0.0); }").shader);
+    CHECK(vpglsl::parse(Stage::Vertex, "#if 0 && AAA\nfloat bad = ;\n#endif\n#if 1 || (BBB / 0)\n#endif\nvoid main() { gl_Position = vec4(0.0); }").shader);
+    CHECK(compileFails(Stage::Vertex, "#if 1 && AAA\n#endif\nvoid main() {}", "undefined identifier"));
+    CHECK(vpglsl::parse(Stage::Vertex, "#define R /* a\n b */ (1.0)\n#define R /* c */ (1.0)\nvoid main() { gl_Position = vec4(R); }").shader);
+    CHECK(compileFails(Stage::Vertex, "#define e +1\nvoid main() { int n = 1e; }", "numeric literal"));
+    CHECK(compileFails(Stage::Vertex, "#version 300 es\nprecision mediump float;\nvoid main() {}\n#extension all : bogus\n", "behavior"));
+    CHECK(compileFails(Stage::Vertex, "#version 300 es\nprecision mediump float;\nin vec4 p;\nlowp centroid out float x; void main() {}", "wrong order"));
+    // Language rules a lenient driver does not enforce.
+    CHECK(compileFails(Stage::Vertex, "float f(float x) { return f(x); } void main() { gl_Position = vec4(f(1.0)); }", "recursion"));
+    CHECK(compileFails(Stage::Vertex, "uniform float u; void main() { const float c = u; gl_Position = vec4(c); }", "constant expression"));
+    CHECK(compileFails(Stage::Vertex, "float f(const float x) { x = 1.0; return x; } void main() { gl_Position = vec4(f(1.0)); }", "const parameter"));
+    CHECK(compileFails(Stage::Vertex, "void f(float x); void f(float x); void main() {}", "declared twice"));
+    CHECK(compileFails(Stage::Vertex, "#version 300 es\nvoid main() { switch (1) { case 1: break; case 1: break; } }", "duplicate case"));
+    CHECK(compileFails(Stage::Vertex, "#version 300 es\nvoid main() { float a[2][2]; }", "arrays of arrays"));
+    CHECK(compileFails(Stage::Vertex, "#version 300 es\nuniform B { layout(foo) float x; }; void main() {}", "layout"));
+    CHECK(compileFails(Stage::Fragment, "#version 300 es\nuniform float u; out mediump vec4 o; void main() { o = vec4(u); }", "no precision"));
+    CHECK(compileFails(Stage::Vertex, "#version 300 es\nvoid f(int x); struct f { int a; }; void main() {}", "name already used"));
+    // Link rules.
+    {
+        auto v = vpglsl::parse(Stage::Vertex, "uniform highp float u; void main() { gl_Position = vec4(u); }");
+        auto f = vpglsl::parse(Stage::Fragment, "precision mediump float; uniform mediump float u; void main() { gl_FragColor = vec4(u); }");
+        CHECK(v.shader && f.shader);
+        auto l = vpglsl::link(v.shader, f.shader, {});
+        CHECK(!l.ok && l.log.find("precisions") != std::string::npos);
+    }
+}
+
+// Lenient mode (the default for games): shaders that break a conformance-only rule compile, and the rule is reported.
+bool compilesLenient(Stage st, const std::string& src, const char* rule) {
+    vpglsl::ParseResult r = vpglsl::parse(st, src);
+    if (!r.shader) std::fprintf(stderr, "  lenient compile failed: %s\n", r.log.c_str());
+    for (const std::string& l : r.lenient)
+        if (l == rule) return r.shader != nullptr;
+    std::fprintf(stderr, "  rule %s not reported (got %zu rules)\n", rule, r.lenient.size());
+    return false;
+}
+
+void testLenient() {
+    CHECK(vpglsl::strictMode() == false);
+    CHECK(compilesLenient(Stage::Vertex, "#version 300 es\nvoid main() { float sample = 1.0; gl_Position = vec4(sample); }", "keyword_as_identifier"));
+    CHECK(compilesLenient(Stage::Vertex, "void main() { float class = 1.0; gl_Position = vec4(class); }", "keyword_as_identifier"));
+    CHECK(compilesLenient(Stage::Vertex, "#define A 1\n#define A 2\nvoid main() { gl_Position = vec4(A); }", "macro_redefinition"));
+    CHECK(compilesLenient(Stage::Vertex, "#if A\n#endif\nvoid main() { gl_Position = vec4(0.0); }", "undefined_identifier"));
+    CHECK(compilesLenient(Stage::Vertex, "#ifdef A B\n#endif\nvoid main() { gl_Position = vec4(0.0); }", "extra_tokens"));
+    CHECK(compilesLenient(Stage::Fragment, "#version 310 es\nprecision mediump float;\nlayout(binding = 4000) uniform sampler2D s;\nout vec4 o;\nvoid main() { o = texture(s, vec2(0.0)); }", "binding_range"));
+    CHECK(compilesLenient(Stage::Vertex, "#undef __LINE__\nvoid main() { gl_Position = vec4(0.0); }", "undef"));
+    CHECK(compilesLenient(Stage::Vertex, "void main() { gl_Position = vec4(1e); }", "character"));
+    CHECK(compilesLenient(Stage::Vertex, "#version 300\nvoid main() { gl_Position = vec4(0.0); }", "version_profile"));
+    CHECK(compilesLenient(Stage::Vertex, "#version 300 es\nprecision mediump float;\nin vec4 p;\nlowp centroid out float x; void main() { gl_Position = p; }", "qualifier_order"));
+    CHECK(compilesLenient(Stage::Vertex, "float f(float x) { return x; } float f(float x); void main() { gl_Position = vec4(f(1.0)); }", "function_redeclared"));
+    CHECK(compilesLenient(Stage::Vertex, "uniform float u; void main() { const float c = u; gl_Position = vec4(c); }", "const_initializer"));
+    CHECK(compilesLenient(Stage::Vertex, "#version 300 es\nvoid main() { float a[2][2]; gl_Position = vec4(a[0][0]); }", "arrays_of_arrays"));
+    CHECK(compilesLenient(Stage::Fragment, "#version 300 es\nuniform float u; out mediump vec4 o; void main() { o = vec4(u); }", "unspecified_precision"));
+    // Recursion cannot be compiled in either mode.
+    CHECK(!vpglsl::parse(Stage::Vertex, "float f(float x) { return f(x); } void main() { gl_Position = vec4(f(1.0)); }").shader);
+    // A conforming shader reports nothing, in either mode.
+    vpglsl::ParseResult ok = vpglsl::parse(Stage::Vertex, "attribute vec4 p; void main() { gl_Position = p; }");
+    CHECK(ok.shader && ok.lenient.empty());
+    // Strict mode still rejects.
+    vpglsl::setStrictMode(1);
+    CHECK(compileFails(Stage::Vertex, "#define A 1\n#define A 2\nvoid main() {}", "redefinition"));
+    vpglsl::setStrictMode(0);
 }
 
 void testEs100() {
@@ -370,6 +450,35 @@ void testBlocks() {
         CHECK(cam.binding != li.binding && cam.binding >= vpglsl::kBlockBase);
         CHECK(cam.stages == 3);
     }
+    // row_major on a block reaches the matrices of struct members: mat3x2 as 2 row vec3s is 32 bytes (48 column-major).
+    Program r = build(
+        "#version 300 es\n"
+        "struct S { highp mat3x2 m; };\n"
+        "layout(std140, row_major) uniform R { highp float f; S s; highp float g; };\n"
+        "in vec4 a_pos;\n"
+        "void main() { gl_Position = a_pos * (f + g + s.m[0][1]); }\n",
+        "#version 300 es\n"
+        "precision mediump float;\n"
+        "out vec4 o;\n"
+        "void main() { o = vec4(1.0); }\n");
+    CHECK(r.ok);
+    if (r.ok && r.link.reflection.blocks.size() == 1) {
+        const auto& m = r.link.reflection.blocks[0].members;
+        CHECK(m.size() == 3 && m[1].name == "s.m" && m[1].rowMajor && m[1].matrixStride == 16);
+        CHECK(m.size() == 3 && m[2].offset == 48);
+    }
+    // An instance array of blocks is indexed like an array: each element is one block (GL names "Inst[0]", "Inst[1]").
+    Program q = build(
+        "#version 300 es\n"
+        "layout(std140) uniform Inst { highp float a; highp vec3 b; } blk[3];\n"
+        "in vec4 a_pos;\n"
+        "void main() { gl_Position = a_pos * (blk[0].a + blk[2].b.x); }\n",
+        "#version 300 es\n"
+        "precision mediump float;\n"
+        "out vec4 o;\n"
+        "void main() { o = vec4(1.0); }\n");
+    CHECK(q.ok);
+    if (q.ok) CHECK(q.link.reflection.blocks.size() == 3 && q.link.reflection.blocks[2].name == "Inst[2]");
 }
 
 void testControl() {
@@ -463,6 +572,25 @@ void testTextures() {
     const auto* arr = uniform(p, "tarr[0]");
     CHECK(arr && arr->arraySize == 2);
     CHECK(p.link.reflection.samplerCount == 8);
+    // A uniform array of structs holding samplers: every leaf is a uniform of its own, named as GL names it.
+    Program st = build(
+        "#version 300 es\n"
+        "in vec4 a;\n"
+        "void main() { gl_Position = a; }\n",
+        "#version 300 es\n"
+        "precision mediump float;\n"
+        "struct S { sampler2D a; samplerCube b; mediump float x[2]; };\n"
+        "uniform S u[2];\n"
+        "out vec4 o;\n"
+        "void main() { o = texture(u[1].a, vec2(0.5)) + texture(u[0].b, vec3(0.5)) + vec4(u[1].x[1]); }\n");
+    CHECK(st.ok);
+    if (st.ok) {
+        const auto* ua = uniform(st, "u[1].a");
+        const auto* ub = uniform(st, "u[0].b");
+        const auto* ux = uniform(st, "u[1].x[0]");
+        CHECK(ua && ua->glType == 0x8B5E && ub && ub->glType == 0x8B60 && ux && ux->arraySize == 2);
+        CHECK(!uniform(st, "u[0].a"));
+    }
     // ES 1.00 cube + EXT lod + shadow ext.
     Program q = build(
         "attribute vec4 a; varying vec3 d; uniform sampler2D vt; void main() { d = a.xyz; gl_Position = a + texture2DLod(vt, a.xy, 0.0); }",
@@ -685,6 +813,14 @@ void testCompute() {
         "layout(binding = 1) buffer B { uint v[]; } b;\n"
         "void main() { b.v[gl_GlobalInvocationID.x] = gl_WorkGroupSize.x; }\n");
     CHECK(q.ok);
+    // gl_WorkGroupSize.x is a constant expression (array sizes).
+    ComputeProgram wgs = buildCompute(
+        "#version 310 es\n"
+        "layout(local_size_x = 4, local_size_y = 2) in;\n"
+        "const uint kSize = gl_WorkGroupSize.x * gl_WorkGroupSize.y;\n"
+        "layout(binding = 0) buffer R { bool ok[kSize]; } r;\n"
+        "void main() { r.ok[gl_LocalInvocationIndex] = true; }\n");
+    CHECK(wgs.ok);
     // Errors.
     CHECK(compileFails(Stage::Compute, "#version 310 es\nvoid main() {}\n", "local_size"));
     CHECK(compileFails(Stage::Compute, "#version 310 es\nlayout(local_size_x = 2000) in;\nvoid main() {}\n", "work group size"));
@@ -730,7 +866,10 @@ void testStorageBlocks() {
     const auto* v2 = member(b, "Blk.v2[0]");
     CHECK(v2 && v2->arrayStride == 16);
     CHECK(off("Blk.ps[0].a") == 128 && off("Blk.ps[0].b") == 144);  // struct {float; vec3}: align 16, size 32
-    CHECK(off("Blk.ps[1].a") == 160);
+    // The top-level array of structs is listed through element 0 only, with its size and stride.
+    CHECK(off("Blk.ps[1].a") == -1);
+    const auto* ps0 = member(b, "Blk.ps[0].a");
+    CHECK(ps0 && ps0->topLevelArraySize == 2 && ps0->topLevelArrayStride == 32);
     const auto* tail = member(b, "Blk.tail[0]");
     CHECK(tail && tail->arraySize == 0 && tail->arrayStride == 4);
     // The same block as std140 has the array stride rounded to 16.
@@ -916,6 +1055,26 @@ void testAtomics() {
     CHECK(compileFails(Stage::Compute, head + "buffer B { float f; } b;\nvoid main() { atomicAdd(b.f, 1.0); }\n", "no matching"));
     CHECK(compileFails(Stage::Compute, head + "void main() { atomic_uint c; }\n", "local"));
     CHECK(compileFails(Stage::Vertex, "#version 300 es\nvoid main() { uint x = 0u; atomicAdd(x, 1u); gl_Position = vec4(0.0); }\n", "no matching"));
+    // A default offset (`layout(binding, offset) uniform atomic_uint;`) must be a multiple of 4 and moves the next counter.
+    CHECK(compileFails(Stage::Compute, head + "layout(binding = 0, offset = 1) uniform atomic_uint;\nlayout(binding = 0) uniform atomic_uint c;\nvoid main() { atomicCounterIncrement(c); }\n", "multiple of 4"));
+    {
+        Program d = build(kTrivialVs,
+            "#version 310 es\nprecision mediump float;\nlayout(binding = 0, offset = 8) uniform atomic_uint;\nlayout(binding = 0) uniform atomic_uint c;\n"
+            "in vec2 uv; out vec4 o;\nvoid main() { o = vec4(float(atomicCounterIncrement(c))); }\n");
+        CHECK(d.ok);
+        bool at8 = false;
+        for (const auto& u : d.link.reflection.uniforms) at8 |= u.name == "c" && u.offset == 8;
+        CHECK(at8);
+    }
+    {  // A uniform shared by both stages takes the explicit location of whichever stage gives one.
+        Program l = build("#version 310 es\nin vec4 pos; uniform float u;\nvoid main() { gl_Position = pos * u; }\n",
+                          "#version 310 es\nprecision mediump float;\nlayout(location = 7) uniform float u;\nout vec4 o;\nvoid main() { o = vec4(u); }\n");
+        CHECK(l.ok);
+        int loc = -1;
+        for (const auto& u : l.link.reflection.uniforms)
+            if (u.name == "u") loc = u.uniformLocation;
+        CHECK(loc == 7);
+    }
 }
 
 void testGather() {
@@ -946,6 +1105,26 @@ void testGather() {
         const auto* tcu = uniform(p, "tcu");
         CHECK(tcu && tcu->glType == 0x900F);
     }
+    // Offsets beyond Metal's -8..7 (Quest 3 reports -32..31): the compiler moves the coordinate by whole texels.
+    Program far = build(kTrivialVs,
+        "#version 310 es\nprecision mediump float;\nuniform sampler2D t; uniform sampler2DArray ta; in vec2 uv; out vec4 o;\n"
+        "void main() { o = textureGatherOffset(t, uv, ivec2(20, -31)) + textureGatherOffset(ta, vec3(uv, 1.0), ivec2(-32, 3), 1); }\n");
+    CHECK(far.ok);
+    if (far.ok) {
+        CHECK(far.fs.msl.find("int2(20, -31)") == std::string::npos && far.fs.msl.find("int2(-32, 3)") == std::string::npos);
+        CHECK(far.fs.msl.find("get_width") != std::string::npos);
+    }
+    // A dynamic offset (ES 3.2 / gpu_shader5): Metal's hardware offset is 4 bits wide, so offsets outside -8..7 move the
+    // coordinate (the size query is in the shader) and the operand is selected to zero for those.
+    Program dyn = build(kTrivialVs,
+        "#version 320 es\nprecision mediump float;\nuniform sampler2D t; uniform sampler2DArray ta; uniform sampler2DShadow ts; in vec2 uv; out vec4 o;\n"
+        "void main() { ivec2 d = ivec2(int(uv.x * 64.0) - 32, int(uv.y * 64.0) - 32);\n"
+        "    o = textureGatherOffset(t, uv, d, 1) + textureGatherOffset(ta, vec3(uv, 1.0), d) + textureGatherOffset(ts, uv, 0.5, d); }\n");
+    CHECK(dyn.ok);
+    if (dyn.ok) {
+        CHECK(dyn.fs.msl.find("get_width") != std::string::npos);
+        CHECK(dyn.fs.msl.find("gather") != std::string::npos);
+    }
     // ES 3.10: cube map arrays need the extension (and the layer's say-so); textureGather exists.
     const std::string fs310 = "#version 310 es\nprecision mediump float;\nuniform samplerCubeArray t; in vec2 uv; out vec4 o;\nvoid main() { o = texture(t, vec4(uv, 0.0, 0.0)); }\n";
     CHECK(compileFails(Stage::Fragment, fs310, "unknown type"));
@@ -953,13 +1132,31 @@ void testGather() {
         "#version 310 es\nprecision mediump float;\nuniform sampler2D t; in vec2 uv; out vec4 o;\n"
         "void main() { o = textureGather(t, uv) + textureGatherOffset(t, uv, ivec2(1)); }\n");
     CHECK(q.ok);
+    // ES 3.10 arrays of arrays: `float[2] a[3]` is 3 arrays of 2; implicit inner sizes come from the constructor / initialiser.
+    Program aoa = build(kTrivialVs,
+        "#version 310 es\nprecision mediump float;\nin vec2 uv; out vec4 o;\nvoid main() {\n"
+        "  float[2] a[3] = float[3][2](float[2](uv.x, uv.y), float[2](uv.x, uv.y), float[2](uv.x, uv.y));\n"
+        "  float x[][] = float[][](float[](uv.x, uv.y), float[](uv.y, uv.x));\n"
+        "  float[][] p = float[2][2](float[2](uv.x, uv.y), float[2](uv.x, uv.y)), q = float[2][3](float[3](uv.x, uv.y, 1.0), float[3](uv.x, uv.y, 1.0));\n"
+        "  o = vec4(a[2][1] + x[1][1] + p[0][1] + q[1][2], float(x.length() + q[0].length() + a[0].length()), 0.0, 1.0);\n}\n");
+    CHECK(aoa.ok);
+    // ES 3.10: gather over a shadow array (its table has textureGather[Offset] for sampler2DArrayShadow, unlike texture/textureOffset).
+    Program sa = build(kTrivialVs,
+        "#version 310 es\nprecision mediump float;\nuniform highp sampler2DArrayShadow t; in vec2 uv; out vec4 o;\n"
+        "void main() { o = textureGather(t, vec3(uv, 1.0), 0.5) + textureGatherOffset(t, vec3(uv, 1.0), 0.5, ivec2(-8, 7)); }\n");
+    CHECK(sa.ok);
     // Not in ES 3.00.
     CHECK(compileFails(Stage::Fragment, "#version 300 es\nprecision mediump float;\nuniform sampler2D t; in vec2 uv; out vec4 o;\nvoid main() { o = textureGather(t, uv); }\n", "no matching"));
-    // gl_HelperInvocation: ES 3.20.
+    // gl_HelperInvocation: ES 3.10 and up.
     Program h = build(kTrivialVs,
-        "#version 320 es\nprecision mediump float;\nin vec2 uv; out vec4 o;\nvoid main() { o = gl_HelperInvocation ? vec4(0.0) : vec4(uv, 0.0, 1.0); }\n");
+        "#version 310 es\nprecision mediump float;\nin vec2 uv; out vec4 o;\nvoid main() { o = gl_HelperInvocation ? vec4(0.0) : vec4(uv, 0.0, 1.0); }\n");
     CHECK(h.ok);
-    CHECK(compileFails(Stage::Fragment, "#version 310 es\nprecision mediump float;\nout vec4 o;\nvoid main() { o = vec4(gl_HelperInvocation); }\n", "undeclared"));
+    CHECK(compileFails(Stage::Fragment, "#version 300 es\nprecision mediump float;\nout vec4 o;\nvoid main() { o = vec4(gl_HelperInvocation); }\n", "undeclared"));
+    // Compute built-in constants (ES 3.10) and the compute default precisions (highp float / int).
+    ComputeProgram mc = buildCompute(
+        "#version 310 es\nlayout(local_size_x = 1) in;\nlayout(std430, binding = 0) buffer B { int v[]; };\n"
+        "void main() { float zero = 0.0; v[0] = gl_MaxComputeWorkGroupSize.x + gl_MaxComputeWorkGroupCount.y + int(zero); }\n");
+    CHECK(mc.ok);
     // With the extension caps on, cube map arrays work in 3.10.
     vpglsl::Caps saved = vpglsl::caps();
     vpglsl::Caps on = saved;
@@ -1236,6 +1433,293 @@ void testExecute() {
 }
 
 
+// Invariant position: `invariant gl_Position;`, `#pragma STDGL invariant(all)` and an invariant varying (declared or
+// listed) reach the final MSL as [[position, invariant]] (the metal2 backend turns preserveInvariance on from that text);
+// a shader that declares nothing keeps the plain [[position]].
+void testInvariant() {
+    const char* fs3 = "#version 300 es\nprecision mediump float; in vec4 v; out vec4 o; void main() { o = v; }";
+    const char* fs1 = "#version 100\nprecision mediump float; varying vec4 v; void main() { gl_FragColor = v; }";
+    auto vsMsl = [&](const char* vs, const char* fs) {
+        Program p = build(vs, fs);
+        CHECK(p.ok);
+        return p.vs.msl;
+    };
+    const char* kInv = "[[position, invariant]]";
+    CHECK(has(vsMsl("#version 300 es\ninvariant gl_Position; in vec4 a; out vec4 v; void main() { v = a; gl_Position = a; }", fs3), kInv));
+    CHECK(has(vsMsl("#version 100\ninvariant gl_Position; attribute vec4 a; varying vec4 v; void main() { v = a; gl_Position = a; }", fs1), kInv));
+    CHECK(has(vsMsl("#version 100\n#pragma STDGL invariant(all)\nattribute vec4 a; varying vec4 v; void main() { v = a; gl_Position = a; }", fs1), kInv));
+    CHECK(has(vsMsl("#version 300 es\n#pragma STDGL invariant(all)\nin vec4 a; out vec4 v; void main() { v = a; gl_Position = a; }", fs3), kInv));
+    CHECK(has(vsMsl("#version 300 es\nin vec4 a; invariant out vec4 v; void main() { v = a; gl_Position = a; }", fs3), kInv));
+    CHECK(has(vsMsl("#version 100\nattribute vec4 a; invariant varying vec4 v; void main() { v = a; gl_Position = a; }", fs1), kInv));
+    CHECK(has(vsMsl("#version 300 es\nin vec4 a; out vec4 v; invariant v; void main() { v = a; gl_Position = a; }", fs3), kInv));
+    // Nothing declared (and the pragma in an inactive #if group): the plain position.
+    const std::string plain = vsMsl("#version 300 es\n#if 0\n#pragma STDGL invariant(all)\n#endif\nin vec4 a; out vec4 v; void main() { v = a; gl_Position = a; }", fs3);
+    CHECK(!has(plain, "invariant"));
+    CHECK(has(plain, "[[position]]"));
+}
+
+// Numeric semantics of the GLSL builtins as the Vulkan path lowers them: a compute shader runs in the VPIR interpreter
+// (the reference semantics of the IR; the MSL itself is not executed here, only its text is checked), inputs come from
+// the buffer so nothing folds. What GLSL fixes: mod = x - y * floor(x / y) (not fmod), step(edge, x) = x < edge ? 0 : 1,
+// smoothstep = Hermite of the clamped ratio, integer / and % truncate toward zero (hardware / Metal; GLSL leaves a
+// negative operand of % undefined), mix(x, y, bool) selects, floatBitsToInt is a bit copy (NaN payloads kept).
+// round() is implementation-defined on halves; the emitter uses rint (round half to even, like roundEven and like the
+// hardware instruction mobile GPUs have), which is what engines compiled for Adreno see. min / max / clamp with a NaN
+// operand are undefined in GLSL; the IR gives the other operand (fmin / fmax), but the MSL `min` / `max` / `clamp`
+// under Metal's fast math make no promise, so NaN-protected shaders (saturate(NaN) = 0) depend on the device.
+void testSemantics() {
+    ComputeProgram p = buildCompute(
+        "#version 310 es\n"
+        "layout(local_size_x = 1) in;\n"
+        "layout(std430, binding = 0) buffer B { float a[6]; int ia[4]; float r[40]; int ir[16]; } b;\n"
+        "void main() {\n"
+        "    float x = b.a[0], y = b.a[1], h = b.a[2], t = b.a[3], nan = b.a[4], z = b.a[5];\n"  // -7.5 3 0.5 2.5 NaN 0
+        "    b.r[0] = mod(x, y); b.r[1] = mod(-x, -y); b.r[2] = mod(vec2(x, 1.0), y).y;\n"
+        "    b.r[3] = round(t); b.r[4] = round(-t); b.r[5] = roundEven(t + 1.0); b.r[6] = round(t + 0.1);\n"
+        "    b.r[7] = step(h, h); b.r[8] = step(h, x); b.r[9] = step(h, t); b.r[10] = step(vec2(h, t), vec2(t, t)).x;\n"
+        "    b.r[11] = smoothstep(z, 1.0, h); b.r[12] = smoothstep(z, 1.0, t); b.r[13] = smoothstep(z, 1.0, x);\n"
+        "    b.r[14] = smoothstep(z, 1.0, 0.25 + z);\n"
+        "    b.r[15] = min(nan, t); b.r[16] = max(nan, h); b.r[17] = clamp(nan, z, 1.0); b.r[18] = clamp(x, z, h);\n"
+        "    b.r[19] = inversesqrt(t + 1.5); b.r[20] = inversesqrt(z);\n"
+        "    b.r[21] = atan(h + 0.5, h + 0.5); b.r[22] = atan(1.0, -1.0 + z); b.r[23] = atan(-1.0, -1.0);\n"
+        "    b.r[24] = atan(-1.0, 1.0); b.r[25] = atan(z, -1.0); b.r[26] = atan(1.0, z); b.r[27] = atan(-1.0, z);\n"
+        "    b.r[28] = atan(t - 0.5); b.r[29] = atan(-h);\n"
+        "    b.r[30] = sign(x); b.r[31] = sign(z); b.r[32] = sign(t);\n"
+        "    b.r[33] = mix(h, t, true); b.r[34] = mix(h, t, false); b.r[35] = mix(vec2(x, y), vec2(h, t), bvec2(true, false)).x;\n"
+        "    b.r[36] = mix(vec2(x, y), vec2(h, t), bvec2(true, false)).y;\n"
+        "    b.r[37] = intBitsToFloat(floatBitsToInt(nan) + 0);\n"
+        "    int p = b.ia[0], q = b.ia[1], u = b.ia[2], v = b.ia[3];\n"  // -7 2 7 -3
+        "    b.ir[0] = p / q; b.ir[1] = p % q; b.ir[2] = u / v; b.ir[3] = u % v; b.ir[4] = sign(p);\n"
+        "    b.ir[5] = floatBitsToInt(1.0); b.ir[6] = floatBitsToInt(-z); b.ir[7] = floatBitsToInt(nan);\n"
+        "    b.ir[8] = int(uint(p) / 2u); b.ir[9] = -p % 4;\n"
+        "}\n");
+    CHECK(p.ok);
+    if (!p.ok) return;
+    const auto& blk = p.link.reflection.storageBlocks.at(0);
+    CHECK(blk.size >= 264);  // 24 + 16 + 160 + 64 bytes
+    int res = -1;
+    for (size_t i = 0; i < p.cs.module.resources.size(); ++i)
+        if (p.cs.module.resources[i].kind == vpir::ResourceKind::Buffer) res = int(i);
+    CHECK(res >= 0);
+    if (res < 0) return;
+    std::vector<uint8_t> mem(blk.size, 0);
+    auto setF = [&](uint32_t off, float v) { std::memcpy(&mem[off], &v, 4); };
+    auto setI = [&](uint32_t off, int32_t v) { std::memcpy(&mem[off], &v, 4); };
+    const float in[6] = {-7.5f, 3.0f, 0.5f, 2.5f, std::nanf(""), 0.0f};
+    for (uint32_t k = 0; k < 6; ++k) setF(k * 4, in[k]);
+    const int32_t iin[4] = {-7, 2, 7, -3};
+    for (uint32_t k = 0; k < 4; ++k) setI(24 + k * 4, iin[k]);
+    vpireval::Invocation inv;
+    inv.memory[uint32_t(res)] = mem;
+    std::string err;
+    CHECK(vpireval::run(p.cs.module, inv, err));
+    if (!err.empty()) std::fprintf(stderr, "  eval: %s\n", err.c_str());
+    const auto& out = inv.memory[uint32_t(res)];
+    auto R = [&](int k) { float v; std::memcpy(&v, &out[size_t(40 + 4 * k)], 4); return v; };
+    auto I = [&](int k) { int32_t v; std::memcpy(&v, &out[size_t(200 + 4 * k)], 4); return v; };
+    auto near = [&](int k, float want, float tol = 1e-5f) {
+        const bool ok = std::fabs(R(k) - want) <= tol;
+        if (!ok) std::fprintf(stderr, "  r[%d] = %.9g, want %.9g\n", k, R(k), want);
+        return ok;
+    };
+    CHECK(near(0, 1.5f) && near(1, -1.5f) && near(2, 1.0f));  // not fmod (-1.5, 1.5): the sign follows y
+    CHECK(near(3, 2.0f) && near(4, -2.0f) && near(5, 4.0f) && near(6, 3.0f));  // halves to even, others to nearest
+    CHECK(near(7, 1.0f) && near(8, 0.0f) && near(9, 1.0f) && near(10, 1.0f));  // x == edge gives 1
+    CHECK(near(11, 0.5f) && near(12, 1.0f) && near(13, 0.0f) && near(14, 0.15625f));
+    CHECK(near(15, 2.5f) && near(16, 0.5f) && near(17, 0.0f) && near(18, 0.0f));  // NaN: the other operand
+    CHECK(near(19, 0.5f) && std::isinf(R(20)) && R(20) > 0);
+    const float pi = 3.14159265358979f;
+    CHECK(near(21, pi / 4) && near(22, 3 * pi / 4) && near(23, -3 * pi / 4) && near(24, -pi / 4));
+    CHECK(near(25, pi) && near(26, pi / 2) && near(27, -pi / 2));
+    CHECK(near(28, std::atan(2.0f)) && near(29, std::atan(-0.5f)));
+    CHECK(near(30, -1.0f) && near(31, 0.0f) && near(32, 1.0f));
+    CHECK(near(33, 2.5f) && near(34, 0.5f) && near(35, 0.5f) && near(36, 3.0f));
+    uint32_t nanBits;
+    std::memcpy(&nanBits, &out[size_t(40 + 4 * 37)], 4);
+    CHECK((nanBits & 0x7fffffffu) > 0x7f800000u);  // still a NaN after the int round trip
+    CHECK(I(0) == -3 && I(1) == -1 && I(2) == -2 && I(3) == 1 && I(4) == -1);  // truncating / and %
+    CHECK(I(5) == 0x3f800000 && uint32_t(I(6)) == 0x80000000u && uint32_t(I(7)) == 0x7fc00000u);  // bit copies
+    CHECK(I(8) == int32_t(0xFFFFFFF9u / 2u) && I(9) == 3);  // unsigned division of the same bits; -(-7) % 4 = 3
+
+    // The MSL of the same builtins in a fragment shader: the structure that carries the semantics above.
+    Program f = build(kTrivialVs,
+        "#version 310 es\nprecision highp float; precision highp int; precision highp sampler2D;\n"
+        "uniform sampler2D s; uniform int lv; in vec2 uv; out vec4 o;\n"
+        "void main() {\n"
+        "    vec4 m = texelFetch(s, ivec2(uv), lv) + texelFetch(s, ivec2(uv), 2);\n"
+        "    o = m + vec4(mod(uv.x, uv.y), round(uv.x), inversesqrt(uv.x), atan(uv.y, uv.x)) + vec4(step(uv.x, uv.y), smoothstep(0.0, 1.0, uv.y), clamp(uv.x, 0.0, 1.0), sign(uv.y));\n"
+        "}\n");
+    CHECK(f.ok);
+    const std::string& msl = f.fs.msl;
+    CHECK(has(msl, "floor(") && !has(msl, "fmod("));  // mod is x - y * floor(x / y)
+    CHECK(has(msl, "rint("));                          // round: half to even
+    CHECK(has(msl, "rsqrt("));
+    // texelFetch with a lod reads that mip level, from the uniform and from the constant: two reads, the second one
+    // with the literal 2u as its last argument (matched inside its own statement, whatever the temporaries are called).
+    auto readWithLastArg = [&](const std::string& lod) {
+        for (size_t at = msl.find(".read("); at != std::string::npos; at = msl.find(".read(", at + 1)) {
+            const std::string stmt = msl.substr(at, msl.find(';', at) - at);
+            if (stmt.size() > lod.size() + 1 && stmt.compare(stmt.size() - lod.size() - 1, lod.size() + 1, lod + ")") == 0) return true;
+        }
+        return false;
+    };
+    CHECK(readWithLastArg("2u"));
+    // No assertion on how clamp / smoothstep reach the MSL (clamp or saturate): the interpreter above fixes their value
+    // for finite inputs and NaN as the IR defines it, but it does NOT test Metal's NaN semantics under fast math; those
+    // are measured on the headset.
+
+    // mix(x, y, a) keeps both ends exact: the textbook x + (y - x) * a loses the small operand against a large one.
+    ComputeProgram mp = buildCompute(
+        "#version 310 es\n"
+        "layout(local_size_x = 1) in;\n"
+        "layout(std430, binding = 0) buffer B { float a[4]; float r[8]; } b;\n"
+        "void main() {\n"
+        "    float x = b.a[0], y = b.a[1], one = b.a[2], zero = b.a[3];\n"  // 1e8 1e-8 1 0
+        "    b.r[0] = mix(x, y, one); b.r[1] = mix(x, y, zero);\n"
+        "    vec2 v = mix(vec2(x, y), vec2(y, x), one); b.r[2] = v.x; b.r[3] = v.y;\n"
+        "    b.r[4] = mix(x, y, 0.5 * one);\n"
+        "}\n");
+    CHECK(mp.ok);
+    if (!mp.ok) return;
+    int mres = -1;
+    for (size_t i = 0; i < mp.cs.module.resources.size(); ++i)
+        if (mp.cs.module.resources[i].kind == vpir::ResourceKind::Buffer) mres = int(i);
+    CHECK(mres >= 0);
+    if (mres < 0) return;
+    std::vector<uint8_t> mmem(48, 0);
+    const float mix_in[4] = {1e8f, 1e-8f, 1.0f, 0.0f};
+    std::memcpy(mmem.data(), mix_in, sizeof mix_in);
+    vpireval::Invocation minv;
+    minv.memory[uint32_t(mres)] = mmem;
+    std::string merr;
+    CHECK(vpireval::run(mp.cs.module, minv, merr));
+    const auto& mout = minv.memory[uint32_t(mres)];
+    auto M = [&](int k) { float v; std::memcpy(&v, &mout[size_t(16 + 4 * k)], 4); return v; };
+    CHECK(M(0) == 1e-8f);  // mix(x, y, 1) == y exactly (x + (y - x) * 1 would give 0)
+    CHECK(M(1) == 1e8f);   // mix(x, y, 0) == x exactly
+    CHECK(M(2) == 1e-8f && M(3) == 1e8f);  // vector ends, scalar weight splatted
+    CHECK(M(4) == 5e7f);   // 0.5: (x + y) / 2 to float precision
+    // The MSL spells it with fma, not mix().
+    Program mf = build(kTrivialVs,
+        "#version 310 es\nprecision highp float; in vec2 uv; out vec4 o;\n"
+        "void main() { o = mix(vec4(uv, 0.0, 1.0), vec4(1.0), uv.x); }\n");
+    CHECK(mf.ok);
+    CHECK(has(mf.fs.msl, "fma(") && !has(mf.fs.msl, "mix("));
+}
+
+// Transform feedback: the capture variant of the vertex shader writes the varyings glTransformFeedbackVaryings named (arrays,
+// array elements, matrices, integers, gl_Position as the shader wrote it, gl_PointSize, and an output no fragment shader reads)
+// into the record of (instance, vertex index); the VPIR interpreter runs it.
+void testXfb() {
+    vpglsl::LinkOptions lo;
+    lo.xfbVaryings = {"v_i", "v_f4[1]", "v_m", "gl_Position", "gl_PointSize", "v_pad", "v_f4[0]"};
+    auto v = vpglsl::parse(Stage::Vertex,
+        "#version 300 es\n"
+        "in vec4 a_pos; in vec4 a_m;\n"
+        "out vec4 v_f4[2]; flat out ivec2 v_i; out mat2x3 v_m; out mediump float v_pad; out vec2 v_used;\n"
+        "void main() { v_f4[0] = a_pos; v_f4[1] = a_pos * 2.0; v_i = ivec2(a_m.xy); v_m = mat2x3(a_m.xyz, a_m.xyz * 2.0);\n"
+        "  v_pad = 7.0; v_used = a_pos.xy; gl_Position = vec4(a_pos.xyz, 4.0); gl_PointSize = 3.0; }\n");
+    auto f = vpglsl::parse(Stage::Fragment,
+        "#version 300 es\nprecision mediump float;\nin vec2 v_used; out vec4 o;\nvoid main() { o = vec4(v_used, 0.0, 1.0); }\n");
+    CHECK(v.shader && f.shader);
+    if (!v.shader || !f.shader) return;
+    auto l = vpglsl::link(v.shader, f.shader, lo);
+    CHECK(l.ok);
+    if (!l.ok) {
+        std::fprintf(stderr, "  link: %s\n", l.log.c_str());
+        return;
+    }
+    const auto& rx = l.reflection;
+    CHECK(rx.xfb.size() == 7 && rx.xfbRecordWords == 2 + 4 + 6 + 4 + 1 + 1 + 4);
+    CHECK(rx.xfb[0].name == "v_i" && rx.xfb[0].glType == 0x8B53 && rx.xfb[0].arraySize == 1 && rx.xfb[0].offset == 0);
+    CHECK(rx.xfb[1].name == "v_f4[1]" && rx.xfb[1].glType == 0x8B52 && rx.xfb[1].arraySize == 1 && rx.xfb[1].offset == 2);
+    CHECK(rx.xfb[2].glType == 0x8B65 /* mat2x3 */ && rx.xfb[2].words == 6 && rx.xfb[2].offset == 6);
+    CHECK(rx.xfb[3].offset == 12 && rx.xfb[4].offset == 16 && rx.xfb[5].offset == 17 && rx.xfb[6].offset == 18);
+    CHECK(!l.xfbVertexSpirv.empty());
+    // The ordinary shaders stay free of the capture.
+    CHECK(l.vertexSpirv.size() < l.xfbVertexSpirv.size());
+    Lowered plain = lowerStage(l.vertexSpirv, Stage::Vertex, rx);
+    CHECK(plain.ok);
+    Lowered cap = lowerStage(l.xfbVertexSpirv, Stage::Vertex, rx, true);
+    CHECK(cap.ok);
+    if (!cap.ok) return;
+    int res = -1;
+    for (size_t i = 0; i < cap.module.resources.size(); ++i)
+        if (cap.module.resources[i].kind == vpir::ResourceKind::Buffer && cap.module.resources[i].index < 29) res = int(i);
+    CHECK(res >= 0);
+    if (res < 0) return;
+    const uint32_t W = rx.xfbRecordWords, span = 8, base = 3, vertex = 5, instance = 2;
+    std::vector<uint8_t> mem((vpglsl::kXfbHeaderWords + span * 3 * W) * 4, 0xAB);
+    auto putU = [&](size_t word, uint32_t x) { std::memcpy(&mem[word * 4], &x, 4); };
+    auto getU = [&](size_t word) { uint32_t x; std::memcpy(&x, &mem[word * 4], 4); return x; };
+    auto getF = [&](size_t word) { float x; std::memcpy(&x, &mem[word * 4], 4); return x; };
+    putU(0, span), putU(1, base), putU(2, 0), putU(3, 0);
+    vpireval::Invocation inv;
+    inv.memory[uint32_t(res)] = mem;
+    auto vec4 = [](float a, float b, float c, float d) {
+        vpireval::Value x;
+        x.type = vpir::Type(vpir::Scalar::F32, 4);
+        const float fs[4] = {a, b, c, d};
+        std::memcpy(x.bits, fs, 16);
+        return x;
+    };
+    auto u32 = [](uint32_t a) {
+        vpireval::Value x;
+        x.type = vpir::Type(vpir::Scalar::U32);
+        x.bits[0] = a;
+        return x;
+    };
+    inv.builtins[vpir::Builtin::VertexId] = u32(vertex);
+    inv.builtins[vpir::Builtin::InstanceId] = u32(instance);
+    // The attributes come from the vertex buffers the test layout gives them (slot 30 down, stride 64, element at vertex * 64).
+    uint32_t slot = 30;
+    for (const auto& a : rx.attributes) {
+        const float fs[4] = {a.name == "a_pos" ? 1.0f : 10.0f, a.name == "a_pos" ? 2.0f : 20.0f, a.name == "a_pos" ? 3.0f : 30.0f,
+                             a.name == "a_pos" ? 9.0f : 0.0f};
+        for (size_t i = 0; i < cap.module.resources.size(); ++i)
+            if (cap.module.resources[i].kind == vpir::ResourceKind::Buffer && cap.module.resources[i].index == slot) {
+                std::vector<uint8_t> vb((vertex + 1) * 64, 0);
+                std::memcpy(&vb[vertex * 64], fs, 16);
+                inv.memory[uint32_t(i)] = vb;
+            }
+        --slot;
+    }
+    std::string err;
+    CHECK(vpireval::run(cap.module, inv, err));
+    if (!err.empty()) std::fprintf(stderr, "  eval: %s\n", err.c_str());
+    mem = inv.memory[uint32_t(res)];
+    const size_t rec = vpglsl::kXfbHeaderWords + size_t(instance * span + (vertex - base)) * W;
+    CHECK(getU(0) == span && getU(1) == base);  // the header is not touched
+    CHECK(int32_t(getU(rec + 0)) == 10 && int32_t(getU(rec + 1)) == 20);                              // v_i
+    CHECK(getF(rec + 2) == 2.0f && getF(rec + 3) == 4.0f && getF(rec + 4) == 6.0f && getF(rec + 5) == 18.0f);  // v_f4[1]
+    CHECK(getF(rec + 6) == 10.0f && getF(rec + 7) == 20.0f && getF(rec + 8) == 30.0f);                // v_m column 0
+    CHECK(getF(rec + 9) == 20.0f && getF(rec + 10) == 40.0f && getF(rec + 11) == 60.0f);              // column 1
+    CHECK(getF(rec + 12) == 1.0f && getF(rec + 13) == 2.0f && getF(rec + 14) == 3.0f && getF(rec + 15) == 4.0f);  // gl_Position: before the clip-z remap
+    CHECK(getF(rec + 16) == 3.0f);                                                                    // gl_PointSize
+    CHECK(getF(rec + 17) == 7.0f);                                                                    // v_pad (not read by the fragment shader)
+    CHECK(getF(rec + 18) == 1.0f && getF(rec + 22 - 1) == 9.0f);                                      // v_f4[0]
+    CHECK(getU(rec + W) == 0xABABABABu && getU(rec - 1) == 0xABABABABu);                              // the neighbours are untouched
+
+    // Link failures: unknown, repeated, out-of-range, element of a non-array, over the limits of the mode.
+    auto linkWith = [&](std::vector<std::string> names, bool separate) {
+        vpglsl::LinkOptions o;
+        o.xfbVaryings = std::move(names);
+        o.xfbSeparate = separate;
+        return vpglsl::link(v.shader, f.shader, o).ok;
+    };
+    CHECK(linkWith({"v_i", "v_used"}, false));
+    CHECK(!linkWith({"v_nope"}, false));
+    CHECK(!linkWith({"v_i", "v_i"}, false));
+    CHECK(!linkWith({"v_f4", "v_f4[1]"}, false));
+    CHECK(!linkWith({"v_f4[2]"}, false));
+    CHECK(!linkWith({"v_i[0]"}, false));
+    CHECK(!linkWith({"v_f4[x]"}, false));
+    CHECK(linkWith({"v_m"}, false) && !linkWith({"v_m"}, true));  // 6 components > 4 for one separate attribute
+    CHECK(linkWith({"v_f4[0]", "v_f4[1]", "v_i", "v_used"}, true));
+    CHECK(!linkWith({"v_f4[0]", "v_f4[1]", "v_i", "v_used", "v_pad"}, true));  // five separate attributes
+    CHECK(!linkWith({"v_f4", "v_f4"}, false));
+}
+
 // UE4-style packed uniform arrays (pu_h / pu_m / pu_l vec4 arrays) in the default block, read with dynamic and constant
 // indices; the bytes are placed exactly where glUniform*fv would put them (reflection offset + element * arrayStride).
 void testPackedUniforms() {
@@ -1434,9 +1918,14 @@ int main(int argc, char** argv) {
         {"textures", testTextures}, {"external", testExternalSampler}, {"link", testLink},
         {"compute", testCompute}, {"ssbo", testStorageBlocks}, {"images", testImages}, {"atomics", testAtomics},
         {"gather", testGather}, {"fbfetch", testFramebufferFetch}, {"exts", testExtensions}, {"texbuffer", testTextureBuffers}, {"exec", testExecute}, {"packed", testPackedUniforms}, {"shlight", testShLighting},
+        {"lenient", testLenient}, {"xfb", testXfb}, {"invariant", testInvariant}, {"semantics", testSemantics},
     };
     auto it = tests.find(argv[1]);
     if (it == tests.end()) return 2;
+    {  // the conformance rules are on only where a test checks them (the rest of the tests build shaders with relaxed headers)
+        const std::string g = argv[1];
+        vpglsl::setStrictMode(g == "errors" || g == "pp" || g == "parse" || g == "fbfetch" || g == "exts" ? 1 : 0);
+    }
     it->second();
     std::printf("%s: %s\n", argv[1], failures ? "FAIL" : "ok");
     return failures ? 1 : 0;

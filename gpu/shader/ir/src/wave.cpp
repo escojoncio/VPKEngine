@@ -28,7 +28,7 @@ constexpr uint32_t kSlotBytes = 16;                 // one lane's value, up to v
 constexpr uint32_t kBallotOffset = 64 * kSlotBytes;  // two words (one per SIMD group) after the lane slots
 constexpr uint32_t kScratchBytes = kBallotOffset + 16;
 
-bool isSubgroupOp(Op op) { return op >= Op::SubgroupBallot && op <= Op::SubgroupAll; }
+bool isSubgroupOp(Op op) { return op >= Op::SubgroupBallot && op <= Op::SubgroupArith; }
 
 bool usesWaveOps(const Block& b) {
     return std::any_of(b.begin(), b.end(), [](const Node& n) {
@@ -181,6 +181,10 @@ private:
                     produced = exchange(seq, in.args[0], t, from);
                     break;
                 }
+                case Op::SubgroupArith:
+                    error_ = "wave 64 lowering: subgroup_arith is not supported";
+                    out.push_back(std::move(n));
+                    continue;
                 default: break;
             }
             // The instruction that computes the answer defines the original result id.

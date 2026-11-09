@@ -11,17 +11,18 @@
 namespace vpvk {
 namespace {
 
-// `quest`: the Quest 3 / Adreno 740 identity. `profile13` (extraExtensions(): always, except with the Quest
-// identity, where it is the conformance run, VPVK_EXTRA_EXTENSIONS=1) reports Vulkan 1.3 like the Adreno 740;
-// Quest games keep seeing 1.1 until the CTS has validated what 1.2 / 1.3 require.
-VkPhysicalDeviceProperties makeProps(bool quest, bool profile13, bool geom) {
+// `quest`: the Quest 3 / Adreno 740 identity. One profile for games and for the conformance run: Vulkan 1.3 like the
+// Adreno 740, with every limit / feature / extension of the headset's report that the translator honours.
+VkPhysicalDeviceProperties makeProps(bool quest, bool geom) {
   VkPhysicalDeviceProperties p{};
-  p.apiVersion = profile13 || !quest ? VK_API_VERSION_1_3 : VK_API_VERSION_1_1;  // native: always 1.3
+  p.apiVersion = VK_API_VERSION_1_3;
   if (quest) {
     p.driverVersion = VK_MAKE_VERSION(512, 744, 0);  // Adreno drivers set bit 31; Unity rejects Qualcomm without it
     p.vendorID = 0x5143;      // Qualcomm: engines key their mobile paths off it
     p.deviceID = 0x43051401;  // Adreno 740 (the id Quest 3 titles check)
-    std::strncpy(p.deviceName, "Adreno (TM) 740", sizeof p.deviceName - 1);
+    // VPVK_QUEST_GPU_NAME: the host names the headset it presents ("Adreno (TM) 650" for a Quest 2); only the name changes.
+    const char* gpu = std::getenv("VPVK_QUEST_GPU_NAME");
+    std::strncpy(p.deviceName, gpu && *gpu ? gpu : "Adreno (TM) 740", sizeof p.deviceName - 1);
   } else {
     p.driverVersion = VK_MAKE_API_VERSION(0, 0, 1, 0);
     p.vendorID = 0x106B;  // Apple (PCI SIG); Apple GPUs have no device id
@@ -40,13 +41,13 @@ VkPhysicalDeviceProperties makeProps(bool quest, bool profile13, bool geom) {
   l.maxImageArrayLayers = 2048;
   l.maxTexelBufferElements = 1u << 26;
   l.maxUniformBufferRange = 65536;
-  l.maxStorageBufferRange = 1u << 30;
-  l.maxPushConstantsSize = 128;
+  l.maxStorageBufferRange = quest ? 134217728u : 1u << 30;  // Quest's 128 MiB
+  l.maxPushConstantsSize = 256;  // BoundState::push is 256 bytes; the block reaches the shader as one constant buffer
   l.maxMemoryAllocationCount = 4096;
   l.maxSamplerAllocationCount = 4000;
   l.bufferImageGranularity = 1;  // unified memory, no linear/optimal aliasing hazard
   l.sparseAddressSpaceSize = 0;
-  l.maxBoundDescriptorSets = 4;
+  l.maxBoundDescriptorSets = 7;  // the Adreno 740's; BoundState keeps 8 set slots
   l.maxPerStageDescriptorSamplers = quest ? 16 : 64;  // argument tables, not Metal's 16 sampler slots (Alyx sets hold 17)
   l.maxPerStageDescriptorUniformBuffers = 15;
   l.maxPerStageDescriptorStorageBuffers = 24;
@@ -64,7 +65,7 @@ VkPhysicalDeviceProperties makeProps(bool quest, bool profile13, bool geom) {
   l.maxDescriptorSetInputAttachments = 8;
   l.maxVertexInputAttributes = 31;  // Metal's vertex buffer table keeps slot 30 for arguments
   l.maxVertexInputBindings = 31;
-  l.maxVertexInputAttributeOffset = 2047;
+  l.maxVertexInputAttributeOffset = 4096;  // vertex pulling: the offset is a 32-bit shader constant
   l.maxVertexInputBindingStride = 2048;
   l.maxVertexOutputComponents = 124;
   l.maxTessellationGenerationLevel = 0;
@@ -100,7 +101,7 @@ VkPhysicalDeviceProperties makeProps(bool quest, bool profile13, bool geom) {
   l.maxComputeWorkGroupInvocations = 1024;
   l.maxComputeWorkGroupSize[0] = 1024;
   l.maxComputeWorkGroupSize[1] = 1024;
-  l.maxComputeWorkGroupSize[2] = 64;
+  l.maxComputeWorkGroupSize[2] = 1024;  // Metal bounds each axis by 1024; the product stays <= maxComputeWorkGroupInvocations
   l.subPixelPrecisionBits = 8;
   l.subTexelPrecisionBits = 8;
   l.mipmapPrecisionBits = 8;
@@ -135,11 +136,11 @@ VkPhysicalDeviceProperties makeProps(bool quest, bool profile13, bool geom) {
   l.storageImageSampleCounts = VK_SAMPLE_COUNT_1_BIT;
   l.maxSampleMaskWords = 1;
   l.timestampComputeAndGraphics = VK_TRUE;
-  l.timestampPeriod = 1.0f;  // nanoseconds
+  l.timestampPeriod = quest ? 52.083336f : 1.0f;  // queries hold host nanoseconds / period (commands.cpp queryEnd); Quest: Adreno's 19.2 MHz tick
   l.maxClipDistances = 8;
   l.maxCullDistances = 0;
   l.maxCombinedClipAndCullDistances = 8;
-  l.discreteQueuePriorities = 2;
+  l.discreteQueuePriorities = 4;  // one in-order queue: priorities are accepted and ignored
   l.pointSizeRange[0] = 1;
   l.pointSizeRange[1] = 511;
   l.lineWidthRange[0] = l.lineWidthRange[1] = 1;
@@ -149,7 +150,7 @@ VkPhysicalDeviceProperties makeProps(bool quest, bool profile13, bool geom) {
   l.standardSampleLocations = VK_TRUE;
   l.optimalBufferCopyOffsetAlignment = 64;
   l.optimalBufferCopyRowPitchAlignment = 64;
-  l.nonCoherentAtomSize = 64;
+  l.nonCoherentAtomSize = 1;  // only coherent memory types are offered: flush / invalidate need no alignment
   return p;
 }
 
@@ -218,15 +219,20 @@ constexpr FormatRow kFormats[] = {
     // B4G4R4A4 (mandatory: sample, filter, blit source) = the same texture with R and B swapped:
     // image views swizzle them back, clears and blit sources swap them (isSwappedRB).
     {VK_FORMAT_B4G4R4A4_UNORM_PACK16, vpgpu::Format::ABGR4Unorm},
+    // A2R10G10B10 = A2B10G10R10 with R and B swapped (isSwappedRB): the same texture, views swizzle them back.
+    {VK_FORMAT_B5G6R5_UNORM_PACK16, vpgpu::Format::B5G6R5Unorm},  // R5G6B5 with R and B swapped
+    {VK_FORMAT_A2R10G10B10_UNORM_PACK32, vpgpu::Format::RGB10A2Unorm},
+    {VK_FORMAT_A2R10G10B10_UINT_PACK32, vpgpu::Format::RGB10A2Uint},
+    // Single and dual channel sRGB (Metal: R8Unorm_sRGB / RG8Unorm_sRGB).
+    {VK_FORMAT_R8_SRGB, vpgpu::Format::R8Srgb}, {VK_FORMAT_R8G8_SRGB, vpgpu::Format::RG8Srgb},
     {VK_FORMAT_D16_UNORM, vpgpu::Format::D16Unorm}, {VK_FORMAT_D32_SFLOAT, vpgpu::Format::D32Float},
     {VK_FORMAT_D24_UNORM_S8_UINT, vpgpu::Format::D24UnormS8},
     // Depth-only D24 (common on Android GPUs): the same texture as D24S8 (Apple: Depth32Float_Stencil8,
     // D24 copies converted), stencil unused. Also what a D24S8 depth resolve may target.
     {VK_FORMAT_X8_D24_UNORM_PACK32, vpgpu::Format::D24UnormS8},
     {VK_FORMAT_D32_SFLOAT_S8_UINT, vpgpu::Format::D32FloatS8}, {VK_FORMAT_S8_UINT, vpgpu::Format::S8Uint},
-    // BCn only where textureCompressionBC() says so (toCoreFormat); not with the Quest identity: the Adreno 740 has
-    // none, so a title takes its ETC2/ASTC path (the one its Quest package ships). BC1_RGB is BC1_RGBA with alpha
-    // read as one (vkCreateImageView swizzle).
+    // BCn only where textureCompressionBC() says so (toCoreFormat: the GPU samples it; the Adreno 740 reports it too).
+    // BC1_RGB is BC1_RGBA with alpha read as one (vkCreateImageView swizzle).
     {VK_FORMAT_BC1_RGB_UNORM_BLOCK, vpgpu::Format::BC1}, {VK_FORMAT_BC1_RGB_SRGB_BLOCK, vpgpu::Format::BC1Srgb},
     {VK_FORMAT_BC1_RGBA_UNORM_BLOCK, vpgpu::Format::BC1}, {VK_FORMAT_BC1_RGBA_SRGB_BLOCK, vpgpu::Format::BC1Srgb},
     {VK_FORMAT_BC2_UNORM_BLOCK, vpgpu::Format::BC2}, {VK_FORMAT_BC2_SRGB_BLOCK, vpgpu::Format::BC2Srgb},
@@ -259,15 +265,12 @@ constexpr FormatRow kFormats[] = {
 }  // namespace
 
 const VkPhysicalDeviceProperties& deviceProperties() {
-  static const VkPhysicalDeviceProperties v[2][2][2] = {
-      {{makeProps(false, false, false), makeProps(false, false, true)},
-       {makeProps(false, true, false), makeProps(false, true, true)}},
-      {{makeProps(true, false, false), makeProps(true, false, true)},
-       {makeProps(true, true, false), makeProps(true, true, true)}}};
-  return v[questIdentity()][extraExtensions()][reportGeom()];
+  static const VkPhysicalDeviceProperties v[2][2] = {{makeProps(false, false), makeProps(false, true)},
+                                                      {makeProps(true, false), makeProps(true, true)}};
+  return v[questIdentity()][reportGeom()];
 }
 
-bool textureCompressionBC() { return !questIdentity() && platformSupportsBC(); }
+bool textureCompressionBC() { return platformSupportsBC(); }  // the Adreno 740 reports BC1..BC7 too
 
 const VkPhysicalDeviceMemoryProperties& memoryProperties() {
   static const VkPhysicalDeviceMemoryProperties m = makeMem();
@@ -291,7 +294,10 @@ const MultiPlane& multiPlane(VkFormat f) {
   }
 }
 
-bool isSwappedRB(VkFormat f) { return f == VK_FORMAT_B4G4R4A4_UNORM_PACK16; }
+bool isSwappedRB(VkFormat f) {
+  return f == VK_FORMAT_B4G4R4A4_UNORM_PACK16 || f == VK_FORMAT_B5G6R5_UNORM_PACK16 || f == VK_FORMAT_A2R10G10B10_UNORM_PACK32 ||
+         f == VK_FORMAT_A2R10G10B10_UINT_PACK32;
+}
 
 vpgpu::Format toCoreFormat(VkFormat f) {
   for (const FormatRow& r : kFormats)
@@ -328,7 +334,8 @@ VkFormatFeatureFlags formatFeatures(VkFormat f, bool buffer) {
   if (isSwappedRB(f))
     return buffer || !extraExtensions()
                ? 0
-               : VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT | VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT |
+               : VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT |
+                     (vpgpu::formatInfo(core).integer() ? 0 : VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT) |
                      VK_FORMAT_FEATURE_BLIT_SRC_BIT | VK_FORMAT_FEATURE_TRANSFER_SRC_BIT |
                      VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
   const vpgpu::FormatInfo& info = vpgpu::formatInfo(core);
@@ -421,6 +428,7 @@ std::vector<VkExtensionProperties> deviceExtensions() {
   v.push_back({VK_EXT_HOST_QUERY_RESET_EXTENSION_NAME, 1});  // vkResetQueryPool (pipelines.cpp)
   v.push_back({VK_KHR_UNIFORM_BUFFER_STANDARD_LAYOUT_EXTENSION_NAME, 1});
   v.push_back({VK_EXT_PRIVATE_DATA_EXTENSION_NAME, 1});              // ext.cpp
+  v.push_back({VK_EXT_INDEX_TYPE_UINT8_EXTENSION_NAME, 1});          // pipelines.cpp widenIndexU8
   v.push_back({VK_KHR_8BIT_STORAGE_EXTENSION_NAME, 1});              // lower.cpp load16 / store16 (bytes)
   v.push_back({VK_KHR_SHADER_FLOAT16_INT8_EXTENSION_NAME, 1});       // lower.cpp F16 / narrowInt
   v.push_back({VK_KHR_VULKAN_MEMORY_MODEL_EXTENSION_NAME, 3});       // lower.cpp semanticsFence
@@ -435,6 +443,26 @@ std::vector<VkExtensionProperties> deviceExtensions() {
   v.push_back({VK_EXT_EXTENDED_DYNAMIC_STATE_EXTENSION_NAME, 1});    // pipelines.cpp pipelineFor / makeDraw
   v.push_back({VK_EXT_EXTENDED_DYNAMIC_STATE_2_EXTENSION_NAME, 1});  // (without logic op / patch control points)
   v.push_back({VK_EXT_MULTI_DRAW_EXTENSION_NAME, 1});  // not an Adreno extension at all
+  v.push_back({VK_KHR_SHADER_SUBGROUP_EXTENDED_TYPES_EXTENSION_NAME, 1});       // lower.cpp laneOp
+  v.push_back({VK_EXT_IMAGE_ROBUSTNESS_EXTENSION_NAME, 1});                     // lower.cpp imageInBounds
+  v.push_back({VK_EXT_PIPELINE_CREATION_CACHE_CONTROL_EXTENSION_NAME, 3});      // pipelines.cpp
+  v.push_back({VK_KHR_ZERO_INITIALIZE_WORKGROUP_MEMORY_EXTENSION_NAME, 1});     // lower.cpp zeroWorkgroup
+  v.push_back({VK_KHR_SHADER_INTEGER_DOT_PRODUCT_EXTENSION_NAME, 1});           // lower.cpp dotProduct
+  // Core 1.1-1.3 features that were already implemented and only lacked their extension name (Quest lists them).
+  v.push_back({VK_KHR_SHADER_TERMINATE_INVOCATION_EXTENSION_NAME, 1});           // OpTerminateInvocation -> discard_fragment
+  v.push_back({VK_KHR_FORMAT_FEATURE_FLAGS_2_EXTENSION_NAME, 2});                // VkFormatProperties3 (entry.cpp)
+  v.push_back({VK_KHR_RELAXED_BLOCK_LAYOUT_EXTENSION_NAME, 1});                  // spirv layout is not validated
+  v.push_back({VK_EXT_PIPELINE_CREATION_FEEDBACK_EXTENSION_NAME, 1});            // pipelines.cpp fillCreationFeedback
+  v.push_back({VK_EXT_TOOLING_INFO_EXTENSION_NAME, 1});                          // ext.cpp (empty list)
+  v.push_back({VK_EXT_LOAD_STORE_OP_NONE_EXTENSION_NAME, 1});                    // LOAD_OP_NONE -> Load, STORE_OP_NONE -> Store
+  v.push_back({VK_KHR_SHADER_NON_SEMANTIC_INFO_EXTENSION_NAME, 1});              // NonSemantic.* ext-insts ignored (spirv)
+  v.push_back({VK_KHR_SPIRV_1_4_EXTENSION_NAME, 1});
+  v.push_back({VK_KHR_SHADER_FLOAT_CONTROLS_EXTENSION_NAME, 4});                 // properties in entry.cpp
+  v.push_back({VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME, 2});                       // pipelines.cpp vkCmdPushDescriptorSetKHR
+  v.push_back({VK_EXT_DEPTH_CLIP_ENABLE_EXTENSION_NAME, 1});                     // pipelines.cpp: static state only
+  v.push_back({VK_EXT_VERTEX_ATTRIBUTE_DIVISOR_EXTENSION_NAME, 3});              // lower.cpp dividedInstance (vertex pulling)
+  v.push_back({VK_EXT_ASTC_DECODE_MODE_EXTENSION_NAME, 1});                      // VkImageViewASTCDecodeModeEXT accepted, decoded as float
+  v.push_back({VK_EXT_TEXEL_BUFFER_ALIGNMENT_EXTENSION_NAME, 1});                // properties + features in entry.cpp
   // What Half-Life: Alyx (Source 2) asks of a Vulkan 1.3 device and an Adreno does not list: native identity only,
   // never with the Quest identity (not even with VPVK_EXTRA_EXTENSIONS=1).
   if (nativeExtras()) {

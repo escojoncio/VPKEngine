@@ -168,6 +168,8 @@ class MetalBackend final : public Backend {
   // timeoutNs 0 polls.
   WaitResult waitFrames(uint64_t frames, uint64_t timeoutNs);
   bool lost() const override;
+  // Logs the command buffers committed and not completed (gpu.hang lines: label, age, scheduled, pipelines). Any thread.
+  void dumpInFlight(const char* why);
   // First loss reason, empty while healthy (no in-process recovery: see lostReason in metal_backend.mm).
   std::string lostReason() const;
   // Age in ms of the oldest in-flight frame command buffer (0 when idle): the GPU's backlog. Any thread.
@@ -212,7 +214,11 @@ class MetalBackend final : public Backend {
   void* nativeQueue() const;
   void* nativeTexture(TextureId);
   // Writes the pipeline binary archive under cacheRoot; false (and a gpu.err line) on failure.
-  bool saveArchive();
+  // `complete`: the explicit prepare step (nobody waits, the archive must end up complete): adds the whole queue (10 min at most)
+  // instead of the 8 s the end of the process and the background get.
+  // `progress(done, total)`: entries added of those queued at the start, after every step (calling thread); a complete flush also
+  // pauses 200 ms per step while free memory is under the harvest's threshold (it never skips entries).
+  bool saveArchive(bool complete = false, const std::function<void(uint32_t, uint32_t)>& progress = nullptr);
   // Compiles the MTLLibrary/MTLFunction of a shader already in the ShaderProvider on a background
   // queue, so pipeline creation later finds it compiled. Deduplicated by shader id (= MSL hash).
   void prewarmShader(uint64_t shaderId);
@@ -241,6 +247,10 @@ class MetalBackend final : public Backend {
     // do are in archiveAdded), same descriptor as one already archived (archiveDup), and refused or lost
     // for any other reason (archiveSkipOther: no vertex / compute function, addRender... failed, dropped when saving).
     uint32_t archiveAdded = 0, archiveSkipDepth = 0, archiveSkipOther = 0, archiveDup = 0;
+    // Of archiveAdded, those already serialized to disk (archiveSerialized); queued and added but not on disk yet
+    // (archivePending); refused at the queue's fuse, 32768 entries (archiveSpilled).
+    uint32_t archiveSerialized = 0, archivePending = 0, archiveSpilled = 0;
+    uint32_t archiveTrimDropped = 0;  // queued entries dropped by a critical trim (cumulative)
     uint64_t libCompiled = 0;       // libraries compiled this process (cumulative)
     uint64_t tileRejected = 0;      // attachments that could not stay tile-local (cumulative)
     uint64_t msaaMemoryless = 0;    // MSAA targets (colour or depth) with no memory now (tile only): size had they been resident
@@ -259,13 +269,18 @@ class MetalBackend final : public Backend {
   // Sets the GPUMEM / PSO / GPUCNT probe metrics (vpgpu/core/probe.h) from memStats() and diagCounters(); no-op while the probe is off.
   void publishProbe() const;
   // Memory warning (level 1) / critical (2); any thread. Frees what is rebuildable (see metal_backend.mm), appends
-  // "key=MiB ..." to `report`, returns bytes freed immediately (submit-thread work is queued, reported as *_queued).
+  // "key=MiB ..." to `report`, returns bytes freed immediately (submit-thread work is queued; msaa_live / args_live are what is alive
+  // now, *_freed_since_last what earlier requests have given back since the previous report; trimSerialized does the queued part at once).
   size_t trimMemory(int level, std::string& report);
   // Releases the objects the guest destroyed that otherwise wait for the next frame to take a slot: the retired lists
   // of frames whose command buffers all completed, and the graveyard once the last submitted frame completed. Needs
   // no idle device (`minIdleMs` is ignored). NOT any-thread: same serialization as submit/destroyTexture (VPVulkan
   // calls it under its submit mutex, try-lock). Never waits. Bytes released.
   size_t drainRetired(uint32_t minIdleMs, std::string& report);
+  // The submit-thread half of trimMemory done at once: MSAA backings not used by the last frame and idle slots' chained
+  // argument buffers go to the graveyard (drainRetired then returns the part no frame reads). Same caller rules as
+  // drainRetired (under VPVulkan's submit mutex). Never waits. Returns the bytes moved; appends "serialized_msaa= serialized_args=" (MiB).
+  size_t trimSerialized(std::string& report);
   // Cumulative counters (key, value) of what the backend created and encoded, for the per-second diagnostics; keys
   // starting "g_" are gauges. Any thread, lock-free.
   void diagCounters(std::vector<std::pair<const char*, uint64_t>>& out) const;

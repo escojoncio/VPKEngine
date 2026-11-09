@@ -1,0 +1,444 @@
+name: GLES CTS
+
+# Khronos dEQP for OpenGL ES (deqp-gles2, deqp-gles3, deqp-gles31) against vpgles (gpu/gles: GLES -> VPVulkan -> Metal) on a macOS
+# arm64 runner. The modules are the CTS ones, built with a "vpgles" target (tools/cts/gles): the CTS's own surfaceless EGL platform on
+# a small EGL + GLESv2 shim (libEGL.dylib, libGLESv2.dylib re-exporting libVPGLES.dylib) that forwards every egl*/gl* call to
+# vpgles_proc() of libVPVulkan.dylib. Independent from the Vulkan CTS workflow (cts.yml): only on demand, a manual run or a push
+# whose commit message says [gles] ([gles-rapida] also runs the sharded "rapida" profile). Jobs:
+#   vpvulkan    libVPVulkan.dylib built natively for macOS (vpgles is linked inside)
+#   shim        libVPGLES/libEGL/libGLESv2.dylib from the Khronos headers (tools/cts/gles/gen_shim.py)
+#   deqp-build  deqp-gles2 / deqp-gles3 / deqp-gles31 for macOS (sources shared with cts.yml; ccache and binary per module)
+#   smoke       info + prerequisite groups of each module
+#   plan        case lists of the profile (tools/cts/gles_caselists.py) -> job matrix (a shard never mixes modules)
+#   shard       one lot per job (max 5 macOS jobs at a time); a crash is recorded and the lot goes on
+#   report      all shards merged, diff against the previous run, published to the ci-logs-gles-report branch
+on:
+  workflow_dispatch:
+    inputs:
+      profile:
+        description: "Profile of the sharded run (none = only build and smoke)"
+        type: choice
+        options: [none, rapida]
+        default: none
+      shard-size:
+        description: "Cases per shard"
+        default: "1500"
+      cases:
+        description: "Focused run: deqp case wildcards, comma separated (skips smoke; full logs on ci-logs-gles-focus)"
+        default: ""
+      gl-config:
+        description: "deqp --deqp-gl-config-name (ms0 = non-multisampled config, as the tests that skip on MSAA expect; ms4 for the default-framebuffer multisample tests)"
+        default: "rgba8888d24s8ms0"
+  push:
+    branches: [main]
+
+permissions:
+  contents: write # to publish logs to the ci-logs-gles-* branches
+  actions: read   # to download the previous run's summary
+
+env:
+  CTS_TAG: vulkan-cts-1.4.6.2
+  PUBLISH_PREFIX: ci-logs-gles-
+  # The driver as games run it on the headset: Quest identity, synchronous pipelines (vpgles has no PSO precache).
+  DRIVER_ENV: >-
+    --env VPVK_QUEST_IDENTITY=1 --env VPVK_GLES_SYNC_PIPELINES=1 --env VPVK_PREWARM=0 --env VPGLES_CRASH_TRACE=1 --env VPGLES_STRICT_GLSL=1
+  GL_ARGS: >-
+    --deqp-gl-config-name=${{ inputs.gl-config || 'rgba8888d24s8ms0' }} --deqp-surface-type=pbuffer --deqp-surface-width=256 --deqp-surface-height=256
+
+jobs:
+  vpvulkan:
+    concurrency:
+      group: gles-vpvulkan-${{ github.sha }}
+      cancel-in-progress: true
+    if: github.event_name == 'workflow_dispatch' || contains(github.event.head_commit.message, '[gles')
+    runs-on: macos-26
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Xcode
+        run: |
+          XCODE=$(ls -d /Applications/Xcode_26*.app 2>/dev/null | sort -V | tail -1)
+          [ -n "$XCODE" ] && sudo xcode-select -s "$XCODE/Contents/Developer"
+          xcodebuild -version && cmake --version | head -1 && ninja --version || brew install ninja
+      - name: "Build libVPVulkan.dylib for macOS (arm64, ninja -k 0 to see every error)"
+        shell: bash
+        run: |
+          set -o pipefail
+          mkdir -p build/logs
+          { cmake -S gpu -B build/gpu-mac -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_ARCHITECTURES=arm64 \
+              -DCMAKE_OSX_DEPLOYMENT_TARGET=26.0 \
+            && ninja -k 0 -C build/gpu-mac VPVulkan; } 2>&1 | tee build/logs/build-mac.txt
+          nm -gU build/gpu-mac/vulkan/libVPVulkan.dylib | grep -E " _(vpgles_init|vpgles_proc|vkGetInstanceProcAddr)$" | tee -a build/logs/build-mac.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: libVPVulkan-macos-gles
+          path: build/gpu-mac/vulkan/libVPVulkan.dylib
+          if-no-files-found: error
+      - name: Publish logs (ci-logs-gles-vpvulkan)
+        if: always()
+        env: { GITHUB_TOKEN: "${{ github.token }}" }
+        run: bash tools/cts/publish-logs.sh vpvulkan build/logs
+
+  shim:
+    if: github.event_name == 'workflow_dispatch' || contains(github.event.head_commit.message, '[gles')
+    runs-on: macos-26
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Xcode
+        run: |
+          XCODE=$(ls -d /Applications/Xcode_26*.app 2>/dev/null | sort -V | tail -1)
+          [ -n "$XCODE" ] && sudo xcode-select -s "$XCODE/Contents/Developer"
+      - name: EGL and GLES shim
+        shell: bash
+        run: |
+          set -o pipefail
+          mkdir -p build/logs
+          { bash tools/cts/gles/fetch-headers.sh build/khr && bash tools/cts/gles/build-shim.sh build/khr build/shim; } 2>&1 | tee build/logs/shim.txt
+          cp build/shim/vpgles_shim.c build/logs/ 2>/dev/null || true
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gles-shim-macos
+          path: |
+            build/shim/libVPGLES.dylib
+            build/shim/libEGL.dylib
+            build/shim/libGLESv2.dylib
+          if-no-files-found: error
+      - name: Publish logs (ci-logs-gles-shim)
+        if: always()
+        env: { GITHUB_TOKEN: "${{ github.token }}" }
+        run: bash tools/cts/publish-logs.sh shim build/logs
+
+  deqp-build:
+    # A running build is never cancelled by a newer push (hours of work): the next run waits, and finds the caches.
+    strategy:
+      fail-fast: false
+      matrix:
+        module: [gles2, gles3, gles31]
+    concurrency:
+      group: gles-deqp-build-${{ matrix.module }}
+      cancel-in-progress: false
+    if: github.event_name == 'workflow_dispatch' || contains(github.event.head_commit.message, '[gles')
+    runs-on: macos-26
+    timeout-minutes: 355
+    env:
+      CCACHE_DIR: ${{ github.workspace }}/.ccache
+      CCACHE_MAXSIZE: 5G
+      HOMEBREW_NO_AUTO_UPDATE: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Xcode
+        id: xcode
+        run: |
+          XCODE=$(ls -d /Applications/Xcode_26*.app 2>/dev/null | sort -V | tail -1)
+          [ -n "$XCODE" ] && sudo xcode-select -s "$XCODE/Contents/Developer"
+          xcodebuild -version
+          echo "version=$(xcodebuild -version | tr '\n ' '__')" >> "$GITHUB_OUTPUT"
+      - name: Previous binary of this module
+        id: bin
+        uses: actions/cache/restore@v4
+        with:
+          path: deqp-bin
+          key: deqp-${{ matrix.module }}-bin-${{ runner.arch }}-${{ steps.xcode.outputs.version }}-${{ env.CTS_TAG }}-${{ hashFiles('tools/cts/gles/vpgles.cmake', 'tools/cts/gles/prepare-cts.sh') }}-v1
+      - name: Tools
+        if: steps.bin.outputs.cache-hit != 'true'
+        run: brew install ccache ninja coreutils 2>&1 | tail -3; ccache --version | head -1; ninja --version
+      - uses: actions/cache/restore@v4
+        id: src
+        if: steps.bin.outputs.cache-hit != 'true'
+        with:
+          path: cts
+          key: vkcts-src-mac-${{ env.CTS_TAG }}-v1
+      - name: VK-GL-CTS sources and dependencies
+        if: steps.bin.outputs.cache-hit != 'true' && steps.src.outputs.cache-hit != 'true'
+        run: |
+          set -o pipefail
+          git clone -q --depth 1 --branch "$CTS_TAG" https://github.com/KhronosGroup/VK-GL-CTS cts
+          (cd cts && python3 external/fetch_sources.py 2>&1 | tail -40)
+      - uses: actions/cache/save@v4
+        if: steps.bin.outputs.cache-hit != 'true' && steps.src.outputs.cache-hit != 'true'
+        with:
+          path: cts
+          key: vkcts-src-mac-${{ env.CTS_TAG }}-v1
+      - uses: actions/cache/restore@v4
+        if: steps.bin.outputs.cache-hit != 'true'
+        with:
+          path: .ccache
+          key: deqp-${{ matrix.module }}-ccache-${{ env.CTS_TAG }}-${{ github.run_id }}
+          restore-keys: deqp-${{ matrix.module }}-ccache-${{ env.CTS_TAG }}-
+      - name: Shim to link against, Khronos headers and the vpgles target
+        if: steps.bin.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          set -o pipefail
+          mkdir -p build/logs
+          { bash tools/cts/gles/fetch-headers.sh "$PWD/build/khr" \
+            && bash tools/cts/gles/build-shim.sh "$PWD/build/khr" "$PWD/build/shim" \
+            && bash tools/cts/gles/prepare-cts.sh cts; } 2>&1 | tee build/logs/prepare.txt
+      - name: Configure (DEQP_TARGET=vpgles)
+        if: steps.bin.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          set -o pipefail
+          cmake -G Ninja -S cts -B build/cts -DDEQP_TARGET=vpgles -DSELECTED_BUILD_TARGETS=deqp-${{ matrix.module }} \
+            -DVPGLES_SHIM_DIR="$PWD/build/shim" -DVPGLES_INCLUDE="$PWD/build/khr" \
+            -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_ARCHITECTURES=arm64 -DCMAKE_OSX_DEPLOYMENT_TARGET=26.0 \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache 2>&1 | tee build/logs/configure.txt | tail -60
+      - name: Build deqp-${{ matrix.module }} (ninja -k 0; stops by itself before the job limit so the compiler cache is saved)
+        if: steps.bin.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          set -o pipefail
+          ccache -z > /dev/null
+          gtimeout 300m cmake --build build/cts --target deqp-${{ matrix.module }} -- -k 0 2>&1 \
+            | grep -v "^\[[0-9]*/[0-9]*\] Building" | tail -400 | tee build/logs/build.txt || true
+          ccache -s | tee -a build/logs/build.txt
+      - uses: actions/cache/save@v4
+        if: always() && steps.bin.outputs.cache-hit != 'true'
+        with:
+          path: .ccache
+          key: deqp-${{ matrix.module }}-ccache-${{ env.CTS_TAG }}-${{ github.run_id }}
+      - name: Collect deqp-${{ matrix.module }} and its data
+        if: steps.bin.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          M=build/cts/modules/${{ matrix.module }}
+          test -f "$M/deqp-${{ matrix.module }}" || { echo "deqp-${{ matrix.module }} was not built"; exit 1; }
+          mkdir -p deqp-bin
+          cp "$M/deqp-${{ matrix.module }}" deqp-bin/
+          cp -R "$M/${{ matrix.module }}" deqp-bin/
+          du -sh deqp-bin/* | tee -a build/logs/build.txt
+          file deqp-bin/deqp-${{ matrix.module }} | tee -a build/logs/build.txt
+          otool -L deqp-bin/deqp-${{ matrix.module }} | tee -a build/logs/build.txt
+      - uses: actions/cache/save@v4
+        if: success() && steps.bin.outputs.cache-hit != 'true'
+        with:
+          path: deqp-bin
+          key: deqp-${{ matrix.module }}-bin-${{ runner.arch }}-${{ steps.xcode.outputs.version }}-${{ env.CTS_TAG }}-${{ hashFiles('tools/cts/gles/vpgles.cmake', 'tools/cts/gles/prepare-cts.sh') }}-v1
+      - name: Pack for the other jobs
+        run: tar -C deqp-bin -cf deqp-bin.tar .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: deqp-${{ matrix.module }}-macos
+          path: deqp-bin.tar
+          compression-level: 1
+          retention-days: 7
+          if-no-files-found: error
+      - name: Publish logs (ci-logs-gles-deqp-build-${{ matrix.module }})
+        if: always()
+        env: { GITHUB_TOKEN: "${{ github.token }}" }
+        run: mkdir -p build/logs && bash tools/cts/publish-logs.sh deqp-build-${{ matrix.module }} build/logs
+
+  smoke:
+    needs: [vpvulkan, shim, deqp-build]
+    if: inputs.cases == ''
+    concurrency:
+      group: gles-smoke-${{ github.sha }}
+      cancel-in-progress: true
+    runs-on: macos-26
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with: { name: libVPVulkan-macos-gles, path: lib }
+      - uses: actions/download-artifact@v4
+        with: { name: gles-shim-macos, path: shim }
+      - uses: actions/download-artifact@v4
+        with: { pattern: "deqp-*-macos", path: pack }
+      - name: Smoke - info and prerequisite groups of each module
+        shell: bash
+        run: |
+          set -o pipefail
+          mkdir -p deqp-bin build/logs build/smoke
+          for t in pack/*/deqp-bin.tar; do tar -C deqp-bin -xf "$t"; done
+          cp shim/*.dylib deqp-bin/ && chmod +x deqp-bin/deqp-gles*
+          ls -la deqp-bin | tee build/logs/smoke-files.txt
+          export VPGLES_VULKAN_LIB="$GITHUB_WORKSPACE/lib/libVPVulkan.dylib"
+          for m in gles2 gles3 gles31; do
+            U=$(echo "$m" | tr a-z A-Z)
+            case $m in gles31) pat="dEQP-$U.info.*";; *) pat="dEQP-$U.info.*,dEQP-$U.functional.prerequisite.*";; esac
+            mkdir -p build/smoke/$m
+            (cd deqp-bin && ./deqp-$m --deqp-runmode=stdout-caselist --deqp-case="$pat" $GL_ARGS \
+              > "$GITHUB_WORKSPACE/build/smoke/$m/caselist.txt" 2> "$GITHUB_WORKSPACE/build/logs/$m-caselist-stderr.txt") || true
+            head -c 800 build/logs/$m-caselist-stderr.txt; head -c 300 build/smoke/$m/caselist.txt; echo
+            sed -n 's/^TEST: //p' build/smoke/$m/caselist.txt > build/smoke/$m/cases.txt
+            wc -l build/smoke/$m/cases.txt
+            python3 -I tools/cts/run_lot.py --deqp deqp-bin/deqp-$m --caselist build/smoke/$m/cases.txt --out build/smoke/$m/out \
+              --budget-min 10 --idle-s 180 --env VPGLES_VULKAN_LIB="$VPGLES_VULKAN_LIB" $DRIVER_ENV -- $GL_ARGS 2>&1 | tee build/logs/$m-run.txt || true
+            cat build/smoke/$m/out/summary.md >> "$GITHUB_STEP_SUMMARY" || true
+            cp build/smoke/$m/out/fails.txt build/logs/$m-fails.txt 2>/dev/null || true
+            cp build/smoke/$m/out/lot.json build/logs/$m-lot.json 2>/dev/null || true
+            cp build/smoke/$m/out/summary.md build/logs/$m-summary.md 2>/dev/null || true
+            head -c 200000 build/smoke/$m/out/attempt-1.log > build/logs/$m-attempt-1.log 2>/dev/null || true
+            head -c 300000 build/smoke/$m/out/attempt-1.qpa > build/logs/$m-attempt-1.qpa.head 2>/dev/null || true
+          done
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: gles-smoke
+          path: build/smoke
+          retention-days: 14
+      - name: Publish logs (ci-logs-gles-smoke)
+        if: always()
+        env: { GITHUB_TOKEN: "${{ github.token }}" }
+        run: mkdir -p build/logs && bash tools/cts/publish-logs.sh smoke build/logs
+
+  focus:
+    # A few cases with the whole log of every failure (shader sources included): the quick loop for fixing a cluster.
+    needs: [vpvulkan, shim, deqp-build]
+    if: inputs.cases != ''
+    concurrency:
+      group: gles-focus-${{ github.ref }}
+      cancel-in-progress: true
+    runs-on: macos-26
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with: { name: libVPVulkan-macos-gles, path: lib }
+      - uses: actions/download-artifact@v4
+        with: { name: gles-shim-macos, path: shim }
+      - uses: actions/download-artifact@v4
+        with: { pattern: "deqp-*-macos", path: pack }
+      - name: Focused cases (each module that has cases matching)
+        shell: bash
+        run: |
+          set -o pipefail
+          mkdir -p deqp-bin build/logs build/focus
+          for t in pack/*/deqp-bin.tar; do tar -C deqp-bin -xf "$t"; done
+          cp shim/*.dylib deqp-bin/ && chmod +x deqp-bin/deqp-gles*
+          export VPGLES_VULKAN_LIB="$GITHUB_WORKSPACE/lib/libVPVulkan.dylib"
+          for m in gles2 gles3 gles31; do
+            mkdir -p build/focus/$m
+            (cd deqp-bin && ./deqp-$m --deqp-runmode=stdout-caselist --deqp-case='${{ inputs.cases }}' $GL_ARGS \
+              > "$GITHUB_WORKSPACE/build/focus/$m/caselist.txt" 2> "$GITHUB_WORKSPACE/build/logs/$m-caselist-stderr.txt") || true
+            sed -n 's/^TEST: //p' build/focus/$m/caselist.txt > build/focus/$m/cases.txt
+            wc -l build/focus/$m/cases.txt
+            [ -s build/focus/$m/cases.txt ] || continue
+            python3 -I tools/cts/run_lot.py --deqp deqp-bin/deqp-$m --full --images --caselist build/focus/$m/cases.txt --out build/focus/$m/out \
+              --budget-min 45 --idle-s 300 --env VPGLES_VULKAN_LIB="$VPGLES_VULKAN_LIB" $DRIVER_ENV -- $GL_ARGS 2>&1 | tee build/logs/$m-focus-run.txt || true
+            for f in summary.md lot.json fails.txt fails-full.txt; do cp build/focus/$m/out/$f build/logs/$m-$f 2>/dev/null || true; done
+            for f in build/focus/$m/out/attempt-*.log; do tail -c 300000 "$f" > "build/logs/$m-$(basename "$f").tail" 2>/dev/null || true; done
+            for f in build/focus/$m/out/attempt-*.qpa; do head -c 6000000 "$f" > "build/logs/$m-$(basename "$f").head" 2>/dev/null || true; done
+          done
+      - name: Publish logs (ci-logs-gles-focus)
+        if: always()
+        env: { GITHUB_TOKEN: "${{ github.token }}" }
+        run: bash tools/cts/publish-logs.sh focus build/logs
+
+  plan:
+    if: (github.event_name == 'workflow_dispatch' && inputs.profile == 'rapida') || contains(github.event.head_commit.message, '[gles-rapida]')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      matrix: ${{ steps.m.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Mustpass lists of the CTS tag
+        run: |
+          git clone -q --depth 1 --filter=blob:none --sparse --branch "$CTS_TAG" https://github.com/KhronosGroup/VK-GL-CTS cts-mp
+          git -C cts-mp sparse-checkout set external/openglcts/data/gl_cts/data/mustpass/gles/aosp_mustpass/main
+      - name: Lots of the profile
+        id: m
+        run: |
+          python3 -I tools/cts/gles_caselists.py cts-mp/external/openglcts/data/gl_cts/data/mustpass/gles/aosp_mustpass/main \
+            build/caselists --profile rapida --shard-size "${{ inputs.shard-size || '1500' }}"
+          echo "matrix=$(cat build/caselists/matrix.json)" >> "$GITHUB_OUTPUT"
+          cat build/caselists/rapida/index.tsv
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gles-caselists
+          path: build/caselists
+          retention-days: 7
+
+  shard:
+    needs: [plan, smoke]
+    strategy:
+      fail-fast: false
+      max-parallel: 5
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    runs-on: macos-26
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with: { name: libVPVulkan-macos-gles, path: lib }
+      - uses: actions/download-artifact@v4
+        with: { name: gles-shim-macos, path: shim }
+      - uses: actions/download-artifact@v4
+        with: { name: "deqp-${{ matrix.module }}-macos", path: pack }
+      - uses: actions/download-artifact@v4
+        with: { name: gles-caselists, path: caselists }
+      - name: Lot ${{ matrix.shard }} (${{ matrix.cases }} cases)
+        shell: bash
+        run: |
+          mkdir -p deqp-bin && tar -C deqp-bin -xf pack/deqp-bin.tar && cp shim/*.dylib deqp-bin/ && chmod +x deqp-bin/deqp-${{ matrix.module }}
+          # (a lot that crashes is recorded and the runner continues with the next case; the budget ends the lot cleanly)
+          python3 -I tools/cts/run_lot.py --deqp deqp-bin/deqp-${{ matrix.module }} --caselist "caselists/${{ matrix.file }}" --out out \
+            --budget-min 75 --idle-s 300 --env VPGLES_VULKAN_LIB="$GITHUB_WORKSPACE/lib/libVPVulkan.dylib" $DRIVER_ENV -- $GL_ARGS 2>&1 | tail -n 60
+          rm -f out/remaining-*.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: gles-shard-${{ matrix.shard }}
+          path: out
+          retention-days: 7
+
+  report:
+    needs: [plan, shard]
+    if: always() && needs.plan.result == 'success' && needs.shard.result != 'skipped'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with: { pattern: "gles-shard-*", path: shards }
+      - name: Merge the shards
+        run: |
+          mkdir -p build/report
+          python3 -I tools/cts/summarize.py --out build/report --title "GLES CTS rapida on vpgles (macOS, $CTS_TAG)" \
+            --merge shards/*/summary.json
+          python3 -I - <<'PY' > build/report/lots.md
+          import glob, json
+          print("| lot | cases | attempts | cases left | startup failed |\n|---|---:|---:|---:|---|")
+          for f in sorted(glob.glob("shards/*/lot.json")):
+              d = json.load(open(f))
+              print(f"| {f.split('/')[1]} | {d['cases']} | {len(d['attempts'])} | {d['left']} | {d['startup_failed']} |")
+          PY
+          cat build/report/lots.md
+          # What the driver said while the cases ran (numbers folded), most frequent first.
+          cat shards/*/attempt-*.log 2>/dev/null | grep -E "gles\.err|vk\.err|vk\.unimpl|vpgles-shim|unimpl" \
+            | sed -E 's/0x[0-9a-fA-F]+/0x#/g; s/[0-9]+/#/g' | sort | uniq -c | sort -rn | head -150 > build/report/driver-log-top.txt || true
+          head -40 build/report/driver-log-top.txt
+      - name: Diff against the previous run
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          PREV=$(gh api "repos/$GITHUB_REPOSITORY/actions/artifacts?name=gles-summary-rapida&per_page=10" \
+            --jq "[.artifacts[] | select(.expired == false and .workflow_run.id != $GITHUB_RUN_ID)] | first | .workflow_run.id // empty" || true)
+          echo "previous run: ${PREV:-none}"
+          mkdir -p build/prev
+          [ -n "$PREV" ] && gh run download "$PREV" -R "$GITHUB_REPOSITORY" -n gles-summary-rapida -D build/prev || true
+          python3 -I tools/cts/diff.py build/prev/summary.json build/report/summary.json --known tools/cts/gles/known-fails.txt \
+            --out build/report/diff.md || true
+      - name: Job summary
+        run: cat build/report/summary.md build/report/diff.md build/report/lots.md >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gles-summary-rapida
+          path: |
+            build/report/summary.json
+            build/report/summary.md
+            build/report/diff.md
+            build/report/lots.md
+            build/report/driver-log-top.txt
+          retention-days: 30
+      - name: Publish (ci-logs-gles-report)
+        if: always()
+        env: { GITHUB_TOKEN: "${{ github.token }}" }
+        run: |
+          mkdir -p build/pub && cp build/report/summary.md build/report/diff.md build/report/lots.md build/report/driver-log-top.txt build/pub/ 2>/dev/null || true
+          for f in shards/*/lot.json; do cp "$f" "build/pub/$(basename "$(dirname "$f")")-lot.json"; done 2>/dev/null || true
+          for f in shards/*/fails.txt; do cp "$f" "build/pub/$(basename "$(dirname "$f")")-fails.txt"; done 2>/dev/null || true
+          for f in shards/*/crash-tails.txt; do cp "$f" "build/pub/$(basename "$(dirname "$f")")-crash-tails.txt"; done 2>/dev/null || true
+          bash tools/cts/publish-logs.sh report build/pub

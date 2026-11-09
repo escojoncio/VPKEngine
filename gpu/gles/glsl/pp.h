@@ -10,7 +10,7 @@
 
 namespace vpglsl {
 
-enum class Tok : uint8_t { End, Ident, IntLit, UintLit, FloatLit, BoolLit, Punct, Newline, Hash };
+enum class Tok : uint8_t { End, Ident, IntLit, UintLit, FloatLit, BoolLit, Punct, Newline, Hash, Bad };  // Bad: a character the language does not have
 
 struct Token {
     Tok kind = Tok::End;
@@ -31,7 +31,9 @@ struct PpResult {
     bool es = true;
     std::set<std::string> extensions;  // enabled / required / warned
     int numViews = 0;                  // not set here (layout); kept for symmetry
+    bool invariantAll = false;         // #pragma STDGL invariant(all)
     bool ok = true;
+    std::vector<std::string> lenient;  // strict-mode rules let through (see ParseResult::lenient)
 };
 
 PpResult runPreprocessor(const std::string& source, Stage stage, std::string& log);

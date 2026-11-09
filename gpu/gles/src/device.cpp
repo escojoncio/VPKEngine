@@ -4,6 +4,7 @@
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>
+#include <thread>
 
 #include "context.h"
 
@@ -22,6 +23,10 @@ void logf(const char* fmt, ...) {
     std::vsnprintf(buf, sizeof buf, fmt, ap);
     va_end(ap);
     std::fprintf(stderr, "%s\n", buf);
+}
+
+void logLenient(const std::vector<std::string>& rules, const char* what, unsigned name) {
+    for (const std::string& r : rules) logf("gles.glsl.lenient rule=%s %s=%u", r.c_str(), what, name);
 }
 
 Device* device() { return gDevice; }
@@ -89,7 +94,10 @@ bool Device::init(PFN_vkGetInstanceProcAddr gipa) {
     dr.dynamicRendering = VK_TRUE;
     VkPhysicalDeviceMultiviewFeatures mv{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MULTIVIEW_FEATURES, &dr};
     mv.multiview = VK_TRUE;
+    VkPhysicalDeviceFeatures features{};
+    features.vertexPipelineStoresAndAtomics = VK_TRUE;  // transform feedback: the vertex shader writes the capture buffer
     VkDeviceCreateInfo dci{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, &mv};
+    dci.pEnabledFeatures = &features;
     dci.queueCreateInfoCount = 1, dci.pQueueCreateInfos = &q;
     dci.enabledExtensionCount = 3, dci.ppEnabledExtensionNames = exts;
     if (vk.vkCreateDevice(phys, &dci, nullptr, &device) != VK_SUCCESS) return false;
@@ -109,6 +117,7 @@ void Device::shutdown() {
     if (!device) return;
     texStatsTick(true);
     recipeStatsTick(true);
+    mapStatsTick(true);
     vk.vkDeviceWaitIdle(device);
     retire(true);
     for (VkDescriptorPool p : freePools) vk.vkDestroyDescriptorPool(device, p, nullptr);
@@ -238,14 +247,66 @@ VkImageView Image::attachmentView(uint32_t level, uint32_t layer, uint32_t layer
     return v;
 }
 
-VkImageView Image::storageView(uint32_t level, uint32_t layer, uint32_t layerCount, VkImageViewType type) {
-    const uint64_t key = 1ull << 62 | uint64_t(type) << 56 | uint64_t(level) << 40 | uint64_t(layer) << 20 | layerCount;
+ImageP createImage2D(Device* dev, const FormatInfo* f, uint32_t w, uint32_t h, uint32_t layers, uint32_t samples,
+                     VkImageUsageFlags usage, VkImageCreateFlags flags) {
+    auto img = std::make_shared<Image>();
+    img->dev = dev;
+    img->format = f;
+    img->width = std::max(w, 1u), img->height = std::max(h, 1u), img->layers = std::max(layers, 1u);
+    img->samples = VkSampleCountFlagBits(std::max(samples, 1u));
+    VkImageCreateInfo ci{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+    ci.imageType = VK_IMAGE_TYPE_2D, ci.format = f->vk, ci.extent = {img->width, img->height, 1};
+    ci.mipLevels = 1, ci.arrayLayers = img->layers, ci.samples = img->samples;
+    ci.tiling = VK_IMAGE_TILING_OPTIMAL;
+    ci.usage = usage;
+    ci.flags = flags;
+    ci.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    if (dev->vk.vkCreateImage(dev->device, &ci, nullptr, &img->image) != VK_SUCCESS) return nullptr;
+    VkMemoryRequirements req;
+    dev->vk.vkGetImageMemoryRequirements(dev->device, img->image, &req);
+    VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    mai.allocationSize = req.size;
+    mai.memoryTypeIndex = uint32_t(dev->memoryType(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT));
+    dev->vk.vkAllocateMemory(dev->device, &mai, nullptr, &img->memory);
+    dev->vk.vkBindImageMemory(dev->device, img->image, img->memory, 0);
+    return img;
+}
+
+ImageP Context::msTwin(uint32_t slot, const FormatInfo* f, uint32_t w, uint32_t h, uint32_t layers, uint32_t samples) {
+    const std::string key = std::to_string(slot) + "#" + std::to_string(int(f->vk)) + ":" + std::to_string(w) + "x" + std::to_string(h) +
+                            "x" + std::to_string(layers) + "@" + std::to_string(samples);
+    auto it = msTwins_.find(key);
+    if (it != msTwins_.end()) return it->second.use = msTwinEpoch_, it->second.image;
+    if (msTwins_.size() >= 32) {  // twins of sizes that are no longer rendered to (never one this passKeyFor asked for): recorded work may still use them
+        for (auto e = msTwins_.begin(); e != msTwins_.end();) {
+            if (e->second.use == msTwinEpoch_) {
+                ++e;
+                continue;
+            }
+            keep(e->second.image);
+            e = msTwins_.erase(e);
+        }
+    }
+    // Transient: the samples never reach memory (the pass resolves them and the next one is seeded), so the backend keeps them on the tile.
+    ImageP img = createImage2D(dev, f, w, h, layers, samples,
+                               (f->depth || f->stencil ? VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT : VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) |
+                                   VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT);
+    if (!img) return nullptr;
+    imageInit(*img);
+    msTwins_[key] = {img, msTwinEpoch_};
+    return img;
+}
+
+VkImageView Image::storageView(uint32_t level, uint32_t layer, uint32_t layerCount, VkImageViewType type, VkFormat fmt) {
+    if (fmt == format->vk) fmt = VK_FORMAT_UNDEFINED;
+    const uint64_t key = 1ull << 62 | uint64_t(fmt != VK_FORMAT_UNDEFINED) << 61 | uint64_t(fmt & 0xFFF) << 49 |
+                         uint64_t(type) << 44 | uint64_t(level) << 32 | uint64_t(layer) << 16 | layerCount;
     auto it = views.find(key);
     if (it != views.end()) return it->second;
     VkImageViewCreateInfo ci{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
     ci.image = image;
     ci.viewType = type;
-    ci.format = format->vk;
+    ci.format = fmt != VK_FORMAT_UNDEFINED ? fmt : format->vk;
     ci.subresourceRange = {aspect(), level, 1, layer, layerCount};
     VkImageView v = VK_NULL_HANDLE;
     dev->vk.vkCreateImageView(dev->device, &ci, nullptr, &v);
@@ -289,7 +350,7 @@ VkImageView Texture::sampledView() {
     switch (target) {
         case gl::TEXTURE_CUBE_MAP: ci.viewType = VK_IMAGE_VIEW_TYPE_CUBE; break;
         case gl::TEXTURE_3D: ci.viewType = VK_IMAGE_VIEW_TYPE_3D; break;
-        case gl::TEXTURE_2D_ARRAY: ci.viewType = VK_IMAGE_VIEW_TYPE_2D_ARRAY; break;
+        case gl::TEXTURE_2D_ARRAY: case gl::TEXTURE_2D_MULTISAMPLE_ARRAY: ci.viewType = VK_IMAGE_VIEW_TYPE_2D_ARRAY; break;
         default: ci.viewType = image->layers > 1 ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : VK_IMAGE_VIEW_TYPE_2D;
     }
     ci.format = image->format->vk;
@@ -302,7 +363,7 @@ VkImageView Texture::sampledView() {
     if (aspect == (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT))
         aspect = depthStencilMode == gl::STENCIL_INDEX ? VK_IMAGE_ASPECT_STENCIL_BIT : VK_IMAGE_ASPECT_DEPTH_BIT;
     const uint32_t base0 = uint32_t(std::min<GLint>(baseLevel, GLint(image->levels) - 1));
-    const uint32_t top = uint32_t(std::min<GLint>(maxLevel, GLint(image->levels) - 1));
+    const uint32_t top = std::max(base0, uint32_t(std::min<GLint>(maxLevel, GLint(image->levels) - 1)));  // max < base: the base level alone, never an unsigned wrap
     ci.subresourceRange = {aspect, base0, std::max<uint32_t>(1, top - base0 + 1), 0, image->layers};
     VkImageView v = VK_NULL_HANDLE;
     image->dev->vk.vkCreateImageView(image->dev->device, &ci, nullptr, &v);
@@ -322,6 +383,7 @@ Context::Context(Device* d, ShareGroup* s, int maj, int min) : dev(d), share(s),
 
 Context::~Context() {
     flush(true);
+    if (occPool_) dev->vk.vkDestroyQueryPool(dev->device, occPool_, nullptr);
     for (VkSampler s : samplerCacheList_) dev->vk.vkDestroySampler(dev->device, s, nullptr);
     if (--share->refs == 0) delete share;
 }
@@ -334,7 +396,98 @@ VkCommandBuffer Context::cmd() {
     VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     dev->vk.vkBeginCommandBuffer(cb_, &bi);
+    if (occActive_ != UINT32_MAX) dev->vk.vkCmdBeginQuery(cb_, occPool_, occActive_, 0);  // the counting goes on in the new buffer
     return cb_;
+}
+
+// ---- Occlusion queries: VPVulkan counts the samples of the draws recorded between vkCmdBeginQuery and vkCmdEndQuery ----
+uint32_t Context::occSlot() {
+    constexpr uint32_t kSlots = 256;
+    if (!occPool_) {
+        VkQueryPoolCreateInfo ci{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+        ci.queryType = VK_QUERY_TYPE_OCCLUSION, ci.queryCount = kSlots;
+        if (dev->vk.vkCreateQueryPool(dev->device, &ci, nullptr, &occPool_) != VK_SUCCESS) {
+            occPool_ = VK_NULL_HANDLE;
+            return UINT32_MAX;
+        }
+        occBusy_.assign(kSlots, false);
+    }
+    for (uint32_t i = 0; i < kSlots; ++i)
+        if (!occBusy_[i]) return occBusy_[i] = true, i;
+    return UINT32_MAX;
+}
+
+void Context::occBegin(Query& q) {
+    q.endSerial = 0;  // set again by occEnd if this run is counted
+    if (q.slot == UINT32_MAX) q.slot = occSlot();
+    if (q.slot == UINT32_MAX || occActive_ != UINT32_MAX) return;  // no slot / another query counting: this one stays coherent
+    endPass();
+    dev->vk.vkCmdResetQueryPool(cmd(), occPool_, q.slot, 1);
+    dev->vk.vkCmdBeginQuery(cmd(), occPool_, q.slot, 0);
+    occActive_ = q.slot;
+}
+
+void Context::occEnd(Query& q) {
+    if (q.slot == UINT32_MAX || occActive_ != q.slot) return;
+    dev->vk.vkCmdEndQuery(cmd(), occPool_, q.slot);
+    occActive_ = UINT32_MAX;
+    q.endSerial = dev->submitted + 1;  // the serial the open command buffer will get
+}
+
+void Context::occPause() {
+    if (occActive_ != UINT32_MAX) dev->vk.vkCmdEndQuery(cmd(), occPool_, occActive_);
+}
+
+void Context::occResume() {
+    if (occActive_ != UINT32_MAX) dev->vk.vkCmdBeginQuery(cmd(), occPool_, occActive_, 0);
+}
+
+bool Context::occResult(Query& q, bool wait, uint64_t& value, OccWait* how) {
+    if (dev->submitted < q.endSerial) flush(false);
+    if (how) *how = OccWait::Done;
+    const auto now = [&] {
+        return dev->clockNs ? dev->clockNs() : uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                                            std::chrono::steady_clock::now().time_since_epoch()).count());
+    };
+    if (dev->occBudgetSerial != dev->submitted) dev->occBudgetSerial = dev->submitted, dev->occBudgetUsedNs = 0;
+    if (wait && dev->occLateSerial) {
+        dev->retire(false);
+        if (dev->completed >= dev->occLateSerial) dev->occLateSerial = 0;
+    }
+    // The GPU is behind (a wait ran out and it has not got past it) or the frame's budget is spent: look once, never wait.
+    const bool skip = wait && (dev->occLateSerial || dev->occBudgetUsedNs >= kOccWaitNs);
+    const bool block = wait && !skip;
+    const uint64_t t0 = block ? now() : 0;
+    for (;;) {
+        uint64_t data[2] = {0, 0};
+        const VkResult r = dev->vk.vkGetQueryPoolResults(dev->device, occPool_, q.slot, 1, sizeof data, data, sizeof data,
+                                                         VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT |
+                                                             (block ? VK_QUERY_RESULT_WAIT_BIT : 0));
+        if (r < 0) {  // device lost: the coherent answer stands
+            value = 1;
+            return true;
+        }
+        value = data[0];
+        const uint64_t waited = block ? now() - t0 : 0;
+        if (data[1] != 0) {
+            dev->occBudgetUsedNs += waited;
+            return true;
+        }
+        if (!wait) return false;
+        value = 1;  // never 0 for a result that is only late: the game would cull what is on screen
+        if (skip) {
+            if (how) *how = OccWait::Skipped;
+            return true;
+        }
+        // The result is late (a WAIT that returned not ready: the submission is not on the GPU yet): ask again, up to the budget.
+        if (dev->occBudgetUsedNs + waited >= kOccWaitNs) {
+            dev->occBudgetUsedNs = kOccWaitNs;
+            dev->occLateSerial = std::max(dev->occLateSerial, q.endSerial);
+            if (how) *how = OccWait::Expired;
+            return true;
+        }
+        std::this_thread::sleep_for(std::chrono::microseconds(100));
+    }
 }
 
 void Context::endPass() {
@@ -429,10 +582,7 @@ void Context::prepareWrite(Buffer& b, bool discard) {
     const bool gpuMayRead = pending && pending > dev->completed;
     if (!gpuMayRead) return;
     // New storage (copy on write); the old one stays alive with the work that reads it.
-    StorageP fresh = dev->newStorage(b.storage->size, b.storage->dev ? VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
-                                                                            VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
-                                                                            VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT
-                                                                      : 0);
+    StorageP fresh = dev->newStorage(b.storage->size, b.storage->dev ? kAllUsage : 0);
     if (!fresh) return;
     if (!discard) std::memcpy(fresh->host, b.storage->host, size_t(b.storage->size));
     b.storage = fresh;

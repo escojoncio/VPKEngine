@@ -13,6 +13,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <functional>
+#include <map>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -48,6 +49,12 @@ class BackgroundGate {
   // release() and never park again.
   void shutdown();
   void setLog(LogFn);
+  // `fn` runs on the thread that calls set(true), at each transition to the background (after the state changed, outside
+  // the gate's own lock). It must not block nor call add/removePauseHook. Returns an id for removePauseHook, which waits for
+  // a running call of that hook to end (the owner can then be destroyed).
+  using PauseHook = std::function<void()>;
+  uint64_t addPauseHook(PauseHook fn);
+  void removePauseHook(uint64_t id);
 
   uint64_t blockedTotal() const;      // commits that ever parked
   uint64_t mainThreadPassed() const;  // commits the main thread made in the background (not parked)
@@ -63,6 +70,9 @@ class BackgroundGate {
   uint64_t episodeBlocked_ = 0, blockedTotal_ = 0, mainPassed_ = 0;
   std::thread::id main_;
   LogFn log_;
+  std::mutex hookMutex_;  // guards hooks_ and is held while they run
+  std::map<uint64_t, PauseHook> hooks_;
+  uint64_t nextHook_ = 1;
 };
 
 // The process-wide gate the C API drives and the Metal backends consult.

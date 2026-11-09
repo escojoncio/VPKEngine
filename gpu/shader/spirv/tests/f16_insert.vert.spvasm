@@ -1,0 +1,139 @@
+OpCapability Cap:Shader
+OpCapability Cap:Float16
+OpMemoryModel AddrModel:Logical MemModel:GLSL450
+OpEntryPoint Model:Vertex %main "main" %outpos
+OpDecorate %outpos Deco:BuiltIn BuiltIn:Position
+OpDecorate %srcblk Deco:BufferBlock
+OpDecorate %dstblk Deco:BufferBlock
+OpDecorate %ra Deco:ArrayStride 4
+OpMemberDecorate %srcblk 0 Deco:Offset 0
+OpMemberDecorate %dstblk 0 Deco:Offset 0
+OpDecorate %src Deco:DescriptorSet 0
+OpDecorate %src Deco:Binding 0
+OpDecorate %dst Deco:DescriptorSet 0
+OpDecorate %dst Deco:Binding 1
+OpMemberDecorate %st 0 Deco:Offset 0
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%u32 = OpTypeInt 32 0
+%i32 = OpTypeInt 32 1
+%bool = OpTypeBool
+%f32 = OpTypeFloat 32
+%v4f32 = OpTypeVector %f32 4
+%f16 = OpTypeFloat 16
+%v2f16 = OpTypeVector %f16 2
+%v3f16 = OpTypeVector %f16 3
+%st = OpTypeStruct %v3f16
+%ra = OpTypeRuntimeArray %u32
+%srcblk = OpTypeStruct %ra
+%dstblk = OpTypeStruct %ra
+%psrc = OpTypePointer Storage:Uniform %srcblk
+%pdst = OpTypePointer Storage:Uniform %dstblk
+%pu32 = OpTypePointer Storage:Uniform %u32
+%src = OpVariable %psrc Storage:Uniform
+%dst = OpVariable %pdst Storage:Uniform
+%pout = OpTypePointer Storage:Output %v4f32
+%outpos = OpVariable %pout Storage:Output
+%pfi = OpTypePointer Storage:Function %i32
+%c0 = OpConstant %i32 0
+%c1 = OpConstant %i32 1
+%c2 = OpConstant %i32 2
+%c4 = OpConstant %i32 4
+%u0 = OpConstant %u32 0
+%u16 = OpConstant %u32 16
+%u1 = OpConstant %u32 1
+%f16n1 = OpConstant %f16 f16:-1.0
+%cn1 = OpConstantComposite %v2f16 %f16n1 %f16n1
+%f0 = OpConstant %f32 f32:0.0
+%pos = OpConstantComposite %v4f32 %f0 %f0 %f0 %f0
+%ldf = OpTypeFunction %f16 %i32
+%ldst = OpTypeFunction %st
+%insf = OpTypeFunction %st %f16 %st %i32
+%stf = OpTypeFunction %void %st
+%main = OpFunction %void 0 %fn
+%l = OpLabel
+%i = OpVariable %pfi Storage:Function
+OpStore %i %c0
+OpBranch %loop
+%loop = OpLabel
+%ic = OpLoad %i32 %i
+%lt = OpSLessThan %bool %ic %c4
+OpLoopMerge %merge %next 0
+OpBranchConditional %lt %body %merge
+%body = OpLabel
+%ndx = OpLoad %i32 %i
+%vnew = OpFunctionCall %f16 %ldsrc %ndx
+%vold = OpFunctionCall %st %lddst
+%vdst = OpFunctionCall %st %swfun %vnew %vold %ndx
+%r = OpFunctionCall %void %stdst %vdst
+OpBranch %next
+%next = OpLabel
+%ic2 = OpLoad %i32 %i
+%in = OpIAdd %i32 %ic2 %c1
+OpStore %i %in
+OpBranch %loop
+%merge = OpLabel
+OpStore %outpos %pos
+OpReturn
+OpFunctionEnd
+%ldsrc = OpFunction %f16 0 %ldf
+%n = OpFunctionParameter %i32
+%e1 = OpLabel
+%half = OpSDiv %i32 %n %c2
+%par = OpSMod %i32 %n %c2
+%p = OpAccessChain %pu32 %src %c0 %half
+%w = OpLoad %u32 %p
+%v = OpBitcast %v2f16 %w
+%x = OpCompositeExtract %f16 %v 0
+%y = OpCompositeExtract %f16 %v 1
+%isodd = OpINotEqual %bool %par %c0
+%rs = OpSelect %f16 %isodd %y %x
+OpReturnValue %rs
+OpFunctionEnd
+%lddst = OpFunction %st 0 %ldst
+%e2 = OpLabel
+%p0 = OpAccessChain %pu32 %dst %c0 %c0
+%p1 = OpAccessChain %pu32 %dst %c0 %c1
+%w0 = OpLoad %u32 %p0
+%w1 = OpLoad %u32 %p1
+%b0 = OpBitcast %v2f16 %w0
+%b1 = OpBitcast %v2f16 %w1
+%vec = OpVectorShuffle %v3f16 %b0 %b1 0 1 2
+%s = OpCompositeConstruct %st %vec
+OpReturnValue %s
+OpFunctionEnd
+%swfun = OpFunction %st 0 %insf
+%pv = OpFunctionParameter %f16
+%pp = OpFunctionParameter %st
+%pn = OpFunctionParameter %i32
+%e3 = OpLabel
+OpSelectionMerge %swe 0
+OpSwitch %pn %def 0 %c_0 1 %c_1 2 %c_2
+%c_0 = OpLabel
+%r0 = OpCompositeInsert %st %pv %pp 0 0
+OpReturnValue %r0
+%c_1 = OpLabel
+%r1 = OpCompositeInsert %st %pv %pp 0 1
+OpReturnValue %r1
+%c_2 = OpLabel
+%r2 = OpCompositeInsert %st %pv %pp 0 2
+OpReturnValue %r2
+%def = OpLabel
+OpReturnValue %pp
+%swe = OpLabel
+OpUnreachable
+OpFunctionEnd
+%stdst = OpFunction %void 0 %stf
+%sp = OpFunctionParameter %st
+%e4 = OpLabel
+%ex = OpCompositeExtract %v3f16 %sp 0
+%va = OpVectorShuffle %v2f16 %ex %cn1 0 1
+%vb = OpVectorShuffle %v2f16 %ex %cn1 2 3
+%ba = OpBitcast %u32 %va
+%bb = OpBitcast %u32 %vb
+%q0 = OpAccessChain %pu32 %dst %c0 %c0
+%q1 = OpAccessChain %pu32 %dst %c0 %c1
+OpStore %q0 %ba
+OpStore %q1 %bb
+OpReturn
+OpFunctionEnd

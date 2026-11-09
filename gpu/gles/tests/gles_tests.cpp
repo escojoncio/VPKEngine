@@ -4,6 +4,7 @@
 // driver accepted everything (stderr scanned for vk.err / vk.unimpl / gles.err lines: every
 // pipeline really went through spirv::lower and the MSL emitter inside VPVulkan).
 // Usage: vpgles_tests <group> <path to libVPVulkan>
+#include "xfb.h"
 #include <dlfcn.h>
 #include <unistd.h>
 
@@ -16,8 +17,10 @@
 #include <fstream>
 #include <functional>
 #include <map>
+#include <set>
 #include <sstream>
 #include <string>
+#include <chrono>
 #include <thread>
 #include <vector>
 
@@ -58,7 +61,15 @@ struct Counts {
     int draws = 0, drawsIndexed = 0, passes = 0, pipelines = 0, copiesToImage = 0, clears = 0, dispatches = 0,
         blits = 0, copiesToBuffer = 0, drawsIndirect = 0, drawsIndexedIndirect = 0, dispatchesIndirect = 0, copiesImage = 0,
         imagesWithStorage = 0, imagesCreated = 0, clearColorImages = 0, clearDepthImages = 0;
+    int passDrops = 0, lastDropDepth = -1;  // vpvk_cmd_pass_drop calls (glInvalidateFramebuffer with an open pass) and the last depth flag
+    int imagesStoredMS = 0, resolves = 0;  // multisample images created without TRANSIENT usage (samples that reach memory); vkCmdResolveImage calls
     uint32_t lastCopyRegions = 0;
+    // Last image view created (format, type) and last image created (flags, samples).
+    VkFormat lastViewFormat = VK_FORMAT_UNDEFINED;
+    VkImageViewType lastViewType = VK_IMAGE_VIEW_TYPE_MAX_ENUM;
+    VkImageCreateFlags lastImageFlags = 0;
+    VkSampleCountFlagBits lastImageSamples = VK_SAMPLE_COUNT_1_BIT, lastRasterSamples = VK_SAMPLE_COUNT_1_BIT;
+    int imagesMultisample = 0, viewsOf3DAs2D = 0;
     // Last graphics pipeline: colour write mask of attachment 0 (0xFFFFFFFF = none yet), stencil test, depth test.
     uint32_t lastWriteMask = 0xFFFFFFFFu;
     int lastStencilTest = -1, lastDepthTest = -1;
@@ -70,6 +81,10 @@ struct Counts {
     // Load / store ops of the last pass (first colour attachment, depth attachment).
     VkAttachmentLoadOp colorLoad = VK_ATTACHMENT_LOAD_OP_MAX_ENUM, depthLoad = VK_ATTACHMENT_LOAD_OP_MAX_ENUM;
     VkAttachmentStoreOp colorStore = VK_ATTACHMENT_STORE_OP_MAX_ENUM, depthStore = VK_ATTACHMENT_STORE_OP_MAX_ENUM;
+    // Whether the last pass resolves its first colour attachment / its depth attachment (a resolve image view).
+    bool colorResolve = false, depthResolve = false;
+    // Image views of the colour attachments / the depth attachment of the last pass (the multisample twins for multisample renderbuffers).
+    VkImageView colorViews[8] = {}, depthView = VK_NULL_HANDLE;
 } counts;
 
 PFN_vkCmdDraw realDraw;
@@ -80,15 +95,28 @@ PFN_vkCmdCopyBufferToImage realCopyToImage;
 PFN_vkCmdClearAttachments realClear;
 PFN_vkCmdDispatch realDispatch;
 PFN_vkCmdBlitImage realBlit;
+PFN_vkCmdResolveImage realResolveImage;
 PFN_vkCmdCopyImageToBuffer realCopyToBuffer;
 PFN_vkCmdDrawIndirect realDrawIndirect;
 PFN_vkCmdDrawIndexedIndirect realDrawIndexedIndirect;
 PFN_vkCmdDispatchIndirect realDispatchIndirect;
 PFN_vkCmdCopyImage realCopyImage;
 PFN_vkCreateImage realCreateImage;
+PFN_vkCreateImageView realCreateImageView;
 PFN_vkCmdClearColorImage realClearColorImage;
 PFN_vkCmdClearDepthStencilImage realClearDepthImage;
 PFN_vkUpdateDescriptorSets realUpdateSets;
+PFN_vkGetQueryPoolResults realGetQueryResults;
+PFN_vkGetFenceStatus realGetFenceStatus;
+PFN_vkCreateBuffer realCreateBuffer;
+VkBufferUsageFlags lastBufferUsage = 0;  // usage of the last vkCreateBuffer the layer made
+// A GPU that is late with the occlusion results: the next `occLate` reads answer "not ready" (or all of them while
+// `occStuck`); once ready, a non-zero `occCount` is the sample count the read reports (the null backend counts 0).
+// `occFenceStuck`: its submissions do not finish either (a GPU that is behind). `occCalls` counts the reads it saw.
+int occLate = 0, occCalls = 0;
+bool occStuck = false, occFenceStuck = false;
+uint64_t occCount = 0;
+std::map<VkImage, VkImageType> imageTypes;  // images the layer created: their type (views of a 3D image as 2D are Metal aborts)
 
 VKAPI_ATTR void VKAPI_CALL myDraw(VkCommandBuffer c, uint32_t v, uint32_t i, uint32_t fv, uint32_t fi) {
     ++counts.draws;
@@ -106,6 +134,10 @@ VKAPI_ATTR void VKAPI_CALL myBeginRendering(VkCommandBuffer c, const VkRendering
     counts.lastColorCount = ri->colorAttachmentCount;
     if (ri->colorAttachmentCount) counts.colorLoad = ri->pColorAttachments[0].loadOp, counts.colorStore = ri->pColorAttachments[0].storeOp;
     if (ri->pDepthAttachment) counts.depthLoad = ri->pDepthAttachment->loadOp, counts.depthStore = ri->pDepthAttachment->storeOp;
+    for (uint32_t i = 0; i < 8; ++i) counts.colorViews[i] = i < ri->colorAttachmentCount ? ri->pColorAttachments[i].imageView : VK_NULL_HANDLE;
+    counts.depthView = ri->pDepthAttachment ? ri->pDepthAttachment->imageView : VK_NULL_HANDLE;
+    counts.colorResolve = ri->colorAttachmentCount && ri->pColorAttachments[0].resolveImageView != VK_NULL_HANDLE;
+    counts.depthResolve = ri->pDepthAttachment && ri->pDepthAttachment->resolveImageView != VK_NULL_HANDLE;
     realBeginRendering(c, ri);
 }
 VKAPI_ATTR VkResult VKAPI_CALL myCreatePipelines(VkDevice d, VkPipelineCache pc, uint32_t n, const VkGraphicsPipelineCreateInfo* ci,
@@ -115,6 +147,7 @@ VKAPI_ATTR VkResult VKAPI_CALL myCreatePipelines(VkDevice d, VkPipelineCache pc,
     for (uint32_t i = 0; i < ci->pVertexInputState->vertexAttributeDescriptionCount; ++i)
         counts.lastAttrFormats.push_back(ci->pVertexInputState->pVertexAttributeDescriptions[i].format);
     counts.lastFrontFace = ci->pRasterizationState->frontFace;
+    counts.lastRasterSamples = ci->pMultisampleState ? ci->pMultisampleState->rasterizationSamples : VK_SAMPLE_COUNT_1_BIT;
     counts.lastWriteMask = ci->pColorBlendState && ci->pColorBlendState->attachmentCount
                                ? ci->pColorBlendState->pAttachments[0].colorWriteMask : 0xFFFFFFFFu;
     counts.lastStencilTest = ci->pDepthStencilState ? int(ci->pDepthStencilState->stencilTestEnable) : -1;
@@ -135,6 +168,8 @@ PFN_passDrop realPassDrop;
 VKAPI_ATTR void VKAPI_CALL myPassDrop(VkCommandBuffer c, uint32_t colorMask, int depth, int stencil) {
     counts.colorStore = (colorMask & 1) ? VK_ATTACHMENT_STORE_OP_DONT_CARE : VK_ATTACHMENT_STORE_OP_STORE;
     counts.depthStore = depth ? VK_ATTACHMENT_STORE_OP_DONT_CARE : VK_ATTACHMENT_STORE_OP_STORE;
+    ++counts.passDrops;
+    counts.lastDropDepth = depth;
     realPassDrop(c, colorMask, depth, stencil);
 }
 VKAPI_ATTR void VKAPI_CALL myDispatch(VkCommandBuffer c, uint32_t x, uint32_t y, uint32_t z) {
@@ -145,6 +180,11 @@ VKAPI_ATTR void VKAPI_CALL myBlit(VkCommandBuffer c, VkImage s, VkImageLayout sl
                                   const VkImageBlit* r, VkFilter f) {
     ++counts.blits;
     realBlit(c, s, sl, d, dl, n, r, f);
+}
+VKAPI_ATTR void VKAPI_CALL myResolveImage(VkCommandBuffer c, VkImage s, VkImageLayout sl, VkImage d, VkImageLayout dl, uint32_t n,
+                                          const VkImageResolve* r) {
+    ++counts.resolves;
+    realResolveImage(c, s, sl, d, dl, n, r);
 }
 VKAPI_ATTR void VKAPI_CALL myCopyToBuffer(VkCommandBuffer c, VkImage i, VkImageLayout l, VkBuffer b, uint32_t n, const VkBufferImageCopy* r) {
     ++counts.copiesToBuffer;
@@ -171,7 +211,24 @@ VKAPI_ATTR void VKAPI_CALL myCopyImage(VkCommandBuffer c, VkImage si, VkImageLay
 VKAPI_ATTR VkResult VKAPI_CALL myCreateImage(VkDevice d, const VkImageCreateInfo* ci, const VkAllocationCallbacks* a, VkImage* out) {
     ++counts.imagesCreated;
     if (ci->usage & VK_IMAGE_USAGE_STORAGE_BIT) ++counts.imagesWithStorage;
-    return realCreateImage(d, ci, a, out);
+    counts.lastImageFlags = ci->flags;
+    counts.lastImageSamples = ci->samples;
+    if (ci->samples != VK_SAMPLE_COUNT_1_BIT) ++counts.imagesMultisample;
+    if (ci->samples != VK_SAMPLE_COUNT_1_BIT && !(ci->usage & VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT)) ++counts.imagesStoredMS;
+    VkResult r = realCreateImage(d, ci, a, out);
+    if (r == VK_SUCCESS) imageTypes[*out] = ci->imageType;
+    return r;
+}
+VkImageSubresourceRange gLastViewRange{};  // subresource range of the last image view created
+VKAPI_ATTR VkResult VKAPI_CALL myCreateImageView(VkDevice d, const VkImageViewCreateInfo* ci, const VkAllocationCallbacks* a, VkImageView* out) {
+    gLastViewRange = ci->subresourceRange;
+    counts.lastViewFormat = ci->format;
+    counts.lastViewType = ci->viewType;
+    auto it = imageTypes.find(ci->image);
+    if (it != imageTypes.end() && it->second == VK_IMAGE_TYPE_3D && ci->viewType != VK_IMAGE_VIEW_TYPE_3D &&
+        ci->viewType != VK_IMAGE_VIEW_TYPE_2D_ARRAY)
+        ++counts.viewsOf3DAs2D;
+    return realCreateImageView(d, ci, a, out);
 }
 
 VKAPI_ATTR void VKAPI_CALL myClearColorImage(VkCommandBuffer c, VkImage i, VkImageLayout l, const VkClearColorValue* v, uint32_t n,
@@ -190,6 +247,28 @@ VKAPI_ATTR void VKAPI_CALL myUpdateSets(VkDevice d, uint32_t n, const VkWriteDes
     realUpdateSets(d, n, w, cn, cp);
 }
 
+VKAPI_ATTR VkResult VKAPI_CALL myGetQueryResults(VkDevice d, VkQueryPool p, uint32_t f, uint32_t n, size_t sz, void* data, VkDeviceSize st,
+                                                 VkQueryResultFlags fl) {
+    if (!occLate && !occStuck && !occCount) return realGetQueryResults(d, p, f, n, sz, data, st, fl);
+    ++occCalls;
+    if (occStuck || occLate > 0) {
+        if (occLate > 0) --occLate;
+        return VK_NOT_READY;  // nothing written: the caller's zeros stay
+    }
+    const VkResult r = realGetQueryResults(d, p, f, n, sz, data, st, fl);
+    static_cast<uint64_t*>(data)[0] = occCount;
+    return r;
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL myGetFenceStatus(VkDevice d, VkFence f) {
+    return occFenceStuck ? VK_NOT_READY : realGetFenceStatus(d, f);
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL myCreateBuffer(VkDevice d, const VkBufferCreateInfo* ci, const VkAllocationCallbacks* a, VkBuffer* out) {
+    lastBufferUsage = ci->usage;
+    return realCreateBuffer(d, ci, a, out);
+}
+
 PFN_vkVoidFunction intercept(const char* name, PFN_vkVoidFunction real) {
 #define I(n, mine, store)                                    \
     if (!std::strcmp(name, n)) {                              \
@@ -205,15 +284,20 @@ PFN_vkVoidFunction intercept(const char* name, PFN_vkVoidFunction real) {
     I("vpvk_cmd_pass_drop", myPassDrop, realPassDrop)
     I("vkCmdDispatch", myDispatch, realDispatch)
     I("vkCmdBlitImage", myBlit, realBlit)
+    I("vkCmdResolveImage", myResolveImage, realResolveImage)
     I("vkCmdCopyImageToBuffer", myCopyToBuffer, realCopyToBuffer)
     I("vkCmdDrawIndirect", myDrawIndirect, realDrawIndirect)
     I("vkCmdDrawIndexedIndirect", myDrawIndexedIndirect, realDrawIndexedIndirect)
     I("vkCmdDispatchIndirect", myDispatchIndirect, realDispatchIndirect)
     I("vkCmdCopyImage", myCopyImage, realCopyImage)
     I("vkCreateImage", myCreateImage, realCreateImage)
+    I("vkCreateBuffer", myCreateBuffer, realCreateBuffer)
+    I("vkCreateImageView", myCreateImageView, realCreateImageView)
     I("vkCmdClearColorImage", myClearColorImage, realClearColorImage)
     I("vkCmdClearDepthStencilImage", myClearDepthImage, realClearDepthImage)
     I("vkUpdateDescriptorSets", myUpdateSets, realUpdateSets)
+    I("vkGetQueryPoolResults", myGetQueryResults, realGetQueryResults)
+    I("vkGetFenceStatus", myGetFenceStatus, realGetFenceStatus)
 #undef I
     return real;
 }
@@ -422,6 +506,10 @@ void testEgl() {
             setQuest(1);
             CHECK(std::strstr(reinterpret_cast<const char*>(glGetString(gl::RENDERER)), "Adreno"));
             CHECK(std::strstr(reinterpret_cast<const char*>(glGetString(gl::VENDOR)), "Qualcomm"));
+            // The renderer is the Vulkan device's name: 740, or VPVK_QUEST_GPU_NAME (ctest gpu_gles.gl.egl_adreno650).
+            const char* gpuName = std::getenv("VPVK_QUEST_GPU_NAME");
+            CHECK(std::strcmp(reinterpret_cast<const char*>(glGetString(gl::RENDERER)),
+                              gpuName && *gpuName ? gpuName : "Adreno (TM) 740") == 0);
             setQuest(0);
         }
     }
@@ -519,6 +607,27 @@ void testFormats() {
     uint16_t p565 = uint16_t(31 << 11 | 63 << 5);
     CHECK(convertReadback(*formatFor(gl::RGB565), gl::RGBA, gl::UNSIGNED_BYTE, reinterpret_cast<uint8_t*>(&p565), 1, rgbaOut));
     CHECK(rgbaOut[0] == 255 && rgbaOut[1] == 255 && rgbaOut[2] == 0 && rgbaOut[3] == 255);
+    // Readback of formats without a raw layout match: RG8, R16I, R16F, RGB10_A2, R11F_G11F_B10F into the usual client types.
+    uint8_t rg8[2] = {255, 128}, rbOut[16];
+    CHECK(convertReadback(*formatFor(gl::RG8), gl::RGBA, gl::UNSIGNED_BYTE, rg8, 1, rbOut));
+    CHECK(rbOut[0] == 255 && rbOut[1] == 128 && rbOut[2] == 0 && rbOut[3] == 255);
+    int16_t r16i = -32768;
+    int32_t i4[4];
+    CHECK(convertReadback(*formatFor(gl::R16I), gl::RGBA_INTEGER, gl::INT, reinterpret_cast<uint8_t*>(&r16i), 1, rbOut));
+    std::memcpy(i4, rbOut, 16);
+    CHECK(i4[0] == -32768 && i4[1] == 0 && i4[2] == 0 && i4[3] == 1);
+    uint16_t r16f = 0x3800;  // 0.5
+    float f4[4];
+    CHECK(convertReadback(*formatFor(gl::R16F), gl::RGBA, gl::FLOAT, reinterpret_cast<uint8_t*>(&r16f), 1, rbOut));
+    std::memcpy(f4, rbOut, 16);
+    CHECK(f4[0] == 0.5f && f4[1] == 0 && f4[3] == 1);
+    uint32_t a2 = 0xC0000000u | 1023u << 20 | 512u << 10;
+    CHECK(convertReadback(*formatFor(gl::RGB10_A2), gl::RGBA, gl::UNSIGNED_BYTE, reinterpret_cast<uint8_t*>(&a2), 1, rbOut));
+    CHECK(rbOut[0] == 0 && rbOut[1] == 128 && rbOut[2] == 255 && rbOut[3] == 255);
+    uint32_t r11 = (0x3C00 >> 4) | (0x3800 >> 4) << 11 | (0x4000 >> 5) << 22;  // 1.0, 0.5, 2.0
+    CHECK(convertReadback(*formatFor(gl::R11F_G11F_B10F), gl::RGBA, gl::FLOAT, reinterpret_cast<uint8_t*>(&r11), 1, rbOut));
+    std::memcpy(f4, rbOut, 16);
+    CHECK(f4[0] == 1.0f && f4[1] == 0.5f && f4[2] == 2.0f && f4[3] == 1.0f);
     CHECK(clientPixelBytes(gl::RGBA, gl::FLOAT) == 16 && clientPixelBytes(gl::RGB, gl::UNSIGNED_SHORT_5_6_5) == 2);
     // DEPTH_COMPONENT uploads: every client type into D16 / D32F / D24.
     const FormatInfo* d16 = formatFor(gl::DEPTH_COMPONENT16);
@@ -631,6 +740,24 @@ void testTextures() {
     GLuint t[4];
     glGenTextures(4, t);
     glBindTexture(gl::TEXTURE_2D, t[0]);
+    // Pure integer parameters (ES 3.2 / EXT_texture_border_clamp): the border colour keeps its exact integers.
+    {
+        G(glTexParameterIiv, void (*)(GLenum, GLenum, const GLint*));
+        G(glGetTexParameterIiv, void (*)(GLenum, GLenum, GLint*));
+        G(glTexParameterIuiv, void (*)(GLenum, GLenum, const GLuint*));
+        G(glGetTexParameterIuiv, void (*)(GLenum, GLenum, GLuint*));
+        CHECK(glTexParameterIiv && glGetTexParameterIiv && glTexParameterIuiv && glGetTexParameterIuiv);
+        const GLint set[4] = {-5, 7, 123456789, -2000000000};
+        GLint got[4] = {0, 0, 0, 0};
+        glTexParameterIiv(gl::TEXTURE_2D, gl::TEXTURE_BORDER_COLOR, set);
+        glGetTexParameterIiv(gl::TEXTURE_2D, gl::TEXTURE_BORDER_COLOR, got);
+        CHECK(err() == gl::NO_ERROR && got[0] == -5 && got[1] == 7 && got[2] == 123456789 && got[3] == -2000000000);
+        const GLint wrap = GLint(gl::CLAMP_TO_EDGE);
+        GLuint ugot = 0;
+        glTexParameterIiv(gl::TEXTURE_2D, gl::TEXTURE_WRAP_S, &wrap);
+        glGetTexParameterIuiv(gl::TEXTURE_2D, gl::TEXTURE_WRAP_S, &ugot);
+        CHECK(err() == gl::NO_ERROR && ugot == gl::CLAMP_TO_EDGE);
+    }
     std::vector<uint8_t> px(64 * 64 * 4, 200);
     counts = {};
     glTexImage2D(gl::TEXTURE_2D, 0, gl::RGBA, 64, 64, 0, gl::RGBA, gl::UNSIGNED_BYTE, px.data());
@@ -711,6 +838,22 @@ void testTextures() {
         glTexImage2D(gl::TEXTURE_2D, 0, gl::RGBA, 16, 16, 0, gl::RGBA, gl::UNSIGNED_BYTE, px.data());
         CHECK(err() == gl::NO_ERROR && counts.copiesToImage == 2);
     }
+    // An empty base level (0 x 0) leaves the texture without an image and without a GL error (the other levels are accepted);
+    // a level larger than the base's mip chain allows is kept as a definition only (no upload into a smaller level).
+    {
+        GLuint z[2];
+        glGenTextures(2, z);
+        glBindTexture(gl::TEXTURE_2D, z[0]);
+        counts = {};
+        glTexImage2D(gl::TEXTURE_2D, 0, gl::RGBA, 0, 0, 0, gl::RGBA, gl::UNSIGNED_BYTE, px.data());
+        glTexImage2D(gl::TEXTURE_2D, 1, gl::RGBA, 8, 8, 0, gl::RGBA, gl::UNSIGNED_BYTE, px.data());
+        CHECK(err() == gl::NO_ERROR && counts.copiesToImage == 0);
+        glBindTexture(gl::TEXTURE_2D, z[1]);
+        counts = {};
+        glTexImage2D(gl::TEXTURE_2D, 0, gl::RGBA, 32, 32, 0, gl::RGBA, gl::UNSIGNED_BYTE, px.data());
+        glTexImage2D(gl::TEXTURE_2D, 1, gl::RGBA, 17, 17, 0, gl::RGBA, gl::UNSIGNED_BYTE, px.data());
+        CHECK(err() == gl::NO_ERROR && counts.copiesToImage == 1);
+    }
     // The first texture of a format is logged when it is made: the periodic summary needs a swap / flush / terminate, which
     // a host that presents through its own swapchain and is killed never gives.
     {
@@ -720,6 +863,33 @@ void testTextures() {
         glTexStorage2D(gl::TEXTURE_2D, 1, gl::RG8, 8, 8);
         CHECK(err() == gl::NO_ERROR);
         CHECK(peekStderr().find("gles.tex fmt=0x822b count=1") != std::string::npos);
+    }
+    // Diagnostics: a sampled texture that is incomplete (mipmapped filter, level 1 never defined) reads black, is counted and logged once with
+    // the rule it broke; a texture that gets a new image over its old one is logged too. The summary is gles.census.
+    {
+        G(glUseProgram, void (*)(GLuint));
+        G(glDrawArrays, void (*)(GLenum, GLint, GLsizei));
+        G(glFinish, void (*)());
+        GLuint inc, grow;
+        glGenTextures(1, &inc);
+        glGenTextures(1, &grow);
+        GLuint pd = program("#version 300 es\nvoid main() { gl_Position = vec4(float(gl_VertexID & 1) * 2.0 - 1.0, float(gl_VertexID >> 1) * 2.0 - 1.0, 0.0, 1.0); }\n",
+                            "#version 300 es\nprecision mediump float; uniform sampler2D u_tex; out vec4 o; void main() { o = texture(u_tex, vec2(0.5)); }\n");
+        glUseProgram(pd);
+        glBindTexture(gl::TEXTURE_2D, inc);
+        glTexImage2D(gl::TEXTURE_2D, 0, gl::RGBA, 8, 8, 0, gl::RGBA, gl::UNSIGNED_BYTE, px.data());
+        glTexParameteri(gl::TEXTURE_2D, gl::TEXTURE_MIN_FILTER, gl::LINEAR_MIPMAP_LINEAR);
+        glBindTexture(gl::TEXTURE_2D, grow);
+        glTexImage2D(gl::TEXTURE_2D, 0, gl::RGBA, 16, 16, 0, gl::RGBA, gl::UNSIGNED_BYTE, px.data());
+        glTexImage2D(gl::TEXTURE_2D, 0, gl::RGBA, 32, 32, 0, gl::RGBA, gl::UNSIGNED_BYTE, px.data());  // a new, larger image over the old one
+        glBindTexture(gl::TEXTURE_2D, inc);
+        glDrawArrays(gl::TRIANGLES, 0, 3);
+        glFinish();
+        CHECK(err() == gl::NO_ERROR);
+        expectLines.push_back("gles.incomplete tex=" + std::to_string(inc) + " target=0xde1 fmt=0x8058 img=8x8 img_levels=4 base=0 max=1000 eff_base=0 eff_max=3 defined=[0:8x8]");
+        expectLines.push_back("fail=level_missing level=1");
+        expectLines.push_back("gles.tex_realloc tex=" + std::to_string(grow) + " target=0xde1 fmt=0x8058->0x8058 size=16x16->32x32 levels=5->6 lost_levels=5");
+        expectLines.push_back("gles.census incomplete=1 incomplete_tick_max=1 msrtt_ds_continued=0");
     }
     // Per-format creation counts reach the log (summary at eglTerminate / every 10 s).
     {
@@ -765,8 +935,10 @@ void testFbo() {
     glRenderbufferStorageMultisample(gl::RENDERBUFFER, 4, gl::DEPTH24_STENCIL8, 32, 32);
     GLint samples = 0;
     glGetRenderbufferParameteriv(gl::RENDERBUFFER, gl::RENDERBUFFER_SAMPLES, &samples);
-    CHECK(samples == 4);  // reported as asked (rendered 1x)
+    CHECK(samples == 4);  // a real 4-sample image
     glFramebufferRenderbuffer(gl::FRAMEBUFFER, gl::DEPTH_STENCIL_ATTACHMENT, gl::RENDERBUFFER, rb);
+    CHECK(glCheckFramebufferStatus(gl::FRAMEBUFFER) == 0x8D56);  // single-sample colour + 4-sample depth: INCOMPLETE_MULTISAMPLE
+    glRenderbufferStorageMultisample(gl::RENDERBUFFER, 0, gl::DEPTH24_STENCIL8, 32, 32);
     CHECK(glCheckFramebufferStatus(gl::FRAMEBUFFER) == gl::FRAMEBUFFER_COMPLETE);
     GLint type = 0;
     glGetFramebufferAttachmentParameteriv(gl::FRAMEBUFFER, (gl::COLOR_ATTACHMENT0 + 1), gl::FRAMEBUFFER_ATTACHMENT_COMPONENT_TYPE, &type);
@@ -881,6 +1053,48 @@ void testFbo() {
     CHECK(err() == gl::NO_ERROR && counts.blits == 1);
     glBlitFramebuffer(0, 0, 32, 32, 0, 0, 64, 64, gl::DEPTH_BUFFER_BIT, gl::LINEAR);
     CHECK(err() == gl::INVALID_OPERATION);
+    // EXT_multisampled_render_to_texture: a single-sample texture rendered with 4 samples completes next to a 4-sample
+    // renderbuffer (a plain single-sample attachment does not), reports the samples, and reads back like any texture.
+    {
+        G(glFramebufferTexture2DMultisampleEXT, void (*)(GLenum, GLenum, GLenum, GLuint, GLint, GLsizei));
+        G(glGetIntegerv, void (*)(GLenum, GLint*));
+        G(glReadPixels, void (*)(GLint, GLint, GLsizei, GLsizei, GLenum, GLenum, void*));
+        GLuint fb2, tex2, rb2;
+        glGenFramebuffers(1, &fb2);
+        glGenTextures(1, &tex2);
+        glGenRenderbuffers(1, &rb2);
+        glBindFramebuffer(gl::FRAMEBUFFER, fb2);
+        glBindTexture(gl::TEXTURE_2D, tex2);
+        glTexStorage2D(gl::TEXTURE_2D, 1, gl::RGBA8, 16, 16);
+        glBindRenderbuffer(gl::RENDERBUFFER, rb2);
+        glRenderbufferStorageMultisample(gl::RENDERBUFFER, 4, gl::DEPTH24_STENCIL8, 16, 16);
+        glFramebufferRenderbuffer(gl::FRAMEBUFFER, gl::DEPTH_STENCIL_ATTACHMENT, gl::RENDERBUFFER, rb2);
+        glFramebufferTexture2D(gl::FRAMEBUFFER, gl::COLOR_ATTACHMENT0, gl::TEXTURE_2D, tex2, 0);
+        CHECK(glCheckFramebufferStatus(gl::FRAMEBUFFER) == 0x8D56);
+        glFramebufferTexture2DMultisampleEXT(gl::FRAMEBUFFER, gl::COLOR_ATTACHMENT0, gl::TEXTURE_2D, tex2, 0, 4);
+        CHECK(err() == gl::NO_ERROR && glCheckFramebufferStatus(gl::FRAMEBUFFER) == gl::FRAMEBUFFER_COMPLETE);
+        GLint n = 0, buffers = 0, attSamples = 0;
+        glGetIntegerv(gl::SAMPLES, &n);
+        glGetIntegerv(gl::SAMPLE_BUFFERS, &buffers);
+        glGetFramebufferAttachmentParameteriv(gl::FRAMEBUFFER, gl::COLOR_ATTACHMENT0, 0x8D6C, &attSamples);
+        CHECK(n == 4 && buffers == 1 && attSamples == 4);
+        glFramebufferTexture2DMultisampleEXT(gl::FRAMEBUFFER, gl::COLOR_ATTACHMENT0, gl::TEXTURE_2D, tex2, 0, 5);
+        CHECK(err() == gl::INVALID_VALUE);
+        glClearColor(1, 0, 1, 0);
+        glClear(gl::COLOR_BUFFER_BIT);
+        uint8_t px[4] = {};
+        glReadPixels(0, 0, 1, 1, gl::RGBA, gl::UNSIGNED_BYTE, px);
+        CHECK(err() == gl::NO_ERROR);
+        // A multisample renderbuffer cannot be read directly or blitted into.
+        GLuint rb3;
+        glGenRenderbuffers(1, &rb3);
+        glBindRenderbuffer(gl::RENDERBUFFER, rb3);
+        glRenderbufferStorageMultisample(gl::RENDERBUFFER, 4, gl::RGBA8, 16, 16);
+        glFramebufferRenderbuffer(gl::FRAMEBUFFER, gl::COLOR_ATTACHMENT0, gl::RENDERBUFFER, rb3);
+        CHECK(glCheckFramebufferStatus(gl::FRAMEBUFFER) == gl::FRAMEBUFFER_COMPLETE);
+        glReadPixels(0, 0, 1, 1, gl::RGBA, gl::UNSIGNED_BYTE, px);
+        CHECK(err() == gl::INVALID_OPERATION);
+    }
     e.down();
 }
 
@@ -1001,21 +1215,178 @@ void testProgram() {
         CHECK(err() == gl::NO_ERROR);
         glGetUniformfv(q, lm + 1, back);
         CHECK(back[5] == 5.0f);
-        glUniform4fv(li, 1, h);  // vec4 call on an ivec4: base type mismatch
+        G(glUniform3fv, void (*)(GLint, GLsizei, const GLfloat*));
+        glUniform3fv(li, 1, h);  // vec3 call on an ivec4: size mismatch (a base type mismatch alone is lenient, see testUniformRaw)
         CHECK(err() == gl::INVALID_OPERATION);
-        const GLuint uv[8] = {};
-        glUniform4uiv(lu, 2, uv);  // count > 1 on a non-array
-        CHECK(err() == gl::INVALID_OPERATION);
+        // Adreno leniency (default mode; the `uniform_strict` run checks the rejections): a count > 1 on a non-array applies
+        // the first element and ignores the rest, a location past the program's range is ignored; neither is a GL error.
+        const GLuint uv[8] = {11u, 12u, 13u, 14u, 21u, 22u, 23u, 24u};
+        glUniform4uiv(lu, 2, uv);
+        CHECK(err() == gl::NO_ERROR);
+        G(glGetUniformuiv, void (*)(GLuint, GLint, GLuint*));
+        GLuint ub[4] = {};
+        glGetUniformuiv(q, lu, ub);
+        CHECK(ub[0] == 11u && ub[3] == 14u);
         glUniform4fv(9999, 1, h);
+        CHECK(err() == gl::NO_ERROR);
+        glUniform4fv(-5, 1, h);  // only -1 is silently skipped by the spec: other negatives stay errors
         CHECK(err() == gl::INVALID_OPERATION);
-        expectLines.push_back("gles.uniform_err name=pu_i[0] decl_type=ivec4 call_type=vec4 count=1 arraySize=2 loc=" +
-                              std::to_string(li) + " reason=base_type_mismatch");
-        expectLines.push_back("gles.uniform_err name=pu_u decl_type=uvec4 call_type=uvec4 count=2 arraySize=1 loc=" +
-                              std::to_string(lu) + " reason=count_on_non_array");
-        expectLines.push_back("gles.uniform_err name=? decl_type=? call_type=vec4 count=1 arraySize=0 loc=9999 reason=location_out_of_range");
+        expectLines.push_back("gles.uniform_err name=pu_i[0] decl_type=ivec4 call_type=vec3 count=1 arraySize=2 loc=" +
+                              std::to_string(li) + " reason=size_mismatch");
+        expectLines.push_back("gles.uniform_lenient prog=" + std::to_string(q) + " name=pu_u decl=uvec4 call=uvec4 reason=count_on_non_array");
+        expectLines.push_back("gles.uniform_lenient prog=" + std::to_string(q) + " name=? decl=? call=vec4 reason=location_out_of_range loc=9999");
+        expectLines.push_back("gles.uniform_err name=? decl_type=? call_type=vec4 count=1 arraySize=0 loc=-5 reason=location_out_of_range");
+    }
+    {
+        // glGetUniform of the non-square matrices (mat4x3: 4 columns of 3).
+        G(glGetUniformLocation, GLint (*)(GLuint, const char*));
+        G(glUseProgram, void (*)(GLuint));
+        G(glUniformMatrix4x3fv, void (*)(GLint, GLsizei, GLboolean, const GLfloat*));
+        G(glUniformMatrix3x2fv, void (*)(GLint, GLsizei, GLboolean, const GLfloat*));
+        G(glGetUniformfv, void (*)(GLuint, GLint, GLfloat*));
+        const char* vsS = "#version 300 es\nin vec4 a; uniform mat4x3 u43; uniform mat3x2 u32;\n"
+                          "void main() { gl_Position = a + vec4(u43[3], 0.0) + vec4(u32[2], 0.0, 0.0); }";
+        const char* fsS = "#version 300 es\nprecision mediump float; out vec4 o; void main() { o = vec4(1.0); }";
+        GLuint q = program(vsS, fsS);
+        glUseProgram(q);
+        const GLint l43 = glGetUniformLocation(q, "u43"), l32 = glGetUniformLocation(q, "u32");
+        CHECK(l43 >= 0 && l32 >= 0);
+        float m[12], back[12];
+        for (int i = 0; i < 12; ++i) m[i] = float(i + 1), back[i] = -1.0f;
+        glUniformMatrix4x3fv(l43, 1, 0, m);
+        glGetUniformfv(q, l43, back);
+        bool same = true;
+        for (int i = 0; i < 12; ++i) same = same && back[i] == m[i];
+        CHECK(same);
+        for (int i = 0; i < 6; ++i) back[i] = -1.0f;
+        glUniformMatrix3x2fv(l32, 1, 0, m);
+        glGetUniformfv(q, l32, back);
+        same = true;
+        for (int i = 0; i < 6; ++i) same = same && back[i] == m[i];
+        CHECK(same);
+        CHECK(err() == gl::NO_ERROR);
     }
     e.down();
 }
+
+// UE4 packed uniforms: glUniform4iv/4uiv onto `highp vec4 x[N]` (the shader reads floatBitsToInt) keeps the raw 32-bit words
+// in lenient mode (default; gles.uniform_lenient); strict mode (VPGLES_STRICT_GLSL=1, the `uniform_strict` run) rejects it.
+void uniformRaw(bool strict) {
+    Egl e;
+    CHECK(e.up());
+    G(glGetUniformLocation, GLint (*)(GLuint, const char*));
+    G(glUseProgram, void (*)(GLuint));
+    G(glUniform4iv, void (*)(GLint, GLsizei, const GLint*));
+    G(glUniform4uiv, void (*)(GLint, GLsizei, const GLuint*));
+    G(glUniform4fv, void (*)(GLint, GLsizei, const GLfloat*));
+    G(glUniformMatrix4fv, void (*)(GLint, GLsizei, GLboolean, const GLfloat*));
+    G(glGetUniformfv, void (*)(GLuint, GLint, GLfloat*));
+    G(glGetUniformiv, void (*)(GLuint, GLint, GLint*));
+    const char* vs = "#version 300 es\nin vec4 a; uniform highp vec4 vc0_h[2]; uniform highp ivec4 vi; uniform highp mat4 vm;\n"
+                     "void main() { gl_Position = a + vc0_h[0] + vc0_h[1] + vec4(vi) + vm[0]; }\n";
+    const char* fs = "#version 300 es\nprecision mediump float; out vec4 o; void main() { o = vec4(1.0); }\n";
+    GLuint q = program(vs, fs);
+    const GLint lh = glGetUniformLocation(q, "vc0_h"), li = glGetUniformLocation(q, "vi"), lm = glGetUniformLocation(q, "vm");
+    CHECK(lh >= 0 && li >= 0 && lm >= 0);
+    glUseProgram(q);
+    {
+        // A sampler set with a vector call (UE4: glUniform4fv with the unit as first component): lenient mode takes the first
+        // component as the unit (gles.uniform_lenient reason=sampler_first_component, repeated with n=100 at the 100th call);
+        // strict mode rejects it (gles.uniform_err reason=sampler_needs_1i). Matrices stay rejected in both.
+        const char* fsS = "#version 300 es\nprecision mediump float; uniform sampler2D ts; out vec4 o; void main() { o = texture(ts, vec2(0.5)); }\n";
+        GLuint qs = program(vs, fsS);
+        const GLint ls = glGetUniformLocation(qs, "ts");
+        CHECK(ls >= 0);
+        glUseProgram(qs);
+        const float f4[4] = {3.0f, 9.0f, 9.0f, 9.0f};
+        GLint unit = -1;
+        glUniform4fv(ls, 1, f4);
+        if (strict) {
+            CHECK(err() == gl::INVALID_OPERATION);
+            glGetUniformiv(qs, ls, &unit);
+            CHECK(unit == 0);
+            for (int i = 1; i < 100; ++i) glUniform4fv(ls, 1, f4);
+            CHECK(err() == gl::INVALID_OPERATION);
+            expectLines.push_back("gles.uniform_err name=ts decl_type=0x8b5e call_type=vec4 count=1 arraySize=1 loc=" + std::to_string(ls) +
+                                  " reason=sampler_needs_1i element=0 base=" + std::to_string(ls) + " prog=" + std::to_string(qs) + "\n");
+            expectLines.push_back("reason=sampler_needs_1i element=0 base=" + std::to_string(ls) + " prog=" + std::to_string(qs) + " n=100");
+        } else {
+            CHECK(err() == gl::NO_ERROR);
+            glGetUniformiv(qs, ls, &unit);
+            CHECK(unit == 3);
+            const GLint i4[4] = {2, 9, 9, 9};
+            glUniform4iv(ls, 1, i4);
+            CHECK(err() == gl::NO_ERROR);
+            glGetUniformiv(qs, ls, &unit);
+            CHECK(unit == 2);
+            const float nan4[4] = {std::numeric_limits<float>::quiet_NaN(), 0.0f, 0.0f, 0.0f};
+            glUniform4fv(ls, 1, nan4);
+            CHECK(err() == gl::INVALID_VALUE);
+            for (int i = 1; i < 100; ++i) glUniform4fv(ls, 1, f4);  // with the first call above: the 100th vec4 sighting
+            CHECK(err() == gl::NO_ERROR);
+            glGetUniformiv(qs, ls, &unit);
+            CHECK(unit == 3);
+            expectLines.push_back("gles.uniform_lenient prog=" + std::to_string(qs) + " name=ts decl=0x8b5e call=vec4 reason=sampler_first_component\n");
+            expectLines.push_back("name=ts decl=0x8b5e call=vec4 reason=sampler_first_component n=100");
+        }
+        const float m4[16] = {};
+        glUniformMatrix4fv(ls, 1, 0, m4);
+        CHECK(err() == gl::INVALID_OPERATION);
+        glUseProgram(q);
+    }
+    const GLint iv[12] = {0x3f800000, -1, 0x7fc00001, 0x40490fdb, 5, 6, 7, 8, 9, 9, 9, 9};  // 1.0f, -1, a NaN payload, pi
+    glUniform4iv(lh, 5, iv);  // clamps to the 2 elements
+    if (strict) {
+        CHECK(err() == gl::INVALID_OPERATION);
+        float back[4] = {1.0f, 1.0f, 1.0f, 1.0f};
+        glGetUniformfv(q, lh, back);
+        CHECK(back[0] == 0.0f);  // dropped
+        // Strict: a count > 1 on a non-array and a location past the range are errors (lenient mode applies / ignores them).
+        glUniform4iv(li, 2, iv);
+        CHECK(err() == gl::INVALID_OPERATION);
+        glUniform4fv(9999, 1, reinterpret_cast<const float*>(iv));
+        CHECK(err() == gl::INVALID_OPERATION);
+        expectLines.push_back("reason=count_on_non_array");
+        expectLines.push_back("loc=9999 reason=location_out_of_range");
+        return;
+    }
+    CHECK(err() == gl::NO_ERROR);
+    GLint back[4] = {};
+    glGetUniformiv(q, lh, back);  // raw words of element 0 (glGetUniformiv on a float uniform converts, so read through the float bits)
+    float f[4] = {};
+    glGetUniformfv(q, lh, f);
+    uint32_t bits[4];
+    std::memcpy(bits, f, sizeof bits);
+    CHECK(bits[0] == 0x3f800000u && bits[1] == 0xffffffffu && bits[2] == 0x7fc00001u && bits[3] == 0x40490fdbu);
+    glGetUniformfv(q, lh + 1, f);
+    std::memcpy(bits, f, sizeof bits);
+    CHECK(bits[0] == 5u && bits[3] == 8u);
+    const GLuint uv[4] = {0xdeadbeefu, 1u, 2u, 3u};
+    glUniform4uiv(lh, 1, uv);  // uint call: same
+    CHECK(err() == gl::NO_ERROR);
+    glGetUniformfv(q, lh, f);
+    std::memcpy(bits, f, sizeof bits);
+    CHECK(bits[0] == 0xdeadbeefu && bits[1] == 1u);
+    const float fv[4] = {1.5f, 2.5f, 3.5f, 4.5f};
+    glUniform4fv(li, 1, fv);  // float call on an ivec4: raw too
+    CHECK(err() == gl::NO_ERROR);
+    glGetUniformiv(q, li, back);
+    uint32_t w;
+    std::memcpy(&w, &fv[0], 4);
+    CHECK(uint32_t(back[0]) == w);
+    glUniform4iv(lm, 1, iv);  // matrices stay strict
+    CHECK(err() == gl::INVALID_OPERATION);
+    glUniform4uiv(li, 1, uv);  // int<->uint mismatch: raw
+    CHECK(err() == gl::NO_ERROR);
+    glGetUniformiv(q, li, back);
+    CHECK(uint32_t(back[0]) == 0xdeadbeefu);
+    expectLines.push_back(strict ? "gles.uniform_err name=vc0_h[0] decl_type=vec4 call_type=ivec4 count=5 arraySize=2 loc=" + std::to_string(lh) +
+                                       " reason=base_type_mismatch"
+                                 : "gles.uniform_lenient prog=" + std::to_string(q) + " name=vc0_h[0] decl=vec4 call=ivec4");
+    e.down();
+}
+void testUniformRaw() { uniformRaw(false); }
+void testUniformStrict() { uniformRaw(true); }
 
 // Program binaries (ES 3.0): one vendor format; a blob re-links to the same locations; a bad blob or format
 // is a failed link (app recompiles from source), never a GL error.
@@ -1217,6 +1588,82 @@ void testProgramBinary() {
     e.down();
 }
 
+// glMapBufferRange with MAP_UNSYNCHRONIZED over storage a draw already sent (not completed) still reads: the write goes to new
+// storage and the draw keeps the old contents; with no unfinished work it is the same storage (nothing is copied).
+void testMapUnsync() {
+    Egl e;
+    CHECK(e.up());
+    GLuint p = program(kVs100, kFs100);
+    G(glUseProgram, void (*)(GLuint));
+    G(glGenBuffers, void (*)(GLsizei, GLuint*));
+    G(glBindBuffer, void (*)(GLenum, GLuint));
+    G(glBufferData, void (*)(GLenum, GLsizeiptr, const void*, GLenum));
+    G(glMapBufferRange, void* (*)(GLenum, GLintptr, GLsizeiptr, GLbitfield));
+    G(glUnmapBuffer, GLboolean (*)(GLenum));
+    G(glGetAttribLocation, GLint (*)(GLuint, const char*));
+    G(glVertexAttribPointer, void (*)(GLuint, GLint, GLenum, GLboolean, GLsizei, const void*));
+    G(glEnableVertexAttribArray, void (*)(GLuint));
+    G(glDrawArrays, void (*)(GLenum, GLint, GLsizei));
+    G(glFlush, void (*)());
+    G(glFinish, void (*)());
+    G(eglTerminate, uint32_t (*)(void*));
+    glUseProgram(p);
+    const float verts[] = {-1, -1, 0, 1, 0, 0, 1, -1, 0, 1, 1, 0, 0, 1, 0, 1, 0, 1};
+    GLuint vb;
+    glGenBuffers(1, &vb);
+    glBindBuffer(gl::ARRAY_BUFFER, vb);
+    glBufferData(gl::ARRAY_BUFFER, sizeof verts, verts, gl::DYNAMIC_DRAW);
+    glVertexAttribPointer(GLuint(glGetAttribLocation(p, "a_pos")), 4, gl::FLOAT, 0, 24, nullptr);
+    glEnableVertexAttribArray(GLuint(glGetAttribLocation(p, "a_pos")));
+    const GLbitfield unsync = gl::MAP_WRITE_BIT | gl::MAP_UNSYNCHRONIZED_BIT;
+    // 1. Never drawn: same storage, nothing copied.
+    auto* m0 = static_cast<float*>(glMapBufferRange(gl::ARRAY_BUFFER, 0, sizeof verts, unsync));
+    CHECK(m0 && m0[6] == 1.0f);
+    m0[6] = 111.0f;
+    CHECK(glUnmapBuffer(gl::ARRAY_BUFFER));
+    // 2. A draw in flight reads this storage: the write goes to a new one holding the same data; the old keeps what the draw reads.
+    glDrawArrays(gl::TRIANGLES, 0, 3);
+    auto* m1 = static_cast<float*>(glMapBufferRange(gl::ARRAY_BUFFER, 0, sizeof verts, unsync));
+    CHECK(m1 && m1 != m0 && m1[6] == 111.0f);
+    // The copy keeps every usage of a GL buffer (indirect, texel...), not only the vertex ones.
+    constexpr VkBufferUsageFlags kNeeded = VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_UNIFORM_TEXEL_BUFFER_BIT |
+                                           VK_BUFFER_USAGE_STORAGE_TEXEL_BUFFER_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT |
+                                           VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT;
+    CHECK((lastBufferUsage & kNeeded) == kNeeded);
+    m1[6] = 222.0f;
+    CHECK(m0[6] == 111.0f && m1[6] == 222.0f);
+    CHECK(glUnmapBuffer(gl::ARRAY_BUFFER));
+    // 3. Everything completed: the same storage again.
+    glDrawArrays(gl::TRIANGLES, 0, 3);
+    glFinish();
+    auto* m2 = static_cast<float*>(glMapBufferRange(gl::ARRAY_BUFFER, 0, sizeof verts, unsync));
+    CHECK(m2 == m1 && m2[6] == 222.0f);
+    CHECK(glUnmapBuffer(gl::ARRAY_BUFFER));
+    // 4. INVALIDATE_BUFFER over storage in use: new storage, no copy.
+    glDrawArrays(gl::TRIANGLES, 0, 3);
+    auto* m3 = static_cast<float*>(glMapBufferRange(gl::ARRAY_BUFFER, 0, sizeof verts, unsync | gl::MAP_INVALIDATE_BUFFER_BIT));
+    CHECK(m3 && m3 != m2 && m2[6] == 222.0f);
+    CHECK(glUnmapBuffer(gl::ARRAY_BUFFER));
+    // 5. A read-only map does not change the storage (it waits for the GPU instead).
+    glDrawArrays(gl::TRIANGLES, 0, 3);
+    auto* m4 = static_cast<float*>(glMapBufferRange(gl::ARRAY_BUFFER, 0, sizeof verts, gl::MAP_READ_BIT));
+    CHECK(m4 == m3);
+    CHECK(glUnmapBuffer(gl::ARRAY_BUFFER));
+    // 6. Submitted but the fence has not signalled (a GPU that is behind): still in use.
+    occFenceStuck = true;
+    glDrawArrays(gl::TRIANGLES, 0, 3);
+    glFlush();
+    auto* m5 = static_cast<float*>(glMapBufferRange(gl::ARRAY_BUFFER, 0, sizeof verts, unsync));
+    CHECK(m5 && m5 != m4);
+    CHECK(glUnmapBuffer(gl::ARRAY_BUFFER));
+    occFenceStuck = false;
+    glFinish();
+    CHECK(err() == gl::NO_ERROR);
+    expectLines.push_back("gles.map_stats maps=6 unsync=5 unsync_inuse=3 cow_bytes=144 max_cow_bytes=72 discard_inuse=1");
+    eglTerminate(e.dpy);
+    e.down();
+}
+
 void testDraw() {
     Egl e;
     CHECK(e.up());
@@ -1267,6 +1714,24 @@ void testDraw() {
     CHECK(err() == gl::NO_ERROR && counts.draws == 2);
     CHECK(counts.lastFrontFace == VK_FRONT_FACE_CLOCKWISE);  // GL CCW, rows bottom-up
     CHECK(counts.pipelines == 1 && counts.passes == 1);  // pipeline and pass reused
+    // INT_2_10_10_10_REV normalizado: VPVulkan no lo lee en el pipeline (sin formato de vertice nativo), se convierte a float32 en la CPU.
+    {
+        const auto saved = counts;
+        const uint32_t packed[3] = {0x3FF, 0x1FF, 0x200};
+        GLuint pb;
+        glGenBuffers(1, &pb);
+        glBindBuffer(gl::ARRAY_BUFFER, pb);
+        glBufferData(gl::ARRAY_BUFFER, sizeof packed, packed, gl::STATIC_DRAW);
+        glVertexAttribPointer(GLuint(pos), 4, gl::INT_2_10_10_10_REV, 1, 4, nullptr);
+        glDrawArrays(gl::TRIANGLES, 0, 3);
+        CHECK(err() == gl::NO_ERROR);
+        bool f32 = false, snorm = false;
+        for (VkFormat f : counts.lastAttrFormats) f32 |= f == VK_FORMAT_R32G32B32A32_SFLOAT, snorm |= f == VK_FORMAT_A2B10G10R10_SNORM_PACK32;
+        CHECK(f32 && !snorm);
+        counts = saved;
+        glBindBuffer(gl::ARRAY_BUFFER, vb);
+        glVertexAttribPointer(GLuint(pos), 4, gl::FLOAT, 0, 24, nullptr);
+    }
     // Texture completeness uses the filter the unit really samples with: a sampler object bound to the unit overrides the
     // texture's own. A 4x4 texture with only level 0 defined (mutable) is incomplete with a mipmapped min filter (it samples
     // the black stand-in) and complete with LINEAR / NEAREST.
@@ -1301,6 +1766,87 @@ void testDraw() {
         CHECK(sampledView() == black);  // the sampler's mipmapped filter needs levels the texture lacks
         glBindSampler(0, 0);
         CHECK(sampledView() == own && err() == gl::NO_ERROR);
+        // ES 2.0: the chain runs down to 1x1 (a 128x64 texture has 8 levels): without its last level a mipmapped texture is incomplete.
+        {
+            GLuint tn;
+            glGenTextures(1, &tn);
+            glBindTexture(gl::TEXTURE_2D, tn);
+            glTexParameteri(gl::TEXTURE_2D, gl::TEXTURE_MIN_FILTER, gl::NEAREST_MIPMAP_NEAREST);
+            const std::vector<uint8_t> big(128 * 64 * 4, 255);
+            for (int l = 0; l < 7; ++l)
+                glTexImage2D(gl::TEXTURE_2D, l, gl::RGBA, std::max(1, 128 >> l), std::max(1, 64 >> l), 0, gl::RGBA, gl::UNSIGNED_BYTE, big.data());
+            const VkImageView missing = sampledView();
+            glTexImage2D(gl::TEXTURE_2D, 7, gl::RGBA, 1, 1, 0, gl::RGBA, gl::UNSIGNED_BYTE, big.data());
+            const VkImageView full = sampledView();
+            CHECK(missing == black && full != black && err() == gl::NO_ERROR);
+        }
+        // UE4 streams mips and moves GL_TEXTURE_BASE_LEVEL / GL_TEXTURE_MAX_LEVEL on an immutable texture: each range is its own
+        // view (a view cached for the old range must not be reused), and going back to a range finds its cached view again.
+        {
+            G(glTexStorage2D, void (*)(GLenum, GLsizei, GLenum, GLsizei, GLsizei));
+            GLuint ts;
+            glGenTextures(1, &ts);
+            glBindTexture(gl::TEXTURE_2D, ts);
+            glTexStorage2D(gl::TEXTURE_2D, 4, gl::RGBA8, 16, 16);
+            glTexParameteri(gl::TEXTURE_2D, gl::TEXTURE_MIN_FILTER, gl::LINEAR_MIPMAP_LINEAR);
+            const VkImageView all = sampledView();
+            glTexParameteri(gl::TEXTURE_2D, gl::TEXTURE_BASE_LEVEL, 2);
+            const VkImageView from2 = sampledView();
+            glTexParameteri(gl::TEXTURE_2D, gl::TEXTURE_MAX_LEVEL, 2);
+            const VkImageView only2 = sampledView();
+            glTexParameteri(gl::TEXTURE_2D, gl::TEXTURE_BASE_LEVEL, 0);
+            const VkImageView to2 = sampledView();
+            glTexParameteri(gl::TEXTURE_2D, gl::TEXTURE_MAX_LEVEL, 3);  // glTexStorage clamped the default 1000 to levels - 1
+            CHECK(sampledView() == all);
+            CHECK(all && from2 && only2 && to2 && err() == gl::NO_ERROR);
+            CHECK(all != from2 && from2 != only2 && only2 != to2 && all != to2 && all != only2 && from2 != to2);
+        }
+        // Mip streaming on a mutable texture: levels 3..5 defined, level 0 never is, GL_TEXTURE_BASE_LEVEL 3 -> complete, sampled
+        // from levels 3..5 (the image is made from the lowest defined level), its data uploaded. Without the base it is incomplete.
+        {
+            GLuint tm;
+            glGenTextures(1, &tm);
+            glBindTexture(gl::TEXTURE_2D, tm);
+            glTexParameteri(gl::TEXTURE_2D, gl::TEXTURE_MIN_FILTER, gl::NEAREST_MIPMAP_NEAREST);
+            const std::vector<uint8_t> d3(8 * 8 * 4, 7), d4(4 * 4 * 4, 8), d5(2 * 2 * 4, 9);
+            counts = {};
+            glTexImage2D(gl::TEXTURE_2D, 5, gl::RGBA, 2, 2, 0, gl::RGBA, gl::UNSIGNED_BYTE, d5.data());
+            glTexImage2D(gl::TEXTURE_2D, 4, gl::RGBA, 4, 4, 0, gl::RGBA, gl::UNSIGNED_BYTE, d4.data());
+            glTexImage2D(gl::TEXTURE_2D, 3, gl::RGBA, 8, 8, 0, gl::RGBA, gl::UNSIGNED_BYTE, d3.data());
+            CHECK(err() == gl::NO_ERROR && counts.copiesToImage == 0);
+            const VkImageView incomplete = sampledView();  // BASE_LEVEL 0: level 0 is not defined
+            CHECK(incomplete == black && counts.copiesToImage == 3);  // the image exists now, with the kept levels uploaded
+            glTexParameteri(gl::TEXTURE_2D, gl::TEXTURE_BASE_LEVEL, 3);
+            glTexParameteri(gl::TEXTURE_2D, gl::TEXTURE_MAX_LEVEL, 5);
+            const VkImageView streamed = sampledView();
+            CHECK(streamed && streamed != black && gLastViewRange.baseMipLevel == 3 && gLastViewRange.levelCount == 3);
+            glTexParameteri(gl::TEXTURE_2D, gl::TEXTURE_MAX_LEVEL, 6);  // level 6 (1x1) is not defined
+            CHECK(sampledView() == black);
+            // The level that arrives later (mip 2, 16x16) fits the chain and lands in the same image.
+            const std::vector<uint8_t> d2(16 * 16 * 4, 6);
+            counts = {};
+            glTexImage2D(gl::TEXTURE_2D, 2, gl::RGBA, 16, 16, 0, gl::RGBA, gl::UNSIGNED_BYTE, d2.data());
+            CHECK(counts.copiesToImage == 1 && err() == gl::NO_ERROR);
+            glTexParameteri(gl::TEXTURE_2D, gl::TEXTURE_MAX_LEVEL, 5);
+            glTexParameteri(gl::TEXTURE_2D, gl::TEXTURE_BASE_LEVEL, 2);
+            CHECK(sampledView() != black && gLastViewRange.baseMipLevel == 2 && gLastViewRange.levelCount == 4);
+        }
+        // GL_TEXTURE_MAX_LEVEL < GL_TEXTURE_BASE_LEVEL: a mipmapped filter is incomplete (black); a non-mipmapped one still samples
+        // the base level, and the view never wraps to VK_REMAINING_MIP_LEVELS.
+        {
+            G(glTexStorage2D, void (*)(GLenum, GLsizei, GLenum, GLsizei, GLsizei));
+            GLuint tx;
+            glGenTextures(1, &tx);
+            glBindTexture(gl::TEXTURE_2D, tx);
+            glTexStorage2D(gl::TEXTURE_2D, 4, gl::RGBA8, 16, 16);
+            glTexParameteri(gl::TEXTURE_2D, gl::TEXTURE_MIN_FILTER, gl::LINEAR_MIPMAP_LINEAR);
+            glTexParameteri(gl::TEXTURE_2D, gl::TEXTURE_BASE_LEVEL, 2);
+            glTexParameteri(gl::TEXTURE_2D, gl::TEXTURE_MAX_LEVEL, 1);
+            CHECK(sampledView() == black);
+            glTexParameteri(gl::TEXTURE_2D, gl::TEXTURE_MIN_FILTER, gl::LINEAR);
+            const VkImageView v = sampledView();
+            CHECK(v && v != black && gLastViewRange.baseMipLevel == 2 && gLastViewRange.levelCount == 1 && err() == gl::NO_ERROR);
+        }
     }
     // Client-side arrays + client indices, triangle fans, line loops, unsigned byte indices.
     glBindBuffer(gl::ARRAY_BUFFER, 0);
@@ -1316,6 +1862,46 @@ void testDraw() {
     CHECK(err() == gl::NO_ERROR && counts.lastInstances == 4);
     glDrawArrays(0x77, 0, 3);
     CHECK(err() == gl::INVALID_ENUM);
+    // An instance array of uniform blocks (uniform B { .. } blk[3]): each element is a block of its own with its binding.
+    {
+        static const char* kVsU =
+            "#version 300 es\nlayout(std140) uniform Blk { highp vec4 v; } blk[3]; in vec4 a_pos;\n"
+            "void main() { gl_Position = a_pos + blk[0].v + blk[2].v; }\n";
+        static const char* kFsU = "#version 300 es\nprecision mediump float; out vec4 o;\nvoid main() { o = vec4(1.0); }\n";
+        G(glGetUniformBlockIndex, GLuint (*)(GLuint, const char*));
+        G(glUniformBlockBinding, void (*)(GLuint, GLuint, GLuint));
+        G(glBindBufferBase, void (*)(GLenum, GLuint, GLuint));
+        const GLuint pu = program(kVsU, kFsU);
+        glUseProgram(pu);
+        GLuint ub[3];
+        glGenBuffers(3, ub);
+        const GLuint idx0 = glGetUniformBlockIndex(pu, "Blk[0]"), idx2 = glGetUniformBlockIndex(pu, "Blk[2]");
+        CHECK(idx0 != 0xFFFFFFFFu && idx2 != 0xFFFFFFFFu && idx0 != idx2);
+        for (int i = 0; i < 3; ++i) {
+            const float zero[4] = {0, 0, 0, 0};
+            glBindBuffer(gl::UNIFORM_BUFFER, ub[i]);
+            glBufferData(gl::UNIFORM_BUFFER, sizeof zero, zero, gl::STATIC_DRAW);
+            glBindBufferBase(gl::UNIFORM_BUFFER, GLuint(i), ub[i]);
+            glUniformBlockBinding(pu, glGetUniformBlockIndex(pu, i == 0 ? "Blk[0]" : i == 1 ? "Blk[1]" : "Blk[2]"), GLuint(i));
+        }
+        // Every element of the block array lists the same member indices (the members exist once, as active uniforms).
+        {
+            G(glGetActiveUniformBlockiv, void (*)(GLuint, GLuint, GLenum, GLint*));
+            G(glGetProgramiv, void (*)(GLuint, GLenum, GLint*));
+            GLint nUniforms = 0, i0 = -1, i1 = -1, n1 = -1;
+            glGetProgramiv(pu, gl::ACTIVE_UNIFORMS, &nUniforms);
+            glGetActiveUniformBlockiv(pu, idx0, gl::UNIFORM_BLOCK_ACTIVE_UNIFORM_INDICES, &i0);
+            glGetActiveUniformBlockiv(pu, idx2, gl::UNIFORM_BLOCK_ACTIVE_UNIFORM_INDICES, &i1);
+            glGetActiveUniformBlockiv(pu, idx2, gl::UNIFORM_BLOCK_ACTIVE_UNIFORMS, &n1);
+            CHECK(nUniforms == 1 && n1 == 1 && i0 == i1 && i1 >= 0 && i1 < nUniforms && err() == gl::NO_ERROR);
+        }
+        glBindBuffer(gl::ARRAY_BUFFER, vb);
+        glVertexAttribPointer(0, 4, gl::FLOAT, 0, 24, nullptr);
+        glEnableVertexAttribArray(0);
+        glDrawArrays(gl::TRIANGLES, 0, 3);
+        CHECK(err() == gl::NO_ERROR);
+        glUseProgram(p);
+    }
     glUseProgram(0);
     glDrawArrays(gl::TRIANGLES, 0, 3);
     CHECK(err() == gl::INVALID_OPERATION);
@@ -1562,6 +2148,473 @@ void testInvalidate() {
 
 // GL_OES_EGL_image_external as Unity uses it for video: the texture is created with glGenTextures +
 // glBindTexture(GL_TEXTURE_EXTERNAL_OES) + glTexParameteri before the SurfaceTexture exists.
+// Game MSAA is always memoryless: a multisample renderbuffer stores only its single-sample image. Passes render in a transient
+// multisample twin that resolves into it (store DONT_CARE + resolve view) and the next pass is seeded from it; a blit with the
+// renderbuffer as source copies the already-resolved image (no vkCmdResolveImage of stored samples).
+void testMsRbo() {
+    Egl e;
+    CHECK(e.up());
+    GLuint p = program(kVs100, kFs100);
+    G(glUseProgram, void (*)(GLuint));
+    G(glGenBuffers, void (*)(GLsizei, GLuint*));
+    G(glBindBuffer, void (*)(GLenum, GLuint));
+    G(glBufferData, void (*)(GLenum, GLsizeiptr, const void*, GLenum));
+    G(glVertexAttribPointer, void (*)(GLuint, GLint, GLenum, GLboolean, GLsizei, const void*));
+    G(glEnableVertexAttribArray, void (*)(GLuint));
+    G(glGetAttribLocation, GLint (*)(GLuint, const char*));
+    G(glDrawArrays, void (*)(GLenum, GLint, GLsizei));
+    G(glGenFramebuffers, void (*)(GLsizei, GLuint*));
+    G(glBindFramebuffer, void (*)(GLenum, GLuint));
+    G(glFramebufferTexture2D, void (*)(GLenum, GLenum, GLenum, GLuint, GLint));
+    G(glFramebufferRenderbuffer, void (*)(GLenum, GLenum, GLenum, GLuint));
+    G(glCheckFramebufferStatus, GLenum (*)(GLenum));
+    G(glGenTextures, void (*)(GLsizei, GLuint*));
+    G(glBindTexture, void (*)(GLenum, GLuint));
+    G(glTexStorage2D, void (*)(GLenum, GLsizei, GLenum, GLsizei, GLsizei));
+    G(glGenRenderbuffers, void (*)(GLsizei, GLuint*));
+    G(glBindRenderbuffer, void (*)(GLenum, GLuint));
+    G(glRenderbufferStorageMultisample, void (*)(GLenum, GLsizei, GLenum, GLsizei, GLsizei));
+    G(glGetRenderbufferParameteriv, void (*)(GLenum, GLenum, GLint*));
+    G(glClear, void (*)(GLbitfield));
+    G(glClearColor, void (*)(GLfloat, GLfloat, GLfloat, GLfloat));
+    G(glEnable, void (*)(GLenum));
+    G(glBlitFramebuffer, void (*)(GLint, GLint, GLint, GLint, GLint, GLint, GLint, GLint, int64_t, int64_t));
+    G(glReadPixels, void (*)(GLint, GLint, GLsizei, GLsizei, GLenum, GLenum, void*));
+    G(glGetIntegerv, void (*)(GLenum, GLint*));
+    glUseProgram(p);
+    const float verts[] = {-1, -1, 0, 1, 0, 0, 1, -1, 0, 1, 1, 0, 0, 1, 0, 1, 0, 1};
+    GLuint vb;
+    glGenBuffers(1, &vb);
+    glBindBuffer(gl::ARRAY_BUFFER, vb);
+    glBufferData(gl::ARRAY_BUFFER, sizeof verts, verts, gl::STATIC_DRAW);
+    const GLint pos = glGetAttribLocation(p, "a_pos");
+    glVertexAttribPointer(GLuint(pos), 4, gl::FLOAT, 0, 24, nullptr);
+    glEnableVertexAttribArray(GLuint(pos));
+    const VkAttachmentLoadOp LOAD = VK_ATTACHMENT_LOAD_OP_LOAD, CLEAR = VK_ATTACHMENT_LOAD_OP_CLEAR, DONT = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    const VkAttachmentStoreOp DROP = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    glDrawArrays(gl::TRIANGLES, 0, 3);  // the first draw uploads the vertex data (ends its pass): later draws continue the clear's pass
+    settle();
+
+    // ---- colour: 4x RGBA8 renderbuffer, drawn, then blitted into a single-sample texture
+    GLuint msFb, rbC, resFb, resTex;
+    glGenFramebuffers(1, &msFb);
+    glGenRenderbuffers(1, &rbC);
+    glGenTextures(1, &resTex);
+    glGenFramebuffers(1, &resFb);
+    glBindTexture(gl::TEXTURE_2D, resTex);
+    glTexStorage2D(gl::TEXTURE_2D, 1, gl::RGBA8, 32, 32);
+    glBindFramebuffer(gl::FRAMEBUFFER, resFb);
+    glFramebufferTexture2D(gl::FRAMEBUFFER, gl::COLOR_ATTACHMENT0, gl::TEXTURE_2D, resTex, 0);
+    CHECK(glCheckFramebufferStatus(gl::FRAMEBUFFER) == gl::FRAMEBUFFER_COMPLETE);
+    counts = {};
+    glBindRenderbuffer(gl::RENDERBUFFER, rbC);
+    glRenderbufferStorageMultisample(gl::RENDERBUFFER, 4, gl::RGBA8, 32, 32);
+    CHECK(err() == gl::NO_ERROR);
+    CHECK(counts.imagesCreated == 1 && counts.imagesMultisample == 0 && counts.imagesStoredMS == 0);  // the backing image is 1x
+    GLint samples = 0;
+    glGetRenderbufferParameteriv(gl::RENDERBUFFER, gl::RENDERBUFFER_SAMPLES, &samples);
+    CHECK(samples == 4);  // the application still sees 4 samples
+    glBindFramebuffer(gl::FRAMEBUFFER, msFb);
+    glFramebufferRenderbuffer(gl::FRAMEBUFFER, gl::COLOR_ATTACHMENT0, gl::RENDERBUFFER, rbC);
+    CHECK(glCheckFramebufferStatus(gl::FRAMEBUFFER) == gl::FRAMEBUFFER_COMPLETE);
+    GLint n = 0, buffers = 0;
+    glGetIntegerv(gl::SAMPLES, &n);
+    glGetIntegerv(gl::SAMPLE_BUFFERS, &buffers);
+    CHECK(n == 4 && buffers == 1);
+    glClearColor(0, 1, 0, 1);
+    counts = {};
+    glClear(gl::COLOR_BUFFER_BIT);
+    glDrawArrays(gl::TRIANGLES, 0, 3);
+    settle();
+    // The pass renders in a transient twin (the only multisample image) and resolves into the renderbuffer's own image.
+    CHECK(err() == gl::NO_ERROR && counts.colorLoad == CLEAR && counts.imagesStoredMS == 0 && counts.colorStore == DROP && counts.colorResolve);
+    counts = {};
+    glBindFramebuffer(gl::READ_FRAMEBUFFER, msFb);
+    glBindFramebuffer(gl::DRAW_FRAMEBUFFER, resFb);
+    glBlitFramebuffer(0, 0, 32, 32, 0, 0, 32, 32, gl::COLOR_BUFFER_BIT, gl::NEAREST);
+    CHECK(err() == gl::NO_ERROR);
+    CHECK(counts.blits == 1 && counts.resolves == 0 && counts.imagesStoredMS == 0);  // copies the resolved image
+    // GLES rules for a multisample read: same rectangle size, same format, no multisample destination, no direct read.
+    glBlitFramebuffer(0, 0, 32, 32, 0, 0, 16, 16, gl::COLOR_BUFFER_BIT, gl::NEAREST);
+    CHECK(err() == gl::INVALID_OPERATION);
+    glBlitFramebuffer(0, 0, 32, 32, 0, 0, 32, 32, gl::COLOR_BUFFER_BIT, gl::NEAREST);
+    CHECK(err() == gl::NO_ERROR);
+    {
+        GLuint fb16, tex16;
+        glGenFramebuffers(1, &fb16);
+        glGenTextures(1, &tex16);
+        glBindTexture(gl::TEXTURE_2D, tex16);
+        glTexStorage2D(gl::TEXTURE_2D, 1, gl::RGBA16F, 32, 32);
+        glBindFramebuffer(gl::DRAW_FRAMEBUFFER, fb16);
+        glFramebufferTexture2D(gl::DRAW_FRAMEBUFFER, gl::COLOR_ATTACHMENT0, gl::TEXTURE_2D, tex16, 0);
+        glBlitFramebuffer(0, 0, 32, 32, 0, 0, 32, 32, gl::COLOR_BUFFER_BIT, gl::NEAREST);
+        CHECK(err() == gl::INVALID_OPERATION);  // format mismatch
+    }
+    glBindFramebuffer(gl::DRAW_FRAMEBUFFER, msFb);
+    glBindFramebuffer(gl::READ_FRAMEBUFFER, resFb);
+    glBlitFramebuffer(0, 0, 32, 32, 0, 0, 32, 32, gl::COLOR_BUFFER_BIT, gl::NEAREST);
+    CHECK(err() == gl::INVALID_OPERATION);  // multisample destination
+    glBindFramebuffer(gl::FRAMEBUFFER, msFb);
+    uint8_t px[4] = {};
+    glReadPixels(0, 0, 1, 1, gl::RGBA, gl::UNSIGNED_BYTE, px);
+    CHECK(err() == gl::INVALID_OPERATION);
+    // The next pass on it continues the picture: it is seeded from the single-sample image (the twin's LOAD becomes DONT_CARE,
+    // a seed draw precedes the triangle) and still stores no samples.
+    counts = {};
+    glDrawArrays(gl::TRIANGLES, 0, 3);
+    settle();
+    CHECK(err() == gl::NO_ERROR && counts.colorLoad == DONT && counts.draws == 2 && counts.colorStore == DROP && counts.colorResolve &&
+          counts.imagesStoredMS == 0);
+
+    // ---- depth / stencil: 4x renderbuffer used across two passes, contents carried by the seed
+    GLuint rbD, rbC2, fbD, resDs, resDsFb;
+    glGenRenderbuffers(1, &rbD);
+    glGenRenderbuffers(1, &rbC2);
+    glGenFramebuffers(1, &fbD);
+    counts = {};
+    glBindRenderbuffer(gl::RENDERBUFFER, rbD);
+    glRenderbufferStorageMultisample(gl::RENDERBUFFER, 4, gl::DEPTH24_STENCIL8, 32, 32);
+    glBindRenderbuffer(gl::RENDERBUFFER, rbC2);
+    glRenderbufferStorageMultisample(gl::RENDERBUFFER, 4, gl::RGBA8, 32, 32);
+    CHECK(err() == gl::NO_ERROR && counts.imagesCreated == 2 && counts.imagesMultisample == 0 && counts.imagesStoredMS == 0);
+    glBindFramebuffer(gl::FRAMEBUFFER, fbD);
+    glFramebufferRenderbuffer(gl::FRAMEBUFFER, gl::COLOR_ATTACHMENT0, gl::RENDERBUFFER, rbC2);
+    glFramebufferRenderbuffer(gl::FRAMEBUFFER, gl::DEPTH_STENCIL_ATTACHMENT, gl::RENDERBUFFER, rbD);
+    CHECK(glCheckFramebufferStatus(gl::FRAMEBUFFER) == gl::FRAMEBUFFER_COMPLETE);
+    glEnable(gl::DEPTH_TEST);
+    counts = {};
+    glClear(gl::COLOR_BUFFER_BIT | gl::DEPTH_BUFFER_BIT | gl::STENCIL_BUFFER_BIT);
+    glDrawArrays(gl::TRIANGLES, 0, 3);
+    settle();
+    CHECK(err() == gl::NO_ERROR && counts.depthLoad == CLEAR && counts.depthStore == DROP && counts.depthResolve && counts.imagesStoredMS == 0);
+    counts = {};
+    glDrawArrays(gl::TRIANGLES, 0, 3);  // second pass, no clear: the depth is loaded (the backend seeds the twin from the resolved image)
+    settle();
+    CHECK(err() == gl::NO_ERROR && counts.depthLoad == LOAD && counts.depthStore == DROP && counts.depthResolve &&
+          counts.colorLoad == DONT && counts.imagesStoredMS == 0);
+    // A cleared pass starts from CLEAR (nothing to seed).
+    counts = {};
+    glClear(gl::COLOR_BUFFER_BIT | gl::DEPTH_BUFFER_BIT | gl::STENCIL_BUFFER_BIT);
+    glDrawArrays(gl::TRIANGLES, 0, 3);
+    settle();
+    CHECK(counts.depthLoad == CLEAR && counts.colorLoad == CLEAR && counts.draws == 1);
+    // glInvalidateFramebuffer on an open pass marks the attachments to drop even though the pass renders in a twin: the hook sees
+    // them by their own (resolve target) views. Depth, then colour.
+    {
+        G(glInvalidateFramebuffer, void (*)(GLenum, GLsizei, const GLenum*));
+        const GLenum depthOnly[1] = {gl::DEPTH_ATTACHMENT}, colorOnly[1] = {gl::COLOR_ATTACHMENT0};
+        counts = {};
+        glDrawArrays(gl::TRIANGLES, 0, 3);
+        glInvalidateFramebuffer(gl::FRAMEBUFFER, 1, depthOnly);
+        settle();
+        CHECK(err() == gl::NO_ERROR && counts.passes == 1 && counts.passDrops == 1 && counts.lastDropDepth == 1);
+        counts = {};
+        glDrawArrays(gl::TRIANGLES, 0, 3);
+        glInvalidateFramebuffer(gl::FRAMEBUFFER, 1, colorOnly);
+        settle();
+        CHECK(err() == gl::NO_ERROR && counts.passes == 1 && counts.passDrops == 1 && counts.lastDropDepth == 0 && counts.colorStore == DROP);
+    }
+    // Depth blit out of the multisample renderbuffer into a single-sample one of the same format.
+    glGenRenderbuffers(1, &resDs);
+    glBindRenderbuffer(gl::RENDERBUFFER, resDs);
+    glRenderbufferStorageMultisample(gl::RENDERBUFFER, 0, gl::DEPTH24_STENCIL8, 32, 32);
+    glGenFramebuffers(1, &resDsFb);
+    glBindFramebuffer(gl::FRAMEBUFFER, resDsFb);
+    glFramebufferRenderbuffer(gl::FRAMEBUFFER, gl::DEPTH_STENCIL_ATTACHMENT, gl::RENDERBUFFER, resDs);
+    CHECK(glCheckFramebufferStatus(gl::FRAMEBUFFER) == gl::FRAMEBUFFER_COMPLETE);
+    glBindFramebuffer(gl::READ_FRAMEBUFFER, fbD);
+    glBindFramebuffer(gl::DRAW_FRAMEBUFFER, resDsFb);
+    counts = {};
+    glBlitFramebuffer(0, 0, 32, 32, 0, 0, 32, 32, gl::DEPTH_BUFFER_BIT | gl::STENCIL_BUFFER_BIT, gl::NEAREST);
+    CHECK(err() == gl::NO_ERROR && counts.imagesStoredMS == 0 && counts.resolves == 0 && counts.blits >= 1);
+    glBlitFramebuffer(0, 0, 32, 32, 0, 0, 16, 16, gl::DEPTH_BUFFER_BIT, gl::NEAREST);
+    CHECK(err() == gl::INVALID_OPERATION);  // size mismatch
+
+    // ---- MRT: same-size, same-format multisample renderbuffers each get a twin of their own (colour slot 0..7, one for depth/stencil)
+    {
+        G(glDrawBuffers, void (*)(GLsizei, const GLenum*));
+        G(glCopyImageSubData, void (*)(GLuint, GLenum, GLint, GLint, GLint, GLint, GLuint, GLenum, GLint, GLint, GLint, GLint, GLsizei, GLsizei, GLsizei));
+        GLuint mrtFb, mrtRb[8], mrtDs;
+        glGenFramebuffers(1, &mrtFb);
+        glGenRenderbuffers(8, mrtRb);
+        glGenRenderbuffers(1, &mrtDs);
+        glBindFramebuffer(gl::FRAMEBUFFER, mrtFb);
+        GLenum bufs[8];
+        for (int i = 0; i < 8; ++i) {
+            glBindRenderbuffer(gl::RENDERBUFFER, mrtRb[i]);
+            glRenderbufferStorageMultisample(gl::RENDERBUFFER, 4, gl::RGBA8, 32, 32);
+            glFramebufferRenderbuffer(gl::FRAMEBUFFER, gl::COLOR_ATTACHMENT0 + GLenum(i), gl::RENDERBUFFER, mrtRb[i]);
+            bufs[i] = gl::COLOR_ATTACHMENT0 + GLenum(i);
+        }
+        glBindRenderbuffer(gl::RENDERBUFFER, mrtDs);
+        glRenderbufferStorageMultisample(gl::RENDERBUFFER, 4, gl::DEPTH24_STENCIL8, 32, 32);
+        glFramebufferRenderbuffer(gl::FRAMEBUFFER, gl::DEPTH_STENCIL_ATTACHMENT, gl::RENDERBUFFER, mrtDs);
+        CHECK(glCheckFramebufferStatus(gl::FRAMEBUFFER) == gl::FRAMEBUFFER_COMPLETE);
+        glDrawBuffers(8, bufs);
+        counts = {};
+        glDrawArrays(gl::TRIANGLES, 0, 3);
+        settle();
+        CHECK(err() == gl::NO_ERROR && counts.imagesStoredMS == 0 && counts.lastColorCount == 8);
+        std::set<VkImageView> views;
+        for (int i = 0; i < 8; ++i) views.insert(counts.colorViews[i]);
+        views.insert(counts.depthView);
+        CHECK(views.size() == 9 && !views.count(VK_NULL_HANDLE));  // 8 colour twins + the depth/stencil one, all different
+        const VkImageView first[8] = {counts.colorViews[0], counts.colorViews[1], counts.colorViews[2], counts.colorViews[3],
+                                      counts.colorViews[4], counts.colorViews[5], counts.colorViews[6], counts.colorViews[7]};
+        // The next pass on it asks for the same twins (nothing evicted mid-framebuffer): the same views.
+        counts = {};
+        glDrawArrays(gl::TRIANGLES, 0, 3);
+        settle();
+        bool same = true;
+        for (int i = 0; i < 8; ++i) same = same && counts.colorViews[i] == first[i];
+        CHECK(same);
+        // Many other sizes in between (more twins than the cache keeps) do not evict a framebuffer's own twins while it is drawn to.
+        for (int k = 0; k < 40; ++k) {
+            GLuint rb, fb;
+            glGenRenderbuffers(1, &rb);
+            glGenFramebuffers(1, &fb);
+            glBindRenderbuffer(gl::RENDERBUFFER, rb);
+            glRenderbufferStorageMultisample(gl::RENDERBUFFER, 4, gl::RGBA8, 8 + k, 8);
+            glBindFramebuffer(gl::FRAMEBUFFER, fb);
+            glFramebufferRenderbuffer(gl::FRAMEBUFFER, gl::COLOR_ATTACHMENT0, gl::RENDERBUFFER, rb);
+            glDrawArrays(gl::TRIANGLES, 0, 3);
+        }
+        settle();
+        glBindFramebuffer(gl::FRAMEBUFFER, mrtFb);
+        glDrawBuffers(8, bufs);
+        counts = {};
+        glDrawArrays(gl::TRIANGLES, 0, 3);
+        settle();
+        views.clear();
+        for (int i = 0; i < 8; ++i) views.insert(counts.colorViews[i]);
+        views.insert(counts.depthView);
+        CHECK(err() == gl::NO_ERROR && views.size() == 9 && !views.count(VK_NULL_HANDLE));
+        // glCopyImageSubData: sample counts must match, and a multisample renderbuffer has no samples to copy.
+        glBindTexture(gl::TEXTURE_2D, resTex);
+        counts = {};
+        glCopyImageSubData(mrtRb[0], gl::RENDERBUFFER, 0, 0, 0, 0, resTex, gl::TEXTURE_2D, 0, 0, 0, 0, 32, 32, 1);
+        CHECK(err() == gl::INVALID_OPERATION && counts.copiesImage == 0);
+        glCopyImageSubData(resTex, gl::TEXTURE_2D, 0, 0, 0, 0, mrtRb[0], gl::RENDERBUFFER, 0, 0, 0, 0, 32, 32, 1);
+        CHECK(err() == gl::INVALID_OPERATION && counts.copiesImage == 0);
+        glCopyImageSubData(mrtRb[0], gl::RENDERBUFFER, 0, 0, 0, 0, mrtRb[1], gl::RENDERBUFFER, 0, 0, 0, 0, 32, 32, 1);
+        CHECK(err() == gl::NO_ERROR && counts.copiesImage == 1);  // same sample counts: the resolved images
+        GLuint plain;
+        glGenRenderbuffers(1, &plain);
+        glBindRenderbuffer(gl::RENDERBUFFER, plain);
+        glRenderbufferStorageMultisample(gl::RENDERBUFFER, 0, gl::RGBA8, 32, 32);
+        glCopyImageSubData(mrtRb[0], gl::RENDERBUFFER, 0, 0, 0, 0, plain, gl::RENDERBUFFER, 0, 0, 0, 0, 32, 32, 1);
+        CHECK(err() == gl::INVALID_OPERATION);
+    }
+    e.down();
+}
+
+// EXT_multisampled_render_to_texture, depth / stencil of a texture across a cut of the pass (barrier, occlusion query): the pass
+// that goes on loads the depth from the single-sample texture the previous pass resolved into (the backend seeds the transient
+// twin from it) instead of testing against an undefined depth. The null backend executes nothing, so what is checked is the
+// contract: the load op / resolve target the layer gives the pass, the format views the seed needs (only for a texture attached as
+// such), that the frame compiler plans a depth seed (gpu.frame seed_draws) and what gles.msrtt_ds / gles.census say about it.
+void testMsrttDepth() {
+    Egl e;
+    CHECK(e.up());
+    GLuint p = program("attribute vec4 a_pos; uniform float u_z; void main() { gl_Position = vec4(a_pos.xy, u_z, 1.0); }\n",
+                       "precision mediump float; uniform vec4 u_col; void main() { gl_FragColor = u_col; }\n");
+    G(glUseProgram, void (*)(GLuint));
+    G(glGenBuffers, void (*)(GLsizei, GLuint*));
+    G(glBindBuffer, void (*)(GLenum, GLuint));
+    G(glBufferData, void (*)(GLenum, GLsizeiptr, const void*, GLenum));
+    G(glVertexAttribPointer, void (*)(GLuint, GLint, GLenum, GLboolean, GLsizei, const void*));
+    G(glEnableVertexAttribArray, void (*)(GLuint));
+    G(glGetAttribLocation, GLint (*)(GLuint, const char*));
+    G(glGetUniformLocation, GLint (*)(GLuint, const char*));
+    G(glUniform1f, void (*)(GLint, GLfloat));
+    G(glUniform4f, void (*)(GLint, GLfloat, GLfloat, GLfloat, GLfloat));
+    G(glDrawArrays, void (*)(GLenum, GLint, GLsizei));
+    G(glGenFramebuffers, void (*)(GLsizei, GLuint*));
+    G(glBindFramebuffer, void (*)(GLenum, GLuint));
+    G(glFramebufferTexture2DMultisampleEXT, void (*)(GLenum, GLenum, GLenum, GLuint, GLint, GLsizei));
+    G(glCheckFramebufferStatus, GLenum (*)(GLenum));
+    G(glGenTextures, void (*)(GLsizei, GLuint*));
+    G(glBindTexture, void (*)(GLenum, GLuint));
+    G(glTexStorage2D, void (*)(GLenum, GLsizei, GLenum, GLsizei, GLsizei));
+    G(glClear, void (*)(GLbitfield));
+    G(glClearColor, void (*)(GLfloat, GLfloat, GLfloat, GLfloat));
+    G(glClearDepthf, void (*)(GLfloat));
+    G(glEnable, void (*)(GLenum));
+    G(glDepthFunc, void (*)(GLenum));
+    G(glMemoryBarrier, void (*)(GLbitfield));
+    G(glGenQueries, void (*)(GLsizei, GLuint*));
+    G(glBeginQuery, void (*)(GLenum, GLuint));
+    G(glEndQuery, void (*)(GLenum));
+    glUseProgram(p);
+    const float quad[] = {-1, -1, 1, -1, -1, 1, 1, 1};
+    GLuint vb;
+    glGenBuffers(1, &vb);
+    glBindBuffer(gl::ARRAY_BUFFER, vb);
+    glBufferData(gl::ARRAY_BUFFER, sizeof quad, quad, gl::STATIC_DRAW);
+    const GLint pos = glGetAttribLocation(p, "a_pos"), uz = glGetUniformLocation(p, "u_z"), uc = glGetUniformLocation(p, "u_col");
+    glVertexAttribPointer(GLuint(pos), 2, gl::FLOAT, 0, 8, nullptr);
+    glEnableVertexAttribArray(GLuint(pos));
+    glEnable(gl::DEPTH_TEST);
+    glDrawArrays(gl::TRIANGLE_STRIP, 0, 4);  // the first draw uploads the vertex data (ends its pass)
+    settle();
+
+    GLuint colorTex, fb;
+    glGenTextures(1, &colorTex);
+    glGenFramebuffers(1, &fb);
+    glBindTexture(gl::TEXTURE_2D, colorTex);
+    glTexStorage2D(gl::TEXTURE_2D, 1, gl::RGBA8, 32, 32);
+    glBindFramebuffer(gl::FRAMEBUFFER, fb);
+    glFramebufferTexture2DMultisampleEXT(gl::FRAMEBUFFER, gl::COLOR_ATTACHMENT0, gl::TEXTURE_2D, colorTex, 0, 4);
+
+    // cut: 1 = glMemoryBarrier, 2 = an occlusion query begins. `func` / `clearZ`: forward-Z (LESS, far = 1) or reverse-Z (GREATER, far = 0).
+    // A near quad, the cut, a far quad that must lose the depth test: its pass has to start from the near quad's depth.
+    auto scenario = [&](int cut, GLenum func, float clearZ, float nearZ, float farZ) {
+        GLuint q = 0;
+        glGenQueries(1, &q);
+        settle();
+        glDepthFunc(func);
+        glClearColor(0, 0, 0, 1);
+        glClearDepthf(clearZ);
+        glClear(gl::COLOR_BUFFER_BIT | gl::DEPTH_BUFFER_BIT | gl::STENCIL_BUFFER_BIT);
+        glUniform1f(uz, nearZ);
+        glUniform4f(uc, 1, 0, 0, 1);
+        glDrawArrays(gl::TRIANGLE_STRIP, 0, 4);
+        if (cut == 1) glMemoryBarrier(0x00000001);
+        if (cut == 2) glBeginQuery(gl::ANY_SAMPLES_PASSED, q);
+        counts = {};
+        glUniform1f(uz, farZ);
+        glUniform4f(uc, 0, 1, 0, 1);
+        glDrawArrays(gl::TRIANGLE_STRIP, 0, 4);
+        if (cut == 2) glEndQuery(gl::ANY_SAMPLES_PASSED);
+        settle();
+    };
+    auto seedDraws = [](const std::string& log) {
+        size_t seeded = 0;
+        for (size_t at = log.find("seed_draws="); at != std::string::npos; at = log.find("seed_draws=", at + 1))
+            seeded += std::strtoul(log.c_str() + at + 11, nullptr, 10);
+        return seeded;
+    };
+    // Each case attaches a fresh depth (/ stencil) texture as a multisampled-render-to-texture attachment and cuts the pass.
+    // `ifmt` / `att`: its format and attachment point. `viewsFlag`: the texture gets MUTABLE_FORMAT (format views) when attached.
+    // `seeded`: the frame compiler plans a depth seed (a gpu.frame line with seed_draws >= 4 over the 4 cut passes); false: it plans none.
+    // `line`: what gles.msrtt_ds says about the continuing pass.
+    struct Case {
+        const char* name;
+        GLenum ifmt, att;
+        bool viewsFlag, seeded;
+        const char* line;
+    };
+    // KNOWN GAP (the two "unseeded" cases): a depth attached alone whose Vulkan format also has a stencil plane (DEPTH_COMPONENT24 and
+    // DEPTH24_STENCIL8 are both D24S8) has no stencil resolve target, so the backend (commands.cpp gameAuto) does not seed the twin: the
+    // continuing pass keeps its LOAD but starts from an undefined depth. This test documents that; when it is fixed the cases flip to seeded.
+    const Case cases[] = {
+        {"D24S8 depth+stencil", gl::DEPTH24_STENCIL8, gl::DEPTH_STENCIL_ATTACHMENT, true, true,
+         "fmt=D24S8(0x88f0) attach=depth_stencil depth=load stencil=load serve=yes"},
+        {"D32F depth only", gl::DEPTH_COMPONENT32F, gl::DEPTH_ATTACHMENT, false, true, "fmt=D32F(0x8cac) attach=depth depth=load stencil=- serve=yes"},
+        {"D24 depth only (known gap: unseeded)", gl::DEPTH_COMPONENT24, gl::DEPTH_ATTACHMENT, false, false,
+         "fmt=D24(0x81a6) attach=depth depth=load stencil=- serve=no why=stencil_not_attached"},
+        {"D24S8 depth only (known gap: unseeded)", gl::DEPTH24_STENCIL8, gl::DEPTH_ATTACHMENT, true, false,
+         "fmt=D24S8(0x88f0) attach=depth depth=load stencil=- serve=no why=stencil_not_attached"},
+    };
+    G(glFramebufferTexture2D, void (*)(GLenum, GLenum, GLenum, GLuint, GLint));
+    for (const Case& c : cases) {
+        GLuint depthTex;
+        glGenTextures(1, &depthTex);
+        glBindTexture(gl::TEXTURE_2D, depthTex);
+        counts = {};
+        glTexStorage2D(gl::TEXTURE_2D, 1, c.ifmt, 32, 32);
+        // A depth texture that is not a multisampled-render-to-texture attachment keeps its lossless depth compression: no format views,
+        // also as a plain framebuffer attachment.
+        CHECK(err() == gl::NO_ERROR && counts.imagesCreated == 1 && !(counts.lastImageFlags & VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT));
+        glFramebufferTexture2DMultisampleEXT(gl::FRAMEBUFFER, gl::DEPTH_STENCIL_ATTACHMENT, gl::TEXTURE_2D, 0, 0, 0);  // detach both
+        glFramebufferTexture2D(gl::FRAMEBUFFER, c.att, gl::TEXTURE_2D, depthTex, 0);
+        CHECK(err() == gl::NO_ERROR && counts.imagesCreated == 1 && !(counts.lastImageFlags & VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT));
+        // Attached as a multisampled-render-to-texture attachment: the image is recreated with format views, its texels copied over.
+        counts = {};
+        glFramebufferTexture2DMultisampleEXT(gl::FRAMEBUFFER, c.att, gl::TEXTURE_2D, depthTex, 0, 4);
+        CHECK(err() == gl::NO_ERROR && glCheckFramebufferStatus(gl::FRAMEBUFFER) == gl::FRAMEBUFFER_COMPLETE);
+        if (c.viewsFlag) {
+            CHECK(counts.imagesCreated == 1 && (counts.lastImageFlags & VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT) && counts.copiesImage == 1);
+        } else {
+            CHECK(counts.imagesCreated == 0 && counts.copiesImage == 0);  // (no stencil plane to read through a view: nothing recreated)
+        }
+        const size_t markCase = peekStderr().size();
+        // (A first frame on the new texture is not counted: the frame compiler's line for it may still carry the change of attachments.)
+        scenario(1, gl::LESS, 1.0f, 0.2f, 0.7f);
+        const size_t mark = peekStderr().size();
+        for (int cut = 1; cut <= 2; ++cut) {
+            for (int reverse = 0; reverse <= 1; ++reverse) {
+                scenario(cut, reverse ? gl::GREATER : gl::LESS, reverse ? 0.0f : 1.0f, reverse ? 0.8f : 0.2f, reverse ? 0.3f : 0.7f);
+                // A new pass: the colour is seeded by the layer's own draw (DONT_CARE + a seed draw before the quad), the depth keeps its
+                // LOAD (the backend seeds it; the cleared value is not applied again: no clear in the new pass) and, like in the first
+                // pass, resolves into the texture; nothing is stored.
+                CHECK(err() == gl::NO_ERROR && counts.passes == 1);
+                CHECK(counts.depthLoad == VK_ATTACHMENT_LOAD_OP_LOAD && counts.depthResolve && counts.depthStore == VK_ATTACHMENT_STORE_OP_DONT_CARE);
+                CHECK(counts.colorLoad == VK_ATTACHMENT_LOAD_OP_DONT_CARE && counts.colorResolve && counts.draws == 2 && counts.imagesStoredMS == 0);
+                CHECK(counts.clears == 0);
+            }
+        }
+        const std::string whole = peekStderr(), log = whole.substr(mark);
+        // The frame compiler plans a depth seed for each of the 4 passes, or (known gap) none.
+        if (c.seeded) {
+            CHECK(seedDraws(log) >= 4);
+        } else {
+            CHECK(seedDraws(log) == 0);
+        }
+        const std::string sinceCase = whole.substr(markCase);
+        const bool said = sinceCase.find(std::string("gles.msrtt_ds tex=") + std::to_string(depthTex) + " " + c.line) != std::string::npos;
+        if (!said) std::printf("  case %s: gles.msrtt_ds line missing; log since the case:\n%s\n", c.name, sinceCase.c_str());
+        CHECK(said);
+    }
+    // An invalidated depth continues as DONT_CARE (glInvalidateFramebuffer): the line says so.
+    {
+        G(glInvalidateFramebuffer, void (*)(GLenum, GLsizei, const GLenum*));
+        GLuint depthTex;
+        glGenTextures(1, &depthTex);
+        glBindTexture(gl::TEXTURE_2D, depthTex);
+        glTexStorage2D(gl::TEXTURE_2D, 1, gl::DEPTH24_STENCIL8, 32, 32);
+        glFramebufferTexture2DMultisampleEXT(gl::FRAMEBUFFER, gl::DEPTH_STENCIL_ATTACHMENT, gl::TEXTURE_2D, depthTex, 0, 4);
+        glDepthFunc(gl::LESS);
+        glClearDepthf(1.0f);
+        glClear(gl::COLOR_BUFFER_BIT | gl::DEPTH_BUFFER_BIT | gl::STENCIL_BUFFER_BIT);
+        glUniform1f(uz, 0.2f);
+        glDrawArrays(gl::TRIANGLE_STRIP, 0, 4);
+        glMemoryBarrier(0x00000001);
+        const GLenum atts[] = {gl::DEPTH_ATTACHMENT, gl::STENCIL_ATTACHMENT};
+        glInvalidateFramebuffer(gl::FRAMEBUFFER, 2, atts);
+        const size_t mark = peekStderr().size();
+        glDrawArrays(gl::TRIANGLE_STRIP, 0, 4);
+        settle();
+        CHECK(err() == gl::NO_ERROR && counts.depthLoad == VK_ATTACHMENT_LOAD_OP_DONT_CARE);
+        CHECK(peekStderr().substr(mark).find("gles.msrtt_ds tex=" + std::to_string(depthTex) + " fmt=D24S8(0x88f0) attach=depth_stencil depth=inv stencil=inv serve=yes") !=
+              std::string::npos);
+    }
+    // No cut: the pass goes on as it is (no new pass, nothing loaded again, one draw).
+    settle();
+    glDepthFunc(gl::LESS);
+    glClearDepthf(1.0f);
+    glClear(gl::COLOR_BUFFER_BIT | gl::DEPTH_BUFFER_BIT | gl::STENCIL_BUFFER_BIT);
+    glUniform1f(uz, 0.2f);
+    glDrawArrays(gl::TRIANGLE_STRIP, 0, 4);
+    counts = {};
+    glUniform1f(uz, 0.7f);
+    glDrawArrays(gl::TRIANGLE_STRIP, 0, 4);
+    settle();
+    CHECK(err() == gl::NO_ERROR && counts.passes == 0 && counts.draws == 1 && counts.clears == 0);
+    // The census counts the continued passes (per tick too): eglTerminate prints it.
+    {
+        G(eglTerminate, uint32_t (*)(void*));
+        const size_t mark = peekStderr().size();
+        eglTerminate(e.dpy);
+        const std::string log = peekStderr().substr(mark);
+        const size_t at = log.find("msrtt_ds_continued=");
+        CHECK(at != std::string::npos && std::strtoul(log.c_str() + at + 19, nullptr, 10) >= 8);
+        const size_t mx = log.find("msrtt_ds_continued_tick_max=");
+        CHECK(mx != std::string::npos && std::strtoul(log.c_str() + mx + 28, nullptr, 10) >= 1);
+    }
+    e.down();
+}
+
 void testExternal() {
     Egl e;
     CHECK(e.up());
@@ -1734,6 +2787,8 @@ void testMultiview() {
     CHECK(tex != 0);
     // A wrapped RGBA image keeps its alpha (passthrough eye): not the RGB8/SRGB8 row that shares its Vulkan format.
     CHECK(formatByVk(VK_FORMAT_R8G8B8A8_SRGB)->alphaBits == 8 && formatByVk(VK_FORMAT_R8G8B8A8_UNORM)->alphaBits == 8);
+    // The window's D24S8 keeps its stencil (a DEPTH_COMPONENT24 row for the same VkFormat has none).
+    CHECK(formatByVk(VK_FORMAT_D24_UNORM_S8_UINT)->stencil && formatByVk(VK_FORMAT_D24_UNORM_S8_UINT)->stencilBits == 8);
     GLuint fb;
     glGenFramebuffers(1, &fb);
     glBindFramebuffer(gl::DRAW_FRAMEBUFFER, fb);
@@ -1908,11 +2963,11 @@ void testEs31() {
     glGetIntegeri_v(gl::VERTEX_BINDING_STRIDE, uv, &q);
     CHECK(q == 24);
     // Errors.
-    glBindVertexBuffer(16, vb, 0, 4);
+    glBindVertexBuffer(32, vb, 0, 4);
     CHECK(err() == gl::INVALID_VALUE);
     glBindVertexBuffer(0, vb, -1, 4);
     CHECK(err() == gl::INVALID_VALUE);
-    glVertexAttribFormat(16, 4, gl::FLOAT, 0, 0);
+    glVertexAttribFormat(32, 4, gl::FLOAT, 0, 0);
     CHECK(err() == gl::INVALID_VALUE);
     glVertexAttribFormat(0, 5, gl::FLOAT, 0, 0);
     CHECK(err() == gl::INVALID_VALUE);
@@ -2065,6 +3120,23 @@ void testEs31() {
     glCopyImageSubData(rb, gl::RENDERBUFFER, 0, 0, 0, 0, tex[1], gl::TEXTURE_2D, 0, 0, 0, 0, 8, 8, 1);
     CHECK(err() == gl::NO_ERROR && counts.copiesImage == 1);
 
+    // ---- error rules of the negative_api family
+    G(glDrawRangeElements, void (*)(GLenum, GLuint, GLuint, GLsizei, GLenum, const void*));
+    G(glGetInternalformativ, void (*)(GLenum, GLenum, GLenum, GLsizei, GLint*));
+    glDrawRangeElements(gl::TRIANGLES, 5, 1, 3, gl::UNSIGNED_SHORT, nullptr);
+    CHECK(err() == gl::INVALID_VALUE);  // end < start
+    GLint nif[2] = {-1, -1};
+    glGetInternalformativ(gl::TEXTURE_2D, gl::RGBA8, 0x80A9, 2, nif);
+    CHECK(err() == gl::INVALID_ENUM);  // not a multisample target
+    glGetInternalformativ(gl::RENDERBUFFER, gl::RGBA8, 0x1234, 2, nif);
+    CHECK(err() == gl::INVALID_ENUM);  // pname
+    glGetInternalformativ(gl::RENDERBUFFER, 0x1908 /* RGBA: unsized */, 0x80A9, 2, nif);
+    CHECK(err() == gl::INVALID_ENUM);  // not a renderable sized format
+    glVertexAttribPointer(0, 4, 0x7777, 0, 0, nullptr);
+    CHECK(err() == gl::INVALID_ENUM);
+    glVertexAttribPointer(0, 3, 0x8368 /* UNSIGNED_INT_2_10_10_10_REV */, 0, 0, nullptr);
+    CHECK(err() == gl::INVALID_OPERATION);  // packed types need size 4
+
     // ---- glProgramUniform*
     G(glProgramUniform1i, void (*)(GLuint, GLint, GLint));
     G(glProgramUniform1f, void (*)(GLuint, GLint, GLfloat));
@@ -2110,10 +3182,12 @@ void testEs31() {
     glProgramUniform1i(9999, lt, 1);
     CHECK(err() == gl::INVALID_VALUE);
     glProgramUniform1i(p3, 9999, 1);
-    CHECK(err() == gl::INVALID_OPERATION);
+    CHECK(err() == gl::NO_ERROR);  // lenient (Adreno): a location past the range is ignored (strict: INVALID_OPERATION, see uniform_strict)
     const GLint two[2] = {1, 2};
     glProgramUniform1iv(p3, lt, 2, two);
-    CHECK(err() == gl::INVALID_OPERATION);  // count > array size
+    CHECK(err() == gl::NO_ERROR);  // lenient: count > array size on a non-array applies the first element only
+    glGetUniformiv(p3, lt, &iv);
+    CHECK(iv == 1);
     glProgramUniform1i(p3, -1, 3);  // location -1 is silently ignored
     CHECK(err() == gl::NO_ERROR);
     {
@@ -2270,7 +3344,7 @@ void testEs31() {
             GLint vo[8] = {};
             glGetProgramResourceiv(cp, gl::BUFFER_VARIABLE, vi, 6, vprops, 8, &got, vo);
             CHECK(err() == gl::NO_ERROR && got == 6 && vo[0] == 0x8B52 /*FLOAT_VEC4*/ && vo[1] == 0 && vo[2] == 16 && vo[3] == 16 &&
-                  vo[4] == 0 && vo[5] == 16);  // unsized last array: size 0, offset after the counter, vec4 stride
+                  vo[4] == 0 && vo[5] == 0);  // unsized last array: size 0, offset after the counter, vec4 stride; no top-level array of aggregates
             const GLenum aprops[] = {gl::BUFFER_BINDING, gl::BUFFER_DATA_SIZE, gl::NUM_ACTIVE_VARIABLES};
             GLint ao[4] = {};
             glGetProgramResourceiv(cp, gl::ATOMIC_COUNTER_BUFFER_IF, 0, 3, aprops, 4, &got, ao);
@@ -2347,6 +3421,95 @@ void testEs31() {
             CHECK(err() == gl::INVALID_VALUE);
             glUseProgram(p);
         }
+    }
+
+    // ---- image units: a slice of a 3D texture as image2D (Metal cannot view 3D as 2D: a 2D copy of the slice is
+    // bound, copied in before the dispatch and back after it) and a format other than the texture's
+    {
+        G(glCreateShader, GLuint (*)(GLenum));
+        G(glShaderSource, void (*)(GLuint, GLsizei, const char* const*, const GLint*));
+        G(glCompileShader, void (*)(GLuint));
+        G(glGetShaderiv, void (*)(GLuint, GLenum, GLint*));
+        G(glCreateProgram, GLuint (*)());
+        G(glAttachShader, void (*)(GLuint, GLuint));
+        G(glLinkProgram, void (*)(GLuint));
+        G(glGetProgramiv, void (*)(GLuint, GLenum, GLint*));
+        G(glBindImageTexture, void (*)(GLuint, GLuint, GLint, GLboolean, GLint, GLenum, GLenum));
+        G(glTexStorage3D, void (*)(GLenum, GLsizei, GLenum, GLsizei, GLsizei, GLsizei));
+        G(glTexStorage2D, void (*)(GLenum, GLsizei, GLenum, GLsizei, GLsizei));
+        auto compute = [&](const char* src) {
+            GLuint sh = glCreateShader(gl::COMPUTE_SHADER);
+            glShaderSource(sh, 1, &src, nullptr);
+            glCompileShader(sh);
+            GLuint cp = glCreateProgram();
+            glAttachShader(cp, sh);
+            glLinkProgram(cp);
+            GLint linked = 0;
+            glGetProgramiv(cp, gl::LINK_STATUS, &linked);
+            return linked ? cp : 0u;
+        };
+        const GLuint slice = compute(
+            "#version 310 es\nlayout(local_size_x = 4) in;\n"
+            "layout(r32ui, binding = 0) readonly uniform highp uimage2D src;\n"
+            "layout(r32ui, binding = 1) writeonly uniform highp uimage2D dst;\n"
+            "void main() { ivec2 p = ivec2(int(gl_GlobalInvocationID.x), 0); imageStore(dst, p, imageLoad(src, p)); }\n");
+        CHECK(slice != 0);
+        GLuint t3, t2;
+        glGenTextures(1, &t3);
+        glGenTextures(1, &t2);
+        glBindTexture(gl::TEXTURE_3D, t3);
+        glTexStorage3D(gl::TEXTURE_3D, 1, 0x8236 /*R32UI*/, 4, 4, 4);
+        glBindTexture(gl::TEXTURE_2D, t2);
+        glTexStorage2D(gl::TEXTURE_2D, 1, 0x8236, 4, 4);
+        CHECK(err() == gl::NO_ERROR);
+        if (slice) {
+            glUseProgram(slice);
+            glBindImageTexture(0, t3, 0, 0, 2, gl::READ_ONLY, 0x8236);
+            glBindImageTexture(1, t2, 0, 0, 0, gl::WRITE_ONLY, 0x8236);
+            CHECK(err() == gl::NO_ERROR);
+            counts = {};  // (the binds made the textures storage-capable: images re-created, contents carried over)
+            glDispatchCompute(1, 1, 1);
+            CHECK(err() == gl::NO_ERROR && counts.dispatches == 1);
+            CHECK(counts.copiesImage == 1);  // the slice in; read-only: nothing comes back
+            CHECK(counts.viewsOf3DAs2D == 0);
+            // Written: copied back after the dispatch.
+            glBindImageTexture(0, t2, 0, 0, 0, gl::READ_ONLY, 0x8236);
+            glBindImageTexture(1, t3, 0, 0, 3, gl::WRITE_ONLY, 0x8236);
+            counts.copiesImage = 0;
+            glDispatchCompute(1, 1, 1);
+            CHECK(err() == gl::NO_ERROR && counts.copiesImage == 2 && counts.viewsOf3DAs2D == 0);
+            // A layer past the depth: reads zero, no error, no 2D view of the 3D image.
+            glBindImageTexture(1, t3, 0, 0, 9, gl::WRITE_ONLY, 0x8236);
+            glDispatchCompute(1, 1, 1);
+            CHECK(err() == gl::NO_ERROR && counts.viewsOf3DAs2D == 0);
+        }
+        // Format reinterpretation: an RGBA8 texture read as R32UI gets a view of that format.
+        const GLuint reint = compute(
+            "#version 310 es\nlayout(local_size_x = 4) in;\n"
+            "layout(r32ui, binding = 0) readonly uniform highp uimage2D src;\n"
+            "layout(r32ui, binding = 1) writeonly uniform highp uimage2D dst;\n"
+            "void main() { ivec2 p = ivec2(int(gl_GlobalInvocationID.x), 0); imageStore(dst, p, imageLoad(src, p)); }\n");
+        CHECK(reint != 0);
+        GLuint ta, tb;
+        glGenTextures(1, &ta);
+        glGenTextures(1, &tb);
+        glBindTexture(gl::TEXTURE_2D, ta);
+        glTexStorage2D(gl::TEXTURE_2D, 1, gl::RGBA8, 4, 4);
+        glBindTexture(gl::TEXTURE_2D, tb);
+        glTexStorage2D(gl::TEXTURE_2D, 1, 0x8236, 4, 4);
+        if (reint) {
+            glUseProgram(reint);
+            counts = {};
+            glBindImageTexture(0, ta, 0, 0, 0, gl::READ_ONLY, 0x8236);
+            CHECK(counts.lastImageFlags & VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT);
+            // (The new image carries the texels over: gles.tex_realloc, which counts the images that lose them, stays silent.)
+            CHECK(counts.copiesImage >= 1 && peekStderr().find("gles.tex_realloc tex=" + std::to_string(ta) + " ") == std::string::npos);
+            glBindImageTexture(1, tb, 0, 0, 0, gl::WRITE_ONLY, 0x8236);
+            glDispatchCompute(1, 1, 1);
+            CHECK(err() == gl::NO_ERROR && counts.dispatches == 1);
+            CHECK(counts.lastViewFormat == VK_FORMAT_R32_UINT);
+        }
+        glUseProgram(p);
     }
 
     // ---- texture buffers
@@ -2672,14 +3835,70 @@ void testEs31() {
     CHECK(err() == gl::NO_ERROR);
     glGetQueryiv(gl::ANY_SAMPLES_PASSED, gl::CURRENT_QUERY, &q);
     CHECK(q == 0);
-    glGetQueryObjectuiv(qs[0], gl::QUERY_RESULT_AVAILABLE, &r);
+    // (a real GPU, e.g. Metal on macOS, finishes the visibility result a moment after End: poll like a game does)
+    for (int spin = 0; spin < 5000; ++spin) {
+        glGetQueryObjectuiv(qs[0], gl::QUERY_RESULT_AVAILABLE, &r);
+        if (r == 1) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
     CHECK(r == 1);
     glGetQueryObjectuiv(qs[0], gl::QUERY_RESULT, &r);
-    CHECK(r == 1);
+    CHECK(r <= 1);  // the GPU counts the samples (the null backend draws nothing: 0); the dEQP occlusion_query cases check the count
     glBeginQuery(gl::ANY_SAMPLES_PASSED_CONSERVATIVE, qs[1]);
     glEndQuery(gl::ANY_SAMPLES_PASSED_CONSERVATIVE);
     glGetQueryObjectuiv(qs[1], gl::QUERY_RESULT, &r);
     CHECK(err() == gl::NO_ERROR && r == 0);  // nothing was drawn
+    // QUERY_RESULT waits for a late GPU result: it never reads 0 ("occluded") only because the count is not ready yet
+    // (Unreal hides what a not-ready query reports as 0). QUERY_RESULT_AVAILABLE does not wait.
+    {
+        GLuint qw;
+        glGenQueries(1, &qw);
+        glBeginQuery(gl::ANY_SAMPLES_PASSED, qw);
+        glDrawArrays(gl::TRIANGLES, 0, 3);
+        glEndQuery(gl::ANY_SAMPLES_PASSED);
+        occLate = 3, occCount = 5, occCalls = 0;
+        glGetQueryObjectuiv(qw, gl::QUERY_RESULT_AVAILABLE, &r);
+        CHECK(r == 0 && occCalls == 1);  // late: the poll answers "not yet" at once
+        r = 99;
+        glGetQueryObjectuiv(qw, gl::QUERY_RESULT, &r);
+        CHECK(err() == gl::NO_ERROR && r == 1 && occLate == 0 && occCalls >= 3);  // waited for the real count (5 samples: visible)
+        // A GPU that is behind (50 queries, none finishes): the first QUERY_RESULT waits its budget and reads visible, not 0;
+        // the other 49 read visible at once (one look each, no wait): ~20 ms in all, not 50 x 20 ms.
+        GLuint qm[50];
+        glGenQueries(50, qm);
+        for (GLuint q : qm) {
+            glBeginQuery(gl::ANY_SAMPLES_PASSED, q);
+            glDrawArrays(gl::TRIANGLES, 0, 3);
+            glEndQuery(gl::ANY_SAMPLES_PASSED);
+        }
+        occStuck = occFenceStuck = true, occCount = 0, occCalls = 0;
+        r = 99;
+        glGetQueryObjectuiv(qm[0], gl::QUERY_RESULT, &r);
+        const int firstCalls = occCalls;
+        CHECK(err() == gl::NO_ERROR && r == 1 && firstCalls >= 2);  // it asked again until the budget ran out
+        for (int i = 1; i < 50; ++i) {
+            r = 99;
+            glGetQueryObjectuiv(qm[i], gl::QUERY_RESULT, &r);
+            CHECK(err() == gl::NO_ERROR && r == 1);
+        }
+        CHECK(occCalls == firstCalls + 49);
+        // The next frame, the GPU still behind: no wait either (the late state outlives the frame's budget).
+        glBeginQuery(gl::ANY_SAMPLES_PASSED, qw);
+        glDrawArrays(gl::TRIANGLES, 0, 3);
+        glEndQuery(gl::ANY_SAMPLES_PASSED);
+        occCalls = 0;
+        r = 99;
+        glGetQueryObjectuiv(qw, gl::QUERY_RESULT, &r);
+        CHECK(err() == gl::NO_ERROR && r == 1 && occCalls == 1);
+        // The GPU gets up to date: reads wait normally again (a late count, then the real zero: a counted query that saw no
+        // samples is occluded).
+        occStuck = occFenceStuck = false, occLate = 3, occCount = 0, occCalls = 0;
+        r = 99;
+        glGetQueryObjectuiv(qw, gl::QUERY_RESULT, &r);
+        CHECK(err() == gl::NO_ERROR && r == 0 && occLate == 0 && occCalls == 3);  // (the call that finds the count goes through uncounted)
+        glDeleteQueries(50, qm);
+        glDeleteQueries(1, &qw);
+    }
     glEndQuery(gl::ANY_SAMPLES_PASSED);
     CHECK(err() == gl::INVALID_OPERATION);  // no active query
     glBeginQuery(gl::ANY_SAMPLES_PASSED, 0);
@@ -2917,10 +4136,27 @@ void testEs31() {
         glDrawArrays(gl::TRIANGLES, 0, 3);
         CHECK(err() == gl::NO_ERROR && counts.draws == 2);
         glUseProgram(0);
-        // Two different programs for the two stages: no draw, an error, no crash.
+        // Two different programs for the two stages: their stages are linked together for the draw.
         glProgramParameteri(other, gl::PROGRAM_SEPARABLE, 1);
         glLinkProgram(other);
         glUseProgramStages(pl, 0x2, other);
+        glValidateProgramPipeline(pl);
+        glGetProgramPipelineiv(pl, gl::VALIDATE_STATUS, &v);
+        CHECK(v == 1);
+        counts = {};
+        glDrawArrays(gl::TRIANGLES, 0, 3);
+        CHECK(err() == gl::NO_ERROR && counts.draws == 1);
+        // A fragment stage whose varying has another type does not link with that vertex stage: no draw, an error, no crash.
+        const char* kFsBad =
+            "precision mediump float; varying vec3 v_uv; varying vec4 v_col; uniform sampler2D u_tex;\n"
+            "void main() { gl_FragColor = vec4(v_uv, 1.0) * v_col; }\n";
+        G(glCreateShaderProgramv, GLuint (*)(GLenum, GLsizei, const char* const*));
+        G(glGetProgramiv, void (*)(GLuint, GLenum, GLint*));
+        GLuint bad = glCreateShaderProgramv(gl::FRAGMENT_SHADER, 1, &kFsBad);
+        GLint badOk = 0;
+        glGetProgramiv(bad, gl::LINK_STATUS, &badOk);
+        CHECK(badOk == 1);  // a single-stage separable program links on its own
+        glUseProgramStages(pl, 0x2, bad);
         glValidateProgramPipeline(pl);
         glGetProgramPipelineiv(pl, gl::VALIDATE_STATUS, &v);
         CHECK(v == 0);
@@ -3027,7 +4263,7 @@ void testEs31() {
         // The remaining ES 3.0 entry points that used to be missing.
         G(glIsTransformFeedback, GLboolean (*)(GLuint));
         G(glGetTransformFeedbackVarying, void (*)(GLuint, GLuint, GLsizei, GLsizei*, GLsizei*, GLenum*, char*));
-        CHECK(!glIsTransformFeedback(0) && glIsTransformFeedback(1));
+        CHECK(!glIsTransformFeedback(0) && !glIsTransformFeedback(1));  // names are objects only once generated and bound
         (void)glGetTransformFeedbackVarying;
     }
 
@@ -3076,6 +4312,135 @@ void testEs31() {
     e.down();
 }
 
+// The flow of dEQP's glsUniformBlockCase on an instance array of uniform blocks (`uniform B { T v; } b[3]`): link, the layout
+// queries, the bindings, one buffer per block or one buffer for all of them, and a draw. Every stage and layout combination.
+void testUbo() {
+    Egl e;
+    CHECK(e.up());
+    G(glGetProgramiv, void (*)(GLuint, GLenum, GLint*));
+    G(glGetActiveUniformBlockiv, void (*)(GLuint, GLuint, GLenum, GLint*));
+    G(glGetActiveUniformBlockName, void (*)(GLuint, GLuint, GLsizei, GLsizei*, char*));
+    G(glGetActiveUniformsiv, void (*)(GLuint, GLsizei, const GLuint*, GLenum, GLint*));
+    G(glGetActiveUniform, void (*)(GLuint, GLuint, GLsizei, GLsizei*, GLint*, GLenum*, char*));
+    G(glGetUniformBlockIndex, GLuint (*)(GLuint, const char*));
+    G(glUniformBlockBinding, void (*)(GLuint, GLuint, GLuint));
+    G(glBindBufferBase, void (*)(GLenum, GLuint, GLuint));
+    G(glBindBufferRange, void (*)(GLenum, GLuint, GLuint, GLintptr, GLsizeiptr));
+    G(glGenBuffers, void (*)(GLsizei, GLuint*));
+    G(glBindBuffer, void (*)(GLenum, GLuint));
+    G(glBufferData, void (*)(GLenum, GLsizeiptr, const void*, GLenum));
+    G(glGetIntegerv, void (*)(GLenum, GLint*));
+    G(glUseProgram, void (*)(GLuint));
+    G(glVertexAttribPointer, void (*)(GLuint, GLint, GLenum, GLboolean, GLsizei, const void*));
+    G(glEnableVertexAttribArray, void (*)(GLuint));
+    G(glBindAttribLocation, void (*)(GLuint, GLuint, const char*));
+    G(glDrawArrays, void (*)(GLenum, GLint, GLsizei));
+    GLuint vb;
+    glGenBuffers(1, &vb);
+    const float verts[] = {-1, -1, 0, 1, 1, -1, 0, 1, 0, 1, 0, 1};
+    glBindBuffer(gl::ARRAY_BUFFER, vb);
+    glBufferData(gl::ARRAY_BUFFER, sizeof verts, verts, gl::STATIC_DRAW);
+    const char* types[][3] = {{"float", "1.0", "float"}, {"vec3", "vec3(1.0, 2.0, 3.0)", "vec3"}, {"mat4x3", "mat4x3(1.0)", "mat4x3"},
+                              {"int", "7", "int"}, {"uvec4", "uvec4(1u, 2u, 3u, 4u)", "uvec4"}, {"bvec2", "bvec2(true, false)", "bvec2"}};
+    for (const char* layout : {"std140", "shared", "packed"})
+        for (const auto& t : types)
+            for (int stage = 0; stage < 3; ++stage)  // 0 vertex, 1 fragment, 2 both
+                for (int perBlock = 0; perBlock < 2; ++perBlock) {
+                    const bool boolean = std::strcmp(t[0], "bvec2") == 0;
+                    std::string decl = std::string("layout(") + layout + ") uniform Block { " + (boolean ? "" : "highp ") + t[2] + " u_var; } block[3];\n";
+                    std::string cmp;
+                    for (int i = 0; i < 3; ++i)
+                        cmp += "    if (block[" + std::to_string(i) + "].u_var != " + t[2] + "(" + t[1] + ")) result = 0.5;\n";
+                    if (std::strcmp(t[0], "mat4x3") == 0) {
+                        decl = std::string("layout(") + layout + ") uniform Block { highp mat4x3 u_var; } block[3];\n";
+                        cmp.clear();
+                        for (int i = 0; i < 3; ++i)
+                            cmp += "    if (block[" + std::to_string(i) + "].u_var[1] != vec3(0.0)) result = 0.5;\n";
+                    } else if (boolean || std::strcmp(t[0], "uvec4") == 0 || std::strcmp(t[0], "vec3") == 0) {
+                        cmp.clear();
+                        for (int i = 0; i < 3; ++i)
+                            cmp += "    if (any(notEqual(block[" + std::to_string(i) + "].u_var, " + t[2] + "(" + t[1] + ")))) result = 0.5;\n";
+                    }
+                    const std::string vs = "#version 300 es\nin highp vec4 a_position;\nout mediump float v_vtxResult;\n" +
+                                           (stage != 1 ? decl : std::string()) + "void main() {\n    gl_Position = a_position;\n    mediump float result = 1.0;\n" +
+                                           (stage != 1 ? cmp : std::string()) + "    v_vtxResult = result;\n}\n";
+                    const std::string fs = "#version 300 es\nin mediump float v_vtxResult;\nlayout(location = 0) out mediump vec4 o;\n" +
+                                           (stage != 0 ? decl : std::string()) + "void main() {\n    mediump float result = 1.0;\n" +
+                                           (stage != 0 ? cmp : std::string()) + "    o = vec4(1.0, v_vtxResult, result, 1.0);\n}\n";
+                    const GLuint pr = program(vs.c_str(), fs.c_str());
+                    GLint nUniforms = 0, nBlocks = 0;
+                    glGetProgramiv(pr, gl::ACTIVE_UNIFORMS, &nUniforms);
+                    glGetProgramiv(pr, gl::ACTIVE_UNIFORM_BLOCKS, &nBlocks);
+                    CHECK(nBlocks == 3 && nUniforms >= 1 && nUniforms <= 3);
+                    std::vector<GLint> blockSize(static_cast<size_t>(nBlocks), 0);
+                    for (GLint b = 0; b < nBlocks; ++b) {
+                        GLint nameLen = 0, n = 0, size = 0;
+                        glGetActiveUniformBlockiv(pr, GLuint(b), gl::UNIFORM_BLOCK_DATA_SIZE, &size);
+                        glGetActiveUniformBlockiv(pr, GLuint(b), gl::UNIFORM_BLOCK_NAME_LENGTH, &nameLen);
+                        glGetActiveUniformBlockiv(pr, GLuint(b), gl::UNIFORM_BLOCK_ACTIVE_UNIFORMS, &n);
+                        std::vector<char> name(size_t(nameLen > 0 ? nameLen : 1));
+                        glGetActiveUniformBlockName(pr, GLuint(b), GLsizei(name.size()), nullptr, name.data());
+                        std::vector<GLint> idx(static_cast<size_t>(n), 0);
+                        if (n > 0) glGetActiveUniformBlockiv(pr, GLuint(b), gl::UNIFORM_BLOCK_ACTIVE_UNIFORM_INDICES, idx.data());
+                        for (GLint i : idx) CHECK(i >= 0 && i < nUniforms);
+                        CHECK(glGetUniformBlockIndex(pr, name.data()) == GLuint(b));
+                        CHECK(size > 0 && n >= 1);
+                        blockSize[size_t(b)] = size;
+                    }
+                    std::vector<GLuint> ids(static_cast<size_t>(nUniforms), 0);
+                    for (GLint i = 0; i < nUniforms; ++i) ids[size_t(i)] = GLuint(i);
+                    std::vector<GLint> bi(static_cast<size_t>(nUniforms), 0), nl(static_cast<size_t>(nUniforms), 0);
+                    glGetActiveUniformsiv(pr, nUniforms, ids.data(), gl::UNIFORM_BLOCK_INDEX, bi.data());
+                    glGetActiveUniformsiv(pr, nUniforms, ids.data(), gl::UNIFORM_NAME_LENGTH, nl.data());
+                    for (GLint i = 0; i < nUniforms; ++i) {
+                        CHECK(bi[size_t(i)] >= 0 && bi[size_t(i)] < nBlocks);
+                        std::vector<char> nm(static_cast<size_t>(nl[size_t(i)]));
+                        GLsizei len = 0;
+                        GLint sz = 0;
+                        GLenum ty = 0;
+                        glGetActiveUniform(pr, GLuint(i), GLsizei(nm.size()), &len, &sz, &ty, nm.data());
+                        CHECK(len + 1 == nl[size_t(i)]);
+                    }
+                    CHECK(err() == gl::NO_ERROR);
+                    glUseProgram(pr);
+                    for (GLint b = 0; b < nBlocks; ++b) glUniformBlockBinding(pr, GLuint(b), GLuint(b));
+                    GLint align = 0;
+                    glGetIntegerv(gl::UNIFORM_BUFFER_OFFSET_ALIGNMENT, &align);
+                    if (perBlock) {
+                        for (GLint b = 0; b < nBlocks; ++b) {
+                            GLuint buf;
+                            glGenBuffers(1, &buf);
+                            std::vector<uint8_t> data(size_t(blockSize[size_t(b)]), 1);
+                            glBindBuffer(gl::UNIFORM_BUFFER, buf);
+                            glBufferData(gl::UNIFORM_BUFFER, GLsizeiptr(data.size()), data.data(), gl::STATIC_DRAW);
+                            glBindBufferBase(gl::UNIFORM_BUFFER, GLuint(b), buf);
+                        }
+                    } else {
+                        GLint cur = 0;
+                        std::vector<GLint> offs;
+                        for (GLint b = 0; b < nBlocks; ++b) {
+                            if (align > 0) cur = (cur + align - 1) / align * align;
+                            offs.push_back(cur);
+                            cur += blockSize[size_t(b)];
+                        }
+                        std::vector<uint8_t> data(size_t(cur), 1);
+                        GLuint buf;
+                        glGenBuffers(1, &buf);
+                        glBindBuffer(gl::UNIFORM_BUFFER, buf);
+                        glBufferData(gl::UNIFORM_BUFFER, GLsizeiptr(data.size()), data.data(), gl::STATIC_DRAW);
+                        for (GLint b = 0; b < nBlocks; ++b)
+                            glBindBufferRange(gl::UNIFORM_BUFFER, GLuint(b), buf, offs[size_t(b)], blockSize[size_t(b)]);
+                    }
+                    CHECK(err() == gl::NO_ERROR);
+                    glBindBuffer(gl::ARRAY_BUFFER, vb);
+                    glVertexAttribPointer(0, 4, gl::FLOAT, 0, 16, nullptr);
+                    glEnableVertexAttribArray(0);
+                    glDrawArrays(gl::TRIANGLES, 0, 3);
+                    CHECK(err() == gl::NO_ERROR);
+                    settle();
+                }
+}
+
 void testErrors() {
     Egl e;
     CHECK(e.up());
@@ -3105,6 +4470,55 @@ void testErrors() {
     GLint maxTex = 0;
     glGetIntegerv(gl::MAX_TEXTURE_SIZE, &maxTex);
     CHECK(maxTex == 16384);
+    // glClearBuffer*: buffer / drawbuffer are validated before the framebuffer is looked at (glClearBufferfi on COLOR crashed).
+    G(glClearBufferfi, void (*)(GLenum, GLint, GLfloat, GLint));
+    G(glClearBufferiv, void (*)(GLenum, GLint, const GLint*));
+    glClearBufferfi(gl::COLOR, 0, 1.0f, 1);
+    CHECK(err() == gl::INVALID_ENUM);
+    glClearBufferfi(gl::DEPTH, 0, 1.0f, 1);
+    CHECK(err() == gl::INVALID_ENUM);
+    glClearBufferfi(gl::DEPTH_STENCIL, 1, 1.0f, 1);
+    CHECK(err() == gl::INVALID_VALUE);
+    const GLint zero4[4] = {};
+    glClearBufferiv(gl::DEPTH, 0, zero4);
+    CHECK(err() == gl::INVALID_ENUM);
+    // Argument validation of the negative_api cases: negative counts, Is* after a first bind, transfer formats.
+    G(glGenFramebuffers, void (*)(GLsizei, GLuint*));
+    G(glGenBuffers, void (*)(GLsizei, GLuint*));
+    G(glBindBuffer, void (*)(GLenum, GLuint));
+    G(glIsBuffer, GLboolean (*)(GLuint));
+    G(glGenTextures, void (*)(GLsizei, GLuint*));
+    G(glBindTexture, void (*)(GLenum, GLuint));
+    G(glTexImage2D, void (*)(GLenum, GLint, GLint, GLsizei, GLsizei, GLint, GLenum, GLenum, const void*));
+    G(glTexParameteri, void (*)(GLenum, GLenum, GLint));
+    G(glMapBufferRange, void* (*)(GLenum, GLintptr, GLsizeiptr, GLbitfield));
+    G(glBufferData, void (*)(GLenum, GLsizeiptr, const void*, GLenum));
+    glGenFramebuffers(-1, nullptr);
+    CHECK(err() == gl::INVALID_VALUE);
+    GLuint bo = 0, tx = 0;
+    glGenBuffers(1, &bo);
+    CHECK(!glIsBuffer(bo));  // generated, not yet bound
+    glBindBuffer(gl::ARRAY_BUFFER, bo);
+    CHECK(glIsBuffer(bo));
+    glBufferData(gl::ARRAY_BUFFER, 32, nullptr, gl::DYNAMIC_DRAW);
+    glMapBufferRange(gl::ARRAY_BUFFER, 0, 16, gl::MAP_READ_BIT | 0x1000);
+    CHECK(err() == gl::INVALID_VALUE);
+    glMapBufferRange(gl::ARRAY_BUFFER, 0, 16, gl::MAP_READ_BIT | gl::MAP_UNSYNCHRONIZED_BIT);
+    CHECK(err() == gl::INVALID_OPERATION);
+    glGenTextures(1, &tx);
+    glBindTexture(gl::TEXTURE_2D, tx);
+    glTexImage2D(gl::TEXTURE_2D, 0, gl::RGB, 1, 1, 0, gl::RGBA, gl::UNSIGNED_BYTE, nullptr);
+    CHECK(err() == gl::INVALID_OPERATION);
+    glTexImage2D(gl::TEXTURE_2D, 0, gl::RGB, 1, 1, 0, gl::RGB, gl::UNSIGNED_SHORT_4_4_4_4, nullptr);
+    CHECK(err() == gl::INVALID_OPERATION);
+    glTexImage2D(0, 0, gl::RGB, 1, 1, 0, gl::RGB, gl::UNSIGNED_BYTE, nullptr);
+    CHECK(err() == gl::INVALID_ENUM);
+    glTexParameteri(gl::TEXTURE_2D, gl::TEXTURE_MAG_FILTER, 0);
+    CHECK(err() == gl::INVALID_ENUM);
+    glTexParameteri(gl::TEXTURE_2D, gl::TEXTURE_MIN_LOD, -1000);  // not an enumerated parameter: any value (gluStateReset sets it)
+    CHECK(err() == gl::NO_ERROR);
+    glTexImage2D(gl::TEXTURE_2D, 0, gl::SRGB8, 1, 1, 0, 0x8C40 /* GL_SRGB_EXT */, gl::UNSIGNED_BYTE, nullptr);
+    CHECK(err() == gl::NO_ERROR);
     e.down();
     // No current context: calls are ignored, not crashes.
     G(glClear, void (*)(GLbitfield));
@@ -3340,6 +4754,197 @@ void testRecipe() {
     std::filesystem::remove_all(dir, ec);
 }
 
+
+// Transform feedback: the pure assembly / copy helpers, then the GL state machine and its errors (the null backend runs no
+// shader, so the captured values themselves are checked in the vpglsl "xfb" test and on Metal by dEQP).
+void testXfb() {
+    {
+        std::vector<uint32_t> out;
+        const uint32_t v[5] = {0, 1, 2, 3, 4};
+        xfbAssemble(5, v, 5, false, 0, out);  // triangle strip: odd triangles swap the first two
+        CHECK((out == std::vector<uint32_t>{0, 1, 2, 2, 1, 3, 2, 3, 4}));
+        out.clear();
+        const uint32_t r[5] = {0, 1, 2, 0xFFFFFFFFu, 3};
+        xfbAssemble(4, r, 5, true, 0xFFFFFFFFu, out);  // restart splits the sequence; the lone vertex makes nothing
+        CHECK((out == std::vector<uint32_t>{0, 1, 2}));
+        out.clear();
+        xfbAssemble(2, v, 3, false, 0, out);  // line loop closes
+        CHECK((out == std::vector<uint32_t>{0, 1, 1, 2, 2, 0}));
+        // Two records of 3 words; binding A takes words 0..1, binding B word 2; B only has room for one vertex.
+        const uint32_t rec[6] = {10, 11, 12, 20, 21, 22};
+        uint32_t a[4] = {}, b[2] = {};
+        std::vector<XfbOut> outs(2);
+        outs[0] = {reinterpret_cast<uint8_t*>(a), sizeof a, 0, 8, {{0, 2}}};
+        outs[1] = {reinterpret_cast<uint8_t*>(b), 4, 0, 4, {{2, 1}}};
+        CHECK(xfbWrite({0, 1}, 1, rec, 3, outs) == 1);  // the second point does not fit B, so it is written to neither
+        CHECK(a[0] == 10 && a[1] == 11 && a[2] == 0 && b[0] == 12 && outs[0].used == 8 && outs[1].used == 4);
+    }
+    Egl e;
+    CHECK(e.up());
+    G(glGenBuffers, void (*)(GLsizei, GLuint*));
+    G(glBindBuffer, void (*)(GLenum, GLuint));
+    G(glBufferData, void (*)(GLenum, GLsizeiptr, const void*, GLenum));
+    G(glBindBufferBase, void (*)(GLenum, GLuint, GLuint));
+    G(glBindBufferRange, void (*)(GLenum, GLuint, GLuint, GLintptr, GLsizeiptr));
+    G(glUseProgram, void (*)(GLuint));
+    G(glDrawArrays, void (*)(GLenum, GLint, GLsizei));
+    G(glDrawArraysInstanced, void (*)(GLenum, GLint, GLsizei, GLsizei));
+    G(glGetIntegerv, void (*)(GLenum, GLint*));
+    G(glGetIntegeri_v, void (*)(GLenum, GLuint, GLint*));
+    G(glBeginTransformFeedback, void (*)(GLenum));
+    G(glEndTransformFeedback, void (*)());
+    G(glPauseTransformFeedback, void (*)());
+    G(glResumeTransformFeedback, void (*)());
+    G(glGenTransformFeedbacks, void (*)(GLsizei, GLuint*));
+    G(glBindTransformFeedback, void (*)(GLenum, GLuint));
+    G(glDeleteTransformFeedbacks, void (*)(GLsizei, const GLuint*));
+    G(glIsTransformFeedback, GLboolean (*)(GLuint));
+    G(glTransformFeedbackVaryings, void (*)(GLuint, GLsizei, const char* const*, GLenum));
+    G(glGetTransformFeedbackVarying, void (*)(GLuint, GLuint, GLsizei, GLsizei*, GLsizei*, GLenum*, char*));
+    G(glGetProgramiv, void (*)(GLuint, GLenum, GLint*));
+    G(glLinkProgram, void (*)(GLuint));
+    G(glCreateShader, GLuint (*)(GLenum));
+    G(glShaderSource, void (*)(GLuint, GLsizei, const char* const*, const GLint*));
+    G(glCompileShader, void (*)(GLuint));
+    G(glCreateProgram, GLuint (*)());
+    G(glAttachShader, void (*)(GLuint, GLuint));
+    const char* vs =
+        "#version 300 es\nin vec4 a; out vec3 v; out float w;\nvoid main() { v = a.xyz; w = a.w; gl_Position = a; }\n";
+    const char* fs = "#version 300 es\nprecision mediump float; in vec3 v; in float w; out vec4 o;\nvoid main() { o = vec4(v, w); }\n";
+    GLuint sh[2] = {glCreateShader(gl::VERTEX_SHADER), glCreateShader(gl::FRAGMENT_SHADER)};
+    const char* src[2] = {vs, fs};
+    GLuint p = glCreateProgram();
+    for (int i = 0; i < 2; ++i) {
+        glShaderSource(sh[i], 1, &src[i], nullptr);
+        glCompileShader(sh[i]);
+        glAttachShader(p, sh[i]);
+    }
+    const char* names[2] = {"v", "w"};
+    glTransformFeedbackVaryings(p, 2, names, 0x8C8D);  // separate
+    CHECK(err() == gl::NO_ERROR);
+    glTransformFeedbackVaryings(p, 2, names, gl::TRIANGLES);
+    CHECK(err() == gl::INVALID_ENUM);
+    glTransformFeedbackVaryings(p, -1, names, 0x8C8C);
+    CHECK(err() == gl::INVALID_VALUE);
+    glTransformFeedbackVaryings(p, 2, names, 0x8C8D);
+    glLinkProgram(p);
+    GLint v = -1, mode = 0, maxLen = 0;
+    glGetProgramiv(p, gl::LINK_STATUS, &v);
+    CHECK(v == 1);
+    glGetProgramiv(p, gl::TRANSFORM_FEEDBACK_VARYINGS, &v);
+    glGetProgramiv(p, gl::TRANSFORM_FEEDBACK_BUFFER_MODE, &mode);
+    glGetProgramiv(p, gl::TRANSFORM_FEEDBACK_VARYING_MAX_LENGTH, &maxLen);
+    CHECK(v == 2 && mode == 0x8C8D && maxLen == 2);
+    char name[8];
+    GLsizei len = 0, size = 0;
+    GLenum type = 0;
+    glGetTransformFeedbackVarying(p, 1, sizeof name, &len, &size, &type, name);
+    CHECK(err() == gl::NO_ERROR && len == 1 && size == 1 && type == 0x1406 && std::string(name) == "w");
+    glGetTransformFeedbackVarying(p, 2, sizeof name, &len, &size, &type, name);
+    CHECK(err() == gl::INVALID_VALUE);
+
+    // Begin needs a program, a buffer on every binding the varyings use, and a valid primitive mode.
+    glBeginTransformFeedback(gl::POINTS);
+    CHECK(err() == gl::INVALID_OPERATION);  // no program in use
+    glUseProgram(p);
+    glBeginTransformFeedback(gl::TRIANGLE_STRIP);
+    CHECK(err() == gl::INVALID_ENUM);
+    glBeginTransformFeedback(gl::POINTS);
+    CHECK(err() == gl::INVALID_OPERATION);  // no buffers bound
+    GLuint buf[2];
+    glGenBuffers(2, buf);
+    for (GLuint b : buf) {
+        glBindBuffer(gl::ARRAY_BUFFER, b);
+        glBufferData(gl::ARRAY_BUFFER, 256, nullptr, gl::DYNAMIC_DRAW);
+    }
+    glBindBufferBase(gl::TRANSFORM_FEEDBACK_BUFFER, 0, buf[0]);
+    glBeginTransformFeedback(gl::POINTS);
+    CHECK(err() == gl::INVALID_OPERATION);  // separate mode with two varyings needs binding 1 too
+    glBindBufferRange(gl::TRANSFORM_FEEDBACK_BUFFER, 1, buf[1], 3, 16);
+    CHECK(err() == gl::INVALID_VALUE);  // offset not a multiple of 4
+    glBindBufferRange(gl::TRANSFORM_FEEDBACK_BUFFER, 1, buf[1], 4, 14);
+    CHECK(err() == gl::INVALID_VALUE);  // size not a multiple of 4
+    glBindBufferRange(gl::TRANSFORM_FEEDBACK_BUFFER, 1, buf[1], 16, 64);
+    CHECK(err() == gl::NO_ERROR);
+    glGetIntegeri_v(0x8C84, 1, &v);  // TRANSFORM_FEEDBACK_BUFFER_START
+    CHECK(v == 16);
+    glGetIntegeri_v(gl::TRANSFORM_FEEDBACK_BUFFER_BINDING, 1, &v);
+    CHECK(GLuint(v) == buf[1]);
+    glEndTransformFeedback();
+    CHECK(err() == gl::INVALID_OPERATION);  // not active
+    glPauseTransformFeedback();
+    CHECK(err() == gl::INVALID_OPERATION);
+    glBeginTransformFeedback(gl::POINTS);
+    CHECK(err() == gl::NO_ERROR);
+    glGetIntegerv(0x8E24, &v);
+    CHECK(v == 1);
+    glBeginTransformFeedback(gl::POINTS);
+    CHECK(err() == gl::INVALID_OPERATION);  // already active
+    glBindBufferBase(gl::TRANSFORM_FEEDBACK_BUFFER, 0, buf[1]);
+    CHECK(err() == gl::INVALID_OPERATION);  // bindings are fixed while capturing
+    glUseProgram(0);
+    CHECK(err() == gl::INVALID_OPERATION);
+    glLinkProgram(p);
+    CHECK(err() == gl::INVALID_OPERATION);
+    glDrawArrays(gl::TRIANGLES, 0, 3);
+    CHECK(err() == gl::INVALID_OPERATION);  // the draw mode must match Begin's primitive type
+    glResumeTransformFeedback();
+    CHECK(err() == gl::INVALID_OPERATION);  // not paused
+    glPauseTransformFeedback();
+    CHECK(err() == gl::NO_ERROR);
+    glGetIntegerv(0x8E23, &v);
+    CHECK(v == 1);
+    glPauseTransformFeedback();
+    CHECK(err() == gl::INVALID_OPERATION);
+    glResumeTransformFeedback();
+    CHECK(err() == gl::NO_ERROR);
+    glEndTransformFeedback();
+    CHECK(err() == gl::NO_ERROR);
+    glGetIntegerv(0x8E24, &v);
+    CHECK(v == 0);
+
+    // Objects: the default object is always there; others exist once generated, own their bindings and cannot be deleted while active.
+    GLuint t[2];
+    glGenTransformFeedbacks(2, t);
+    CHECK(t[0] != 0 && t[0] != t[1] && !glIsTransformFeedback(t[0]));
+    glBindTransformFeedback(gl::TRANSFORM_FEEDBACK, t[0]);
+    CHECK(err() == gl::NO_ERROR && glIsTransformFeedback(t[0]));
+    glGetIntegerv(0x8E25, &v);
+    CHECK(GLuint(v) == t[0]);
+    glGetIntegeri_v(gl::TRANSFORM_FEEDBACK_BUFFER_BINDING, 0, &v);
+    CHECK(v == 0);  // its own bindings, not the default object's
+    glBindBufferBase(gl::TRANSFORM_FEEDBACK_BUFFER, 0, buf[0]);
+    glBindBufferBase(gl::TRANSFORM_FEEDBACK_BUFFER, 1, buf[1]);
+    G(glGenQueries, void (*)(GLsizei, GLuint*));
+    G(glBeginQuery, void (*)(GLenum, GLuint));
+    G(glEndQuery, void (*)(GLenum));
+    G(glGetQueryObjectuiv, void (*)(GLuint, GLenum, GLuint*));
+    GLuint q = 0, written = 0;
+    glGenQueries(1, &q);
+    glBeginQuery(gl::TRANSFORM_FEEDBACK_PRIMITIVES_WRITTEN, q);
+    glBeginTransformFeedback(gl::POINTS);
+    CHECK(err() == gl::NO_ERROR);
+    glDrawArrays(gl::POINTS, 0, 3);
+    glDrawArraysInstanced(gl::POINTS, 0, 100, 1);  // the 12-byte varying has room for 21 vertices in all
+    CHECK(err() == gl::NO_ERROR);
+    glEndQuery(gl::TRANSFORM_FEEDBACK_PRIMITIVES_WRITTEN);
+    glGetQueryObjectuiv(q, 0x8866 /*QUERY_RESULT*/, &written);
+    CHECK(written == 21);
+    glBindTransformFeedback(gl::TRANSFORM_FEEDBACK, 0);
+    CHECK(err() == gl::INVALID_OPERATION);  // active and not paused
+    glDeleteTransformFeedbacks(1, &t[0]);
+    CHECK(err() == gl::INVALID_OPERATION);
+    glEndTransformFeedback();
+    glBindTransformFeedback(gl::TRANSFORM_FEEDBACK, 12345);
+    CHECK(err() == gl::INVALID_OPERATION);  // never generated
+    glBindTransformFeedback(gl::ARRAY_BUFFER, 0);
+    CHECK(err() == gl::INVALID_ENUM);
+    glDeleteTransformFeedbacks(1, &t[0]);
+    CHECK(err() == gl::NO_ERROR && !glIsTransformFeedback(t[0]));
+    glGetIntegerv(0x8E25, &v);
+    CHECK(v == 0);  // deleting the bound object rebinds the default one
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -3362,13 +4967,15 @@ int main(int argc, char** argv) {
         std::printf("libVPVulkan has no vpgles_* exports\n");
         return 1;
     }
+    if (std::string(argv[1]) == "uniform_strict") setenv("VPGLES_STRICT_GLSL", "1", 1);  // read once by the driver, before its first use
     captureStderr();
     const int ok = vpgles_init(reinterpret_cast<void*>(&myGipa));
     const std::map<std::string, std::function<void()>> tests = {
-        {"egl", testEgl}, {"eglthreads", testEglThreads}, {"formats", testFormats}, {"buffers", testBuffers}, {"textures", testTextures},
-        {"fbo", testFbo}, {"program", testProgram}, {"draw", testDraw}, {"invalidate", testInvalidate}, {"multiview", testMultiview},
-        {"errors", testErrors}, {"readback", testReadback}, {"external", testExternal}, {"es31", testEs31},
-        {"progbin", testProgramBinary}, {"recipe", testRecipe}, {"recipe_session", testRecipeSession},
+        {"egl", testEgl}, {"eglthreads", testEglThreads}, {"formats", testFormats}, {"buffers", testBuffers}, {"mapunsync", testMapUnsync}, {"textures", testTextures},
+        {"fbo", testFbo}, {"msrbo", testMsRbo}, {"msrtt_depth", testMsrttDepth}, {"program", testProgram}, {"draw", testDraw}, {"invalidate", testInvalidate}, {"multiview", testMultiview},
+        {"errors", testErrors}, {"ubo", testUbo}, {"readback", testReadback}, {"external", testExternal}, {"es31", testEs31},
+        {"progbin", testProgramBinary}, {"recipe", testRecipe}, {"recipe_session", testRecipeSession}, {"xfb", testXfb},
+        {"uniform_raw", testUniformRaw}, {"uniform_strict", testUniformStrict},
     };
     auto it = tests.find(argv[1]);
     if (ok && it != tests.end()) it->second();

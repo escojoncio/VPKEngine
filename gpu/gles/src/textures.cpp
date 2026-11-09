@@ -5,6 +5,7 @@
 #include <cmath>
 #include <cstring>
 #include <map>
+#include <set>
 
 #include "context.h"
 
@@ -30,6 +31,9 @@ struct TexStats {
     std::map<GLenum, uint64_t> count, shown;  // internal format -> textures defined / count at its last line
     std::chrono::steady_clock::time_point last = std::chrono::steady_clock::now();
     int lines = 0;
+    // DiagCounter: all, this tick, the most in one tick, and all at the last line.
+    static constexpr size_t kDiag = size_t(DiagCounter::kCount);
+    uint64_t diagTotal[kDiag]{}, diagTick[kDiag]{}, diagMax[kDiag]{}, diagShown[kDiag]{};
 } gTexStats;
 }  // namespace
 
@@ -43,11 +47,26 @@ void texStatsCount(GLenum internalFormat) {
     }
 }
 
+void diagCount(DiagCounter c, uint64_t n) {
+    gTexStats.diagTotal[size_t(c)] += n, gTexStats.diagTick[size_t(c)] += n;
+}
+
 void texStatsTick(bool force) {
     TexStats& st = gTexStats;
+    for (size_t i = 0; i < TexStats::kDiag; ++i) st.diagMax[i] = std::max(st.diagMax[i], st.diagTick[i]), st.diagTick[i] = 0;
     const auto now = std::chrono::steady_clock::now();
     if (!force && now - st.last < std::chrono::seconds(10)) return;
     st.last = now;
+    if (!std::equal(st.diagTotal, st.diagTotal + TexStats::kDiag, st.diagShown) && st.lines < 256) {
+        ++st.lines;
+        std::copy(st.diagTotal, st.diagTotal + TexStats::kDiag, st.diagShown);
+        const uint64_t* t = st.diagTotal;  // (DiagCounter order: Incomplete, MsrttDsContinued, TexRealloc)
+        const uint64_t* m = st.diagMax;
+        logf("gles.census incomplete=%llu incomplete_tick_max=%llu msrtt_ds_continued=%llu msrtt_ds_continued_tick_max=%llu "
+             "tex_realloc=%llu tex_realloc_tick_max=%llu",
+             static_cast<unsigned long long>(t[0]), static_cast<unsigned long long>(m[0]), static_cast<unsigned long long>(t[1]),
+             static_cast<unsigned long long>(m[1]), static_cast<unsigned long long>(t[2]), static_cast<unsigned long long>(m[2]));
+    }
     for (const auto& [fmt, n] : st.count) {
         if (st.shown[fmt] == n) continue;
         if (st.lines >= 256) return;
@@ -69,25 +88,56 @@ static bool storageCapable(VkFormat f) {
     }
 }
 
-bool Context::realizeTexture(Texture& t) {
-    if (t.levels.empty() || !t.levels[0].format) return false;
-    const Texture::Level& l0 = t.levels[0];
+bool Context::realizeTexture(Texture& t, bool carries) {
+    // The image is sized from level 0. When level 0 is not defined (UE4 mip streaming: levels 3.. with GL_TEXTURE_BASE_LEVEL 3) it is
+    // sized from the lowest defined level `a`, as if level 0 were that level's size << a (exact for power-of-two chains): GL level L
+    // stays image level L, and the levels below `a` are allocated but never sampled (the base level is >= a).
+    uint32_t a = 0;
+    while (a < t.levels.size() && !(t.levels[a].format && t.levels[a].w && t.levels[a].h && t.levels[a].d)) {
+        if (a == 0 && t.levels[0].format) return false;  // an empty base level: no image, the texture is incomplete
+        ++a;
+    }
+    if (a == t.levels.size() || a > 16) return false;
+    const Texture::Level& l0 = t.levels[a];
+    const uint32_t imgW = l0.w << a, imgH = l0.h << a;
+    if (imgW > 16384 || imgH > 16384) return false;
     const bool cube = t.target == gl::TEXTURE_CUBE_MAP;
     const bool is3D = t.target == gl::TEXTURE_3D;
-    const bool array = t.target == gl::TEXTURE_2D_ARRAY;
+    const bool array = t.target == gl::TEXTURE_2D_ARRAY || t.target == gl::TEXTURE_2D_MULTISAMPLE_ARRAY;
+    const uint32_t samples = (t.target == gl::TEXTURE_2D_MULTISAMPLE || t.target == gl::TEXTURE_2D_MULTISAMPLE_ARRAY) && t.samples > 1
+                                 ? renderSamples(uint32_t(t.samples)) : 1;
     const uint32_t layers = cube ? 6 : array ? l0.d : 1;
-    const uint32_t depth = is3D ? l0.d : 1;
-    const uint32_t levels = t.immutable ? uint32_t(t.immutableLevels) : mipCount(l0.w, l0.h, depth);
+    const uint32_t depth = is3D ? l0.d << a : 1;
+    const uint32_t levels = t.immutable ? uint32_t(t.immutableLevels) : mipCount(imgW, imgH, depth);
     const bool storage = t.wantStorage && storageCapable(l0.format->vk);
-    if (t.image && t.image->format == l0.format && t.image->width == l0.w && t.image->height == l0.h &&
-        t.image->depth == depth && t.image->layers == layers && t.image->levels == levels && t.image->storage == storage)
+    const bool formatViews = t.wantFormatViews && l0.format->depth && l0.format->stencil && samples == 1 && !is3D;
+    if (t.image && t.image->format == l0.format && t.image->width == imgW && t.image->height == imgH &&
+        t.image->depth == depth && t.image->layers == layers && t.image->levels == levels && t.image->storage == storage &&
+        t.image->formatViews == formatViews && uint32_t(t.image->samples) == samples)
         return true;
+    // diagnostics: the texture had an image, which is replaced by an empty one (its texels are gone until the app uploads again);
+    // not when the caller carries them over to a new image of the same shape
+    if (t.image && !(carries && t.image->format == l0.format && t.image->width == imgW && t.image->height == imgH &&
+                     t.image->depth == depth && t.image->layers == layers && t.image->levels == levels &&
+                     uint32_t(t.image->samples) == samples)) {
+        diagCount(DiagCounter::TexRealloc);
+        static std::set<GLuint> seen;  // the first 64 textures
+        if (seen.size() < 64 && seen.insert(t.name).second) {
+            uint32_t defined = 0;
+            for (const Texture::Level& l : t.levels) defined += l.format != nullptr;
+            logf("gles.tex_realloc tex=%u target=0x%x fmt=0x%04x->0x%04x size=%ux%u->%ux%u levels=%u->%u lost_levels=%u defined=%u base=%d max=%d immutable=%d",
+                 t.name, t.target, t.image->format->internal, l0.format->internal, t.image->width, t.image->height, imgW, imgH, t.image->levels,
+                 levels, t.image->levels, defined, t.baseLevel, t.maxLevel, int(t.immutable));
+        }
+    }
     auto img = std::make_shared<Image>();
     img->dev = dev;
     img->format = l0.format;
-    img->width = l0.w, img->height = l0.h, img->depth = depth, img->layers = layers, img->levels = levels;
+    img->width = imgW, img->height = imgH, img->depth = depth, img->layers = layers, img->levels = levels;
     img->cube = cube;
     img->storage = storage;
+    img->formatViews = formatViews;
+    img->samples = VkSampleCountFlagBits(samples);
     img->type = is3D ? VK_IMAGE_TYPE_3D : VK_IMAGE_TYPE_2D;
     VkImageCreateInfo ci{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
     ci.flags = cube ? VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT : 0;
@@ -98,14 +148,21 @@ bool Context::realizeTexture(Texture& t) {
         ci.flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;  // sRGB decode skip / sRGB writes
     ci.imageType = img->type;
     ci.format = l0.format->vk;
-    ci.extent = {l0.w, l0.h, depth};
-    ci.mipLevels = levels, ci.arrayLayers = layers, ci.samples = VK_SAMPLE_COUNT_1_BIT;
+    ci.extent = {imgW, imgH, depth};
+    ci.mipLevels = levels, ci.arrayLayers = layers, ci.samples = VkSampleCountFlagBits(samples);
     ci.tiling = VK_IMAGE_TILING_OPTIMAL;
     ci.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
     if (!l0.format->compressed && (!is3D || (ci.flags & VK_IMAGE_CREATE_2D_ARRAY_COMPATIBLE_BIT)))
         ci.usage |= l0.format->depth || l0.format->stencil ? VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT
                                                            : VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
-    if (storage) ci.usage |= VK_IMAGE_USAGE_STORAGE_BIT;  // lazy: ShaderWrite turns off lossless compression on Apple GPUs
+    if (storage) {
+        ci.usage |= VK_IMAGE_USAGE_STORAGE_BIT;  // lazy: ShaderWrite turns off lossless compression on Apple GPUs
+        ci.flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;  // glBindImageTexture may read the texels with another format of the same size
+    }
+    // An EXT_multisampled_render_to_texture depth/stencil attachment: the twin of a continuing pass is seeded from it, and the seed
+    // reads its stencil plane through a stencil view (format views, as for the multisample renderbuffers). Other depth textures
+    // do not pay for it (MUTABLE_FORMAT turns off lossless depth compression on Apple GPUs).
+    if (formatViews) ci.flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
     ci.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
     if (dev->vk.vkCreateImage(dev->device, &ci, nullptr, &img->image) != VK_SUCCESS) {
         setError(gl::OUT_OF_MEMORY);
@@ -130,21 +187,33 @@ bool Context::makeStorage(Texture& t) {
     if (t.image->external || t.target == gl::TEXTURE_EXTERNAL_OES || !storageCapable(t.image->format->vk)) return false;
     ImageP old = t.image;
     t.wantStorage = true;
-    if (!realizeTexture(t)) {
+    if (!realizeTexture(t, true)) {
         t.wantStorage = false;  // creation with STORAGE failed: keep the texture usable without it
         return false;
     }
     if (t.image == old) return false;
+    carryTexels(old, t);
+    return true;
+}
+
+void Context::makeFormatViews(Texture& t) {
+    t.wantFormatViews = true;
+    if (!t.image || t.image->formatViews || t.image->external) return;
+    ImageP old = t.image;
+    if (realizeTexture(t, true) && t.image != old) carryTexels(old, t);
+}
+
+void Context::carryTexels(const ImageP& old, Texture& t) {
     // A level 0 definition that no longer matches the old image (nothing to carry over): start empty.
     if (t.image->width != old->width || t.image->height != old->height || t.image->depth != old->depth ||
         t.image->layers != old->layers || t.image->levels != old->levels)
-        return true;
+        return;
     // Views, framebuffer attachments and descriptors are resolved from t.image at each draw, so the new image
     // is picked up there; the old one stays alive (realizeTexture keeps it) until the recorded work completes.
     VkImageCopy r{};
     std::vector<VkImageCopy> regions;
     for (uint32_t l = 0; l < old->levels; ++l) {
-        r.srcSubresource = r.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, l, 0, old->layers};
+        r.srcSubresource = r.dstSubresource = {old->aspect(), l, 0, old->layers};
         r.extent = {std::max(1u, old->width >> l), std::max(1u, old->height >> l), std::max(1u, old->depth >> l)};
         regions.push_back(r);
     }
@@ -152,17 +221,17 @@ bool Context::makeStorage(Texture& t) {
     dev->vk.vkCmdCopyImage(cmd(), old->image, VK_IMAGE_LAYOUT_GENERAL, t.image->image, VK_IMAGE_LAYOUT_GENERAL,
                            uint32_t(regions.size()), regions.data());
     barrier();
-    return true;
 }
 
 void Context::copyBufferToImage(Image& img, uint32_t level, uint32_t layer, int32_t x, int32_t y, int32_t z,
-                                uint32_t w, uint32_t h, uint32_t d, const uint8_t* data, size_t bytes) {
+                                uint32_t w, uint32_t h, uint32_t d, const uint8_t* data, size_t bytes, bool stencilPlane) {
     Alloc a = stream(bytes, 16);
     std::memcpy(a.host, data, bytes);
     barrier();
     VkBufferImageCopy r{};
     r.bufferOffset = a.offset;
-    r.imageSubresource = {img.aspect() & ~VkImageAspectFlags(img.format->stencil && img.format->depth ? VK_IMAGE_ASPECT_STENCIL_BIT : 0),
+    r.imageSubresource = {stencilPlane ? VkImageAspectFlags(VK_IMAGE_ASPECT_STENCIL_BIT)
+                                       : img.aspect() & ~VkImageAspectFlags(img.format->stencil && img.format->depth ? VK_IMAGE_ASPECT_STENCIL_BIT : 0),
                           level, img.type == VK_IMAGE_TYPE_3D ? 0 : layer, img.type == VK_IMAGE_TYPE_3D ? 1 : d};
     r.imageOffset = {x, y, img.type == VK_IMAGE_TYPE_3D ? z : 0};
     r.imageExtent = {w, h, img.type == VK_IMAGE_TYPE_3D ? d : 1};
@@ -221,9 +290,19 @@ void Context::flushPending(Texture& t) {
 void Context::texImage(GLenum target, GLint level, GLenum internalFormat, GLsizei w, GLsizei h, GLsizei d, GLenum format,
                        GLenum type, const void* pixels, bool sub, GLint xo, GLint yo, GLint zo, bool compressed,
                        GLsizei imageSize) {
+    if (!isCubeFace(target) && target != gl::TEXTURE_2D && target != gl::TEXTURE_3D && target != gl::TEXTURE_2D_ARRAY &&
+        target != gl::TEXTURE_EXTERNAL_OES && target != gl::TEXTURE_CUBE_MAP && target != gl::TEXTURE_CUBE_MAP_ARRAY &&
+        target != gl::TEXTURE_2D_MULTISAMPLE && target != gl::TEXTURE_2D_MULTISAMPLE_ARRAY && target != gl::TEXTURE_BUFFER)
+        return setError(gl::INVALID_ENUM);
     Texture* t = boundTexture(bindTarget(target));
     if (!t) return setError(gl::INVALID_OPERATION);
-    if (level < 0 || w < 0 || h < 0 || d < 0 || level > 16) return setError(gl::INVALID_VALUE);
+    if (level < 0 || w < 0 || h < 0 || d < 0 || level > 16 || (compressed && imageSize < 0)) return setError(gl::INVALID_VALUE);
+    {  // MAX_TEXTURE_SIZE / MAX_CUBE_MAP_TEXTURE_SIZE 16384, MAX_3D_TEXTURE_SIZE and MAX_ARRAY_TEXTURE_LAYERS 2048 (gl_api.cpp)
+        const bool vol = target == gl::TEXTURE_3D;
+        const GLsizei limit = vol ? 2048 : 16384;
+        if (w > limit || h > limit || ((vol || target == gl::TEXTURE_2D_ARRAY) && d > 2048) || level > (vol ? 11 : 14))
+            return setError(gl::INVALID_VALUE);
+    }
     const bool cube = isCubeFace(target);
     if (target == gl::TEXTURE_CUBE_MAP) return setError(gl::INVALID_ENUM);
     // Targets that bind but cannot hold image data here (cube array, buffer texture, multisample array).
@@ -241,9 +320,27 @@ void Context::texImage(GLenum target, GLint level, GLenum internalFormat, GLsize
         fi = formatFor(internalFormat, format, type);
         if (!fi) return setError(compressed ? gl::INVALID_ENUM : gl::INVALID_VALUE);
         if (compressed != fi->compressed) return setError(gl::INVALID_ENUM);
+        if (!compressed)
+            if (GLenum e = transferError(*fi, format, type)) return setError(e);
+        if (compressed && imageSize != GLsizei(size_t(compressedSize(*fi, uint32_t(w), uint32_t(h))) * uint32_t(std::max(d, 1))) &&
+            w && h && d)
+            return setError(gl::INVALID_VALUE);
         Texture::Level& lv = t->levels[size_t(level)];
         lv.w = uint32_t(w), lv.h = uint32_t(h), lv.d = uint32_t(std::max(d, 1));
         lv.format = fi;
+        if (cube) {
+            auto& fl = t->faceLevels[face];
+            if (fl.size() <= size_t(level)) fl.resize(size_t(level) + 1);
+            fl[size_t(level)] = lv;
+        }
+        // An empty level (0 x 0 x 0 resets a texture, as gluStateReset does) has no storage: level 0 drops the image.
+        if (w == 0 || h == 0 || d == 0) {
+            if (level == 0 && t->image) {
+                keep(t->image);
+                t->image.reset();
+            }
+            return;
+        }
         // Level 0 defines the image; other levels must be consistent with it to land in it.
         if (level == 0 || !t->image) {
             if (level != 0 && !t->levels[0].format) {
@@ -256,6 +353,9 @@ void Context::texImage(GLenum target, GLint level, GLenum internalFormat, GLsize
             }
         } else if (t->image->format != fi) {
             return;  // inconsistent level: texture incomplete until redefined
+        } else if (uint32_t(level) >= t->image->levels || uint32_t(w) > std::max(1u, t->image->width >> level) ||
+                   uint32_t(h) > std::max(1u, t->image->height >> level)) {
+            return;  // a level outside the image's chain or larger than it: kept as a definition only (incomplete / unused)
         }
         if (!pixels && !pixelUnpack) return;
         xo = yo = zo = 0;
@@ -273,6 +373,14 @@ void Context::texImage(GLenum target, GLint level, GLenum internalFormat, GLsize
             const FormatInfo* given = formatFor(internalFormat);
             if (!given) return setError(gl::INVALID_ENUM);  // not a format at all
             if (fi->vk != given->vk) return setError(gl::INVALID_OPERATION);  // a format, but not the level's
+            if (imageSize != GLsizei(size_t(compressedSize(*fi, uint32_t(w), uint32_t(h))) * uint32_t(std::max(d, 1))))
+                return setError(gl::INVALID_VALUE);
+            // The region must sit on block boundaries (its far edge may be the edge of the level).
+            if (xo % int(fi->blockW) || yo % int(fi->blockH) || (w % int(fi->blockW) && uint32_t(xo + w) != lv.w) ||
+                (h % int(fi->blockH) && uint32_t(yo + h) != lv.h))
+                return setError(gl::INVALID_OPERATION);
+        } else if (GLenum e = transferError(*fi, format, type, true)) {
+            return setError(e);
         }
     }
     if (!early && (!t->image || uint32_t(level) >= t->image->levels)) return;
@@ -281,7 +389,27 @@ void Context::texImage(GLenum target, GLint level, GLenum internalFormat, GLsize
     const uint8_t* src = static_cast<const uint8_t*>(pixels);
     if (pixelUnpack) {
         Buffer* pb = buffer(pixelUnpack);
-        if (!pb || !pb->storage) return setError(gl::INVALID_OPERATION);
+        if (!pb || !pb->storage || pb->mapped) return setError(gl::INVALID_OPERATION);
+        {  // the reads must stay inside the buffer
+            const size_t at = reinterpret_cast<uintptr_t>(pixels);
+            size_t last;
+            if (compressed) {
+                last = size_t(imageSize);
+            } else {
+                const uint32_t px0 = clientPixelBytes(format, type);
+                // The offset must be a multiple of the size of the basic machine unit of the type.
+                const uint32_t unit = (type == gl::BYTE || type == gl::UNSIGNED_BYTE) ? 1u
+                                      : (type == gl::SHORT || type == gl::UNSIGNED_SHORT || type == gl::HALF_FLOAT || type == 0x8033 ||
+                                         type == 0x8034 || type == 0x8363) ? 2u : 4u;
+                if (at % unit) return setError(gl::INVALID_OPERATION);
+                const size_t rl = unpackRowLength ? size_t(unpackRowLength) : size_t(w);
+                const size_t rowB = (rl * px0 + size_t(unpackAlignment) - 1) / size_t(unpackAlignment) * size_t(unpackAlignment);
+                const size_t ih = unpackImageHeight ? size_t(unpackImageHeight) : size_t(h);
+                last = size_t(unpackSkipImages + std::max(d, 1) - 1) * ih * rowB + size_t(unpackSkipRows + h - 1) * rowB +
+                       size_t(unpackSkipPixels + w) * px0;
+            }
+            if (at + last > size_t(pb->size)) return setError(gl::INVALID_OPERATION);
+        }
         if (pb->storage->lastUse > dev->completed) flush(true);
         src = pb->storage->host + reinterpret_cast<uintptr_t>(pixels);
     }
@@ -316,7 +444,26 @@ void Context::texImage(GLenum target, GLint level, GLenum internalFormat, GLsize
     }
     if (early)
         queuePending(*t, uint32_t(level), layer, xo, yo, zo, uint32_t(w), uint32_t(h), depthN, converted.data(), converted.size());
-    else
+    else if (fi->depth && fi->stencil && format == gl::DEPTH_STENCIL) {
+        // Packed depth/stencil data: the depth plane (4 bytes per texel) and the stencil plane (1 byte) are two copies.
+        const size_t cnt = size_t(w) * h * depthN;
+        const bool f32 = fi->vk == VK_FORMAT_D32_SFLOAT_S8_UINT;
+        std::vector<uint8_t> dplane(cnt * 4), splane(cnt);
+        for (size_t i = 0; i < cnt; ++i) {
+            if (f32) {
+                std::memcpy(&dplane[4 * i], &converted[8 * i], 4);
+                splane[i] = converted[8 * i + 4];
+            } else {
+                uint32_t q;
+                std::memcpy(&q, &converted[4 * i], 4);
+                const uint32_t dq = q & 0xFFFFFFu;
+                std::memcpy(&dplane[4 * i], &dq, 4);
+                splane[i] = uint8_t(q >> 24);
+            }
+        }
+        copyBufferToImage(*t->image, uint32_t(level), layer, xo, yo, zo, uint32_t(w), uint32_t(h), depthN, dplane.data(), dplane.size());
+        copyBufferToImage(*t->image, uint32_t(level), layer, xo, yo, zo, uint32_t(w), uint32_t(h), depthN, splane.data(), splane.size(), true);
+    } else
         copyBufferToImage(*t->image, uint32_t(level), layer, xo, yo, zo, uint32_t(w), uint32_t(h), depthN, converted.data(),
                           converted.size());
 }
@@ -324,9 +471,12 @@ void Context::texImage(GLenum target, GLint level, GLenum internalFormat, GLsize
 void Context::texStorage(GLenum target, GLsizei levels, GLenum internalFormat, GLsizei w, GLsizei h, GLsizei d,
                          GLsizei samples) {
     Texture* t = boundTexture(target);
-    if (!t) return setError(gl::INVALID_OPERATION);
+    if (!t || t->name == 0) return setError(gl::INVALID_OPERATION);
     if (t->immutable) return setError(gl::INVALID_OPERATION);
     if (levels < 1 || w < 1 || h < 1 || d < 1) return setError(gl::INVALID_VALUE);
+    if (w > (target == gl::TEXTURE_3D ? 2048 : 16384) || h > (target == gl::TEXTURE_3D ? 2048 : 16384) ||
+        ((target == gl::TEXTURE_3D || target == gl::TEXTURE_2D_ARRAY) && d > 2048))
+        return setError(gl::INVALID_VALUE);
     const FormatInfo* fi = formatFor(internalFormat);
     if (!fi || (fi->internal != internalFormat && !fi->compressed)) return setError(gl::INVALID_ENUM);
     if (uint32_t(levels) > mipCount(uint32_t(w), uint32_t(h), target == gl::TEXTURE_3D ? uint32_t(d) : 1))
@@ -344,7 +494,6 @@ void Context::texStorage(GLenum target, GLsizei levels, GLenum internalFormat, G
         lv.d = target == gl::TEXTURE_3D ? std::max(1u, uint32_t(d) >> i) : uint32_t(d);
         lv.format = fi;
     }
-    if (samples > 1) logf("gles.note what=texstorage_multisample samples=%d (created 1x: VPKTAA does AA)", samples);
     realizeTexture(*t);
     t->maxLevel = std::min(t->maxLevel, levels - 1 + t->baseLevel);
 }
@@ -357,6 +506,7 @@ void Context::copyImageSubData(GLuint srcName, GLenum srcTarget, GLint srcLevel,
         Image* image = nullptr;
         uint32_t levelW = 0, levelH = 0, levelD = 1;  // size of the chosen level; layers (not depth) for arrays / cubes
         bool is3D = false;
+        uint32_t msRbo = 0;  // samples of a multisample renderbuffer (its image is single-sample)
         std::shared_ptr<Image> hold;
     } side[2];
     const GLuint names[2] = {srcName, dstName};
@@ -370,6 +520,7 @@ void Context::copyImageSubData(GLuint srcName, GLenum srcTarget, GLint srcLevel,
             if (levels[i] != 0) return setError(gl::INVALID_VALUE, targets[i]);
             sd.image = r->image.get(), sd.hold = r->image;
             sd.levelW = uint32_t(r->width), sd.levelH = uint32_t(r->height);
+            sd.msRbo = r->samples > 1 ? uint32_t(r->samples) : 0;
             continue;
         }
         const bool known = targets[i] == gl::TEXTURE_2D || targets[i] == gl::TEXTURE_3D || targets[i] == gl::TEXTURE_2D_ARRAY ||
@@ -389,16 +540,32 @@ void Context::copyImageSubData(GLuint srcName, GLenum srcTarget, GLint srcLevel,
     if (w == 0 || h == 0 || d == 0) return;
     const FormatInfo& sf = *side[0].image->format;
     const FormatInfo& df = *side[1].image->format;
-    const bool sameClass = sf.compressed == df.compressed && sf.texelBytes == df.texelBytes && sf.blockW == df.blockW &&
-                           sf.blockH == df.blockH && sf.depth == df.depth && sf.stencil == df.stencil;
+    // Same texel size, or a compressed format and an uncompressed one whose texel is as big as the block (extent counted in source texels).
+    const bool mixed = sf.compressed != df.compressed;
+    const bool sameClass = sf.texelBytes == df.texelBytes && sf.depth == df.depth && sf.stencil == df.stencil &&
+                           (mixed || (sf.blockW == df.blockW && sf.blockH == df.blockH));
     if (!sameClass) return setError(gl::INVALID_OPERATION);
+    // GL: the sample counts must match. A multisample renderbuffer holds no samples (only its resolved image), so it cannot be
+    // copied with a multisample texture either.
+    const uint32_t ns[2] = {side[0].msRbo ? side[0].msRbo : uint32_t(side[0].image->samples),
+                            side[1].msRbo ? side[1].msRbo : uint32_t(side[1].image->samples)};
+    if (ns[0] != ns[1] || ((side[0].msRbo || side[1].msRbo) && (side[0].image->samples > 1 || side[1].image->samples > 1)))
+        return setError(gl::INVALID_OPERATION);
+    const uint32_t sbw = sf.compressed ? sf.blockW : 1, sbh = sf.compressed ? sf.blockH : 1;
     const GLint o[2][3] = {{sx, sy, sz}, {dx, dy, dz}};
     for (int i = 0; i < 2; ++i) {
         const Side& sd = side[i];
-        if (o[i][0] < 0 || o[i][1] < 0 || o[i][2] < 0 || uint32_t(o[i][0] + w) > sd.levelW || uint32_t(o[i][1] + h) > sd.levelH ||
+        const FormatInfo& f = *sd.image->format;
+        uint32_t rw = i == 0 ? uint32_t(w) : (uint32_t(w) + sbw - 1) / sbw * (f.compressed ? f.blockW : 1);
+        uint32_t rh = i == 0 ? uint32_t(h) : (uint32_t(h) + sbh - 1) / sbh * (f.compressed ? f.blockH : 1);
+        // A compressed region that ends exactly at the level edge may cover a partial block there.
+        if (f.compressed && !mixed && o[i][0] >= 0 && o[i][1] >= 0) {
+            if (uint32_t(o[i][0]) + uint32_t(w) == sd.levelW) rw = uint32_t(w);
+            if (uint32_t(o[i][1]) + uint32_t(h) == sd.levelH) rh = uint32_t(h);
+        }
+        if (o[i][0] < 0 || o[i][1] < 0 || o[i][2] < 0 || uint32_t(o[i][0]) + rw > sd.levelW || uint32_t(o[i][1]) + rh > sd.levelH ||
             uint32_t(o[i][2] + d) > sd.levelD)
             return setError(gl::INVALID_VALUE);
-        const FormatInfo& f = *sd.image->format;
         if (f.compressed && (o[i][0] % f.blockW || o[i][1] % f.blockH)) return setError(gl::INVALID_VALUE);
     }
     const bool anyDepthStencil = sf.depth || sf.stencil;
@@ -425,6 +592,9 @@ void Context::copyImageSubData(GLuint srcName, GLenum srcTarget, GLint srcLevel,
 }
 
 void Context::generateMipmap(GLenum target) {
+    if (target != gl::TEXTURE_2D && target != gl::TEXTURE_3D && target != gl::TEXTURE_2D_ARRAY && target != gl::TEXTURE_CUBE_MAP &&
+        target != gl::TEXTURE_CUBE_MAP_ARRAY)
+        return setError(gl::INVALID_ENUM, target);
     Texture* t = boundTexture(target);
     if (!t || !t->image) return setError(gl::INVALID_OPERATION, target);
     Image& img = *t->image;
@@ -446,23 +616,48 @@ void Context::generateMipmap(GLenum target) {
         if (t->levels.size() <= l) t->levels.resize(l + 1);
         t->levels[l] = {uint32_t(b.dstOffsets[1].x), uint32_t(b.dstOffsets[1].y),
                         target == gl::TEXTURE_3D ? uint32_t(b.dstOffsets[1].z) : t->levels[0].d, img.format};
+        if (target == gl::TEXTURE_CUBE_MAP)
+            for (auto& fl : t->faceLevels) {
+                if (fl.size() <= l) fl.resize(l + 1);
+                fl[l] = t->levels[l];
+            }
     }
 }
 
 void Context::copyTexImage(GLenum target, GLint level, GLenum internalFormat, GLint x, GLint y, GLsizei w, GLsizei h,
                            bool sub, GLint xo, GLint yo, GLint zo) {
+    if (!isCubeFace(target) && target != gl::TEXTURE_2D && target != gl::TEXTURE_3D && target != gl::TEXTURE_2D_ARRAY &&
+        target != gl::TEXTURE_CUBE_MAP_ARRAY)
+        return setError(gl::INVALID_ENUM, target);
+    if (level < 0 || level > 14 || w < 0 || h < 0 || xo < 0 || yo < 0 || zo < 0) return setError(gl::INVALID_VALUE, target);
+    if (sub) {
+        Texture* dst = boundTexture(bindTarget(target));
+        if (!dst || size_t(level) >= dst->levels.size() || !dst->levels[size_t(level)].format) return setError(gl::INVALID_OPERATION, target);
+        const Texture::Level& lv = dst->levels[size_t(level)];
+        if (uint32_t(xo + w) > lv.w || uint32_t(yo + h) > lv.h) return setError(gl::INVALID_VALUE, target);
+        if ((target == gl::TEXTURE_3D || target == gl::TEXTURE_2D_ARRAY) && uint32_t(zo) >= lv.d) return setError(gl::INVALID_VALUE, target);
+    }
     FbInfo fb = resolveFramebuffer(readFbo, false);
     if (fb.status != gl::FRAMEBUFFER_COMPLETE) return setError(gl::INVALID_FRAMEBUFFER_OPERATION, target);
     const Framebuffer* rf = fbo(readFbo);
     int idx = 0;
     if (rf && readFbo && rf->readBuffer >= gl::COLOR_ATTACHMENT0) idx = int(rf->readBuffer - gl::COLOR_ATTACHMENT0);
     FbTarget src = fb.color[size_t(idx)];
+    if (src.image && (src.image->samples > 1 || src.msSamples)) return setError(gl::INVALID_OPERATION, target);
     if (!src.image) return setError(gl::INVALID_OPERATION, target);
     if (!sub) {
         GLenum fmt = internalFormat;
         const FormatInfo* f = formatFor(internalFormat, internalFormat, gl::UNSIGNED_BYTE);
         if (!f) return setError(gl::INVALID_ENUM, target);
-        texImage(target, level, fmt, w, h, 1, f->baseFormat, gl::UNSIGNED_BYTE, nullptr, false, 0, 0, 0, false, 0);
+        // No data is sent: any type that suits the format will do.
+        GLenum ty = gl::UNSIGNED_BYTE;
+        for (GLenum cand : {gl::UNSIGNED_BYTE, gl::FLOAT, gl::UNSIGNED_SHORT_5_6_5, gl::UNSIGNED_SHORT_4_4_4_4, gl::UNSIGNED_SHORT_5_5_5_1,
+                            gl::UNSIGNED_INT_2_10_10_10_REV, gl::UNSIGNED_INT_10F_11F_11F_REV, gl::BYTE, gl::UNSIGNED_SHORT, gl::UNSIGNED_INT})
+            if (!transferError(*f, f->baseFormat, cand)) {
+                ty = cand;
+                break;
+            }
+        texImage(target, level, fmt, w, h, 1, f->baseFormat, ty, nullptr, false, 0, 0, 0, false, 0);
         xo = yo = zo = 0;
     }
     Texture* t = boundTexture(bindTarget(target));
@@ -472,6 +667,40 @@ void Context::copyTexImage(GLenum target, GLint level, GLenum internalFormat, GL
     int32_t sx = std::max(0, x), sy = std::max(0, y);
     int32_t ex = std::min<int32_t>(x + w, int32_t(fb.width)), ey = std::min<int32_t>(y + h, int32_t(fb.height));
     if (ex <= sx || ey <= sy) return;
+    const FormatInfo& tf = *t->image->format;
+    if ((tf.baseFormat == gl::ALPHA || tf.baseFormat == gl::LUMINANCE_ALPHA) && tf.componentType == 0x8C17 /* UNSIGNED_NORMALIZED */ &&
+        (tf.vk == VK_FORMAT_R8_UNORM || tf.vk == VK_FORMAT_R8G8_UNORM) && !src.image->format->depth && !src.image->format->stencil &&
+        !src.image->format->integer) {
+        // Alpha and luminance-alpha are stored as R8 / RG8 (luminance in red, alpha in green or red): a blit would copy the source's
+        // red and green, so the pixels go through the host (read like glReadPixels, RGBA8).
+        const FormatInfo& sf = *src.image->format;
+        const uint32_t cw = uint32_t(ex - sx), ch = uint32_t(ey - sy);
+        Alloc rb = stream(VkDeviceSize(cw) * ch * sf.texelBytes, 16);
+        barrier();
+        VkBufferImageCopy rc{};
+        rc.bufferOffset = rb.offset;
+        rc.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, src.level, src.layer, 1};
+        rc.imageOffset = {sx, sy, 0};
+        rc.imageExtent = {cw, ch, 1};
+        src.image->invalid.clear();
+        dev->vk.vkCmdCopyImageToBuffer(cmd(), src.image->image, VK_IMAGE_LAYOUT_GENERAL, rb.buffer, 1, &rc);
+        const uint8_t* host = rb.host;
+        StorageP keepAlive = chunks_.back().storage;  // the chunk survives the flush below
+        flush(true);
+        const uint32_t tb = tf.texelBytes;
+        std::vector<uint8_t> row(size_t(cw) * 4), out(size_t(cw) * ch * tb);
+        for (uint32_t j = 0; j < ch; ++j) {
+            if (!convertReadback(sf, gl::RGBA, gl::UNSIGNED_BYTE, host + size_t(j) * cw * sf.texelBytes, cw, row.data())) return;
+            for (uint32_t i = 0; i < cw; ++i) {
+                uint8_t* o = &out[(size_t(j) * cw + i) * tb];
+                if (tb == 1) o[0] = row[4 * i + 3];
+                else o[0] = row[4 * i], o[1] = row[4 * i + 3];
+            }
+        }
+        copyBufferToImage(*t->image, uint32_t(level), isCubeFace(target) ? face : 0, xo + (sx - x), yo + (sy - y), isCubeFace(target) ? 0 : zo, cw,
+                          ch, 1, out.data(), out.size());
+        return;
+    }
     barrier();
     VkImageBlit b{};
     b.srcSubresource = {src.image->aspect(), src.level, src.layer, 1};

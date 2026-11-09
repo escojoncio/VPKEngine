@@ -21,6 +21,7 @@
 #include "vpgpu/core/background.h"
 #include "vpgpu/core/scoped_pool.h"
 #include "recipes.h"
+#include "texdecode.h"
 #include "vpvk.h"
 #include "vpvk/config.h"
 
@@ -144,9 +145,32 @@ void* findNextOut(void* chain, VkStructureType t) {
   return nullptr;
 }
 
+// "vk.imgzero fmt=<core format> vkfmt=<n> w= h= mips= layers= usage=0x.. why=..": an image that ends with zeroed contents
+// (zeroInitResolve) or whose format was converted / has no core format (imageDesc). Once per (why, format), 16 lines at most.
+// vkfmt is -1 where the Vulkan format is not at hand; usage is the Vulkan flags (imageDesc) or the core ones (zeroInitResolve).
+void noteImgZero(const char* why, int vkFmt, vpgpu::Format fmt, uint32_t w, uint32_t h, uint32_t mips, uint32_t layers, uint32_t usage) {
+  static std::atomic<size_t> count{0};
+  if (count.load(std::memory_order_relaxed) >= 16) return;  // the limit is reached: no string, no mutex
+  static std::mutex m;
+  static std::set<std::string> seen;
+  const std::string key = std::string(why) + "/" + std::to_string(vkFmt >= 0 ? vkFmt : -1 - int(fmt));
+  std::lock_guard<std::mutex> lock(m);
+  if (seen.size() >= 16 || !seen.insert(key).second) return;
+  count.store(seen.size(), std::memory_order_relaxed);
+  logf("vk.imgzero fmt=%s vkfmt=%d w=%u h=%u mips=%u layers=%u usage=0x%x why=%s", vpgpu::formatInfo(fmt).name, vkFmt, w, h, mips,
+       layers, usage, why);
+}
+
 vpgpu::TextureDesc imageDesc(const VkImageCreateInfo& ci) {
   vpgpu::TextureDesc d;
   d.format = toCoreFormat(ci.format);
+  if (d.format == vpgpu::Format::Undefined && ci.format != VK_FORMAT_UNDEFINED)
+    noteImgZero("unsupported", int(ci.format), d.format, ci.extent.width, ci.extent.height, ci.mipLevels, ci.arrayLayers, ci.usage);
+  // Metal has no 3D ASTC: the volume is RGBA8 and its uploads are decoded on the CPU (texdecode.h, commands.cpp).
+  if (ci.imageType == VK_IMAGE_TYPE_3D && astcFormat(d.format)) {
+    d.format = astcDecodedFormat(d.format);
+    noteImgZero("astc3d_decoded", int(ci.format), d.format, ci.extent.width, ci.extent.height, ci.mipLevels, ci.arrayLayers, ci.usage);
+  }
   d.width = ci.extent.width;
   d.height = ci.extent.height;
   d.depth = ci.extent.depth;
@@ -193,6 +217,13 @@ vpgpu::TextureDesc imageDesc(const VkImageCreateInfo& ci) {
   if (ci.samples > 1 && !vpgpu::formatInfo(d.format).depth() && !vpgpu::formatInfo(d.format).stencil())
     d.usage |= vpgpu::usage::sampled;
   if (!d.usage) d.usage = vpgpu::usage::sampled;
+  d.samplesReadable = (ci.usage & (VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT |
+                                   VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_STORAGE_BIT)) != 0;
+  // The 1x images forced MSAA resolves into (and seeds samples from, Attachment::needsSeed): a shader reads them. The game's own
+  // MSAA (gameMsaaAuto) adds nothing: commands.cpp gameAuto only serves resolve targets that are already readable.
+  if (d.samples <= 1 && (ci.usage & (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT)) &&
+      !(ci.usage & VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT) && msaaForce() > 0)
+    d.usage |= vpgpu::usage::sampled;
   // Transient attachments never need memory: the core keeps them on tile when it can.
   d.transient = (ci.usage & VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT) != 0;
   // Anything sampled may be read in a later frame (Vulkan gives no frame boundary).
@@ -302,7 +333,9 @@ namespace {
 constexpr uint32_t kSubgroupSize = 32;  // Apple SIMD-group width (the Adreno's 64 cannot be honoured)
 constexpr VkShaderStageFlags kSubgroupStages = VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_COMPUTE_BIT;
 constexpr VkSubgroupFeatureFlags kSubgroupOps =
-    VK_SUBGROUP_FEATURE_BASIC_BIT | VK_SUBGROUP_FEATURE_VOTE_BIT | VK_SUBGROUP_FEATURE_BALLOT_BIT;
+    VK_SUBGROUP_FEATURE_BASIC_BIT | VK_SUBGROUP_FEATURE_VOTE_BIT | VK_SUBGROUP_FEATURE_BALLOT_BIT |
+    VK_SUBGROUP_FEATURE_SHUFFLE_BIT | VK_SUBGROUP_FEATURE_SHUFFLE_RELATIVE_BIT | VK_SUBGROUP_FEATURE_QUAD_BIT |
+    VK_SUBGROUP_FEATURE_ARITHMETIC_BIT | VK_SUBGROUP_FEATURE_CLUSTERED_BIT;  // arithmetic / clustered: vpir subgroup_arith
 constexpr uint32_t kMaxInlineUniformBlockSize = 256, kMaxInlineUniformBlocks = 4;  // the minimums
 // What the Adreno driver reports with the Quest identity (VK_KHR_driver_properties): engines key Qualcomm
 // workarounds off driverID, never off the name.
@@ -318,9 +351,11 @@ void fillDriver(VkPhysicalDeviceDriverProperties& d) {
     std::strncpy(d.driverName, "VPVulkan", sizeof d.driverName - 1);
     std::strncpy(d.driverInfo, "VPKEngine Vulkan on Metal", sizeof d.driverInfo - 1);
   }
-  // The API version reported (deviceProperties().apiVersion): 1.3, or with the Quest identity 1.1 (1.3 in the conformance run).
+  // The API version reported (deviceProperties().apiVersion) is 1.3; the Quest identity reports the headset's
+  // conformance version too (1.3.0.6: major, minor, subminor, patch).
   const uint32_t api = deviceProperties().apiVersion;
-  d.conformanceVersion = {uint8_t(VK_API_VERSION_MAJOR(api)), uint8_t(VK_API_VERSION_MINOR(api)), 0, 0};
+  d.conformanceVersion = {uint8_t(VK_API_VERSION_MAJOR(api)), uint8_t(VK_API_VERSION_MINOR(api)), 0,
+                          uint8_t(questIdentity() ? 6 : 0)};
 }
 }  // namespace
 
@@ -450,6 +485,8 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkGetPhysicalDeviceProperties2(VkPhysical
         v->maxInlineUniformBlockSize = kMaxInlineUniformBlockSize;
         v->maxPerStageDescriptorInlineUniformBlocks = kMaxInlineUniformBlocks;
         v->maxDescriptorSetInlineUniformBlocks = kMaxInlineUniformBlocks;
+        v->maxPerStageDescriptorUpdateAfterBindInlineUniformBlocks = kMaxInlineUniformBlocks;
+        v->maxDescriptorSetUpdateAfterBindInlineUniformBlocks = kMaxInlineUniformBlocks;
         v->maxInlineUniformTotalSize = kMaxInlineUniformBlockSize * kMaxInlineUniformBlocks;
         break;
       }
@@ -464,17 +501,52 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkGetPhysicalDeviceProperties2(VkPhysical
         auto* iu = reinterpret_cast<VkPhysicalDeviceInlineUniformBlockProperties*>(s);
         iu->maxInlineUniformBlockSize = kMaxInlineUniformBlockSize;
         iu->maxPerStageDescriptorInlineUniformBlocks = kMaxInlineUniformBlocks;
-        iu->maxPerStageDescriptorUpdateAfterBindInlineUniformBlocks = 0;
+        iu->maxPerStageDescriptorUpdateAfterBindInlineUniformBlocks = kMaxInlineUniformBlocks;  // (limit only: the feature is false)
         iu->maxDescriptorSetInlineUniformBlocks = kMaxInlineUniformBlocks;
-        iu->maxDescriptorSetUpdateAfterBindInlineUniformBlocks = 0;
+        iu->maxDescriptorSetUpdateAfterBindInlineUniformBlocks = kMaxInlineUniformBlocks;
         break;
       }
+      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FLOAT_CONTROLS_PROPERTIES: {
+        // Same values as the float-controls part of Vulkan12Properties.
+        auto* x = reinterpret_cast<VkPhysicalDeviceFloatControlsProperties*>(s);
+        void* next = x->pNext;
+        *x = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FLOAT_CONTROLS_PROPERTIES, next};
+        x->denormBehaviorIndependence = VK_SHADER_FLOAT_CONTROLS_INDEPENDENCE_NONE;
+        x->roundingModeIndependence = VK_SHADER_FLOAT_CONTROLS_INDEPENDENCE_NONE;
+        x->shaderRoundingModeRTEFloat32 = VK_TRUE;
+        break;
+      }
+      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SAMPLER_FILTER_MINMAX_PROPERTIES: {  // samplerFilterMinmax is false
+        auto* x = reinterpret_cast<VkPhysicalDeviceSamplerFilterMinmaxProperties*>(s);
+        void* next = x->pNext;
+        *x = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SAMPLER_FILTER_MINMAX_PROPERTIES, next};
+        break;
+      }
+      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_INTEGER_DOT_PRODUCT_PROPERTIES: {  // no dot-product acceleration
+        auto* x = reinterpret_cast<VkPhysicalDeviceShaderIntegerDotProductProperties*>(s);
+        void* next = x->pNext;
+        *x = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_INTEGER_DOT_PRODUCT_PROPERTIES, next};
+        break;
+      }
+      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TEXEL_BUFFER_ALIGNMENT_PROPERTIES: {
+        auto* x = reinterpret_cast<VkPhysicalDeviceTexelBufferAlignmentProperties*>(s);
+        void* next = x->pNext;
+        *x = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TEXEL_BUFFER_ALIGNMENT_PROPERTIES, next};
+        x->storageTexelBufferOffsetAlignmentBytes = x->uniformTexelBufferOffsetAlignmentBytes =
+            deviceProperties().limits.minTexelBufferOffsetAlignment;
+        break;
+      }
+      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PUSH_DESCRIPTOR_PROPERTIES_KHR:
+        reinterpret_cast<VkPhysicalDevicePushDescriptorPropertiesKHR*>(s)->maxPushDescriptors = 32;
+        break;
+      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_ATTRIBUTE_DIVISOR_PROPERTIES_EXT:
+        reinterpret_cast<VkPhysicalDeviceVertexAttributeDivisorPropertiesEXT*>(s)->maxVertexAttribDivisor = 65535;  // Adreno's value
+        break;
       case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_4_PROPERTIES:
         reinterpret_cast<VkPhysicalDeviceMaintenance4Properties*>(s)->maxBufferSize = 1ull << 32;
         break;
       case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_PROPERTIES: {
         // descriptorIndexing is false, but an engine that chains the struct reads its limits: none of it is left unset.
-        if (!nativeExtras()) break;
         auto* x = reinterpret_cast<VkPhysicalDeviceDescriptorIndexingProperties*>(s);
         void* next = x->pNext;
         *x = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_PROPERTIES, next};
@@ -532,8 +604,7 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkGetPhysicalDeviceFeatures(VkPhysicalDev
   // Metal rasterizes [[point_size]] up to 511 (pointSizeRange); Adreno reports largePoints too.
   f->largePoints = VK_TRUE;
   f->samplerAnisotropy = VK_TRUE;
-  // BCn when the GPU samples it; with the Quest identity not (the Adreno 740 has none: titles must take their ETC2/ASTC
-  // path, no BC format either).
+  // BCn when the GPU samples it (the Adreno 740 reports it as well).
   f->textureCompressionBC = textureCompressionBC() ? VK_TRUE : VK_FALSE;
   f->textureCompressionETC2 = VK_TRUE;
   f->textureCompressionASTC_LDR = VK_TRUE;  // every LDR block size, 4x4..12x12 (Metal ASTC_*_LDR)
@@ -588,8 +659,7 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkGetPhysicalDeviceFeatures2(VkPhysicalDe
   // What the driver really does, in one place; every extension / VulkanNN struct reads from it.
   // Not offered (the translator or the driver does not do it): 16-bit shader inputs/outputs,
   // variablePointers (workgroup pointers), protected memory, descriptor indexing, shader Int64
-  // atomics, availability / visibility chains, zero-initialised workgroup memory, integer dot
-  // products, robustImageAccess, update-after-bind (see bitacora.md, "No viable"). Games therefore
+  // atomics, availability / visibility chains, update-after-bind (see bitacora.md, "No viable"). Games therefore
   // see apiVersion 1.1; the conformance run (VPVK_EXTRA_EXTENSIONS=1) reports 1.3 like the Adreno 740.
   const VkBool32 multiDraw = extraExtensions();  // EXT_multi_draw is no Adreno extension
   // Everything added for the Adreno profile that the Vulkan CTS has not validated yet answers only
@@ -658,6 +728,10 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkGetPhysicalDeviceFeatures2(VkPhysicalDe
         f16->storageBuffer16BitAccess = f16->uniformAndStorageBuffer16BitAccess = gate;
         f16->storagePushConstant16 = gate;
         f16->storageInputOutput16 = VK_FALSE;
+        break;
+      }
+      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_INDEX_TYPE_UINT8_FEATURES_EXT: {
+        reinterpret_cast<VkPhysicalDeviceIndexTypeUint8FeaturesEXT*>(s)->indexTypeUint8 = gate;  // widened to 16 bits per draw
         break;
       }
       case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_8BIT_STORAGE_FEATURES: {
@@ -738,12 +812,54 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkGetPhysicalDeviceFeatures2(VkPhysicalDe
         if (native) reinterpret_cast<VkPhysicalDeviceMemoryPriorityFeaturesEXT*>(s)->memoryPriority = VK_FALSE;
         break;
       case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_FEATURES: {
-        if (!native) break;
         auto* x = reinterpret_cast<VkPhysicalDeviceDescriptorIndexingFeatures*>(s);
         void* next = x->pNext;
         *x = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_FEATURES, next};
         break;
       }
+      // Core 1.2 / 1.3 feature structs of things this driver does not do: written as false for every identity (an
+      // unwritten struct reads as the caller's bytes) and in step with the VulkanNN structs below.
+      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_INT64_FEATURES: {
+        auto* x = reinterpret_cast<VkPhysicalDeviceShaderAtomicInt64Features*>(s);
+        x->shaderBufferInt64Atomics = x->shaderSharedInt64Atomics = VK_FALSE;
+        break;
+      }
+      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_SUBGROUP_EXTENDED_TYPES_FEATURES:
+        reinterpret_cast<VkPhysicalDeviceShaderSubgroupExtendedTypesFeatures*>(s)->shaderSubgroupExtendedTypes = gate;  // laneOp on any scalar/vector type (lower.cpp)
+        break;
+      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_CLIP_ENABLE_FEATURES_EXT:
+        reinterpret_cast<VkPhysicalDeviceDepthClipEnableFeaturesEXT*>(s)->depthClipEnable = gate;  // pipelines.cpp: Metal clip mode
+        break;
+      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_ATTRIBUTE_DIVISOR_FEATURES_EXT: {
+        auto* x = reinterpret_cast<VkPhysicalDeviceVertexAttributeDivisorFeaturesEXT*>(s);  // lower.cpp dividedInstance
+        x->vertexAttributeInstanceRateDivisor = x->vertexAttributeInstanceRateZeroDivisor = gate;
+        break;
+      }
+      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ASTC_DECODE_FEATURES_EXT:
+        reinterpret_cast<VkPhysicalDeviceASTCDecodeFeaturesEXT*>(s)->decodeModeSharedExponent = VK_FALSE;  // the mode itself is accepted and ignored
+        break;
+      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TEXEL_BUFFER_ALIGNMENT_FEATURES_EXT:
+        reinterpret_cast<VkPhysicalDeviceTexelBufferAlignmentFeaturesEXT*>(s)->texelBufferAlignment = gate;
+        break;
+      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_TERMINATE_INVOCATION_FEATURES:
+        // OpTerminateInvocation -> discard_fragment (same answer as Vulkan13Features).
+        reinterpret_cast<VkPhysicalDeviceShaderTerminateInvocationFeatures*>(s)->shaderTerminateInvocation = gate;
+        break;
+      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_ROBUSTNESS_FEATURES:
+        reinterpret_cast<VkPhysicalDeviceImageRobustnessFeatures*>(s)->robustImageAccess = gate;  // lower.cpp imageInBounds
+        break;
+      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_CREATION_CACHE_CONTROL_FEATURES:
+        reinterpret_cast<VkPhysicalDevicePipelineCreationCacheControlFeatures*>(s)->pipelineCreationCacheControl = gate;  // pipelines.cpp
+        break;
+      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_INTEGER_DOT_PRODUCT_FEATURES:
+        reinterpret_cast<VkPhysicalDeviceShaderIntegerDotProductFeatures*>(s)->shaderIntegerDotProduct = gate;  // lower.cpp dotProduct
+        break;
+      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TEXTURE_COMPRESSION_ASTC_HDR_FEATURES:
+        reinterpret_cast<VkPhysicalDeviceTextureCompressionASTCHDRFeatures*>(s)->textureCompressionASTC_HDR = VK_FALSE;
+        break;
+      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ZERO_INITIALIZE_WORKGROUP_MEMORY_FEATURES:
+        reinterpret_cast<VkPhysicalDeviceZeroInitializeWorkgroupMemoryFeatures*>(s)->shaderZeroInitializeWorkgroupMemory = gate;  // lower.cpp zeroWorkgroup
+        break;
       case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_HOST_IMAGE_COPY_FEATURES_EXT:
         // vkCopyMemoryToImageEXT & co. (ext.cpp): staged GPU copies, waited for.
         reinterpret_cast<VkPhysicalDeviceHostImageCopyFeaturesEXT*>(s)->hostImageCopy = native;
@@ -801,6 +917,7 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkGetPhysicalDeviceFeatures2(VkPhysicalDe
         v->bufferDeviceAddress = VK_TRUE;
         v->vulkanMemoryModel = v->vulkanMemoryModelDeviceScope = VK_TRUE;
         v->storageBuffer8BitAccess = v->uniformAndStorageBuffer8BitAccess = v->storagePushConstant8 = VK_TRUE;
+        v->shaderSubgroupExtendedTypes = VK_TRUE;
         break;
       }
       case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES: {
@@ -817,6 +934,10 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkGetPhysicalDeviceFeatures2(VkPhysicalDe
         v->shaderTerminateInvocation = VK_TRUE;  // OpTerminateInvocation -> discard_fragment
         v->inlineUniformBlock = VK_TRUE;
         v->shaderDemoteToHelperInvocation = VK_TRUE;
+        v->robustImageAccess = VK_TRUE;
+        v->pipelineCreationCacheControl = VK_TRUE;
+        v->shaderZeroInitializeWorkgroupMemory = VK_TRUE;
+        v->shaderIntegerDotProduct = VK_TRUE;
         break;
       }
       default: break;
@@ -828,8 +949,8 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkGetPhysicalDeviceQueueFamilyProperties(
     VkPhysicalDevice, uint32_t* count, VkQueueFamilyProperties* out) {
   VkQueueFamilyProperties q{};
   q.queueFlags = VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT | VK_QUEUE_TRANSFER_BIT;
-  q.queueCount = 1;
-  q.timestampValidBits = 64;
+  q.queueCount = kQueueCount;
+  q.timestampValidBits = kTimestampValidBits;
   q.minImageTransferGranularity = {1, 1, 1};
   fillArray(std::vector<VkQueueFamilyProperties>{q}, count, out);
 }
@@ -873,10 +994,16 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkGetPhysicalDeviceFormatProperties(VkPhy
                                                                            VkFormatProperties* p) {
   p->optimalTilingFeatures = formatFeatures(f, false);
   // Linear images are only offered for transfers (staging): Metal linear textures are restrictive.
-  p->linearTilingFeatures = multiPlane(f).planes ? 0
-                            : p->optimalTilingFeatures &
-                                  (VK_FORMAT_FEATURE_TRANSFER_SRC_BIT | VK_FORMAT_FEATURE_TRANSFER_DST_BIT |
-                                   VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT);
+  // Multi-planar linear images: transfers only (each plane is a linear image of its own, see vkCreateImage).
+  // A linear colour image is the same texture as an optimal one (the host memory is its staging), so what a sampler or a blit
+  // source does with it holds for both: Quest reports linear = optimal for these.
+  const vpgpu::FormatInfo& lin = vpgpu::formatInfo(toCoreFormat(f));
+  const VkFormatFeatureFlags linearReads = lin.depth() || lin.stencil() ? 0
+                                           : VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT | VK_FORMAT_FEATURE_BLIT_SRC_BIT;
+  p->linearTilingFeatures = p->optimalTilingFeatures &
+                            (multiPlane(f).planes ? (VK_FORMAT_FEATURE_TRANSFER_SRC_BIT | VK_FORMAT_FEATURE_TRANSFER_DST_BIT)
+                                                  : (VK_FORMAT_FEATURE_TRANSFER_SRC_BIT | VK_FORMAT_FEATURE_TRANSFER_DST_BIT |
+                                                     VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT | linearReads));
   p->bufferFeatures = formatFeatures(f, true);
   // A format the game asks about and gets nothing for: the first 64 are named (an engine that refuses to start over a
   // missing format then says which one in the log).
@@ -892,27 +1019,33 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkGetPhysicalDeviceFormatProperties2(VkPh
                                                                             VkFormat f,
                                                                             VkFormatProperties2* p) {
   vkGetPhysicalDeviceFormatProperties(pd, f, &p->formatProperties);
-  if (!nativeExtras()) return;
+  // VkFormatProperties3 (core 1.3, VK_KHR_format_feature_flags2) is answered for every identity: it carries at least
+  // the 32-bit flags of VkFormatProperties (the CTS reads usage support from it).
   if (auto* p3 = static_cast<VkFormatProperties3*>(findNextOut(p->pNext, VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_3))) {
     const VkFormatProperties& fp = p->formatProperties;
     p3->linearTilingFeatures = fp.linearTilingFeatures;
     p3->optimalTilingFeatures = fp.optimalTilingFeatures;
     p3->bufferFeatures = fp.bufferFeatures;
+    // Depth formats can be sampled with comparison, linear or optimal (a sampler compare mode on the depth texture).
+    if (vpgpu::formatInfo(toCoreFormat(f)).depth()) {
+      if (fp.linearTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT)
+        p3->linearTilingFeatures |= VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_DEPTH_COMPARISON_BIT;
+      if (fp.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT)
+        p3->optimalTilingFeatures |= VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_DEPTH_COMPARISON_BIT;
+    }
+    if (!nativeExtras()) return;
     // Storage images are read and written without a declared format (the MSL type comes from the SPIR-V
-    // sampled type); depth formats can be sampled with comparison; every image can be a host transfer target.
+    // sampled type); every image can be a host transfer target.
     if (fp.optimalTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT)
       p3->optimalTilingFeatures |= VK_FORMAT_FEATURE_2_STORAGE_READ_WITHOUT_FORMAT_BIT |
                                    VK_FORMAT_FEATURE_2_STORAGE_WRITE_WITHOUT_FORMAT_BIT;
-    if (fp.optimalTilingFeatures & VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT)
-      p3->optimalTilingFeatures |= VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_DEPTH_COMPARISON_BIT;
     if (fp.optimalTilingFeatures && !multiPlane(f).planes)
       p3->optimalTilingFeatures |= VK_FORMAT_FEATURE_2_HOST_IMAGE_TRANSFER_BIT_EXT;
   }
 }
 
-VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkGetPhysicalDeviceImageFormatProperties(
-    VkPhysicalDevice, VkFormat f, VkImageType type, VkImageTiling tiling, VkImageUsageFlags usage,
-    VkImageCreateFlags flags, VkImageFormatProperties* out) {
+static VkResult imageFormatProperties(VkFormat f, VkImageType type, VkImageTiling tiling, VkImageUsageFlags usage,
+                                      VkImageCreateFlags flags, VkImageFormatProperties* out) {
   *out = {};  // every field 0 when the combination is refused (spec; the CTS checks it)
   // VK_EXT_host_image_copy: any image can be a vkCopyMemoryToImageEXT target (host transfers are staged copies).
   if (nativeExtras()) usage &= ~VkImageUsageFlags(VK_IMAGE_USAGE_HOST_TRANSFER_BIT_EXT);
@@ -929,8 +1062,10 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkGetPhysicalDeviceImageFormatPropert
       !(ff & (VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT | VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT)))
     return VK_ERROR_FORMAT_NOT_SUPPORTED;
   // Multi-planar (Y'CbCr) formats: optimal-tiling 2D images only.
-  if (multiPlane(f).planes && (tiling != VK_IMAGE_TILING_OPTIMAL || type != VK_IMAGE_TYPE_2D ||
-                               (flags & VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT)))
+  // Linear ones: transfers only (one mip level, one layer: see maxMipLevels / maxArrayLayers below).
+  if (multiPlane(f).planes && (type != VK_IMAGE_TYPE_2D || (flags & VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT) ||
+                               (tiling == VK_IMAGE_TILING_LINEAR &&
+                                (usage & ~(VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT)))))
     return VK_ERROR_FORMAT_NOT_SUPPORTED;
   if (tiling == VK_IMAGE_TILING_LINEAR &&
       (usage & ~(VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT)))
@@ -946,8 +1081,12 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkGetPhysicalDeviceImageFormatPropert
     // views (newTextureViewWithPixelFormat aborts; the backend refuses them), so reading the block
     // bits would return garbage. Not offered.
     if ((flags & VK_IMAGE_CREATE_BLOCK_TEXEL_VIEW_COMPATIBLE_BIT) && fi.blockSize > 1) return VK_ERROR_FORMAT_NOT_SUPPORTED;
-    if (type == VK_IMAGE_TYPE_3D && fi.name &&
-        (!strncmp(fi.name, "Etc2", 4) || !strncmp(fi.name, "Eac", 3) || !strncmp(fi.name, "Astc", 4)))
+    if (type == VK_IMAGE_TYPE_3D && fi.name && (!strncmp(fi.name, "Etc2", 4) || !strncmp(fi.name, "Eac", 3)))
+      return VK_ERROR_FORMAT_NOT_SUPPORTED;
+    // 3D ASTC is decoded to RGBA8 (texdecode.h): sampling works, but the compressed blocks are gone, so block-exact
+    // copies (the CTS copy_and_blit / compressed_3D cases) cannot. Not offered in the conformance run; vkCreateImage
+    // still takes it for a game that creates one without asking.
+    if (extraExtensions() && type == VK_IMAGE_TYPE_3D && fi.name && !strncmp(fi.name, "Astc", 4))
       return VK_ERROR_FORMAT_NOT_SUPPORTED;
   }
   const auto& l = deviceProperties().limits;
@@ -959,6 +1098,7 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkGetPhysicalDeviceImageFormatPropert
     out->maxExtent = {l.maxImageDimension3D, l.maxImageDimension3D, l.maxImageDimension3D};
   out->maxMipLevels = 15;
   out->maxArrayLayers = type == VK_IMAGE_TYPE_3D ? 1 : l.maxImageArrayLayers;
+  if (multiPlane(f).planes && tiling == VK_IMAGE_TILING_LINEAR) out->maxMipLevels = out->maxArrayLayers = 1;
   // Multisample only where Vulkan allows it: optimal 2D, not cube-compatible, an attachment format
   // (Metal renders MSAA into it), not storage (storageImageSampleCounts = 1), and not transfer-only.
   const bool msaa = tiling == VK_IMAGE_TILING_OPTIMAL && type == VK_IMAGE_TYPE_2D &&
@@ -970,6 +1110,29 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkGetPhysicalDeviceImageFormatPropert
   return VK_SUCCESS;
 }
 
+VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkGetPhysicalDeviceImageFormatProperties(
+    VkPhysicalDevice, VkFormat f, VkImageType type, VkImageTiling tiling, VkImageUsageFlags usage,
+    VkImageCreateFlags flags, VkImageFormatProperties* out) {
+  VkResult r = imageFormatProperties(f, type, tiling, usage, flags, out);
+  // VK_KHR_maintenance2 EXTENDED_USAGE on a mutable image: the usage is valid when some compatible uncompressed colour
+  // format (same texel size) supports it without the flags (an sRGB image used as storage through its UNORM view).
+  if (r == VK_ERROR_FORMAT_NOT_SUPPORTED && (flags & VK_IMAGE_CREATE_EXTENDED_USAGE_BIT) &&
+      (flags & VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT)) {
+    const vpgpu::FormatInfo& fi = vpgpu::formatInfo(toCoreFormat(f));
+    const VkImageCreateFlags plain = flags & ~VkImageCreateFlags(VK_IMAGE_CREATE_EXTENDED_USAGE_BIT);
+    if (fi.blockSize == 1 && !fi.depth() && !fi.stencil() && !multiPlane(f).planes)
+      for (int g = 1; g <= int(VK_FORMAT_ASTC_12x12_SRGB_BLOCK) && r != VK_SUCCESS; ++g) {
+        const VkFormat vf = VkFormat(g);
+        if (vf == f || !formatFeatures(vf, false)) continue;
+        const vpgpu::FormatInfo& gi = vpgpu::formatInfo(toCoreFormat(vf));
+        if (gi.blockSize != 1 || gi.depth() || gi.stencil() || multiPlane(vf).planes || gi.bytesPerBlock != fi.bytesPerBlock)
+          continue;
+        r = imageFormatProperties(vf, type, tiling, usage, plain, out);
+      }
+  }
+  return r;
+}
+
 VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkGetPhysicalDeviceImageFormatProperties2(
     VkPhysicalDevice pd, const VkPhysicalDeviceImageFormatInfo2* in, VkImageFormatProperties2* out) {
   VkImageUsageFlags usage = in->usage;
@@ -978,8 +1141,18 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkGetPhysicalDeviceImageFormatPropert
     if (const auto* su = static_cast<const VkImageStencilUsageCreateInfo*>(
             findNext(in->pNext, VK_STRUCTURE_TYPE_IMAGE_STENCIL_USAGE_CREATE_INFO)))
       usage |= su->stencilUsage;
-  const VkResult r = vkGetPhysicalDeviceImageFormatProperties(pd, in->format, in->type, in->tiling, usage,
-                                                              in->flags, &out->imageFormatProperties);
+  VkResult r = vkGetPhysicalDeviceImageFormatProperties(pd, in->format, in->type, in->tiling, usage, in->flags,
+                                                        &out->imageFormatProperties);
+  // VK_KHR_maintenance2 EXTENDED_USAGE: the usage is valid when a view format of the list supports it (an sRGB image
+  // used as storage through its UNORM view).
+  if (r == VK_ERROR_FORMAT_NOT_SUPPORTED && (in->flags & VK_IMAGE_CREATE_EXTENDED_USAGE_BIT) &&
+      (in->flags & VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT))
+    if (const auto* fl = static_cast<const VkImageFormatListCreateInfo*>(
+            findNext(in->pNext, VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO)))
+      for (uint32_t i = 0; i < fl->viewFormatCount && r != VK_SUCCESS; ++i)
+        if (fl->pViewFormats[i] != in->format)
+          r = vkGetPhysicalDeviceImageFormatProperties(pd, fl->pViewFormats[i], in->type, in->tiling, usage, in->flags,
+                                                       &out->imageFormatProperties);
   if (auto* q = static_cast<VkHostImageCopyDevicePerformanceQueryEXT*>(
           findNextOut(out->pNext, VK_STRUCTURE_TYPE_HOST_IMAGE_COPY_DEVICE_PERFORMANCE_QUERY_EXT))) {
     if (nativeExtras()) {
@@ -1051,6 +1224,7 @@ bool featuresSupported(VkPhysicalDevice pd, const VkDeviceCreateInfo* ci, std::s
       {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_4_FEATURES, 1},
       {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGELESS_FRAMEBUFFER_FEATURES, 1},
       {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_FEATURES, 2},
+      {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_INDEX_TYPE_UINT8_FEATURES_EXT, 1},
       {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_8BIT_STORAGE_FEATURES, 3},
       {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT16_INT8_FEATURES, 2},
       {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_MEMORY_MODEL_FEATURES, 3},
@@ -1062,6 +1236,11 @@ bool featuresSupported(VkPhysicalDevice pd, const VkDeviceCreateInfo* ci, std::s
       {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_3_FEATURES_EXT, 31},
       {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_LOCAL_READ_FEATURES_KHR, 1},
       {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_HOST_IMAGE_COPY_FEATURES_EXT, 1},
+      {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_SUBGROUP_EXTENDED_TYPES_FEATURES, 1},
+      {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_ROBUSTNESS_FEATURES, 1},
+      {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_CREATION_CACHE_CONTROL_FEATURES, 1},
+      {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_INTEGER_DOT_PRODUCT_FEATURES, 1},
+      {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ZERO_INITIALIZE_WORKGROUP_MEMORY_FEATURES, 1},
       // The VulkanNN structs hold exactly this many VkBool32 (sizeof also counts tail padding).
       {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES, 12},
       {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES, 47},
@@ -1104,6 +1283,7 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkCreateDevice(VkPhysicalDevice pd,
   const auto have = deviceExtensions();
   auto* d = new Device;
   d->physical = from<PhysicalDevice>(pd);
+  bool wantIndexU8 = false;
   for (uint32_t i = 0; i < ci->enabledExtensionCount; ++i) {
     const char* e = ci->ppEnabledExtensionNames[i];
     // A game that enables the density map without checking (it is not advertised) is let through
@@ -1119,6 +1299,7 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkCreateDevice(VkPhysicalDevice pd,
       return VK_ERROR_EXTENSION_NOT_PRESENT;
     }
     if (!std::strcmp(e, VK_KHR_MULTIVIEW_EXTENSION_NAME)) d->multiview = true;
+    if (!std::strcmp(e, VK_EXT_INDEX_TYPE_UINT8_EXTENSION_NAME)) wantIndexU8 = true;
     if (!std::strcmp(e, VK_EXT_METAL_OBJECTS_EXTENSION_NAME)) d->metalObjects = true;
   }
   if (extraExtensions()) {
@@ -1169,7 +1350,9 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkCreateDevice(VkPhysicalDevice pd,
   // render/main threads two cores.
   const unsigned workers = std::clamp(std::thread::hardware_concurrency(), 4u, 8u) - 2u;
   d->gpu = std::make_unique<vpgpu::Device>(d->platform->backend(), workers, [](const std::string& s) { log(s); });
-  d->queue.device = d;
+  for (uint32_t i = 0; i < kQueueCount; ++i) d->queues[i].device = d, d->queues[i].index = i;
+  requestIndirectPatch(d);  // engine-internal kernel of GPU indirect draws: compiling (Urgent) before the game's first frame
+  if (wantIndexU8) requestIndexU8(d);  // the 8-bit index widening kernel too: no draw waits for its first compile
   // Pipeline recipes of earlier runs: compiled now, before the game's first frame, so its
   // vkCreate*Pipelines calls are cache hits. With vpvk_prewarm() run by the app beforehand this is
   // mostly binary-archive lookups.
@@ -1180,6 +1363,9 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkCreateDevice(VkPhysicalDevice pd,
   const bool doPrewarm = d->recipes->enabled() && prewarmEnabled();
   d->recipesLoaded = uint32_t(d->recipes->pipelineCount());
   if (doPrewarm) d->prewarmedRecipes = d->recipesLoaded;
+  // vk.pso.census prewarmed_unused / requested_not_prewarmed: the recipe keys once the prewarm's refresh() has rekeyed them
+  // (a changed translator gives other MSL ids, so other keys); read earlier they would not match anything the game asks for.
+  const auto noteRecipeKeys = [dev = d] { dev->recipeUse.setPrewarmed(dev->recipes->keys()); };
   if (asyncPipelinesOn()) {
     // vkCreate*Pipelines returns before translating (pipelines.cpp "compile policy"); the frame gate replaces the
     // core's frame hold, and the prewarm runs in the background (it used to block this call for up to 20 s).
@@ -1188,13 +1374,14 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkCreateDevice(VkPhysicalDevice pd,
     if (!std::getenv("VP_HOLD_MS")) d->gpu->setHoldMs(0);
     if (doPrewarm) {
       Device* dev = d;
-      d->prewarmThread = std::thread([dev] {
+      d->prewarmThread = std::thread([dev, noteRecipeKeys] {
 #if defined(__APPLE__)
         pthread_set_qos_class_self_np(QOS_CLASS_UTILITY, 0);
 #endif
         PrewarmHooks hooks;
         hooks.cancel = &dev->prewarmCancel;
         hooks.refreshThreads = 1;
+        hooks.afterRefresh = noteRecipeKeys;
         hooks.pollMs = 250;  // the game runs meanwhile: one status() lock per recipe per poll is not free
         hooks.addShader = [dev](uint64_t id, ShaderBlob blob) {
           std::lock_guard<std::mutex> lock(dev->shaderMutex);
@@ -1209,8 +1396,11 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkCreateDevice(VkPhysicalDevice pd,
       });
     }
   } else if (doPrewarm) {
-    // Bounded (8 s): vkCreateDevice must not sit through a whole cold prewarm; what is left keeps compiling on the workers.
-    d->recipesPrewarmed = prewarm(*d->platform, d->gpu->pipelines(), *d->recipes, nullptr, 8.0).ready;
+    // Bounded (8 s from the prewarm's start, recipes and forced-MSAA variants alike): vkCreateDevice must not sit through a whole
+    // cold prewarm; what is left (variants included) keeps compiling on the workers.
+    PrewarmHooks hooks;
+    hooks.afterRefresh = noteRecipeKeys;
+    d->recipesPrewarmed = prewarm(*d->platform, d->gpu->pipelines(), *d->recipes, nullptr, 8.0, hooks).ready;
   }
   logf("vk.device exts=%u multiview=%d fdm=%d metal_objects=%d", ci->enabledExtensionCount,
        d->multiview, d->densityMap, d->metalObjects);
@@ -1237,6 +1427,7 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkDestroyDevice(VkDevice dv, const VkAllo
   { std::lock_guard<std::mutex> l(d->submitMutex); }
   d->prewarmCancel = true;
   if (d->prewarmThread.joinable()) d->prewarmThread.join();
+  joinCacheFlush(d);
   pipelineSummary(d, true);
   psoCensus(d, true);
   d->platform->waitIdle(UINT64_MAX);  // bounded by a lost device (Platform::waitIdle)
@@ -1244,7 +1435,9 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkDestroyDevice(VkDevice dv, const VkAllo
   {
     std::lock_guard<std::mutex> l(d->submitMutex);  // uiMask lo usa vpvk_taa_native_encode bajo este mutex
     d->uiMask.release();
+    d->msaaTwins.release(d);
     if (d->zeroBuffer) d->gpu->destroy(d->zeroBuffer);
+    if (d->zeroAstcBuffer) d->gpu->destroy(d->zeroAstcBuffer);
   }
   d->translator.reset();  // after every pipeline job it could still hold ran or was dropped (jobs touch d->gpu)
   d->gpu.reset();
@@ -1254,9 +1447,8 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkDestroyDevice(VkDevice dv, const VkAllo
 VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkGetDeviceQueue(VkDevice dv, uint32_t family, uint32_t index,
                                                         VkQueue* out) {
   Device* d = from<Device>(dv);
-  d->queue.family = family;
-  d->queue.index = index;
-  *out = to<VkQueue>(&d->queue);
+  d->queues[std::min(index, kQueueCount - 1)].family = family;
+  *out = to<VkQueue>(&d->queues[std::min(index, kQueueCount - 1)]);
 }
 
 VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkGetDeviceQueue2(VkDevice dv, const VkDeviceQueueInfo2* i,
@@ -1273,7 +1465,8 @@ static VkResult waitResult(Platform::WaitResult r) {
 
 // Batches held back on a timeline wait (Device::deferred) are queue work too: idle means they ran.
 // Another thread's vkSignalSemaphore releases them; polled in 1 ms steps.
-static VkResult waitDeviceIdle(Device* d) {
+// `queueMask`: bit i = VkQueue i (vkQueueWaitIdle waits for its own queue's held batches, vkDeviceWaitIdle for all).
+static VkResult waitDeviceIdle(Device* d, uint32_t queueMask = ~0u) {
   PerfWait perfWait(perf().idleWaits, perf().idleUs, perf().idleUsMax);  // vk.perf idle_wait
   // Batches parked on a timeline value nobody will signal would hang this forever
   // (an application bug, but a hang is worse than a log line): bounded at 2 s.
@@ -1281,7 +1474,9 @@ static VkResult waitDeviceIdle(Device* d) {
   for (;;) {
     {
       std::lock_guard<std::mutex> lock(d->submitMutex);
-      if (d->deferred.empty()) break;
+      bool held = false;
+      for (const DeferredBatch& b : d->deferred) held = held || (queueMask >> b.queue & 1);
+      if (!held) break;
     }
     if (d->platform->lost()) return VK_ERROR_DEVICE_LOST;
     if (std::chrono::steady_clock::now() > until) {
@@ -1296,7 +1491,9 @@ static VkResult waitDeviceIdle(Device* d) {
 
 VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkDeviceWaitIdle(VkDevice dv) { return waitDeviceIdle(from<Device>(dv)); }
 
-VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkQueueWaitIdle(VkQueue q) { return waitDeviceIdle(from<Queue>(q)->device); }
+VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkQueueWaitIdle(VkQueue q) {
+  return waitDeviceIdle(from<Queue>(q)->device, 1u << from<Queue>(q)->index);
+}
 
 // ---------------------------------------------------------------------------------------------
 // Memory
@@ -1506,8 +1703,10 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkCreateImage(VkDevice, const VkImage
   VkImageCreateInfo plane0 = *ci;
   if (mp.planes) {
     if (ci->imageType != VK_IMAGE_TYPE_2D || ci->samples != VK_SAMPLE_COUNT_1_BIT ||
-        ci->tiling != VK_IMAGE_TILING_OPTIMAL || (ci->flags & VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT) ||
-        ci->extent.width < 2 || ci->extent.height < 2)
+        (ci->flags & VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT) || ci->extent.width < 2 || ci->extent.height < 2 ||
+        (ci->tiling == VK_IMAGE_TILING_LINEAR &&
+         (ci->mipLevels != 1 || ci->arrayLayers != 1 ||
+          (ci->usage & ~(VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT)))))
       return VK_ERROR_FORMAT_NOT_SUPPORTED;
     plane0.format = mp.plane[0];
   }
@@ -1585,8 +1784,8 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkCreateImage(VkDevice, const VkImage
   // by the format features, multisampled ones by the image format properties.
   {
     const vpgpu::FormatInfo& fi = vpgpu::formatInfo(img->desc.format);
-    img->linear = ci->tiling == VK_IMAGE_TILING_LINEAR && !fi.depth() && !fi.stencil() && img->desc.samples == 1 &&
-                  !mp.planes;
+    img->linear = ci->tiling == VK_IMAGE_TILING_LINEAR && !fi.depth() && !fi.stencil() && img->desc.samples == 1;
+    for (auto& pl : img->planes) pl->linear = img->linear;  // planes of a linear multi-planar image are linear as well
   }
   *out = to<VkImage>(img);
   const bool linearTiling = ci->tiling == VK_IMAGE_TILING_LINEAR;
@@ -1769,14 +1968,23 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkBindImageMemory2(VkDevice dv, uint3
 VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkGetImageSubresourceLayout(VkDevice, VkImage im,
                                                                    const VkImageSubresource* sub,
                                                                    VkSubresourceLayout* out) {
-  // Only meaningful for linear images (the layout their memory really has, see linearLayout).
-  const vpgpu::TextureDesc& d = from<Image>(im)->desc;
+  // Only meaningful for linear images (the layout their memory really has, see linearLayout). Multi-planar: the plane
+  // asked for, its offset after the earlier planes (they follow each other, see planeOffset).
+  const Image* whole = from<Image>(im);
+  const Image* pl = whole;
+  VkDeviceSize planeBase = 0;
+  if (!whole->planes.empty()) {
+    const uint32_t k = (sub->aspectMask & VK_IMAGE_ASPECT_PLANE_2_BIT) ? 2 : (sub->aspectMask & VK_IMAGE_ASPECT_PLANE_1_BIT) ? 1 : 0;
+    if (k > 0 && k <= whole->planes.size()) pl = whole->planes[k - 1].get();
+    for (uint32_t j = 0; j < k; ++j) planeBase += imageBytes(j == 0 ? whole->desc : whole->planes[j - 1]->desc);
+  }
+  const vpgpu::TextureDesc& d = pl->desc;
   if (sub->mipLevel >= d.mips || sub->arrayLayer >= d.layers) {
     *out = {};
     return;
   }
   const LinearLayout l = linearLayout(d, sub->mipLevel, sub->arrayLayer);
-  out->offset = l.offset;
+  out->offset = planeBase + l.offset;
   out->size = l.size;
   out->rowPitch = l.rowPitch;
   out->arrayPitch = l.arrayPitch;
@@ -1866,7 +2074,7 @@ VkResult createViewOne(VkDevice dv, const VkImageViewCreateInfo* ci, VkImageView
     const uint32_t layers = v->range.layerCount == VK_REMAINING_ARRAY_LAYERS ? d.layers - v->range.baseArrayLayer : v->range.layerCount;
     info.baseMip = uint16_t(v->range.baseMipLevel), info.mips = uint16_t(mips);
     info.baseLayer = uint16_t(v->range.baseArrayLayer), info.layers = uint16_t(layers);
-    info.format = toCoreFormat(ci->format);
+    info.format = isDecodedVolume(*im) ? vpgpu::Format::Undefined : toCoreFormat(ci->format);  // the volume's own RGBA8
     switch (ci->viewType) {
       case VK_IMAGE_VIEW_TYPE_1D_ARRAY: info.type = vpgpu::TextureType::Tex2D, info.array = true; break;
       case VK_IMAGE_VIEW_TYPE_3D: info.type = vpgpu::TextureType::Tex3D; break;
@@ -1935,6 +2143,21 @@ VkResult createViewOne(VkDevice dv, const VkImageViewCreateInfo* ci, VkImageView
       if (v->view) diag::add(diag::c().viewCreateN);
     }
   }
+  // Storage cube images are accessed as 2D arrays of faces (see ImageView::storageView).
+  if (im && im->id && (ci->viewType == VK_IMAGE_VIEW_TYPE_CUBE || ci->viewType == VK_IMAGE_VIEW_TYPE_CUBE_ARRAY) &&
+      (im->info.usage & VK_IMAGE_USAGE_STORAGE_BIT)) {
+    const vpgpu::TextureDesc& d = im->desc;
+    Platform::ViewInfo info;
+    const uint32_t mips = v->range.levelCount == VK_REMAINING_MIP_LEVELS ? d.mips - v->range.baseMipLevel : v->range.levelCount;
+    const uint32_t layers = v->range.layerCount == VK_REMAINING_ARRAY_LAYERS ? d.layers - v->range.baseArrayLayer : v->range.layerCount;
+    info.baseMip = uint16_t(v->range.baseMipLevel), info.mips = uint16_t(mips);
+    info.baseLayer = uint16_t(v->range.baseArrayLayer), info.layers = uint16_t(layers);
+    info.format = toCoreFormat(ci->format);
+    info.type = vpgpu::TextureType::Tex2D, info.array = true;
+    Device* dd = from<Device>(dv);
+    std::lock_guard<std::mutex> lock(dd->submitMutex);
+    v->storageView = dd->platform->createTextureView(im->id, info);
+  }
   *out = to<VkImageView>(v);
   return VK_SUCCESS;
 }
@@ -1947,11 +2170,14 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkDestroyImageView(VkDevice dv, VkImageVi
   if (!v) return;
   ImageView* iv = from<ImageView>(v);
   for (ImageView* pv : iv->planeViews) vkDestroyImageView(dv, to<VkImageView>(pv), nullptr);
-  if (iv->view) {
+  if (iv->view || iv->storageView) {
     Device* d = from<Device>(dv);
     std::lock_guard<std::mutex> lock(d->submitMutex);
-    d->platform->destroyTextureView(iv->view);
-    diag::add(diag::c().viewDestroyN);
+    if (iv->storageView) d->platform->destroyTextureView(iv->storageView);
+    if (iv->view) {
+      d->platform->destroyTextureView(iv->view);
+      diag::add(diag::c().viewDestroyN);
+    }
   }
   delete iv;
 }
@@ -2020,7 +2246,7 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkCreateSampler(VkDevice dv, const Vk
   }
   d.lodMin = ci->minLod;
   d.lodMax = ci->maxLod;
-  d.lodBias = std::clamp(ci->mipLodBias, -16.0f, 15.99f);  // maxSamplerLodBias; Metal S4.6
+  d.shaderLodBias = std::clamp(ci->mipLodBias, -16.0f, 15.99f);  // maxSamplerLodBias; applied by the shader (SamplerBias)
   // Texel coordinates: Vulkan's restrictions (one filter, no mips, clamp modes, lod 0) match
   // Metal's for normalizedCoordinates = NO.
   d.normalized = !ci->unnormalizedCoordinates;
@@ -2150,9 +2376,9 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkCreateRenderPass(VkDevice, const Vk
     b.flags = a.flags;
     b.format = a.format;
     b.samples = a.samples;
-    b.loadOp = a.loadOp;
+    b.loadOp = a.loadOp == VK_ATTACHMENT_LOAD_OP_NONE_KHR ? VK_ATTACHMENT_LOAD_OP_LOAD : a.loadOp;  // NONE keeps the contents
     b.storeOp = a.storeOp;
-    b.stencilLoadOp = a.stencilLoadOp;
+    b.stencilLoadOp = a.stencilLoadOp == VK_ATTACHMENT_LOAD_OP_NONE_KHR ? VK_ATTACHMENT_LOAD_OP_LOAD : a.stencilLoadOp;
     b.stencilStoreOp = a.stencilStoreOp;
     b.initialLayout = a.initialLayout;
     b.finalLayout = a.finalLayout;
@@ -2187,6 +2413,10 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkCreateRenderPass2(VkDevice, const V
                                                                VkRenderPass* out) {
   auto* rp = new RenderPassObj;
   rp->attachments.assign(ci->pAttachments, ci->pAttachments + ci->attachmentCount);
+  for (VkAttachmentDescription2& a : rp->attachments) {  // LOAD_OP_NONE (VK_EXT_load_store_op_none) keeps the contents: Load
+    if (a.loadOp == VK_ATTACHMENT_LOAD_OP_NONE_KHR) a.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+    if (a.stencilLoadOp == VK_ATTACHMENT_LOAD_OP_NONE_KHR) a.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+  }
   for (auto& a : rp->attachments) a.pNext = nullptr;
   for (uint32_t s = 0; s < ci->subpassCount; ++s) {
     const VkSubpassDescription2& sd = ci->pSubpasses[s];
@@ -2323,6 +2553,7 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkBeginCommandBuffer(VkCommandBuffer 
 }
 
 VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkEndCommandBuffer(VkCommandBuffer cb) {
+  from<CommandBuffer>(cb)->rec->flushHoisted();  // (a pass left open to be resumed)
   from<CommandBuffer>(cb)->state = CommandBuffer::State::Executable;
   return VK_SUCCESS;
 }
@@ -2359,13 +2590,14 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdBeginRenderPass(VkCommandBuffer cb,
   r.bound.pass = op.pass;
   r.bound.framebuffer = op.framebuffer;
   r.bound.subpass = 0;
-  r.bound.passSamples = op.pass && op.framebuffer ? subpassSamples(*op.pass, *op.framebuffer, 0) : 0;
+  r.bound.passSamples = op.pass && op.framebuffer ? subpassSamples(*op.pass, *op.framebuffer, 0, true, vpvk::markedEyeOf(r.device)) : 0;
   r.bound.targetWidth = uint32_t(op.area.offset.x) + op.area.extent.width;
   r.bound.targetHeight = uint32_t(op.area.offset.y) + op.area.extent.height;
   r.bound.renderArea = op.area;
   r.bound.fbWidth = op.framebuffer ? op.framebuffer->width : 0;
   r.bound.fbHeight = op.framebuffer ? op.framebuffer->height : 0;
   r.bound.fbLayers = op.framebuffer ? op.framebuffer->layers : 0;
+  r.flushHoisted();  // (a pass that was never ended)
   r.passBegin = r.ops.size();
   r.ops.emplace_back(std::move(op));
   r.inPass = true;
@@ -2379,6 +2611,7 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdBeginRenderPass2(VkCommandBuffer cb,
 
 VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdEndRenderPass(VkCommandBuffer cb) {
   Recorder& r = *from<CommandBuffer>(cb)->rec;
+  r.flushHoisted();
   r.ops.emplace_back(OpEndPass{});
   r.inPass = false;
   r.passBegin = SIZE_MAX;
@@ -2444,7 +2677,13 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdCopyBufferToImage(VkCommandBuffer cb
     VkBufferImageCopy c = regions[i];
     Image* im = planeOf(from<Image>(dst), c.imageSubresource.aspectMask);  // a plane of a multi-planar image
     if (im != from<Image>(dst)) c.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-    r.ops.emplace_back(OpCopyBufferToImage{from<Buffer>(src), im, c});
+    OpCopyBufferToImage op{from<Buffer>(src), im, c};
+    if (isDecodedVolume(*im)) {  // room for the RGBA8 texels; the blocks are decoded at submit (commands.cpp)
+      const VkDeviceSize bytes = VkDeviceSize(c.imageExtent.width) * c.imageExtent.height * c.imageExtent.depth * 4;
+      op.decoded = r.arena.put(r.device, nullptr, bytes, op.decodedOffset);
+      op.decodedHost = r.arena.chunks[r.arena.current].host + op.decodedOffset;
+    }
+    r.ops.emplace_back(std::move(op));
   }
 }
 
@@ -2455,6 +2694,7 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkCreateFence(VkDevice, const VkFence
                                                          const VkAllocationCallbacks*, VkFence* out) {
   auto* f = new Fence;
   f->signaled = (ci->flags & VK_FENCE_CREATE_SIGNALED_BIT) != 0;
+  pendingTrack(f);
   *out = to<VkFence>(f);
   return VK_SUCCESS;
 }
@@ -2468,6 +2708,7 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkDestroyFence(VkDevice dv, VkFence f, co
     for (DeferredBatch& b : d->deferred)
       if (b.fence == fe) b.fence = nullptr;
   }
+  pendingUntrack(fe);
   delete fe;
 }
 
@@ -2479,7 +2720,7 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkResetFences(VkDevice, uint32_t n, c
 // A fence is signaled when its submission's GPU work is done: every vpgpu frame up to the one its
 // vkQueueSubmit made (Fence::frames) has completed on the GPU. The client reuses that submission's
 // command buffers (upload memory, descriptors) as soon as this says done.
-VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkGetFenceStatus(VkDevice dv, VkFence f) {
+static VkResult fenceStatus(VkDevice dv, VkFence f) {
   Fence* fe = from<Fence>(f);
   Platform& p = *from<Device>(dv)->platform;
   if (p.lost()) return VK_ERROR_DEVICE_LOST;
@@ -2491,9 +2732,13 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkGetFenceStatus(VkDevice dv, VkFence
   }
   return VK_SUCCESS;
 }
+VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkGetFenceStatus(VkDevice dv, VkFence f) {
+  const VkResult r = fenceStatus(dv, f);
+  from<Fence>(f)->poll.note(r);  // vk.pending (pending.cpp)
+  return r;
+}
 
-VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkWaitForFences(VkDevice dv, uint32_t n, const VkFence* fs,
-                                                           VkBool32 waitAll, uint64_t timeout) {
+static VkResult waitForFences(VkDevice dv, uint32_t n, const VkFence* fs, VkBool32 waitAll, uint64_t timeout) {
   PerfWait perfWait(perf().fenceWaits, perf().fenceUs, perf().fenceUsMax);  // vk.perf fence_wait
   Platform& p = *from<Device>(dv)->platform;
   if (p.lost()) return VK_ERROR_DEVICE_LOST;
@@ -2547,6 +2792,13 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkWaitForFences(VkDevice dv, uint32_t
   }
   return VK_SUCCESS;
 }
+VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkWaitForFences(VkDevice dv, uint32_t n, const VkFence* fs,
+                                                           VkBool32 waitAll, uint64_t timeout) {
+  pendingFenceWait(n, fs, true);  // vk.pending (pending.cpp)
+  const VkResult r = waitForFences(dv, n, fs, waitAll, timeout);
+  pendingFenceWait(n, fs, false, waitAll, r);
+  return r;
+}
 
 VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkCreateSemaphore(VkDevice, const VkSemaphoreCreateInfo* ci,
                                                              const VkAllocationCallbacks*, VkSemaphore* out) {
@@ -2556,6 +2808,7 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkCreateSemaphore(VkDevice, const VkS
       t && t->semaphoreType == VK_SEMAPHORE_TYPE_TIMELINE) {
     s->timeline = true;
     s->completed = t->initialValue;
+    pendingTrack(s);
   }
   *out = to<VkSemaphore>(s);
   return VK_SUCCESS;
@@ -2563,15 +2816,19 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkCreateSemaphore(VkDevice, const VkS
 
 VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkDestroySemaphore(VkDevice, VkSemaphore s,
                                                           const VkAllocationCallbacks*) {
+  if (Semaphore* sem = from<Semaphore>(s); sem && sem->timeline) pendingUntrack(sem);
   delete from<Semaphore>(s);
 }
 
 VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkCreateEvent(VkDevice, const VkEventCreateInfo*,
                                                          const VkAllocationCallbacks*, VkEvent* out) {
-  *out = to<VkEvent>(new Event);
+  auto* e = new Event;
+  pendingTrack(e);
+  *out = to<VkEvent>(e);
   return VK_SUCCESS;
 }
 VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkDestroyEvent(VkDevice, VkEvent e, const VkAllocationCallbacks*) {
+  pendingUntrack(from<Event>(e));
   delete from<Event>(e);
 }
 VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkGetEventStatus(VkDevice dv, VkEvent e) {
@@ -2582,18 +2839,20 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkGetEventStatus(VkDevice dv, VkEvent
     if (w == Platform::WaitResult::Lost) return VK_ERROR_DEVICE_LOST;
     if (w == Platform::WaitResult::Done) ev->set = ev->value, ev->frame = 0;
   }
-  return ev->set ? VK_EVENT_SET : VK_EVENT_RESET;
+  const VkResult r = ev->set ? VK_EVENT_SET : VK_EVENT_RESET;
+  ev->poll.note(r);  // vk.pending (pending.cpp)
+  return r;
 }
 VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkSetEvent(VkDevice, VkEvent e) {
   Event* ev = from<Event>(e);
   std::lock_guard<std::mutex> l(ev->m);
-  ev->set = true, ev->frame = 0;
+  ev->set = true, ev->frame = 0, ++ev->hostSet;
   return VK_SUCCESS;
 }
 VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkResetEvent(VkDevice, VkEvent e) {
   Event* ev = from<Event>(e);
   std::lock_guard<std::mutex> l(ev->m);
-  ev->set = false, ev->frame = 0;
+  ev->set = false, ev->frame = 0, ++ev->hostReset;
   return VK_SUCCESS;
 }
 
@@ -2735,6 +2994,8 @@ size_t zeroInitResolve(Device& d, const ZeroLog& log, vpgpu::Frame& pre) {
     const vpgpu::FormatInfo& fi = vpgpu::formatInfo(p.desc.format);
     const bool depth = fi.depth() || fi.stencil();
     const bool is3d = p.desc.type == vpgpu::TextureType::Tex3D;
+    noteImgZero(!p.viaCopy ? "zero_clear" : astcFormat(p.desc.format) ? "zero_astc_void" : "zero_copy", -1, p.desc.format,
+                p.desc.width, p.desc.height, p.desc.mips, p.desc.layers, p.desc.usage);
     if (p.viaCopy) {
       // Row bands of at most kZeroBufferBytes per copy, one layer (3D: one slice) at a time.
       constexpr uint64_t kZeroBufferBytes = 8u << 20;
@@ -2746,6 +3007,24 @@ size_t zeroInitResolve(Device& d, const ZeroLog& log, vpgpu::Frame& pre) {
         if (!d.zeroBuffer) continue;
         pre.fillBuffer({d.zeroBuffer, 0, kZeroBufferBytes}, 0);  // new buffers are not guaranteed zero
       }
+      // An all-zero ASTC block has a reserved block mode: it decodes to the error colour (magenta). The void-extent block of
+      // colour (0, 0, 0, 0) is what zeroed memory should read as; ETC2 / EAC / BC blocks of zeros are valid already.
+      const bool astc = astcFormat(p.desc.format);
+      if (astc && !d.zeroAstcBuffer) {
+        vpgpu::BufferDesc bd;
+        bd.size = kZeroBufferBytes;
+        bd.label = "vk.zeros_astc";
+        d.zeroAstcBuffer = d.gpu->createBuffer(std::move(bd));
+        if (!d.zeroAstcBuffer) continue;
+        // Block: FC FD, six FF (void extent, LDR, no extent given), eight 0 (R, G, B, A = 0). Then doubled up to the whole buffer.
+        const vpgpu::BufferId z = d.zeroAstcBuffer;
+        pre.fillBuffer({z, 0, 1}, 0xFC);
+        pre.fillBuffer({z, 1, 1}, 0xFD);
+        pre.fillBuffer({z, 2, 6}, 0xFF);
+        pre.fillBuffer({z, 8, 8}, 0);
+        for (uint64_t n = 16; n < kZeroBufferBytes; n *= 2) pre.copyBuffer({z, 0, n}, {z, n, n});
+      }
+      const vpgpu::BufferId zeros = astc ? d.zeroAstcBuffer : d.zeroBuffer;
       const uint32_t bw = std::max<uint32_t>(1, fi.blockSize), bh = std::max<uint32_t>(1, fi.blockHeight);
       for (uint32_t m = 0; m < p.desc.mips; ++m) {
         const uint32_t w = std::max(1u, p.desc.width >> m), h = std::max(1u, p.desc.height >> m);
@@ -2756,7 +3035,7 @@ size_t zeroInitResolve(Device& d, const ZeroLog& log, vpgpu::Frame& pre) {
           for (uint32_t y = 0; y < h; y += bandBlocks * bh) {
             vpgpu::Copy c;
             c.kind = vpgpu::CopyKind::BufferToTexture;
-            c.srcBuffer = {d.zeroBuffer, 0, kZeroBufferBytes, uint32_t(rowBytes), 0};
+            c.srcBuffer = {zeros, 0, kZeroBufferBytes, uint32_t(rowBytes), 0};
             vpgpu::TextureSpan& t = c.dstTexture;
             t.texture = p.id, t.mip = uint16_t(m), t.layer = is3d ? 0 : uint16_t(l), t.layerCount = 1;
             t.y = y, t.z = is3d ? l : 0;
@@ -2844,7 +3123,9 @@ void runBatches(Device* d, std::vector<DeferredBatch>& list, size_t count) {
   ++d->submits;
   pipelineSummary(d, false);
   psoCensus(d, false);
+  cacheStateTick(d);
   ampCensus();
+  indirectStatsLog();
   msaaSubmitTick(d->submits);
   if (taa.enabled) taaRecordSubmit(d->submits, taa, st.taaJittered, st.taaSkipped, st.taaTargetW, st.taaTargetH);
   if (taa.enabled && st.ui.passes) {  // masks for hosts that composite the eye themselves (vpvk_ui_mask_texture)
@@ -2921,6 +3202,7 @@ void runBatches(Device* d, std::vector<DeferredBatch>& list, size_t count) {
   }
   perfTick(d);
   const uint64_t frames = d->gpu->submittedFrames();
+  pendingFrames(*d, frames);
   for (size_t i = 0; i < count; ++i)
     for (const auto& [s, v] : list[i].signals) {  // reached once this frame finishes
       std::lock_guard<std::mutex> l(s->m);
@@ -2931,6 +3213,7 @@ void runBatches(Device* d, std::vector<DeferredBatch>& list, size_t count) {
     std::lock_guard<std::mutex> l(ev->m);
     ev->frame = frames + 1;  // +1: 0 means nothing pending (see Event)
     ev->value = value;
+    ++ev->cmdStamps, ev->stampNs = pendingNowNs();
   }
   for (size_t i = 0; i < count; ++i)
     if (Fence* fe = list[i].fence) {  // done when this frame (and every earlier one) has finished
@@ -2942,20 +3225,39 @@ void runBatches(Device* d, std::vector<DeferredBatch>& list, size_t count) {
   list.erase(list.begin(), list.begin() + std::ptrdiff_t(count));
 }
 
-// Runs the longest ready prefix of d->deferred (submitMutex held); stops at the first batch with a
-// wait nothing can meet yet.
+// Runs the ready batches of d->deferred (submitMutex held). A batch is ready when its waits can be met and every batch
+// submitted before it to the same VkQueue is ready too: each queue keeps its own order, and a queue held back on a wait
+// nothing can meet yet does not hold back the others. The ready batches keep their submission order among themselves
+// (they go to the one Metal queue in that order, which is what makes cross-queue timeline waits satisfiable).
 void drainDeferred(Device* d) {
   while (!d->deferred.empty()) {
     std::vector<std::pair<Semaphore*, uint64_t>> ahead;
+    uint32_t blocked = 0;  // queues with a batch that is not ready
+    std::vector<bool> run(d->deferred.size(), false);
     size_t ready = 0;
-    for (; ready < d->deferred.size(); ++ready) {
-      const DeferredBatch& b = d->deferred[ready];
+    for (size_t i = 0; i < d->deferred.size(); ++i) {
+      const DeferredBatch& b = d->deferred[i];
+      if (blocked >> b.queue & 1) continue;
       bool met = true;
       for (const auto& [s, v] : b.waits) met = met && waitMet(s, v, ahead);
-      if (!met) break;
+      if (!met) {
+        blocked |= 1u << b.queue;
+        continue;
+      }
       ahead.insert(ahead.end(), b.signals.begin(), b.signals.end());
+      run[i] = true;
+      ++ready;
     }
     if (!ready) return;
+    if (ready != d->deferred.size()) {  // ready batches first, both groups in submission order
+      std::vector<DeferredBatch> ordered;
+      ordered.reserve(d->deferred.size());
+      for (size_t i = 0; i < d->deferred.size(); ++i)
+        if (run[i]) ordered.push_back(std::move(d->deferred[i]));
+      for (size_t i = 0; i < d->deferred.size(); ++i)
+        if (!run[i]) ordered.push_back(std::move(d->deferred[i]));
+      d->deferred = std::move(ordered);
+    }
     runBatches(d, d->deferred, ready);
   }
 }
@@ -3012,6 +3314,7 @@ VPVK_EXPORT int vpvk_mark_eye_image(void* image) {
     }
   }
   vpvk::markEyeTexture(*d, i->id);
+  d->eyeSize.store(vpvk::packEyeSize(i->desc.width, i->desc.height, i->desc.layers), std::memory_order_relaxed);
   static std::atomic<unsigned> n{0};
   if (n.fetch_add(1) < 16)
     vpvk::logf("vk.eye_image marked=%dx%d layers=%u samples=%u bound=%d", i->desc.width, i->desc.height, i->desc.layers,
@@ -3071,6 +3374,7 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkQueueSubmit(VkQueue q, uint32_t n, 
   const size_t first = d->deferred.size();
   for (uint32_t i = 0; i < n; ++i) {
     DeferredBatch b;
+    b.queue = from<Queue>(q)->index;
     for (uint32_t j = 0; j < si[i].commandBufferCount; ++j) b.cbs.push_back(from<CommandBuffer>(si[i].pCommandBuffers[j]));
     const auto* t = static_cast<const VkTimelineSemaphoreSubmitInfo*>(
         findNext(si[i].pNext, VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO));
@@ -3085,9 +3389,10 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkQueueSubmit(VkQueue q, uint32_t n, 
     d->deferred.push_back(std::move(b));
   }
   if (fence) {
-    if (d->deferred.size() == first) d->deferred.emplace_back();  // n == 0: the fence alone
+    if (d->deferred.size() == first) d->deferred.emplace_back().queue = from<Queue>(q)->index;  // n == 0: the fence alone
     Fence* fe = from<Fence>(fence);
     fe->deferred = true;  // until its batch runs (cleared by runBatches)
+    fe->submitNs = pendingNowNs();
     fe->signaled = true;
     d->deferred.back().fence = fe;
   }
@@ -3207,7 +3512,7 @@ VPVK_EXPORT int vpvk_taa_native_encode(const vpvk_taa_native_frame* f, void* cb)
                          (uint64_t(args.sharpness * 100.0f + 0.5f) << 8);
     if (last.exchange(key) != key)
       logf("vk.rcas active intensity=%.2f stops=%.2f denoise=%d mode=%s ui_mask=%s", double(args.sharpness),
-           double(2.0f * (1.0f - args.sharpness)), args.rcasDenoise ? 1 : 0, rcasOnly ? "rcas_only(no TAA)" : "after_VPKTAA",
+           double(2.0f * (1.0f - args.sharpness)), args.rcasDenoise ? 1 : 0, rcasOnly ? "rcas_only(no TAA)" : "host_sharpens(VPKTAA output unsharpened)",
            args.mask[0].texture || args.mask[1].texture ? "yes" : "no(no UI draws this frame, MSAA pass or mask off)");
   }
   const bool encoded = d->platform->taaNativeEncode(args, cb);
@@ -3249,6 +3554,21 @@ VPVK_EXPORT size_t vpvk_mem_stats(char* out, size_t cap) {
   return n;
 }
 
+VPVK_EXPORT size_t vpvk_mem_brief(char* out, size_t cap) {
+  if (!out || !cap) return 0;
+  std::unique_lock<std::mutex> live(liveDeviceMutex(), std::try_to_lock);
+  if (!live.owns_lock()) return 0;  // a trim or a per-frame call holds it: skip this sample
+  Device* d = liveDevice();
+  if (!d || !d->platform) return 0;
+  vpgpu::ScopedPool pool;  // host thread: no autorelease pool of its own (see scoped_pool.h)
+  std::string s = d->platform->memStats();
+  if (const size_t at = s.find(" ledger: "); at != std::string::npos) s.resize(at);
+  const size_t n = std::min(s.size(), cap - 1);
+  std::memcpy(out, s.data(), n);
+  out[n] = 0;
+  return n;
+}
+
 VPVK_EXPORT unsigned vpvk_gpu_backlog_ms(void) {
   vpgpu::ScopedPool pool;  // guest thread: no autorelease pool of its own (see scoped_pool.h)
   std::lock_guard<std::mutex> live(liveDeviceMutex());
@@ -3261,6 +3581,32 @@ VPVK_EXPORT unsigned vpvk_gpu_last_frame_chunks(void) {
   std::lock_guard<std::mutex> live(liveDeviceMutex());
   Device* d = liveDevice();
   return d && d->platform ? d->platform->lastFrameChunks() : 0;
+}
+
+VPVK_EXPORT void vpvk_dump_pending(void) {
+  vpgpu::ScopedPool pool;  // host thread: no autorelease pool of its own (see scoped_pool.h)
+  std::unique_lock<std::mutex> live(liveDeviceMutex(), std::try_to_lock);
+  if (!live.owns_lock()) {  // a stalled thread may hold it: the report must not wait
+    logf("vk.pending device_mutex=BUSY");
+    return;
+  }
+  Device* d = liveDevice();
+  if (!d || !d->platform) return;
+  for (const std::string& l : pendingReport(*d)) log(l);
+  d->platform->dumpInFlight("vk_pending");
+}
+
+// Host (dlsym): whether the game's shader cache looks complete (see VpvkCacheState in vpvk.h). Poll it; every change of
+// complete / reason is also logged ("vk.cache_state"). 1 = filled from the live device; 0 = no device or null `out`.
+VPVK_EXPORT int vpvk_cache_state(VpvkCacheState* out) {
+  if (!out) return 0;
+  *out = VpvkCacheState{};
+  out->version = kCacheStateVersion;
+  std::lock_guard<std::mutex> live(liveDeviceMutex());
+  Device* d = liveDevice();
+  if (!d || !d->gpu) return 0;
+  cacheState(d, *out);
+  return 1;
 }
 
 VPVK_EXPORT int vpvk_gpu_lost(void) {
@@ -3283,7 +3629,7 @@ VPVK_EXPORT uint32_t vpvk_device_wait_compiles(VkDevice dv) {
   d->platform->drainCompiles();
   d->gpu->pipelines().waitIdle();
   d->platform->drainCompiles();  // libraries the last pipelines asked for
-  d->platform->flushCaches();
+  d->platform->flushCaches(true);  // the host's replay drain: nobody waits, the archive must be complete
   psoCensus(d, true);
   const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
   const vpgpu::PipelineStats t = d->gpu->pipelines().totals();
@@ -3294,20 +3640,40 @@ VPVK_EXPORT uint32_t vpvk_device_wait_compiles(VkDevice dv) {
 VPVK_EXPORT size_t vpvk_trim_memory(int level, char* out, size_t cap) {
   vpgpu::ScopedPool pool;  // guest thread: no autorelease pool of its own (see scoped_pool.h)
   if (out && cap) out[0] = 0;
-  std::lock_guard<std::mutex> live(liveDeviceMutex());
+  std::unique_lock<std::mutex> live(liveDeviceMutex());
   Device* d = liveDevice();
   if (!d || !d->platform) return 0;
   std::string report;
   size_t freed = d->platform->trimMemory(level, report);
-  // Also what the guest destroyed and no frame in flight reads (the submit mutex is only try-locked, as in
-  // vpvk_idle_drain: a busy device means "not now"; the trim request itself still applies at the next submit).
-  {
-    std::unique_lock<std::mutex> lock(d->submitMutex, std::try_to_lock);
-    if (lock.owns_lock()) {
-      std::string drained;
-      freed += d->platform->drainRetired(0, drained);
-      if (!drained.empty()) report += " " + drained;
+  // Also what the guest destroyed and no frame in flight reads, and the MSAA backings / argument buffers trimMemory could
+  // only queue. Nothing is ever blocked on: the submit mutex is try-locked (order live -> submit, as vpvk_native_submit) and
+  // retried for ~50 ms, with liveDeviceMutex RELEASED while waiting between attempts (a sleeping holder would stall every
+  // per-frame call that takes it) and the device fetched again each time. With frames running the submit mutex is free for
+  // gaps of a few ms, and one attempt per second (the caller's rate) almost never caught one, so the trim freed 0.
+  std::unique_lock<std::mutex> lock;
+  for (int i = 0;; ++i) {
+    if (live.owns_lock()) {
+      Device* cur = liveDevice();
+      if (cur != d || !cur || !cur->platform) {  // the device went away (or was replaced) while we waited
+        report += " device_gone=1";
+        d = nullptr;
+        break;
+      }
+      lock = std::unique_lock<std::mutex>(d->submitMutex, std::try_to_lock);
+      if (lock.owns_lock()) break;
+      live.unlock();
     }
+    if (i >= 50) break;
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));  // no lock held here
+    (void)live.try_lock();  // busy: counts as a failed attempt
+  }
+  if (d && lock.owns_lock()) {
+    d->platform->trimSerialized(report);  // moves to the graveyard; the drain below returns what no frame reads
+    std::string drained;
+    freed += d->platform->drainRetired(0, drained);
+    if (!drained.empty()) report += " " + drained;
+  } else if (d) {
+    report += " submit_busy=1";
   }
   if (out && cap) {
     const size_t n = std::min(report.size(), cap - 1);

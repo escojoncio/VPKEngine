@@ -1,0 +1,45 @@
+OpCapability Cap:Shader
+OpExtension "SPV_KHR_terminate_invocation"
+%glsl = OpExtInstImport "GLSL.std.450"
+OpMemoryModel AddrModel:Logical MemModel:GLSL450
+OpEntryPoint Model:Fragment %main "main" %fc %col %fd
+OpExecutionMode %main ExecMode:OriginUpperLeft
+OpExecutionMode %main ExecMode:DepthReplacing
+OpDecorate %fc Deco:BuiltIn BuiltIn:FragCoord
+OpDecorate %col Deco:Location 0
+OpDecorate %fd Deco:BuiltIn BuiltIn:FragDepth
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%f32 = OpTypeFloat 32
+%v4 = OpTypeVector %f32 4
+%pin4 = OpTypePointer Storage:Input %v4
+%fc = OpVariable %pin4 Storage:Input
+%u32 = OpTypeInt 32 0
+%i32 = OpTypeInt 32 1
+%c0u = OpConstant %u32 0
+%pinf = OpTypePointer Storage:Input %f32
+%c2 = OpConstant %i32 2
+%c0 = OpConstant %i32 0
+%bool = OpTypeBool
+%pout4 = OpTypePointer Storage:Output %v4
+%col = OpVariable %pout4 Storage:Output
+%c1f = OpConstant %f32 f32:1.0
+%one4 = OpConstantComposite %v4 %c1f %c1f %c1f %c1f
+%poutf = OpTypePointer Storage:Output %f32
+%c02 = OpConstant %f32 f32:0.2
+%fd = OpVariable %poutf Storage:Output %c02
+%main = OpFunction %void 0 %fn
+%l = OpLabel
+%p = OpAccessChain %pinf %fc %c0u
+%x = OpLoad %f32 %p
+%xi = OpConvertFToS %i32 %x
+%m = OpSMod %i32 %xi %c2
+%e = OpIEqual %bool %m %c0
+OpSelectionMerge %mg 0
+OpBranchConditional %e %kill %mg
+%kill = OpLabel
+OpTerminateInvocation
+%mg = OpLabel
+OpStore %col %one4
+OpReturn
+OpFunctionEnd

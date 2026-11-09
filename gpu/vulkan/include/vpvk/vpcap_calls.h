@@ -61,6 +61,8 @@ struct S;  // struct codecs, specialised below
   X(VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_INLINE_UNIFORM_BLOCK, VkWriteDescriptorSetInlineUniformBlock)               \
   X(VK_STRUCTURE_TYPE_SUBPASS_DESCRIPTION_DEPTH_STENCIL_RESOLVE, VkSubpassDescriptionDepthStencilResolve)              \
   X(VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO, VkDescriptorSetLayoutBindingFlagsCreateInfo)    \
+  X(VK_STRUCTURE_TYPE_FRAMEBUFFER_ATTACHMENTS_CREATE_INFO, VkFramebufferAttachmentsCreateInfo)                         \
+  X(VK_STRUCTURE_TYPE_RENDER_PASS_ATTACHMENT_BEGIN_INFO, VkRenderPassAttachmentBeginInfo)                              \
   X(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, VkPhysicalDeviceFeatures2)                                           \
   X(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES, VkPhysicalDeviceVulkan11Features)                           \
   X(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES, VkPhysicalDeviceVulkan12Features)                           \
@@ -512,8 +514,29 @@ SC(VkRenderPassCreateInfo2) {
   c.next(x.pNext);
 }
 };
+// Imageless framebuffer (VK_KHR_imageless_framebuffer): pAttachments is ignored by the spec (attachmentCount is not), its
+// attachments are described by the VkFramebufferAttachmentsCreateInfo of the chain and given at every vkCmdBeginRenderPass.
+SC(VkFramebufferAttachmentImageInfo) {
+  c.st(x);
+  c.pod(x.pViewFormats, x.viewFormatCount);
+  c.next(x.pNext);
+}
+};
+SC(VkFramebufferAttachmentsCreateInfo) {
+  c.st(x);
+  c.ss(x.pAttachmentImageInfos, x.attachmentImageInfoCount);
+  c.next(x.pNext);
+}
+};
+SC(VkRenderPassAttachmentBeginInfo) {
+  c.st(x);
+  c.hs(x.pAttachments, x.attachmentCount);
+  c.next(x.pNext);
+}
+};
 SC(VkFramebufferCreateInfo) {
   c.h(x.renderPass);
+  if (x.flags & VK_FRAMEBUFFER_CREATE_IMAGELESS_BIT) x.pAttachments = nullptr;
   c.st(x);
   c.hs(x.pAttachments, x.attachmentCount);
   c.next(x.pNext);

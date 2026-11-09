@@ -73,6 +73,7 @@ struct Member {
     Type type;
     bool rowMajor = false;
     uint8_t mem = 0;  // buffer block members: MemQual
+    uint8_t prec = 0;  // declared precision (1 lowp, 2 mediump, 3 highp; explicit or the default in force), 0 = none
 };
 
 struct StructDef {
@@ -89,7 +90,7 @@ enum class BuiltinVar : uint8_t {
     None, Position, PointSize, VertexID, InstanceID, FragCoord, FrontFacing, PointCoord, FragColor, FragData,
     FragDepth, ViewID, LocalInvocationID, GlobalInvocationID, WorkGroupID, NumWorkGroups, LocalInvocationIndex,
     // Read-only builtins from here on (see Parser::isLValue).
-    WorkGroupSize, HelperInvocation, LastFragData, LastFragColor,
+    WorkGroupSize, MaxComputeWorkGroupCount, MaxComputeWorkGroupSize, HelperInvocation, LastFragData, LastFragColor,
 };
 enum class Interp : uint8_t { Smooth, Flat, Centroid };
 
@@ -114,6 +115,12 @@ struct Symbol {
     int member = -1;                     // BlockMember: index in the block
     int id = 0;                          // unique per shader (emitter maps)
     bool used = false;                   // referenced by any expression
+    uint8_t prec = 0;                    // uniforms: declared precision (Member::prec)
+    bool constant = false;               // a `const` whose value is a constant expression (usable in one)
+    bool constParam = false;             // a function parameter declared `const`
+    // A uniform struct holding samplers: it has no storage of its own, every leaf ("u[1].tex") is a uniform of its own.
+    bool split = false;
+    std::map<std::string, Symbol*> leaves;  // path relative to the symbol ("[1].tex", ".a") -> leaf uniform
 };
 
 struct UniformBlockDecl {
@@ -122,6 +129,8 @@ struct UniformBlockDecl {
     std::vector<int> dims;  // instance array
     int binding = -1;
     bool std430 = false;
+    uint8_t packing = 0;  // declared layout: 0 none (shared), 1 shared, 2 packed, 3 std140, 4 std430
+    bool rowMajor = false;  // the block's default matrix layout
     bool buffer = false;  // shader storage block
     Symbol* instanceSym = nullptr;  // the variable that names the block (instance or hidden)
 };
@@ -193,6 +202,9 @@ public:
     std::array<uint32_t, 3> localSize{1, 1, 1};
     bool hasLocalSize = false;
     bool earlyFragmentTests = false;
+    // Some output is declared invariant (`invariant gl_Position;`, an invariant varying, #pragma STDGL invariant(all)):
+    // the vertex shader's position is SPIR-V Invariant.
+    bool invariantPosition = false;
 
     // Arena.
     std::vector<std::unique_ptr<Symbol>> symbols;
@@ -219,7 +231,7 @@ uint32_t std140Size(const Type& t, bool rowMajor = false, bool s430 = false);
 uint32_t std140ArrayStride(const Type& t, bool rowMajor = false, bool s430 = false);  // stride of t's elements (t is an array)
 uint32_t std140MatrixStride(const Type& t, bool rowMajor = false, bool s430 = false);
 // Offsets of the members of a struct/block laid out with std140.
-std::vector<uint32_t> std140Offsets(const std::vector<Member>& members, uint32_t* size, bool s430 = false);
+std::vector<uint32_t> std140Offsets(const std::vector<Member>& members, uint32_t* size, bool s430 = false, bool rowMajor = false);
 
 uint32_t glTypeEnum(const Type& t);
 

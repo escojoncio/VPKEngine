@@ -22,8 +22,10 @@
 #include "commands.h"
 #include "taa_native.h"
 #include "vpir/passes.h"
+#include "vpgpu/core/archive_harvest.h"
 #include "vpgpu/core/background.h"
 #include "vpgpu/core/perf.h"
+#include "vpgpu/core/scoped_pool.h"
 #include "vpmsl/msl.h"
 #include "vpvk.h"
 
@@ -48,17 +50,17 @@ void PassSamples::add(const ImageView* v, bool depth) {
   }
 }
 
-void PassSamples::finish(uint32_t viewMask, const char* what) {
+void PassSamples::finish(uint32_t viewMask, const char* what, uint64_t markedEye) {
   if (mismatch) {
     // Images created with different counts (the override changed between them): Metal refuses
     // the pass. Logged; the frame compiler / backend report the failure itself.
     static std::atomic<unsigned> n{0};
     if (n.fetch_add(1) < 8) logf("vk.err what=msaa_mismatch pass=%s size=%ux%u", what, w, h);
   }
-  msaaObservePass(game, w, h, viewMask, hasColor, hasDepth);
+  msaaObservePass(game, w, h, viewMask, hasColor, hasDepth, markedEye);
 }
 
-uint8_t subpassSamples(const RenderPassObj& rp, const Framebuffer& fb, uint32_t sub, bool observe) {
+uint8_t subpassSamples(const RenderPassObj& rp, const Framebuffer& fb, uint32_t sub, bool observe, uint64_t markedEye) {
   if (sub >= rp.subpasses.size()) return 0;
   const RenderPassObj::Subpass& sp = rp.subpasses[sub];
   PassSamples ps;
@@ -71,7 +73,7 @@ uint8_t subpassSamples(const RenderPassObj& rp, const Framebuffer& fb, uint32_t 
   for (const auto& c : sp.colors)
     if (c.attachment != VK_ATTACHMENT_UNUSED && c.attachment < rp.attachments.size())
       ps.game = std::max<uint8_t>(ps.game, uint8_t(rp.attachments[c.attachment].samples));
-  if (observe) ps.finish(sp.viewMask, "render_pass");
+  if (observe) ps.finish(sp.viewMask, "render_pass", markedEye);
   return ps.effective;
 }
 
@@ -192,7 +194,7 @@ void retainKey(Device* dev, const PipelineObj& p, vpgpu::PipelineKey k) {
 // ---- compile policy -------------------------------------------------------------------------------
 // Two modes, chosen per device (Device::translator, asyncPipelinesOn()):
 //
-// * Asynchronous creation (default; VPVK_ASYNC_PIPELINES=0 turns it off). Games create thousands of pipelines in a burst (AC Nexus ShaderWarmup: 3313
+// * Asynchronous creation (default; VPVK_ASYNC_PIPELINES=0 turns it off; AVP / Source 2). Games create thousands of pipelines in a burst (AC Nexus ShaderWarmup: 3313
 //   stages / 4101 pipelines) and draw with them in the same breath; translating or compiling on the calling thread
 //   froze it for seconds. So:
 //   - vkCreate{Graphics,Compute}Pipelines gathers the state the create info decides, queues the rest (SPIR-V -> MSL
@@ -209,6 +211,15 @@ void retainKey(Device* dev, const PipelineObj& p, vpgpu::PipelineKey k) {
 //         the game redraws it every frame):
 //         wait at most VPVK_PIPELINE_FRAME_WAIT_MS (default 3) for all of them together, then drop the draws still
 //         pending from this frame (counted, `vk.pipeline_skip`). Never drawn with another shader.
+//         With VPVK_PIPELINE_EYE_HARD_WAIT_MS > 0 (default 0 = the above, vpgles included; eyeHardWaitMs) the eye is treated
+//         as hard: the frame waits up to that budget for its pipelines (already boosted), `vk.pipeline_wait what=eye_target`,
+//         and only what is still pending after it is dropped. Each pipeline gets that wait once (later frames drop its
+//         draws as before until it is ready) and all eye waits together take at most twice the budget per second.
+//       soft too: a render target redrawn every frame (the scene FBO a GL game blits to the eye). It is tracked per attachment
+//         view (texture, mip, layer): a "frame" is a submit with an eye pass, and the target counts for a frame when the
+//         first pass that writes it there clears it (load Clear / DontCare; a Load pass accumulates, so it resets the count).
+//         After more than 3 counted frames in a row (one skipped tick is tolerated) its draws are dropped like the eye's
+//         (redrawnEveryFrame). Without a marked eye image nothing is tracked; first frames and sporadic targets stay hard.
 //       hard passes (they store a texture that outlives the frame and is not the eye: a render-to-texture, a shadow
 //         map, a probe; and every dispatch): a draw dropped there can stay missing for good, so the frame waits for
 //         them, at most VPVK_PIPELINE_PERSIST_WAIT_MS (default 1500; 10000 for vpgles, persistWaitMs), `vk.pipeline_wait what=persistent_target`.
@@ -227,21 +238,36 @@ void retainKey(Device* dev, const PipelineObj& p, vpgpu::PipelineKey k) {
 // * Synchronous creation (opt-in: VPVK_ASYNC_PIPELINES=0, VQP's games and the CTS run): the convention of every desktop / mobile driver (Quest's compiles
 //   inside the call): vkCreate*Pipelines returns with the pipelines translated and compiled. An engine that counts a
 //   created pipeline as warm (UE4's PSO precache, >8000 of them) is told so only when it is. It waits for the whole
-//   call (every pipeline of the batch, boosted to Urgent while it waits), at most VPVK_PIPELINE_CREATE_WAIT_MS
-//   (default 60000, a safety valve; the pipelines still pending then count in vk.pso.census timed_out), and variants
+//   call (every pipeline of the batch, boosted to Urgent while it waits), at most VPVK_CREATE_WAIT_MS (older name
+//   VPVK_PIPELINE_CREATE_WAIT_MS; default 60000, a safety valve: the call still returns VK_SUCCESS, the draw gate protects the
+//   pipeline, `vk.pipeline_create_slow` is logged and the pipelines still pending count in vk.pso.census timed_out), and variants
 //   made at the first draw wait for their compile once (VPVK_PIPELINE_DRAW_WAIT_MS, default 2000; the VPKTAA UI-mask
 //   variants, built while a submission is translated under submitMutex, are collected and awaited once before the frame
 //   is sent, awaitFreshVariants). No wait while the device is lost or the app is in the background, and after a wait
-//   timed out the next ones are capped at 500 ms for 5 s (awaitPipelines). A pipeline the
+//   timed out the next draw / variant waits are capped at 500 ms for 5 s (awaitPipelines; the creates never: each waits its full budget). A pipeline the
 //   recipe store / disk cache already holds costs no wait. Game threads translate on their own and the Metal compiles run
 //   in parallel on the core's workers (PipelineCache::workerLoop compiles outside its mutex; the waiters sleep on a
 //   condition variable): no lock is held across the wait. With VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT a
-//   pipeline the cache / recipe store does not hold is not requested: VK_PIPELINE_COMPILE_REQUIRED, handle VK_NULL_HANDLE
-//   (not honoured in the asynchronous mode, where the key is not known when the call returns).
+//   pipeline the cache / recipe store does not hold is not requested for the game: VK_PIPELINE_COMPILE_REQUIRED, handle VK_NULL_HANDLE
+//   (not honoured in the asynchronous mode, where the key is not known when the call returns). Its recipe is stored, nothing is
+//   compiled (noteCompileRequired).
 uint32_t waitBudgetMs(const char* name, uint32_t fallback) {
   const char* e = std::getenv(name);
   return e && *e ? uint32_t(std::strtoul(e, nullptr, 10)) : fallback;
 }
+
+// vkCreate*Pipelines in the synchronous mode: VPVK_CREATE_WAIT_MS (older name VPVK_PIPELINE_CREATE_WAIT_MS), default 60000.
+// Read once (a create is hot: thousands of them); resetCreateWaitMs() is for tests.
+std::atomic<int64_t> gCreateWaitMs{-1};
+uint32_t createWaitMs() {
+  int64_t v = gCreateWaitMs.load(std::memory_order_relaxed);
+  if (v < 0) {
+    v = waitBudgetMs("VPVK_CREATE_WAIT_MS", waitBudgetMs("VPVK_PIPELINE_CREATE_WAIT_MS", 60000));
+    gCreateWaitMs.store(v, std::memory_order_relaxed);
+  }
+  return uint32_t(v);
+}
+void resetCreateWaitMs() { gCreateWaitMs.store(-1, std::memory_order_relaxed); }
 
 // Per-boot counters (struct in commands.h), all threads: the "vk.boot_summary" line, pipelineSummary().
 PipelineCounters& pipelineCounters() {
@@ -269,7 +295,9 @@ void noteTranslateFail(const std::string& why, uint64_t key, const std::string& 
 // Returns how many of them are still queued or compiling when it gives up (0 when all came back). Does not wait at all
 // while the device is lost or the app is in the background (nothing compiles that anyone could use, the thread would only
 // sit out the whole budget); after a wait timed out the next ones are capped at kBackoffWaitMs for kBackoffMs.
-unsigned awaitPipelines(Device* dev, const std::vector<vpgpu::PipelineKey>& keys, uint32_t budgetMs, const char* what) {
+// `backoff` false (vkCreate*Pipelines: Quest's driver waits for every create): neither capped by an earlier timeout nor starting a window.
+unsigned awaitPipelines(Device* dev, const std::vector<vpgpu::PipelineKey>& keys, uint32_t budgetMs, const char* what,
+                        bool backoff = true) {
   if (!dev || !dev->gpu || !budgetMs || dev->translator) return 0;
   if ((dev->platform && dev->platform->lost()) || vpgpu::backgroundGate().active()) return 0;
   constexpr uint32_t kBackoffWaitMs = 500;
@@ -277,7 +305,7 @@ unsigned awaitPipelines(Device* dev, const std::vector<vpgpu::PipelineKey>& keys
   auto nowNs = [] {
     return int64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
   };
-  if (nowNs() < dev->pipelineBackoffUntilNs.load(std::memory_order_relaxed)) budgetMs = std::min(budgetMs, kBackoffWaitMs);
+  if (backoff && nowNs() < dev->pipelineBackoffUntilNs.load(std::memory_order_relaxed)) budgetMs = std::min(budgetMs, kBackoffWaitMs);
   std::vector<vpgpu::PipelineKey> pending;
   for (vpgpu::PipelineKey k : keys) {
     if (!k.value) continue;
@@ -287,7 +315,11 @@ unsigned awaitPipelines(Device* dev, const std::vector<vpgpu::PipelineKey>& keys
   if (pending.empty()) return 0;
   for (vpgpu::PipelineKey k : pending) dev->gpu->pipelines().boost(k);  // a synchronous wait: ahead of every queued job
   const auto t0 = std::chrono::steady_clock::now();
-  const bool complete = dev->gpu->pipelines().waitReady(pending, std::chrono::milliseconds(budgetMs));
+  bool complete;
+  {
+    const vpgpu::DemandWait demand;  // the binary-archive harvest steps aside while a thread waits here
+    complete = dev->gpu->pipelines().waitReady(pending, std::chrono::milliseconds(budgetMs));
+  }
   const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
   pipelineCounters().blockedCreateUs += usSince(t0);
   static std::atomic<unsigned> n{0};
@@ -312,12 +344,28 @@ unsigned awaitPipelines(Device* dev, const std::vector<vpgpu::PipelineKey>& keys
   }
   unsigned left = 0;
   if (!complete) {
-    dev->pipelineBackoffUntilNs.store(nowNs() + kBackoffMs * 1'000'000, std::memory_order_relaxed);
+    if (backoff) dev->pipelineBackoffUntilNs.store(nowNs() + kBackoffMs * 1'000'000, std::memory_order_relaxed);
     for (vpgpu::PipelineKey k : pending) {
       const auto st = dev->gpu->pipelines().status(k);
       if (st == vpgpu::PipelineCache::Status::Queued || st == vpgpu::PipelineCache::Status::Compiling) ++left;
     }
   }
+  return left;
+}
+
+// A vkCreate*Pipelines call returned with pipelines of its batch still queued or compiling (the wait ran out, or none was made: device
+// lost, background, budget 0): it returns VK_SUCCESS anyway, the draw gate covers them. Returns how many.
+unsigned noteCreateUnready(Device* dev, const std::vector<vpgpu::PipelineKey>& keys, uint32_t budgetMs, const char* what) {
+  unsigned left = 0;
+  if (dev && dev->gpu && !dev->translator)
+    for (vpgpu::PipelineKey k : keys) {
+      const auto st = dev->gpu->pipelines().status(k);
+      left += st == vpgpu::PipelineCache::Status::Queued || st == vpgpu::PipelineCache::Status::Compiling;
+    }
+  static std::atomic<unsigned> lines{0};
+  if (left && lines.fetch_add(1) < 64)
+    logf("vk.pipeline_create_slow what=%s pending=%u of=%zu budget_ms=%u (returned unready; the draw gate covers it)", what, left,
+         keys.size(), budgetMs);
   return left;
 }
 
@@ -370,7 +418,78 @@ static DestClass classifyPass(Device* dev, const vpgpu::RenderPassDesc& rd) {
   if (!anyColor) return DestClass::NoColor;
   if (!persists) return DestClass::TransientRT;
   bool known = false;
-  return eyeSizedPass(w, h, &known) && rd.layerCount <= 2 ? DestClass::EyeSizedNotEye : DestClass::PersistentRT;
+  return eyeSizedPass(w, h, &known, dev->eyeSize.load(std::memory_order_relaxed)) && rd.layerCount <= 2 ? DestClass::EyeSizedNotEye : DestClass::PersistentRT;
+}
+
+// A render target drawn in each of the last kRedrawFrames frames is redrawn every frame (the scene FBO a GL game blits to the
+// eye): a draw dropped there costs one frame, so its pass is soft like the eye's. A "frame" is a submit with an eye pass
+// (Device::eyeTick); without any marked eye image nothing is tracked and every non-eye pass stays hard. Targets rendered once
+// or now and then keep the hard wait. A target counts for a frame only when the first pass that writes it in that frame does
+// not load its old contents (load Clear / DontCare): a Load pass accumulates, a dropped draw there is lost for good.
+static constexpr uint32_t kRedrawFrames = 3;
+
+struct PassTarget {
+  uint64_t key = 0;  // 0 = no attachment; mixes the texture, mip and layer of the attachment view
+  vpgpu::LoadAction load = vpgpu::LoadAction::Load;
+};
+
+static PassTarget passTarget(const vpgpu::RenderPassDesc& rd) {
+  auto make = [](vpgpu::TextureId id, uint32_t mip, uint32_t layer, vpgpu::LoadAction load) {
+    uint64_t h = uint64_t{id.generation} << 32 | id.index;
+    h = (h ^ mip) * 0x9E3779B97F4A7C15ull;
+    h = (h ^ layer) * 0x9E3779B97F4A7C15ull;
+    return PassTarget{h | 1, load};
+  };
+  for (const vpgpu::Attachment& a : rd.colors)
+    if (a.texture)  // the resolve target when there is one (the msaa texture is a stand-in), the msaa attachment's load
+      return a.resolve ? make(a.resolve, a.resolveMip, a.resolveLayer, a.load) : make(a.texture, a.mip, a.layer, a.load);
+  return rd.depth.texture ? make(rd.depth.texture, rd.depth.mip, rd.depth.layer, rd.depth.load) : PassTarget{};
+}
+
+// Called once per submit, before the "nothing is compiling" early return. Stamps the passes' targets with the current frame
+// and returns its number (the tick the submit belongs to; an eye submit moves the counter on afterwards).
+static uint64_t stampRedrawnTargets(Device* dev, const vpgpu::Frame& frame) {
+  bool hasEye = false;
+  for (const vpgpu::Command& cmd : frame.commands()) {
+    const auto* rp = std::get_if<vpgpu::RenderPass>(&cmd);
+    if (!rp) continue;
+    for (const vpgpu::Attachment& a : rp->desc.colors)
+      if (a.texture && (isEyeTexture(*dev, a.texture) || (a.resolve && isEyeTexture(*dev, a.resolve)))) hasEye = true;
+    if (hasEye) break;
+  }
+  std::lock_guard<std::mutex> lock(dev->redrawMutex);
+  const uint64_t tick = dev->eyeTick;
+  if (hasEye || tick) {
+    for (const vpgpu::Command& cmd : frame.commands()) {
+      const auto* rp = std::get_if<vpgpu::RenderPass>(&cmd);
+      if (!rp) continue;
+      const PassTarget t = passTarget(rp->desc);
+      if (!t.key) continue;
+      Device::RedrawStamp& st = dev->redrawStamps[t.key];
+      if (st.seen && st.tick == tick) continue;  // the first pass of this frame decided
+      // One skipped tick is tolerated (a game with one submit per eye moves the counter twice per frame).
+      const bool next = st.streak && tick > st.tick && tick - st.tick <= 2;
+      st.streak = t.load == vpgpu::LoadAction::Load ? 0 : next ? st.streak + 1 : 1;
+      st.tick = tick, st.seen = true;
+    }
+    if (dev->redrawStamps.size() > 1024 && tick >= dev->redrawPruneTick) {  // drop what can no longer be part of a streak
+      dev->redrawPruneTick = tick + 64;
+      for (auto it = dev->redrawStamps.begin(); it != dev->redrawStamps.end();)
+        it = it->second.tick + 2 < tick ? dev->redrawStamps.erase(it) : std::next(it);
+    }
+  }
+  if (hasEye) ++dev->eyeTick;
+  return tick;
+}
+
+// True when the pass's target was rendered in each of the kRedrawFrames frames before `tick` (this frame is stamped already).
+static bool redrawnEveryFrame(Device* dev, const vpgpu::RenderPassDesc& rd, uint64_t tick) {
+  const PassTarget t = passTarget(rd);
+  if (!t.key) return false;
+  std::lock_guard<std::mutex> lock(dev->redrawMutex);
+  const auto it = dev->redrawStamps.find(t.key);
+  if (it == dev->redrawStamps.end()) return false;
+  return it->second.tick == tick && it->second.streak > kRedrawFrames;
 }
 
 uint32_t persistWaitMs(bool internalClient) {
@@ -382,11 +501,39 @@ uint32_t persistWaitMs(bool internalClient) {
   return internalClient ? 10000 : 1500;
 }
 
+// How long a submit waits for the pipelines of the eye's passes (soft otherwise). 0 = no extra wait (the soft frame wait
+// alone). Read at every call that has eye draws pending, so a test can change it. The eye is redrawn every frame, GL
+// games included, so a dropped eye draw costs one frame; a block of up to 1.5 s per new effect would cost more.
+uint32_t eyeHardWaitMs(bool) {
+  const char* env = std::getenv("VPVK_PIPELINE_EYE_HARD_WAIT_MS");
+  if (env && *env) return uint32_t(std::strtoul(env, nullptr, 10));
+  return 0;
+}
+
+// The eye's wait budget is spent once per pipeline key (`waited`: forgotten when the pipeline is no longer pending) and
+// at most twice the budget per 1 s window (`spentMs`), whatever the number of frames and devices.
+struct EyeWaitState {
+  std::mutex m;
+  std::unordered_set<uint64_t> waited;
+  std::chrono::steady_clock::time_point windowStart{};
+  double spentMs = 0;
+};
+static EyeWaitState& eyeWaitState() {
+  static EyeWaitState s;
+  return s;
+}
+void eyeWaitReset() {  // tests
+  EyeWaitState& st = eyeWaitState();
+  std::lock_guard<std::mutex> lock(st.m);
+  st.waited.clear(), st.windowStart = {}, st.spentMs = 0;
+}
+
 GateResult gateFramePipelines(Device* dev, vpgpu::Frame& frame, uint64_t submitNo) {
   GateResult r;
   if (!dev || !dev->gpu || !dev->translator) return r;  // legacy mode: the core's frame hold (VP_HOLD_MS) decides
   PipelineCounters& c = pipelineCounters();
   ++c.gateFrames;
+  const uint64_t tick = stampRedrawnTargets(dev, frame);
   vpgpu::PipelineCache& cache = dev->gpu->pipelines();
   if (cache.idle()) return r;  // the common case: nothing is queued or compiling
   static const uint32_t softMs = waitBudgetMs("VPVK_PIPELINE_FRAME_WAIT_MS", 3);
@@ -408,14 +555,15 @@ GateResult gateFramePipelines(Device* dev, vpgpu::Frame& frame, uint64_t submitN
   for (const vpgpu::Command& cmd : frame.commands()) {
     if (const auto* rp = std::get_if<vpgpu::RenderPass>(&cmd)) {
       const DestClass cls = classifyPass(dev, rp->desc);
-      const bool mustRun = cls != DestClass::Eye;
+      int redrawn = cls == DestClass::Eye ? 1 : -1;  // 1 = soft (the eye, or a target redrawn every frame); looked up at the first pending draw
       for (const vpgpu::Draw& d : rp->draws) {
         if (d.clear) continue;
         ++r.draws;
         classOfDraw.push_back(uint8_t(cls));
         if (!pending(d.pipeline)) continue;
         ++r.pendingByClass[size_t(cls)];
-        if (mustRun) {
+        if (redrawn < 0) redrawn = redrawnEveryFrame(dev, rp->desc, tick) ? 1 : 0;
+        if (!redrawn) {
           if (inHard.insert(d.pipeline.value).second) hard.push_back(d.pipeline);
         } else if (inSoft.insert(d.pipeline.value).second) {
           soft.push_back(d.pipeline);
@@ -433,7 +581,11 @@ GateResult gateFramePipelines(Device* dev, vpgpu::Frame& frame, uint64_t submitN
   for (vpgpu::PipelineKey k : soft) cache.boost(k);
   if (!hard.empty() && hardMs) {
     const auto t0 = std::chrono::steady_clock::now();
-    const bool complete = cache.waitReady(hard, std::chrono::milliseconds(hardMs));
+    bool complete;
+    {
+      const vpgpu::DemandWait demand;  // the binary-archive harvest steps aside while the frame waits
+      complete = cache.waitReady(hard, std::chrono::milliseconds(hardMs));
+    }
     const uint64_t us = usSince(t0);
     c.blockedGateUs += us, ++c.hardWaits;
     r.hardWaitedMs = double(us) / 1000.0;
@@ -445,12 +597,47 @@ GateResult gateFramePipelines(Device* dev, vpgpu::Frame& frame, uint64_t submitN
            (unsigned long long)submitNo, hard.size(), r.hardWaitedMs, int(complete), hardMs, r.pendingByClass[0],
            r.pendingByClass[1], r.pendingByClass[2], r.pendingByClass[3], r.pendingByClass[4]);
   }
-  if (!soft.empty() && softMs) {
+  // The eye budget is spent once per pipeline (a slow one would otherwise freeze every frame for the whole budget) and at
+  // most twice the budget per second in all: eyeWait are the pipelines that still get their wait, eyeBudgetMs its length.
+  const uint32_t eyeMs = soft.empty() ? 0 : eyeHardWaitMs(dev->internalClient);
+  std::vector<vpgpu::PipelineKey> eyeWait;
+  uint32_t eyeBudgetMs = 0;
+  if (eyeMs) {
+    EyeWaitState& st = eyeWaitState();
+    std::lock_guard<std::mutex> lock(st.m);
+    for (auto it = st.waited.begin(); it != st.waited.end();) it = pending(vpgpu::PipelineKey{*it}) ? std::next(it) : st.waited.erase(it);
+    const auto now = std::chrono::steady_clock::now();
+    if (now - st.windowStart >= std::chrono::seconds(1)) st.windowStart = now, st.spentMs = 0;
+    for (vpgpu::PipelineKey k : soft)
+      if (!st.waited.count(k.value)) eyeWait.push_back(k);
+    const double left = 2.0 * eyeMs - st.spentMs;
+    eyeBudgetMs = left >= 1.0 ? uint32_t(std::min<double>(eyeMs, left)) : 0;
+    if (!eyeBudgetMs) eyeWait.clear();
+    for (vpgpu::PipelineKey k : eyeWait) st.waited.insert(k.value);
+  }
+  const bool eyeWaits = !eyeWait.empty();
+  if (!soft.empty() && (eyeWaits || softMs)) {
     const auto t0 = std::chrono::steady_clock::now();
-    cache.waitReady(soft, std::chrono::milliseconds(softMs));
+    bool complete;
+    {
+      const vpgpu::DemandWait demand;  // the binary-archive harvest steps aside while the frame waits
+      complete = eyeWaits ? cache.waitReady(eyeWait, std::chrono::milliseconds(eyeBudgetMs))
+                          : cache.waitReady(soft, std::chrono::milliseconds(softMs));
+    }
     const uint64_t us = usSince(t0);
     c.blockedGateUs += us;
     r.waitedMs = double(us) / 1000.0;
+    if (eyeWaits) {
+      {
+        EyeWaitState& st = eyeWaitState();
+        std::lock_guard<std::mutex> lock(st.m);
+        st.spentMs += r.waitedMs;
+      }
+      static std::atomic<unsigned> lines{0};
+      if (const unsigned n = lines.fetch_add(1); n < 48 || n % 120 == 0)
+        logf("vk.pipeline_wait what=eye_target submit=%llu pipelines=%zu ms=%.0f complete=%d budget_ms=%u",
+             (unsigned long long)submitNo, eyeWait.size(), r.waitedMs, int(complete), eyeBudgetMs);
+    }
   }
   // What is still not ready is dropped from this frame (soft passes; a hard pass that timed out too: its pipelines are
   // logged above). Compute pipelines cannot be dropped here: the backend skips such a dispatch (missing_pipelines).
@@ -480,7 +667,8 @@ GateResult gateFramePipelines(Device* dev, vpgpu::Frame& frame, uint64_t submitN
 }
 
 // One line per boot (after 20 s of device life, then every 60 s while something changed, and at vkDestroyDevice):
-// what the cache did and what the game's threads paid for it.
+// what the cache did and what the game's threads paid for it. stages cache_hits = stage translations answered by the
+// recipe store, cumulative (not distinct stages: the unique modules / pipelines are in vk.pso.census and vk.cache_state).
 void pipelineSummary(Device* dev, bool final) {
   if (!dev) return;
   PipelineCounters& c = pipelineCounters();
@@ -491,11 +679,11 @@ void pipelineSummary(Device* dev, bool final) {
   }
   const vpgpu::PipelineStats t = dev->gpu ? dev->gpu->pipelines().totals() : vpgpu::PipelineStats{};
   const std::string archive = dev->platform ? dev->platform->archiveSummary() : std::string();
-  logf("vk.boot_summary%s t_s=%.0f mode=%s translator=%s | stages cached=%llu translated=%llu translate_ms=%.0f "
+  logf("vk.boot_summary%s t_s=%.0f mode=%s translator=%s | stages cache_hits=%llu translated=%llu translate_ms=%.0f "
        "miss{new_content=%llu new_options=%llu lower=%llu emit=%llu driver=%llu baseline=%llu no_msl=%llu uncached=%llu} "
        "| pso compiled=%u failed=%u hits=%u compile_ms=%.0f max_ms=%.0f %s | pipelines created=%llu async=%llu "
        "| draws_skipped=%llu skip_frames=%llu | blocked_ms{create=%.0f record=%.0f gate=%.0f} record_waits=%llu "
-       "record_timeouts=%llu hard_waits=%llu hard_timeouts=%llu",
+       "record_timeouts=%llu hard_waits=%llu hard_timeouts=%llu indirect_patch_fb=%llu",
        final ? " final=1" : "", double(ms) / 1000.0, dev->translator ? "async" : "sync", translatorTag().c_str(),
        (unsigned long long)c.stagesCached.load(), (unsigned long long)c.stagesTranslated.load(),
        double(c.translateUs.load()) / 1000.0, (unsigned long long)c.missNewContent.load(),
@@ -508,7 +696,76 @@ void pipelineSummary(Device* dev, bool final) {
        (unsigned long long)c.gateSkipFrames.load(), double(c.blockedCreateUs.load()) / 1000.0,
        double(c.blockedRecordUs.load()) / 1000.0, double(c.blockedGateUs.load()) / 1000.0,
        (unsigned long long)c.recordWaits.load(), (unsigned long long)c.recordTimeouts.load(),
-       (unsigned long long)c.hardWaits.load(), (unsigned long long)c.hardTimeouts.load());
+       (unsigned long long)c.hardWaits.load(), (unsigned long long)c.hardTimeouts.load(),
+       (unsigned long long)c.indirectPatchFallback.load());
+}
+
+// The body of the vk.pso.census line. archived = serialized to disk; archive_pending = queued or added but not on disk yet;
+// archive_spilled = refused at the harvest queue's fuse; archive_trim_dropped = queued entries dropped by a critical trim.
+std::string psoCensusLine(const PipelineCounters& c, const vpgpu::PipelineStats& t, const Platform::ArchiveCensus& a) {
+  char b[512];
+  std::snprintf(b, sizeof b,
+                "created=%llu compiled=%u failed=%llu timed_out=%llu archived=%u not_archived_depth_only=%u "
+                "not_archived_other=%u archive_hits=%u compiled_in_session=%u archive_dup=%u archive_pending=%u "
+                "archive_spilled=%u archive_trim_dropped=%u compile_required=%llu",
+                (unsigned long long)c.pipelinesCreated.load(), t.compiled, (unsigned long long)(t.failed + c.translateFailed.load()),
+                (unsigned long long)c.createTimedOut.load(), a.archived, a.depthOnly, a.other, a.hits, a.compiled, a.dup,
+                a.pending, a.spilled, a.trimDropped, (unsigned long long)(c.probeGraphics.load() + c.probeCompute.load()));
+  return b;
+}
+
+void RecipeUse::note(uint64_t key, const std::string& label) {
+  std::lock_guard<std::mutex> lock(mutex);
+  if (requested.size() >= kMax && !requested.count(key)) {
+    overflow = true;
+    return;
+  }
+  if (!requested.insert(key).second) return;
+  if (std::binary_search(prewarmed.begin(), prewarmed.end(), key)) ++requestedPrewarmed;
+  else if (freshSample.size() < kSample) freshSample.emplace_back(key, label);
+}
+
+void RecipeUse::setPrewarmed(std::vector<uint64_t> keys) {
+  std::sort(keys.begin(), keys.end());
+  std::lock_guard<std::mutex> lock(mutex);
+  prewarmed = std::move(keys);
+  requestedPrewarmed = 0;
+  for (const uint64_t k : requested)
+    if (std::binary_search(prewarmed.begin(), prewarmed.end(), k)) ++requestedPrewarmed;
+  freshSample.erase(std::remove_if(freshSample.begin(), freshSample.end(),
+                                   [&](const auto& f) { return std::binary_search(prewarmed.begin(), prewarmed.end(), f.first); }),
+                    freshSample.end());
+}
+
+std::string RecipeUse::census() const {
+  std::lock_guard<std::mutex> lock(mutex);
+  char b[160];
+  std::snprintf(b, sizeof b, " prewarmed_unused=%zu requested_not_prewarmed=%zu requested=%zu%s", prewarmed.size() - requestedPrewarmed,
+                requested.size() - requestedPrewarmed, requested.size(), overflow ? " requested_overflow=1" : "");
+  return b;
+}
+
+std::string RecipeUse::keysLine(const RecipeStore* recipes) const {
+  std::lock_guard<std::mutex> lock(mutex);
+  const auto entry = [](uint64_t key, std::string label) {
+    for (char& c : label)
+      if (c == ' ' || c == ',') c = '_';
+    char b[24];
+    std::snprintf(b, sizeof b, "%016llx:", (unsigned long long)key);
+    return b + label;
+  };
+  std::string unused, fresh;
+  size_t n = 0;
+  for (const uint64_t key : prewarmed) {
+    if (n >= kSample) break;
+    if (requested.count(key)) continue;
+    vpgpu::PipelineState st;
+    if (recipes) recipes->stateFor(key, st);
+    unused += (n++ ? "," : "") + entry(key, st.label.empty() ? "-" : st.label);
+  }
+  for (size_t i = 0; i < freshSample.size(); ++i) fresh += (i ? "," : "") + entry(freshSample[i].first, freshSample[i].second);
+  if (unused.empty() && fresh.empty()) return {};
+  return "prewarmed_unused=[" + unused + "] requested_not_prewarmed=[" + fresh + "]";
 }
 
 // created = vkCreate*Pipelines objects made; compiled / failed = the cache's backend compiles (failed also counts the
@@ -519,6 +776,7 @@ void pipelineSummary(Device* dev, bool final) {
 // flush and device destroy (always printed).
 void psoCensus(Device* dev, bool force) {
   if (!dev) return;
+  probeReport(dev, force);
   static std::atomic<int64_t> nextNs{0};
   const int64_t nowNs = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
   if (!force && nowNs < nextNs.load(std::memory_order_relaxed)) return;
@@ -526,19 +784,212 @@ void psoCensus(Device* dev, bool force) {
   const vpgpu::PipelineStats t = dev->gpu ? dev->gpu->pipelines().totals() : vpgpu::PipelineStats{};
   Platform::ArchiveCensus a;
   if (dev->platform) dev->platform->archiveCensus(a);
-  char b[384];
-  std::snprintf(b, sizeof b,
-                "created=%llu compiled=%u failed=%llu timed_out=%llu archived=%u not_archived_depth_only=%u "
-                "not_archived_other=%u archive_hits=%u compiled_in_session=%u archive_dup=%u",
-                (unsigned long long)c.pipelinesCreated.load(), t.compiled, (unsigned long long)(t.failed + c.translateFailed.load()),
-                (unsigned long long)c.createTimedOut.load(), a.archived, a.depthOnly, a.other, a.hits, a.compiled, a.dup);
+  const std::string b = psoCensusLine(c, t, a) + dev->cacheWatch.modulesCensus() + dev->recipeUse.census();
   static std::mutex m;
-  static std::string last;
+  static std::string last, lastKeys;
+  static unsigned keyLines = 0;
   std::lock_guard<std::mutex> lock(m);
   nextNs.store(nowNs + 10'000'000'000LL, std::memory_order_relaxed);
   if (!force && last == b) return;
   last = b;
-  logf("vk.pso.census %s", b);
+  logf("vk.pso.census %s", b.c_str());
+  // The keys behind prewarmed_unused / requested_not_prewarmed (10 of each), on a line of their own; at most 120 per process.
+  const std::string keys = dev->recipeUse.keysLine(dev->recipes.get());
+  if (!keys.empty() && keys != lastKeys && keyLines < 120) {
+    lastKeys = keys, ++keyLines;
+    log("vk.pso.census_keys " + keys);
+  }
+}
+
+// ---- Complete shader cache detector ----------------------------------------------------------------------
+// The engine decides whether the game's shader cache is complete: some pipeline exists, no new pipeline key (created or probed)
+// for kCacheIdleMs, the game kept drawing (kCacheIdleFrames submitted since), nothing queued or compiling, and (nearly) every shader
+// module it created is referenced by a pipeline. The host polls vpvk_cache_state (entry.cpp); changes are logged here.
+int64_t cacheNowNs(const Device* d) { return d && d->clockNs ? d->clockNs() : pendingNowNs(); }
+
+void noteCacheKey(Device* d, uint64_t key) {
+  if (d) d->cacheWatch.noteKey(key, cacheNowNs(d), d->gpu ? d->gpu->submittedFrames() : 0);
+}
+
+void CacheWatch::noteKey(uint64_t key, int64_t nowNs, uint64_t frame) {
+  std::lock_guard<std::mutex> lock(keyMutex);
+  if (keys.size() >= kMaxKeys) {
+    if (!keys.count(key)) lastNewNs.store(nowNs), lastNewFrame.store(frame);  // full: unknown keys count as new
+    return;
+  }
+  if (!keys.insert(key).second) return;
+  uniqueKeys.store(uint32_t(keys.size()));
+  lastNewNs.store(nowNs), lastNewFrame.store(frame);
+}
+
+void CacheWatch::noteModule(uint64_t uid, bool used) {
+  std::lock_guard<std::mutex> lock(moduleMutex);
+  if (used) {
+    const auto it = modules.find(uid);
+    if (it != modules.end() && !it->second) it->second = true, ++modulesUsed;
+  } else if (modules.size() < kMaxModules) {
+    modules.emplace(uid, false);
+  }
+}
+
+std::string CacheWatch::modulesCensus() {
+  std::lock_guard<std::mutex> lock(moduleMutex);
+  char b[96];
+  std::snprintf(b, sizeof b, " modules_created=%zu modules_used=%u modules_unused=%zu", modules.size(), modulesUsed,
+                modules.size() - modulesUsed);
+  return b;
+}
+
+VpvkCacheState CacheWatch::evaluate(int64_t nowNs, uint64_t frame, bool pipelinesIdle, uint32_t recipes) {
+  const auto clamp32 = [](uint64_t v) { return uint32_t(std::min<uint64_t>(v, UINT32_MAX)); };
+  VpvkCacheState s{};
+  s.version = kCacheStateVersion;
+  s.recipes = recipes;
+  s.pipelines_unique = uniqueKeys.load();
+  uint64_t unused = 0;
+  {
+    std::lock_guard<std::mutex> lock(moduleMutex);
+    s.modules_created = uint32_t(modules.size()), s.modules_used = modulesUsed;
+    unused = modules.size() - modulesUsed;
+  }
+  if (s.pipelines_unique) {
+    const int64_t last = lastNewNs.load();
+    const uint64_t lastFrame = lastNewFrame.load();
+    s.idle_ms = clamp32(nowNs > last ? uint64_t(nowNs - last) / 1'000'000 : 0);
+    s.frames_idle = clamp32(frame > lastFrame ? frame - lastFrame : 0);
+  }
+  s.reason = !s.pipelines_unique                              ? CacheNoPipelines
+             : s.idle_ms < kCacheIdleMs                        ? CacheRecent
+             : s.frames_idle < kCacheIdleFrames                ? CacheNoFrames
+             : !pipelinesIdle                                  ? CacheCompiling
+             : unused * 100 > uint64_t(s.modules_created) * kCacheUnusedPercent ? CacheUnusedModules
+                                                                                 : CacheOk;
+  s.complete = s.reason == CacheOk;
+  return s;
+}
+
+bool CacheWatch::logChange(const VpvkCacheState& s) {
+  std::lock_guard<std::mutex> lock(logMutex);
+  if (s.complete == lastComplete && s.reason == lastReason) return false;
+  const bool flushable = s.complete || s.reason == CacheUnusedModules;
+  const bool becameFlushable = flushable && !lastFlushable;
+  lastComplete = s.complete, lastReason = s.reason, lastFlushable = flushable;
+  if (lines++ < kCacheLogLines)
+    logf("vk.cache_state complete=%u reason=%u pipelines=%u modules_created=%u modules_used=%u idle_ms=%u", s.complete, s.reason,
+         s.pipelines_unique, s.modules_created, s.modules_used, s.idle_ms);
+  return becameFlushable;
+}
+
+// complete turned 1 (or only unused modules hold it back): the compiled pipelines must be on disk before the host lets the user leave (a paused app can be killed), so
+// the archive flush (the one vpvk_flush_caches does) starts now, on a thread of its own: the submit tick / the host's poll never
+// wait for it and it takes none of their locks. NOT a guarantee: complete=1 does not mean the flush finished.
+void requestCacheFlush(Device* d) {
+  logf("vk.cache_state flush=requested");
+  if (!d->platform) return;
+  CacheWatch& w = d->cacheWatch;
+  std::thread old;
+  {
+    std::lock_guard<std::mutex> lock(w.flushMutex);
+    if (w.flushRunning) {
+      w.flushAgain = true;  // the running flush may have started before the last compiles: once more when it ends
+      return;
+    }
+    w.flushRunning = true;
+    old = std::move(w.flushThread);  // (finished or leaving: it cleared flushRunning as its last locked act)
+  }
+  if (old.joinable()) old.join();
+  std::lock_guard<std::mutex> lock(w.flushMutex);
+  w.flushThread = std::thread([d] {
+    vpgpu::ScopedPool pool;  // own thread: no autorelease pool of its own (see scoped_pool.h)
+    CacheWatch& cw = d->cacheWatch;
+    for (;;) {
+      d->platform->flushCaches();
+      std::lock_guard<std::mutex> l(cw.flushMutex);
+      if (!cw.flushAgain) {
+        cw.flushRunning = false;
+        return;
+      }
+      cw.flushAgain = false;
+    }
+  });
+}
+
+void joinCacheFlush(Device* d) {
+  std::thread t;
+  {
+    std::lock_guard<std::mutex> lock(d->cacheWatch.flushMutex);
+    t = std::move(d->cacheWatch.flushThread);
+  }
+  if (t.joinable()) t.join();
+}
+
+void cacheState(Device* d, VpvkCacheState& out) {
+  const uint32_t recipes = d->recipes && d->recipes->enabled() ? uint32_t(d->recipes->pipelineCount()) : 0;
+  out = d->cacheWatch.evaluate(cacheNowNs(d), d->gpu->submittedFrames(), d->gpu->pipelines().idle(), recipes);
+  if (d->cacheWatch.logChange(out)) requestCacheFlush(d);
+}
+
+void cacheStateTick(Device* d) {
+  const int64_t now = cacheNowNs(d);
+  if (now < d->cacheWatch.nextTickNs.load(std::memory_order_relaxed)) return;
+  d->cacheWatch.nextTickNs.store(now + 1'000'000'000LL, std::memory_order_relaxed);
+  VpvkCacheState s;
+  cacheState(d, s);
+}
+
+// ---- FAIL_ON_PIPELINE_COMPILE_REQUIRED probes ----------------------------------------------------------
+// UE5 probes its whole PSO list (>8600) with the flag during its precache. The game is answered COMPILE_REQUIRED as the spec asks,
+// but the shaders are already translated: the recipe (state + stage inputs) is stored so a later boot's pre-launch compile has it.
+// Nothing is compiled, requested or retained here (the caller deletes the PipelineObj). Device::probed keeps pipelineKnown from
+// counting such a recipe as compiled: a probe of it is refused again until the cache holds the pipeline.
+namespace {
+constexpr uint32_t kProbeRecipeCap = 32768;  // recipes one session may store from probes
+std::atomic<uint32_t> gProbeRecipeCap{kProbeRecipeCap};
+}  // namespace
+
+void setProbeRecipeCap(uint32_t cap) { gProbeRecipeCap = cap; }
+
+void noteCompileRequired(Device* d, const vpgpu::PipelineState& st, vpgpu::PipelineKey key, const std::array<uint64_t, 3>& inputs,
+                         bool compute) {
+  PipelineCounters& c = pipelineCounters();
+  ++(compute ? c.probeCompute : c.probeGraphics);
+  noteCacheKey(d, key.value);
+  if (!d->recipes) return;  // nothing to store into
+  {
+    std::lock_guard<std::mutex> lock(d->probeMutex);
+    if (d->probed.count(key.value)) {
+      ++c.probeDup;  // probed before (or by another thread a moment ago)
+      return;
+    }
+    if (d->probed.size() >= gProbeRecipeCap.load()) {
+      if (!c.probeCapped.fetch_add(1)) logf("vk.pso.probe capped recipes=%u (further probes are not recorded)", gProbeRecipeCap.load());
+      return;
+    }
+    d->probed.insert(key.value);
+  }
+  d->recipes->addPipeline(st, inputs);
+  if (d->recipes->has(key.value)) ++c.probeRecorded;  // (a store without a file, or a stage without an input, keeps nothing)
+}
+
+void probeReport(Device* d, bool force) {
+  static std::atomic<int64_t> nextNs{0};
+  static std::atomic<unsigned> lines{0};
+  static std::mutex m;
+  static std::string last;
+  PipelineCounters& c = pipelineCounters();
+  if (!d || !(c.probeGraphics.load() + c.probeCompute.load())) return;
+  const int64_t nowNs = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+  if (!force && nowNs < nextNs.load(std::memory_order_relaxed)) return;
+  std::lock_guard<std::mutex> lock(m);
+  nextNs.store(nowNs + 5'000'000'000LL, std::memory_order_relaxed);
+  char b[160];
+  std::snprintf(b, sizeof b, "graphics=%llu compute=%llu recorded=%llu dup=%llu capped=%llu", (unsigned long long)c.probeGraphics.load(),
+                (unsigned long long)c.probeCompute.load(), (unsigned long long)c.probeRecorded.load(),
+                (unsigned long long)c.probeDup.load(), (unsigned long long)c.probeCapped.load());
+  if (b == last || lines.load() >= 720) return;
+  last = b;
+  ++lines;
+  logf("vk.pso.probe %s", b);
 }
 
 // gpu.amp: at most every 10 s, the multiview draws recorded since the last line (none: no line). inst = multiview by
@@ -576,9 +1027,7 @@ vpgpu::PipelineKey pipelineFor(Device* dev, const PipelineObj& p, uint8_t passSa
     for (const auto& [n, k] : list)
       if (n == passSamples) baseKey = k, found = true;
     if (!found) {
-      vpgpu::PipelineState st = base;
-      st.samples = passSamples;
-      st.label += ".ms" + std::to_string(passSamples);
+      const vpgpu::PipelineState st = msaaVariantState(base, passSamples);  // (the prewarm builds it the same way)
       const vpgpu::PipelineKey k = st.key();
       list.push_back({passSamples, k});
       static std::atomic<unsigned> n{0};
@@ -642,7 +1091,8 @@ vpgpu::BufferId UploadArena::put(Device* d, const void* data, VkDeviceSize size,
   }
   Chunk& c = chunks[current];
   offset = c.used;
-  std::memcpy(c.host + c.used, data, size);
+  if (data) std::memcpy(c.host + c.used, data, size);
+  else std::memset(c.host + c.used, 0, size);  // reserved for a later fill (decoded 3D ASTC uploads)
   c.used += need;
   return c.id;
 }
@@ -784,6 +1234,10 @@ spirv::VertexAttribute vertexAttribute(const VkVertexInputAttributeDescription& 
     case VK_FORMAT_R8G8B8_SNORM: v.format = vpgpu::Format::RGBA8Snorm, v.components = 3; break;
     case VK_FORMAT_A2B10G10R10_UNORM_PACK32: v.format = vpgpu::Format::RGB10A2Unorm; break;
     case VK_FORMAT_A2B10G10R10_UINT_PACK32: v.format = vpgpu::Format::RGB10A2Uint; break;
+    // Stored as R/B-swapped twins (isSwappedRB): the fetch has no swap, so they are not vertex formats (no vertex-buffer feature).
+    case VK_FORMAT_B5G6R5_UNORM_PACK16:
+    case VK_FORMAT_A2R10G10B10_UNORM_PACK32:
+    case VK_FORMAT_A2R10G10B10_UINT_PACK32: v.format = vpgpu::Format::Undefined; break;
     default: v.format = toCoreFormat(a.format);
   }
   if (v.format == vpgpu::Format::Undefined) logf("vk.err what=vertex_format value=%d", int(a.format));
@@ -803,10 +1257,12 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkCreateShaderModule(VkDevice dv, con
   auto* m = new ShaderModuleObj;
   m->module = std::shared_ptr<spirv::SpirvModule>(spirv::parse(ci->pCode, ci->codeSize / 4, m->error), spirv::release);
   if (!m->module) logf("vk.err what=spirv_parse error=\"%s\"", m->error.c_str());
-  const Device* d = dv ? from<Device>(dv) : nullptr;
+  Device* d = dv ? from<Device>(dv) : nullptr;
+  m->uid = spirvHash(ci->pCode, ci->codeSize / 4);
+  if (d) d->cacheWatch.noteModule(m->uid, false);
   if (m->module && d && d->recipes && d->recipes->enabled()) {
     auto w = std::make_shared<std::vector<uint32_t>>(ci->pCode, ci->pCode + ci->codeSize / 4);
-    m->hash = spirvHash(w->data(), w->size());
+    m->hash = m->uid;
     m->words = std::move(w);
   }
   *out = to<VkShaderModule>(m);
@@ -824,6 +1280,7 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkCreateDescriptorSetLayout(VkDevice,
                                                                        const VkAllocationCallbacks*,
                                                                        VkDescriptorSetLayout* out) {
   auto data = std::make_shared<SetLayoutData>();
+  data->push = (ci->flags & VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR) != 0;
   for (uint32_t i = 0; i < ci->bindingCount; ++i) {
     const VkDescriptorSetLayoutBinding& b = ci->pBindings[i];
     SetLayoutBinding x;
@@ -895,30 +1352,38 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkDestroyDescriptorPool(VkDevice d, VkDes
   delete from<DescriptorPoolObj>(p);
 }
 
+namespace {
+// An empty set of `layout` (every descriptor unwritten, immutable samplers in place).
+void initDescriptorSet(DescriptorSetObj& s, std::shared_ptr<const SetLayoutData> layout) {
+  s.layout = std::move(layout);
+  s.slots.clear(), s.inlineData.clear();
+  s.slots.resize(s.layout->bindings.size());
+  s.inlineData.resize(s.layout->bindings.size());
+  for (size_t b = 0; b < s.layout->bindings.size(); ++b) {
+    const SetLayoutBinding& lb = s.layout->bindings[b];
+    if (lb.type == VK_DESCRIPTOR_TYPE_INLINE_UNIFORM_BLOCK) {
+      s.slots[b].resize(1);
+      s.slots[b][0].type = lb.type;
+      s.inlineData[b].assign(lb.count, 0);
+      continue;
+    }
+    s.slots[b].resize(lb.count);
+    for (uint32_t k = 0; k < lb.immutable.size() && k < lb.count; ++k) {
+      s.slots[b][k].sampler = lb.immutable[k];
+      s.slots[b][k].type = lb.type;
+      s.slots[b][k].immutable = true;
+    }
+  }
+}
+}  // namespace
+
 VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkAllocateDescriptorSets(VkDevice, const VkDescriptorSetAllocateInfo* ai,
                                                                     VkDescriptorSet* out) {
   auto* pool = from<DescriptorPoolObj>(ai->descriptorPool);
   for (uint32_t i = 0; i < ai->descriptorSetCount; ++i) {
     auto* s = new DescriptorSetObj;
-    s->layout = from<DescriptorSetLayoutObj>(ai->pSetLayouts[i])->data;
+    initDescriptorSet(*s, from<DescriptorSetLayoutObj>(ai->pSetLayouts[i])->data);
     s->pool = pool;
-    s->slots.resize(s->layout->bindings.size());
-    s->inlineData.resize(s->layout->bindings.size());
-    for (size_t b = 0; b < s->layout->bindings.size(); ++b) {
-      const SetLayoutBinding& lb = s->layout->bindings[b];
-      if (lb.type == VK_DESCRIPTOR_TYPE_INLINE_UNIFORM_BLOCK) {
-        s->slots[b].resize(1);
-        s->slots[b][0].type = lb.type;
-        s->inlineData[b].assign(lb.count, 0);
-        continue;
-      }
-      s->slots[b].resize(lb.count);
-      for (uint32_t k = 0; k < lb.immutable.size() && k < lb.count; ++k) {
-        s->slots[b][k].sampler = lb.immutable[k];
-        s->slots[b][k].type = lb.type;
-        s->slots[b][k].immutable = true;
-      }
-    }
     pool->sets.push_back(s);
     out[i] = to<VkDescriptorSet>(s);
   }
@@ -984,39 +1449,43 @@ void writeInline(DescriptorSetObj* s, uint32_t binding, uint32_t offset, uint32_
 }
 }  // namespace
 
-VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkUpdateDescriptorSets(VkDevice, uint32_t nw, const VkWriteDescriptorSet* w,
-                                                              uint32_t nc, const VkCopyDescriptorSet* c) {
-  for (uint32_t i = 0; i < nw; ++i) {
-    auto* s = from<DescriptorSetObj>(w[i].dstSet);
-    if (w[i].descriptorType == VK_DESCRIPTOR_TYPE_INLINE_UNIFORM_BLOCK) {
-      // dstArrayElement is a byte offset, descriptorCount a byte count; the data is in the pNext chain.
-      for (auto* n = static_cast<const VkBaseInStructure*>(w[i].pNext); n; n = n->pNext)
-        if (n->sType == VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_INLINE_UNIFORM_BLOCK) {
-          auto* iu = reinterpret_cast<const VkWriteDescriptorSetInlineUniformBlock*>(n);
-          writeInline(s, w[i].dstBinding, w[i].dstArrayElement, std::min(w[i].descriptorCount, iu->dataSize), iu->pData);
-        }
-      continue;
-    }
-    for (uint32_t k = 0; k < w[i].descriptorCount; ++k) {
-      Descriptor* d = element(s, w[i].dstBinding, w[i].dstArrayElement + k);
-      if (!d) break;
-      switch (w[i].descriptorType) {
-        case VK_DESCRIPTOR_TYPE_SAMPLER:
-        case VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER:
-        case VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE:
-        case VK_DESCRIPTOR_TYPE_STORAGE_IMAGE:
-        case VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT:
-          writeImage(*d, w[i].descriptorType, w[i].pImageInfo[k]);
-          break;
-        case VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER:
-        case VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER:
-          d->type = w[i].descriptorType;
-          d->texel = w[i].pTexelBufferView[k] ? from<BufferView>(w[i].pTexelBufferView[k]) : nullptr;
-          break;
-        default: writeBuffer(*d, w[i].descriptorType, w[i].pBufferInfo[k]); break;
+namespace {
+// One write into `s` (vkUpdateDescriptorSets and vkCmdPushDescriptorSetKHR share it; the set is w.dstSet or the push set).
+void applyWrite(DescriptorSetObj* s, const VkWriteDescriptorSet& w) {
+  if (w.descriptorType == VK_DESCRIPTOR_TYPE_INLINE_UNIFORM_BLOCK) {
+    // dstArrayElement is a byte offset, descriptorCount a byte count; the data is in the pNext chain.
+    for (auto* n = static_cast<const VkBaseInStructure*>(w.pNext); n; n = n->pNext)
+      if (n->sType == VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_INLINE_UNIFORM_BLOCK) {
+        auto* iu = reinterpret_cast<const VkWriteDescriptorSetInlineUniformBlock*>(n);
+        writeInline(s, w.dstBinding, w.dstArrayElement, std::min(w.descriptorCount, iu->dataSize), iu->pData);
       }
+    return;
+  }
+  for (uint32_t k = 0; k < w.descriptorCount; ++k) {
+    Descriptor* d = element(s, w.dstBinding, w.dstArrayElement + k);
+    if (!d) break;
+    switch (w.descriptorType) {
+      case VK_DESCRIPTOR_TYPE_SAMPLER:
+      case VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER:
+      case VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE:
+      case VK_DESCRIPTOR_TYPE_STORAGE_IMAGE:
+      case VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT:
+        writeImage(*d, w.descriptorType, w.pImageInfo[k]);
+        break;
+      case VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER:
+      case VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER:
+        d->type = w.descriptorType;
+        d->texel = w.pTexelBufferView[k] ? from<BufferView>(w.pTexelBufferView[k]) : nullptr;
+        break;
+      default: writeBuffer(*d, w.descriptorType, w.pBufferInfo[k]); break;
     }
   }
+}
+}  // namespace
+
+VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkUpdateDescriptorSets(VkDevice, uint32_t nw, const VkWriteDescriptorSet* w,
+                                                              uint32_t nc, const VkCopyDescriptorSet* c) {
+  for (uint32_t i = 0; i < nw; ++i) applyWrite(from<DescriptorSetObj>(w[i].dstSet), w[i]);
   for (uint32_t i = 0; i < nc; ++i) {
     auto* src = from<DescriptorSetObj>(c[i].srcSet);
     auto* dst = from<DescriptorSetObj>(c[i].dstSet);
@@ -1038,6 +1507,8 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkCreateDescriptorUpdateTemplate(VkDe
                                                                             VkDescriptorUpdateTemplate* out) {
   auto* t = new DescriptorUpdateTemplateObj;
   t->entries.assign(ci->pDescriptorUpdateEntries, ci->pDescriptorUpdateEntries + ci->descriptorUpdateEntryCount);
+  t->push = ci->templateType == VK_DESCRIPTOR_UPDATE_TEMPLATE_TYPE_PUSH_DESCRIPTORS_KHR;
+  t->bindPoint = ci->pipelineBindPoint, t->set = ci->set;
   *out = to<VkDescriptorUpdateTemplate>(t);
   return VK_SUCCESS;
 }
@@ -1047,9 +1518,8 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkDestroyDescriptorUpdateTemplate(VkDevic
   delete from<DescriptorUpdateTemplateObj>(t);
 }
 
-VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkUpdateDescriptorSetWithTemplate(VkDevice, VkDescriptorSet set,
-                                                                         VkDescriptorUpdateTemplate tpl, const void* data) {
-  auto* s = from<DescriptorSetObj>(set);
+namespace {
+void applyTemplate(DescriptorSetObj* s, VkDescriptorUpdateTemplate tpl, const void* data) {
   const auto* bytes = static_cast<const uint8_t*>(data);
   for (const VkDescriptorUpdateTemplateEntry& e : from<DescriptorUpdateTemplateObj>(tpl)->entries) {
     if (e.descriptorType == VK_DESCRIPTOR_TYPE_INLINE_UNIFORM_BLOCK) {  // bytes at `offset`, count = size
@@ -1087,6 +1557,12 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkUpdateDescriptorSetWithTemplate(VkDevic
       }
     }
   }
+}
+}  // namespace
+
+VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkUpdateDescriptorSetWithTemplate(VkDevice, VkDescriptorSet set,
+                                                                         VkDescriptorUpdateTemplate tpl, const void* data) {
+  applyTemplate(from<DescriptorSetObj>(set), tpl, data);
 }
 
 // =================================================================================================
@@ -1218,6 +1694,7 @@ TranslateFail lowerAndEmit(const spirv::SpirvModule& m, const spirv::SpirvLowerO
   vpmsl::EmitOptions eo;
   eo.positionalNames = true;  // MSL text independent of absolute slots (precompile == runtime)
   eo.loopGuard = kVulkanLoopGuard;
+  eo.samplerBias = true;  // mipLodBias reaches the shader (Metal ignores the sampler descriptor lodBias)
   eo.robustBuffers = opt.robustBuffers;  // robustBufferAccess (VPVK_ROBUST): OOB / null storage buffers cannot fault the GPU
   vpmsl::EmitResult e = vpmsl::emitMsl(mod, eo);
   if (!e.errors.empty()) {
@@ -1293,7 +1770,8 @@ StageOut translateStage(Device* d, const PipelineObj::StageSrc& src, const Pipel
                         uint32_t viewCount, const std::vector<spirv::VertexAttribute>& attrs,
                         const std::vector<spirv::VertexBufferBinding>& vbs, const std::string& label,
                         uint32_t viewMask = 0, const std::vector<PipelineObj::TexelBinding>* texel = nullptr,
-                        uint16_t colorIntKinds = 0, int uiMaskSlot = -1, bool uiMaskAlpha = false, bool a2cTest = false) {
+                        uint16_t colorIntKinds = 0, int uiMaskSlot = -1, bool uiMaskAlpha = false, bool a2cTest = false,
+                        uint32_t sampleMask = ~0u) {
   StageOut o;
   if (!src.module) {
     logf("vk.err what=shader pipeline=%s stage=%u error=\"no module\"", label.c_str(), unsigned(src.stage));
@@ -1313,6 +1791,7 @@ StageOut translateStage(Device* d, const PipelineObj::StageSrc& src, const Pipel
     opt.colorIntKinds = colorIntKinds;
     opt.uiMaskSlot = int8_t(uiMaskSlot), opt.uiMaskAlpha = uiMaskAlpha;
     opt.alphaTest = a2cTest;
+    opt.sampleMask = sampleMask;
   }
   // Foveation: multiview stages of exactly two views (rate map layer = view) carry the viewport index / the
   // FragCoord mapping, in every pass they may run in (outside a foveated pass the backend binds an identity map
@@ -1525,24 +2004,58 @@ void targetFormats(const VkGraphicsPipelineCreateInfo& ci, vpgpu::PipelineState&
     }
 }
 
-// Was this key among the recipes of earlier runs (or already requested on this device)? Checked before the game's request
-// records it. The boot log's last "gpu.pso.recipe game" line is what AVP reads to trust (or drop) warm.stamp.
-void noteRecipeKey(Device* d, vpgpu::PipelineKey key, const std::string& label) {
-  const bool hit = d->gpu->pipelines().status(key) != vpgpu::PipelineCache::Status::Missing ||
-                   (d->recipes && d->recipes->has(key.value));
-  if (!hit) ++d->recipesFresh;  // vpvk_recipe_stats: also when nothing was stored (a first run misses everything)
-  if (!d->prewarmedRecipes) return;
-  const uint32_t h = hit ? ++d->recipeHits : d->recipeHits.load(), m = hit ? d->recipeMisses.load() : ++d->recipeMisses;
-  if (!hit && m <= 8) logf("gpu.pso.recipe game miss key=%016llx pipeline=%s", (unsigned long long)key.value, label.c_str());
-  if (h + m <= 4 || (h + m) % 64 == 0)
-    logf("gpu.pso.recipe game hits=%u misses=%u prewarmed=%u", h, m, d->prewarmedRecipes);
+// The line body of gpu.pso.miss_detail for a Vulkan pipeline object: the core description of its state plus the creation inputs
+// that are not PipelineState fields (view count / mask, sample mask, vertex input hash). The render pass / subpass is not kept on the object.
+std::string recipeMissDetail(const PipelineObj& p, uint64_t viHash) {
+  char b[260];
+  std::snprintf(b, sizeof b,
+                "src=vk_recipe key_dec=%llu views=%u viewMask=0x%x sampleMask=0x%x a2cTest=%d gameSamples=%u topology=%d vbs=%zu vi=%016llx",
+                (unsigned long long)p.state.key().value, p.viewCount, p.viewMask, p.sampleMask, int(p.a2cTest), unsigned(p.gameSamples),
+                int(p.topology), p.vertexBuffers.size(), (unsigned long long)viHash);
+  return vpgpu::describePipelineState(p.state, b);
+}
+
+// Hash of a pipeline's vertex input (attributes and bindings): PipelineState::key() has no field for it, it only reaches the key
+// through the vertex shader id (gpu.pso.miss_detail vi=).
+uint64_t vertexInputHash(const std::vector<spirv::VertexAttribute>& attrs, const std::vector<spirv::VertexBufferBinding>& vbs) {
+  uint64_t h = 1469598103934665603ull;
+  const auto mix = [&h](uint64_t x) {
+    for (int i = 0; i < 8; ++i, x >>= 8) h = (h ^ (x & 0xFF)) * 1099511628211ull;
+  };
+  for (const spirv::VertexAttribute& a : attrs) mix(a.location), mix(a.binding), mix(a.offset), mix(uint64_t(a.format)), mix(a.components);
+  for (const spirv::VertexBufferBinding& v : vbs) mix(v.binding), mix(v.stride), mix(v.perInstance), mix(v.slot), mix(v.divisor);
+  return h;
 }
 
 // Would creating `key` compile nothing new: the core cache already has it (any status) or an earlier run's recipe does (its
 // prewarm / the Metal binary archive serve it)? What VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT tests.
+// A recipe stored by a probe of this run (Device::probed) is not compiled yet: it does not count.
 bool pipelineKnown(Device* d, vpgpu::PipelineKey key) {
-  return d->gpu->pipelines().status(key) != vpgpu::PipelineCache::Status::Missing ||
-         (d->recipes && d->recipes->has(key.value));
+  if (d->gpu->pipelines().status(key) != vpgpu::PipelineCache::Status::Missing) return true;
+  if (!d->recipes || !d->recipes->has(key.value)) return false;
+  std::lock_guard<std::mutex> lock(d->probeMutex);
+  return !d->probed.count(key.value);
+}
+
+// Was this key among the recipes of earlier runs (or already requested on this device)? Checked before the game's request
+// records it. The boot log's last "gpu.pso.recipe game" line is what AVP reads to trust (or drop) warm.stamp.
+// gpu.pso.miss_detail: the first 20 misses with every field of the pipeline state and what the Vulkan object adds to it.
+void noteRecipeKey(Device* d, vpgpu::PipelineKey key, const PipelineObj& p, uint64_t viHash) {
+  const std::string& label = p.state.label;
+  noteCacheKey(d, key.value);
+  d->recipeUse.note(key.value, label);
+  const bool hit = pipelineKnown(d, key);  // (a recipe stored by a probe of this run, not compiled yet, is no hit)
+  if (d->recipes) {  // the game creates it for real now: its recipe is a normal one from here on (known even if the pipeline is destroyed later)
+    std::lock_guard<std::mutex> lock(d->probeMutex);
+    d->probed.erase(key.value);
+  }
+  if (!hit) ++d->recipesFresh;  // vpvk_recipe_stats: also when nothing was stored (a first run misses everything)
+  if (!d->prewarmedRecipes) return;
+  const uint32_t h = hit ? ++d->recipeHits : d->recipeHits.load(), m = hit ? d->recipeMisses.load() : ++d->recipeMisses;
+  if (!hit && m <= 8) logf("gpu.pso.recipe game miss key=%016llx pipeline=%s", (unsigned long long)key.value, label.c_str());
+  if (!hit && m <= 20) log("gpu.pso.miss_detail " + recipeMissDetail(p, viHash));
+  if (h + m <= 4 || (h + m) % 64 == 0)
+    logf("gpu.pso.recipe game hits=%u misses=%u prewarmed=%u", h, m, d->prewarmedRecipes);
 }
 
 // The part of a pipeline's creation that translates and registers shaders: everything that needs the SPIR-V. Runs on
@@ -1556,7 +2069,7 @@ void finishGraphics(Device* d, PipelineObj* p, std::vector<PipelineObj::StageSrc
     p->sources.push_back(std::move(src));
     const VkShaderStageFlagBits stage = p->sources.back().stage;
     StageOut o = translateStage(d, p->sources.back(), *p->layout, p->viewCount, attrs, p->vertexBuffers, st.label,
-                                p->viewMask, nullptr, p->colorIntKinds, -1, false, p->a2cTest);
+                                p->viewMask, nullptr, p->colorIntKinds, -1, false, p->a2cTest, p->sampleMask);
     if (!o.ok) {
       if (ok) why = o.why;
       ok = false;
@@ -1595,6 +2108,7 @@ void finishGraphics(Device* d, PipelineObj* p, std::vector<PipelineObj::StageSrc
         if (!(o.msl.colorOutputs & (1u << c))) st.blend[c].writeMask = 0;
       p->fragmentOutputs = uint8_t(o.msl.colorOutputs & 0xFF);
       p->dualSource = o.msl.dualSource;
+      p->sampleBuiltin = p->sources.back().module && spirv::declaresSampleBuiltin(*p->sources.back().module);
       degradeSrc1Blend(st, o.msl.dualSource);
     }
   }
@@ -1605,6 +2119,7 @@ void finishGraphics(Device* d, PipelineObj* p, std::vector<PipelineObj::StageSrc
   if (p->rasterDiscard && !p->isDynamic(VK_DYNAMIC_STATE_RASTERIZER_DISCARD_ENABLE)) discardRaster(st);
   p->ok = ok;
   p->key = st.key();
+  const uint64_t vi = vertexInputHash(attrs, p->vertexBuffers);  // before attrs may be moved below
   if (!ok) noteTranslateFail(why, p->key.value, st.label);
   p->inputs = inputs;
   // Only texel buffer / stride variants and the VPKTAA UI-mask variants (maskPipelineKey) retranslate.
@@ -1612,10 +2127,11 @@ void finishGraphics(Device* d, PipelineObj* p, std::vector<PipelineObj::StageSrc
   else p->attrs = std::move(attrs);
   if (ok && p->failOnCompile && !pipelineKnown(d, p->key)) {
     p->compileRequired = true;
+    noteCompileRequired(d, st, p->key, inputs, false);
     return;
   }
   if (ok) {
-    noteRecipeKey(d, p->key, st.label);
+    noteRecipeKey(d, p->key, *p, vi);
     retainKey(d, *p, p->key);
     d->gpu->pipelines().request(st, p->key, vpgpu::Priority::Visible);
     if (d->recipes) d->recipes->addPipeline(st, inputs);
@@ -1655,6 +2171,12 @@ PipelineObj* createGraphics(Device* d, const VkGraphicsPipelineCreateInfo& ci) {
       const auto& b = vi->pVertexBindingDescriptions[i];
       spirv::VertexBufferBinding vb;
       vb.binding = b.binding, vb.stride = b.stride, vb.perInstance = b.inputRate == VK_VERTEX_INPUT_RATE_INSTANCE;
+      for (auto* e = static_cast<const VkBaseInStructure*>(vi->pNext); e; e = e->pNext)  // VK_EXT_vertex_attribute_divisor
+        if (e->sType == VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_DIVISOR_STATE_CREATE_INFO_EXT) {
+          const auto* dv = reinterpret_cast<const VkPipelineVertexInputDivisorStateCreateInfoEXT*>(e);
+          for (uint32_t k = 0; k < dv->vertexBindingDivisorCount; ++k)
+            if (dv->pVertexBindingDivisors[k].binding == b.binding) vb.divisor = dv->pVertexBindingDivisors[k].divisor;
+        }
       vb.slot = uint16_t(p->layout->nextBuffer + b.binding);
       p->vertexBuffers.push_back(vb);
     }
@@ -1682,7 +2204,10 @@ PipelineObj* createGraphics(Device* d, const VkGraphicsPipelineCreateInfo& ci) {
     if (p->pointMode) st.primitive = primitiveOf(*p, p->topology, st.primitive);
     p->frontFace = rs->frontFace;
     p->depthBiasEnable = rs->depthBiasEnable;
-    p->depthClamp = rs->depthClampEnable;
+    p->depthClamp = rs->depthClampEnable;  // Metal's clamp mode = no clipping
+    for (auto* e = static_cast<const VkBaseInStructure*>(rs->pNext); e; e = e->pNext)  // VK_EXT_depth_clip_enable: clipping is its own switch
+      if (e->sType == VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_DEPTH_CLIP_STATE_CREATE_INFO_EXT)
+        p->depthClamp = !reinterpret_cast<const VkPipelineRasterizationDepthClipStateCreateInfoEXT*>(e)->depthClipEnable;
     p->depthBias[0] = rs->depthBiasConstantFactor, p->depthBias[1] = rs->depthBiasClamp, p->depthBias[2] = rs->depthBiasSlopeFactor;
   }
   if (const auto* ms = ci.pMultisampleState) {
@@ -1692,6 +2217,12 @@ PipelineObj* createGraphics(Device* d, const VkGraphicsPipelineCreateInfo& ci) {
     p->gameSamples = std::max<uint8_t>(1, static_cast<uint8_t>(ms->rasterizationSamples));
     st.samples = effectiveSamples(p->gameSamples);
     st.alphaToCoverage = ms->alphaToCoverageEnable;
+    // VkSampleMask: Metal has no pipeline coverage mask; the fragment shader ANDs it into its [[sample_mask]] output.
+    // Only for the game's own sample count (forced counts have other sample positions) and when it clears a sample.
+    if (ms->pSampleMask && p->gameSamples > 1 && p->gameSamples <= 32 && st.samples == p->gameSamples) {
+      const uint32_t all = p->gameSamples >= 32 ? ~0u : (1u << p->gameSamples) - 1u;
+      if ((ms->pSampleMask[0] & all) != all) p->sampleMask = ms->pSampleMask[0] & all;
+    }
     // Native identity: also a pipeline the game made 1x (Alyx: alpha-to-coverage on a single-sample pass): Apple
     // hardware A2C with one sample dithers, the fragment stage tests alpha >= 0.5 as the Adreno does.
     if (st.alphaToCoverage && (p->gameSamples > 1 || nativeExtras()) && st.samples <= 1) {
@@ -1740,6 +2271,7 @@ PipelineObj* createGraphics(Device* d, const VkGraphicsPipelineCreateInfo& ci) {
   std::vector<PipelineObj::StageSrc> srcs;  // read from the create info now: it does not outlive the call
   for (uint32_t i = 0; i < ci.stageCount; ++i) {
     const auto& s = ci.pStages[i];
+    if (const ShaderModuleObj* sm = from<ShaderModuleObj>(s.module)) d->cacheWatch.noteModule(sm->uid, true);  // referenced, supported stage or not
     if (s.stage != VK_SHADER_STAGE_VERTEX_BIT && s.stage != VK_SHADER_STAGE_FRAGMENT_BIT) {
       logf("vk.err what=stage value=%u pipeline=%s (geometry/tessellation unsupported)", unsigned(s.stage), st.label.c_str());
       ok = false;
@@ -1761,6 +2293,7 @@ PipelineObj* createCompute(Device* d, const VkComputePipelineCreateInfo& ci) {
   if (!p->layout) p->layout = std::make_shared<PipelineLayoutObj>();
   static std::atomic<unsigned> counter{0};
   p->state.label = "vk.comp" + std::to_string(counter++);
+  if (const ShaderModuleObj* sm = from<ShaderModuleObj>(ci.stage.module)) d->cacheWatch.noteModule(sm->uid, true);
   runCreation(d, p, [d, p, src = stageSrc(ci.stage)]() mutable {
     p->sources.push_back(std::move(src));
     StageOut o = translateStage(d, p->sources.back(), *p->layout, 1, {}, {}, p->state.label);
@@ -1775,9 +2308,10 @@ PipelineObj* createCompute(Device* d, const VkComputePipelineCreateInfo& ci) {
     p->key = p->state.key();
     if (p->failOnCompile && !pipelineKnown(d, p->key)) {
       p->compileRequired = true;
+      noteCompileRequired(d, p->state, p->key, {0, 0, o.input}, true);
       return;
     }
-    noteRecipeKey(d, p->key, p->state.label);
+    noteRecipeKey(d, p->key, *p, 0);
     retainKey(d, *p, p->key);
     d->gpu->pipelines().request(p->state, p->key, vpgpu::Priority::Visible);
     if (d->recipes) d->recipes->addPipeline(p->state, {0, 0, o.input});
@@ -1807,6 +2341,25 @@ bool vpvk::translateRecipeStage(const spirv::SpirvModule& m, const spirv::SpirvL
   return true;
 }
 
+namespace {
+// VK_EXT_pipeline_creation_feedback (core 1.3): the call's own duration for the pipeline (what a caller measures around
+// vkCreate*Pipelines); stages carry no figure of their own (VALID with a zero duration). A pipeline that was not created
+// (COMPILE_REQUIRED) reports nothing.
+void fillCreationFeedback(const void* pNext, uint32_t stageCount, uint64_t ns, bool created) {
+  for (auto* n = static_cast<const VkBaseInStructure*>(pNext); n; n = n->pNext) {
+    if (n->sType != VK_STRUCTURE_TYPE_PIPELINE_CREATION_FEEDBACK_CREATE_INFO) continue;
+    auto* fb = reinterpret_cast<const VkPipelineCreationFeedbackCreateInfo*>(n);
+    const VkPipelineCreationFeedbackFlags f = created ? VK_PIPELINE_CREATION_FEEDBACK_VALID_BIT : 0;
+    if (fb->pPipelineCreationFeedback) *fb->pPipelineCreationFeedback = {f, created ? ns : 0};
+    for (uint32_t k = 0; k < fb->pipelineStageCreationFeedbackCount && fb->pPipelineStageCreationFeedbacks; ++k)
+      fb->pPipelineStageCreationFeedbacks[k] = {k < stageCount ? f : 0, 0};
+  }
+}
+uint64_t nsSince(std::chrono::steady_clock::time_point t) {
+  return uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t).count());
+}
+}  // namespace
+
 VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkCreateGraphicsPipelines(VkDevice dv, VkPipelineCache, uint32_t n,
                                                                      const VkGraphicsPipelineCreateInfo* ci,
                                                                      const VkAllocationCallbacks*, VkPipeline* out) {
@@ -1815,18 +2368,25 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkCreateGraphicsPipelines(VkDevice dv
   std::vector<vpgpu::PipelineKey> keys;
   VkResult result = VK_SUCCESS;
   for (uint32_t i = 0; i < n; ++i) {
+    const auto t0 = std::chrono::steady_clock::now();
     PipelineObj* p = createGraphics(d, ci[i]);
+    fillCreationFeedback(ci[i].pNext, ci[i].stageCount, nsSince(t0), !p->compileRequired);
     if (p->compileRequired) {  // FAIL_ON_PIPELINE_COMPILE_REQUIRED: not requested; the others of the batch still are
       delete p;
       out[i] = VK_NULL_HANDLE;
       result = VK_PIPELINE_COMPILE_REQUIRED;
+      if (ci[i].flags & VK_PIPELINE_CREATE_EARLY_RETURN_ON_FAILURE_BIT) {  // the rest of the batch is not created
+        for (uint32_t j = i + 1; j < n; ++j) out[j] = VK_NULL_HANDLE;
+        break;
+      }
       continue;
     }
     out[i] = to<VkPipeline>(p);
     if (!d->translator && p->ok) keys.push_back(p->key);  // synchronous mode: translated already
   }
-  static const uint32_t budget = waitBudgetMs("VPVK_PIPELINE_CREATE_WAIT_MS", 60000);
-  pipelineCounters().createTimedOut += awaitPipelines(d, keys, budget, "create_graphics");  // see "compile policy"
+  const uint32_t budget = createWaitMs();
+  pipelineCounters().createTimedOut += awaitPipelines(d, keys, budget, "create_graphics", false);  // see "compile policy"
+  noteCreateUnready(d, keys, budget, "create_graphics");
   psoCensus(d, false);
   return result;
 }
@@ -1839,18 +2399,25 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkCreateComputePipelines(VkDevice dv,
   std::vector<vpgpu::PipelineKey> keys;
   VkResult result = VK_SUCCESS;
   for (uint32_t i = 0; i < n; ++i) {
+    const auto t0 = std::chrono::steady_clock::now();
     PipelineObj* p = createCompute(d, ci[i]);
+    fillCreationFeedback(ci[i].pNext, 1, nsSince(t0), !p->compileRequired);
     if (p->compileRequired) {
       delete p;
       out[i] = VK_NULL_HANDLE;
       result = VK_PIPELINE_COMPILE_REQUIRED;
+      if (ci[i].flags & VK_PIPELINE_CREATE_EARLY_RETURN_ON_FAILURE_BIT) {
+        for (uint32_t j = i + 1; j < n; ++j) out[j] = VK_NULL_HANDLE;
+        break;
+      }
       continue;
     }
     out[i] = to<VkPipeline>(p);
     if (!d->translator && p->ok) keys.push_back(p->key);
   }
-  static const uint32_t budget = waitBudgetMs("VPVK_PIPELINE_CREATE_WAIT_MS", 60000);
-  pipelineCounters().createTimedOut += awaitPipelines(d, keys, budget, "create_compute");
+  const uint32_t budget = createWaitMs();
+  pipelineCounters().createTimedOut += awaitPipelines(d, keys, budget, "create_compute", false);
+  noteCreateUnready(d, keys, budget, "create_compute");
   psoCensus(d, false);
   return result;
 }
@@ -1869,8 +2436,9 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkDestroyPipeline(VkDevice dv, VkPipeline
 
 // Pipeline caches: the core keeps its own (compiled pipelines + binary archive + recipe store).
 // The Vulkan object is a key list: vkGetPipelineCacheData returns a VkPipelineCacheHeaderVersionOne
-// header (our vendor/device/UUID) followed by "VQPC", a count and the recipe keys, so a game that
-// saves and reloads it (Unity) hands the keys back; vkCreatePipelineCache then queues those recipes.
+// header (our vendor/device/UUID) followed by "VQPC", a count and the recipe identities (RecipeStore::recipeId: not the
+// pipeline keys, which move when a translator change makes refresh() re-key the recipes), so a game that saves and
+// reloads it (Unity, Unreal) hands them back; vkCreatePipelineCache then queues those recipes.
 namespace {
 constexpr uint32_t kCacheMagic = 0x43505156;  // "VQPC"
 struct PipelineCacheObj {
@@ -1926,7 +2494,7 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkCreatePipelineCache(VkDevice dv, co
     std::memcpy(&k, b + 40 + size_t(i) * 8, 8);
     vpgpu::PipelineState s;
     if (!d->recipes) break;
-    if (!d->recipes->stateFor(k, s)) continue;
+    if (!d->recipes->resolve(k, k) || !d->recipes->stateFor(k, s)) continue;  // k: the identity, then the recipe's current key
     ++known;
     if (d->gpu->pipelines().status({k}) != vpgpu::PipelineCache::Status::Missing) continue;
     if (!d->recipes->stateFor(k, s, &shaders)) {  // the MSL only for what will be queued
@@ -1939,7 +2507,8 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkCreatePipelineCache(VkDevice dv, co
     ++queued;
   }
   if (noShader) logf("vk.pipelinecache recipes_without_shaders=%u (not queued)", noShader);
-  logf("vk.pipelinecache initial size=%zu keys=%u known=%u queued=%u", n, count, known, queued);
+  logf("vk.pipelinecache initial size=%zu keys=%u known=%u queued=%u recipes=%zu", n, count, known, queued,
+       d->recipes ? d->recipes->pipelineCount() : size_t(0));
   return VK_SUCCESS;
 }
 VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkDestroyPipelineCache(VkDevice, VkPipelineCache c, const VkAllocationCallbacks*) {
@@ -1948,7 +2517,7 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkDestroyPipelineCache(VkDevice, VkPipeli
 VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkGetPipelineCacheData(VkDevice dv, VkPipelineCache, size_t* size, void* data) {
   Device* d = from<Device>(dv);
   std::vector<uint64_t> keys;
-  if (d && d->recipes) keys = d->recipes->keys();
+  if (d && d->recipes) keys = d->recipes->ids();
   const size_t total = 40 + keys.size() * 8;
   if (!data) {
     *size = total;
@@ -2025,6 +2594,42 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdBindDescriptorSets(VkCommandBuffer c
   }
 }
 
+namespace {
+// The push set of (bind point, set number), made (or reused) for the layout's set layout and bound in place of whatever
+// was bound there. Null when the layout has no such set.
+DescriptorSetObj* pushSetFor(VkCommandBuffer cb, VkPipelineBindPoint bp, VkPipelineLayout pl, uint32_t set) {
+  const std::shared_ptr<const PipelineLayoutObj> lay = layoutOf(pl);
+  Recorder& r = rec(cb);
+  if (!lay || set >= lay->sets.size() || !lay->sets[set] || set >= r.pushSets[0].size()) return nullptr;
+  const bool compute = bp == VK_PIPELINE_BIND_POINT_COMPUTE;
+  auto& own = r.pushSets[compute ? 1 : 0][set];
+  if (!own || own->layout != lay->sets[set]) {
+    own = std::make_unique<DescriptorSetObj>();
+    initDescriptorSet(*own, lay->sets[set]);
+  }
+  auto& bound = (compute ? r.bound.computeSets : r.bound.graphicsSets)[set];
+  bound.set = own.get();
+  bound.dynamicOffsets.clear();
+  return own.get();
+}
+}  // namespace
+
+// VK_KHR_push_descriptor: the writes go to a set the command buffer owns; draws copy descriptors when recorded,
+// so rewriting it in place for the next push is safe.
+VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdPushDescriptorSetKHR(VkCommandBuffer cb, VkPipelineBindPoint bp, VkPipelineLayout pl,
+                                                                 uint32_t set, uint32_t n, const VkWriteDescriptorSet* w) {
+  DescriptorSetObj* s = pushSetFor(cb, bp, pl, set);
+  if (!s) return;
+  for (uint32_t i = 0; i < n; ++i) applyWrite(s, w[i]);
+}
+
+VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdPushDescriptorSetWithTemplateKHR(VkCommandBuffer cb, VkDescriptorUpdateTemplate tpl,
+                                                                             VkPipelineLayout pl, uint32_t set, const void* data) {
+  const auto* t = from<DescriptorUpdateTemplateObj>(tpl);
+  DescriptorSetObj* s = pushSetFor(cb, t->bindPoint, pl, set);
+  if (s) applyTemplate(s, tpl, data);
+}
+
 VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdPushConstants(VkCommandBuffer cb, VkPipelineLayout, VkShaderStageFlags,
                                                           uint32_t offset, uint32_t size, const void* data) {
   BoundState& b = rec(cb).bound;
@@ -2052,6 +2657,7 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdBindIndexBuffer(VkCommandBuffer cb, 
   b.index = buf ? from<Buffer>(buf) : nullptr;
   b.indexOffset = off;
   b.indexWide = t == VK_INDEX_TYPE_UINT32;
+  b.index8 = t == VK_INDEX_TYPE_UINT8_EXT;
 }
 
 VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdSetViewport(VkCommandBuffer cb, uint32_t first, uint32_t n, const VkViewport* v) {
@@ -2270,7 +2876,9 @@ bool resolveBindings(Recorder& r, const PipelineObj& p, const std::array<BoundSt
           if (!d.view || !d.view->image || !d.view->image->id) return false;
           vpgpu::Access a{vpgpu::ResourceRange::wholeTexture(d.view->image->id), u.stages, u.written};
           a.kind = ls.kind, a.slot = uint16_t(ls.slot + e);
-          if (d.view->view) views.push_back({ls.kind, a.slot, d.view->view});
+          if (ls.type == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE && d.view->storageView)
+            views.push_back({ls.kind, a.slot, d.view->storageView});  // cube storage: texture2d_array
+          else if (d.view->view) views.push_back({ls.kind, a.slot, d.view->view});
           out.push_back(a);
           if (zeroPendingImage(d.view->image)) zeroReads.push_back(d.view->image->id);
           if (ls.ycbcr) {  // planes 1 and 2 of the multi-planar image
@@ -2329,7 +2937,7 @@ PipelineObj::TexelVariant* texelVariant(Device* dev, const PipelineObj& p, const
   // vertex fetch is in the shader, so the stride is part of the translation.
   std::vector<uint32_t> strides;
   for (const spirv::VertexBufferBinding& vb : p.vertexBuffers) {
-    const int64_t s = p.dynStride ? bound.vertex[vb.binding < 16 ? vb.binding : 0].stride : -1;
+    const int64_t s = p.dynStride ? bound.vertex[vb.binding < bound.vertex.size() ? vb.binding : 0].stride : -1;
     strides.push_back(s >= 0 ? uint32_t(s) : vb.stride);
     differs = differs || strides.back() != vb.stride;
   }
@@ -2357,7 +2965,7 @@ PipelineObj::TexelVariant* texelVariant(Device* dev, const PipelineObj& p, const
   v.ok = true;
   for (const PipelineObj::StageSrc& src : p.sources) {
     StageOut o = translateStage(dev, src, *p.layout, p.viewCount, p.attrs, vbs, v.state.label, p.viewMask, &tb,
-                                p.colorIntKinds, -1, false, p.a2cTest);
+                                p.colorIntKinds, -1, false, p.a2cTest, p.sampleMask);
     if (!o.ok) {
       v.ok = false;
       break;
@@ -2419,7 +3027,7 @@ bool maskPipelineKey(Device* dev, const PipelineObj& p, PipelineObj::TexelVarian
     for (const PipelineObj::StageSrc& src : p.sources) {
       if (src.stage != VK_SHADER_STAGE_FRAGMENT_BIT) continue;
       StageOut o = translateStage(dev, src, *p.layout, p.viewCount, p.attrs, p.vertexBuffers, st.label + ".um", p.viewMask,
-                                  tv ? &tb : nullptr, p.colorIntKinds, slot, uiMaskUsesAlpha(base.blend[0]), p.a2cTest);
+                                  tv ? &tb : nullptr, p.colorIntKinds, slot, uiMaskUsesAlpha(base.blend[0]), p.a2cTest, p.sampleMask);
       if (o.ok) st.fragmentShader = o.id, inputs[1] = o.input, translated = true;
       break;
     }
@@ -2431,18 +3039,7 @@ bool maskPipelineKey(Device* dev, const PipelineObj& p, PipelineObj::TexelVarian
     }
   }
   const bool writes = ui && translated;
-  st.colorFormats[slot] = vpgpu::Format::R8Unorm;
-  vpgpu::BlendState& b = st.blend[slot];
-  b = vpgpu::BlendState{};
-  if (writes) {  // coverage accumulates: the largest value over the draws that touch the pixel
-    b.enabled = true;
-    b.colorOp = b.alphaOp = vpgpu::BlendOp::Max;
-    b.srcColor = b.srcAlpha = b.dstColor = b.dstAlpha = vpgpu::BlendFactor::One;
-    b.writeMask = 1;
-  } else {
-    b.writeMask = 0;
-  }
-  st.label += writes ? ".umu" : ".ums";
+  applyUiMaskTarget(st, writes);  // (the prewarm builds the '.ums' variant the same way)
   mv.key = st.key();
   mv.ok = true;
   mv.fragment = st.fragmentShader;
@@ -2468,8 +3065,124 @@ void awaitFreshVariants(Device* dev) {
   awaitPipelines(dev, keys, budget, "uimask_variant");
 }
 
+// VK_EXT_index_type_uint8: Metal has no 8-bit indices, so the indices a draw reads are widened to 16 bits first. The command
+// buffer's arena gets a 16-byte header (count, restart flag) and room for the widened indices; a compute dispatch recorded
+// before the render pass (`vk.index_u8`) fills it from the app's buffer, so indices written earlier in the same submission
+// count. Where that cannot run (a secondary command buffer: no pass to put it before; kernel not compiled) the indices are read
+// from host-visible memory now. The restart index 0xFF becomes 0xFFFF only while primitive restart is on (else 255 is an index).
+constexpr uint64_t kIndexU8Shader = 0x7650564b49555438ull;  // "vPVKIUT8"
+const char* kIndexU8Msl = R"(#include <metal_stdlib>
+using namespace metal;
+struct VpArgs {
+    const device uchar* src;
+    device uchar* dst;
+};
+[[max_total_threads_per_threadgroup(64)]] kernel void vp_main(constant VpArgs& a [[buffer(0)]],
+        uint2 g [[thread_position_in_grid]]) {
+    device uint* prm = (device uint*)a.dst;
+    const uint n = prm[0];
+    const uint i = g.y * 2097152u + g.x;
+    if (i >= n) return;
+    const uint v = a.src[i];
+    device ushort* out = (device ushort*)(a.dst + 16);
+    out[i] = (prm[1] != 0u && v == 255u) ? ushort(0xFFFF) : ushort(v);
+}
+)";
+constexpr uint32_t kIndexU8RowThreads = 2097152;  // 32768 groups of 64: the kernel's grid is 2-D past that
+
+uint16_t indexU8Ref(uint8_t index, bool restartEnabled) { return restartEnabled && index == 255 ? 0xFFFFu : uint16_t(index); }
+const char* indexU8Msl() { return kIndexU8Msl; }
+
+void requestIndexU8(Device* d) {
+  std::call_once(d->indexU8Once, [d] {
+    ShaderBlob blob;
+    blob.source = kIndexU8Msl;
+    blob.threadsPerGroup = {64, 1, 1};
+    blob.arguments = {{vpgpu::BindKind::Buffer, 0, 0}, {vpgpu::BindKind::Buffer, 1, 8}};
+    d->platform->addShader(kIndexU8Shader, std::move(blob));
+    vpgpu::PipelineState st;
+    st.computeShader = kIndexU8Shader;
+    st.label = "vk.index_u8";
+    d->indexU8Key = st.key();
+    d->gpu->pipelines().request(st, d->indexU8Key, vpgpu::Priority::Blocking);
+  });
+}
+
+// True when the kernel is compiled (it is requested when the device is created: vkCreateDevice). While it is queued or compiling it
+// waits (bounded, 2 s, with a backoff after a timeout) only when `mayWait`: a caller that can read the indices on the CPU does not.
+bool indexU8Ready(Device* d, vpgpu::PipelineKey& key, bool mayWait) {
+  requestIndexU8(d);
+  key = d->indexU8Key;
+  using Status = vpgpu::PipelineCache::Status;
+  using Clock = std::chrono::steady_clock;
+  const auto nowNs = [] { return int64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now().time_since_epoch()).count()); };
+  vpgpu::PipelineCache& cache = d->gpu->pipelines();
+  Status st = cache.status(key);
+  if (mayWait && (st == Status::Queued || st == Status::Compiling) && nowNs() >= d->indexU8BackoffNs.load(std::memory_order_relaxed)) {
+    cache.boost(key);
+    cache.waitReady({key}, std::chrono::milliseconds(2000));
+    st = cache.status(key);
+    if (st == Status::Queued || st == Status::Compiling) d->indexU8BackoffNs.store(nowNs() + 3'000'000'000, std::memory_order_relaxed);
+  }
+  if (st == Status::Ready) return true;
+  static std::atomic<unsigned> k{0};
+  if (k.fetch_add(1) < 4) logf("vk.index_u8 kernel_not_ready status=%d (0 missing 1 queued 2 compiling 3 ready 4 failed)", int(st));
+  return false;
+}
+
+// `n` 8-bit indices from byte `first` of the bound index buffer, as a 16-bit index buffer in `out` (n clipped to the buffer).
+// False when nothing can be read (the draw is skipped).
+static bool widenIndexU8(Recorder& r, uint64_t first, uint64_t n, bool restart, vpgpu::IndexBuffer& out) {
+  const Buffer* ib = r.bound.index;
+  const uint64_t avail = ib && ib->size > r.bound.indexOffset ? ib->size - r.bound.indexOffset : 0;
+  if (first >= avail) return false;
+  n = std::min(n, avail - first);
+  if (!n || n > 0xFFFFFFFFull) return false;
+  const uint64_t at = r.bound.indexOffset + first;
+  vpgpu::PipelineKey key{};
+  const bool inPass = r.passBegin != SIZE_MAX && r.passBegin < r.ops.size() && ib->id;
+  if (inPass)  // the same range drawn again in this pass (indirect draws widen the whole bound range): one copy
+    for (const Recorder::Widened& w : r.widened)
+      if (w.buffer == ib->id && w.at == at && w.n == n && w.restart == restart) return out = w.out, true;
+  // (A kernel still compiling is not waited for when the indices can be read on the CPU now.)
+  const bool hostReadable = ib->memory && ib->memory->host;
+  if (inPass && indexU8Ready(r.device, key, !hostReadable)) {
+    std::vector<uint8_t> blob(16 + n * 2, 0);
+    const uint32_t head[2] = {uint32_t(n), restart ? 1u : 0u};
+    std::memcpy(blob.data(), head, sizeof head);
+    VkDeviceSize aoff = 0;
+    const vpgpu::BufferId arena = r.arena.put(r.device, blob.data(), blob.size(), aoff);
+    OpDispatch dp;
+    dp.dispatch.pipeline = key;
+    const uint64_t groups = (n + 63) / 64;
+    dp.dispatch.groups = {uint32_t(std::min<uint64_t>(groups, kIndexU8RowThreads / 64)),
+                          uint32_t((groups + kIndexU8RowThreads / 64 - 1) / (kIndexU8RowThreads / 64)), 1};
+    dp.dispatch.label = "vk.index_u8";
+    dp.dispatch.required = true;
+    auto acc = [](vpgpu::ResourceRange rr, bool w, uint16_t slot) {
+      vpgpu::Access a{rr, vpgpu::stage::compute, w};
+      a.kind = vpgpu::BindKind::Buffer, a.slot = slot;
+      return a;
+    };
+    dp.dispatch.bindings.push_back(acc(vpgpu::ResourceRange::bytes(ib->id, at, n), false, 0));
+    dp.dispatch.bindings.push_back(acc(vpgpu::ResourceRange::bytes(arena, aoff, blob.size()), true, 1));
+    r.hoisted.emplace_back(std::move(dp));  // before the pass begins: flushHoisted at its end
+    out = vpgpu::IndexBuffer{arena, aoff + 16, false};
+    if (r.widened.size() < 16) r.widened.push_back({ib->id, at, n, restart, out});
+    return true;
+  }
+  if (!ib->memory || !ib->memory->host) return false;
+  const uint8_t* src = ib->memory->host + ib->offset + at;
+  std::vector<uint16_t> wide(n);
+  for (uint64_t i = 0; i < n; ++i) wide[i] = indexU8Ref(src[i], restart);
+  VkDeviceSize aoff = 0;
+  const vpgpu::BufferId arena = r.arena.put(r.device, wide.data(), wide.size() * 2, aoff);
+  out = vpgpu::IndexBuffer{arena, aoff, false};
+  return true;
+}
+
 OpDraw makeDraw(Recorder& r, uint32_t first, uint32_t count, uint32_t instances, uint32_t firstInstance,
-                int32_t baseVertex, bool indexed) {
+                int32_t baseVertex, bool indexed, bool widenIndex) {
   OpDraw op;
   const PipelineObj* p = r.bound.graphics;
   if (p && !resolvePipeline(r.device, *p)) {
@@ -2534,7 +3247,7 @@ OpDraw makeDraw(Recorder& r, uint32_t first, uint32_t count, uint32_t instances,
             a.range.generation == im->id.generation && std::find(op.images.begin(), op.images.end(), im) == op.images.end())
           op.images.push_back(im);
   for (const spirv::VertexBufferBinding& vb : p->vertexBuffers) {
-    const BoundState::VB& b = r.bound.vertex[vb.binding < 16 ? vb.binding : 0];
+    const BoundState::VB& b = r.bound.vertex[vb.binding < r.bound.vertex.size() ? vb.binding : 0];
     if (!b.buffer || !b.buffer->id) continue;  // unused by the shader or not bound
     VkDeviceSize avail = b.offset < b.buffer->size ? b.buffer->size - b.offset : 0;
     if (b.size != VK_WHOLE_SIZE) avail = std::min(avail, b.size);  // vkCmdBindVertexBuffers2 pSizes
@@ -2560,15 +3273,24 @@ OpDraw makeDraw(Recorder& r, uint32_t first, uint32_t count, uint32_t instances,
       return op;
     }
     d.index = vpgpu::IndexBuffer{r.bound.index->id, r.bound.indexOffset, r.bound.indexWide};
+    if (r.bound.index8 && widenIndex && topo != VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN) {  // fans read the indices themselves below
+      const bool restart = p->isDynamic(VK_DYNAMIC_STATE_PRIMITIVE_RESTART_ENABLE) && eds.restart >= 0 ? eds.restart != 0 : p->primitiveRestart;
+      if (!widenIndexU8(r, first, count, restart, *d.index)) {
+        op.ok = false, op.reason = SkipReason::NoIndex;
+        logSkip("index_u8_unreadable", p, "first=%u count=%u", first, count);
+        return op;
+      }
+      d.first = 0;
+    }
   }
   // Triangle fans (Metal has none): an indexed triangle list (v0, vk, vk+1) in the command
   // buffer's upload memory; an indexed fan reads its indices now (unified memory: the buffer the
-  // app filled before recording). Indirect fans keep the list topology (not converted).
+  // app filled before recording). Indirect fans become direct draws (recordIndirectDraw).
   if (topo == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN && count >= 3) {
     const uint8_t* src = nullptr;
     if (indexed) {
       const Buffer* ib = r.bound.index;
-      const VkDeviceSize stride = r.bound.indexWide ? 4 : 2;
+      const VkDeviceSize stride = r.bound.indexWide ? 4 : r.bound.index8 ? 1 : 2;
       const VkDeviceSize avail = ib->size > r.bound.indexOffset ? (ib->size - r.bound.indexOffset) / stride : 0;
       if (ib->memory && ib->memory->host && uint64_t(first) + count <= avail)  // in bounds only
         src = ib->memory->host + ib->offset + r.bound.indexOffset;
@@ -2581,6 +3303,7 @@ OpDraw makeDraw(Recorder& r, uint32_t first, uint32_t count, uint32_t instances,
           std::memcpy(&v, src + size_t(first + i) * 4, 4);
           return v;
         }
+        if (r.bound.index8) return src[size_t(first + i)];
         uint16_t v;
         std::memcpy(&v, src + size_t(first + i) * 2, 2);
         return v;
@@ -2588,7 +3311,7 @@ OpDraw makeDraw(Recorder& r, uint32_t first, uint32_t count, uint32_t instances,
       std::vector<uint32_t> tri;
       tri.reserve(size_t(count - 2) * 3);
       // Primitive restart (indexed): the restart index ends a fan and the next one starts after it.
-      const uint32_t restart = r.bound.indexWide ? 0xFFFFFFFFu : 0xFFFFu;
+      const uint32_t restart = r.bound.indexWide ? 0xFFFFFFFFu : r.bound.index8 ? 0xFFu : 0xFFFFu;
       const bool splits = indexed && (p->isDynamic(VK_DYNAMIC_STATE_PRIMITIVE_RESTART_ENABLE) && eds.restart >= 0
                                           ? eds.restart != 0
                                           : p->primitiveRestart);
@@ -2717,7 +3440,25 @@ struct VpArgs {
 }
 )";
 
-bool indirectPatch(Device* d, vpgpu::PipelineKey& key) {
+// The same logic in C++ for record `i` (tests; keep in step with vp_main above): `prm` is the 8-word parameter block, `src` the app's
+// records (prm[1] words apart), `count` the GPU draw count buffer; writes prm[2] words to `out` (the packed record i).
+void indirectPatchRef(uint32_t i, const uint32_t* prm, const uint32_t* src, const uint32_t* count, uint32_t* out) {
+  const uint32_t n = prm[0];
+  if (i >= n) return;
+  const uint32_t words = prm[2], views = std::max(prm[3], 1u);
+  const uint32_t* s = src + size_t(i) * prm[1];
+  for (uint32_t k = 0; k < words; ++k) out[k] = s[k];
+  const uint32_t cnt = prm[4] != 0u ? count[prm[5]] : n;
+  if (i >= cnt) out[1] = 0u;
+  if (out[0] > 33554432u || out[1] > 1048576u) out[0] = 0u, out[1] = 0u;
+  out[1] = out[1] * views;
+  out[words - 1u] = out[words - 1u] * views;
+}
+const char* indirectPatchMsl() { return kIndirectPatchMsl; }
+
+// Registers and requests the patch kernel (once per device), at Urgent priority: vkCreateDevice calls it so the compile is under way
+// before the first indirect draw.
+void requestIndirectPatch(Device* d) {
   std::call_once(d->indirectPatchOnce, [d] {
     ShaderBlob blob;
     blob.source = kIndirectPatchMsl;
@@ -2729,10 +3470,117 @@ bool indirectPatch(Device* d, vpgpu::PipelineKey& key) {
     st.label = "vk.indirect_patch";
     d->indirectPatchKey = st.key();
     d->gpu->pipelines().request(st, d->indirectPatchKey, vpgpu::Priority::Blocking);
-    d->indirectPatchOk = true;
+    d->gpu->pipelines().boost(d->indirectPatchKey);  // Urgent: ahead of the prewarm and every queued compile
   });
+}
+
+// True when the patch kernel is compiled and the draw may use it. Waits (bounded, 2 s: it is a tiny kernel) while it is queued or
+// compiling, rather than recording a dispatch the backend would skip and leave the patched arguments zero (the draws vanish). A
+// kernel that failed or did not come back in time sends the draw to the CPU path (or skips a draw-count draw, which has no CPU path),
+// loudly: vk.indirect_patch fail, counted in PipelineCounters::indirectPatchFallback.
+bool indirectPatch(Device* d, vpgpu::PipelineKey& key) {
+  requestIndirectPatch(d);
   key = d->indirectPatchKey;
-  return d->indirectPatchOk;
+  using Status = vpgpu::PipelineCache::Status;
+  using Clock = std::chrono::steady_clock;
+  const auto nowNs = [] { return int64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now().time_since_epoch()).count()); };
+  vpgpu::PipelineCache& cache = d->gpu->pipelines();
+  Status st = cache.status(key);
+  if ((st == Status::Queued || st == Status::Compiling) && nowNs() >= d->indirectPatchBackoffNs.load(std::memory_order_relaxed)) {
+    cache.boost(key);
+    const auto t0 = Clock::now();
+    cache.waitReady({key}, std::chrono::milliseconds(d->indirectPatchWaitMs));
+    st = cache.status(key);
+    if (st == Status::Queued || st == Status::Compiling)  // timed out: the next draws do not wait again for a while
+      d->indirectPatchBackoffNs.store(nowNs() + int64_t(d->indirectPatchBackoffMs) * 1'000'000, std::memory_order_relaxed);
+    static std::atomic<unsigned> w{0};
+    if (w.fetch_add(1) < 4)
+      logf("vk.indirect_patch wait ms=%.0f status=%d", std::chrono::duration<double, std::milli>(Clock::now() - t0).count(), int(st));
+  }
+  if (st == Status::Ready) return true;
+  const uint64_t total = ++pipelineCounters().indirectPatchFallback;
+  // Loud while it lasts: the first 8, then at least one line per second with the cumulative count.
+  static std::atomic<int64_t> lastLogNs{0};
+  int64_t last = lastLogNs.load(std::memory_order_relaxed);
+  const int64_t now = nowNs();
+  if (total <= 8 || (now - last >= 1'000'000'000 && lastLogNs.compare_exchange_strong(last, now)))
+    logf("vk.indirect_patch fail status=%d (0 missing 1 queued 2 compiling 3 ready 4 failed) fallback=cpu_or_skip total=%llu", int(st),
+         (unsigned long long)total);
+  return false;
+}
+
+std::string indirectStatsLine(const PipelineCounters& c) {
+  char b[256];
+  std::snprintf(b, sizeof b,
+                "draws=%llu count_variants=%llu max_count=%u max_instances=%u cpu_readable=%llu not_readable=%llu over_cap_seen=%llu",
+                (unsigned long long)c.indirectDraws.load(), (unsigned long long)c.indirectCountDraws.load(), c.indirectMaxCount.load(),
+                c.indirectMaxInstances.load(), (unsigned long long)c.indirectCpuReadable.load(),
+                (unsigned long long)c.indirectNotReadable.load(), (unsigned long long)c.indirectOverCap.load());
+  return b;
+}
+
+void indirectStatsLog(int64_t nowNs) {
+  static std::atomic<int64_t> nextNs{0};
+  static std::mutex m;
+  static uint64_t lastDraws = 0;
+  static unsigned lines = 0;
+  if (nowNs < 0) nowNs = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+  if (nowNs < nextNs.load(std::memory_order_relaxed)) return;
+  const PipelineCounters& c = pipelineCounters();
+  std::lock_guard<std::mutex> lock(m);
+  const uint64_t draws = c.indirectDraws.load();
+  if (draws == lastDraws || lines >= 720) return;
+  lastDraws = draws, ++lines;
+  nextNs.store(nowNs + 5'000'000'000LL, std::memory_order_relaxed);
+  logf("vk.indirect_stats %s", indirectStatsLine(c).c_str());
+}
+
+// vk.indirect_stats: counts the draw and looks at up to kIndirectScan of its records when they sit in host-visible memory (what the CPU path
+// would read; for a Count draw the count word must be readable too and bounds the records). Device-local buffers are only counted.
+// With arguments the GPU generates, the host-visible bytes may be what an earlier frame left: the maxima are then stale data.
+static constexpr uint32_t kIndirectScan = 64;  // records looked at per command
+static void noteIndirectArgs(const Buffer* b, VkDeviceSize off, uint32_t n, uint32_t stride, bool indexed,
+                             const Buffer* countBuf, VkDeviceSize countOff) {
+  PipelineCounters& pc = pipelineCounters();
+  ++pc.indirectDraws;
+  if (countBuf) ++pc.indirectCountDraws;
+  const auto host = [](const Buffer* x, VkDeviceSize at, VkDeviceSize bytes) -> const uint8_t* {
+    return x && x->memory && x->memory->host && at + bytes <= x->size ? x->memory->host + x->offset + at : nullptr;
+  };
+  const uint32_t size = indexed ? 20 : 16;
+  uint32_t records = n;
+  if (countBuf) {
+    const uint8_t* cp = host(countBuf, countOff, 4);
+    if (cp) {
+      uint32_t live;
+      std::memcpy(&live, cp, 4);
+      records = std::min(records, live);
+    }
+    if (!cp || !host(b, off, size)) return void(++pc.indirectNotReadable);
+  } else if (!host(b, off, size)) {
+    return void(++pc.indirectNotReadable);
+  }
+  ++pc.indirectCpuReadable;
+  const auto atomicMax = [](std::atomic<uint32_t>& a, uint32_t v) {
+    uint32_t cur = a.load(std::memory_order_relaxed);
+    while (v > cur && !a.compare_exchange_weak(cur, v, std::memory_order_relaxed)) {}
+  };
+  for (uint32_t i = 0; i < std::min(records, kIndirectScan); ++i) {
+    const uint8_t* src = host(b, off + VkDeviceSize(i) * stride, size);
+    if (!src) break;
+    uint32_t count, instances;
+    if (indexed) {
+      VkDrawIndexedIndirectCommand c;
+      std::memcpy(&c, src, sizeof c);
+      count = c.indexCount, instances = c.instanceCount;
+    } else {
+      VkDrawIndirectCommand c;
+      std::memcpy(&c, src, sizeof c);
+      count = c.vertexCount, instances = c.instanceCount;
+    }
+    atomicMax(pc.indirectMaxCount, count), atomicMax(pc.indirectMaxInstances, instances);
+    if (count > (1u << 25) || instances > (1u << 20)) ++pc.indirectOverCap;  // commands.cpp kMaxIndirectCount / kMaxIndirectInstances
+  }
 }
 
 // vkCmdDraw(Indexed)Indirect(Count). GPU-read arguments whenever the draw is recorded inside a
@@ -2744,7 +3592,7 @@ bool indirectPatch(Device* d, vpgpu::PipelineKey& key) {
 // counted by TranslateStats::indirectCpu / indirectCpuSecondary, vk.perf ind{cpu cpu_sec}).
 void recordIndirectDraw(Recorder& r, const Buffer* b, VkDeviceSize off, uint32_t n, uint32_t stride, bool indexed,
                         const Buffer* countBuf, VkDeviceSize countOff) {
-  OpDraw op = makeDraw(r, 0, 1, 1, 0, 0, indexed);
+  OpDraw op = makeDraw(r, 0, 1, 1, 0, 0, indexed, false);
   op.indirect = b, op.indirectOffset = off, op.indirectCount = n, op.indirectStride = stride;
   if (!op.ok || !b || !b->id || n == 0) {
     if (countBuf && op.ok) {  // no GPU count without the GPU path (logged by the skip)
@@ -2754,10 +3602,53 @@ void recordIndirectDraw(Recorder& r, const Buffer* b, VkDeviceSize off, uint32_t
     r.ops.emplace_back(std::move(op));
     return;
   }
+  noteIndirectArgs(b, off, n, stride, indexed, countBuf, countOff);
+  // Triangle fans have no Metal topology: each record becomes a direct draw converted like vkCmdDraw (makeDraw), the
+  // arguments read now from the host-visible buffer (stale if the GPU writes them later in the submission).
+  if (!countBuf && op.pipe && b->memory && b->memory->host &&
+      effectiveTopology(*op.pipe, &r.bound.eds) == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN) {
+    const uint32_t size = indexed ? 20 : 16;
+    for (uint32_t i = 0; i < n; ++i) {
+      const VkDeviceSize at = off + VkDeviceSize(i) * stride;
+      if (at + size > b->size) break;
+      const uint8_t* src = b->memory->host + b->offset + at;
+      uint32_t count, instances, first, firstInstance;
+      int32_t vertexOffset = 0;
+      if (indexed) {
+        VkDrawIndexedIndirectCommand c;
+        std::memcpy(&c, src, sizeof c);
+        count = c.indexCount, instances = c.instanceCount, first = c.firstIndex, firstInstance = c.firstInstance;
+        vertexOffset = c.vertexOffset;
+      } else {
+        VkDrawIndirectCommand c;
+        std::memcpy(&c, src, sizeof c);
+        count = c.vertexCount, instances = c.instanceCount, first = c.firstVertex, firstInstance = c.firstInstance;
+      }
+      if (!count || !instances) continue;
+      if (count > (1u << 25) || instances > (1u << 20)) {  // garbage arguments (commands.cpp kMaxIndirectCount)
+        logSkip("indirect_clamped", op.pipe, "fan draw=%u of %u count=%u instances=%u", i, n, count, instances);
+        continue;
+      }
+      OpDraw d = makeDraw(r, first, count, instances, firstInstance, vertexOffset, indexed);
+      d.draw.drawIndex = i;
+      r.ops.emplace_back(std::move(d));
+    }
+    return;
+  }
   const uint32_t words = indexed ? 5 : 4;
+  if (indexed && r.bound.index8 && op.ok && op.pipe) {  // the records' indices are unknown here: the whole bound range is widened
+    const PipelineObj& pp = *op.pipe;
+    const bool restart = pp.isDynamic(VK_DYNAMIC_STATE_PRIMITIVE_RESTART_ENABLE) && r.bound.eds.restart >= 0 ? r.bound.eds.restart != 0 : pp.primitiveRestart;
+    if (!widenIndexU8(r, 0, UINT64_MAX, restart, *op.draw.index)) {
+      op.ok = false, op.reason = SkipReason::NoIndex;
+      logSkip("index_u8_unreadable", op.pipe, "indirect");
+      r.ops.emplace_back(std::move(op));
+      return;
+    }
+  }
   if (indexed && r.bound.index) {  // hazards cover the whole bound index range
     const VkDeviceSize ib = r.bound.index->size > r.bound.indexOffset ? r.bound.index->size - r.bound.indexOffset : 0;
-    op.draw.first = 0, op.draw.count = uint32_t(std::min<VkDeviceSize>(ib / (r.bound.indexWide ? 4 : 2), 0xFFFFFFFFu));
+    op.draw.first = 0, op.draw.count = uint32_t(std::min<VkDeviceSize>(ib / (r.bound.indexWide ? 4 : r.bound.index8 ? 1 : 2), 0xFFFFFFFFu));
   } else {
     op.draw.first = 0, op.draw.count = 0xFFFF;  // unknown on the CPU: never a "fullscreen" pass to VPKTAA
   }
@@ -2790,6 +3681,7 @@ void recordIndirectDraw(Recorder& r, const Buffer* b, VkDeviceSize off, uint32_t
   dp.dispatch.pipeline = pk;
   dp.dispatch.groups = {(n + 63) / 64, 1, 1};
   dp.dispatch.label = "vk.indirect_patch";
+  dp.dispatch.required = true;
   const VkDeviceSize srcBytes = VkDeviceSize(n - 1) * stride + words * 4;
   auto acc = [](vpgpu::ResourceRange rr, bool w, uint16_t slot) {
     vpgpu::Access a{rr, vpgpu::stage::compute, w};
@@ -2800,8 +3692,7 @@ void recordIndirectDraw(Recorder& r, const Buffer* b, VkDeviceSize off, uint32_t
   dp.dispatch.bindings.push_back(acc(vpgpu::ResourceRange::bytes(arena, aoff, blob.size() * 4), true, 1));
   if (countBuf) dp.dispatch.bindings.push_back(acc(vpgpu::ResourceRange::bytes(countBuf->id, countOff, 4), false, 2));
   else dp.dispatch.bindings.push_back(acc(vpgpu::ResourceRange::bytes(b->id, off, 4), false, 2));
-  r.ops.insert(r.ops.begin() + std::ptrdiff_t(r.passBegin), Op{std::move(dp)});
-  ++r.passBegin;
+  r.hoisted.emplace_back(std::move(dp));  // before the pass begins: flushHoisted at its end
   op.gpuBuffer = arena, op.gpuOffset = aoff + 32;
   op.indirectStride = words * 4;
   r.ops.emplace_back(std::move(op));
@@ -2906,7 +3797,7 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdNextSubpass(VkCommandBuffer cb, VkSu
   Recorder& r = rec(cb);
   r.ops.emplace_back(OpNextSubpass{});
   ++r.bound.subpass;
-  if (r.bound.pass && r.bound.framebuffer) r.bound.passSamples = subpassSamples(*r.bound.pass, *r.bound.framebuffer, r.bound.subpass);
+  if (r.bound.pass && r.bound.framebuffer) r.bound.passSamples = subpassSamples(*r.bound.pass, *r.bound.framebuffer, r.bound.subpass, true, markedEyeOf(r.device));
 }
 VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdNextSubpass2(VkCommandBuffer cb, const VkSubpassBeginInfo*, const VkSubpassEndInfo*) {
   vkCmdNextSubpass(cb, VK_SUBPASS_CONTENTS_INLINE);
@@ -3036,8 +3927,9 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdBeginRendering(VkCommandBuffer cb, c
     const bool clearD = !resuming && da && fi.depth() && da->loadOp == VK_ATTACHMENT_LOAD_OP_CLEAR;
     const bool clearS = !resuming && sa && fi.stencil() && sa->loadOp == VK_ATTACHMENT_LOAD_OP_CLEAR;
     // An aspect of the image that is not attached keeps its contents (it is loaded, and stored below).
-    const bool loadD = fi.depth() && (da ? da->loadOp == VK_ATTACHMENT_LOAD_OP_LOAD : true);
-    const bool loadS = fi.stencil() && (sa ? sa->loadOp == VK_ATTACHMENT_LOAD_OP_LOAD : true);
+    auto loads = [](VkAttachmentLoadOp op) { return op == VK_ATTACHMENT_LOAD_OP_LOAD || op == VK_ATTACHMENT_LOAD_OP_NONE_KHR; };
+    const bool loadD = fi.depth() && (da ? loads(da->loadOp) : true);
+    const bool loadS = fi.stencil() && (sa ? loads(sa->loadOp) : true);
     if (da) d.depth.clear.depth = da->clearValue.depthStencil.depth;
     if (sa) d.depth.clear.stencil = uint8_t(sa->clearValue.depthStencil.stencil);
     const bool keepOthers = partialArea(ri->renderArea, v) || irregular;
@@ -3105,7 +3997,7 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdBeginRendering(VkCommandBuffer cb, c
       ps.add(ri->pColorAttachments[i].imageView ? from<ImageView>(ri->pColorAttachments[i].imageView) : nullptr, false);
     if (ri->pDepthAttachment) ps.add(ri->pDepthAttachment->imageView ? from<ImageView>(ri->pDepthAttachment->imageView) : nullptr, true);
     if (ri->pStencilAttachment) ps.add(ri->pStencilAttachment->imageView ? from<ImageView>(ri->pStencilAttachment->imageView) : nullptr, true);
-    ps.finish(ri->viewMask, "rendering");
+    ps.finish(ri->viewMask, "rendering", markedEyeOf(r.device));
     r.bound.passSamples = ps.effective;
   }
   for (const auto& [src, dst] : forcedPairs) op.resolveCopies.push_back(forcedResolveCopy(src, dst, std::max<uint16_t>(d.layerCount, 1)));
@@ -3131,12 +4023,14 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdBeginRendering(VkCommandBuffer cb, c
   for (uint32_t i = 0; i < ri->colorAttachmentCount; ++i) keepImage(&ri->pColorAttachments[i]);
   keepImage(ri->pDepthAttachment);
   keepImage(ri->pStencilAttachment);
+  r.flushHoisted();  // (a pass that was never ended)
   r.passBegin = r.ops.size();
   r.ops.emplace_back(std::move(op));
   r.inPass = true;
 }
 VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdEndRendering(VkCommandBuffer cb) {
   Recorder& r = rec(cb);
+  r.flushHoisted();
   r.ops.emplace_back(OpEndPass{});
   r.inPass = false;
   r.passBegin = SIZE_MAX;
@@ -3343,6 +4237,34 @@ bool occlusionOn() {
   return !(e && *e == '0');
 }
 
+// The WAITs on occlusion queries wait at most this long in all per device and vpgpu frame; past it (or while the GPU is behind
+// the frame of an earlier wait that ran out) the query reads visible at once (a late result must not read as occluded: the
+// game would cull what is on screen).
+constexpr uint64_t kOcclusionWaitNs = 20'000'000;
+constexpr uint32_t kQueryStatsLines = 720;
+constexpr int64_t kQueryStatsEveryNs = 5'000'000'000;
+
+// vk.query_stats: what the games read from occlusion queries (backed pools), every ~5 s while they are read.
+struct QueryStats {
+  std::atomic<uint64_t> reads{0}, notReady{0}, zero{0}, positive{0}, expired{0}, skipped{0};
+  std::atomic<int64_t> lastNs{0};
+  std::atomic<uint32_t> lines{0};
+  void tick() {
+    const int64_t now = pendingNowNs();
+    int64_t last = lastNs.load(std::memory_order_relaxed);
+    if (!last) {
+      lastNs.compare_exchange_strong(last, now);
+      return;
+    }
+    if (now - last < kQueryStatsEveryNs || !lastNs.compare_exchange_strong(last, now)) return;
+    if (lines.fetch_add(1) >= kQueryStatsLines) return;
+    logf("vk.query_stats api=vulkan reads=%llu not_ready=%llu zero=%llu positive=%llu wait_expired=%llu wait_skipped=%llu",
+         static_cast<unsigned long long>(reads.load()), static_cast<unsigned long long>(notReady.load()),
+         static_cast<unsigned long long>(zero.load()), static_cast<unsigned long long>(positive.load()),
+         static_cast<unsigned long long>(expired.load()), static_cast<unsigned long long>(skipped.load()));
+  }
+} queryStats;
+
 uint32_t allocVisibility(Device* d, uint32_t count) {
   Device::Visibility& v = d->visibility;
   std::lock_guard<std::mutex> l(v.m);
@@ -3409,6 +4331,7 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkCreateQueryPool(VkDevice dev, const
     q->base = allocVisibility(q->device, q->count);
     if (q->base == UINT32_MAX) logf("vk.err what=query_pool_unbacked count=%u (occlusion reads as visible)", q->count);
   }
+  pendingTrack(q);
   *out = to<VkQueryPool>(q);
   return VK_SUCCESS;
 }
@@ -3424,6 +4347,7 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkDestroyQueryPool(VkDevice, VkQueryPool 
         break;
       }
   }
+  pendingUntrack(q);
   delete q;
 }
 VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkGetQueryPoolResults(VkDevice, VkQueryPool qp, uint32_t first, uint32_t n,
@@ -3443,6 +4367,13 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkGetQueryPoolResults(VkDevice, VkQue
     }
   };
   bool notReady = false;
+  const bool occ = p->type == VK_QUERY_TYPE_OCCLUSION;
+  Device* const dv = p->device;
+  const auto nowNs = [&] { return dv && dv->clockNs ? dv->clockNs() : pendingNowNs(); };
+  if (occ && backed) {  // a new vpgpu frame, a new wait budget
+    const uint64_t cur = dv->gpu->submittedFrames();
+    if (dv->occBudgetFrame.exchange(cur) != cur) dv->occBudgetUsedNs = 0;
+  }
   for (uint32_t i = 0; i < n; ++i) {
     uint8_t* at = static_cast<uint8_t*>(data) + size_t(i) * stride;
     if (size_t(i) * stride + word * (withAvail ? 2 : 1) > size) break;
@@ -3457,21 +4388,49 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkGetQueryPoolResults(VkDevice, VkQue
       std::lock_guard<std::mutex> l(p->m);
       f = q < p->frame.size() ? p->frame[q] : 0;
     }
-    bool avail = false;
+    bool avail = false, expired = false, skipped = false;
     if (f) {
-      const auto w = p->device->platform->waitFrames(f - 1, (flags & VK_QUERY_RESULT_WAIT_BIT) ? UINT64_MAX : 0);
+      uint64_t timeout = 0;
+      if (flags & VK_QUERY_RESULT_WAIT_BIT) {
+        if (!occ) timeout = UINT64_MAX;
+        else {
+          uint64_t late = dv->occLateFrame.load();
+          if (late && dv->platform->waitFrames(late - 1, 0) == Platform::WaitResult::Done)
+            dv->occLateFrame.compare_exchange_strong(late, 0), late = 0;
+          const uint64_t used = dv->occBudgetUsedNs.load();
+          if (!late && used < kOcclusionWaitNs) timeout = kOcclusionWaitNs - used;
+          else skipped = true;  // the GPU is behind / the budget is spent: look once, never wait
+        }
+      }
+      const int64_t t0 = timeout && occ ? nowNs() : 0;
+      const auto w = p->device->platform->waitFrames(f - 1, timeout);
+      if (timeout && occ) dv->occBudgetUsedNs += uint64_t(std::max<int64_t>(0, nowNs() - t0));
       if (w == Platform::WaitResult::Lost) return VK_ERROR_DEVICE_LOST;
       avail = w == Platform::WaitResult::Done;
+      expired = !avail && occ && timeout != 0;
+      skipped = skipped && !avail;
+      if (expired) {
+        uint64_t late = dv->occLateFrame.load();
+        while (late < f && !dv->occLateFrame.compare_exchange_weak(late, f)) {}
+      }
     }
     // (WAIT on a query never ended would hang forever in Vulkan; it reports not ready instead.)
-    if (avail || (flags & VK_QUERY_RESULT_PARTIAL_BIT)) {
-      uint64_t v;
-      std::memcpy(&v, p->device->visibility.host + size_t(p->base + q) * 8, 8);
-      put(at, v);
-    }
+    uint64_t v = 0;
+    if (avail || (!expired && !skipped && (flags & VK_QUERY_RESULT_PARTIAL_BIT)))
+      std::memcpy(&v, p->device->visibility.host + size_t(p->base + q) * 8, 8), put(at, v);
+    else if (expired || skipped) put(at, 1), avail = true;  // the wait ran out / was not made: visible, not 0
     if (withAvail) put(at + word, avail ? 1 : 0);
-    if (!avail) notReady = true;
+    if (!avail) notReady = true, p->lastNotReady = q;
+    if (occ) {
+      queryStats.reads.fetch_add(1, std::memory_order_relaxed);
+      if (expired) queryStats.expired.fetch_add(1, std::memory_order_relaxed);
+      else if (skipped) queryStats.skipped.fetch_add(1, std::memory_order_relaxed);
+      else if (!avail) queryStats.notReady.fetch_add(1, std::memory_order_relaxed);
+      else (v ? queryStats.positive : queryStats.zero).fetch_add(1, std::memory_order_relaxed);
+    }
   }
+  if (occ && p->base != UINT32_MAX) queryStats.tick();
+  p->poll.note(notReady ? VK_NOT_READY : VK_SUCCESS);  // vk.pending (pending.cpp)
   return notReady ? VK_NOT_READY : VK_SUCCESS;
 }
 VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkResetQueryPool(VkDevice, VkQueryPool qp, uint32_t first, uint32_t n) {
@@ -3536,7 +4495,7 @@ PFN_vkVoidFunction lookupPhase3(const char* name) {
       F(vkUpdateDescriptorSets), F(vkCreateDescriptorUpdateTemplate), F(vkDestroyDescriptorUpdateTemplate),
       F(vkUpdateDescriptorSetWithTemplate), F(vkCreateGraphicsPipelines), F(vkCreateComputePipelines), F(vkDestroyPipeline),
       F(vkCreatePipelineCache), F(vkDestroyPipelineCache), F(vkGetPipelineCacheData), F(vkMergePipelineCaches),
-      F(vkCmdBindPipeline), F(vkCmdBindDescriptorSets), F(vkCmdPushConstants), F(vkCmdBindVertexBuffers),
+      F(vkCmdBindPipeline), F(vkCmdBindDescriptorSets), F(vkCmdPushDescriptorSetKHR), F(vkCmdPushDescriptorSetWithTemplateKHR), F(vkCmdPushConstants), F(vkCmdBindVertexBuffers),
       F(vkCmdBindVertexBuffers2), F(vkCmdBindIndexBuffer), F(vkCmdSetViewport), F(vkCmdSetScissor),
       F(vkCmdSetStencilReference), F(vkCmdSetBlendConstants), F(vkCmdSetLineWidth), F(vkCmdSetDepthBias),
       F(vkCmdSetDepthBounds), F(vkCmdSetViewportWithCount), F(vkCmdSetScissorWithCount), F(vkCmdSetCullMode),

@@ -42,7 +42,7 @@ leg() {
   $runner "$(abs "$VPREPLAY")" "$cap" "$@" --dump "$dir" --dump-at "$DUMP_AT" > "$dir/replay.log" 2>&1 || rc=$?
   grep -E '^vpreplay: (calls=|capture )' "$dir/replay.log" | sed "s|^|$kind: |" || true
   if [ "$rc" -ne 0 ] || [ ! -f "$dir/index.json" ]; then
-    tail -n 20 "$dir/replay.log" >&2
+    tail -n 200 "$dir/replay.log" >&2
     die "$kind replay of $(basename "$cap") failed (exit $rc, ${dir}/replay.log)"
   fi
 }

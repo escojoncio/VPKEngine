@@ -34,7 +34,7 @@ Reconstruction reconstruction(float sx, float sy) {
     float best = 1e9f;
     for (int o = -1; o <= 1; ++o) {
       const float d = float(r.base[a] + o) - s[a];
-      axis[a][o + 1] = std::exp(-2.29f * d * d);
+      axis[a][o + 1] = std::exp(-3.125f * d * d);
       if (std::fabs(d) < best) best = std::fabs(d), r.nearest[a] = o;
     }
   }

@@ -1,0 +1,17 @@
+module fragment
+
+input a : vec4<f32> location(0)
+output nan_safe : vec4<f32> location(0)
+output plain : vec4<f32> location(1)
+
+; precise min / max (SPIR-V NMin / NMax / NClamp) become precise::fmin / fmax; the unmarked ones stay min / max.
+func main() {
+  %0 = load_input a : vec4<f32>
+  %1 = const 0.5, 0.25, 2.0, 1.0 : vec4<f32>
+  %2 = precise max %0, %1 : vec4<f32>
+  %3 = precise min %2, %1 : vec4<f32>
+  store_output nan_safe, %3
+  %4 = max %0, %1 : vec4<f32>
+  %5 = min %4, %1 : vec4<f32>
+  store_output plain, %5
+}

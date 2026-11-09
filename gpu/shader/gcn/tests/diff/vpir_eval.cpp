@@ -215,8 +215,9 @@ struct Machine {
                 return true;
             case Op::Mix:
                 out = map3(a[0], a[1], a[2], t, [&](uint32_t x, uint32_t y, uint32_t w) {
-                    float fx = fl(s, x);
-                    return fb(s, fx + (fl(s, y) - fx) * fl(s, w));
+                    // Same formula as the MSL emitter: fma(y, a, fma(x, -a, x)); exact at a = 0 and a = 1.
+                    const float fx = fl(s, x), fw = fl(s, w);
+                    return fb(s, std::fma(fl(s, y), fw, std::fma(fx, -fw, fx)));
                 });
                 return true;
             case Op::UnpackUnorm4x8:
@@ -414,6 +415,14 @@ struct Machine {
                 out = a[0];
                 out.bits[in.lits[0]] = a[1].bits[0];
                 break;
+            case Op::BufferSize: {  // the byte size of the buffer bound to the same slot (what OpArrayLength reads)
+                for (uint32_t r = 0; r < m.resources.size(); ++r)
+                    if (m.resources[r].kind == vpir::ResourceKind::Buffer && m.resources[r].index == m.resources[in.sym].index) {
+                        auto mem = inv.memory.find(r);
+                        out.bits[0] = mem == inv.memory.end() ? 0u : uint32_t(mem->second.size());
+                    }
+                break;
+            }
             case Op::Shuffle:
                 for (unsigned c = 0; c < in.type.width; ++c) {
                     uint32_t l = in.lits[c];

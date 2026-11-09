@@ -102,7 +102,10 @@ struct IoVar {
 // draw; the emitter places it in the `constant` address space so reads skip generic memory paths.
 // BufferSize: the byte size of the range bound to Buffer slot `index` (the same binding), read with
 // buffer_size (SPIR-V OpArrayLength). Last, so the other kinds keep their argument-table order.
-enum class ResourceKind : uint8_t { Buffer, ConstantBuffer, Texture, Sampler, StorageTexture, BufferSize };
+// SamplerBias: the lod bias (float) of the Sampler with the same `index`, written by the backend (the
+// sampler's mipLodBias; Metal's own sampler lodBias has no effect on the device); the emitter adds it
+// to the lod of every sample through that sampler.
+enum class ResourceKind : uint8_t { Buffer, ConstantBuffer, Texture, Sampler, StorageTexture, BufferSize, SamplerBias };
 enum class TexDim : uint8_t { D1, D2, D2Array, D3, Cube, CubeArray };
 enum class Access : uint8_t { Read, Write, ReadWrite };
 
@@ -157,6 +160,15 @@ enum class Topology : uint8_t { Point, Line, Triangle };
 //                  0..waveSize-1, subgroup_ballot sets bit i of its vec4<u32> mask for lane i (bits
 //                  >= waveSize are 0) and broadcast/shuffle lanes must be < waveSize. A wave is the
 //                  set of invocations that execute in lockstep; it is not tied to the workgroup.
+//   subgroup_arith v, lane, kind, mode, cluster, identity  a reduction or scan of `v` over the ACTIVE lanes of the wave
+//                  (SPIR-V OpGroupNonUniform{I,F}{Add,Mul}, {S,U,F}{Min,Max}, Bitwise/Logical{And,Or,Xor}); `lane` is this
+//                  invocation's lane id (subgroup_invocation). kind: 0 add, 1 mul, 2 min, 3 max, 4 and, 5 or, 6 xor (min / max
+//                  compare as the operand's type: i32 signed, u32 unsigned; and / or / xor need an integer). mode: 0 reduce
+//                  over all active lanes, 1 inclusive scan (active lanes <= lane), 2 exclusive scan (active lanes < lane; an
+//                  invocation with none gets the identity), 3 clustered reduce (the active lanes whose id >> log2(cluster)
+//                  equals this one's; cluster a power of two, 1..16; 32 or more is mode 0). `identity`: the bits of the
+//                  identity element for integer operands (ignored for floats, whose identities are 0, 1, +inf, -inf).
+//                  Result type = operand type (never bool).
 //   quad_shuffle v, lane  the value of `v` in lane `lane` (0..3) of this invocation's quad: the
 //                  2x2 pixels a fragment shares derivatives with (lane = x + 2y), or four
 //                  consecutive invocations in compute. quad_any: any lane of the quad has it true.
@@ -287,6 +299,7 @@ enum class Topology : uint8_t { Point, Line, Triangle };
     X(SubgroupReadFirst, "subgroup_read_first", "v")                                               \
     X(SubgroupAny, "subgroup_any", "v")                                                            \
     X(SubgroupAll, "subgroup_all", "v")                                                            \
+    X(SubgroupArith, "subgroup_arith", "vvN")                                                      \
     X(QuadShuffle, "quad_shuffle", "vv")                                                           \
     X(QuadAny, "quad_any", "v")                                                                    \
     X(MeshDispatch, "mesh_dispatch", "vvv")                                                        \

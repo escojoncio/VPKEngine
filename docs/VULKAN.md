@@ -1,6 +1,6 @@
 # VPVulkan — VPKEngine's own Vulkan driver (`gpu/vulkan`)
 
-A Vulkan 1.1 driver for Apple Vision Pro built on `gpu/core` (pass graph, hazards, pipeline cache) and
+A Vulkan 1.3 driver for Apple Vision Pro built on `gpu/core` (pass graph, hazards, pipeline cache) and
 `gpu/metal`. Goal: Quest titles (Vulkan, Unity/Unreal) running through Klepton load `libVPVulkan.dylib`
 where they loaded MoltenVK today. Written from the Vulkan specification; uses only the Khronos headers
 (`third_party/vulkan-headers`). No MoltenVK, Mesa or SPIRV-Cross code.
@@ -17,7 +17,8 @@ where they loaded MoltenVK today. Written from the Vulkan specification; uses on
 
 ## Model
 - **One physical device**, reported as Adreno 740 (vendor 0x5143) with Quest-3-like limits so engines
-  pick their mobile Vulkan path. One queue family (graphics+compute+transfer), one queue.
+  pick their mobile Vulkan path. One queue family (graphics+compute+transfer) with 4 VkQueues (Quest: queueCount 4, timestampValidBits 48): each
+  keeps its own submission order and all run on the one Metal command queue in the order their batches become ready.
 - **Memory**: one DEVICE_LOCAL heap; types 0 device, 1 host-visible coherent, 2 +cached, 3 lazily
   allocated (transient attachments only). Every `VkDeviceMemory` is page-aligned (16 KiB) host memory;
   a bound `VkBuffer` is a core buffer aliasing `memory + offset` (`BufferDesc::guestMemory`, Metal

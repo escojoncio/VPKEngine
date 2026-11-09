@@ -101,6 +101,10 @@ struct OpCopyBufferToImage {
   const Buffer* src = nullptr;
   const Image* dst = nullptr;
   VkBufferImageCopy region{};
+  // 3D ASTC image (created as RGBA8, texdecode.h): arena room for the region decoded to RGBA8, filled at submit from `src`.
+  vpgpu::BufferId decoded;
+  VkDeviceSize decodedOffset = 0;
+  uint8_t* decodedHost = nullptr;
 };
 struct OpCopyImageToBuffer {
   const Image* src = nullptr;
@@ -240,10 +244,11 @@ struct BoundState {
     VkDeviceSize size = VK_WHOLE_SIZE;  // vkCmdBindVertexBuffers2
     int64_t stride = -1;                 // vkCmdBindVertexBuffers2 (dynamic strides); -1 = the pipeline's
   };
-  std::array<VB, 16> vertex{};
+  std::array<VB, 32> vertex{};
   const Buffer* index = nullptr;
   VkDeviceSize indexOffset = 0;
   bool indexWide = false;
+  bool index8 = false;  // VK_INDEX_TYPE_UINT8: widened to 16 bits for the draw (pipelines.cpp widenIndexU8)
   bool hasViewport = false, hasScissor = false;
   VkViewport viewport{};
   VkRect2D scissor{};
@@ -288,10 +293,10 @@ struct PassSamples {
   bool mismatch = false, hasColor = false, hasDepth = false;
   uint32_t w = 0, h = 0;
   void add(const ImageView* v, bool depth);
-  void finish(uint32_t viewMask, const char* what);  // logs a mismatch, feeds the detection
+  void finish(uint32_t viewMask, const char* what, uint64_t markedEye = 0);  // logs a mismatch, feeds the detection
 };
 // Effective sample count of subpass `sub` (0 = no attachments); `observe` feeds the detection.
-uint8_t subpassSamples(const RenderPassObj&, const Framebuffer&, uint32_t sub, bool observe = true);
+uint8_t subpassSamples(const RenderPassObj&, const Framebuffer&, uint32_t sub, bool observe = true, uint64_t markedEye = 0);
 // Pipeline key for a draw into a pass of `passSamples` (variant with that count if it differs).
 vpgpu::PipelineKey pipelineFor(Device*, const PipelineObj&, uint8_t passSamples, PipelineObj::TexelVariant* tv = nullptr,
                                const BoundState::Eds* eds = nullptr);
@@ -303,6 +308,7 @@ vpgpu::PipelineKey pipelineFor(Device*, const PipelineObj&, uint8_t passSamples,
 bool resolvePipeline(Device*, const PipelineObj&);
 // Per-boot counters of the pipeline machinery (all threads).
 struct PipelineCounters {
+  // Cumulative, not distinct: every stage translation answered by the recipe store counts (the same stage twice counts twice).
   std::atomic<uint64_t> stagesCached{0}, stagesTranslated{0}, translateUs{0};
   // Why a stage was translated although a cache exists: the SPIR-V is new, only its options are (another layout,
   // vertex format, view mask), a translator component moved (lower / emit / driver / baseline), MSL gone, or no cache.
@@ -314,18 +320,28 @@ struct PipelineCounters {
   // vk.pso.census: creations whose SPIR-V translation failed (the Metal compile failures are the cache's: totals().failed),
   // and pipelines still not ready when vkCreate*Pipelines gave up waiting (legacy mode, VPVK_PIPELINE_CREATE_WAIT_MS).
   std::atomic<uint64_t> translateFailed{0}, createTimedOut{0};
+  // vk.pso.probe (noteCompileRequired): creates refused with FAIL_ON_PIPELINE_COMPILE_REQUIRED, by kind; their recipes stored (recorded),
+  // probed before (dup) or refused at the cap (capped).
+  std::atomic<uint64_t> probeGraphics{0}, probeCompute{0}, probeRecorded{0}, probeDup{0}, probeCapped{0};
   std::atomic<uint64_t> recordWaits{0}, recordTimeouts{0};
+  // Draws that wanted the indirect-argument patch kernel (vk.indirect_patch) while it was failed / not back in 2 s: CPU path or skipped.
+  std::atomic<uint64_t> indirectPatchFallback{0};
   std::atomic<uint64_t> gateFrames{0}, gateSkipFrames{0}, gateSkippedDraws{0}, hardWaits{0}, hardTimeouts{0};
   // gpu.amp (ampCensus): draws of multiview pipelines since the last line, amplified or instanced (by PipelineObj::AmpWhy for the
   // latter), and the view-vertices (count x instances, views included) of the instanced ones.
   std::atomic<uint64_t> ampDraws{0}, ampInstDraws{0}, ampInstVerts{0}, ampBy[PipelineObj::AmpWhyCount]{};
+  // vk.indirect_stats (indirectStatsLog): vkCmdDraw*Indirect* recorded (indirectDraws; indirectCountDraws = the Count variants), and what
+  // the CPU could see of their records in host-visible memory (never a GPU readback): the largest count / instance count, commands
+  // whose records were readable / not, and records past the caps of commands.cpp (count > 2^25 or instances > 2^20).
+  std::atomic<uint64_t> indirectDraws{0}, indirectCountDraws{0}, indirectCpuReadable{0}, indirectNotReadable{0}, indirectOverCap{0};
+  std::atomic<uint32_t> indirectMaxCount{0}, indirectMaxInstances{0};
 };
 PipelineCounters& pipelineCounters();
 struct GateResult {
   uint32_t draws = 0, skipped = 0, softPending = 0, hardPending = 0;
   double waitedMs = 0, hardWaitedMs = 0;
   // Draws with a pending pipeline / dropped, by destination class (pipelines.cpp DestClass: eye, no_color,
-  // transient_rt, persistent_rt, eye_sized_not_marked). Only "eye" is ever soft.
+  // transient_rt, persistent_rt, eye_sized_not_marked). A pass is soft when it is the eye or its target is redrawn every frame (pipelines.cpp redrawnEveryFrame).
   uint32_t pendingByClass[5] = {}, skippedByClass[5] = {};
 };
 GateResult gateFramePipelines(Device*, vpgpu::Frame&, uint64_t submitNo);
@@ -333,8 +349,29 @@ void pipelineSummary(Device*, bool final);
 // "vk.pso.census": one line with how many pipelines the game created and what became of each (pipelines.cpp). Without
 // `force`, at most every 10 s and only when a counter moved; `force` (cache flush, device destroy) always prints.
 void psoCensus(Device*, bool force);
+// Complete shader cache detector (vpvk.h CacheWatch). cacheNowNs: the device's clock (Device::clockNs in tests, else the steady
+// clock). noteCacheKey: a pipeline key was created or probed. cacheState: evaluates, fills `out` and logs a change of
+// complete / reason ("vk.cache_state"). cacheStateTick: from the submit tick, evaluates at most once a second.
+int64_t cacheNowNs(const Device*);
+void noteCacheKey(Device*, uint64_t key);
+void cacheState(Device*, VpvkCacheState& out);
+void cacheStateTick(Device*);
+void joinCacheFlush(Device*);  // vkDestroyDevice: waits for the archive flush thread that complete turning 1 started
+// A create with FAIL_ON_PIPELINE_COMPILE_REQUIRED the cache / recipes do not hold is answered COMPILE_REQUIRED as always; only its recipe
+// is stored (at most kProbeRecipeCap per session) so the next boot's prewarm has it. Nothing is compiled or retained; the key stays
+// unknown (pipelineKnown) until something compiles it. probeReport: the "vk.pso.probe" line, at most every 5 s (`force`: now), 720 lines.
+void noteCompileRequired(Device*, const vpgpu::PipelineState&, vpgpu::PipelineKey, const std::array<uint64_t, 3>& inputs, bool compute);
+void probeReport(Device*, bool force);
+void setProbeRecipeCap(uint32_t cap);  // tests
+// The "key=value ..." body of that line.
+std::string psoCensusLine(const PipelineCounters&, const vpgpu::PipelineStats&, const Platform::ArchiveCensus&);
 // "gpu.amp": multiview draws per 10 s, vertex amplified vs by instancing (and why not amplified); called from the submit tick.
 void ampCensus();
+// "vk.indirect_stats": the indirect-draw counters above, cumulative, at most every 5 s and only when a draw was recorded since the last
+// line, 720 lines at most (called from the submit tick). nowNs < 0 = the steady clock (tests pass their own).
+void indirectStatsLog(int64_t nowNs = -1);
+// The "key=value ..." body of that line.
+std::string indirectStatsLine(const PipelineCounters&);
 
 struct Recorder {
   Device* device = nullptr;
@@ -342,18 +379,47 @@ struct Recorder {
   uint32_t barriers = 0;  // vkCmdPipelineBarrier calls dropped (the core derives its own)
   bool inPass = false;
   size_t passBegin = SIZE_MAX;  // index of the open pass's begin op (indirect argument patches go before it)
+  // Compute ops that must run before the open pass (index widening, indirect argument patches): collected while the pass
+  // records and put before its begin op in one insertion when it ends (flushHoisted), not one insert per draw.
+  std::vector<Op> hoisted;
+  // The 8-bit index buffers widened in the open pass (the same bound range drawn again reuses the arena copy).
+  struct Widened {
+    vpgpu::BufferId buffer;
+    uint64_t at = 0, n = 0;
+    bool restart = false;
+    vpgpu::IndexBuffer out;
+  };
+  std::vector<Widened> widened;
+  void flushHoisted() {
+    widened.clear();
+    if (hoisted.empty()) return;
+    if (passBegin < ops.size()) {
+      ops.insert(ops.begin() + std::ptrdiff_t(passBegin), std::make_move_iterator(hoisted.begin()), std::make_move_iterator(hoisted.end()));
+      passBegin += hoisted.size();
+    } else {
+      for (Op& o : hoisted) ops.push_back(std::move(o));
+    }
+    hoisted.clear();
+  }
   bool hasLocalRead = false;    // an in-pass barrier was recorded in a dynamic rendering pass (translator: local read)
   BoundState bound;
   UploadArena arena;
   // VK_KHR_imageless_framebuffer: the framebuffer of each pass begun with its views given at
   // vkCmdBeginRenderPass (VkRenderPassAttachmentBeginInfo); ops point at them until reset.
   std::vector<std::unique_ptr<Framebuffer>> imageless;
+  // VK_KHR_push_descriptor: one set per (bind point, set number), rewritten in place by each push. A draw copies its
+  // descriptors when it is recorded, so a later push does not reach it.
+  std::array<std::array<std::unique_ptr<DescriptorSetObj>, 8>, 2> pushSets;
   void reset() {
     imageless.clear();
+    for (auto& bp : pushSets)
+      for (auto& s : bp) s.reset();
     ops.clear();
     barriers = 0;
     inPass = false;
     passBegin = SIZE_MAX;
+    hoisted.clear();
+    widened.clear();
     hasLocalRead = false;
     bound = BoundState{};
     arena.reset();
@@ -416,12 +482,24 @@ bool maskPipelineKey(Device*, const PipelineObj& p, PipelineObj::TexelVariant* t
 // Synchronous pipeline mode: waits once (VPVK_PIPELINE_DRAW_WAIT_MS) for the mask variants maskPipelineKey requested since
 // the last call (UiMaskState::freshVariants). submitMutex held; no-op in the asynchronous mode.
 void awaitFreshVariants(Device*);
+// The indirect-argument patch kernel (pipelines.cpp): requested at vkCreateDevice; indirectPatchRef mirrors its MSL for the tests.
+void requestIndirectPatch(Device*);
+// The 8-bit index widening kernel (VK_EXT_index_type_uint8; pipelines.cpp); indexU8Ref mirrors its MSL for the tests.
+void requestIndexU8(Device*);
+// mayWait false: a kernel still compiling is not waited for (the caller reads the indices on the CPU instead).
+bool indexU8Ready(Device*, vpgpu::PipelineKey&, bool mayWait = true);
+uint16_t indexU8Ref(uint8_t index, bool restartEnabled);
+const char* indexU8Msl();
+bool indirectPatch(Device*, vpgpu::PipelineKey&);
+void indirectPatchRef(uint32_t i, const uint32_t* prm, const uint32_t* src, const uint32_t* count, uint32_t* out);
+const char* indirectPatchMsl();
 
 // Records a draw/dispatch with the current state (pipelines.cpp).
 size_t recordedOps(VkCommandBuffer);
 void setDrawIndexSince(VkCommandBuffer, size_t before, uint32_t index);
+// `widenIndex` false: the draw keeps the bound index buffer as is (an 8-bit one is widened by the caller: indirect draws).
 OpDraw makeDraw(Recorder&, uint32_t first, uint32_t count, uint32_t instances, uint32_t firstInstance,
-                int32_t baseVertex, bool indexed);
+                int32_t baseVertex, bool indexed, bool widenIndex = true);
 OpDispatch makeDispatch(Recorder&, uint32_t x, uint32_t y, uint32_t z);
 // One "vk.skip" line (the first 32 of the process) for a draw / dispatch that is not drawn; `fmt` adds details.
 void logSkip(const char* why, const PipelineObj* p, const char* fmt = nullptr, ...) __attribute__((format(printf, 3, 4)));

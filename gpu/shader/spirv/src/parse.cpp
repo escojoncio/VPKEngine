@@ -184,7 +184,8 @@ struct Parser {
                 return true;
             case OpExtInstImport:
                 if (!need(in, 3)) return false;
-                if (literalString(m, in, 2) == "GLSL.std.450") m.glslExt = w(in, 1);
+                if (const std::string name = literalString(m, in, 2); name == "GLSL.std.450") m.glslExt = w(in, 1);
+                else if (name.rfind("NonSemantic.", 0) == 0) m.nonSemanticExt.push_back(w(in, 1));
                 return true;
             case OpEntryPoint: {
                 if (!need(in, 4)) return false;
@@ -352,6 +353,19 @@ bool declaresLayer(const SpirvModule& m) {
         if (isLayer(d)) return true;
     for (const auto& [member, d] : m.memberDecorations)
         if (isLayer(d)) return true;
+    return false;
+}
+
+bool declaresSampleBuiltin(const SpirvModule& m) {
+    auto isSample = [](const Decorations& d) {
+        if (!d.has(spv::Deco::BuiltIn)) return false;
+        const uint32_t b = d.get(spv::Deco::BuiltIn);
+        return b == uint32_t(spv::BuiltIn::SampleId) || b == uint32_t(spv::BuiltIn::SampleMask);
+    };
+    for (const auto& [id, d] : m.decorations)
+        if (isSample(d)) return true;
+    for (const auto& [member, d] : m.memberDecorations)
+        if (isSample(d)) return true;
     return false;
 }
 
