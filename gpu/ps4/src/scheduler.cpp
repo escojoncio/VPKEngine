@@ -1,13 +1,16 @@
 #include "vpps4/scheduler.h"
 
 #include <algorithm>
+#include <cstdlib>
+
+#include "vpgpu/core/probe.h"
 
 namespace vpps4 {
 
 using vpgpu::SubmitReason;
 
 Scheduler::Scheduler(Renderer& r, vpgpu::Device& d, vpgpu::SubmitPolicy p, Clock c)
-    : renderer_(r), device_(d), policy_(p), now_(std::move(c)) {}
+    : renderer_(r), device_(d), policy_(p), now_(std::move(c)), dmaGpu_(!std::getenv("VPKENGINE_DMA_CPU")) {}
 
 void Scheduler::resetOpen() {
     openSince_ = labelSince_ = -1;
@@ -57,16 +60,20 @@ double Scheduler::nextCheckMs() const {
     return vpgpu::nextCheckMs(policy_, stateOf(renderer_, now_(), openSince_, labelSince_, labelIrq_));
 }
 
-bool Scheduler::syncCpu(uint64_t a, uint64_t n, SubmitReason why, uint64_t b, uint64_t m) {
+bool Scheduler::syncCpu(uint64_t a, uint64_t n, SubmitReason why, uint64_t b, uint64_t m, const char* caller) {
     uint64_t target = renderer_.waitTarget(a, n, b, m);
     uint64_t labels = std::max(device_.labelWaitTarget(a, uint32_t(std::min<uint64_t>(n, ~0u))),
                                m ? device_.labelWaitTarget(b, uint32_t(std::min<uint64_t>(m, ~0u))) : 0);
     if (target == 0 && labels == 0) {
         ++counters_.cpuSyncFree;
         renderer_.waitedBelow(device_.completedFrames());  // (write backs the GPU has run give their pages back)
+        renderer_.noteCpuSync(caller, a, n, b, m, "", 0, false, 0);
         return false;
     }
     ++counters_.cpuSyncs;
+    const bool probing = vpgpu::probe::enabled();
+    const std::string busyRange = probing ? renderer_.busyText(a, n, b, m) : std::string();
+    const bool unsubmitted = target == Renderer::kUnsubmitted || labels > device_.submittedFrames();
     // Recorded work (or a label waiting for it) is part of what must finish: it goes first. Frames
     // are numbered in submit order, so the frame it becomes is the last one.
     if (target == Renderer::kUnsubmitted || labels > device_.submittedFrames()) {
@@ -94,7 +101,20 @@ bool Scheduler::syncCpu(uint64_t a, uint64_t n, SubmitReason why, uint64_t b, ui
         }
     }
     counters_.waitMs += now_() - t0;
+    if (probing) renderer_.noteCpuSync(caller, a, n, b, m, busyRange, frames, unsubmitted, now_() - t0);
     return frames != 0;
+}
+
+bool Scheduler::dmaOnGpu(uint64_t a, uint64_t n, uint64_t b, uint64_t m) {
+    if (!dmaGpu_) return false;
+    // (a label write into the range lands when its frame completes: it must come before the DMA's bytes, which only the
+    // CPU waiting for it guarantees)
+    if (device_.labelWaitTarget(a, uint32_t(std::min<uint64_t>(n, ~0u))) ||
+        (m && device_.labelWaitTarget(b, uint32_t(std::min<uint64_t>(m, ~0u)))))
+        return false;
+    if (renderer_.waitTarget(a, n, b, m) == 0) return false;
+    ++counters_.dmaRecorded;
+    return true;
 }
 
 void Scheduler::finish() {
@@ -190,7 +210,7 @@ std::string Scheduler::takeSummary() {
     s += " frames=" + std::to_string(counters_.frames) + " cpu_sync=" + std::to_string(counters_.cpuSyncs) + "/" +
          std::to_string(counters_.cpuSyncs + counters_.cpuSyncFree) + " partial_waits=" +
          std::to_string(counters_.partialWaits) + " full_waits=" + std::to_string(counters_.fullWaits) +
-         " labels=" + std::to_string(counters_.labels) + " ordered_waits=" + std::to_string(counters_.orderedWaits) +
+         " dma_gpu=" + std::to_string(counters_.dmaRecorded) + " labels=" + std::to_string(counters_.labels) + " ordered_waits=" + std::to_string(counters_.orderedWaits) +
          " polled_waits=" + std::to_string(counters_.polledWaits) + " idle_waits=" + std::to_string(counters_.idleWaits) + " wait_ms=" + std::to_string(int(counters_.waitMs));
     if (counters_.labelTimeouts) s += " label_timeouts=" + std::to_string(counters_.labelTimeouts);
     counters_ = {};

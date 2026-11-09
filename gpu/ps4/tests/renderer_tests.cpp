@@ -1918,6 +1918,133 @@ void partialWaits() {
     CHECK(x.f.backend.waits.back() == 5);
 }
 
+// Host DMA (Rasterizer::FillBuffer / CopyBuffer of the app) with a byte pattern: on the GPU timeline when queued GPU work
+// touches the range (Scheduler::dmaOnGpu: no wait, no submit), on the CPU in place when it is free. The NullBackend does not run
+// copies: gpuRuns() applies the ones submitted so far, in order, to the guest block.
+struct HostDma {
+    Sched x;
+    size_t ran = 0;
+    bool fill(uint64_t addr, uint64_t bytes, uint8_t byte) {  // true = on the CPU
+        if (x.s.dmaOnGpu(addr, bytes)) {
+            CHECK(x.f.renderer.fill(addr, bytes, byte * 0x01010101u));
+            x.s.noteWork();
+            return false;
+        }
+        x.s.syncCpu(addr, bytes, vpgpu::SubmitReason::Dma, 0, 0, "fill");
+        std::memset(x.f.at(addr), byte, bytes);
+        x.f.renderer.invalidate(addr, bytes);
+        return true;
+    }
+    bool copy(uint64_t dst, uint64_t src, uint64_t bytes) {
+        if (x.s.dmaOnGpu(src, bytes, dst, bytes)) {
+            CHECK(x.f.renderer.copy(dst, src, bytes));
+            x.s.noteWork();
+            return false;
+        }
+        x.s.syncCpu(src, bytes, vpgpu::SubmitReason::Dma, dst, bytes, "copy");
+        std::memmove(x.f.at(dst), x.f.at(src), bytes);
+        x.f.renderer.invalidate(dst, bytes);
+        return true;
+    }
+    void gpuRuns() {
+        for (; ran < x.f.backend.copies.size(); ++ran) {
+            const vpgpu::Copy& c = x.f.backend.copies[ran];
+            uint8_t* dst = static_cast<uint8_t*>(x.f.host) + c.dstBuffer.offset;
+            if (c.kind == vpgpu::CopyKind::FillBuffer) std::memset(dst, c.fillByte, c.dstBuffer.size);
+            else std::memmove(dst, static_cast<uint8_t*>(x.f.host) + c.srcBuffer.offset, c.dstBuffer.size);
+        }
+    }
+};
+
+// A DMA over a range the running GPU work touches does not wait for it (nor submit): it is recorded in order with that work.
+// A free range stays on the CPU, in place. The bytes are what the in-order timeline would leave.
+void dmaOnGpu() {
+    HostDma h;
+    Sched& x = h.x;
+    x.work(kBase + 0x1000);  // GPU work over [0x1000, 0x1100) ...
+    x.s.present();           // ... frame 0, submitted and still running
+    CHECK(!h.fill(kBase + 0x1080, 64, 0xaa));                // overlaps it: recorded
+    CHECK(!h.copy(kBase + 0x3000, kBase + 0x1080, 64));      // the source is that fill's destination
+    CHECK(x.f.backend.waits.empty() && x.submits() == 1);    // no wait, no submit
+    CHECK(x.s.counters().cpuSyncs == 0 && x.s.counters().dmaRecorded == 2);
+    CHECK(*x.f.at(kBase + 0x1080) == 0 && *x.f.at(kBase + 0x3000) == 0);  // (the GPU has not run them)
+    CHECK(h.fill(kBase + 0x9000, 64, 0x55));                 // untouched by the GPU: in place, now
+    CHECK(*x.f.at(kBase + 0x9000) == 0x55555555u && x.f.backend.waits.empty());
+    CHECK(x.s.counters().dmaRecorded == 2 && x.s.counters().cpuSyncFree == 1);
+    // A DMA after a recorded one on the same bytes keeps the order (the later fill wins).
+    CHECK(!h.fill(kBase + 0x3000, 16, 0x11));
+    x.s.present();
+    h.gpuRuns();
+    CHECK(*x.f.at(kBase + 0x1080) == 0xaaaaaaaau && *x.f.at(kBase + 0x3000) == 0x11111111u);
+    CHECK(*x.f.at(kBase + 0x3010) == 0xaaaaaaaau);
+    CHECK(x.f.backend.waits.empty());
+}
+
+// The CP reads (IB, label, WAIT_REG_MEM) go through syncCpu: a range with a recorded DMA waits for it, and a label queued
+// after it lands after it. A label queued before it is written before the DMA (that DMA stays on the CPU, behind the wait).
+void dmaThenLabel() {
+    HostDma h;
+    Sched& x = h.x;
+    const uint64_t label = kBase + 0x5040;
+    x.work(kBase + 0x5000);
+    x.s.present();
+    CHECK(!h.fill(label, 4, 0x77));  // recorded, the open frame
+    CHECK(*x.f.at(label) == 0);
+    // The command processor reads that word: the frame is submitted and waited for, then the value is there.
+    CHECK(x.s.syncCpu(label, 4, vpgpu::SubmitReason::Dma, 0, 0, "cp_read"));
+    CHECK(x.submits() == 2 && !x.f.backend.waits.empty() && x.f.backend.waits.back() == 2);
+    h.gpuRuns();
+    CHECK(*x.f.at(label) == 0x77777777u);
+    // A label written after a recorded DMA: the GPU's order (fill, then the label's own write).
+    const uint64_t l2 = kBase + 0x5080;
+    x.work(kBase + 0x5000);
+    CHECK(!h.fill(l2, 4, 0x33));
+    x.s.scheduleLabel(l2, 4, false, [&] { *x.f.at(l2) = 7; });
+    x.s.present();
+    h.gpuRuns();
+    x.f.backend.finishFramesBelow(x.f.device.submittedFrames());
+    CHECK(*x.f.at(l2) == 7);
+    // A label queued before the DMA: the DMA waits for it (CPU, in place), the DMA's bytes are the last.
+    const uint64_t l3 = kBase + 0x6040;
+    x.work(kBase + 0x6000);
+    x.s.scheduleLabel(l3, 4, false, [&] { *x.f.at(l3) = 1; });
+    CHECK(h.fill(l3, 4, 0x44));
+    CHECK(*x.f.at(l3) == 0x44444444u && !x.f.renderer.labelPending(l3, 4));
+}
+
+// VPKENGINE_DMA_CPU: every DMA waits and runs on the CPU, as before.
+void dmaOnCpuOptOut() {
+    setenv("VPKENGINE_DMA_CPU", "1", 1);
+    HostDma h;
+    unsetenv("VPKENGINE_DMA_CPU");
+    Sched& x = h.x;
+    x.work(kBase + 0x1000);
+    x.s.present();
+    CHECK(h.fill(kBase + 0x1080, 64, 0xaa));
+    CHECK(!x.f.backend.waits.empty() && x.s.counters().dmaRecorded == 0);
+    CHECK(*x.f.at(kBase + 0x1080) == 0xaaaaaaaau);
+}
+
+// A buffer bound by address alone (a V# without records: no extent) marks a window of it busy, not the whole mapping it lies
+// in (a CPU DMA elsewhere in the mapping would wait for the GPU). VPKENGINE_TOUCH_WINDOW=1 brings the whole mapping back.
+void unknownExtentBusy() {
+    const auto busyFar = [](bool env) {
+        if (env) setenv("VPKENGINE_TOUCH_WINDOW", "1", 1);
+        Fixture f;
+        if (env) unsetenv("VPKENGINE_TOUCH_WINDOW");
+        f.at(kBase + 0x100)[2] = 0;  // the vertex V# says 0 records
+        f.renderer.draw(f.state());
+        const bool near = f.renderer.gpuMayAccess(kBase + 0x1000, 4);
+        const bool far = f.renderer.gpuMayAccess(kBase + 0x70000, 4);
+        f.renderer.submit();
+        return std::pair{near, far};
+    };
+    const auto normal = busyFar(false);
+    CHECK(normal.first && !normal.second);
+    const auto optOut = busyFar(true);
+    CHECK(optOut.first && optOut.second);
+}
+
 // Label writes happen when the GPU is done with the work before them, in order, with their interrupt.
 void labelOrdering() {
     Sched x;
@@ -2995,6 +3122,10 @@ int main(int argc, char** argv) {
     else if (t == "draw_bench_heavy") drawBenchHeavy();
     else if (t == "one_frame_per_image") oneFramePerImage();
     else if (t == "partial_waits") partialWaits();
+    else if (t == "dma_on_gpu") dmaOnGpu();
+    else if (t == "unknown_extent_busy") unknownExtentBusy();
+    else if (t == "dma_then_label") dmaThenLabel();
+    else if (t == "dma_on_cpu_opt_out") dmaOnCpuOptOut();
     else if (t == "index_scan_memo") indexScanMemo();
     else if (t == "abandon_owners") abandonOwners();
     else if (t == "label_ordering") labelOrdering();

@@ -54,7 +54,14 @@ public:
     // The CPU is about to read or write guest [a, +n) (and [b, +m)): waits, with a partial fence, for the
     // GPU work that touches it and for label writes into it, submitting the recorded frame first only if
     // it is part of that. False = nothing to wait for.
-    bool syncCpu(uint64_t a, uint64_t n, vpgpu::SubmitReason why, uint64_t b = 0, uint64_t m = 0);
+    // `caller` names who asks (probe DMASYNC only: "fill", "copy", "owned_fault", "cp_read", ...).
+    bool syncCpu(uint64_t a, uint64_t n, vpgpu::SubmitReason why, uint64_t b = 0, uint64_t m = 0, const char* caller = "");
+    // A host DMA (fill / copy) over [a, +n) (and [b, +m)) is about to run: true = queued GPU work touches the range, so
+    // syncCpu would wait; the caller records it on the GPU timeline (Renderer::fill / copy) instead, in order with that work,
+    // with no wait and no submit. False = the CPU may do it in place after syncCpu (nothing GPU touches the range, a label
+    // write into it is pending: that one must land first, or VPKENGINE_DMA_CPU is set). Whoever reads the result on the CPU
+    // (a CP read: IB, label, WAIT_REG_MEM) goes through syncCpu, which finds the recorded range busy.
+    bool dmaOnGpu(uint64_t a, uint64_t n, uint64_t b = 0, uint64_t m = 0);
     // The same for GDS.
     bool syncGds() { return syncCpu(renderer_.gdsAddress(), 0x10000, vpgpu::SubmitReason::Gds); }
     // Everything submitted and recorded has finished.
@@ -91,6 +98,7 @@ public:
     struct Counters {
         std::array<uint64_t, size_t(vpgpu::SubmitReason::Count)> submits{};
         uint64_t orderedWaits = 0, polledWaits = 0, idleWaits = 0;
+        uint64_t dmaRecorded = 0;  // host DMAs recorded on the GPU timeline instead of waiting (dmaOnGpu)
         uint64_t frames = 0, cpuSyncs = 0, cpuSyncFree = 0, partialWaits = 0, fullWaits = 0, labels = 0, labelTimeouts = 0;
         double waitMs = 0;
     };
@@ -105,6 +113,7 @@ private:
     vpgpu::SubmitPolicy policy_;
     Clock now_;
     std::function<void()> hook_;
+    bool dmaGpu_;  // false (VPKENGINE_DMA_CPU set): a DMA always waits and runs on the CPU
     double openSince_ = -1, labelSince_ = -1;
     bool labelIrq_ = false;
     Counters counters_;

@@ -242,6 +242,11 @@ public:
     // Commands recorded and not submitted yet.
     bool hasRecordedWork() const;
     uint64_t recordedCommands() const;
+    // Probe (DMASYNC, needs vpgpu::probe enabled): the busy range a CPU access to [a, +n) (and [b, +m)) overlaps with who made
+    // it ("" if none), and one access that waited `frames` frames (0: did not wait) for `ms` (counters, timer and a line per caller).
+    std::string busyText(uint64_t a, uint64_t n, uint64_t b = 0, uint64_t m = 0) const;
+    void noteCpuSync(const char* caller, uint64_t a, uint64_t n, uint64_t b, uint64_t m, const std::string& busy, uint64_t frames,
+                     bool submitted, double ms);
     // Host address of GDS (as the busy ranges name it; 64 KiB): waitTarget(gdsAddress(), 0x10000) says
     // whether queued work uses it.
     uint64_t gdsAddress() const;

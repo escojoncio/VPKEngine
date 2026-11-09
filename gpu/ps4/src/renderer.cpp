@@ -455,9 +455,12 @@ struct Renderer::Impl {
         if (!ok) return false;
         offset = address - use.base;
         available = use.size - offset;
-        touch(address, size && size < available ? size : available);
+        // (a bare address, no V#: its extent is unknown, so a window is tracked as for a raw access, not the whole mapping)
+        touch(address, size && size < available ? size : !size && !touchWindow ? std::min<uint64_t>(available, kUnknownExtent) : available);
         return true;
     }
+    // VPKENGINE_TOUCH_WINDOW=1: a buffer of unknown extent counts the whole window around it as busy, as before.
+    bool touchWindow = std::getenv("VPKENGINE_TOUCH_WINDOW") != nullptr;
 
     // Guest ranges the GPU may read or write through work recorded since it was last idle
     // (start -> end, merged). DMA done on the CPU must wait for the GPU only when it overlaps.
@@ -469,6 +472,7 @@ struct Renderer::Impl {
         uint64_t frame;
         std::map<uint64_t, uint64_t> ranges;
         bool all;
+        std::map<uint64_t, const char*> who = {};  // probe only: see busyWho
     };
     std::deque<InFlight> inFlight;
     void retireBusy() {
@@ -492,12 +496,24 @@ struct Renderer::Impl {
     // The last range touch() left in `busy` (merged): most buffers of a draw lie in it already.
     // Whoever empties `busy` forgets it.
     uint64_t touchedLo = 0, touchedHi = 0;
+    // Probe only: what made each range of `busy` (by its start; a merged range keeps the first one's), `touchWho` being
+    // what is recording now (see Who). DMASYNC names it.
+    std::map<uint64_t, const char*> busyWho;
+    const char* touchWho = "draw";
+    struct Who {
+        const char*& slot;
+        const char* prev;
+        Who(const char*& s, const char* w) : slot(s), prev(s) { slot = w; }
+        ~Who() { slot = prev; }
+    };
     void touch(uint64_t a, uint64_t n) {
         if (busyAll || !n) return;
         static vpgpu::probe::Timer& touchTimer = vpgpu::probe::timer("TIME", "hazard_touch");
         const vpgpu::probe::ScopedSampled touchScope(touchTimer);  // (hot: calls exact, time estimated from 1 in 16)
         uint64_t lo = a, hi = a + n < a ? ~uint64_t(0) : a + n;
         if (lo >= touchedLo && hi <= touchedHi) return;
+        const bool probing = vpgpu::probe::enabled();
+        const char* who = touchWho;
         auto it = busy.upper_bound(lo);
         if (it != busy.begin()) {
             auto prev = std::prev(it);
@@ -507,14 +523,18 @@ struct Renderer::Impl {
                     return;
                 }
                 lo = prev->first;
+                if (probing)
+                    if (auto w = busyWho.find(lo); w != busyWho.end()) who = w->second;
                 it = busy.erase(prev);
             }
         }
         while (it != busy.end() && it->first <= hi) {
             hi = std::max(hi, it->second);
+            if (probing) busyWho.erase(it->first);
             it = busy.erase(it);
         }
         busy[lo] = hi;
+        if (probing) busyWho[lo] = who;
         touchedLo = lo, touchedHi = hi;
         if (busy.size() > kBusyRanges) coalesceBusy();
     }
@@ -531,6 +551,7 @@ struct Renderer::Impl {
             auto next = std::next(it);
             if (next != busy.end() && next->first - it->second <= limit) {
                 it->second = std::max(it->second, next->second);
+                busyWho.erase(next->first);
                 busy.erase(next);
             } else {
                 ++it;
@@ -544,6 +565,56 @@ struct Renderer::Impl {
         auto it = busy.upper_bound(a);
         if (it != busy.begin() && std::prev(it)->second > a) return true;
         return it != busy.end() && it->first < end;
+    }
+
+    // Probe DMASYNC: the first busy range a CPU access to [a, +n) (and [b, +m)) overlaps, "lo-hi by=<who> in=<recorded|frame N>"
+    // (who made it: see busyWho); "" if none.
+    static bool firstOverlap(const std::map<uint64_t, uint64_t>& m, uint64_t a, uint64_t n, uint64_t& lo, uint64_t& hi) {
+        const uint64_t end = a + std::max<uint64_t>(n, 1);
+        auto it = m.upper_bound(a);
+        if (it != m.begin() && std::prev(it)->second > a) --it;
+        if (it == m.end() || it->first >= end || it->second <= a) return false;
+        lo = it->first, hi = it->second;
+        return true;
+    }
+    std::string busyText(uint64_t a, uint64_t n, uint64_t b, uint64_t m) const {
+        for (const auto& [x, y] : {std::pair{a, n}, std::pair{b, m}}) {
+            if (!y) continue;
+            uint64_t lo = 0, hi = 0;
+            const auto text = [&](const std::map<uint64_t, const char*>& who, const std::string& in) {
+                const auto w = who.find(lo);
+                return hex(lo) + "-" + hex(hi) + " by=" + (w == who.end() ? "?" : w->second) + " in=" + in;
+            };
+            if (busyAll) return "all";
+            if (firstOverlap(busy, x, y, lo, hi)) return text(busyWho, "recorded");
+            for (const InFlight& f : inFlight) {
+                if (f.all) return "all in=frame " + std::to_string(f.frame);
+                if (firstOverlap(f.ranges, x, y, lo, hi)) return text(f.who, "frame " + std::to_string(f.frame));
+            }
+        }
+        return "";
+    }
+    // Probe DMASYNC: one CPU access (`caller`) to [a, +n) (and [b, +m)) that waited for `frames` frames (0: it did not wait)
+    // for `ms`. Counters and a timer per caller (family DMASYNC); the first 200 waits, and then every 50th or one over 2 ms,
+    // leave a line with the busy range that made it wait and who made that.
+    uint64_t dmaSyncLines = 0;
+    void noteCpuSync(const char* caller, uint64_t a, uint64_t n, uint64_t b, uint64_t m, const std::string& busyRange, uint64_t frames,
+                     bool submitted, double ms) {
+        namespace pr = vpgpu::probe;
+        if (!pr::enabled()) return;
+        const std::string c = pr::Registry::sanitize(caller[0] ? caller : "other");
+        if (!frames) {
+            pr::counter("DMASYNC", c + "_free").add();
+            return;
+        }
+        pr::counter("DMASYNC", c + "_waits").add();
+        pr::counter("DMASYNC", c + "_bytes").add(n + m);
+        pr::timer("DMASYNC", c + "_wait").addMs(ms);
+        const uint64_t k = ++dmaSyncLines;
+        if (k > 200 && k % 50 && ms < 2.0) return;
+        log("VPKENGINE_PROBE DMASYNC_WAIT n=" + std::to_string(k) + " f=" + std::to_string(r.frame_) + " why=" + c + " a=" + hex(a) +
+            " bytes=" + std::to_string(n) + (m ? " b=" + hex(b) + " bytes_b=" + std::to_string(m) : std::string()) + " frames=" +
+            std::to_string(frames) + " submitted_first=" + (submitted ? "1" : "0") + " busy=[" + busyRange + "] ms=" + pr::Registry::number(ms));
     }
 
     // ---- GDS ------------------------------------------------------------------------------------
@@ -4394,6 +4465,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
                     if (b.source.kind == vpgcn::DescriptorSource::Gds) {
                         if (!gdsBuffer()) return why = "no GDS buffer", false;
                         a.range = ResourceRange::bytes(gds.id, 0, kGdsBytes);
+                        const Who gdsWho(touchWho, "gds");
                         touch(reinterpret_cast<uint64_t>(gds.memory), kGdsBytes);  // the CPU reads GDS: see gdsAddress()
                         break;
                     }
@@ -5321,6 +5393,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
     }
 
     void dispatch(const DispatchState& d) {
+        const Who who(touchWho, "dispatch");
         pollCache();
         ringRoom();
         const RegionScope regions(*this);
@@ -5715,6 +5788,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
 
     bool fill(uint64_t address, uint64_t bytes, uint32_t value) {
         if (guestReadOnly) return false;
+        const Who who(touchWho, "fill");
         BufferId id;
         uint64_t offset = 0, available = 0;
         if (!bytes) return true;
@@ -5754,6 +5828,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
     bool copy(uint64_t dst, uint64_t src, uint64_t bytes) {
         if (guestReadOnly) return false;
         if (!bytes) return true;
+        const Who who(touchWho, "copy");
         BufferId di, si;
         uint64_t doff = 0, dav = 0, soff = 0, sav = 0;
         if (!guestBuffer(dst, bytes, di, doff, dav) || bytes > dav || !guestBuffer(src, bytes, si, soff, sav) || bytes > sav) {
@@ -5866,7 +5941,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         ++r.cpu_.submits;
         if (frame.commands().empty()) {  // nothing recorded (a Flush after a Flush): no GPU frame
             ++r.cpu_.emptySubmits;
-            busy.clear();  // (ranges bound by draws that were skipped afterwards)
+            busy.clear(), busyWho.clear();  // (ranges bound by draws that were skipped afterwards)
             busyAll = false;
             touchedLo = touchedHi = 0;  // (touch() skips ranges inside the last one it added: that set is gone)
             return {};
@@ -5922,8 +5997,9 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
             alignedCopyBytesLogged = alignedCopyBytes;
         }
         if (!busy.empty() || busyAll) {
-            inFlight.push_back({report.frame, std::move(busy), busyAll});
+            inFlight.push_back({report.frame, std::move(busy), busyAll, std::move(busyWho)});
             busy.clear();
+            busyWho.clear();
             busyAll = false;
             touchedLo = touchedHi = 0;
             if (inFlight.size() > 64) {  // a GPU far behind: fold the oldest into one "everything"
@@ -6127,6 +6203,11 @@ void Renderer::waitedBelow(uint64_t frames) {
     while (!q.empty() && q.front().frame < frames) q.pop_front();
     impl_->retireOwned();
 }
+std::string Renderer::busyText(uint64_t a, uint64_t n, uint64_t b, uint64_t m) const { return impl_->busyText(a, n, b, m); }
+void Renderer::noteCpuSync(const char* caller, uint64_t a, uint64_t n, uint64_t b, uint64_t m, const std::string& busy, uint64_t frames,
+                           bool submitted, double ms) {
+    impl_->noteCpuSync(caller, a, n, b, m, busy, frames, submitted, ms);
+}
 uint64_t Renderer::gdsAddress() const { return reinterpret_cast<uint64_t>(impl_->gds.memory); }
 void Renderer::afterGpu(uint64_t address, uint32_t size, std::function<void()> action) {
     const uint64_t submitted = device_.submittedFrames();
@@ -6142,6 +6223,7 @@ bool Renderer::labelPending(uint64_t address, uint32_t size) const { return devi
 uint64_t Renderer::labelWaitTarget(uint64_t address, uint32_t size) const { return device_.labelWaitTarget(address, size); }
 void Renderer::gpuIdle() {
     impl_->busy.clear();
+    impl_->busyWho.clear();
     impl_->busyAll = false;
     impl_->touchedLo = impl_->touchedHi = 0;
     impl_->inFlight.clear();
