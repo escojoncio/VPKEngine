@@ -4139,9 +4139,40 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         void* memory;
         BufferId id;
         uint64_t after;
-        uint64_t size = 0;  // dedicated buffers only (counted against stagingLimit)
+        uint64_t size = 0;   // dedicated buffers only (counted against stagingLimit)
+        uint64_t pooled = 0; // from the pool of this size class (power of two): back to it when the GPU is done, not destroyed
     };
     std::vector<Staging> stagings;
+    // Dedicated staging up to kPoolMaxClass is served from buffers kept by size class (powers of two) instead of an aligned_alloc
+    // + createBuffer per request (a no-copy MTLBuffer each time: 260 of 21.7 MB in 2 s). A buffer returns to its class when its
+    // frame is done (where a dedicated one was destroyed) and is destroyed after kPoolIdle submits unused or past kPoolMaxBytes
+    // kept. VPKENGINE_NO_STAGING_POOL=1: one buffer per request, as before.
+    struct Pooled {
+        void* memory;
+        BufferId id;
+        uint64_t cls, since;
+    };
+    std::vector<Pooled> stagingPool;
+    uint64_t stagingPoolHits = 0, stagingPoolMisses = 0;
+    bool stagingPoolOn = !std::getenv("VPKENGINE_NO_STAGING_POOL");
+    static constexpr uint64_t kPoolMaxClass = 64ull << 20, kPoolMaxBytes = 192ull << 20;
+    static constexpr uint64_t kPoolIdle = 120;
+    static uint64_t poolClass(uint64_t size) {
+        uint64_t c = kPage;
+        while (c < size) c <<= 1;
+        return c;
+    }
+    void poolTrim() {
+        uint64_t kept = 0;
+        for (const Pooled& x : stagingPool) kept += x.cls;
+        std::erase_if(stagingPool, [&](const Pooled& x) {
+            if (x.since + kPoolIdle > r.frame_ && kept <= kPoolMaxBytes) return false;
+            kept -= x.cls;
+            r.device_.destroy(x.id);
+            std::free(x.memory);
+            return true;
+        });
+    }
     uint64_t stagingLive() const {
         uint64_t live = 0;
         for (const Staging& x : stagings) live += x.size;
@@ -4171,9 +4202,22 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
             note("staging memory limit reached: copy source refused");
             return nullptr;
         }
-        void* memory = std::aligned_alloc(kPage, size);
+        const uint64_t cls = stagingPoolOn && size <= kPoolMaxClass ? poolClass(size) : 0;
+        if (cls) {
+            auto hit = std::find_if(stagingPool.begin(), stagingPool.end(), [&](const Pooled& x) { return x.cls == cls; });
+            if (hit != stagingPool.end()) {
+                ++stagingPoolHits;
+                stagings.push_back({hit->memory, hit->id, r.frame_ + kFrames + 2, size, cls});
+                stagingPool.erase(hit);
+                id = stagings.back().id;
+                offset = 0;
+                return static_cast<uint8_t*>(stagings.back().memory);
+            }
+            ++stagingPoolMisses;
+        }
+        void* memory = std::aligned_alloc(kPage, cls ? cls : size);
         if (!memory) return nullptr;
-        Staging st{memory, r.device_.createBuffer({size, memory, "vpps4 staging"}), r.frame_ + kFrames + 2, size};
+        Staging st{memory, r.device_.createBuffer({cls ? cls : size, memory, "vpps4 staging"}), r.frame_ + kFrames + 2, size, cls};
         if (!st.id) {
             std::free(memory);
             return nullptr;
@@ -6039,10 +6083,15 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         });
         std::erase_if(stagings, [&](const Staging& x) {
             if (x.after > r.frame_ + 1) return false;
+            if (x.pooled) {
+                stagingPool.push_back({x.memory, x.id, x.pooled, r.frame_});
+                return true;
+            }
             r.device_.destroy(x.id);
             std::free(x.memory);
             return true;
         });
+        poolTrim();
         return report;
     }
 
@@ -6054,6 +6103,10 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         for (Staging& st : stagings) {
             r.device_.destroy(st.id);
             std::free(st.memory);
+        }
+        for (Pooled& x : stagingPool) {
+            r.device_.destroy(x.id);
+            std::free(x.memory);
         }
         for (auto& slabs : scratchSlots)
             for (ScratchSlab& x : slabs) {
@@ -6347,6 +6400,10 @@ void Renderer::publishProbe(uint64_t pictures) {
         C(f, "guest_buf_adds", ps.guestBufAdds), C(f, "guest_buf_removes", ps.guestBufRemoves), C(f, "guest_buf_refused", ps.guestBufRefused);
         // Staging, scratch, upload ring
         G(f, "staging_live", double(im.stagings.size())), G(f, "staging_mb", MB(im.stagingLive())), G(f, "staging_limit_mb", MB(im.stagingLimit));
+        uint64_t poolBytes = 0;
+        for (const auto& x : im.stagingPool) poolBytes += x.cls;
+        G(f, "staging_pool", double(im.stagingPool.size())), G(f, "staging_pool_mb", MB(poolBytes));
+        C(f, "staging_pool_hits", im.stagingPoolHits), C(f, "staging_pool_misses", im.stagingPoolMisses);
         uint64_t slabs = 0;
         for (const auto& v : im.scratchSlots) slabs += v.size();
         G(f, "scratch_slabs", double(slabs)), G(f, "scratch_mb", MB(im.scratchBytes)), G(f, "scratch_limit_mb", MB(im.scratchLimit));

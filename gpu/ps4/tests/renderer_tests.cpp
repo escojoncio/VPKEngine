@@ -538,6 +538,31 @@ void dma() {
     f.renderer.submit();
 }
 
+// Dedicated staging (a copy source the upload ring has no room for) is kept by size class and reused once its frame is done: no
+// buffer is created for it again. VPKENGINE_NO_STAGING_POOL=1: a buffer per request, as before.
+void stagingPool() {
+    Fixture f;
+    const auto dedicated = [&] {
+        size_t n = 0;
+        for (const std::string& c : f.backend.calls) n += c.find("size=524288 ") != std::string::npos || c.find("size=311296 ") != std::string::npos;  // (class / page-rounded size of 300000 bytes)
+        return n;
+    };
+    uint32_t v = 0x01020304u;
+    const auto round = [&] {
+        for (int i = 0; i < 60; ++i) CHECK(f.renderer.fill(kBase, 300000, v += 0x01010100u));  // (not a byte pattern: through staging)
+        f.renderer.submit();
+    };
+    round();
+    const size_t made = dedicated();
+    CHECK(made >= 1);  // (the 16 MiB ring holds the first 53 fills; the rest need buffers of their own)
+    for (int i = 0; i < 12; ++i) {  // their frames are done
+        CHECK(f.renderer.fill(kBase + 0x2000, 256, 0));
+        f.renderer.submit();
+    }
+    round();
+    CHECK(dedicated() == made);
+}
+
 // A CPU write to a texture's source is found without invalidate(): by content, next frame.
 void contentCheck() {
     Fixture f;
@@ -3123,6 +3148,7 @@ int main(int argc, char** argv) {
     else if (t == "one_frame_per_image") oneFramePerImage();
     else if (t == "partial_waits") partialWaits();
     else if (t == "dma_on_gpu") dmaOnGpu();
+    else if (t == "staging_pool") stagingPool();
     else if (t == "unknown_extent_busy") unknownExtentBusy();
     else if (t == "dma_then_label") dmaThenLabel();
     else if (t == "dma_on_cpu_opt_out") dmaOnCpuOptOut();
