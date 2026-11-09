@@ -3424,7 +3424,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         float value = c.value;
         if (const auto r = clearedDepths.find(t.address); r != clearedDepths.end()) value = r->second.value;
         else if (newest) value = newest->clearDepth;
-        else if (!c.stamp) return impliedDepths.erase(t.address), nullptr;  // (no clear value known: memory, as before)
+        else return impliedDepths.erase(t.address), nullptr;  // (no clear value known: memory, as before)
         if (!c.stamp || c.value != value) c.value = value, c.mask = ~uint32_t(0), c.stamp = ++clearedDepthStamp;
         return &c;
     }
