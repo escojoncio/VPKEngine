@@ -57,6 +57,17 @@ namespace vpgpu::metal2 {
 
 // MTLDevice.currentAllocatedSize for the probe's allocation bracket: 0 (no Metal call) while the probe is off.
 static uint64_t probeDeviceBytes(id<MTLDevice> d) { return probe::enabled() ? uint64_t(d.currentAllocatedSize) : 0; }
+// [residency commit], timed for the probe (TIME residency_commit: calls, ms, longest) with the size of the set after it (GPUMEM
+// residency_allocations, residency_mb).
+static void commitResidency(id<MTLResidencySet> r) {
+  if (!probe::enabled()) return (void)[r commit];
+  const auto t0 = std::chrono::steady_clock::now();
+  [r commit];
+  static probe::Timer& t = probe::timer("TIME", "residency_commit");
+  t.add(uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count()));
+  probe::counter("GPUMEM", "residency_allocations").set(uint64_t(r.allocationCount));
+  probe::counter("GPUMEM", "residency_mb").set(uint64_t(r.allocatedSize) >> 20);
+}
 
 void ShaderTable::add(uint64_t shaderId, MslShader shader) {
   std::lock_guard lock(mutex_);
@@ -1696,7 +1707,7 @@ size_t MetalBackend::Impl::drainIdle(std::string& report) {
   if (!graveyard.empty() && (lastSlot < 0 || slotSettled(size_t(lastSlot))))
     takeList(graveyard, graveyardBytes);
   if (residencyDirty && residency) {
-    [residency commit];
+    commitResidency(residency);
     bump(cnt.resCommit);
     residencyDirty = false;
   }
@@ -4185,7 +4196,7 @@ MetalBackend::Impl::Slot* MetalBackend::Impl::acquireSlot(uint64_t frame, std::a
   graveyard.clear();
   graveyardBytes = 0;
   if (residencyDirty) {
-    [residency commit];
+    commitResidency(residency);
     bump(cnt.resCommit);
     residencyDirty = false;
   }
@@ -4282,7 +4293,7 @@ bool MetalBackend::Impl::encodeNative(NativeEncodeFn fn, void* user) {
   [end endEncoding];
   frontier.push_back(tailFence);
   if (residencyDirty) {
-    [residency commit];
+    commitResidency(residency);
     bump(cnt.resCommit);
     residencyDirty = false;
   }
@@ -5202,7 +5213,7 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
   // queue; queue order keeps the work in order and the fences keep ordering the encoders across it.
   auto commitChunk = [&]() {
     if (residencyDirty) {
-      [residency commit];
+      commitResidency(residency);
       bump(cnt.resCommit);
       residencyDirty = false;
     }
@@ -6866,7 +6877,7 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
         exclType = (exclType ^ v) * 1099511628211ull;
   releaseMsaaBackings(frameIndex);
   if (residencyDirty) {  // render targets allocated lazily while encoding
-    [residency commit];
+    commitResidency(residency);
     bump(cnt.resCommit);
     residencyDirty = false;
   }
