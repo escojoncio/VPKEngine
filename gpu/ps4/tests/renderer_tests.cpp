@@ -1952,6 +1952,7 @@ struct HostDma {
     bool fill(uint64_t addr, uint64_t bytes, uint8_t byte) {  // true = on the CPU
         if (x.s.dmaOnGpu(addr, bytes)) {
             CHECK(x.f.renderer.fill(addr, bytes, byte * 0x01010101u));
+            x.s.noteDmaRecorded();
             x.s.noteWork();
             return false;
         }
@@ -1961,8 +1962,9 @@ struct HostDma {
         return true;
     }
     bool copy(uint64_t dst, uint64_t src, uint64_t bytes) {
-        if (x.s.dmaOnGpu(src, bytes, dst, bytes)) {
+        if (x.s.dmaOnGpu(dst, bytes, src)) {
             CHECK(x.f.renderer.copy(dst, src, bytes));
+            x.s.noteDmaRecorded();
             x.s.noteWork();
             return false;
         }
@@ -2035,6 +2037,23 @@ void dmaThenLabel() {
     x.s.scheduleLabel(l3, 4, false, [&] { *x.f.at(l3) = 1; });
     CHECK(h.fill(l3, 4, 0x44));
     CHECK(*x.f.at(l3) == 0x44444444u && !x.f.renderer.labelPending(l3, 4));
+}
+
+// A range the renderer reads on the CPU (texture source, descriptors, ...) is not DMA'd on the GPU timeline even when the GPU is
+// busy over it: the CPU would read the old bytes until the GPU ran the DMA. A busy range it never read is.
+void dmaAfterCpuRead() {
+    Sched x;
+    x.f.renderer.draw(x.f.state());  // reads the texture at +0x10000 and the V# table at +0x100 on the CPU
+    x.s.noteWork();
+    x.work(kBase + 0x10000);
+    x.work(kBase + 0x100);
+    x.work(kBase + 0x20000);
+    x.s.present();
+    CHECK(!x.s.dmaOnGpu(kBase + 0x10040, 64));
+    CHECK(!x.s.dmaOnGpu(kBase + 0x108, 4));
+    CHECK(x.s.dmaOnGpu(kBase + 0x20040, 64, kBase + 0x10080));  // (a copy's destination decides, not its source)
+    CHECK(x.s.dmaOnGpu(kBase + 0x20040, 64));
+    CHECK(x.s.counters().dmaRecorded == 0);  // (counted when the caller records it)
 }
 
 // Probe DMASYNC: a CPU access that waits leaves a line with the caller, the busy range that made it wait and who made that.
@@ -3167,6 +3186,7 @@ int main(int argc, char** argv) {
     else if (t == "one_frame_per_image") oneFramePerImage();
     else if (t == "partial_waits") partialWaits();
     else if (t == "dma_on_gpu") dmaOnGpu();
+    else if (t == "dma_after_cpu_read") dmaAfterCpuRead();
     else if (t == "dma_sync_probe") dmaSyncProbe();
     else if (t == "staging_pool") stagingPool();
     else if (t == "unknown_extent_busy") unknownExtentBusy();

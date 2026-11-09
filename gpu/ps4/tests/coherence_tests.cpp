@@ -1868,6 +1868,31 @@ void bigAndSmallTargets() {
     }
 }
 
+// The small target drawn first, then the big one over its range (twice), then the small one sampled: nothing is written back or filled
+// from memory (the small one keeps its texels, the big one's bytes are not overwritten with the small one's), and the big one stays the
+// owner of the shared range.
+void smallThenBigTargets() {
+    Fixture f;
+    vpps4::DrawState s = f.state();
+    s.color[0] = {kSub, 64, 64, 64, 10, 0, 0, 8};
+    f.renderer.draw(s);
+    f.renderer.draw(f.state());
+    f.renderer.draw(f.state());
+    vpps4::DrawState d = f.state();
+    d.color[0].address = kOut;
+    f.sample(kSub, 64, 64, 10, 0, 8);
+    f.renderer.draw(d);
+    f.sample(kRt, 128, 128, 10, 0, 8);
+    f.renderer.draw(d);
+    const auto& st = f.renderer.stats();
+    CHECK(st.retiled == 0);
+    const auto e = f.events();
+    CHECK(Fixture::count(e, "copy retile ") == 0);
+    CHECK(Fixture::count(e, "copy upload " + Fixture::hex(kRt)) == 0 && Fixture::count(e, "copy upload " + Fixture::hex(kSub)) == 0);
+    CHECK(f.renderer.tracker().ownerImage(kSub, 64 * 64 * 4) == f.renderer.tracker().ownerImage(kRt, 128 * 128 * 4));
+    if (failures) f.dump();
+}
+
 // ---- Compare-sampled T#s (QUAL cmp_*, compare_mismatch)
 
 // The draw of ps_sample_compare (a depth texture in the lifted program) reading the T# `at` (dfmt/nfmt, w x h, tile 8) and writing kOut.
@@ -1971,6 +1996,7 @@ int main(int argc, char** argv) {
     else if (t == "alias_evicted") aliasEvicted();
     else if (t == "alias_off") aliasOff();
     else if (t == "big_and_small_targets") bigAndSmallTargets();
+    else if (t == "small_then_big_targets") smallThenBigTargets();
     else if (t == "compare_mismatch") compareMismatch();
     else if (t == "compare_depth") compareDepth();
     else if (t == "alias_channel_order") aliasChannelOrder();

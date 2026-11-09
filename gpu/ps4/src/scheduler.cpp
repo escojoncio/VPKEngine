@@ -105,16 +105,15 @@ bool Scheduler::syncCpu(uint64_t a, uint64_t n, SubmitReason why, uint64_t b, ui
     return frames != 0;
 }
 
-bool Scheduler::dmaOnGpu(uint64_t a, uint64_t n, uint64_t b, uint64_t m) {
-    if (!dmaGpu_) return false;
+bool Scheduler::dmaOnGpu(uint64_t dst, uint64_t n, uint64_t src) {
+    if (!dmaGpu_ || renderer_.cpuReadSeen(dst, n)) return false;
+    const uint64_t m = src ? n : 0;
     // (a label write into the range lands when its frame completes: it must come before the DMA's bytes, which only the
     // CPU waiting for it guarantees)
-    if (device_.labelWaitTarget(a, uint32_t(std::min<uint64_t>(n, ~0u))) ||
-        (m && device_.labelWaitTarget(b, uint32_t(std::min<uint64_t>(m, ~0u)))))
+    if (device_.labelWaitTarget(dst, uint32_t(std::min<uint64_t>(n, ~0u))) ||
+        (m && device_.labelWaitTarget(src, uint32_t(std::min<uint64_t>(m, ~0u)))))
         return false;
-    if (renderer_.waitTarget(a, n, b, m) == 0) return false;
-    ++counters_.dmaRecorded;
-    return true;
+    return renderer_.waitTarget(dst, n, src, m) != 0;
 }
 
 void Scheduler::finish() {

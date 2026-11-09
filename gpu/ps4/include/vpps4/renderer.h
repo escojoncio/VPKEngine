@@ -242,6 +242,9 @@ public:
     // Commands recorded and not submitted yet.
     bool hasRecordedWork() const;
     uint64_t recordedCommands() const;
+    // Whether the renderer has ever read guest [a, +n) on the CPU (descriptors, indices, program code, texture sources, constant
+    // copies). A DMA recorded on the GPU timeline lands later than a CPU read would see, so such a range is DMA'd by the CPU.
+    bool cpuReadSeen(uint64_t a, uint64_t n) const;
     // Probe (DMASYNC, needs vpgpu::probe enabled): the busy range a CPU access to [a, +n) (and [b, +m)) overlaps with who made
     // it ("" if none), and one access that waited `frames` frames (0: did not wait) for `ms` (counters, timer and a line per caller).
     std::string busyText(uint64_t a, uint64_t n, uint64_t b = 0, uint64_t m = 0) const;

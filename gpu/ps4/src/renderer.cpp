@@ -350,9 +350,42 @@ struct Renderer::Impl {
         return true;
     }
 
+    // Guest ranges this renderer has read on the CPU (descriptors, index data, program code, texture sources, constant copies),
+    // merged, never forgotten. A host DMA recorded on the GPU timeline lands when the GPU runs it, so a CPU read of its
+    // destination before that sees old bytes: Scheduler::dmaOnGpu leaves such ranges to the CPU path (cpuReadSeen). A range read
+    // for the first time while a recorded DMA over it is pending is not covered (it reads old bytes).
+    std::map<uint64_t, uint64_t> cpuRead;
+    uint64_t cpuReadLo = 0, cpuReadHi = 0;
+    bool cpuReadAll = false;  // too many ranges: no DMA goes to the GPU any more
+    static constexpr size_t kCpuReadRanges = 4096;
+    void noteCpuRead(uint64_t a, uint64_t n) {
+        if (cpuReadAll || !n) return;
+        uint64_t lo = a, hi = a + n < a ? ~uint64_t(0) : a + n;
+        if (lo >= cpuReadLo && hi <= cpuReadHi) return;
+        auto it = cpuRead.upper_bound(lo);
+        if (it != cpuRead.begin()) {
+            auto prev = std::prev(it);
+            if (prev->second >= lo) lo = prev->first, hi = std::max(hi, prev->second), it = cpuRead.erase(prev);
+        }
+        while (it != cpuRead.end() && it->first <= hi) hi = std::max(hi, it->second), it = cpuRead.erase(it);
+        cpuRead[lo] = hi;
+        cpuReadLo = lo, cpuReadHi = hi;
+        if (cpuRead.size() > kCpuReadRanges) {  // merge neighbours closer than 1 MiB; still too many: give up
+            for (auto m = cpuRead.begin(); m != cpuRead.end();) {
+                auto next = std::next(m);
+                if (next != cpuRead.end() && next->first - m->second <= (1u << 20)) m->second = std::max(m->second, next->second), cpuRead.erase(next);
+                else ++m;
+            }
+            cpuReadLo = cpuReadHi = 0;
+            if (cpuRead.size() > kCpuReadRanges) cpuReadAll = true;
+        }
+    }
+    bool cpuReadSeen(uint64_t a, uint64_t n) const { return cpuReadAll || overlaps(cpuRead, false, a, n); }
+
     bool readGuest(uint64_t address, void* dst, size_t bytes) {
         GuestRegion g;
         if (!region(address, bytes, g)) return false;
+        noteCpuRead(address, bytes);
         std::memcpy(dst, static_cast<const uint8_t*>(g.host) + (address - g.base), bytes);
         return true;
     }
@@ -1554,6 +1587,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         // A program the title rewrites in place without the CPU write being reported (invalidate) must not keep an old
         // key: the content is looked at too, as sampleRange does (the whole of a program up to 4 KiB, else its ends and
         // 16 lines of 64 bytes spread over it; a few hundred ns, against the kilobytes programKey hashes).
+        noteCpuRead(s.address, s.code.size() * 4);
         const uint64_t content =
             mix(sampleRange(reinterpret_cast<const uint8_t*>(s.code.data()), s.code.size() * 4),
                 sampleRange(reinterpret_cast<const uint8_t*>(s.fetch.data()), s.fetch.size() * 4));
@@ -2465,6 +2499,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
             return true;
         }
         GuestRegion g;
+        noteCpuRead(s.address, lay.bytes);
         if (!region(s.address, lay.bytes, g)) {
             s.fillWhy = "tiled outside guest memory";
             probeFailure("tiled outside", s, lay.bytes);
@@ -2608,6 +2643,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         const uint32_t levels = uint32_t(lay.levels.size());
         const bool linear = linearTiling(s.tile);
         GuestRegion g;
+        noteCpuRead(s.address, lay.bytes);
         if (!region(s.address, lay.bytes, g)) {
             s.fillWhy = linear ? "linear outside guest memory" : "tiled outside guest memory";
             probeFailure(linear ? "linear outside/misaligned" : "tiled outside", s, lay.bytes);
@@ -2964,6 +3000,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
     const uint8_t* guestBytes(uint64_t address, uint64_t bytes) {
         GuestRegion g;
         if (!bytes || !region(address, bytes, g)) return nullptr;
+        noteCpuRead(address, bytes);
         return static_cast<const uint8_t*>(g.host) + (address - g.base);
     }
     // After a fill: remember what the source held.
@@ -4556,6 +4593,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
                         const uint64_t bytes = std::min<uint64_t>(size, 64 * 1024);
                         GuestRegion g;
                         region(address, bytes, g);
+                        noteCpuRead(address, bytes);
                         const Phase cbPhase(r.cpu_.bindCbMs);
                         auto at = alignedConstantCopy(address, bytes, static_cast<const uint8_t*>(g.host) + (address - g.base));
                         if (!at) return why = "upload ring full", false;
@@ -6256,6 +6294,7 @@ void Renderer::waitedBelow(uint64_t frames) {
     while (!q.empty() && q.front().frame < frames) q.pop_front();
     impl_->retireOwned();
 }
+bool Renderer::cpuReadSeen(uint64_t a, uint64_t n) const { return impl_->cpuReadSeen(a, n); }
 std::string Renderer::busyText(uint64_t a, uint64_t n, uint64_t b, uint64_t m) const { return impl_->busyText(a, n, b, m); }
 void Renderer::noteCpuSync(const char* caller, uint64_t a, uint64_t n, uint64_t b, uint64_t m, const std::string& busy, uint64_t frames,
                            bool submitted, double ms) {

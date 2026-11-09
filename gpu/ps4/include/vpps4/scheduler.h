@@ -61,7 +61,11 @@ public:
     // with no wait and no submit. False = the CPU may do it in place after syncCpu (nothing GPU touches the range, a label
     // write into it is pending: that one must land first, or VPKENGINE_DMA_CPU is set). Whoever reads the result on the CPU
     // (a CP read: IB, label, WAIT_REG_MEM) goes through syncCpu, which finds the recorded range busy.
-    bool dmaOnGpu(uint64_t a, uint64_t n, uint64_t b = 0, uint64_t m = 0);
+    // `dst` is what the DMA writes ([dst, +n)), `src` (0: none) what a copy reads. A destination the renderer has read on the CPU
+    // (Renderer::cpuReadSeen) stays on the CPU path: it would read old bytes until the GPU runs the DMA.
+    bool dmaOnGpu(uint64_t dst, uint64_t n, uint64_t src = 0);
+    // The caller recorded the DMA that dmaOnGpu allowed (Renderer::fill / copy succeeded): counted.
+    void noteDmaRecorded() { ++counters_.dmaRecorded; }
     // The same for GDS.
     bool syncGds() { return syncCpu(renderer_.gdsAddress(), 0x10000, vpgpu::SubmitReason::Gds); }
     // Everything submitted and recorded has finished.
