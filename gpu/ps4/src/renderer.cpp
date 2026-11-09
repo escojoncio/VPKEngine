@@ -20,6 +20,7 @@
 #include "vpgcn/gcn.h"
 #include "vpgcn/lift.h"
 #include "vpps4/bc_decode.h"
+#include "vpps4/fetch.h"
 #include "vpps4/fixed_function.h"
 #include "vpps4/formats.h"
 #include "vpps4/gpu_tiler.h"
@@ -219,6 +220,7 @@ struct Renderer::Impl {
         uint64_t guestBufAdds = 0, guestBufRemoves = 0, guestBufRefused = 0;
         uint64_t uploadBytes = 0, alignedCopies = 0;
         uint64_t refills[3] = {}, refillBytes[3] = {}, refillFailed = 0;  // first fill, written by others (version), history forgotten
+        uint64_t dmaStaleReads = 0, cpuReadAll = 0;  // CPU reads of a range a recorded fill / copy was still to write (probe); cpuReadRanges gave up
         uint64_t refillSkipped = 0, refillSkippedBytes = 0, refillLines = 0;  // refills of a target left out because only images wrote its range (R1)
         uint64_t fillPath[5] = {}, fillPathBytes[5] = {};                  // none, GPU detile, CPU detile, linear upload, not filled
         uint64_t mirrorCalls = 0, mirrorCopies = 0, mirrorBytes = 0;
@@ -358,10 +360,23 @@ struct Renderer::Impl {
     uint64_t cpuReadLo = 0, cpuReadHi = 0;
     bool cpuReadAll = false;  // too many ranges: no DMA goes to the GPU any more
     static constexpr size_t kCpuReadRanges = 4096;
-    void noteCpuRead(uint64_t a, uint64_t n) {
+    // Probe: a range read on the CPU for the first time while a recorded fill / copy over it is still pending read old bytes
+    // (QUAL dma_stale_read; the first 50 leave a DMA_STALE_READ line). `by` names the reader.
+    void probeStaleRead(uint64_t a, uint64_t n, const char* by) {
+        const auto covering = cpuRead.upper_bound(a);
+        if (covering != cpuRead.begin() && std::prev(covering)->second >= a + n) return;  // (read before)
+        retireBusy();
+        const std::string busyRange = busyText(a, n, 0, 0);
+        if (busyRange.find("by=fill") == std::string::npos && busyRange.find("by=copy") == std::string::npos) return;
+        if (++pstat.dmaStaleReads <= 50)
+            log("VPKENGINE_PROBE DMA_STALE_READ n=" + std::to_string(pstat.dmaStaleReads) + " f=" + std::to_string(r.frame_) + " a=" + hex(a) +
+                " bytes=" + std::to_string(n) + " by=" + by + " busy=[" + busyRange + "]");
+    }
+    void noteCpuRead(uint64_t a, uint64_t n, const char* by = "?") {
         if (cpuReadAll || !n) return;
         uint64_t lo = a, hi = a + n < a ? ~uint64_t(0) : a + n;
         if (lo >= cpuReadLo && hi <= cpuReadHi) return;
+        if (vpgpu::probe::enabled()) probeStaleRead(a, n, by);
         auto it = cpuRead.upper_bound(lo);
         if (it != cpuRead.begin()) {
             auto prev = std::prev(it);
@@ -377,7 +392,11 @@ struct Renderer::Impl {
                 else ++m;
             }
             cpuReadLo = cpuReadHi = 0;
-            if (cpuRead.size() > kCpuReadRanges) cpuReadAll = true;
+            if (cpuRead.size() > kCpuReadRanges) {
+                cpuReadAll = true;
+                pstat.cpuReadAll = 1;
+                log("vpps4.cpu_read_ranges_exceeded ranges=" + std::to_string(cpuRead.size()) + ": no host DMA goes to the GPU timeline from now on");
+            }
         }
     }
     bool cpuReadSeen(uint64_t a, uint64_t n) const { return cpuReadAll || overlaps(cpuRead, false, a, n); }
@@ -385,7 +404,7 @@ struct Renderer::Impl {
     bool readGuest(uint64_t address, void* dst, size_t bytes) {
         GuestRegion g;
         if (!region(address, bytes, g)) return false;
-        noteCpuRead(address, bytes);
+        noteCpuRead(address, bytes, "read_guest");
         std::memcpy(dst, static_cast<const uint8_t*>(g.host) + (address - g.base), bytes);
         return true;
     }
@@ -1582,12 +1601,15 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
     };
     std::array<ProgramMemo, 64> programMemo;
     uint64_t programGeneration = 0;
+    FetchAddressMemo fetchMemo;
     uint64_t programKeyCached(const Stage& s, vpgcn::ShaderStage stage) {
         const uint64_t rest = programKey(s, stage, false);
         // A program the title rewrites in place without the CPU write being reported (invalidate) must not keep an old
         // key: the content is looked at too, as sampleRange does (the whole of a program up to 4 KiB, else its ends and
         // 16 lines of 64 bytes spread over it; a few hundred ns, against the kilobytes programKey hashes).
-        noteCpuRead(s.address, s.code.size() * 4);
+        noteCpuRead(s.address, s.code.size() * 4, "code");
+        if (!s.fetch.empty())  // (the fetch subroutine is read on the CPU too: where it lives is what the user data and the code say)
+            if (const uint64_t fa = fetchMemo.address(s.code, s.userData, s.userSgprs)) noteCpuRead(fa, s.fetch.size() * 4, "fetch");
         const uint64_t content =
             mix(sampleRange(reinterpret_cast<const uint8_t*>(s.code.data()), s.code.size() * 4),
                 sampleRange(reinterpret_cast<const uint8_t*>(s.fetch.data()), s.fetch.size() * 4));
@@ -2499,7 +2521,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
             return true;
         }
         GuestRegion g;
-        noteCpuRead(s.address, lay.bytes);
+        noteCpuRead(s.address, lay.bytes, "texture_soft_bc");
         if (!region(s.address, lay.bytes, g)) {
             s.fillWhy = "tiled outside guest memory";
             probeFailure("tiled outside", s, lay.bytes);
@@ -2643,7 +2665,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         const uint32_t levels = uint32_t(lay.levels.size());
         const bool linear = linearTiling(s.tile);
         GuestRegion g;
-        noteCpuRead(s.address, lay.bytes);
+        noteCpuRead(s.address, lay.bytes, "texture_cpu_fill");
         if (!region(s.address, lay.bytes, g)) {
             s.fillWhy = linear ? "linear outside guest memory" : "tiled outside guest memory";
             probeFailure(linear ? "linear outside/misaligned" : "tiled outside", s, lay.bytes);
@@ -3000,7 +3022,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
     const uint8_t* guestBytes(uint64_t address, uint64_t bytes) {
         GuestRegion g;
         if (!bytes || !region(address, bytes, g)) return nullptr;
-        noteCpuRead(address, bytes);
+        noteCpuRead(address, bytes, "stamp");
         return static_cast<const uint8_t*>(g.host) + (address - g.base);
     }
     // After a fill: remember what the source held.
@@ -4593,7 +4615,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
                         const uint64_t bytes = std::min<uint64_t>(size, 64 * 1024);
                         GuestRegion g;
                         region(address, bytes, g);
-                        noteCpuRead(address, bytes);
+                        noteCpuRead(address, bytes, "cbuf_copy");
                         const Phase cbPhase(r.cpu_.bindCbMs);
                         auto at = alignedConstantCopy(address, bytes, static_cast<const uint8_t*>(g.host) + (address - g.base));
                         if (!at) return why = "upload ring full", false;
@@ -6533,6 +6555,7 @@ void Renderer::publishProbe(uint64_t pictures) {
             C(f, std::string("refill_") + why[k], ps.refills[k]), C(f, std::string("refill_") + why[k] + "_bytes", ps.refillBytes[k]);
         C(f, "refill_unfilled", ps.refillFailed);
         C(f, "refill_skipped", ps.refillSkipped), C(f, "refill_skipped_bytes", ps.refillSkippedBytes);
+        C(f, "dma_stale_read", ps.dmaStaleReads), C(f, "cpu_read_all", ps.cpuReadAll);
         static const char* const aliasWhy[Impl::kAliasReasons] = {"depth", "address", "shape", "layout", "mips", "samples", "format", "no_view", "range", "feedback"};
         C(f, "alias_hits", ps.aliasHits), C(f, "alias_hits_legacy", ps.aliasHitsLegacy);
         for (unsigned k = 0; k < Impl::kAliasReasons; ++k) C(f, std::string("alias_rejected_") + aliasWhy[k], ps.aliasRejected[k]);

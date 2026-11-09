@@ -2056,6 +2056,31 @@ void dmaAfterCpuRead() {
     CHECK(x.s.counters().dmaRecorded == 0);  // (counted when the caller records it)
 }
 
+// The fetch subroutine the renderer reads on the CPU counts as read where it lives; with the probe on, a first CPU read of a range
+// that a recorded fill still has to write leaves a DMA_STALE_READ line.
+void dmaStaleRead() {
+    vpgpu::probe::setEnabled(true);
+    {
+        Sched x;
+        x.work(kBase + 0x10000);  // a fill recorded over the texture the draw reads
+        x.f.renderer.draw(x.f.state());
+        std::string line;
+        for (const std::string& l : x.f.log)
+            if (l.rfind("VPKENGINE_PROBE DMA_STALE_READ", 0) == 0) line = l;
+        CHECK(line.find("a=0x10010000") != std::string::npos && line.find("by=") != std::string::npos);
+        CHECK(line.find("busy=[0x10010000-") != std::string::npos && line.find(" by=fill in=recorded") != std::string::npos);
+        vpps4::DrawState d = x.f.state();
+        d.vs.userSgprs = 16;
+        for (unsigned i = 0; i < 16; ++i) d.vs.userData[i] = 0x1000u * (i + 1);  // (a pair of them is the fetch subroutine's address)
+        d.vs.userData[4] = uint32_t(kBase + 0x100);
+        const uint64_t fetchAt = vpps4::fetchAddress(d.vs.code, d.vs.userData, d.vs.userSgprs);
+        CHECK(fetchAt != 0 && !x.f.renderer.cpuReadSeen(fetchAt, 4));
+        x.f.renderer.draw(d);
+        CHECK(x.f.renderer.cpuReadSeen(fetchAt, 4));
+    }
+    vpgpu::probe::setEnabled(false);
+}
+
 // Probe DMASYNC: a CPU access that waits leaves a line with the caller, the busy range that made it wait and who made that.
 void dmaSyncProbe() {
     vpgpu::probe::setEnabled(true);
@@ -3186,6 +3211,7 @@ int main(int argc, char** argv) {
     else if (t == "one_frame_per_image") oneFramePerImage();
     else if (t == "partial_waits") partialWaits();
     else if (t == "dma_on_gpu") dmaOnGpu();
+    else if (t == "dma_stale_read") dmaStaleRead();
     else if (t == "dma_after_cpu_read") dmaAfterCpuRead();
     else if (t == "dma_sync_probe") dmaSyncProbe();
     else if (t == "staging_pool") stagingPool();
