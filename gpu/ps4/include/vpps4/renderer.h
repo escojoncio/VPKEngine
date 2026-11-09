@@ -250,6 +250,10 @@ public:
     // Whether the renderer has ever read guest [a, +n) on the CPU (descriptors, indices, program code, texture sources, constant
     // copies). A DMA recorded on the GPU timeline lands later than a CPU read would see, so such a range is DMA'd by the CPU.
     bool cpuReadSeen(uint64_t a, uint64_t n) const;
+    // The CPU side of the command processor (a DMA done on the CPU, DUMP_CONST_RAM, WRITE_DATA) had to wait for recorded
+    // work to finish before touching [a, +n): the range counts as read by the CPU from now on, so a small read-only buffer
+    // bound from it is copied when its draw is recorded (see cpuReadSeen) and the next such access finds nothing to wait for.
+    void cpuAccessed(uint64_t a, uint64_t n);
     // Probe (first 50): a DMA over [a, +n) stays on the CPU because of cpuReadSeen: one DMA_CPU_READ line naming the first
     // readers of the ranges it overlaps (cbuf_copy, read_guest, code, ...).
     void probeDmaCpuRead(uint64_t a, uint64_t n, uint64_t src);

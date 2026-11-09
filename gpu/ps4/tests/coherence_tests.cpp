@@ -2119,12 +2119,12 @@ void depthClearedTexture() {
     for (const bool old : {false, true}) {
         if (old) setenv("VPKENGINE_HTILE_CLEAR_MEMORY", "1", 1);
         Fixture f;
-        auto drawSlice = [&](uint16_t k) {
+        auto drawSlice = [&](uint16_t k, bool clear = true) {
             vpps4::DrawState d = f.depthState(true);
             d.color[0] = {};
             d.depth.width = d.depth.height = 64;
             d.depth.sliceStart = k;
-            d.depth.depthClear = true;
+            d.depth.depthClear = clear;
             f.renderer.draw(d);
         };
         auto sampleArray = [&] {
@@ -2151,13 +2151,19 @@ void depthClearedTexture() {
         sampleArray();
         CHECK(Fixture::count(f.events(), label) == (old ? 0u : 4u));
         if (!old) {
-            drawSlice(1);  // slice 1 is drawn into: it is memory's again, the other three keep the value
+            drawSlice(1);  // a clear of slice 1 leaves the value there: nothing changes
             sampleArray();
-            CHECK(f.renderer.stats().refilled == refilled + 1);
-            CHECK(Fixture::count(f.events(), label) == 7u);
+            CHECK(f.renderer.stats().refilled == refilled && Fixture::count(f.events(), label) == 4u);
+            drawSlice(1, false);  // slice 1 is drawn into: it is memory's again, the other three keep the value
+            sampleArray();
+            CHECK(Fixture::count(f.events(), label) == 7u);  // (and slice 1 is looked for in memory again)
             f.renderer.depthCleared(kDepth, 1.0f);  // cleared again: all four
             sampleArray();
             CHECK(Fixture::count(f.events(), label) == 11u);
+            f.renderer.invalidate(kDepth, 4096);  // the CPU writes the surface: the clear no longer stands, memory is read
+            const uint64_t before = f.renderer.stats().refilled;
+            sampleArray();
+            CHECK(f.renderer.stats().refilled == before + 1 && Fixture::count(f.events(), label) == 11u);
         }
         if (old) unsetenv("VPKENGINE_HTILE_CLEAR_MEMORY");
         if (failures) f.dump();

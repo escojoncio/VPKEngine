@@ -3349,6 +3349,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         float value = 1.0f;
         uint32_t mask = 0;
         uint64_t stamp = 0;
+        uint64_t version = 0;  // the tracker's when it was cleared (or last looked at): a writer that is not a depth image since then ends it
     };
     std::unordered_map<uint64_t, ClearedDepth> clearedDepths;
     uint64_t clearedDepthStamp = 0;
@@ -3358,6 +3359,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         ClearedDepth& c = clearedDepths[zAddress];
         if (c.mask == ~uint32_t(0) && c.value == value) return;
         c.value = value, c.mask = ~uint32_t(0), c.stamp = ++clearedDepthStamp;
+        c.version = tracker.current();
     }
     void depthDrawn(uint64_t zAddress, uint32_t sliceStart, uint32_t sliceCount) {
         const auto it = clearedDepths.find(zAddress);
@@ -3369,7 +3371,10 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         if (!it->second.mask) clearedDepths.erase(it);
     }
     static uint32_t layerMask(const Surface& s) { return s.layers >= 32 ? ~uint32_t(0) : (1u << s.layers) - 1; }
-    const ClearedDepth* clearedDepthOf(const Texture& t) const {
+    // (the record ends when something other than a depth image wrote the range since the clear: the memory was given another
+    // use, or the CPU / a DMA filled the surface, and the texture is memory's again)
+    std::vector<MemoryTracker::WriterId> clearedWriters;
+    const ClearedDepth* clearedDepthOf(const Texture& t) {
         if (clearedDepths.empty()) return nullptr;
         const vpgpu::Format f = t.format;
         if (f != vpgpu::Format::D32Float && f != vpgpu::Format::R32Float && f != vpgpu::Format::D16Unorm && f != vpgpu::Format::R16Unorm)
@@ -3377,7 +3382,19 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         if (!t.id || t.mips != 1 || t.samples > 1 || t.softBc || t.storage || t.type == vpgpu::TextureType::Tex3D || !t.layers || t.layers > 32)
             return nullptr;
         const auto it = clearedDepths.find(t.address);
-        return it != clearedDepths.end() ? &it->second : nullptr;
+        if (it == clearedDepths.end()) return nullptr;
+        if (tracker.writtenByOthers(t.address, t.bytes, t.wid, it->second.version)) {
+            clearedWriters.clear();
+            tracker.writersSince(t.address, t.bytes, t.wid, it->second.version, clearedWriters);
+            for (const MemoryTracker::WriterId w : clearedWriters) {
+                const Surface* o = MemoryTracker::isImage(w) ? surfaceOf(w) : nullptr;
+                if (o && o->isDepth) continue;
+                clearedDepths.erase(it);
+                return nullptr;
+            }
+            it->second.version = tracker.current();
+        }
+        return &it->second;
     }
     // Before the texture's refresh: true when every layer holds the clear value (memory is not looked at). A layer drawn
     // into since it took the value goes back to memory.
@@ -3421,6 +3438,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
             ++pstat.depthClearFills;
         }
         ++t.writeSeq;
+        if (tv.pending && tv.pending->wid == t.wid) tv.pending.reset();  // (a check of the fill from memory would find these layers different)
         t.clearedStamp = c.stamp, t.clearedFills = t.fills, t.clearedLayers = now;
         if (vpgpu::probe::enabled() && (++pstat.depthClearLines <= 40 || pstat.depthClearLines % 600 == 0))
             log("VPKENGINE_PROBE CLEARFILL n=" + std::to_string(pstat.depthClearLines) + " f=" + std::to_string(r.frame_) + " addr=" + hex(t.address) +
@@ -5404,7 +5422,6 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
             Target* dt = target(depthTargets, readAddress, zf, z.width, z.height,
                                 samples, uint16_t(z.sliceStart + z.sliceCount), true, z.tileMode, depthPitch(z), nullptr, depthRows(z));
             if (!dt) return skip("depth target creation failed");
-            depthDrawn(readAddress, z.sliceStart, z.sliceCount);
             {
                 const uint64_t zBase = agreedBase(z.zAddress, z.zWriteAddress), stencilBase = agreedBase(z.stencilAddress, z.stencilWriteAddress);
                 const uint64_t primary = z.zFormat ? zBase : stencilBase;
@@ -6038,6 +6055,9 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         if (depthWid) clearDone(clears ? desc.layerCount : z.sliceCount);  // (a clear of one plane or of part of the target is a rectangle inside the pass)
         if (depthWid && (clears || clearsZ || clearsStencil || (d.depthStencil.depthWrite && z.zFormat) || (d.depthStencil.stencilTest && z.stencilFormat)))
             markWriteWid(depthWid);
+        // (a draw that writes Z: its slices no longer hold the clear value alone; a clear leaves that value, a read does nothing)
+        if (depthWid && d.depthStencil.depthWrite && z.zFormat && !z.zReadOnly && !z.depthClear && !clears && !clearsZ)
+            depthDrawn(z.zAddress, z.sliceStart, z.sliceCount);
     }
 
     // Whether a compute program has what the reference translation emits as a bitwise xor 32: v_xor_b32, s_xor_b32,
@@ -6891,6 +6911,7 @@ void Renderer::waitedBelow(uint64_t frames) {
     impl_->retireOwned();
 }
 bool Renderer::cpuReadSeen(uint64_t a, uint64_t n) const { return impl_->cpuReadSeen(a, n); }
+void Renderer::cpuAccessed(uint64_t a, uint64_t n) { impl_->noteCpuRead(a, n, "cp_access"); }
 void Renderer::probeDmaCpuRead(uint64_t a, uint64_t n, uint64_t src) {
     Impl& i = *impl_;
     if (!vpgpu::probe::enabled() || ++i.dmaCpuReadLines > 50) return;
