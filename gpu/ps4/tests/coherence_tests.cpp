@@ -11,6 +11,7 @@
 #include <fstream>
 #include <functional>
 #include <map>
+#include <set>
 #include <sstream>
 #include <string>
 #include <string_view>
@@ -64,7 +65,9 @@ public:
     std::vector<vpgpu::Command> commands;
     std::map<uint32_t, uint8_t*> memory;  // host memory of the buffers that alias some (guest windows, upload rings), by index
 
+    std::map<uint32_t, vpgpu::BufferDesc> bufferDescs;
     void createBuffer(vpgpu::BufferId i, const vpgpu::BufferDesc& d) override {
+        bufferDescs[i.index] = d;
         if (d.guestMemory) memory[i.index] = static_cast<uint8_t*>(d.guestMemory);
         inner.createBuffer(i, d);
     }
@@ -1431,6 +1434,30 @@ void flatMap() {
     for (size_t k = 1; k < table.size(); ++k) CHECK(table[k - 1].first < table[k].first);
 }
 
+// Guest windows are made resident by the work that names them (BufferDesc::residentByUse: gpu/metal2 keeps them out of the
+// residency set): a FLAT dispatch, which may follow a pointer into any window of its GuestMap, names every one of them in
+// its bindings (address-only accesses), so each is declared to its encoder.
+void flatWindowsNamed() {
+    Windows w;
+    w.mirrored = false;
+    w.use(kWinBase, 64 * kMiB);
+    w.use(kWinBase + 64 * kMiB, 64 * kMiB);
+    w.offered = {{kWinBase, 64 * kMiB}, {kWinBase + 64 * kMiB, 64 * kMiB}};
+    const size_t before = w.backend.commands.size();
+    CHECK(w.flatTable().size() == 2);
+    std::set<uint32_t> windows, named;
+    for (const auto& [index, d] : w.backend.bufferDescs)
+        if (d.label.rfind("guest ", 0) == 0) {
+            CHECK(d.residentByUse);
+            windows.insert(index);
+        }
+    for (size_t i = before; i < w.backend.commands.size(); ++i)
+        if (const auto* dp = std::get_if<vpgpu::Dispatch>(&w.backend.commands[i]))
+            for (const vpgpu::Access& a : dp->bindings)
+                if (a.range.kind == vpgpu::ResourceRange::Kind::Buffer && windows.count(a.range.index)) named.insert(a.range.index);
+    CHECK(windows.size() == 2 && named == windows);
+}
+
 // A window over a mirror the host has replaced is not left behind: made again over the new one it retires the overlapping
 // windows made of the old copy of the pages (the buffer is destroyed once the frames in flight are done), and one that
 // does not overlap it is left out of the FLAT map and retired there. Windows of the same copy stay.
@@ -2466,6 +2493,7 @@ int main(int argc, char** argv) {
     const std::string_view t = argc > 1 ? argv[1] : "";
     if (t == "rt_to_texture") rtToTexture();
     else if (t == "frame_capture") frameCapture();
+    else if (t == "flat_windows_named") flatWindowsNamed();
     else if (t == "depth_alloc_pitch_change") depthAllocPitchChange();
     else if (t == "sample_extent") sampleExtent();
     else if (t == "soft_bc_upload") softBcUpload();

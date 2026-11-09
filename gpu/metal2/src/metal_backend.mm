@@ -548,6 +548,9 @@ struct MetalBackend::Impl {
     uint64_t base = 0;  // guest pointer's offset inside a page-aligned no-copy buffer
     uint64_t bytes = 0;  // MTLBuffer length, counted in bufOwnBytes (own) or bufGuestBytes (guest memory)
     bool guest = false;
+    // In the residency set (or, without one, nothing is): false = made resident by useResource in each encoder whose work
+    // names it (BufferDesc::residentByUse; VPVK_RESIDENCY_FULL=1 keeps those in the set too).
+    bool resident = true;
     // Host address of byte 0 of the client's range and its usable length (VP_CB_ORDER=2 hazards by address).
     uintptr_t host = 0;
     uint64_t span = 0;
@@ -808,6 +811,7 @@ struct MetalBackend::Impl {
     std::atomic<uint64_t> cbs{0}, encRender{0}, encCompute{0}, encBlit{0};
     std::atomic<uint64_t> cutEnc{0}, chunkWaits{0}, chunkWaitUs{0};  // encoder-budget cuts; backpressure waits and their time
     std::atomic<uint64_t> resAdd{0}, resRemove{0}, resCommit{0};
+    std::atomic<uint64_t> byUse{0}, byUseBytes{0};  // useResource of buffers kept out of the residency set (per encoder)
     std::atomic<uint64_t> heldObjs{0}, heldBytes{0};  // gauges: retired objects (graveyard + slots) and their bytes
     std::atomic<uint64_t> drainedObjs{0}, drainedBytes{0}, drainRuns{0};
     // Texture lifetime: textures-map entries (created / destroyed; live = difference), explicit views destroyed, format views
@@ -1017,6 +1021,8 @@ struct MetalBackend::Impl {
   std::atomic<uint64_t> fovShadowBytes{0};   // bytes of the pooled foveation shadow textures
   std::atomic<uint64_t> liveViews{0};        // views created and not destroyed
   std::atomic<uint64_t> bufOwnBytes{0}, bufGuestBytes{0}, tileRejectedTotal{0};
+  std::atomic<uint64_t> bufByUseBytes{0};  // buffers kept out of the residency set (Buffer::resident false with a set)
+  const bool residencyFull = std::getenv("VPVK_RESIDENCY_FULL") != nullptr;
   // Function keys whose library compile is running (guarded by pipelineMutex); a second caller
   // waits on functionReady instead of compiling the same MSL again.
   std::unordered_set<uint64_t> compiling;
@@ -4602,7 +4608,7 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
           auto b = buffers.find(r.index);
           if (b != buffers.end() && b->second.generation == r.generation) {
             v = b->second.buffer.gpuAddress + b->second.base + r.begin;
-            if (!residency) pendingUse.push_back({b->second.buffer, u});
+            if (!b->second.resident) pendingUse.push_back({b->second.buffer, u});
           } else {
             missWhy = b == buffers.end() ? "buffer_unknown" : "buffer_stale_generation";
           }
@@ -4824,13 +4830,24 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
     }
   };
 
-  // Declares the current draw's/dispatch's table resources to the open encoder (no residency set).
+  // Buffers out of the residency set that the draw's / dispatch's bindings name without a table slot (an address-only Access:
+  // a raw pointer the shader follows, e.g. a window of the gpu/ps4 FLAT GuestMap): declared with the table's (useBound).
+  auto useNamed = [&](const std::vector<Access>& bindings) {
+    for (const Access& a : bindings) {
+      if (a.range.kind != ResourceRange::Kind::Buffer) continue;
+      const auto b = buffers.find(a.range.index);
+      if (b == buffers.end() || b->second.generation != a.range.generation || b->second.resident) continue;
+      pendingUse.push_back({b->second.buffer, a.write ? MTLResourceUsageRead | MTLResourceUsageWrite : MTLResourceUsageRead});
+    }
+  };
+  // Declares the current draw's/dispatch's table resources to the open encoder (no residency set, or buffers out of it).
   auto useBound = [&]() {
     for (const auto& [res, u] : pendingUse) {
       const uintptr_t key = reinterpret_cast<uintptr_t>((__bridge const void*)res) | ((u & MTLResourceUsageWrite) ? 1 : 0);
       if (!used.insert(key).second) continue;
       if (open.render) [open.render useResource:res usage:u stages:MTLRenderStageVertex | MTLRenderStageFragment];
       else if (open.compute) [open.compute useResource:res usage:u];
+      if (residency) bump(cnt.byUse), bump(cnt.byUseBytes, [(id<MTLBuffer>)res length]);  // (with a set, only buffers out of it are here)
     }
     pendingUse.clear();
     if (!residency) {
@@ -6240,6 +6257,7 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
             skip(ci, j, why);
             continue;
           }
+          useNamed(d.bindings);
           useBound();
           trackPipeline(e, p, false);
           ++cbDraws;
@@ -6585,6 +6603,7 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
           skip(enc.commands[k], 0, why);
           continue;
         }
+        useNamed(d.bindings);
         useBound();
         if (dumping)
           for (const Access& a : d.bindings) {
@@ -7780,12 +7799,14 @@ void MetalBackend::createBuffer(BufferId handle, const BufferDesc& d) {
   if (!d.label.empty()) b.buffer.label = @(d.label.c_str());
   attr::track(d.guestMemory ? "m2.buf.nocopy" : "m2.buf.own", b.buffer);  // nocopy wraps guest memory
   std::lock_guard<std::recursive_mutex> tables(m.tableMutex);  // the allocation above does not need the tables
-  if (m.residency) {
+  b.resident = m.residency && !(d.residentByUse && !m.residencyFull);
+  if (b.resident) {
     [m.residency addAllocation:b.buffer];
     Impl::bump(m.cnt.resAdd);
     m.residencyDirty = true;
   }
   b.bytes = b.buffer.length;
+  if (m.residency && !b.resident) m.bufByUseBytes += b.bytes;
   b.host = reinterpret_cast<uintptr_t>(b.buffer.contents) + uintptr_t(b.base);
   b.span = uint64_t(b.buffer.length) > b.base ? uint64_t(b.buffer.length) - b.base : 0;
   b.guest = d.guestMemory != nullptr;
@@ -7908,6 +7929,7 @@ void MetalBackend::destroyBuffer(BufferId handle) {
   }
   impl_->retire(it->second.buffer);
   (it->second.guest ? impl_->bufGuestBytes : impl_->bufOwnBytes) -= it->second.bytes;
+  if (impl_->residency && !it->second.resident) impl_->bufByUseBytes -= it->second.bytes;
   impl_->buffers.erase(it);
 }
 
@@ -8299,6 +8321,8 @@ void MetalBackend::diagCounters(std::vector<std::pair<const char*, uint64_t>>& o
   add("res_add", c.resAdd);
   add("res_remove", c.resRemove);
   add("res_commit", c.resCommit);
+  add("by_use", c.byUse);
+  add("by_use_b", c.byUseBytes);
   add("drain_runs", c.drainRuns);
   add("drained", c.drainedObjs);
   add("drained_b", c.drainedBytes);
@@ -8327,6 +8351,7 @@ void MetalBackend::publishProbe() const {
   G("GPUMEM", "tex_astc_mb", double(s.texAstc) * mb), G("GPUMEM", "tex_color_mb", double(s.texColor) * mb);
   G("GPUMEM", "tex_depth_mb", double(s.texDepth) * mb), G("GPUMEM", "tex_msaa_mb", double(s.texMsaa) * mb);
   G("GPUMEM", "buf_own_mb", double(s.bufOwn) * mb), G("GPUMEM", "buf_guest_mb", double(s.bufGuest) * mb);
+  G("GPUMEM", "buf_by_use_mb", double(s.bufByUse) * mb);  // (out of the residency set: residency_mb no longer holds them)
   G("GPUMEM", "held_mb", double(s.heldBytes) * mb), G("GPUMEM", "views", double(s.views));
   G("GPUMEM", "args_mb", double(s.argsBytes) * mb), G("GPUMEM", "buf_internal_mb", double(s.bufIntBytes) * mb);
   G("GPUMEM", "fov_shadow_mb", double(s.fovBytes) * mb), G("GPUMEM", "msaa_memoryless_mb", double(s.msaaMemoryless) * mb);
@@ -9587,7 +9612,7 @@ MetalBackend::MemStats MetalBackend::memStats() const {
     std::lock_guard lock(m.ledgerMutex);
     s.ledger = m.ledgerLast;
   }
-  s.bufOwn = m.bufOwnBytes, s.bufGuest = m.bufGuestBytes;
+  s.bufOwn = m.bufOwnBytes, s.bufGuest = m.bufGuestBytes, s.bufByUse = m.bufByUseBytes;
   s.heldBytes = m.cnt.heldBytes.load(std::memory_order_relaxed);
   s.views = m.liveViews.load(std::memory_order_relaxed);
   s.argsBytes = m.argsRingBytes.load(std::memory_order_relaxed) + m.argsMoreBytes.load(std::memory_order_relaxed);

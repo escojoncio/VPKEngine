@@ -226,7 +226,7 @@ struct Renderer::Impl {
         uint64_t refillSkipped = 0, refillSkippedBytes = 0, refillLines = 0;  // refills of a target left out because only images wrote its range (R1)
         uint64_t fillPath[5] = {}, fillPathBytes[5] = {};                  // none, GPU detile, CPU detile, linear upload, not filled
         uint64_t mirrorCalls = 0, mirrorCopies = 0, mirrorBytes = 0;
-        uint64_t depthAllocLines = 0, depthWritesUntracked = 0;  // depth targets made drawn smaller than their allocation (VPKENGINE_PROBE DEPTHALLOC)
+        uint64_t depthAllocLines = 0, depthWritesUntracked = 0, flatTables = 0;  // depth targets made drawn smaller than their allocation (VPKENGINE_PROBE DEPTHALLOC)
         uint64_t msDraws[4][4] = {};  // samples the title asked for (1,2,4,8) x samples the host draws with
         std::unordered_map<const char*, uint64_t> resolveDrops;
         struct Plan {
@@ -476,7 +476,9 @@ struct Renderer::Impl {
         if (b.host != g.host) b.failedLogged = false;
         b.base = g.base, b.size = g.size, b.host = g.host;
         b.spanBase = span.base, b.spanSize = span.size, b.mirrored = g.mirrored;
-        b.id = r.device_.createBuffer({g.size, g.host, "guest " + hex(g.base)});
+        vpgpu::BufferDesc bd{g.size, g.host, "guest " + hex(g.base)};
+        bd.residentByUse = true;  // (draws name the windows they read, FLAT ones all of the GuestMap: see guestMap)
+        b.id = r.device_.createBuffer(bd);
         b.failed = !b.id;
         if (b.id) ++pstat.guestBufAdds;
         else ++pstat.guestBufRefused;
@@ -4895,7 +4897,9 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         auto where = upload(table.data(), vpgcn::kGuestMapBytes);
         if (!where) return why = "upload ring full", false;
         at = *where;
-        // (the shader may write anywhere in them: ordered like any other GPU write to guest memory)
+        ++pstat.flatTables;
+        // (the shader may write anywhere in them: ordered like any other GPU write to guest memory; each one is named by an
+        // address-only Access, which is what makes it resident for the draw, see BufferDesc::residentByUse)
         for (const Entry& e : entries) {
             Access a;
             a.stages = mask;
@@ -7048,6 +7052,7 @@ void Renderer::publishProbe(uint64_t pictures) {
         C(f, "refill_unfilled", ps.refillFailed);
         C(f, "refill_skipped", ps.refillSkipped), C(f, "refill_skipped_bytes", ps.refillSkippedBytes);
         C(f, "depth_writes_untracked", ps.depthWritesUntracked);
+        C(f, "flat_tables", ps.flatTables);
         C(f, "dma_stale_read", ps.dmaStaleReads), C(f, "cpu_read_all", ps.cpuReadAll);
         static const char* const aliasWhy[Impl::kAliasReasons] = {"depth", "address", "shape", "layout", "mips", "samples", "format", "no_view", "range", "feedback"};
         C(f, "alias_hits", ps.aliasHits), C(f, "alias_hits_legacy", ps.aliasHitsLegacy);

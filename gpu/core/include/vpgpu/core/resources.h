@@ -96,6 +96,10 @@ struct BufferDesc {
   // no staging copy). It must stay mapped for the buffer's lifetime.
   void* guestMemory = nullptr;
   std::string label;
+  // Every GPU access to the buffer is named by the bindings of the draw / dispatch / copy that makes it (an address-only
+  // Access for a raw pointer into it, e.g. the gpu/ps4 FLAT GuestMap): a backend may make it resident only for the work
+  // that names it instead of always (gpu/metal2: out of the residency set, useResource per encoder).
+  bool residentByUse = false;
 };
 
 enum class TextureType : uint8_t { Tex1D, Tex2D, Tex3D, Cube };  // arrays: layers > 1

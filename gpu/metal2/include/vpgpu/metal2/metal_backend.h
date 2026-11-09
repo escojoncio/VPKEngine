@@ -236,6 +236,7 @@ class MetalBackend final : public Backend {
     uint64_t deviceAllocated = 0, workingSetMax = 0;  // MTLDevice.currentAllocatedSize / recommendedMaxWorkingSetSize
     uint64_t texAstc = 0, texColor = 0, texDepth = 0, texMsaa = 0;
     uint64_t bufOwn = 0, bufGuest = 0;
+    uint64_t bufByUse = 0;  // buffers kept out of the residency set (BufferDesc::residentByUse): made resident per encoder
     uint32_t pipelines = 0, functions = 0, libraries = 0;  // one MTLLibrary per function
     uint32_t archiveEntries = 0;    // session archive descriptors still held (last value if busy)
     uint32_t archiveFiles = 0;      // .metalar files opened for lookups
