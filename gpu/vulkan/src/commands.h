@@ -279,6 +279,7 @@ struct BoundState {
   VkRect2D renderArea{};
   uint32_t fbWidth = 0, fbHeight = 0, fbLayers = 0;
   uint32_t subpass = 0;
+  uint16_t subDump = 0;  // vk.sub_draw lines still to write for the subpass being recorded (pipelines.cpp vkCmdNextSubpass)
   const RenderPassObj* pass = nullptr;
   const Framebuffer* framebuffer = nullptr;
   uint8_t passSamples = 0;  // effective sample count of the open pass's attachments (0 = unknown)

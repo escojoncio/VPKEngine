@@ -2825,6 +2825,7 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdBeginRenderPass(VkCommandBuffer cb,
   r.bound.pass = op.pass;
   r.bound.framebuffer = op.framebuffer;
   r.bound.subpass = 0;
+  r.bound.subDump = 0;
   r.bound.passSamples = op.pass && op.framebuffer ? subpassSamples(*op.pass, *op.framebuffer, 0, true, vpvk::markedEyeOf(r.device)) : 0;
   r.bound.targetWidth = uint32_t(op.area.offset.x) + op.area.extent.width;
   r.bound.targetHeight = uint32_t(op.area.offset.y) + op.area.extent.height;

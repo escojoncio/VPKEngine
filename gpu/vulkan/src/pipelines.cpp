@@ -3437,6 +3437,16 @@ OpDraw makeDraw(Recorder& r, uint32_t first, uint32_t count, uint32_t instances,
   d.frontFace = front == VK_FRONT_FACE_CLOCKWISE ? vpgpu::Winding::Clockwise : vpgpu::Winding::CounterClockwise;
   if (QueryPoolObj* q = r.bound.queryPool; q && q->device && q->device->visibility.id)
     d.visibility = vpgpu::BufferSpan{q->device->visibility.id, uint64_t(q->base + r.bound.query) * 8, 8};
+  // vk.sub_draw: every draw of a later subpass (a mobile forward pass draws decals, fog and translucency there, reading
+  // the depth of the first one), with its state: which effects the game issues and how. Armed by vkCmdNextSubpass.
+  if (r.bound.subDump) {
+    --r.bound.subDump;
+    char more[200];
+    std::snprintf(more, sizeof more, "sub=%u ok=%d count=%u inst=%u indexed=%d vbs=%zu stencilRef=%u rawDepth=%d%d:%d cullMode=%u gameSamples=%u",
+                  r.bound.subpass, int(op.ok), count, instances, int(indexed), p->vertexBuffers.size(), unsigned(d.stencilRef),
+                  int(p->rawDepth.test), int(p->rawDepth.write), int(p->rawDepth.compare), unsigned(p->cullMode), unsigned(p->gameSamples));
+    log("vk.sub_draw " + vpgpu::describePipelineState(p->state, more));
+  }
   return op;
 }
 
@@ -3837,6 +3847,18 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdNextSubpass(VkCommandBuffer cb, VkSu
   Recorder& r = rec(cb);
   r.ops.emplace_back(OpNextSubpass{});
   ++r.bound.subpass;
+  {  // vk.sub_draw: the first 2 later subpasses of an eye-sized pass, then one in 3000
+    static std::atomic<uint32_t> seen{0};
+    r.bound.subDump = 0;
+    if (r.bound.fbWidth >= 1024) {
+      const uint32_t n = seen.fetch_add(1, std::memory_order_relaxed);
+      if (n < 2 || n % 3000 == 0) {
+        r.bound.subDump = 64;
+        logf("vk.sub_dump subpass=%u fb=%ux%ux%u area=%ux%u samples=%u", r.bound.subpass, r.bound.fbWidth, r.bound.fbHeight,
+             r.bound.fbLayers, r.bound.renderArea.extent.width, r.bound.renderArea.extent.height, unsigned(r.bound.passSamples));
+      }
+    }
+  }
   if (r.bound.pass && r.bound.framebuffer) r.bound.passSamples = subpassSamples(*r.bound.pass, *r.bound.framebuffer, r.bound.subpass, true, markedEyeOf(r.device));
 }
 VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdNextSubpass2(VkCommandBuffer cb, const VkSubpassBeginInfo*, const VkSubpassEndInfo*) {
