@@ -2,6 +2,7 @@
 
 #include <algorithm>
 
+#include "vpgpu/core/ab_switch.h"
 #include "vpps4/bc_decode.h"
 
 namespace vpps4 {
@@ -519,6 +520,7 @@ vpgpu::SamplerDesc decodeSampler(std::span<const uint32_t> d) {
     s.magFilter = (mag & 1) ? vpgpu::Filter::Linear : vpgpu::Filter::Nearest;
     s.minFilter = (min & 1) ? vpgpu::Filter::Linear : vpgpu::Filter::Nearest;
     if (min < 2 && mag < 2) s.maxAnisotropy = 1;  // (aniso only with the ANISO_* filters)
+    s.maxAnisotropy = vpgpu::ab::capAniso(s.maxAnisotropy, vpgpu::ab::maxAniso());  // (VPKENGINE_MAX_ANISO: an A/B test, off by default)
     s.mipFilter = mip == 0 ? vpgpu::MipFilter::None : mip == 1 ? vpgpu::MipFilter::Nearest : vpgpu::MipFilter::Linear;
     const uint32_t border = bits(d[3], 30, 2);
     s.border = border == 1 ? vpgpu::BorderColor::OpaqueBlack : border == 2 ? vpgpu::BorderColor::OpaqueWhite

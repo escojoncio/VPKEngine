@@ -32,7 +32,7 @@ if(BUILD_TESTING OR NOT DEFINED BUILD_TESTING)
   if(NOT MSVC)
     target_compile_options(vpgpu_probe_tests PRIVATE -Wall -Wextra)
   endif()
-  foreach(t hist busy_union lines names csv summary mutex bigalloc log)
+  foreach(t hist busy_union lines names csv summary mutex bigalloc log ab_switch)
     add_test(NAME gpu_probe.${t} COMMAND vpgpu_probe_tests ${t})
   endforeach()
   # One CTest entry per test case so failures are reported by name.
