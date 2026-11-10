@@ -576,8 +576,8 @@ void testCuts() {
   const TextureId c = s.rt(), d = s.depthRt(), other = s.rt();
   const BufferId buf = s.buf();
   Frame f;
-  Scene::passWithDraw(f, Scene::pass(c, d));                                              // FrameStart
-  f.dispatch(Scene::compute({write(ResourceRange::bytes(buf, 0, 256), stage::compute)})); // ComputeWork
+  Scene::passWithDraw(f, Scene::pass(c, d), {Scene::vsRead(buf)});                        // FrameStart
+  f.dispatch(Scene::compute({write(ResourceRange::bytes(buf, 0, 256), stage::compute)})); // ComputeWork (WAR: not hoisted)
   Scene::passWithDraw(f, Scene::pass(c, d), {Scene::vsRead(buf)});                        // ComputeBetween
   Scene::passWithDraw(f, Scene::pass(other), {Scene::sample(c)});                         // AttachmentChange
   Scene::passWithDraw(f, Scene::pass(other), {Scene::sample(other)});                     // Feedback
@@ -2456,7 +2456,10 @@ void testCopyRects() {
     CHECK_EQ(rects.encoders.size(), size_t{1});
     CHECK(rects.barriers.empty());
     CHECK_EQ(hazards(rects, HazardKind::WAW), 0u);
-    CHECK_EQ(compileFrame(f, nullptr, {}).stats.intraBarriers, 270u);  // off: 255 + 15, a chain per mip (mip 1 never conflicts with mip 0)
+    CompileOptions unordered;
+    unordered.barrierOrder = false;
+    CHECK_EQ(compileFrame(f, nullptr, unordered).stats.intraBarriers, 270u);  // off: 255 + 15, a chain per mip (mip 1 never conflicts with mip 0)
+    CHECK_EQ(compileFrame(f, nullptr, {}).stats.intraBarriers, 255u);  // the two chains run side by side: one barrier per level
   }
   {  // overlapping rects keep their barrier, partially or fully, and a whole-subresource access orders against all
     Frame f;
@@ -4378,6 +4381,207 @@ void testFrameOpt() {
   }
 }
 
+// Every pair of commands of `f` that conflicts (one writes what the other touches) runs in the recorded order in `c`.
+bool conflictOrderKept(const Frame& f, const CompiledFrame& c) {
+  const auto& cmds = f.commands();
+  auto accessesOf = [&](uint32_t i) {
+    std::vector<Access> out;
+    if (const auto* rp = std::get_if<RenderPass>(&cmds[i])) {
+      out = attachmentAccesses(rp->desc);
+      for (const Draw& d : rp->draws) for (const Access& x : drawAccesses(d)) out.push_back(x);
+    } else if (const auto* dp = std::get_if<Dispatch>(&cmds[i])) {
+      out = dp->bindings;
+    } else {
+      out = copyAccesses(std::get<Copy>(cmds[i]));
+    }
+    return out;
+  };
+  std::vector<size_t> pos(cmds.size(), SIZE_MAX);
+  size_t n = 0;
+  for (const Encoder& e : c.encoders) for (uint32_t ci : e.commands) pos[ci] = n++;
+  if (n != cmds.size()) return false;
+  for (uint32_t i = 0; i < cmds.size(); ++i)
+    for (uint32_t j = i + 1; j < cmds.size(); ++j) {
+      bool conflict = false;
+      for (const Access& x : accessesOf(i))
+        for (const Access& y : accessesOf(j)) conflict = conflict || ((x.write || y.write) && x.range.overlaps(y.range));
+      if (conflict && pos[i] > pos[j]) return false;
+    }
+  return true;
+}
+
+std::vector<uint32_t> commandOrder(const CompiledFrame& c) {
+  std::vector<uint32_t> o;
+  for (const Encoder& e : c.encoders) for (uint32_t ci : e.commands) o.push_back(ci);
+  return o;
+}
+
+size_t renderEncoders(const CompiledFrame& c) {
+  size_t n = 0;
+  for (const Encoder& e : c.encoders) n += e.kind == Encoder::Kind::Render;
+  return n;
+}
+
+// CompileOptions::dispatchHoist: a dispatch that touches nothing the open render encoder (nor the copies sunk behind it) touches
+// runs ahead of it, so the passes on either side of it stay one encoder; one that does conflict still ends the encoder.
+void testDispatchHoist() {
+  Scene s;
+  const TextureId c = s.rt();
+  const BufferId ubo = s.buf(), vb = s.buf(), staging = s.buf(), x = s.buf();
+  CompileOptions on, off, noOpt;
+  off.dispatchHoist = false;
+  noOpt.frameOpt = false;
+  CHECK(on.dispatchHoist);
+
+  {  // independent dispatch between two equal passes: one render encoder (before: render, compute, render)
+    Frame f;
+    Scene::passWithDraw(f, Scene::pass(c), {Scene::vsRead(ubo, 0)});                                // 0
+    f.dispatch(Scene::compute({write(ResourceRange::bytes(x, 0, 256), stage::compute)}));            // 1
+    Scene::passWithDraw(f, Scene::pass(c), {Scene::vsRead(ubo, 256)});                              // 2
+    const CompiledFrame a = compileFrame(f, &s.res, on), b = compileFrame(f, &s.res, off), n = compileFrame(f, &s.res, noOpt);
+    CHECK_EQ(renderEncoders(a), size_t{1});
+    CHECK_EQ(a.encoders.size(), size_t{2});
+    CHECK_EQ(a.stats.passesMerged, 1u);
+    CHECK(conflictOrderKept(f, a));
+    CHECK_EQ(b.encoders.size(), size_t{3});
+    CHECK_EQ(renderEncoders(b), size_t{2});
+    CHECK_EQ(n.encoders.size(), size_t{3});
+    CHECK((commandOrder(n) == std::vector<uint32_t>{0, 1, 2}));
+  }
+  {  // a dispatch after an earlier compute encoder joins it
+    Frame f;
+    f.dispatch(Scene::compute({write(ResourceRange::bytes(x, 0, 256), stage::compute)}));            // 0
+    Scene::passWithDraw(f, Scene::pass(c), {Scene::vsRead(ubo, 0)});                                // 1
+    f.dispatch(Scene::compute({write(ResourceRange::bytes(x, 512, 256), stage::compute)}));          // 2: joins encoder 0
+    Scene::passWithDraw(f, Scene::pass(c), {Scene::vsRead(ubo, 256)});                              // 3
+    const CompiledFrame a = compileFrame(f, &s.res, on);
+    CHECK_EQ(a.encoders.size(), size_t{2});
+    CHECK((commandOrder(a) == std::vector<uint32_t>{0, 2, 1, 3}));
+    CHECK(conflictOrderKept(f, a));
+  }
+  {  // a later pass reads the dispatch's result: it runs before the (single) render encoder
+    Frame f;
+    Scene::passWithDraw(f, Scene::pass(c), {Scene::vsRead(ubo, 0)});                                // 0
+    f.dispatch(Scene::compute({write(ResourceRange::bytes(x, 0, 256), stage::compute)}));            // 1
+    Scene::passWithDraw(f, Scene::pass(c), {Scene::vsRead(x, 0)});                                  // 2
+    const CompiledFrame a = compileFrame(f, &s.res, on);
+    CHECK_EQ(renderEncoders(a), size_t{1});
+    CHECK((commandOrder(a) == std::vector<uint32_t>{1, 0, 2}));
+    CHECK(conflictOrderKept(f, a));
+  }
+  {  // the dispatch overwrites what the pass reads (WAR): it stays where it was recorded
+    Frame f;
+    Scene::passWithDraw(f, Scene::pass(c), {Scene::vsRead(ubo, 0)});
+    f.dispatch(Scene::compute({write(ResourceRange::bytes(ubo, 0, 256), stage::compute)}));
+    Scene::passWithDraw(f, Scene::pass(c), {Scene::vsRead(ubo, 256)});
+    const CompiledFrame a = compileFrame(f, &s.res, on);
+    CHECK_EQ(a.encoders.size(), size_t{3});
+    CHECK((commandOrder(a) == std::vector<uint32_t>{0, 1, 2}));
+  }
+  {  // the dispatch reads what the pass wrote (an attachment, RAW): it stays
+    Frame f;
+    Scene::passWithDraw(f, Scene::pass(c), {Scene::vsRead(ubo, 0)});
+    f.dispatch(Scene::compute({read(ResourceRange::subresource(c, 0, 1, 0, 1), stage::compute)}));
+    Scene::passWithDraw(f, Scene::pass(c), {Scene::vsRead(ubo, 256)});
+    const CompiledFrame a = compileFrame(f, &s.res, on);
+    CHECK_EQ(a.encoders.size(), size_t{3});
+    CHECK((commandOrder(a) == std::vector<uint32_t>{0, 1, 2}));
+  }
+  {  // the dispatch's indirect arguments are written by the pass: it stays
+    Frame f;
+    Scene::passWithDraw(f, Scene::pass(c), {write(ResourceRange::bytes(x, 0, 256), stage::fragment)});
+    Dispatch d = Scene::compute({});
+    d.indirect = Indirect{x, 0};
+    f.dispatch(std::move(d));
+    Scene::passWithDraw(f, Scene::pass(c), {Scene::vsRead(ubo, 256)});
+    const CompiledFrame a = compileFrame(f, &s.res, on);
+    CHECK_EQ(a.encoders.size(), size_t{3});
+    CHECK((commandOrder(a) == std::vector<uint32_t>{0, 1, 2}));
+  }
+  {  // it conflicts with a copy sunk behind the open encoder: the copy stays before it
+    Frame f;
+    Scene::passWithDraw(f, Scene::pass(c), {Scene::vsRead(vb, 0)});                                  // 0
+    f.copyBuffer(Scene::span(staging), Scene::span(vb, 0));                                          // 1: WAR on vb -> sunk
+    f.dispatch(Scene::compute({read(ResourceRange::bytes(vb, 0, 256), stage::compute)}));            // 2: reads the copy
+    Scene::passWithDraw(f, Scene::pass(c), {Scene::vsRead(ubo, 256)});                              // 3
+    const CompiledFrame a = compileFrame(f, &s.res, on);
+    CHECK((commandOrder(a) == std::vector<uint32_t>{0, 1, 2, 3}));
+    CHECK(conflictOrderKept(f, a));
+  }
+  {  // a dispatch that conflicts with a middle encoder lands after it in an encoder that follows it
+    Frame f;
+    const TextureId c2 = s.rt();
+    Scene::passWithDraw(f, Scene::pass(c2), {Scene::vsRead(ubo, 0)});                               // 0
+    Scene::passWithDraw(f, Scene::pass(c), {write(ResourceRange::bytes(x, 0, 256), stage::fragment)});  // 1
+    f.dispatch(Scene::compute({read(ResourceRange::bytes(x, 0, 256), stage::compute)}));             // 2: after 1
+    Scene::passWithDraw(f, Scene::pass(c), {Scene::vsRead(ubo, 256)});                              // 3
+    const CompiledFrame a = compileFrame(f, &s.res, on);
+    CHECK(conflictOrderKept(f, a));
+  }
+}
+
+// CompileOptions::barrierOrder: ES/GS pairs of disjoint rings in one compute encoder take one barrier, not one per pair.
+void testBarrierOrder() {
+  Scene s;
+  const BufferId in = s.buf();
+  std::vector<BufferId> ring, out;
+  for (int i = 0; i < 15; ++i) ring.push_back(s.buf()), out.push_back(s.buf());
+  CompileOptions on, off, noOpt;
+  off.barrierOrder = false;
+  noOpt.frameOpt = false;
+  CHECK(on.barrierOrder);
+  Frame f;
+  for (int i = 0; i < 15; ++i) {
+    f.dispatch(Scene::compute({read(ResourceRange::bytes(in, 0, 256), stage::compute),
+                               write(ResourceRange::bytes(ring[i], 0, 256), stage::compute)}));  // ES
+    f.dispatch(Scene::compute({read(ResourceRange::bytes(ring[i], 0, 256), stage::compute),
+                               write(ResourceRange::bytes(out[i], 0, 256), stage::compute)}));   // GS
+  }
+  const CompiledFrame a = compileFrame(f, &s.res, on), b = compileFrame(f, &s.res, off), n = compileFrame(f, &s.res, noOpt);
+  CHECK_EQ(a.encoders.size(), size_t{1});
+  CHECK_EQ(b.stats.intraBarriers, 15u);
+  CHECK_EQ(n.stats.intraBarriers, 15u);  // frameOpt off: recorded order
+  CHECK_EQ(a.stats.intraBarriers, 1u);
+  CHECK_EQ(a.barriers.size(), size_t{1});
+  CHECK_EQ(a.barriers[0].item, 15u);  // in front of the first GS
+  CHECK(conflictOrderKept(f, a));
+  const std::vector<uint32_t> o = commandOrder(a);
+  for (uint32_t k = 0; k < 15; ++k) {
+    CHECK_EQ(o[k], 2 * k);
+    CHECK_EQ(o[15 + k], 2 * k + 1);
+  }
+  CHECK_EQ(a.stats.hazards[static_cast<int>(HazardKind::RAW)], 1u);
+
+  {  // a real chain (each reads what the one before wrote) keeps its order and its barriers
+    Frame g;
+    for (int i = 0; i < 6; ++i)
+      g.dispatch(Scene::compute({read(ResourceRange::bytes(ring[i], 0, 256), stage::compute),
+                                 write(ResourceRange::bytes(ring[i + 1], 0, 256), stage::compute)}));
+    const CompiledFrame c = compileFrame(g, &s.res, on);
+    CHECK((commandOrder(c) == std::vector<uint32_t>{0, 1, 2, 3, 4, 5}));
+    CHECK_EQ(c.stats.intraBarriers, 5u);
+  }
+  {  // WAR/WAW across pairs: ES2 overwrites what GS1 read, so the pairs cannot pass each other
+    Frame g;
+    const auto rd = [&](BufferId b) { return read(ResourceRange::bytes(b, 0, 256), stage::compute); };
+    const auto wr = [&](BufferId b) { return write(ResourceRange::bytes(b, 0, 256), stage::compute); };
+    g.dispatch(Scene::compute({wr(ring[0])}));            // 0
+    g.dispatch(Scene::compute({rd(ring[0]), wr(out[0])}));  // 1
+    g.dispatch(Scene::compute({wr(ring[0])}));            // 2: WAR with 1, WAW with 0
+    g.dispatch(Scene::compute({rd(ring[0]), wr(out[1])}));  // 3
+    const CompiledFrame c = compileFrame(g, &s.res, on);
+    CHECK((commandOrder(c) == std::vector<uint32_t>{0, 1, 2, 3}));
+    CHECK(conflictOrderKept(g, c));
+  }
+  {  // fewer than four items, or an order that does not save barriers: untouched
+    Frame g;
+    for (int i = 0; i < 3; ++i) {
+      g.dispatch(Scene::compute({write(ResourceRange::bytes(ring[i], 0, 256), stage::compute)}));
+    }
+    CHECK((commandOrder(compileFrame(g, &s.res, on)) == std::vector<uint32_t>{0, 1, 2}));
+  }
+}
+
 
 // The frame compiler's fold of a pass's accesses (CompileOptions::foldFast, VPVK_FRAME_FOLD=0 off) leaves the compiled frame the
 // way the slow fold does: random passes whose draws bind the same buffers and textures at the same positions with other stages
@@ -4525,7 +4729,7 @@ int main(int argc, char** argv) {
       {"submit", testSubmit},       {"hoist", testHoist},       {"hold", testHold},
       {"label_queue", testLabelQueue}, {"defaults", testDefaults}, {"locks", testLocks}, {"parallel", testParallel},
       {"nullrun", testNullRun},
-      {"automsaa", testAutoMsaa}, {"required_dispatch", testRequiredDispatch}, {"frameopt", testFrameOpt},
+      {"automsaa", testAutoMsaa}, {"required_dispatch", testRequiredDispatch}, {"frameopt", testFrameOpt}, {"dispatch_hoist", testDispatchHoist}, {"barrier_order", testBarrierOrder},
       {"fold_equal", testFoldEqual}, {"label_span", testLabelSpan}};
   bool ran = false;
   for (const auto& [name, fn] : groups) {
