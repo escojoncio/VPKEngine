@@ -545,12 +545,13 @@ struct MetalBackend::Impl {
     uint64_t bytes = 0;      // allocatedSize counted in texBytes[cat]
     uint64_t msaaLogical = 0;  // deferred render target still without memory: its size (msaaDeferredBytes)
     // Deferred render target (colour or depth, any sample count): memory is only a TRANSIENT backing. A frame that cannot stay on tile
-    // (HeavyGeometry, loads, samples...) materialises it; after msaaReleaseFrames consecutive tile-local frames it
-    // is given back (msaa_released) and the memoryless stand-in is used again.
+    // (HeavyGeometry, loads, samples...) materialises it; after msaaReleaseFrames consecutive tile-local frames (doubled by
+    // each earlier release, see releases) it is given back (msaa_released) and the memoryless stand-in is used again.
     bool deferredRT = false;
     bool pinned = false;        // handed out by nativeTexture(): the client may keep it, never released
     bool tileBanned = false;    // a command buffer that used its memoryless stand-in failed (tiler flush): real memory from now on
     uint32_t streak = 0;        // consecutive frames served by the stand-in since the last memory use
+    uint8_t releases = 0;       // times its backing was given back after a streak: each one doubles the streak the next needs
     uint64_t usedFrame = ~0ull; // last frame that needed the real texture
     uint64_t tileFrame = ~0ull; // last frame counted in `streak`
   };
@@ -2015,7 +2016,11 @@ void MetalBackend::Impl::releaseMsaaBackings(uint64_t frameIndex, bool bookkeepi
       continue;
     }
     Texture& tex = it->second;
-    if (tex.pinned || (!trim && tex.streak < msaaReleaseFrames) || (frameIndex != ~0ull && tex.usedFrame == frameIndex)) {
+    // A target that needed its memory again after a release waits twice as long the next time (up to 64x): allocating a
+    // 50-100 MiB backing stalls the frame it comes back in, and a target that alternates (Gundam: the same eye targets
+    // 16 times in 77 s, 45-58 ms each) gains nothing from being released. A memory warning still takes it at once.
+    const uint32_t need = msaaReleaseFrames << std::min<uint32_t>(tex.releases, 6);
+    if (tex.pinned || (!trim && tex.streak < need) || (frameIndex != ~0ull && tex.usedFrame == frameIndex)) {
       ++bi;
       continue;
     }
@@ -2047,8 +2052,9 @@ void MetalBackend::Impl::releaseMsaaBackings(uint64_t frameIndex, bool bookkeepi
     char line[320];
     std::snprintf(line, sizeof line, "gpu.metal.info what=msaa_released index=%u %ux%ux%u samples=%u mb=%.1f after_tile_frames=%u label=%s",
                   *bi, tex.desc.width, tex.desc.height, unsigned(tex.desc.layers), unsigned(tex.desc.samples), mb,
-                  msaaReleaseFrames, token(tex.desc.label).c_str());
+                  trim ? tex.streak : need, token(tex.desc.label).c_str());
     info(line);
+    if (!trim && tex.releases < 255) ++tex.releases;
     trimmedMsaaBytes += uint64_t(mb * 1048576.0);
     ++msaaReleases;
     bi = backedMsaa.erase(bi);

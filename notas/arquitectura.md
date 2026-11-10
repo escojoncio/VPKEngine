@@ -41,7 +41,7 @@
 | `VPVK_MAX_PENDING_CHUNKS` | 2 (0 = sin límite) | chunks sin completar por frame antes de esperar (metal2) |
 | `VPVK_MAX_DRAWS_PER_CB` | 256 (0 = off) | presupuesto de coste por CB (metal2) |
 | `VPVK_HANG_SPLIT` | 256 (0 = off) | draws por trozo del hang split (metal2) |
-| `VPVK_MSAA_RELEASE_FRAMES` | 120 (0 = pegajoso) | frames sin uso antes de liberar respaldo MSAA (metal2) |
+| `VPVK_MSAA_RELEASE_FRAMES` | 120 (0 = pegajoso) | frames sin uso antes de liberar respaldo MSAA (metal2); cada liberación previa de la misma textura duplica la espera (hasta x64, `Texture::releases`); un aviso de memoria libera siempre |
 | `VPVK_COPY_RECT_HAZARD` | apagado (activo si no vacío y ≠ `0`) | hazard de copias por rect (`core/device.cpp`) |
 | `VP_ENC_DETAIL` | 600 (0 = off) | muestreo `gpu.enc` (`core/device.cpp`) |
 | `VPVK_ASYNC_PIPELINES` | sin fijar: async (por defecto) | 0 = `vkCreate*Pipelines` síncrono, 1 = async; vpgles siempre async salvo `VPVK_GLES_SYNC_PIPELINES=1` (`config.cpp`) |
