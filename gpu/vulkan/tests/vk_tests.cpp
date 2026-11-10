@@ -3551,6 +3551,43 @@ void testRenderPassOps() {
     CHECK(ps.size() == 1 && ps[0]->desc.colors[0].load == vpgpu::LoadAction::DontCare &&
           ps[0]->desc.colors[0].store == vpgpu::StoreAction::DontCare);
   }
+  {  // CLEAR over a partial area. An ordinary image: load + clear quad (the outside survives). A TRANSIENT one, colour
+     // and depth: the load action clears the whole attachment and no quad is drawn.
+    VkAttachmentDescription a = col;
+    a.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR, a.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    Pass p = pass({a}, {one}, {}, {cv1});
+    vpgpu::Frame f;
+    TranslateStats st;
+    run(p, {{0, 0}, {64, 62}}, nullptr, f, st);
+    auto ps = passes(f);
+    CHECK(ps.size() == 1 && ps[0]->desc.colors[0].load == vpgpu::LoadAction::Load && ps[0]->draws.size() == 1 &&
+          ps[0]->draws[0].clear);
+    VkImage tc = image(c, VK_FORMAT_R8G8B8A8_UNORM, 64, 1,
+                       VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT, m);
+    VkImage td = image(c, VK_FORMAT_D32_SFLOAT_S8_UINT, 64, 1,
+                       VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT, m);
+    VkImageView tcv = makeView(tc, VK_IMAGE_ASPECT_COLOR_BIT, 1);
+    VkImageView tdv = makeView(td, VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT, 1);
+    VkAttachmentDescription d{};
+    d.format = VK_FORMAT_D32_SFLOAT_S8_UINT;
+    d.samples = VK_SAMPLE_COUNT_1_BIT;
+    d.loadOp = d.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+    d.storeOp = d.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    d.initialLayout = d.finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+    VkAttachmentReference dref{1, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL};
+    VkSubpassDescription both = one;
+    both.pDepthStencilAttachment = &dref;
+    Pass t = pass({a, d}, {both}, {}, {tcv, tdv});
+    vpgpu::Frame g;
+    run(t, {{0, 0}, {64, 62}}, nullptr, g, st);
+    ps = passes(g);
+    CHECK(ps.size() == 1 && ps[0]->draws.empty());
+    if (ps.size() == 1) {
+      CHECK(ps[0]->desc.colors[0].load == vpgpu::LoadAction::Clear && ps[0]->desc.depth.load == vpgpu::LoadAction::Clear);
+      CHECK(ps[0]->desc.colors[0].store == vpgpu::StoreAction::DontCare && ps[0]->desc.depth.store == vpgpu::StoreAction::DontCare);
+      CHECK(ps[0]->desc.colors[0].clear.color[0] == 1.0 && ps[0]->desc.depth.clear.depth == 1.0f && ps[0]->desc.depth.clear.stencil == 5);
+    }
+  }
   {  // D32S8: depth DONT_CARE store, stencil STORE -> the image is stored.
     VkAttachmentDescription a{};
     a.format = VK_FORMAT_D32_SFLOAT_S8_UINT;
@@ -3624,7 +3661,16 @@ void testRenderPassOps() {
     if (ps.size() == 2) {
       CHECK(ps[0]->desc.colors[0].load == vpgpu::LoadAction::Clear && ps[0]->desc.colors[0].store == vpgpu::StoreAction::Store);
       CHECK(ps[1]->desc.colors[0].load == vpgpu::LoadAction::Load);
+      CHECK(ps[1]->desc.colors[0].store == vpgpu::StoreAction::DontCare);  // the last part: the client's own store op
     }
+    // The same subpass with no barrier is one pass and keeps the client's DONT_CARE (nothing to hand over).
+    vpgpu::Frame f2;
+    TranslateStats st2;
+    run(p, {{0, 0}, {64, 64}}, [](VkCommandBuffer) {}, f2, st2);
+    auto ps2 = passes(f2);
+    CHECK(st2.selfDependencySplits == 0 && ps2.size() == 1);
+    if (ps2.size() == 1)
+      CHECK(ps2[0]->desc.colors[0].load == vpgpu::LoadAction::Clear && ps2[0]->desc.colors[0].store == vpgpu::StoreAction::DontCare);
   }
   {  // Integer MSAA colour with a resolve: samples stored, sample 0 blitted into the target after.
     VkImageCreateInfo ii{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};

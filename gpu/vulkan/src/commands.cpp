@@ -8,6 +8,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <optional>
 #include <unordered_map>
 
 #include "texdecode.h"
@@ -328,8 +329,13 @@ std::vector<std::shared_ptr<vpgpu::ClearRects>> areaClears(const OpBeginPass& b,
   };
   // First use from an UNDEFINED layout: nothing outside the render area / the views has defined
   // contents, so the load action may clear the whole attachment (cheaper than load + quad).
+  // A TRANSIENT attachment likewise: it has no contents worth keeping outside the area (attach() never promotes its load
+  // or store for a partial area either). Unreal renders 2258 rows of its 2260-row 4x targets: as a Load plus clear quads
+  // that first pass read both attachments back from memory every frame (Into the Radius 2).
   auto wholeClear = [&](uint32_t a) {
-    return int(sub) == uses(*b.pass, a).first && b.pass->attachments[a].initialLayout == VK_IMAGE_LAYOUT_UNDEFINED;
+    if (int(sub) != uses(*b.pass, a).first) return false;
+    const ImageView* v = view(a);
+    return b.pass->attachments[a].initialLayout == VK_IMAGE_LAYOUT_UNDEFINED || (v && v->image->desc.transient);
   };
   std::vector<uint32_t> keys;
   auto group = [&](uint32_t layers) -> vpgpu::ClearRects& {
@@ -426,7 +432,7 @@ bool resolveTargetClear(const OpBeginPass& b, uint32_t sub, uint16_t layers, vpg
 
 // "vk.rp_dump": what the game asked for in a multisampled render pass of 1 Mpx or more, as Vulkan states it (attachment
 // ops, usage, subpasses) and the order of what it records inside (draw counts between subpass changes, barriers and
-// clears). The first 3 such passes with a different shape, then one in 3000. One submit's core encoders (gpu.enc) only
+// clears). The first 6 such passes with a different shape, then one in 3000. One submit's core encoders (gpu.enc) only
 // show what the translator made of it; this line is the request itself.
 void rpDump(const OpBeginPass& b, const std::vector<Op>& ops, size_t at, uint64_t submit) {
   if (!b.pass || !b.framebuffer) return;
@@ -438,13 +444,24 @@ void rpDump(const OpBeginPass& b, const std::vector<Op>& ops, size_t at, uint64_
   uint64_t shape = b.pass->attachments.size() * 131 + b.pass->subpasses.size();
   for (const VkAttachmentDescription2& d : b.pass->attachments)
     shape = shape * 1000003 + uint64_t(d.format) * 64 + uint64_t(d.samples) * 16 + uint64_t(d.loadOp) * 4 + uint64_t(d.storeOp);
+  // ... and the framebuffer size and whether the pass is loaded (16 draws or more): the empty pass of a loading screen has
+  // the ops of the level's pass and used to take its place in the log.
+  shape = shape * 1000003 + (uint64_t(b.framebuffer->width) << 20) + b.framebuffer->height;
+  uint32_t ahead = 0;
+  for (size_t i = at + 1; i < ops.size() && ahead < 16; ++i) {
+    const Op& op = ops[i];
+    if (std::holds_alternative<OpDraw>(op)) ++ahead;
+    else if (const auto* e = std::get_if<OpExecute>(&op)) ahead += e->secondary ? uint32_t(std::min<size_t>(e->secondary->ops.size(), 16)) : 0u;
+    else if (std::holds_alternative<OpEndPass>(op) || std::holds_alternative<OpBeginPass>(op) || std::holds_alternative<OpBeginRendering>(op)) break;
+  }
+  shape = shape * 2 + (ahead >= 16 ? 1 : 0);
   static std::mutex mu;
   static std::vector<uint64_t> seen;
   static uint64_t count = 0;
   {
     std::lock_guard<std::mutex> l(mu);
     const bool fresh = std::find(seen.begin(), seen.end(), shape) == seen.end();
-    if (fresh && seen.size() < 3) seen.push_back(shape);
+    if (fresh && seen.size() < 6) seen.push_back(shape);
     else if (++count % 3000) return;
   }
   std::string att;
@@ -519,10 +536,30 @@ bool selfReads(const RenderPassObj& rp, uint32_t sub) {
   return false;
 }
 
+// Is there a self-dependency barrier between ops[at] (the begin of a subpass) and the end of that subpass? Secondary
+// command buffers executed in it count.
+bool barrierAhead(const std::vector<Op>& ops, size_t at) {
+  for (size_t i = at + 1; i < ops.size(); ++i) {
+    const Op& op = ops[i];
+    if (std::holds_alternative<OpPassBarrier>(op)) return true;
+    if (const auto* e = std::get_if<OpExecute>(&op)) {
+      if (e->secondary)
+        for (const Op& so : e->secondary->ops)
+          if (std::holds_alternative<OpPassBarrier>(so)) return true;
+    } else if (std::holds_alternative<OpNextSubpass>(op) || std::holds_alternative<OpEndPass>(op) ||
+               std::holds_alternative<OpBeginPass>(op) || std::holds_alternative<OpBeginRendering>(op)) {
+      return false;
+    }
+  }
+  return false;
+}
+
 // Subpass `sub` of a render pass as one core pass. Input attachments are read as textures (they
 // were stored by the earlier subpass); passes that the core merges keep them on tile.
+// `keepForSplit`: a self-reading subpass that will be split at a barrier stores every attachment (see below). False when no
+// barrier follows: the subpass is one core pass and ends with the client's own store ops.
 bool beginPass(const OpBeginPass& b, uint32_t sub, vpgpu::RenderPassDesc& desc,
-               std::vector<vpgpu::Copy>* resolveCopies = nullptr) {
+               std::vector<vpgpu::Copy>* resolveCopies = nullptr, bool keepForSplit = true) {
   if (!b.pass || sub >= b.pass->subpasses.size()) return false;
   const RenderPassObj::Subpass& sp = b.pass->subpasses[sub];
   std::vector<std::pair<const ImageView*, const ImageView*>> forced, intResolves;
@@ -544,7 +581,10 @@ bool beginPass(const OpBeginPass& b, uint32_t sub, vpgpu::RenderPassDesc& desc,
   }
   // A subpass reading its own attachment as an input attachment (self-dependency) is split at its
   // barriers (Translator, OpPassBarrier): every part stores, so the next part loads what it drew.
-  if (selfReads(*b.pass, sub)) {
+  // The last part (and a subpass with no barrier at all: Unreal's translucency subpass reads the read-only depth the
+  // opaque subpass stored) ends with the client's store ops: forcing a Store there wrote 4x colour and depth to memory
+  // every frame for nobody.
+  if (keepForSplit && selfReads(*b.pass, sub)) {
     auto keep = [](vpgpu::Attachment& a) {
       if (!a.texture) return;
       if (a.store == vpgpu::StoreAction::DontCare) a.store = vpgpu::StoreAction::Store;
@@ -640,6 +680,7 @@ struct Translator {
   EyeWhy eyeWhy;  // why eyeScene is false (forceMsaa's "eye" rejection diagnostics)
   uint8_t forceN = 0;
   vpgpu::TextureId lastColor0, lastDepth;  // colour 0 and depth of the pass opened last in this translation (open)
+  std::optional<vpgpu::RenderPassDesc> selfFinal;  // a self-reading subpass that splits: its pass with the client's own stores
   // VPKTAA UI mask. uiOn: classify the draws of eye passes (taa::DrawClassifier) and leave the UI
   // unjittered; `um` also lets the pass carry the R8 mask (maskPass) the UI draws mark.
   bool uiOn = false;
@@ -861,7 +902,13 @@ struct Translator {
         fovSuppressed = false;
         taaSubpass(*b, 0);
         viewMask = b->pass && !b->pass->subpasses.empty() ? b->pass->subpasses[0].viewMask : 0;
-        if (beginPass(*b, 0, desc, &pendingResolves)) {
+        selfFinal.reset();
+        const bool split0 = barrierAhead(rec.ops, opIx);
+        if (split0 && b->pass && selfReads(*b->pass, 0)) {  // the client's own stores, for the part after the last barrier
+          vpgpu::RenderPassDesc fin;
+          if (beginPass(*b, 0, fin, nullptr, false)) selfFinal = fin;
+        }
+        if (beginPass(*b, 0, desc, &pendingResolves, split0)) {
           auto cr = areaClears(*b, 0, desc);
           fovArea = !cr.empty();
           resolveClear(*b, 0, desc.layerCount);
@@ -910,7 +957,13 @@ struct Translator {
         fovSuppressed = false;
         if (pass) taaSubpass(*pass, subpass);
         viewMask = pass && pass->pass && subpass < pass->pass->subpasses.size() ? pass->pass->subpasses[subpass].viewMask : 0;
-        if (pass && beginPass(*pass, subpass, desc, &pendingResolves)) {
+        selfFinal.reset();
+        const bool splitN = barrierAhead(rec.ops, opIx);
+        if (splitN && pass && pass->pass && selfReads(*pass->pass, subpass)) {
+          vpgpu::RenderPassDesc fin;
+          if (beginPass(*pass, subpass, fin, nullptr, false)) selfFinal = fin;
+        }
+        if (pass && beginPass(*pass, subpass, desc, &pendingResolves, splitN)) {
           auto cr = areaClears(*pass, subpass, desc);
           fovArea = !cr.empty();
           resolveClear(*pass, subpass, desc.layerCount);
@@ -932,6 +985,15 @@ struct Translator {
           for (vpgpu::Attachment& a : d.colors)
             if (a.texture) a.load = vpgpu::LoadAction::Load;
           if (d.depth.texture) d.depth.load = vpgpu::LoadAction::Load;
+          // The part after the last barrier ends with the client's stores (inside a secondary buffer the rest of the
+          // subpass is not visible from here: it keeps storing).
+          if (selfFinal && secondaryDepth == 0 && !barrierAhead(rec.ops, opIx)) {
+            auto own = [](vpgpu::Attachment& a, const vpgpu::Attachment& f) {
+              if (a.texture && a.texture == f.texture && !a.autoMsaa) a.store = f.store, a.keepSamples = f.keepSamples;
+            };
+            for (int c = 0; c < vpgpu::kMaxColorAttachments; ++c) own(d.colors[c], selfFinal->colors[c]);
+            own(d.depth, selfFinal->depth);
+          }
           close();
           open(std::move(d));
           ++st.selfDependencySplits;
