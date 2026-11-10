@@ -450,20 +450,18 @@ class Scheduler {
       ++out_.stats.copiesSunk;
       return;
     }
-    // Hoist as far up as no earlier encoder conflicts: copies of a whole frame then gather in
-    // a few compute encoders instead of one in front of every render encoder.
-    int target = -1;
-    for (int e = open_ - 1; e >= 0; --e) {
-      if (out_.encoders[e].kind == Encoder::Kind::Compute) target = e;
-      if (conflicts(acc, acc_[e])) break;
-    }
-    if (target < 0) target = insertComputeBeforeOpen();
-    out_.encoders[target].commands.push_back(i);
-    acc_[target].append(acc);
+    hoist(i, acc, CutReason::CopyWork);
     ++out_.stats.copiesHoisted;
   }
 
   void dispatch(uint32_t i, AccessList acc) {
+    // A dispatch that touches nothing the open render encoder or the copies sunk behind it touch runs ahead of it
+    // (the same test as a copy's), so the passes on either side of it stay one encoder. Its reads, writes and
+    // indirect arguments are all in `acc` (GDS, rings and counters are bindings), so that test is the whole of its
+    // dependencies; one that does conflict ends the encoder as before.
+    if (open_ >= 0 && options_.frameOpt && options_.dispatchHoist && !conflicts(acc, acc_[open_]) &&
+        !conflicts(acc, sunkAcc_))
+      return hoist(i, acc, CutReason::ComputeWork);
     closeRender();
     computeWork(i, CutReason::ComputeWork, std::move(acc));
   }
@@ -471,6 +469,20 @@ class Scheduler {
   void finish() { closeRender(); }
 
  private:
+  // Puts command `i` (which does not conflict with the open render encoder nor the copies sunk behind it) in the earliest
+  // compute encoder before the open one that nothing between conflicts with, else in a new one in front of the open encoder:
+  // the work of a whole frame then gathers in a few compute encoders instead of one in front of every render encoder.
+  void hoist(uint32_t i, const AccessList& acc, CutReason reason) {
+    int target = -1;
+    for (int e = open_ - 1; e >= 0; --e) {
+      if (out_.encoders[e].kind == Encoder::Kind::Compute) target = e;
+      if (conflicts(acc, acc_[e])) break;
+    }
+    if (target < 0) target = insertComputeBeforeOpen(reason);
+    out_.encoders[target].commands.push_back(i);
+    acc_[target].append(acc);
+  }
+
   // Brings texture range `r` in at colour `slot` of `need` for a fetch. Refused (the read is then a
   // bad fetch) when compatible() rejects it against what `need` already holds (slot taken, texture
   // in another slot, other size or sample count), it would exceed the tile budget, or there is no
@@ -571,10 +583,10 @@ class Scheduler {
     return static_cast<int>(out_.encoders.size()) - 1;
   }
 
-  int insertComputeBeforeOpen() {
+  int insertComputeBeforeOpen(CutReason reason) {
     Encoder e;
     e.kind = Encoder::Kind::Compute;
-    e.reason = CutReason::CopyWork;
+    e.reason = reason;
     out_.encoders.insert(out_.encoders.begin() + open_, std::move(e));
     acc_.insert(acc_.begin() + open_, AccessIndex{});
     return open_++;
@@ -1312,6 +1324,60 @@ bool CompiledFrame::skipped(uint32_t command, uint32_t draw) const {
   return std::binary_search(badDraws.begin(), badDraws.end(), DrawRef{command, draw});
 }
 
+// Orders the items of each compute encoder by dependency level (an item's level is one more than the highest level of the
+// earlier items it conflicts with: one writes what the other touches), so the independent items of a chain run together and a
+// single barrier separates the levels: ES, GS, ES, GS... with disjoint rings becomes ES... barrier GS... instead of a barrier
+// per pair. Items that conflict keep their order (the later one has the higher level), so every resource sees the same writes
+// in the same order. Done only when it saves barriers over a greedy placement in the recorded order (the model: a barrier
+// before an item that conflicts with one since the previous barrier).
+constexpr size_t kMaxLevelItems = 2048;  // the per-resource scan is quadratic in the worst case: bigger encoders keep their order
+void orderComputeByLevel(CompiledFrame& out, const std::vector<AccessList>& accesses) {
+  struct Rec {
+    ResourceRange range;
+    uint32_t level, index;
+  };
+  struct Recs {
+    std::vector<Rec> reads, writes;
+  };
+  for (Encoder& enc : out.encoders) {
+    const size_t n = enc.commands.size();
+    if (enc.kind != Encoder::Kind::Compute || n < 4 || n > kMaxLevelItems) continue;
+    std::unordered_map<uint64_t, Recs> recs;
+    std::vector<uint32_t> level(n, 0);
+    uint32_t barriers = 0, last = 0, top = 0;
+    for (uint32_t k = 0; k < n; ++k) {
+      const AccessList& acc = accesses[enc.commands[k]];
+      uint32_t lv = 0;
+      int64_t dep = -1;
+      for (const Tagged& t : acc) {
+        if (t.access.range.kind == ResourceRange::Kind::Sampler) continue;
+        const auto it = recs.find(resourceKey(t.access.range));
+        if (it == recs.end()) continue;
+        auto scan = [&](const std::vector<Rec>& list) {
+          for (const Rec& r : list)
+            if (r.range.overlaps(t.access.range)) lv = std::max(lv, r.level + 1), dep = std::max<int64_t>(dep, r.index);
+        };
+        scan(it->second.writes);
+        if (t.access.write) scan(it->second.reads);
+      }
+      if (dep >= static_cast<int64_t>(last)) ++barriers, last = k;
+      level[k] = lv;
+      top = std::max(top, lv);
+      for (const Tagged& t : acc)
+        if (t.access.range.kind != ResourceRange::Kind::Sampler)
+          (t.access.write ? recs[resourceKey(t.access.range)].writes : recs[resourceKey(t.access.range)].reads)
+              .push_back({t.access.range, lv, k});
+    }
+    if (top >= barriers) continue;
+    std::vector<uint32_t> idx(n);
+    for (uint32_t k = 0; k < n; ++k) idx[k] = k;
+    std::stable_sort(idx.begin(), idx.end(), [&](uint32_t a, uint32_t b) { return level[a] < level[b]; });
+    std::vector<uint32_t> sorted(n);
+    for (uint32_t k = 0; k < n; ++k) sorted[k] = enc.commands[idx[k]];
+    enc.commands = std::move(sorted);
+  }
+}
+
 CompiledFrame compileFrame(const Frame& frame, const ResourceTable* resources, const CompileOptions& options) {
   CompiledFrame out;
   const auto& cmds = frame.commands();
@@ -1334,6 +1400,7 @@ CompiledFrame compileFrame(const Frame& frame, const ResourceTable* resources, c
     else scheduler.copy(i, accesses[i]);
   }
   scheduler.finish();
+  if (options.frameOpt && options.barrierOrder) orderComputeByLevel(out, accesses);
   out.stats.splitViews = options.splitViews;
   out.stats.tileMaxVertices = options.tileMaxVertices;
   if (resources) {

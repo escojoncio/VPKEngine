@@ -281,6 +281,12 @@ struct CompileOptions {
   // false (Device: VPVK_FRAME_OPT=0): no pass is merged into an open render encoder and no copy is hoisted or sunk: every command
   // keeps its recorded position (an A/B switch against the optimiser; the hazards still get their barriers). Default true.
   bool frameOpt = true;
+  // false (Device: VPVK_FRAME_HOIST_OFF=1): a dispatch always ends the open render encoder, instead of running ahead of it
+  // when it conflicts with nothing the encoder (nor the copies sunk behind it) touches. Needs frameOpt. Default true.
+  bool dispatchHoist = true;
+  // false (Device: VPVK_BARRIER_ORDER_OFF=1): the items of a compute encoder keep their recorded order, instead of running
+  // by dependency level (all of one level, one barrier, all of the next) when that saves barriers. Needs frameOpt. Default true.
+  bool barrierOrder = true;
   // false (Device: VPVK_FRAME_FOLD=0): the accesses of a render pass's draws are folded through a map, one vector per draw,
   // as before. The compiled frame is the same either way (only the time to build it differs). Default true.
   bool foldFast = true;
