@@ -5708,8 +5708,8 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
     vpgpu::PassAccessSet passAccess;  // incremental read/write set of the open pass (ES/GS hoisting)
     uint8_t passSamples = 0;          // host samples of the open pass
     uint8_t passWritten = 0;          // colour slots its draws have written (a bit each)
-    // A depth-only draw on a multisampled depth target keeps the colour target the draws that read that depth wrote attached
-    // (unwritten): the passes around it are one pass, not a store and a reload of every sample. By depth read address.
+    // A depth-only draw on a depth target keeps the colour target the draws that read that depth wrote attached (unwritten): the passes
+    // around it are one pass, not a store and a reload of the colour (of every sample, when multisampled). By depth read address.
     // VPKENGINE_DEPTH_ONLY_SPLIT=1: split as before.
     struct DepthPartner {
         unsigned slot;
@@ -5718,7 +5718,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         uint64_t frame;
     };
     std::unordered_map<uint64_t, DepthPartner> depthPartners;
-    bool depthPartnerOff = std::getenv("VPKENGINE_DEPTH_ONLY_SPLIT") != nullptr;
+    bool depthPartnerOff = optedOut("VPKENGINE_DEPTH_ONLY_SPLIT");
     // A one-sample pass that binds a multisampled depth surface (guest samples > 1, colour fragments 1) tests against that surface's
     // single-sample picture instead of a depth of its own that never holds the scene. VPKENGINE_DEPTH_1X_SEPARATE=1: a depth of its own.
     bool depth1xSeparate = std::getenv("VPKENGINE_DEPTH_1X_SEPARATE") != nullptr;
@@ -5863,13 +5863,13 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         if (plan.eqaa && samples > 1) note("EQAA: the depth buffer has more samples than the colour stores; the host draws with the colour's");
         std::vector<std::pair<unsigned, TargetIds>>& colorIds = colorIdsScratch;
         colorIds.clear();
-        // A depth-only draw on a multisampled depth target keeps the colour target the draws that read that depth wrote
+        // A depth-only draw on a depth target keeps the colour target the draws that read that depth wrote
         // attached, unwritten: the passes around it are one pass (see depthPartners).
         const DepthPartner* partner = nullptr;
         unsigned partnerSlot = 8;  // (the slot attached for it, 8 = none)
         bool colourOnTile = false, colourStored = false;  // a multisampled colour attachment keeps its samples on tile / stores them
         uint32_t keepWid = ~0u;                           // the target of colour 0 when it does (and VPKENGINE_MSAA_CUT_SAMPLES_OFF is not 1)
-        if (!depthPartnerOff && samples > 1 && zf != vpgpu::Format::Undefined && !std::any_of(fragments.begin(), fragments.end(), [](uint8_t f) { return f != 0; })) {
+        if (!depthPartnerOff && zf != vpgpu::Format::Undefined && !std::any_of(fragments.begin(), fragments.end(), [](uint8_t f) { return f != 0; })) {
             const auto it = depthPartners.find(d.depth.zFormat ? d.depth.zAddress : d.depth.stencilAddress);
             if (it != depthPartners.end() && it->second.samples == samples && it->second.c.width == d.depth.width && it->second.c.height == d.depth.height &&
                 it->second.c.sliceStart == d.depth.sliceStart && r.frame_ - it->second.frame <= 600)
@@ -6175,12 +6175,14 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
 
         // Foveation: a pass over two-slice targets renders both eyes through a rate map.
         viewIndexedNow = false;
-        if (r.foveation_ && samples == 1 && !colorIds.empty()) {
+        if (r.foveation_ && samples == 1 && (!colorIds.empty() || partnerSlot < 8)) {
             bool eligible = true;
             for (const auto& entry : colorIds) {
                 const ColorTarget& c = d.color[entry.first];
                 eligible = eligible && c.sliceStart == 0 && c.sliceCount == 2;
             }
+            // (a depth-only draw that keeps its colour partner joins the pass of the draws that wrote it: the same rate map)
+            if (partnerSlot < 8) eligible = eligible && partner->c.sliceStart == 0 && partner->c.sliceCount == 2;
             if (zf != vpgpu::Format::Undefined) eligible = eligible && z.sliceStart == 0 && z.sliceCount == 2;
             if (eligible) {
                 if (const auto& rm = rateMap(width, height)) {
@@ -6655,9 +6657,9 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
                     " count=" + std::to_string(d.count) + " instances=" + std::to_string(d.instances) + " vs=" + hex(ps.vertexShader) + " ps=" + hex(ps.fragmentShader));
             }
         }
-        // A draw that reads and writes one colour target of a multisampled depth target's size: the depth-only draws of that depth
+        // A draw that reads and writes one colour target of a depth target's size: the depth-only draws of that depth
         // keep it attached from now on.
-        if (samples > 1 && zf != vpgpu::Format::Undefined && colorIds.size() == 1) {
+        if (!depthPartnerOff && zf != vpgpu::Format::Undefined && colorIds.size() == 1) {
             const unsigned slot = colorIds[0].first;
             const ColorTarget& c = d.color[slot];
             if (c.width == z.width && c.height == z.height && c.sliceStart == z.sliceStart)
