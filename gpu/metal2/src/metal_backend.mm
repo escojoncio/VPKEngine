@@ -2307,10 +2307,17 @@ id<MTLFunction> MetalBackend::Impl::function(uint64_t shaderId, const FetchInput
   if (macros.count) o.preprocessorMacros = macros;
   NSError* e = nil;
   int retried = 0;
+  // VPKENGINE_VS_FASTMATH=2: no preserveInvariance, so the attribute leaves the text too (as in the retry below) rather than relying on
+  // the compiler to ignore [[invariant]] without it.
+  std::string noInvariant;
+  if (vsFastMath == 2) {
+    noInvariant = shader.source;
+    for (size_t at = 0; (at = noInvariant.find(", invariant]]", at)) != std::string::npos;) noInvariant.replace(at, 13, "]]");
+  }
   const attr::Probe probe(device);
   id<MTLLibrary> lib = compileRetrying(&e, [&](NSError* __autoreleasing* pe) {
     vpgpu::HitchSpan hitch(vpgpu::hitchPerf().libCompileUs, false);  // vk.hitch lib_compile_ms
-    return [device newLibraryWithSource:@(shader.source.c_str()) options:o error:pe];
+    return [device newLibraryWithSource:@((vsFastMath == 2 ? noInvariant : shader.source).c_str()) options:o error:pe];
   }, &retried);
   if (retried) err("what=compiler_unreachable site=msl retries=%d ok=%d", retried, lib ? 1 : 0);
   bool invariantKept = invariantMsl;

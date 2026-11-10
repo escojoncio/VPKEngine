@@ -3677,6 +3677,14 @@ void shaderStats() {
     small.use(8);
     const std::vector<std::string> noText = small.flush(dir.string());
     CHECK(noText.size() == 1 && noText[0].find(" file=no_source") != std::string::npos && noText[0].find(" samples=1 ") != std::string::npos);
+    // Cold shaders registered first do not spend the retention budget of the hot one registered after them.
+    vpps4::ShaderDump cold;
+    cold.limits.minDraws = 5, cold.limits.maxRetainedBytes = 10 * msl.size();
+    for (uint64_t id = 100; id < 200; ++id) cold.add(id, "ps", msl, 0);
+    cold.add(7, "ps", msl, 0);
+    for (int i = 0; i < 9; ++i) cold.use(7);
+    const std::vector<std::string> hot = cold.flush(dir.string());
+    CHECK(hot.size() == 1 && hot[0].find("id=0000000000000007 ") != std::string::npos && hot[0].find(" file=shader-0000000000000007-ps.metal") != std::string::npos);
     fs::remove_all(dir);
 }
 

@@ -62,6 +62,11 @@ void ShaderDump::add(uint64_t id, const char* stage, const std::string& msl, int
     e.stat = analyzeMsl(msl);
     e.stat.mbcnt = mbcnt;
     e.hasStat = true;
+    if (retained_ + msl.size() > limits.maxRetainedBytes) {
+        // (the budget is for the shaders that get drawn: the texts of those not used enough yet make room)
+        for (auto& [other, x] : map_)
+            if (!x.reported && x.draws < limits.minDraws && !x.source.empty()) retained_ -= x.source.size(), std::string().swap(x.source);
+    }
     if (retained_ + msl.size() <= limits.maxRetainedBytes) {
         e.source = msl;
         retained_ += msl.size();

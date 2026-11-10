@@ -28,7 +28,7 @@ public:
     struct Limits {
         unsigned maxShaders = 64;                 // shaders given a SHADERSTAT line (and a file) per run
         uint64_t maxFileBytes = 2ull << 20;       // MSL written to the directory per run
-        uint64_t maxRetainedBytes = 32ull << 20;  // MSL kept in memory waiting for its shader to be drawn enough
+        uint64_t maxRetainedBytes = 32ull << 20;  // MSL kept in memory waiting for its shader to be drawn enough (a full budget is freed of the shaders used less than minDraws)
         uint64_t minDraws = 50;                   // a shader is reported once it has been used this many times
         unsigned round = 16;                      // the most used shaders considered by each flush
     } limits;
