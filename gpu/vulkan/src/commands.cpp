@@ -1107,7 +1107,8 @@ struct Translator {
         if (cr->colorMask || cr->depth || cr->stencil) clearQuads(std::move(cr));
       } else if (const auto* bi = std::get_if<OpCopyBufferToImage>(&op)) {
         linearSync(bi->dst, true);
-        if (bi->decodedHost) decodedVolumeCopy(*bi);
+        if (bi->shrink) shrunkCopy(*bi);
+        else if (bi->decodedHost) decodedVolumeCopy(*bi);
         else bufferImage(bi->src, bi->dst, bi->region, true);
         linearSync(bi->dst, false);
       } else if (const auto* ib = std::get_if<OpCopyImageToBuffer>(&op)) {
@@ -2193,6 +2194,67 @@ struct Translator {
     ts.x = uint32_t(r.imageOffset.x), ts.y = uint32_t(r.imageOffset.y), ts.z = uint32_t(r.imageOffset.z);
     ts.width = w, ts.height = h, ts.depth = d;
     c.label = "vk.upload_astc3d";
+    st.uploadBytes += c.srcBuffer.size;
+    frame.copy(std::move(c));
+    ++st.copies;
+  }
+
+  // Texture budget: level 0 of an uncompressed image that lost its largest levels, box-filtered by 2^shrink into the op's arena
+  // room and copied to the largest level left (sRGB texels are averaged as stored). The texels are read from the buffer's host
+  // memory now (submit), as the GPU would have at the copy.
+  void shrunkCopy(const OpCopyBufferToImage& op) {
+    const VkBufferImageCopy& r = op.region;
+    const BudgetShrink bs = budgetShrink(*op.dst, r);
+    if (!op.dst->id || !bs.bytes) {
+      ++st.dropped;
+      return;
+    }
+    const uint32_t s = op.shrink, n = bs.texelBytes, w = r.imageExtent.width, h = r.imageExtent.height;
+    const uint32_t rowTexels = r.bufferRowLength ? r.bufferRowLength : w, rows = r.bufferImageHeight ? r.bufferImageHeight : h;
+    const VkDeviceSize rowBytes = VkDeviceSize(rowTexels) * n, layerBytes = rowBytes * rows;
+    const uint8_t* base = indirectData(op.src, r.bufferOffset, layerBytes * (bs.layers - 1) + rowBytes * (h - 1) + VkDeviceSize(w) * n);
+    if (!base) {
+      static std::atomic<unsigned> k{0};
+      if (k.fetch_add(1) < 8) logf("vk.err what=tex_budget_source_unreadable buffer_host=%d (the copy is dropped)", int(op.src && op.src->memory && op.src->memory->host));
+      ++st.dropped;
+      return;
+    }
+    const uint32_t ox = uint32_t(r.imageOffset.x), oy = uint32_t(r.imageOffset.y);
+    for (uint32_t l = 0; l < bs.layers; ++l) {
+      const uint8_t* src = base + l * layerBytes;
+      uint8_t* dst = op.decodedHost + VkDeviceSize(l) * bs.width * bs.height * n;
+      for (uint32_t y = 0; y < bs.height; ++y) {
+        // Rows and columns of the region under this texel (whole 2^s squares except at the region's edges).
+        const uint32_t y0 = std::max((bs.y + y) << s, oy) - oy, y1 = std::min((bs.y + y + 1) << s, oy + h) - oy;
+        for (uint32_t x = 0; x < bs.width; ++x) {
+          const uint32_t x0 = std::max((bs.x + x) << s, ox) - ox, x1 = std::min((bs.x + x + 1) << s, ox + w) - ox;
+          uint32_t sum[4] = {0, 0, 0, 0};
+          for (uint32_t yy = y0; yy < y1; ++yy) {
+            const uint8_t* p = src + yy * rowBytes + VkDeviceSize(x0) * n;
+            for (uint32_t xx = x0; xx < x1; ++xx, p += n)
+              for (uint32_t c = 0; c < n; ++c) sum[c] += p[c];
+          }
+          const uint32_t count = std::max(1u, (y1 - y0) * (x1 - x0));
+          uint8_t* q = dst + (VkDeviceSize(y) * bs.width + x) * n;
+          for (uint32_t c = 0; c < n; ++c) q[c] = uint8_t((sum[c] + count / 2) / count);
+        }
+      }
+    }
+    vpgpu::Copy c;
+    c.kind = vpgpu::CopyKind::BufferToTexture;
+    c.srcBuffer.buffer = op.decoded;
+    c.srcBuffer.offset = op.decodedOffset;
+    c.srcBuffer.bytesPerRow = bs.width * n;
+    c.srcBuffer.rowsPerImage = bs.height;
+    c.srcBuffer.size = bs.bytes;
+    vpgpu::TextureSpan& ts = c.dstTexture;
+    ts.texture = op.dst->id;
+    ts.mip = 0;
+    ts.layer = static_cast<uint16_t>(r.imageSubresource.baseArrayLayer);
+    ts.layerCount = static_cast<uint16_t>(bs.layers);
+    ts.x = bs.x, ts.y = bs.y, ts.z = 0;
+    ts.width = bs.width, ts.height = bs.height, ts.depth = 1;
+    c.label = "vk.upload_shrunk";
     st.uploadBytes += c.srcBuffer.size;
     frame.copy(std::move(c));
     ++st.copies;

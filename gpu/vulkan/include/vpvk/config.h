@@ -178,6 +178,13 @@ void vpvk_dump_pending(void);
 // next submit). Returns the bytes freed (libraries + retired objects); 0 without a live device. Any thread; may wait up to
 // ~50 ms for the submit mutex (never blocks on it).
 size_t vpvk_trim_memory(int level, char* out, size_t cap);
+// Texture budget: the largest width / height of the plain sampled textures created from now on (0 = no limit, the default). An
+// image above it is created without its largest mip levels (block-compressed and uncompressed 8-bit formats; never attachments,
+// storage images or single-level compressed images): uploads to those levels are dropped, or scaled down where the format
+// allows, and views and copies see the remaining levels. Existing textures keep what they have. The host derives it from the
+// process' memory state and only ever tightens it within a run (copies between two textures then find the same levels on both).
+// "vk.tex_budget ..." lines report the cap and what it saved. Any thread.
+void vpvk_texture_budget(unsigned max_dim);
 // Releases what the guest destroyed that the backend keeps until a frame reuses a slot (the graveyard, and the
 // leftovers of frames that completed), without waiting for the GPU to go idle; min_idle_ms no longer gates it.
 // Any thread, never blocks (the submit mutex is try-locked: a busy device returns 0). Short key=value report into

@@ -279,7 +279,31 @@ struct Image {
   mutable vpgpu::TextureId localReadCopy;
   // vk.tex_hist: bit m = mip m got a copy/blit recorded into it (relaxed; recording threads write, the submit tick reads).
   mutable std::atomic<uint32_t> mipsWritten{0};
+  // Texture budget (vpvk_texture_budget, textureBudgetDrop): the texture is the image the game asked for without its `mipDrop`
+  // largest levels, so `desc` is 2^mipDrop smaller per axis and guest level L is level L - mipDrop. `info` keeps what the game
+  // asked. Copies are rewritten where they are recorded and views where they are created (budgetLevel / budgetRange); an image
+  // with attachment or storage usage never has it.
+  uint8_t mipDrop = 0;
 };
+// The texture budget: the largest width / height a sampled texture is created with (0 = no limit). Set by the host from the
+// process' memory state (vpvk_texture_budget); read at vkCreateImage.
+uint32_t textureBudget();
+void setTextureBudget(uint32_t maxDim);
+// How many of its largest levels an image created from `ci` (core format `core`) loses under a budget of `cap` texels per axis.
+// 0 for what cannot shrink: not a plain 2D sampled texture (attachment, storage, host-transfer, multisampled, linear, sparse,
+// multi-planar), or a single-level block-compressed image (no smaller level to keep and no way to scale its blocks).
+// Uncompressed 8-bit formats shrink even with one level: their level-0 uploads are box-filtered (commands.cpp shrunkCopy).
+uint32_t textureBudgetDrop(const VkImageCreateInfo& ci, vpgpu::Format core, uint32_t cap);
+// Whether uploads to a dropped level of `core` can be scaled down on the CPU (8-bit unorm / sRGB, 1, 2 or 4 channels).
+bool budgetCanShrink(vpgpu::Format core);
+// Guest mip level -> the texture's; false when the budget dropped that level.
+inline bool budgetLevel(const Image* im, uint32_t& level) {
+  if (level < im->mipDrop) return false;
+  level -= im->mipDrop;
+  return true;
+}
+// Guest subresource range -> the levels of it the texture has (explicit count); false when it has none of them.
+bool budgetRange(const Image* im, VkImageSubresourceRange& r);
 // vk.tex_hist (entry.cpp): live images registered at vkCreateImage / dropped at vkDestroyImage; the per-5 s residency line.
 void noteMipsWritten(const Image* im, uint32_t mip);
 void texHistTick(bool force = false);

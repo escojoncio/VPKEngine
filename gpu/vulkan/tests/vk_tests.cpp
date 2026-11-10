@@ -4079,6 +4079,194 @@ void testTexHist() {
   vkFreeMemory(c.dev, mem, nullptr);
 }
 
+// Texture budget (vpvk_texture_budget): plain sampled textures above the cap lose their largest levels; copies, blits and views
+// see the levels left; the top level of an uncompressed image is scaled down into the largest one left.
+void testTexBudget() {
+  Ctx c;
+  VkCommandPoolCreateInfo pi{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+  VkCommandPool pool;
+  vkCreateCommandPool(c.dev, &pi, nullptr, &pool);
+  VkCommandBufferAllocateInfo ai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+  ai.commandPool = pool, ai.commandBufferCount = 1;
+  VkCommandBuffer cb;
+  vkAllocateCommandBuffers(c.dev, &ai, &cb);
+  VkDeviceMemory mem = alloc(c, 4 << 20, 1), imem = alloc(c, 8 << 20, 0);
+  VkBuffer staging = buffer(c, 1 << 20, mem, 0);
+  VkDeviceSize at = 0;
+  auto make = [&](VkFormat f, uint32_t w, uint32_t h, uint32_t mips, VkImageUsageFlags usage) {
+    VkImageCreateInfo ii{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+    ii.imageType = VK_IMAGE_TYPE_2D, ii.format = f, ii.extent = {w, h, 1}, ii.mipLevels = mips, ii.arrayLayers = 1;
+    ii.samples = VK_SAMPLE_COUNT_1_BIT, ii.tiling = VK_IMAGE_TILING_OPTIMAL, ii.usage = usage;
+    VkImage i = VK_NULL_HANDLE;
+    CHECK(vkCreateImage(c.dev, &ii, nullptr, &i) == VK_SUCCESS);
+    VkMemoryRequirements mr{};
+    vkGetImageMemoryRequirements(c.dev, i, &mr);
+    CHECK(vkBindImageMemory(c.dev, i, imem, at) == VK_SUCCESS);
+    at += (mr.size + 65535) & ~VkDeviceSize(65535);
+    return i;
+  };
+  const VkImageUsageFlags tex = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+  // No budget: nothing changes.
+  VkImage free0 = make(VK_FORMAT_ASTC_4x4_UNORM_BLOCK, 256, 256, 9, tex);
+  CHECK(from<Image>(free0)->mipDrop == 0 && from<Image>(free0)->desc.width == 256 && from<Image>(free0)->desc.mips == 9);
+  const std::string said = captureStderr([] { vpvk_texture_budget(64); });
+  CHECK(textureBudget() == 64);
+  VkImage astc = make(VK_FORMAT_ASTC_4x4_UNORM_BLOCK, 256, 128, 9, tex);  // 256x128 -> 64x32, levels 2..8 kept
+  const Image* ai2 = from<Image>(astc);
+  CHECK(ai2->mipDrop == 2 && ai2->desc.width == 64 && ai2->desc.height == 32 && ai2->desc.mips == 7 && ai2->info.mipLevels == 9);
+  VkMemoryRequirements small{}, big{};
+  vkGetImageMemoryRequirements(c.dev, astc, &small);
+  vkGetImageMemoryRequirements(c.dev, free0, &big);
+  CHECK(small.size * 8 < big.size);  // what the game is asked to allocate shrinks with it
+  VkImage astc1 = make(VK_FORMAT_ASTC_4x4_UNORM_BLOCK, 256, 256, 1, tex);  // one compressed level: nothing smaller to keep
+  CHECK(from<Image>(astc1)->mipDrop == 0 && from<Image>(astc1)->desc.width == 256);
+  VkImage astc2 = make(VK_FORMAT_ASTC_4x4_UNORM_BLOCK, 256, 256, 2, tex);  // only one level can go
+  CHECK(from<Image>(astc2)->mipDrop == 1 && from<Image>(astc2)->desc.width == 128 && from<Image>(astc2)->desc.mips == 1);
+  VkImage rgba1 = make(VK_FORMAT_R8G8B8A8_UNORM, 256, 256, 1, tex);  // one uncompressed level: scaled on upload
+  CHECK(from<Image>(rgba1)->mipDrop == 2 && from<Image>(rgba1)->desc.width == 64 && from<Image>(rgba1)->desc.mips == 1);
+  VkImage rgba = make(VK_FORMAT_R8G8B8A8_SRGB, 256, 256, 9, tex);
+  CHECK(from<Image>(rgba)->mipDrop == 2 && from<Image>(rgba)->desc.mips == 7);
+  VkImage rt = make(VK_FORMAT_R8G8B8A8_UNORM, 256, 256, 1, tex | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT);  // render target: never
+  VkImage f16 = make(VK_FORMAT_R16G16B16A16_SFLOAT, 256, 256, 1, tex);  // no scaler for it
+  VkImage fits = make(VK_FORMAT_ASTC_4x4_UNORM_BLOCK, 64, 64, 7, tex);
+  CHECK(from<Image>(rt)->mipDrop == 0 && from<Image>(f16)->mipDrop == 0 && from<Image>(fits)->mipDrop == 0);
+
+  // Views: the levels of the range that exist.
+  auto view = [&](VkImage im, uint32_t base, uint32_t count) {
+    VkImageViewCreateInfo vi{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+    vi.image = im, vi.viewType = VK_IMAGE_VIEW_TYPE_2D, vi.format = from<Image>(im)->info.format;
+    vi.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, base, count, 0, 1};
+    VkImageView v = VK_NULL_HANDLE;
+    CHECK(vkCreateImageView(c.dev, &vi, nullptr, &v) == VK_SUCCESS);
+    return v;
+  };
+  VkImageView vAll = view(astc, 0, VK_REMAINING_MIP_LEVELS), vTop = view(astc, 1, 1), vLow = view(astc, 3, 2), vSpan = view(astc, 1, 3);
+  CHECK(from<ImageView>(vAll)->range.baseMipLevel == 0 && from<ImageView>(vAll)->range.levelCount == 7);
+  CHECK(!from<ImageView>(vAll)->view);  // the whole texture: no backend view
+  CHECK(from<ImageView>(vTop)->range.baseMipLevel == 0 && from<ImageView>(vTop)->range.levelCount == 1);  // dropped only: the largest left
+  CHECK(from<ImageView>(vLow)->range.baseMipLevel == 1 && from<ImageView>(vLow)->range.levelCount == 2);
+  CHECK(from<ImageView>(vSpan)->range.baseMipLevel == 0 && from<ImageView>(vSpan)->range.levelCount == 2);  // guest 1..3 -> 2..3
+
+  // Copies.
+  uint8_t* host = nullptr;
+  vkMapMemory(c.dev, mem, 0, VK_WHOLE_SIZE, 0, reinterpret_cast<void**>(&host));
+  for (uint32_t y = 0; y < 256; ++y)
+    for (uint32_t x = 0; x < 256; ++x) {
+      uint8_t* p = host + (y * 256 + x) * 4;
+      p[0] = uint8_t(x & ~3u), p[1] = uint8_t(y & ~3u), p[2] = uint8_t((x & 3) * 10 + (y & 3)), p[3] = 255;  // 4x4 squares: R, G flat
+    }
+  VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+  vkBeginCommandBuffer(cb, &bi);
+  auto upload = [&](VkImage im, uint32_t mip, uint32_t w, uint32_t h, int32_t x = 0, int32_t y = 0) {
+    VkBufferImageCopy r{};
+    r.bufferRowLength = x || y ? 256 : 0;  // the region's texels sit in the buffer as the 256-wide picture above
+    r.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, mip, 0, 1};
+    r.imageOffset = {x, y, 0}, r.imageExtent = {w, h, 1};
+    vkCmdCopyBufferToImage(cb, staging, im, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &r);
+  };
+  upload(astc, 0, 256, 128);  // dropped
+  upload(astc, 1, 128, 64);   // dropped
+  upload(astc, 2, 64, 32);    // -> level 0
+  upload(astc, 8, 1, 1);      // -> level 6
+  upload(rgba1, 0, 256, 256);  // scaled by 4 -> 64x64 at level 0
+  upload(rgba1, 0, 8, 8, 128, 64);  // a region of level 0: 2x2 texels at (32, 16)
+  upload(rgba, 0, 256, 256);  // top of a chain: scaled into the largest level left
+  upload(rgba, 1, 128, 128);  // dropped
+  upload(rgba, 2, 64, 64);    // -> level 0 (the chain's own level, after the scaled one)
+  VkBufferImageCopy back{};
+  back.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, back.imageExtent = {256, 256, 1};
+  vkCmdCopyImageToBuffer(cb, rgba, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, staging, 1, &back);  // dropped level: nothing read
+  back.imageSubresource.mipLevel = 3, back.imageExtent = {32, 32, 1};
+  vkCmdCopyImageToBuffer(cb, rgba, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, staging, 1, &back);  // -> level 1
+  VkImageCopy ic{};
+  ic.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 3, 0, 1}, ic.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 1, 0, 1};
+  ic.extent = {32, 16, 1};
+  vkCmdCopyImage(cb, astc, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, fits, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &ic);  // src -> level 1
+  ic.srcSubresource.mipLevel = 1, ic.dstSubresource.mipLevel = 0, ic.extent = {64, 64, 1};
+  vkCmdCopyImage(cb, astc, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, fits, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &ic);  // dropped source
+  // A copy into the dropped top level of an uncompressed image lands scaled in its largest level left.
+  ic.srcSubresource.mipLevel = 0, ic.dstSubresource.mipLevel = 0, ic.extent = {256, 256, 1};
+  vkCmdCopyImage(cb, rt, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, rgba1, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &ic);
+  // Unity's GenerateMips over the budgeted chain: 0->1 and 1->2 fall on dropped levels, 2->3 starts the chain at level 0.
+  for (uint32_t m = 0; m < 3; ++m) {
+    VkImageBlit bl{};
+    bl.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, m, 0, 1}, bl.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, m + 1, 0, 1};
+    bl.srcOffsets[1] = {int32_t(256u >> m), int32_t(256u >> m), 1}, bl.dstOffsets[1] = {int32_t(128u >> m), int32_t(128u >> m), 1};
+    vkCmdBlitImage(cb, rgba, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, rgba, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &bl, VK_FILTER_LINEAR);
+  }
+  VkClearColorValue col{};
+  VkImageSubresourceRange top{VK_IMAGE_ASPECT_COLOR_BIT, 0, 2, 0, 1}, some{VK_IMAGE_ASPECT_COLOR_BIT, 1, 3, 0, 1};
+  vkCmdClearColorImage(cb, rgba, VK_IMAGE_LAYOUT_GENERAL, &col, 1, &top);   // dropped levels only
+  vkCmdClearColorImage(cb, rgba, VK_IMAGE_LAYOUT_GENERAL, &col, 1, &some);  // guest 1..3 -> levels 0..1
+  vkEndCommandBuffer(cb);
+
+  const std::vector<Op>& ops = from<CommandBuffer>(cb)->rec->ops;
+  std::vector<const OpCopyBufferToImage*> ups;
+  unsigned backs = 0, copies = 0, gen = 0, clears = 0, scaled = 0;
+  for (const Op& op : ops) {
+    if (const auto* u = std::get_if<OpCopyBufferToImage>(&op)) {
+      ups.push_back(u);
+    } else if (const auto* rb = std::get_if<OpCopyImageToBuffer>(&op)) {
+      ++backs;
+      CHECK(rb->region.imageSubresource.mipLevel == 1);
+    } else if (const auto* ci = std::get_if<OpCopyImage>(&op)) {
+      if (ci->genMips) {
+        ++gen;
+        CHECK(ci->region.srcSubresource.mipLevel == 0);
+      } else {
+        ++copies;
+        CHECK(ci->region.srcSubresource.mipLevel == 1 && ci->region.dstSubresource.mipLevel == 1);
+      }
+    } else if (const auto* cc = std::get_if<OpClearColor>(&op)) {
+      ++clears;
+      CHECK(cc->range.baseMipLevel == 0 && cc->range.levelCount == 2);
+    } else if (const auto* bl = std::get_if<OpBlitImage>(&op)) {
+      ++scaled;
+      CHECK(bl->dst == from<Image>(rgba1) && bl->region.dstSubresource.mipLevel == 0 && bl->region.dstOffsets[1].x == 64 &&
+            bl->region.dstOffsets[1].y == 64 && bl->region.srcOffsets[1].x == 256);
+    }
+  }
+  CHECK(scaled == 1);
+  CHECK(ups.size() == 6 && backs == 1 && copies == 1 && gen == 1 && clears == 1);
+  if (ups.size() == 6) {
+    CHECK(ups[0]->dst == ai2 && ups[0]->region.imageSubresource.mipLevel == 0 && !ups[0]->shrink && ups[0]->region.imageExtent.width == 64);
+    CHECK(ups[1]->region.imageSubresource.mipLevel == 6 && !ups[1]->shrink);
+    CHECK(ups[2]->shrink == 2 && ups[2]->decodedHost && ups[3]->shrink == 2 && ups[4]->shrink == 2);
+    CHECK(ups[5]->region.imageSubresource.mipLevel == 0 && !ups[5]->shrink);
+  }
+  vpgpu::Frame frame;
+  TranslateStats st;
+  translate(*from<CommandBuffer>(cb)->rec, frame, st);
+  CHECK(st.dropped == 0);
+  std::vector<const vpgpu::Copy*> shrunk;
+  for (const auto& cmd : frame.commands())
+    if (const auto* cp = std::get_if<vpgpu::Copy>(&cmd))
+      if (cp->label == "vk.upload_shrunk") shrunk.push_back(cp);
+  CHECK(shrunk.size() == 3);
+  if (shrunk.size() == 3 && ups.size() == 6) {
+    const vpgpu::Copy& whole = *shrunk[0];
+    CHECK(whole.dstTexture.mip == 0 && whole.dstTexture.width == 64 && whole.dstTexture.height == 64 && whole.dstTexture.x == 0);
+    CHECK(whole.srcBuffer.bytesPerRow == 64 * 4 && whole.srcBuffer.rowsPerImage == 64 && whole.srcBuffer.size == 64 * 64 * 4);
+    // Texel (5, 9) averages the 4x4 square at (20, 36): R = 20, G = 36 (flat), B = mean of (x&3)*10 + (y&3) = 16.5 -> 17, A = 255.
+    const uint8_t* t = ups[2]->decodedHost + (9 * 64 + 5) * 4;
+    CHECK(t[0] == 20 && t[1] == 36 && t[2] == 17 && t[3] == 255);
+    const vpgpu::Copy& part = *shrunk[1];
+    CHECK(part.dstTexture.x == 32 && part.dstTexture.y == 16 && part.dstTexture.width == 2 && part.dstTexture.height == 2);
+    const uint8_t* q = ups[3]->decodedHost + (1 * 2 + 1) * 4;  // buffer texels (4..7, 4..7)
+    CHECK(q[0] == 4 && q[1] == 4 && q[2] == 17);
+  }
+  CHECK(said.find("vk.tex_budget cap=64") != std::string::npos);
+
+  setTextureBudget(0);
+  VkImage after = make(VK_FORMAT_ASTC_4x4_UNORM_BLOCK, 256, 256, 9, tex);
+  CHECK(from<Image>(after)->mipDrop == 0);
+  for (VkImageView v : {vAll, vTop, vLow, vSpan}) vkDestroyImageView(c.dev, v, nullptr);
+  for (VkImage im : {free0, astc, astc1, astc2, rgba1, rgba, rt, f16, fits, after}) vkDestroyImage(c.dev, im, nullptr);
+  vkDestroyCommandPool(c.dev, pool, nullptr);
+  vkFreeMemory(c.dev, mem, nullptr);
+  vkFreeMemory(c.dev, imem, nullptr);
+}
+
 void testImages() {
   Ctx c;
   VkDeviceMemory m = alloc(c, 16 << 20, 1);
@@ -13370,7 +13558,7 @@ int main(int argc, char** argv) {
       {"exports", testExports}, {"physical", testPhysical}, {"memory", testMemory}, {"msaa_tile_off", testMsaaTileOff},
       {"passes", testPasses},   {"submit", testSubmit}, {"pipeline", testPipeline},
       {"recipes", testRecipes}, {"recipe_keys", testRecipeKeys}, {"taa", testTaa}, {"msaa", testMsaa}, {"queries", testQueries}, {"query_not_ready", testQueryNotReady},
-      {"timeline", testTimeline}, {"queues", testQueues}, {"timeline_order", testTimelineOrder}, {"pending", testPending}, {"renderpass_ops", testRenderPassOps}, {"linear", testLinear}, {"images", testImages}, {"image_lifetime", testImageLifetime}, {"tex_hist", testTexHist},
+      {"timeline", testTimeline}, {"queues", testQueues}, {"timeline_order", testTimelineOrder}, {"pending", testPending}, {"renderpass_ops", testRenderPassOps}, {"linear", testLinear}, {"images", testImages}, {"image_lifetime", testImageLifetime}, {"tex_hist", testTexHist}, {"tex_budget", testTexBudget},
       {"vertex_stores", testVertexStores}, {"profile", testProfile}, {"profile13", testProfile13}, {"quest_extras", testQuestExtras}, {"push_descriptor", testPushDescriptor}, {"report_geom", testReportGeomInterpolators}, {"pipeline_policy", testPipelinePolicy}, {"eds", testExtendedDynamicState},
       {"quest_gpu_name", testQuestGpuName}, {"native_identity", testNativeIdentity}, {"inline_uniform", testInlineUniformBlock}, {"bda", testBufferDeviceAddress}, {"ycbcr", testYcbcr},
       {"taa_native", testTaaNative}, {"taa_eye_depth", testTaaEyeDepth}, {"taa_uimask", testTaaUiMask}, {"msaa_force", testMsaaForce}, {"d24_emul", testD24Emul}, {"prewarm_variants", testPrewarmVariants}, {"msaa_force_marked", testMsaaForceMarkedEye}, {"aot", testAot}, {"aniso", testAniso}, {"zeroinit", testZeroInit}, {"archive_index", testArchiveIndex}, {"foveation", testFoveation},

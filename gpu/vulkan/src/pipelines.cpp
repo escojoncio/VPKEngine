@@ -4185,6 +4185,7 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdCopyImageToBuffer(VkCommandBuffer cb
     VkBufferImageCopy c = regions[i];
     Image* im = planeOf(from<Image>(src), c.imageSubresource.aspectMask);  // a plane of a multi-planar image
     if (im != from<Image>(src)) c.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    if (im->mipDrop && !budgetLevel(im, c.imageSubresource.mipLevel)) continue;  // a level the texture budget dropped: nothing to read
     r.ops.emplace_back(OpCopyImageToBuffer{im, from<Buffer>(dst), c});
   }
 }
@@ -4199,6 +4200,20 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdCopyImage(VkCommandBuffer cb, VkImag
     if (s != from<Image>(src)) c.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
     if (d != from<Image>(dst)) c.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
     noteMipsWritten(d, c.dstSubresource.mipLevel);
+    // Texture budget: a level either image lost is not copied (the budget only tightens, so a level-to-level copy between two
+    // textures finds the same levels dropped on both sides).
+    // An uncompressed destination level that is gone takes the copy scaled down into its largest level left (a blit).
+    if (d->mipDrop && c.dstSubresource.mipLevel < d->mipDrop && s != d && s->desc.format == d->desc.format &&
+        budgetCanShrink(d->desc.format) && s == from<Image>(src) && d == from<Image>(dst)) {
+      VkImageBlit b{};
+      b.srcSubresource = c.srcSubresource, b.dstSubresource = c.dstSubresource;
+      b.srcOffsets[0] = c.srcOffset, b.dstOffsets[0] = c.dstOffset;
+      b.srcOffsets[1] = {c.srcOffset.x + int32_t(c.extent.width), c.srcOffset.y + int32_t(c.extent.height), c.srcOffset.z + int32_t(c.extent.depth)};
+      b.dstOffsets[1] = {c.dstOffset.x + int32_t(c.extent.width), c.dstOffset.y + int32_t(c.extent.height), c.dstOffset.z + int32_t(c.extent.depth)};
+      vkCmdBlitImage(cb, src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &b, VK_FILTER_LINEAR);
+      continue;
+    }
+    if ((s->mipDrop && !budgetLevel(s, c.srcSubresource.mipLevel)) || (d->mipDrop && !budgetLevel(d, c.dstSubresource.mipLevel))) continue;
     r.ops.emplace_back(OpCopyImage{s, d, c});
   }
 }
@@ -4218,16 +4233,35 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdBlitImage(VkCommandBuffer cb, VkImag
   const Image* s = from<Image>(src);
   const Image* d = from<Image>(dst);
   for (uint32_t i = 0; i < n; ++i) {
-    const VkImageBlit& b = regions[i];
+    VkImageBlit b = regions[i];
+    bool rescaled = false;  // the source rectangle was moved to another level: never a raw copy
+    if (s->mipDrop || d->mipDrop) {
+      // Texture budget: a level that is gone stands for its rectangle scaled to the image's largest level left. Within one image
+      // (the chain being built from its top level, Unity's GenerateMips) such a step is dropped: the largest level left already
+      // holds the top level scaled down (shrunkCopy), and the chain goes on from there.
+      const auto toTop = [&](const Image* im, VkImageSubresourceLayers& sub, VkOffset3D* o) {
+        if (!im->mipDrop || budgetLevel(im, sub.mipLevel)) return true;
+        if (s == d) return false;
+        const uint32_t down = im->mipDrop - sub.mipLevel;
+        o[0].x >>= down, o[0].y >>= down, o[1].x >>= down, o[1].y >>= down;
+        if (o[1].x == o[0].x) ++o[1].x;
+        if (o[1].y == o[0].y) ++o[1].y;
+        sub.mipLevel = 0;
+        rescaled = true;
+        return true;
+      };
+      if (d->mipDrop && b.dstSubresource.mipLevel < d->mipDrop && !budgetCanShrink(d->desc.format)) continue;
+      if (!toTop(d, b.dstSubresource, b.dstOffsets) || !toTop(s, b.srcSubresource, b.srcOffsets)) continue;
+    }
     const int sw = b.srcOffsets[1].x - b.srcOffsets[0].x, sh = b.srcOffsets[1].y - b.srcOffsets[0].y;
     const int dw = b.dstOffsets[1].x - b.dstOffsets[0].x, dh = b.dstOffsets[1].y - b.dstOffsets[0].y;
     const int sd = b.srcOffsets[1].z - b.srcOffsets[0].z, dd = b.dstOffsets[1].z - b.dstOffsets[0].z;
     if (!sw || !sh || !dw || !dh) continue;
-    noteMipsWritten(d, b.dstSubresource.mipLevel);
-    if (sw == dw && sh == dh && sd == dd && sw > 0 && sh > 0 && rawBlitCompatible(s->desc.format, d->desc.format) &&
+    noteMipsWritten(d, regions[i].dstSubresource.mipLevel);
+    if (!rescaled && sw == dw && sh == dh && sd == dd && sw > 0 && sh > 0 && rawBlitCompatible(s->desc.format, d->desc.format) &&
         isSwappedRB(s->info.format) == isSwappedRB(d->info.format)) {
       VkImageCopy c{};
-      c.srcSubresource = b.srcSubresource, c.dstSubresource = b.dstSubresource;
+      c.srcSubresource = regions[i].srcSubresource, c.dstSubresource = regions[i].dstSubresource;  // vkCmdCopyImage maps the levels itself
       c.srcOffset = b.srcOffsets[0], c.dstOffset = b.dstOffsets[0];
       c.extent = {uint32_t(sw), uint32_t(sh), uint32_t(std::max(1, sd))};
       vkCmdCopyImage(cb, src, sl, dst, dl, 1, &c);
@@ -4268,7 +4302,16 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdResolveImage(VkCommandBuffer cb, VkI
     return;
   }
   Recorder& r = rec(cb);
-  for (uint32_t i = 0; i < n; ++i) r.ops.emplace_back(OpResolveImage{from<Image>(src), from<Image>(dst), regions[i]});
+  for (uint32_t i = 0; i < n; ++i) {
+    VkImageResolve g = regions[i];
+    if (from<Image>(dst)->mipDrop && !budgetLevel(from<Image>(dst), g.dstSubresource.mipLevel)) {
+      // A resolve into a level the texture budget dropped (a plain sampled texture as a resolve target): nothing to write.
+      static std::atomic<unsigned> k{0};
+      if (k.fetch_add(1) < 4) logf("vk.tex_budget resolve into a dropped level of a %ux%u image skipped", from<Image>(dst)->info.extent.width, from<Image>(dst)->info.extent.height);
+      continue;
+    }
+    r.ops.emplace_back(OpResolveImage{from<Image>(src), from<Image>(dst), g});
+  }
 }
 
 // =================================================================================================

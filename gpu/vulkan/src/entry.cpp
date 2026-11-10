@@ -16,6 +16,11 @@
 #include <thread>
 #include <unordered_map>
 
+#if defined(__APPLE__) || defined(__linux__)
+#include <sys/mman.h>
+#define VPVK_HOST_MMAP 1
+#endif
+
 #include "commands.h"
 #include "perf.h"
 #include "vpgpu/core/background.h"
@@ -234,6 +239,71 @@ vpgpu::TextureDesc imageDesc(const VkImageCreateInfo& ci) {
   d.persistent = !d.transient;
   return d;
 }
+
+}  // namespace
+
+// ---- texture budget ---------------------------------------------------------------------------------------------------------
+// A Quest keeps a title alive through its texture peaks with what the title's engine streams and with swap; here every byte of a
+// texture counts against the process limit. The host turns the process' memory state into a size cap (vpvk_texture_budget) and
+// an image created above it loses its largest levels: the same picture, less sharp up close, instead of a kill.
+namespace {
+std::atomic<uint32_t> g_textureBudget{0};
+std::atomic<uint64_t> g_budgetImages{0}, g_budgetSavedBytes{0};
+}  // namespace
+uint32_t textureBudget() { return g_textureBudget.load(std::memory_order_relaxed); }
+void setTextureBudget(uint32_t maxDim) { g_textureBudget.store(maxDim, std::memory_order_relaxed); }
+
+bool budgetCanShrink(vpgpu::Format f) {
+  switch (f) {
+    case vpgpu::Format::R8Unorm: case vpgpu::Format::R8Srgb: case vpgpu::Format::RG8Unorm: case vpgpu::Format::RG8Srgb:
+    case vpgpu::Format::RGBA8Unorm: case vpgpu::Format::RGBA8Srgb: case vpgpu::Format::BGRA8Unorm: case vpgpu::Format::BGRA8Srgb:
+      return true;
+    default: return false;
+  }
+}
+
+uint32_t textureBudgetDrop(const VkImageCreateInfo& ci, vpgpu::Format core, uint32_t cap) {
+  if (!cap || core == vpgpu::Format::Undefined) return 0;
+  const VkImageUsageFlags plain = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+  if (ci.imageType != VK_IMAGE_TYPE_2D || ci.samples != VK_SAMPLE_COUNT_1_BIT || ci.tiling != VK_IMAGE_TILING_OPTIMAL ||
+      !(ci.usage & VK_IMAGE_USAGE_SAMPLED_BIT) || (ci.usage & ~plain) || multiPlane(ci.format).planes ||
+      (ci.flags & (VK_IMAGE_CREATE_SPARSE_BINDING_BIT | VK_IMAGE_CREATE_SPARSE_RESIDENCY_BIT | VK_IMAGE_CREATE_SPARSE_ALIASED_BIT)))
+    return 0;
+  const bool compressed = vpgpu::formatInfo(core).blockSize > 1;
+  if (!compressed && !budgetCanShrink(core)) return 0;
+  uint32_t k = 0;
+  while ((std::max(ci.extent.width, ci.extent.height) >> k) > cap) ++k;
+  // A mip chain keeps at least its smallest level asked for; a single level only shrinks where its upload can be scaled.
+  if (ci.mipLevels > 1 || compressed) k = std::min(k, ci.mipLevels - 1);
+  return k;
+}
+
+BudgetShrink budgetShrink(const Image& im, const VkBufferImageCopy& c) {
+  BudgetShrink o;
+  if (!im.mipDrop || c.imageSubresource.mipLevel != 0 || !budgetCanShrink(im.desc.format)) return o;
+  const uint32_t s = im.mipDrop, ox = uint32_t(c.imageOffset.x), oy = uint32_t(c.imageOffset.y);
+  const uint32_t x1 = std::min(im.desc.width, (ox + c.imageExtent.width + (1u << s) - 1) >> s);
+  const uint32_t y1 = std::min(im.desc.height, (oy + c.imageExtent.height + (1u << s) - 1) >> s);
+  if (x1 <= (ox >> s) || y1 <= (oy >> s) || c.imageSubresource.baseArrayLayer >= im.desc.layers) return o;
+  o.x = ox >> s, o.y = oy >> s, o.width = x1 - o.x, o.height = y1 - o.y;
+  o.layers = c.imageSubresource.layerCount == VK_REMAINING_ARRAY_LAYERS ? im.desc.layers - c.imageSubresource.baseArrayLayer
+                                                                          : c.imageSubresource.layerCount;
+  o.texelBytes = vpgpu::formatInfo(im.desc.format).bytesPerBlock;
+  o.bytes = VkDeviceSize(o.width) * o.height * o.texelBytes * o.layers;
+  return o;
+}
+
+bool budgetRange(const Image* im, VkImageSubresourceRange& r) {
+  const uint32_t k = im->mipDrop;
+  const uint32_t count = r.levelCount == VK_REMAINING_MIP_LEVELS ? im->info.mipLevels - r.baseMipLevel : r.levelCount;
+  const uint32_t end = r.baseMipLevel + count;
+  const uint32_t b = r.baseMipLevel > k ? r.baseMipLevel - k : 0, e = std::min<uint32_t>(end > k ? end - k : 0, im->desc.mips);
+  if (e <= b) return false;
+  r.baseMipLevel = b, r.levelCount = e - b;
+  return true;
+}
+
+namespace {
 
 uint64_t imageBytes(const vpgpu::TextureDesc& d) {
   const vpgpu::FormatInfo& fi = vpgpu::formatInfo(d.format);
@@ -1731,6 +1801,45 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkQueueWaitIdle(VkQueue q) {
 // ---------------------------------------------------------------------------------------------
 // Memory
 // ---------------------------------------------------------------------------------------------
+namespace {
+// Host memory of a VkDeviceMemory. From kHostMapBytes up it is a mapping of its own rather than a malloc block: pages nobody
+// writes (the memory of an image, whose texels live in the texture) are never resident whatever the allocator does with a
+// reused block, they go back to the system at vkFreeMemory, and on Apple the region map names them (VM tag 241, "[hb] vm
+// tag241/...": resident = staging and buffer contents).
+constexpr uint64_t kHostMapBytes = 1u << 20;
+uint8_t* hostAlloc(uint64_t bytes) {
+#ifdef VPVK_HOST_MMAP
+  if (bytes >= kHostMapBytes) {
+#ifdef __APPLE__
+    const int tag = int(241u << 24);  // VM_MAKE_TAG: Darwin reads an anonymous mapping's tag from the fd argument
+#else
+    const int tag = -1;
+#endif
+    // kPage-aligned whatever the system's page size (4 KiB hosts): map one kPage more and give the ends back.
+    void* p = mmap(nullptr, bytes + kPage, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, tag, 0);
+    if (p == MAP_FAILED) return nullptr;
+    uint8_t* raw = static_cast<uint8_t*>(p);
+    uint8_t* out = raw + (kPage - reinterpret_cast<uintptr_t>(raw) % kPage) % kPage;
+    if (out > raw) munmap(raw, size_t(out - raw));
+    if (const size_t tail = size_t((raw + bytes + kPage) - (out + bytes))) munmap(out + bytes, tail);
+    return out;
+  }
+#endif
+  return static_cast<uint8_t*>(std::aligned_alloc(kPage, bytes));
+}
+void hostFree(uint8_t* p, uint64_t bytes) {
+  if (!p) return;
+#ifdef VPVK_HOST_MMAP
+  if (bytes >= kHostMapBytes) {
+    munmap(p, bytes);
+    return;
+  }
+#endif
+  (void)bytes;
+  std::free(p);
+}
+}  // namespace
+
 VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkAllocateMemory(VkDevice, const VkMemoryAllocateInfo* ai,
                                                             const VkAllocationCallbacks*,
                                                             VkDeviceMemory* out) {
@@ -1753,7 +1862,7 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkAllocateMemory(VkDevice, const VkMe
     return VK_SUCCESS;
   }
   // Page-aligned host memory for every other type: GPU buffers alias it in place (no staging).
-  m->host = static_cast<uint8_t*>(std::aligned_alloc(kPage, alignUp(std::max<uint64_t>(m->size, 1), kPage)));
+  m->host = hostAlloc(alignUp(std::max<uint64_t>(m->size, 1), kPage));
   if (!m->host) {
     delete m;
     logf("vk.err what=alloc size=%llu", static_cast<unsigned long long>(ai->allocationSize));
@@ -1782,7 +1891,7 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkFreeMemory(VkDevice dv, VkDeviceMemory 
   }
   diag::rangeDel(m->host);
   if (m->host) allocatedBytes() -= m->size;  // counted only for what vkAllocateMemory allocated (not lazy memory)
-  std::free(m->host);
+  hostFree(m->host, alignUp(std::max<uint64_t>(m->size, 1), kPage));
   delete m;
 }
 
@@ -1989,6 +2098,20 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkCreateImage(VkDevice, const VkImage
            ci->extent.width, ci->extent.height, ci->arrayLayers, unsigned(desc.samples), ci->format,
            unsigned(ci->usage), double(imageBytes(desc)) / 1048576.0);
   }
+  // Texture budget: a plain sampled texture above the cap is created without its largest levels (Image::mipDrop).
+  const uint32_t mipDrop = textureBudgetDrop(*ci, desc.format, textureBudget());
+  if (mipDrop) {
+    const uint64_t full = imageBytes(desc);
+    desc.width = std::max(1u, desc.width >> mipDrop), desc.height = std::max(1u, desc.height >> mipDrop);
+    desc.mips = static_cast<uint16_t>(std::max<uint32_t>(1, ci->mipLevels > mipDrop ? ci->mipLevels - mipDrop : 1));
+    const uint64_t saved = full - std::min(full, imageBytes(desc));
+    const uint64_t n = g_budgetImages.fetch_add(1, std::memory_order_relaxed) + 1;
+    const uint64_t total = g_budgetSavedBytes.fetch_add(saved, std::memory_order_relaxed) + saved;
+    if (n <= 16 || n % 64 == 0)
+      logf("vk.tex_budget cap=%u image=%ux%u mips=%u layers=%u format=%d -> %ux%u mips=%u (%.1f MiB less; %llu images, %.0f MiB so far)",
+           textureBudget(), ci->extent.width, ci->extent.height, ci->mipLevels, ci->arrayLayers, ci->format, desc.width, desc.height,
+           unsigned(desc.mips), double(saved) / 1048576.0, static_cast<unsigned long long>(n), double(total) / 1048576.0);
+  }
   if (desc.format == vpgpu::Format::Undefined || !vpgpu::validate(desc)) {
     logf("vk.err what=image_desc format=%d %ux%ux%u mips=%u layers=%u", ci->format, ci->extent.width,
          ci->extent.height, ci->extent.depth, ci->mipLevels, ci->arrayLayers);
@@ -1999,6 +2122,7 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkCreateImage(VkDevice, const VkImage
   img->info.pNext = nullptr;
   img->forcedFrom = forcedFrom;
   img->gameSamples = gameSamples;
+  img->mipDrop = static_cast<uint8_t>(mipDrop);
   img->info.pQueueFamilyIndices = nullptr;
   img->desc = std::move(desc);
   for (uint32_t k = 1; k < mp.planes; ++k) {
@@ -2298,6 +2422,8 @@ VkResult createViewOne(VkDevice dv, const VkImageViewCreateInfo* ci, VkImageView
   v->type = ci->viewType;
   v->format = ci->format;
   v->range = ci->subresourceRange;
+  // Texture budget: the levels of the range the texture has; a view of dropped levels only shows the largest one left.
+  if (v->image && v->image->mipDrop && !budgetRange(v->image, v->range)) v->range.baseMipLevel = 0, v->range.levelCount = 1;
   // A backend view when sampling it as the image itself would bind something else: another type
   // (2D of an array, cube of a layered image, 2D array of a single layer…), another format, a
   // mip/layer subset, or only the stencil aspect.
@@ -2902,7 +3028,11 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdClearColorImage(VkCommandBuffer cb, 
                                                             const VkClearColorValue* color, uint32_t n,
                                                             const VkImageSubresourceRange* ranges) {
   Recorder& r = *from<CommandBuffer>(cb)->rec;
-  for (uint32_t i = 0; i < n; ++i) r.ops.emplace_back(OpClearColor{from<Image>(im), *color, ranges[i]});
+  for (uint32_t i = 0; i < n; ++i) {
+    VkImageSubresourceRange range = ranges[i];
+    if (from<Image>(im)->mipDrop && !budgetRange(from<Image>(im), range)) continue;  // only levels the budget dropped
+    r.ops.emplace_back(OpClearColor{from<Image>(im), *color, range});
+  }
 }
 
 VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdCopyBufferToImage(VkCommandBuffer cb, VkBuffer src, VkImage dst,
@@ -2915,6 +3045,21 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdCopyBufferToImage(VkCommandBuffer cb
     if (im != from<Image>(dst)) c.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
     noteMipsWritten(im, c.imageSubresource.mipLevel);
     OpCopyBufferToImage op{from<Buffer>(src), im, c};
+    if (im->mipDrop) {
+      uint32_t level = c.imageSubresource.mipLevel;
+      if (budgetLevel(im, level)) {
+        op.region.imageSubresource.mipLevel = level;
+      } else {
+        // A level the budget dropped. Its texels are not kept, except the top level of an uncompressed image, scaled down into
+        // the largest level left (commands.cpp shrunkCopy): what a single-level image shows, and what a chain built from its top
+        // level (blits) starts from. A chain uploaded level by level overwrites it with its own level.
+        const BudgetShrink bs = budgetShrink(*im, c);
+        if (!bs.bytes) continue;
+        op.shrink = im->mipDrop;
+        op.decoded = r.arena.put(r.device, nullptr, bs.bytes, op.decodedOffset);
+        op.decodedHost = r.arena.chunks[r.arena.current].host + op.decodedOffset;
+      }
+    }
     if (isDecodedVolume(*im)) {  // room for the RGBA8 texels; the blocks are decoded at submit (commands.cpp)
       const VkDeviceSize bytes = VkDeviceSize(c.imageExtent.width) * c.imageExtent.height * c.imageExtent.depth * 4;
       op.decoded = r.arena.put(r.device, nullptr, bytes, op.decodedOffset);
@@ -3873,6 +4018,12 @@ VPVK_EXPORT uint32_t vpvk_device_wait_compiles(VkDevice dv) {
   const vpgpu::PipelineStats t = d->gpu->pipelines().totals();
   logf("vk.prewarm drained ms=%.0f pipelines compiled=%u failed=%u hits=%u", ms, t.compiled, t.failed, t.hits);
   return uint32_t(ms);
+}
+
+VPVK_EXPORT void vpvk_texture_budget(unsigned max_dim) {
+  if (max_dim == textureBudget()) return;
+  setTextureBudget(max_dim);
+  logf("vk.tex_budget cap=%u (0 = none): plain sampled textures created from here keep levels of at most this size", max_dim);
 }
 
 VPVK_EXPORT size_t vpvk_trim_memory(int level, char* out, size_t cap) {

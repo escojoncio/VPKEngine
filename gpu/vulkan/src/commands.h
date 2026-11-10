@@ -102,10 +102,20 @@ struct OpCopyBufferToImage {
   const Image* dst = nullptr;
   VkBufferImageCopy region{};
   // 3D ASTC image (created as RGBA8, texdecode.h): arena room for the region decoded to RGBA8, filled at submit from `src`.
+  // Also the room of a shrunk upload (texture budget): `shrink` > 0 = `region` is level 0 of an uncompressed image that lost its
+  // `shrink` largest levels; the texels are box-filtered by 2^shrink into the room at submit and copied to the largest level left.
   vpgpu::BufferId decoded;
   VkDeviceSize decodedOffset = 0;
   uint8_t* decodedHost = nullptr;
+  uint8_t shrink = 0;
 };
+// Where a level-0 region of an image that lost `mipDrop` levels lands in the largest level left, and the bytes of its texels
+// there (0 = nothing to keep: not the top level, a compressed format, or an empty rectangle).
+struct BudgetShrink {
+  uint32_t x = 0, y = 0, width = 0, height = 0, layers = 0, texelBytes = 0;
+  VkDeviceSize bytes = 0;
+};
+BudgetShrink budgetShrink(const Image& im, const VkBufferImageCopy& region);
 struct OpCopyImageToBuffer {
   const Image* src = nullptr;
   const Buffer* dst = nullptr;
