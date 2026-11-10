@@ -90,6 +90,9 @@ void holdForceSingleSample(bool acquire);  // vkCreateDevice / vkDestroyDevice (
 int msaaForce();
 int msaaForceLive();
 bool gameMsaaAuto();  // VPVK_GAME_MSAA_AUTO (default on), frozen like msaaForce
+// VPVK_DEPTH_TILE (default on; "0" = off; VPVK_MSAA_STRICT=0 also turns it off), read once per process: a render pass whose later subpass reads the multisampled depth
+// as an input attachment keeps it on tile through a memoryless R32F colour attachment (commands.cpp planDepthTile).
+bool depthTileOn();
 // VPVK_D24_EMUL (default off; "" / "0" = off): pipelines that render into a D24UnormS8 image (held by Metal as Depth32Float_Stencil8)
 // write their depth rounded to 24 bits UNORM from the fragment shader, with the depth bias applied there (pipelines.cpp
 // PipelineObj::d24Emul, SpirvLowerOptions::d24Emul). Read once per process.
@@ -277,6 +280,9 @@ struct Image {
   // VK_KHR_dynamic_rendering_local_read: the copy that draws after an in-pass barrier read instead of this attachment
   // (commands.cpp localReadSplit), made on first need and destroyed with the image (submitMutex).
   mutable vpgpu::TextureId localReadCopy;
+  // Depth in tile (commands.cpp planDepthTile): the memoryless R32F colour attachment that holds this multisampled depth image's
+  // values for the later subpass that reads it as an input attachment; made on first need, destroyed with the image (submitMutex).
+  mutable vpgpu::TextureId depthTileShadow;
   // vk.tex_hist: bit m = mip m got a copy/blit recorded into it (relaxed; recording threads write, the submit tick reads).
   mutable std::atomic<uint32_t> mipsWritten{0};
   // Texture budget (vpvk_texture_budget, textureBudgetDrop): the texture is the image the game asked for without its `mipDrop`
@@ -622,6 +628,7 @@ struct PipelineObj {
   uint32_t sampleMask = ~0u;  // VkSampleMask of the pipeline (pSampleMask[0]) when it clears samples of the game's count, else ~0u
   bool a2cTest = false;  // alpha-to-coverage pipeline created at 1x (MSAA forced off): alpha test in the fragment shader
   bool d24Emul = false;  // d24Emul() and the pipeline tests depth into a D24UnormS8 image: its fragment stage rounds the depth to 24 bits
+  bool depthTileSrc = false;  // a pass of this pipeline's render pass may keep its depth input on tile: `sources` stay for depthPipelineKey
   bool d24Skipped = false;  // ... except a shader with early fragment tests that may write resources (spirv::d24EmulSkipped): hardware depth
   uint16_t colorIntKinds = 0;  // SpirvLowerOptions::colorIntKinds of the fragment stage
   uint8_t fragmentOutputs = 0;  // colour outputs the fragment shader writes (a dynamic colour write mask never enables others)
@@ -647,6 +654,19 @@ struct PipelineObj {
     uint64_t fragment = 0;  // fragment shader id of the variant (tests)
   };
   mutable std::vector<MaskVariant> maskVariants;
+  // Depth in tile (depthPipelineKey): variants for the draws of a render pass whose depth is kept in a colour attachment
+  // (commands.cpp planDepthTile). kind 0 = fragment shader also writes the depth into it, 1 = reads the depth input attachment at
+  // texture slot `texSlot` from it, 2 = same shaders, the attachment bound with write mask 0. Under variantMutex.
+  struct DepthVariant {
+    uint8_t kind = 0;
+    int32_t texSlot = -1;
+    bool ok = false, committed = false;  // committed: requested from the pipeline cache and recorded in the recipes
+    vpgpu::PipelineKey key{};
+    vpgpu::PipelineState state;
+    std::array<uint64_t, 3> inputs{};
+  };
+  mutable std::vector<DepthVariant> depthVariants;
+  int8_t depthTileSub = -1;  // depthTileSrc: 0 = the subpass that writes the depth another subpass reads, 1 = the reader, -1 neither
   bool isDynamic(VkDynamicState s) const {
     for (auto d : dynamic)
       if (d == s) return true;

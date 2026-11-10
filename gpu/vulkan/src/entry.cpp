@@ -2237,6 +2237,7 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkDestroyImage(VkDevice dv, VkImage im,
     for (auto& p : i->planes) releaseImageTexture(*d, *p);
     releaseImageTexture(*d, *i);
     if (i->localReadCopy) d->gpu->destroy(i->localReadCopy);
+    if (i->depthTileShadow) d->gpu->destroy(i->depthTileShadow);
   }
   imgRegRemove(i);
   delete i;

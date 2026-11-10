@@ -29,6 +29,14 @@ foreach(f ${fetch})
   add_test(NAME vpir.fbfetch.${n} COMMAND vpir_test fbfetch ${f})
 endforeach()
 
+# Multisampled depth input attachment served from a colour attachment (toDepthFramebufferFetch): ok_array must rewrite to ok_array.out,
+# the others must come out unchanged with the rejections their "; reject:" lines name.
+add_test(NAME vpir.depthfetch.ok_array COMMAND vpir_test depthfetch ${CMAKE_CURRENT_SOURCE_DIR}/depthfetch/ok_array.vpir
+         ${CMAKE_CURRENT_SOURCE_DIR}/depthfetch/ok_array.out)
+foreach(n other_sample other_pixel)
+  add_test(NAME vpir.depthfetch.${n} COMMAND vpir_test depthfetch ${CMAKE_CURRENT_SOURCE_DIR}/depthfetch/${n}.vpir)
+endforeach()
+
 # Optimizer: NAME.vpir must optimize to NAME.out (canonical VPIR text).
 file(GLOB opt CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/optimize/*.vpir)
 foreach(f ${opt})

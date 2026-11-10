@@ -1,0 +1,40 @@
+; Fragment shader: the multisampled depth read as an input attachment, per sample (Unreal's translucency subpass):
+;   layout(input_attachment_index = 0, set = 0, binding = 3) uniform subpassInputMS depthIn;
+;   layout(location = 0) out vec4 color;
+;   void main() { color = vec4(subpassLoad(depthIn, gl_SampleID).r); }
+OpCapability Cap:Shader
+OpCapability Cap:InputAttachment
+OpCapability Cap:SampleRateShading
+OpMemoryModel AddrModel:Logical MemModel:GLSL450
+OpEntryPoint Model:Fragment %main "main" %sid %color
+OpExecutionMode %main ExecMode:OriginUpperLeft
+OpName %main "main"
+OpDecorate %inAtt Deco:DescriptorSet 0
+OpDecorate %inAtt Deco:Binding 3
+OpDecorate %inAtt Deco:InputAttachmentIndex 0
+OpDecorate %sid Deco:BuiltIn BuiltIn:SampleId
+OpDecorate %color Deco:Location 0
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%f32 = OpTypeFloat 32
+%i32 = OpTypeInt 32 1
+%v4 = OpTypeVector %f32 4
+%v2i = OpTypeVector %i32 2
+%img = OpTypeImage %f32 Dim:SubpassData 0 0 1 2 ImgFmt:Unknown
+%pimg = OpTypePointer Storage:UniformConstant %img
+%inAtt = OpVariable %pimg Storage:UniformConstant
+%pin = OpTypePointer Storage:Input %i32
+%sid = OpVariable %pin Storage:Input
+%pout = OpTypePointer Storage:Output %v4
+%color = OpVariable %pout Storage:Output
+%c0 = OpConstant %i32 0
+%zero2 = OpConstantComposite %v2i %c0 %c0
+%main = OpFunction %void 0 %fn
+%l = OpLabel
+%im = OpLoad %img %inAtt
+%s = OpLoad %i32 %sid
+%d = OpImageRead %v4 %im %zero2 ImgOp:Sample %s
+%r = OpVectorShuffle %v4 %d %d 0 0 0 0
+OpStore %color %r
+OpReturn
+OpFunctionEnd

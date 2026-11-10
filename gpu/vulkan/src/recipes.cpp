@@ -144,7 +144,8 @@ void encodeInput(Writer& w, const StageInput& in) {
   const uint8_t ext =
       uint8_t((o.multisampleAsSingle ? 1 : 0) | (o.viewMask ? 2 : 0) | (o.colorIntKinds ? 4 : 0) | (nYcbcr ? 8 : 0) |
                 (o.uiMaskSlot >= 0 ? 16 : 0) | (o.alphaTest ? 32 : 0) | (o.viewportIndex ? 64 : 0) | (o.rateMapPosition ? 128 : 0));
-  if (ext || !o.robustBuffers || o.sampleMask != ~0u || o.d24Emul) w.pod(ext);
+  const bool dShadow = o.depthShadowSlot >= 0, dFetch = o.depthFetchSlot >= 0;
+  if (ext || !o.robustBuffers || o.sampleMask != ~0u || o.d24Emul || dShadow || dFetch) w.pod(ext);
   if (o.viewMask) w.pod(uint32_t(o.viewMask));
   if (o.colorIntKinds) w.pod(uint16_t(o.colorIntKinds));
   if (nYcbcr) {
@@ -160,9 +161,12 @@ void encodeInput(Writer& w, const StageInput& in) {
   }
   if (o.uiMaskSlot >= 0) w.pod(uint8_t(o.uiMaskSlot)), w.pod(uint8_t(o.uiMaskAlpha ? 1 : 0));
   // last: emit flags, bit 0 robustBuffers off, bit 1 a sampleMask (uint32) follows, bit 2 d24Emul (no payload)
-  if (!o.robustBuffers || o.sampleMask != ~0u || o.d24Emul)
-    w.pod(uint8_t((o.robustBuffers ? 0 : 1) | (o.sampleMask != ~0u ? 2 : 0) | (o.d24Emul ? 4 : 0)));
+  // (bit 3 depthShadowSlot, bit 4 depthFetchSlot: their payloads follow the sample mask's: slot byte, and slot + texture slot)
+  if (!o.robustBuffers || o.sampleMask != ~0u || o.d24Emul || dShadow || dFetch)
+    w.pod(uint8_t((o.robustBuffers ? 0 : 1) | (o.sampleMask != ~0u ? 2 : 0) | (o.d24Emul ? 4 : 0) | (dShadow ? 8 : 0) | (dFetch ? 16 : 0)));
   if (o.sampleMask != ~0u) w.pod(uint32_t(o.sampleMask));
+  if (dShadow) w.pod(uint8_t(o.depthShadowSlot));
+  if (dFetch) w.pod(uint8_t(o.depthFetchSlot)), w.pod(uint32_t(o.depthFetchTexSlot));
 }
 
 bool decodeInput(Reader& r, StageInput& in) {
@@ -234,6 +238,11 @@ bool decodeInput(Reader& r, StageInput& in) {
     o.robustBuffers = !(f & 1);
     o.d24Emul = (f & 4) != 0;
     if (f & 2) o.sampleMask = r.pod<uint32_t>();
+    if (f & 8) o.depthShadowSlot = int8_t(r.pod<uint8_t>());
+    if (f & 16) {
+      o.depthFetchSlot = int8_t(r.pod<uint8_t>());
+      o.depthFetchTexSlot = int32_t(r.pod<uint32_t>());
+    }
   }
   return r.ok && in.spirv != 0;
 }

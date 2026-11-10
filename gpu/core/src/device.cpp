@@ -138,6 +138,35 @@ void Device::destroy(SamplerId id) {
 }
 
 void Device::trackRenderTargets(uint64_t index, const CompiledFrame& compiled, std::vector<std::string>& lines) {
+  // One line per cause (TileVerdict) the first time an MSAA texture could not stay memoryless: what the game does that needs the
+  // samples in memory. The verdicts are the compiler's; "game_needs" says what in the recorded work produces each.
+  auto nonMemoryless = [&](TextureId t, TileVerdict why) {
+    const TextureDesc* d = resources_.get(t);
+    if (!d || d->samples < 2 || why == TileVerdict::None || why == TileVerdict::TileLocal || (nonMemorylessSeen_ >> int(why) & 1)) return;
+    nonMemorylessSeen_ |= 1u << int(why);
+    const char* need = "?";
+    switch (why) {
+      case TileVerdict::SampledRead: need = "a pass samples or reads the multisample image as a texture (texture2d_ms, input attachment, compute)"; break;
+      case TileVerdict::OtherEncoder: need = "a later encoder Loads the samples (the pass was cut: feedback, attachment change, compute or copy between)"; break;
+      case TileVerdict::LoadsContents: need = "the first pass Loads samples written by an earlier submit"; break;
+      case TileVerdict::UsedElsewhere: need = "the image is copied or written outside its render encoder"; break;
+      case TileVerdict::Persistent: need = "the image is persistent (read after the frame: eye image, history)"; break;
+      case TileVerdict::Partial: need = "the attachment covers only some mips or layers"; break;
+      case TileVerdict::SizeMismatch: need = "size or sample count differs from the encoder's other attachments"; break;
+      case TileVerdict::BadFetch: need = "a pixel-local read of something that is not a colour attachment"; break;
+      case TileVerdict::HeavyGeometry: need = "the encoder has so much geometry the tiler may flush (tileMaxDraws / tileMaxVertices)"; break;
+      default: break;
+    }
+    std::string label = d->label.empty() ? "-" : d->label.substr(0, 40);
+    for (char& c : label)
+      if (c == ' ') c = '_';
+    char buf[320];
+    std::snprintf(buf, sizeof buf, "gpu.msaa.nonmemoryless rp=%s tex=%u %ux%ux%u s%u fmt=%s why=%s game_needs=\"%s\"", label.c_str(),
+                  t.index, d->width, d->height, unsigned(d->layers), unsigned(d->samples), formatInfo(d->format).name, toString(why), need);
+    lines.emplace_back(buf);
+  };
+  for (const TransientViolation& v : compiled.transientViolations) nonMemoryless(v.texture, v.why);
+  for (const MsaaReject& r : compiled.msaaRejects) nonMemoryless(r.texture, r.why);
   for (const TransientViolation& v : compiled.transientViolations) {
     ++transientViolations_;
     const TextureDesc* d = resources_.get(v.texture);

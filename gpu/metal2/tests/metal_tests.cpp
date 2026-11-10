@@ -86,7 +86,30 @@ fragment LOut fs_light(float4 albedo [[color(0)]], float4 normal [[color(1)]], f
 }
 )";
 
-enum : uint64_t { kVs = 1, kFsColor, kFsMrt, kFsTex, kCsFill, kFsSampler, kFsGbuffer, kFsLight };
+// Depth in tile: the writer also outputs its depth to colour 6 (an R32Float attachment), the reader fetches it per sample ([[sample_id]]
+// makes the fragment function run per sample); the reference reader samples the stored multisampled depth instead.
+const char* kTile = R"(
+#include <metal_stdlib>
+using namespace metal;
+struct VOut { float4 pos [[position]]; };
+struct Args { device const float4* verts; device const float4* color; };
+struct TArgs { device const float4* verts; device const float4* color; depth2d_ms<float> dtex; };
+struct WOut { float4 c [[color(0)]]; float d [[color(6)]]; };
+fragment WOut fs_dwrite(VOut in [[stage_in]], constant Args& a [[buffer(30)]]) { return {a.color[0], in.pos.z}; }
+fragment float4 fs_dread(float d [[color(6)]], uint sid [[sample_id]]) { return float4(d, 0.0, 0.0, 1.0) + float4(0.0 * float(sid)); }
+fragment float4 fs_dsample(VOut in [[stage_in]], uint sid [[sample_id]], constant TArgs& a [[buffer(30)]]) {
+  return float4(a.dtex.read(uint2(in.pos.xy), sid), 0.0, 0.0, 1.0);
+}
+// Two layers (multiview by instancing: instance = layer, the way the Vulkan layer draws viewMask 0b11).
+struct LOut { float4 pos [[position]]; uint layer [[render_target_array_index]]; };
+struct LArgs { device const float4* verts; device const float4* color; depth2d_ms_array<float> dtex; };
+vertex LOut vs_layer(uint vid [[vertex_id]], uint inst [[instance_id]], constant Args& a [[buffer(30)]]) { return {a.verts[vid], inst}; }
+fragment float4 fs_dsample_l(LOut in [[stage_in]], uint sid [[sample_id]], constant LArgs& a [[buffer(30)]]) {
+  return float4(a.dtex.read(uint2(in.pos.xy), in.layer, sid), 0.0, 0.0, 1.0);
+}
+)";
+
+enum : uint64_t { kVs = 1, kFsColor, kFsMrt, kFsTex, kCsFill, kFsSampler, kFsGbuffer, kFsLight, kFsDepthW, kFsDepthRead, kFsDepthSample, kVsLayer, kFsDepthSampleL };
 
 struct Rig {
   ShaderTable shaders;
@@ -121,6 +144,21 @@ struct Rig {
     MslShader light = shader("fs_light", {}, 0b1000);
     light.source = kLight;
     t.add(kFsLight, light);
+    MslShader dw = shader("fs_dwrite", {color}, 0b1000001);
+    dw.source = kTile;
+    t.add(kFsDepthW, dw);
+    MslShader dr = shader("fs_dread", {}, 0b1);
+    dr.source = kTile;
+    t.add(kFsDepthRead, dr);
+    MslShader ds = shader("fs_dsample", {tex}, 0b1);
+    ds.source = kTile;
+    t.add(kFsDepthSample, ds);
+    MslShader vl = shader("vs_layer", {verts}, 0);
+    vl.source = kTile;
+    t.add(kVsLayer, vl);
+    MslShader dl = shader("fs_dsample_l", {tex}, 0b1);
+    dl.source = kTile;
+    t.add(kFsDepthSampleL, dl);
     return t;
   }
   void log(const std::string& l) {
@@ -159,15 +197,20 @@ struct Rig {
   }
 
   // Submits, appends a readback copy for each texture, waits, and returns RGBA8 rows.
-  std::vector<std::vector<uint8_t>> run(Frame& f, std::vector<TextureId> read, uint32_t size, FrameReport* report = nullptr) {
+  // `layers` > 1: the readback of each texture holds its layers one after the other.
+  std::vector<std::vector<uint8_t>> run(Frame& f, std::vector<TextureId> read, uint32_t size, FrameReport* report = nullptr,
+                                        uint32_t layers = 1) {
     std::vector<BufferId> out;
+    const uint64_t layerBytes = uint64_t{size} * size * 4;
     for (TextureId t : read) {
-      out.push_back(device.createBuffer({uint64_t{size} * size * 4, nullptr, "readback"}));
-      Copy c;
-      c.kind = CopyKind::TextureToBuffer;
-      c.srcTexture = {t, 0, 0, 1, 0, 0, 0, size, size, 1};
-      c.dstBuffer = {out.back(), 0, uint64_t{size} * size * 4, 0, 0};
-      f.copy(c);
+      out.push_back(device.createBuffer({layerBytes * layers, nullptr, "readback"}));
+      for (uint32_t l = 0; l < layers; ++l) {
+        Copy c;
+        c.kind = CopyKind::TextureToBuffer;
+        c.srcTexture = {t, 0, uint16_t(l), 1, 0, 0, 0, size, size, 1};
+        c.dstBuffer = {out.back(), l * layerBytes, layerBytes, 0, 0};
+        f.copy(c);
+      }
     }
     const FrameReport r = device.submit(f);
     if (report) *report = r;
@@ -175,24 +218,24 @@ struct Rig {
     std::vector<std::vector<uint8_t>> pixels;
     for (BufferId b : out) {
       const auto* p = static_cast<const uint8_t*>(backend.contents(b));
-      pixels.emplace_back(p, p + size_t{size} * size * 4);
+      pixels.emplace_back(p, p + size_t{size} * size * 4 * layers);
     }
     return pixels;
   }
 };
 
-bool near(uint8_t a, uint8_t b) { return std::abs(int(a) - int(b)) <= 1; }
+bool near(uint8_t a, uint8_t b, int tol = 1) { return std::abs(int(a) - int(b)) <= tol; }
 
 // Counts pixels that differ from expect(x, y) (RGBA); prints the first few.
 int compare(const std::vector<uint8_t>& px, uint32_t size, const std::function<std::array<uint8_t, 4>(uint32_t, uint32_t)>& expect,
-            const std::function<bool(uint32_t, uint32_t)>& skip = nullptr) {
+            const std::function<bool(uint32_t, uint32_t)>& skip = nullptr, int tol = 1, size_t offset = 0) {
   int bad = 0;
   for (uint32_t y = 0; y < size; ++y)
     for (uint32_t x = 0; x < size; ++x) {
       if (skip && skip(x, y)) continue;
       const auto e = expect(x, y);
-      const uint8_t* p = &px[(size_t{y} * size + x) * 4];
-      if (near(p[0], e[0]) && near(p[1], e[1]) && near(p[2], e[2]) && near(p[3], e[3])) continue;
+      const uint8_t* p = &px[offset + (size_t{y} * size + x) * 4];
+      if (near(p[0], e[0], tol) && near(p[1], e[1], tol) && near(p[2], e[2], tol) && near(p[3], e[3], tol)) continue;
       if (bad++ < 4)
         std::printf("  pixel %u,%u = %u %u %u %u, expected %u %u %u %u\n", x, y, p[0], p[1], p[2], p[3], e[0], e[1], e[2], e[3]);
     }
@@ -461,6 +504,180 @@ void testDeferred(Rig& r) {
         }, onDiagonal) == 0);
 }
 
+// Depth in tile (Vulkan layer: VPVK_DEPTH_TILE): a 2-subpass MSAA 4x pass whose subpass 1 reads the depth of subpass 0. Fused path:
+// subpass 0 also writes its depth to an R32Float attachment (colour 6), subpass 1 fetches it per sample; both subpasses are one
+// encoder and neither the 4x depth nor the shadow reaches memory. Reference path: subpass 1 samples the stored 4x depth (two
+// encoders). The pictures must agree (<= 1 LSB).
+// `layers` 2: the multiview shape (Into The Radius 2: viewMask 0b11, one draw instanced per layer, layer = the view) with a
+// per-layer reference reader; `sloped`: the triangle's depth varies across it (0.2 / 0.6 / 0.4 at its corners), so the
+// pixel-centre depth the shadow holds is compared with the stored per-sample depth within a bound (<= 2 LSB inside; the
+// edge pixels, where the samples straddle the triangle, are reported and not bounded).
+void depthTileRun(Rig& r, uint32_t layers, bool sloped) {
+  if (!r.backend.tileMemory()) SKIP("no tile memory (memoryless + framebuffer fetch)");
+  std::printf("  depth_tile layers=%u sloped=%d\n", layers, int(sloped));
+  auto ms = [&](Format f, uint8_t usageBits, bool transient) {
+    TextureDesc d;
+    d.format = f;
+    d.width = d.height = N;
+    d.layers = uint16_t(layers);
+    d.samples = 4;
+    d.usage = usageBits;
+    d.transient = transient;
+    return r.device.createTexture(d);
+  };
+  const TextureId color = ms(Format::RGBA8Unorm, usage::colorTarget, true);
+  const TextureId depth = ms(Format::D32Float, usage::depthTarget, true);
+  const TextureId shadow = ms(Format::R32Float, usage::colorTarget, true);
+  const TextureId color2 = ms(Format::RGBA8Unorm, usage::colorTarget, true);
+  const TextureId depth2 = ms(Format::D32Float, usage::depthTarget | usage::sampled, false);
+  auto resolveTarget = [&] {
+    TextureDesc d;
+    d.format = Format::RGBA8Unorm;
+    d.width = d.height = N;
+    d.layers = uint16_t(layers);
+    d.usage = usage::sampled | usage::colorTarget;
+    return r.device.createTexture(d);
+  };
+  const TextureId out1 = resolveTarget(), out2 = resolveTarget();
+
+  const BufferId tri = sloped ? r.buffer({-1, -1, 0.2f, 1, 1, -1, 0.6f, 1, -1, 1, 0.4f, 1})
+                              : r.buffer({-1, -1, 0.3f, 1, 1, -1, 0.3f, 1, -1, 1, 0.3f, 1});
+  const BufferId quad = r.buffer(fullQuad(0.9f));
+  const BufferId blue = r.buffer({0, 0, 1, 1});
+
+  auto pass0 = [&](TextureId c, TextureId z, bool withShadow) {
+    RenderPassDesc d;
+    d.colors[0].texture = c;
+    d.colors[0].load = LoadAction::Clear;
+    d.colors[0].store = StoreAction::Store;  // (the client's pass stores: a later subpass uses it)
+    d.colors[0].clear.color = {0, 0, 0, 1};
+    if (withShadow) {
+      d.colors[6].texture = shadow;
+      d.colors[6].load = LoadAction::Clear;
+      d.colors[6].store = StoreAction::Store;
+      d.colors[6].clear.color = {1, 0, 0, 0};  // the depth clear value
+    }
+    d.depth.texture = z;
+    d.depth.load = LoadAction::Clear;
+    d.depth.store = StoreAction::Store;
+    d.depth.clear.depth = 1.0f;
+    return d;
+  };
+  auto pass1 = [&](TextureId c, TextureId z, TextureId resolve, bool withShadow) {
+    RenderPassDesc d;
+    d.colors[0].texture = c;
+    d.colors[0].load = LoadAction::Load;
+    d.colors[0].store = StoreAction::Resolve;
+    d.colors[0].resolve = resolve;
+    if (withShadow) {
+      d.colors[6].texture = shadow;
+      d.colors[6].load = LoadAction::Load;
+      d.colors[6].store = StoreAction::DontCare;
+    }
+    d.depth.texture = z;
+    d.depth.load = LoadAction::Load;
+    d.depth.store = StoreAction::DontCare;
+    return d;
+  };
+  auto state = [&](uint64_t fs, bool withShadow, bool depthWrite) {
+    PipelineState s;
+    s.vertexShader = layers > 1 ? kVsLayer : kVs;
+    s.fragmentShader = fs;
+    s.colorFormats[0] = Format::RGBA8Unorm;
+    if (withShadow) s.colorFormats[6] = Format::R32Float;
+    s.depthFormat = Format::D32Float;
+    s.depthTest = depthWrite, s.depthWrite = depthWrite;
+    s.depthCompare = CompareOp::Less;
+    s.primitive = depthWrite ? Primitive::Triangles : Primitive::TriangleStrip;
+    s.samples = 4;
+    return s;
+  };
+
+  // Fused: the writer's colour 6 is the depth; the reader's fetch input 6 is texture slot 0.
+  PipelineState writer = state(kFsDepthW, true, true);
+  writer.blend[6].writeMask = 1;
+  PipelineState reader = state(kFsDepthRead, true, false);
+  RenderPassDesc b1 = pass1(color, depth, out1, true);
+  Draw rd = draw({}, {quad}, 4, Primitive::TriangleStrip);
+  rd.instances = layers;
+  rd.bindings.push_back(pixelLocalRead(shadow));
+  CHECK(fetchInputs(rd, b1, reader.fetch) && reader.fetch.mask == 0b1000000);
+  rd.pipeline = r.pipeline(reader);
+  Frame f;
+  f.beginRenderPass(pass0(color, depth, true));
+  Draw wd = draw(r.pipeline(writer), {tri, blue}, 3);
+  wd.instances = layers;
+  f.draw(wd);
+  f.endRenderPass();
+  f.beginRenderPass(b1);
+  f.draw(rd);
+  f.endRenderPass();
+  FrameReport fused;
+  const auto px1 = r.run(f, {out1}, N, &fused, layers);
+  std::printf("  depth_tile fused: encoders=%u passes=%u merged=%u tile_local=%u msaa_store_bytes=%llu\n", fused.renderEncoders,
+              fused.passes, fused.compile.passesMerged, fused.compile.tileLocal, (unsigned long long)fused.compile.msaaStoreBytes);
+  CHECK(fused.renderEncoders == 1 && fused.passes == 2 && fused.compile.passesMerged == 1);
+  CHECK(fused.compile.tileLocal >= 3);  // colour, depth, shadow: all tile memory
+  CHECK(fused.compile.msaaStoreBytes == 0 && fused.compile.msaaLoadBytes == 0);
+
+  // Reference: subpass 1 samples the stored depth.
+  PipelineState plain = state(kFsColor, false, true);
+  PipelineState sampler = state(layers > 1 ? kFsDepthSampleL : kFsDepthSample, false, false);
+  Draw sd = draw(r.pipeline(sampler), {quad}, 4, Primitive::TriangleStrip);
+  sd.instances = layers;
+  sd.bindings.push_back(read(ResourceRange::wholeTexture(depth2), stage::fragment));
+  Frame g;
+  g.beginRenderPass(pass0(color2, depth2, false));
+  Draw pd = draw(r.pipeline(plain), {tri, blue}, 3);
+  pd.instances = layers;
+  g.draw(pd);
+  g.endRenderPass();
+  g.beginRenderPass(pass1(color2, depth2, out2, false));
+  g.draw(sd);
+  g.endRenderPass();
+  FrameReport ref;
+  const auto px2 = r.run(g, {out2}, N, &ref, layers);
+  std::printf("  depth_tile reference: encoders=%u\n", ref.renderEncoders);
+  CHECK(ref.renderEncoders == 2);
+
+  // The picture, every layer: red = the depth the pixel's samples hold (the triangle's inside, the clear value 1.0 outside),
+  // averaged by the resolve.
+  const auto edge = [](uint32_t x, uint32_t y) { return x + y >= N - 2 && x + y <= N; };
+  const auto planeZ = [&](uint32_t x, uint32_t y) {
+    if (!sloped) return 0.3f;
+    const float nx = (float(x) + 0.5f) / N * 2 - 1, ny = 1 - (float(y) + 0.5f) / N * 2;
+    return 0.2f + 0.4f * (nx + 1) / 2 + 0.2f * (ny + 1) / 2;
+  };
+  const int tol = sloped ? 2 : 1;
+  const size_t layerBytes = size_t{N} * N * 4;
+  for (uint32_t l = 0; l < layers; ++l) {
+    CHECK(compare(px1[0], N, [&](uint32_t x, uint32_t y) {
+            return lowerLeft(x, y) ? std::array<uint8_t, 4>{unorm(planeZ(x, y)), 0, 0, 255} : std::array<uint8_t, 4>{255, 0, 0, 255};
+          }, edge, tol, l * layerBytes) == 0);
+    int differ = 0, edgeMax = 0;  // fused against reference
+    for (uint32_t y = 0; y < N; ++y)
+      for (uint32_t x = 0; x < N; ++x) {
+        const size_t o = l * layerBytes + (size_t{y} * N + x) * 4;
+        const int d = std::abs(int(px1[0][o]) - int(px2[0][o]));
+        if (edge(x, y)) edgeMax = std::max(edgeMax, d);
+        else differ += d > tol;
+      }
+    std::printf("  depth_tile layer %u: interior fused-vs-reference over %d LSB: %d pixels, edge max diff %d LSB (reported)\n", l, tol,
+                differ, edgeMax);
+    CHECK(differ == 0);
+  }
+  if (layers > 1) {  // the layers must hold the same picture (same geometry drawn once per view)
+    int layerDiff = 0;
+    for (size_t i = 0; i < layerBytes; ++i) layerDiff += !near(px1[0][i], px1[0][layerBytes + i], tol);
+    CHECK(layerDiff == 0);
+  }
+}
+void testDepthTile(Rig& r) {
+  depthTileRun(r, 1, false);
+  depthTileRun(r, 1, true);
+}
+void testDepthTileLayers(Rig& r) { depthTileRun(r, 2, true); }
+
 // Stencil: the triangle marks 1, a full-screen quad then draws only where the mark is.
 void testStencil(Rig& r) {
   const TextureId t = r.target(Format::RGBA8Unorm, N), ds = r.target(Format::D32FloatS8, N);
@@ -714,7 +931,7 @@ int main(int argc, char** argv) {
     void (*fn)(Rig&);
   } tests[] = {{"clear", testClear},   {"triangle", testTriangle}, {"textured", testTexturedQuad},
                {"depth", testDepth},   {"mrt", testMrt},           {"compute", testCompute},
-               {"merged", testMergedPasses}, {"deferred", testDeferred}, {"stencil", testStencil},
+               {"merged", testMergedPasses}, {"deferred", testDeferred}, {"depth_tile", testDepthTile}, {"depth_tile_layers", testDepthTileLayers}, {"stencil", testStencil},
                {"msaa", testMsaaResolve}, {"blendconst", testBlendConstant}, {"timings", testTimings},
                {"native", testNative},   {"manyenc", testManyEncoders}, {"texlife", testTextureLifetime},
                {"nopool", testNoPoolThread}};

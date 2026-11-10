@@ -121,6 +121,14 @@ struct SpirvLowerOptions {
   // fragment shader that reads FragCoord sees it mapped back from physical to screen space through the pass's
   // rate map (vpir::Module::rateMapPosition; the shader then takes the map data at vpmsl::kRateMapBuffer).
   // false = the MSL is byte-identical to before. Recipes: flags bits 6 and 7.
+  // Depth in tile (VPVK_DEPTH_TILE, commands.cpp planDepthTile). Fragment, 2-subpass MSAA passes whose later subpass reads the
+  // depth of the earlier one as an input attachment: depthShadowSlot >= 0 = an extra float output at [[color(slot)]] that every
+  // invocation reaching the end of main writes with the depth it writes to the depth buffer (FragDepth, else FragCoord.z);
+  // depthFetchSlot >= 0 = the multisampled input attachment at texture slot depthFetchTexSlot is read from that colour slot
+  // (vpir::toDepthFramebufferFetch; the lowering fails when it cannot). -1 = none: the MSL is byte-identical to before.
+  // Recipes: emit flags bits 3 and 4.
+  int8_t depthShadowSlot = -1, depthFetchSlot = -1;
+  int32_t depthFetchTexSlot = -1;
   bool viewportIndex = false;
   bool rateMapPosition = false;
   // Fragment: the pipeline renders into a D24UnormS8 image that the Metal backend holds as Depth32Float_Stencil8 (VPVK_D24_EMUL,

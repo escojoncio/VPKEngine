@@ -765,6 +765,21 @@ struct Translator {
   // an in-pass barrier read through a copy: attachment texture -> its copy. Null device (tests): no copies.
   Device* device = nullptr;
   std::vector<std::pair<vpgpu::TextureId, vpgpu::TextureId>> localCopies;
+  // Depth in tile (VPVK_DEPTH_TILE, planDepthTile): a 2-subpass pass whose subpass 1 reads the multisampled depth the subpass 0 writes
+  // as an input attachment. Colour attachment kDepthTileSlot (a memoryless R32F texture) holds the depth in both subpasses: the
+  // draws of subpass 0 also write it, those of subpass 1 read it by framebuffer fetch per sample (pixel-local), so the frame
+  // compiler merges the subpasses into one encoder and the 4x depth is never stored for the read. `uses`: the pipeline variant
+  // of every (pipeline, subpass) the pass draws with (depthPipelineKey).
+  struct DepthTile {
+    struct Use {
+      int kind = kDepthTileState;
+      int texSlot = -1;
+      vpgpu::PipelineKey key;
+    };
+    bool active = false;
+    vpgpu::Attachment shadow;
+    std::unordered_map<uint64_t, Use> uses;
+  } dt;
   // The device whatever the caller passed (`device` is only set with the native extras): null in tests without one.
   const Device* anyDevice() const { return device ? device : zl && zl->dev ? zl->dev : um ? um->dev : nullptr; }
 
@@ -961,6 +976,7 @@ struct Translator {
         fovSuppressed = false;
         taaSubpass(*b, 0);
         viewMask = b->pass && !b->pass->subpasses.empty() ? b->pass->subpasses[0].viewMask : 0;
+        dt = DepthTile{};
         selfFinal.reset();
         const bool split0 = barrierAhead(rec.ops, opIx);
         if (split0 && b->pass && selfReads(*b->pass, 0)) {  // the client's own stores, for the part after the last barrier
@@ -975,6 +991,8 @@ struct Translator {
           forceMsaa(desc, rec.ops, opIx, b->area, false, multi);
           gameAuto(desc, b->area, false, multi);
           uiPass(rec.ops, opIx, desc);
+          planDepthTile(*b, rec.ops, opIx, desc,
+                        std::any_of(cr.begin(), cr.end(), [](const auto& q) { return q && (q->depth || q->stencil); }));
           open(std::move(desc));
           clearQuads(std::move(cr));
         } else {
@@ -1029,6 +1047,7 @@ struct Translator {
           forceMsaa(desc, rec.ops, opIx, pass->area, false, true);  // (a later subpass of a multi-subpass pass: never forced)
           gameAuto(desc, pass->area, false, true);
           uiPass(rec.ops, opIx, desc);
+          depthTileReader(desc);
           open(std::move(desc));
           clearQuads(std::move(cr));
         } else {
@@ -1063,6 +1082,7 @@ struct Translator {
         localCopies.clear();
         close();
         flushResolves();
+        dt = DepthTile{};
         pass = nullptr;
         taaPass = false;
         forceN = 0;
@@ -2033,6 +2053,212 @@ struct Translator {
       }
   }
 
+  static uint64_t depthTileKey(const PipelineObj* p, uint32_t sub) { return uint64_t(reinterpret_cast<uintptr_t>(p)) * 2 + (sub ? 1 : 0); }
+
+  // "gpu.pass.fuse src=vk depth_input_in_tile=N reason=..": the decision for a pass that reads a multisampled depth as an input
+  // attachment. The first lines, then one in 2000.
+  void depthTileLog(const OpBeginPass& b, bool on, const char* why, uint32_t att, size_t draws0 = 0, size_t draws1 = 0, size_t fetchPipes = 0) {
+    static std::atomic<unsigned> n{0};
+    const unsigned k = n.fetch_add(1);
+    if (k >= 24 && k % 2000) return;
+    logf("gpu.pass.fuse src=vk depth_input_in_tile=%d reason=%s att=%u fb=%ux%u draws0=%zu draws1=%zu fetch_pipes=%zu", on ? 1 : 0, why, att,
+         b.framebuffer ? b.framebuffer->width : 0, b.framebuffer ? b.framebuffer->height : 0, draws0, draws1, fetchPipes);
+  }
+
+  // Decides, when subpass 0 of `b` opens as `desc`, whether the depth the later subpass reads as an input attachment can stay on
+  // tile; if so adds the shadow attachment to `desc` and fills `dt`. Any unmet condition leaves everything as it was (the
+  // subpass 1 samples the stored depth: the encoder is cut) and logs why. A pass without such an input says nothing.
+  void planDepthTile(const OpBeginPass& b, const std::vector<Op>& ops, size_t at, vpgpu::RenderPassDesc& desc, bool areaDepth) {
+    dt = DepthTile{};
+    if (!b.pass || !b.framebuffer) return;
+    const auto& sps = b.pass->subpasses;
+    uint32_t att = VK_ATTACHMENT_UNUSED;
+    const ImageView* dv = nullptr;
+    for (size_t s = 1; s < sps.size() && !dv; ++s)
+      for (const VkAttachmentReference2& r : sps[s].inputs) {
+        const ImageView* v = r.attachment < b.framebuffer->views.size() ? b.framebuffer->views[r.attachment] : nullptr;
+        if (v && v->image && v->image->desc.samples >= 2 && vpgpu::formatInfo(v->image->desc.format).depth()) {
+          att = r.attachment, dv = v;
+          break;
+        }
+      }
+    if (!dv) return;
+    const Image* img = dv->image;
+    auto no = [&](const char* why) { depthTileLog(b, false, why, att); };
+    if (!depthTileOn()) return no("disabled");
+    Device* dev = devForce();
+    if (!dev || !dev->gpu || !img->id) return no("no_device");
+    if (sps.size() != 2 || !sps[0].inputs.empty()) return no("subpasses");
+    const RenderPassObj::Subpass &s0 = sps[0], &s1 = sps[1];
+    if (!s0.hasDepth || s0.depth.attachment != att || !s1.hasDepth || s1.depth.attachment != att) return no("depth_attachment");
+    for (const VkAttachmentReference2& r : s1.inputs)
+      if (r.attachment != att) return no("other_inputs");
+    if (s0.viewMask != s1.viewMask) return no("view_mask");
+    for (size_t c = 0; c < s1.colors.size(); ++c) {
+      const uint32_t a1 = s1.colors[c].attachment;
+      const uint32_t a0 = c < s0.colors.size() ? s0.colors[c].attachment : VK_ATTACHMENT_UNUSED;
+      if (a1 != VK_ATTACHMENT_UNUSED && a1 != a0) return no("colors");
+    }
+    // (the VPKTAA jitter only moves the viewport and the mask variant is what jitter() would replace: those stay out)
+    if (maskPass || forceN || desc.rateMap || (fovs && taaPass)) return no("pass_state");
+    if (desc.depth.autoMsaa || desc.depth.texture != img->id) return no("depth_attachment");
+    for (const vpgpu::Attachment& a : desc.colors)
+      if (a.autoMsaa) return no("auto_msaa");
+    if (desc.colors[kDepthTileSlot].texture) return no("slot_taken");
+    if (desc.depth.load == vpgpu::LoadAction::Load) return no("depth_load");
+    if (areaDepth || partialArea(b.area, dv)) return no("area_clear");
+    if (dv->range.baseMipLevel != 0 || img->desc.type != vpgpu::TextureType::Tex2D) return no("depth_view");
+    if (img->desc.layers < desc.layerCount) return no("layers");
+    // The draws: subpass 0 must leave the shadow equal to its depth, subpass 1 must not change the depth.
+    struct Seen {
+      const PipelineObj* p;
+      uint32_t sub;
+      int kind, texSlot;
+    };
+    std::vector<Seen> seen;
+    std::unordered_map<uint64_t, size_t> seenAt;  // depthTileKey -> index in `seen`
+    size_t draws[2] = {0, 0};
+    uint32_t sub = 0;
+    const char* bad = nullptr;
+    auto visit = [&](auto&& self, const Op& op) -> bool {  // true: stop
+      if (const auto* d = std::get_if<OpDraw>(&op)) {
+        if (!d->ok) return false;
+        if (!d->pipe || !d->pipe->ok || !d->pipe->depthTileSrc || d->pipe->sources.empty()) return bad = "pipeline", true;
+        if (d->edsVariant || d->texelVariant) return bad = "pipeline_variant", true;
+        const PipelineObj& p = *d->pipe;
+        const bool writes = p.state.depthTest && p.state.depthWrite;
+        if (p.dualSource) return bad = "dual_source", true;
+        if (d->passSamples && d->passSamples != p.state.samples) return bad = "pass_samples", true;
+        if (d->draw.depthClamp) return bad = "depth_clamp", true;
+        ++draws[sub ? 1 : 0];
+        int kind = kDepthTileState, texSlot = -1;
+        if (sub == 0) {
+          if (d->draw.depthBias != 0 || d->draw.depthBiasSlope != 0) return bad = "depth_bias", true;
+          if (writes) {
+            if (p.d24Emul) return bad = "d24_emul", true;
+            bool frag = false;
+            for (const PipelineObj::StageSrc& src : p.sources) frag = frag || (src.stage == VK_SHADER_STAGE_FRAGMENT_BIT && !src.synthetic);
+            if (!frag) return bad = "depth_only", true;
+            kind = kDepthTileWrite;
+          }
+        } else {
+          if (writes) return bad = "reader_writes_depth", true;
+          int inputs = 0;
+          for (const PipelineObj::Used& u : p.used)
+            if (u.slot.type == VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT) {
+              ++inputs;
+              texSlot = int(u.slot.slot);
+              if (u.slot.count != 1) return bad = "input_array", true;
+            }
+          if (inputs > 1) return bad = "other_inputs", true;
+          if (inputs) {
+            kind = kDepthTileFetch;
+            bool found = false;
+            for (const vpgpu::Access& a : d->draw.bindings)
+              if (a.slot == texSlot && vpgpu::bindKind(a) == vpgpu::BindKind::Texture && !a.pixelLocal) {
+                if (a.range.kind != vpgpu::ResourceRange::Kind::Texture || a.range.index != img->id.index || a.range.generation != img->id.generation)
+                  return bad = "input_not_depth", true;
+                found = true;
+              }
+            if (!found) return bad = "input_not_depth", true;
+          }
+        }
+        const auto [it, fresh] = seenAt.emplace(depthTileKey(d->pipe, sub), seen.size());
+        if (!fresh) {
+          const Seen& x = seen[it->second];
+          if (x.kind != kind || x.texSlot != texSlot) return bad = "pipeline_mixed", true;
+          return false;
+        }
+        seen.push_back({d->pipe, sub, kind, texSlot});
+      } else if (const auto* e = std::get_if<OpExecute>(&op)) {
+        if (e->secondary)
+          for (const Op& so : e->secondary->ops)
+            if (self(self, so)) return true;
+      } else if (std::holds_alternative<OpNextSubpass>(op)) {
+        ++sub;
+      } else if (std::holds_alternative<OpPassBarrier>(op)) {
+        return bad = "barrier", true;
+      } else if (std::holds_alternative<OpClearAttachments>(op)) {
+        return bad = "clear_attachments", true;
+      } else if (std::holds_alternative<OpEndPass>(op) || std::holds_alternative<OpBeginPass>(op) || std::holds_alternative<OpBeginRendering>(op)) {
+        return true;
+      }
+      return false;
+    };
+    for (size_t i = at + 1; i < ops.size(); ++i)
+      if (visit(visit, ops[i])) break;
+    if (bad) return no(bad);
+    if (sub != 1) return no("subpasses");
+    // The variants: all translated first (nothing requested or recorded), committed only when every one exists and the pass is taken.
+    std::unordered_map<uint64_t, DepthTile::Use> uses;
+    size_t fetchPipes = 0;
+    for (const Seen& x : seen) {
+      DepthTile::Use u;
+      u.kind = x.kind, u.texSlot = x.texSlot;
+      if (!depthPipelineKey(dev, *x.p, x.kind, x.texSlot, u.key, false)) return no(x.kind == kDepthTileFetch ? "lowering_fetch" : "lowering_write");
+      fetchPipes += x.kind == kDepthTileFetch;
+      uses[depthTileKey(x.p, x.sub)] = u;
+    }
+    if (!fetchPipes) return no("no_reader");
+    if (!img->depthTileShadow) {
+      vpgpu::TextureDesc td = img->desc;
+      td.format = vpgpu::Format::R32Float;
+      td.mips = 1;
+      td.usage = vpgpu::usage::colorTarget;
+      td.transient = true, td.persistent = false, td.samplesReadable = false;
+      td.label = "vk.depth_tile";
+      img->depthTileShadow = dev->gpu->createTexture(td);
+    }
+    if (!img->depthTileShadow) return no("texture");
+    dt.shadow = {};
+    dt.shadow.texture = img->depthTileShadow;
+    dt.shadow.layer = uint16_t(dv->range.baseArrayLayer);
+    dt.shadow.load = desc.depth.load == vpgpu::LoadAction::Clear ? vpgpu::LoadAction::Clear : vpgpu::LoadAction::DontCare;
+    dt.shadow.clear.color = {double(desc.depth.clear.depth), 0, 0, 0};
+    dt.shadow.store = vpgpu::StoreAction::Store;  // (the core drops it when the next subpass merges and the texture is transient)
+    for (const Seen& x : seen) depthPipelineKey(dev, *x.p, x.kind, x.texSlot, uses[depthTileKey(x.p, x.sub)].key, true);
+    dt.uses = std::move(uses);
+    dt.active = true;
+    desc.colors[kDepthTileSlot] = dt.shadow;
+    depthTileLog(b, true, "ok", att, draws[0], draws[1], fetchPipes);
+  }
+
+  // Subpass 1 of a depth-tile pass: the shadow is read, never written, and not needed after.
+  void depthTileReader(vpgpu::RenderPassDesc& desc) {
+    if (!dt.active) return;
+    if (maskPass || forceN || (fovs && taaPass)) {  // (subpass 1 is judged on its own): it samples the stored depth, as before
+      dt.active = false;
+      return;
+    }
+    desc.colors[kDepthTileSlot] = dt.shadow;
+    desc.colors[kDepthTileSlot].load = vpgpu::LoadAction::Load;
+    desc.colors[kDepthTileSlot].store = vpgpu::StoreAction::DontCare;
+  }
+
+  // The draw with the pipeline variant of the depth-tile pass and, for a fetch, the shadow read pixel-locally instead of the depth.
+  bool depthTileDraw(const OpDraw& d, const vpgpu::Draw& base, vpgpu::Draw& out) {
+    if (!dt.active || !d.pipe) return false;
+    const auto it = dt.uses.find(depthTileKey(d.pipe, subpass));
+    if (it == dt.uses.end()) return false;
+    out = base;
+    out.pipeline = it->second.key;
+    if (it->second.kind != kDepthTileFetch) return true;
+    for (vpgpu::Access& a : out.bindings)
+      if (a.slot == it->second.texSlot && vpgpu::bindKind(a) == vpgpu::BindKind::Texture && !a.pixelLocal) {
+        const vpgpu::StageMask stages = a.stages;
+        a = vpgpu::pixelLocalRead(dt.shadow.texture, dt.shadow.mip, dt.shadow.layer);
+        a.stages = stages;
+        a.slot = uint16_t(it->second.texSlot);
+        break;
+      }
+    out.views.erase(std::remove_if(out.views.begin(), out.views.end(),
+                                   [&](const vpgpu::ViewBinding& v) {
+                                     return v.kind == vpgpu::BindKind::Texture && v.slot == it->second.texSlot;
+                                   }),
+                    out.views.end());
+    return true;
+  }
+
   void draw(const OpDraw& d, size_t opIx) {
     if (!d.ok || !passOpen) {
       skipDraw(d.ok ? SkipReason::Pass : d.reason);
@@ -2049,6 +2275,8 @@ struct Translator {
       rebindLocalReads(rebound);
       base = &rebound;
     }
+    vpgpu::Draw tiled;  // depth in tile (planDepthTile)
+    if (dt.active && depthTileDraw(d, *base, tiled)) base = &tiled;
     // Forced MSAA: the pipeline variant with the pass's sample count (the draws were recorded for a 1x pass).
     vpgpu::Draw forced;
     if (forceN && d.pipe && !d.edsVariant && base == &d.draw) {
@@ -2064,7 +2292,8 @@ struct Translator {
         frame.draw(std::move(dr));
       } else {
         if (eyeScene) noteDepthDraw(dd, *base, d);
-        frame.draw(*base);
+        if (base == &tiled) frame.draw(std::move(tiled));  // (the variant copy is the draw: no second copy)
+        else frame.draw(*base);
       }
       ++st.draws;
       return;

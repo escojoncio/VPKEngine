@@ -262,6 +262,7 @@ private:
     bool depthEmulOwn_ = false;                           // ... added by the lowering (the shader writes no depth)
     int depthBiasInput_ = -1;                             // Builtin::DepthBias input (own depth only)
     int depthSlopeVar_ = -1;                              // max(|dz/dx|, |dz/dy|) of FragCoord.z, taken at the top of main
+    int depthShadowOutput_ = -1;                          // depth in tile: the extra output (SpirvLowerOptions::depthShadowSlot)
     int uiMaskOutput_ = -1;                               // VPKTAA UI mask output (SpirvLowerOptions::uiMaskSlot)
     std::vector<uint32_t> outputShadow_;                  // vpir output index -> variable
     std::map<uint32_t, int> packedColor_;                 // location | index << 8 -> packed colour output
@@ -2045,6 +2046,15 @@ private:
             iface_.colorOutputs |= uint8_t(1u << o_.uiMaskSlot);
             uiMaskOutput_ = addOutput(v);
         }
+        if (stage_ == vpir::Stage::Fragment && o_.depthShadowSlot >= 0) {
+            for (const vpir::IoVar& o : out_.outputs)
+                if (o.builtin == vpir::Builtin::None && o.location == uint32_t(o_.depthShadowSlot))
+                    fail("depth shadow slot " + std::to_string(o_.depthShadowSlot) + " is a shader output");
+            vpir::IoVar v;
+            v.type = vpir::kF32, v.location = uint32_t(o_.depthShadowSlot), v.name = "depthshadow";
+            iface_.colorOutputs |= uint8_t(1u << o_.depthShadowSlot);
+            depthShadowOutput_ = addOutput(v);
+        }
         if (stage_ == vpir::Stage::Fragment && o_.sampleMask != ~0u) {
             for (size_t i = 0; i < out_.outputs.size(); ++i)
                 if (out_.outputs[i].builtin == vpir::Builtin::SampleMask) sampleMaskOutput_ = int(i);
@@ -2128,6 +2138,13 @@ private:
             }
         return f32(1.0f);
     }
+    // The depth this invocation writes to the depth buffer (depth in tile): the shader's FragDepth output, else FragCoord.z.
+    ValueId depthShadowValue() {
+        for (size_t k = 0; k < out_.outputs.size(); ++k)
+            if (out_.outputs[k].builtin == vpir::Builtin::FragDepth)  // (the depth buffer holds it clamped to [0, 1])
+                return un(Op::Saturate, loadVar(outputShadow_[k]), vpir::kF32);
+        return ext(positionInput(), 2);
+    }
     // Alpha-to-coverage at 1x (SpirvLowerOptions::alphaTest): coverage becomes alpha >= 0.5.
     void alphaTestDiscard() {
         out_.earlyFragmentTests = false;  // Metal still writes depth for fragments discarded under early tests
@@ -2177,6 +2194,7 @@ private:
             if (int(i) == viewportOutput_) v = amp_ ? u32(0) : viewIndex();
             if (int(i) == viewOutput_) v = viewIndex();
             if (int(i) == uiMaskOutput_) v = uiMaskValue();
+            if (int(i) == depthShadowOutput_) v = depthShadowValue();
             if (int(i) == depthEmulOutput_) v = d24Depth(v);
             if (int(i) == sampleMaskOutput_) v = sampleMaskOwn_ ? u32(o_.sampleMask) : bin(Op::And, v, u32(o_.sampleMask), vpir::kU32);
             if (auto m = clipMirror_.find(int(i)); m != clipMirror_.end()) v = loadVar(outputShadow_[size_t(m->second)]);

@@ -9,8 +9,8 @@ namespace {
 
 class FetchRewriter {
 public:
-    FetchRewriter(Module& m, const std::map<uint32_t, uint32_t>& att, const std::set<uint32_t>& nearest)
-        : m_(m), att_(att), nearest_(nearest) {}
+    FetchRewriter(Module& m, const std::map<uint32_t, uint32_t>& att, const std::set<uint32_t>& nearest, bool msDepth = false)
+        : m_(m), att_(att), nearest_(nearest), msDepth_(msDepth) {}
 
     std::vector<FetchRejection> run() {
         std::vector<size_t> before = references();
@@ -22,6 +22,13 @@ public:
             changed_ = false;
         }
         dropUnreferenced(before);
+        // The per-sample fetch only reads this invocation's sample if the function runs per sample: the module must take
+        // [[sample_id]] (the emitter declares every builtin input as an entry parameter, used or not).
+        if (msDepth_ && fetched_ && std::none_of(m_.inputs.begin(), m_.inputs.end(), [](const IoVar& v) { return v.builtin == Builtin::SampleId; })) {
+            IoVar v;
+            v.builtin = Builtin::SampleId, v.name = "sample_id", v.type = kU32;
+            m_.inputs.push_back(v);
+        }
         return std::move(rejected_);
     }
 
@@ -33,7 +40,7 @@ private:
         const Resource& r = m_.resources[in.sym];
         auto it = att_.find(r.index);
         if (r.kind != ResourceKind::Texture || it == att_.end()) return;
-        std::string why = check(in, r, it->second);
+        std::string why = msDepth_ ? checkMsDepth(in, r, it->second) : check(in, r, it->second);
         if (!why.empty()) {
             rejected_.push_back({fn_->name, in.result, std::move(why)});
             return;
@@ -46,6 +53,7 @@ private:
         in.result = res;
         in.lits = {it->second};
         changed_ = true;
+        fetched_ = true;
     }
 
     std::string check(const Inst& in, const Resource& r, uint32_t attachment) const {
@@ -66,6 +74,36 @@ private:
         if (!isPixelCentreUv(in.args[0], in.sym)) return "coordinate is not this fragment's pixel centre";
         if (!nearest_.contains(m_.resources[in.sampler].index)) return "sampler is not known to filter nearest";
         return {};
+    }
+
+    // A multisampled input attachment (subpassLoad of a depth image, served from a colour attachment holding its depth): the
+    // fetch of this invocation's own pixel, sample and layer. The sample operand (lod) must be the SampleId builtin, possibly
+    // through convert / bitcast: any other sample is not what the tile holds for this invocation.
+    std::string checkMsDepth(const Inst& in, const Resource& r, uint32_t attachment) const {
+        if (m_.stage != Stage::Fragment) return "framebuffer fetch is fragment-only";
+        if (attachment >= 8) return "attachment index must be 0..7";
+        if (in.op != Op::ImageFetch) return "only image_fetch reads a multisampled input attachment";
+        if (!r.multisample || (r.dim != TexDim::D2 && r.dim != TexDim::D2Array)) return "not a multisampled 2d input attachment";
+        if (in.type != (r.depth ? kF32 : Type(Scalar::F32, 4))) return "the fetch is not an f32 depth value";
+        if (!(in.image & kImageLod) || in.args.size() < 2 || !isSampleId(in.args[1])) return "the sample is not gl_SampleID";
+        if (r.dim == TexDim::D2) return isPixelIndex(in.args[0]) ? std::string() : "coordinate is not this fragment's pixel";
+        const Inst* c = def(in.args[0]);
+        if (!c || c->op != Op::Construct || c->args.size() != 3) return "array coordinate is not (x, y, layer)";
+        for (uint32_t k = 0; k < 2; ++k) {
+            const Inst* e = def(c->args[k]);
+            if (!e || e->op != Op::Extract || e->lits[0] != k || !isPixelIndex(e->args[0])) return "coordinate is not this fragment's pixel";
+        }
+        return {};
+    }
+
+    bool isSampleId(ValueId v) const {
+        const Inst* d = def(v);
+        for (int hop = 0; d && hop < 4; ++hop) {
+            if (d->op == Op::LoadInput) return d->sym < m_.inputs.size() && m_.inputs[d->sym].builtin == Builtin::SampleId;
+            if (d->op != Op::Convert && d->op != Op::Bitcast) return false;
+            d = def(d->args[0]);
+        }
+        return false;
     }
 
     const Inst* def(ValueId v) const {
@@ -171,6 +209,7 @@ private:
     std::unordered_map<ValueId, const Inst*> defs_;
     std::vector<FetchRejection> rejected_;
     bool changed_ = false;
+    bool msDepth_ = false, fetched_ = false;
 };
 
 }  // namespace
@@ -178,6 +217,11 @@ private:
 std::vector<FetchRejection> toFramebufferFetch(Module& module, const std::map<uint32_t, uint32_t>& attachments,
                                                const std::set<uint32_t>& nearestSamplers) {
     return FetchRewriter(module, attachments, nearestSamplers).run();
+}
+
+std::vector<FetchRejection> toDepthFramebufferFetch(Module& module, const std::map<uint32_t, uint32_t>& attachments) {
+    const std::set<uint32_t> none;
+    return FetchRewriter(module, attachments, none, true).run();
 }
 
 }  // namespace vpir

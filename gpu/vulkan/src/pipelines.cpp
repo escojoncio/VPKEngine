@@ -1693,6 +1693,17 @@ TranslateFail lowerAndEmit(const spirv::SpirvModule& m, const spirv::SpirvLowerO
     errors.push_back(std::move(error));
     return TranslateFail::Lower;
   }
+  if (opt.depthFetchSlot >= 0) {  // depth in tile: the input attachment is read from the shadow colour attachment, or the variant fails
+    const std::map<uint32_t, uint32_t> att{{uint32_t(opt.depthFetchTexSlot), uint32_t(opt.depthFetchSlot)}};
+    const auto rejected = vpir::toDepthFramebufferFetch(mod, att);
+    bool left = false;  // the slot's resource is still declared: some use was not a fetch (it would stay in the argument table)
+    for (const vpir::Resource& r : mod.resources)
+      left = left || (r.kind == vpir::ResourceKind::Texture && r.index == uint32_t(opt.depthFetchTexSlot));
+    if (!rejected.empty() || left) {
+      errors.push_back("depth_fetch: " + (rejected.empty() ? std::string("the input attachment has a use other than subpassLoad") : rejected[0].reason));
+      return TranslateFail::Lower;
+    }
+  }
   vpmsl::EmitOptions eo;
   eo.positionalNames = true;  // MSL text independent of absolute slots (precompile == runtime)
   eo.loopGuard = kVulkanLoopGuard;
@@ -1773,7 +1784,8 @@ StageOut translateStage(Device* d, const PipelineObj::StageSrc& src, const Pipel
                         const std::vector<spirv::VertexBufferBinding>& vbs, const std::string& label,
                         uint32_t viewMask = 0, const std::vector<PipelineObj::TexelBinding>* texel = nullptr,
                         uint16_t colorIntKinds = 0, int uiMaskSlot = -1, bool uiMaskAlpha = false, bool a2cTest = false,
-                        uint32_t sampleMask = ~0u, bool d24Emul = false) {
+                        uint32_t sampleMask = ~0u, bool d24Emul = false, int depthShadowSlot = -1, int depthFetchSlot = -1,
+                        int depthFetchTexSlot = -1) {
   StageOut o;
   if (!src.module) {
     logf("vk.err what=shader pipeline=%s stage=%u error=\"no module\"", label.c_str(), unsigned(src.stage));
@@ -1795,6 +1807,7 @@ StageOut translateStage(Device* d, const PipelineObj::StageSrc& src, const Pipel
     opt.alphaTest = a2cTest;
     opt.sampleMask = sampleMask;
     opt.d24Emul = d24Emul;
+    opt.depthShadowSlot = int8_t(depthShadowSlot), opt.depthFetchSlot = int8_t(depthFetchSlot), opt.depthFetchTexSlot = depthFetchTexSlot;
   }
   // Foveation: multiview stages of exactly two views (rate map layer = view) carry the viewport index / the
   // FragCoord mapping, in every pass they may run in (outside a foveated pass the backend binds an identity map
@@ -2161,7 +2174,7 @@ void finishGraphics(Device* d, PipelineObj* p, std::vector<PipelineObj::StageSrc
   if (!ok) noteTranslateFail(why, p->key.value, st.label);
   p->inputs = inputs;
   // Only texel buffer / stride variants and the VPKTAA UI-mask variants (maskPipelineKey) retranslate.
-  if (p->texel.empty() && !p->dynStride && !taaUiMaskOn()) p->sources.clear();
+  if (p->texel.empty() && !p->dynStride && !taaUiMaskOn() && !p->depthTileSrc) p->sources.clear();
   else p->attrs = std::move(attrs);
   if (ok && p->failOnCompile && !pipelineKnown(d, p->key)) {
     p->compileRequired = true;
@@ -2173,6 +2186,20 @@ void finishGraphics(Device* d, PipelineObj* p, std::vector<PipelineObj::StageSrc
     retainKey(d, *p, p->key);
     d->gpu->pipelines().request(st, p->key, vpgpu::Priority::Visible);
     if (d->recipes) d->recipes->addPipeline(st, inputs);
+  }  // Depth in tile: the variant the pipeline will need (by its subpass) is made here, off the submit thread.
+  if (ok && p->depthTileSrc && !p->sources.empty() && p->layout) {
+    const bool real = std::any_of(p->sources.begin(), p->sources.end(), [](const PipelineObj::StageSrc& x) {
+      return x.stage == VK_SHADER_STAGE_FRAGMENT_BIT && !x.synthetic;
+    });
+    int kind = kDepthTileState, texSlot = -1;
+    if (p->depthTileSub == 0) {
+      if (st.depthTest && st.depthWrite && real && !p->d24Emul) kind = kDepthTileWrite;
+    } else {
+      for (const PipelineObj::Used& u : p->used)
+        if (u.slot.type == VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT) kind = kDepthTileFetch, texSlot = int(u.slot.slot);
+    }
+    vpgpu::PipelineKey k;
+    depthPipelineKey(d, *p, kind, texSlot, k, true, true);
   }
 }
 
@@ -2300,6 +2327,10 @@ PipelineObj* createGraphics(Device* d, const VkGraphicsPipelineCreateInfo& ci) {
   p->dynStride = p->isDynamic(VK_DYNAMIC_STATE_VERTEX_INPUT_BINDING_STRIDE);
   p->d24Emul = d24Emul() && st.depthFormat == vpgpu::Format::D24UnormS8 &&
                (st.depthTest || p->isDynamic(VK_DYNAMIC_STATE_DEPTH_TEST_ENABLE));
+  if (ci.renderPass && depthTileOn()) {
+    p->depthTileSub = depthInputRole(*from<RenderPassObj>(ci.renderPass), ci.subpass);
+    p->depthTileSrc = p->depthTileSub >= 0;
+  }
 
   // Integer colour attachments by signedness (fragment outputs take the attachment's type).
   for (int c = 0; c < vpgpu::kMaxColorAttachments; ++c) {
@@ -3097,6 +3128,85 @@ bool maskPipelineKey(Device* dev, const PipelineObj& p, PipelineObj::TexelVarian
   return true;
 }
 
+bool depthInputPass(const RenderPassObj& rp) {
+  for (uint32_t s = 0; s < rp.subpasses.size(); ++s)
+    if (depthInputRole(rp, s) >= 0) return true;
+  return false;
+}
+
+int8_t depthInputRole(const RenderPassObj& rp, uint32_t subpass) {
+  if (subpass >= rp.subpasses.size()) return -1;
+  auto msDepth = [&](uint32_t a) {
+    return a < rp.attachments.size() && rp.attachments[a].samples >= VK_SAMPLE_COUNT_2_BIT &&
+           vpgpu::formatInfo(toCoreFormat(rp.attachments[a].format)).depth();
+  };
+  auto readByOther = [&](uint32_t a) {
+    for (uint32_t t = 0; t < rp.subpasses.size(); ++t)
+      if (t != subpass)
+        for (const VkAttachmentReference2& r : rp.subpasses[t].inputs)
+          if (r.attachment == a) return true;
+    return false;
+  };
+  const RenderPassObj::Subpass& sp = rp.subpasses[subpass];
+  for (const VkAttachmentReference2& r : sp.inputs)
+    if (msDepth(r.attachment))
+      for (uint32_t t = 0; t < rp.subpasses.size(); ++t)
+        if (t != subpass && rp.subpasses[t].hasDepth && rp.subpasses[t].depth.attachment == r.attachment) return 1;
+  if (sp.hasDepth && msDepth(sp.depth.attachment) && readByOther(sp.depth.attachment)) return 0;
+  return -1;
+}
+
+bool depthPipelineKey(Device* dev, const PipelineObj& p, int kind, int texSlot, vpgpu::PipelineKey& out, bool commit, bool atCreate) {
+  if (!dev || p.compute || !p.ok || kind < 0 || kind > kDepthTileState) return false;
+  if (kind != kDepthTileFetch) texSlot = -1;
+  std::unique_lock<std::mutex> lock(p.variantMutex);
+  PipelineObj::DepthVariant* dv = nullptr;
+  for (PipelineObj::DepthVariant& v : p.depthVariants)
+    if (v.kind == kind && v.texSlot == texSlot) dv = &v;
+  if (!dv) {
+    PipelineObj::DepthVariant n;
+    n.kind = uint8_t(kind), n.texSlot = texSlot;
+    n.state = p.state;
+    n.inputs = p.inputs;
+    vpgpu::PipelineState& st = n.state;
+    static const char* const kSuffix[] = {".dtw", ".dtf", ".dts"};
+    st.label += kSuffix[kind];
+    bool translated = kind == kDepthTileState;
+    if (kind != kDepthTileState) {
+      for (const PipelineObj::StageSrc& src : p.sources) {
+        if (src.stage != VK_SHADER_STAGE_FRAGMENT_BIT || src.synthetic) continue;
+        StageOut o = translateStage(dev, src, *p.layout, p.viewCount, p.attrs, p.vertexBuffers, st.label, p.viewMask, nullptr,
+                                    p.colorIntKinds, -1, false, p.a2cTest, p.sampleMask, p.d24Emul,
+                                    kind == kDepthTileWrite ? kDepthTileSlot : -1, kind == kDepthTileFetch ? kDepthTileSlot : -1, texSlot);
+        if (o.ok) st.fragmentShader = o.id, n.inputs[1] = o.input, translated = true;
+        break;
+      }
+    }
+    if (translated) {  // (a failed translation is logged by translateStage and remembered: not ok)
+      st.colorFormats[kDepthTileSlot] = vpgpu::Format::R32Float;
+      vpgpu::BlendState& b = st.blend[kDepthTileSlot];
+      b = vpgpu::BlendState{};
+      b.writeMask = kind == kDepthTileWrite && p.state.depthWrite ? 1 : 0;
+      if (kind == kDepthTileFetch) st.fetch.mask = uint8_t(1u << kDepthTileSlot), st.fetch.textureSlot[kDepthTileSlot] = uint16_t(texSlot);
+      n.ok = true;
+      n.key = st.key();
+    }
+    p.depthVariants.push_back(std::move(n));
+    dv = &p.depthVariants.back();
+  }
+  if (!dv->ok) return false;
+  out = dv->key;
+  if (commit && !dv->committed) {
+    dv->committed = true;
+    static std::atomic<unsigned> cnt{0};
+    if (cnt.fetch_add(1) < 12) logf("gpu.pass.fuse depth_tile pipeline_variant pipeline=%s kind=%d", dv->state.label.c_str(), kind);
+    retainKey(dev, p, dv->key);
+    dev->gpu->pipelines().request(dv->state, dv->key, atCreate ? vpgpu::Priority::Visible : vpgpu::Priority::Blocking);
+    if (dev->recipes) dev->recipes->addPipeline(dv->state, dv->inputs);
+    if (!atCreate && !dev->translator) dev->uiMask.freshVariants.push_back(dv->key);
+  }
+  return true;
+}
 void awaitFreshVariants(Device* dev) {
   if (!dev || dev->uiMask.freshVariants.empty()) return;
   static const uint32_t budget = waitBudgetMs("VPVK_PIPELINE_DRAW_WAIT_MS", 2000);

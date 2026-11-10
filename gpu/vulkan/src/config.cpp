@@ -546,6 +546,15 @@ bool gameMsaaAuto() {
   return gameMsaaAutoLive();
 }
 
+bool depthTileOn() {
+  static const bool on = [] {
+    const char* e = getenv("VPVK_DEPTH_TILE");
+    const char* strict = getenv("VPVK_MSAA_STRICT");  // umbrella: every path that keeps MSAA on tile at a cost (=0: the behaviour before them)
+    return !(e && e[0] == '0') && !(strict && strict[0] == '0');
+  }();
+  return on;
+}
+
 bool d24Emul() {
   static const bool on = [] {
     const char* e = getenv("VPVK_D24_EMUL");

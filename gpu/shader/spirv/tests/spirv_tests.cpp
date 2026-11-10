@@ -1279,6 +1279,56 @@ void sampleMask(const std::string& dir) {
 // D24 emulation (SpirvLowerOptions::d24Emul): the fragment shader writes its depth rounded to 24 bits UNORM. solid.frag writes none: it
 // gets [[depth(any)]] = FragCoord.z + the draw's bias (vp_dbias), rounded; depth_write.frag writes 0.001: the value is rounded, no bias.
 // Without the option the MSL is exactly what it was (no depth output, no bias parameter).
+// Depth in tile (VPVK_DEPTH_TILE): the writer's extra float output at [[color(6)]] holding the depth it writes (FragDepth, else the
+// fragment's own), and the reader's multisampled depth input attachment turned into a per-sample fetch of that colour slot.
+void depthTile(const std::string& dir) {
+    spirv::SpirvLowerOptions o;
+    o.entry = "main";
+    o.stage = vpir::Stage::Fragment;
+    for (const char* name : {"/solid.frag.spv", "/depth_write.frag.spv"}) {
+        Result off = run(dir + name, o);
+        Result off2 = run(dir + name, o);
+        CHECK(off.ok && off2.ok && off.msl.source == off2.msl.source);
+        CHECK(off.msl.source.find("[[color(6)]]") == std::string::npos);
+        spirv::SpirvLowerOptions w = o;
+        w.depthShadowSlot = 6;
+        Result on = run(dir + name, w);
+        CHECK(on.ok);
+        if (!on.ok) continue;
+        CHECK(on.msl.source.find("[[color(6)]]") != std::string::npos);
+        CHECK((on.msl.colorOutputs & 0x40) && (on.iface.colorOutputs & 0x40));
+        CHECK(on.msl.colorOutputs == (off.msl.colorOutputs | 0x40));
+        CHECK(on.msl.source != off.msl.source);
+        w.depthShadowSlot = 0;  // collides with the shader's own colour 0
+        CHECK(!run(dir + name, w).ok);
+        if (failures || std::getenv("VP_PRINT")) std::fprintf(stderr, "---- %s\n%s\n", name, on.msl.source.c_str());
+    }
+    // The reader: the input attachment is a Texture binding (slot 0) until the fetch rewrite.
+    o.layout = {bind(0, 3, vpgpu::BindKind::Texture, 0)};
+    Result r = run(dir + "/tile/depth_input.frag.spv", o);
+    CHECK(r.ok);
+    if (!r.ok) return;
+    CHECK(used(r, 0, 3));
+    CHECK(r.msl.source.find("[[color(6)]]") == std::string::npos);
+    const auto bad = vpir::toDepthFramebufferFetch(r.module, {{5, 6}});  // another texture slot: nothing to rewrite
+    CHECK(bad.empty());
+    vpmsl::EmitResult none = vpmsl::emitMsl(r.module, {});
+    CHECK(none.errors.empty() && none.shader.source == r.msl.source);
+    const auto rej = vpir::toDepthFramebufferFetch(r.module, {{0, 6}});
+    for (auto& x : rej) std::fprintf(stderr, "  depth fetch rejected: %s\n", x.reason.c_str());
+    CHECK(rej.empty());
+    for (const vpir::Resource& res : r.module.resources) CHECK(!(res.kind == vpir::ResourceKind::Texture && res.index == 0));
+    CHECK(vpir::verify(r.module).empty());
+    vpmsl::EmitResult e = vpmsl::emitMsl(r.module, {});
+    CHECK(e.errors.empty());
+    if (e.errors.empty()) {
+        CHECK(e.shader.source.find("[[color(6)]]") != std::string::npos);
+        CHECK(e.shader.source.find("[[sample_id]]") != std::string::npos);  // per-sample shading: the fetch reads this sample
+        CHECK(e.shader.source.find("texture2d_ms") == std::string::npos && e.shader.source.find("read(") == std::string::npos);
+        if (failures || std::getenv("VP_PRINT")) std::fprintf(stderr, "---- fetch\n%s\n", e.shader.source.c_str());
+    }
+}
+
 void d24Emul(const std::string& dir) {
     spirv::SpirvLowerOptions o;
     o.entry = "main";
@@ -2282,6 +2332,7 @@ int main(int argc, char** argv) {
     else if (c == "submask") subgroupMasks(dir);
     else if (c == "sample_mask") sampleMask(dir);
     else if (c == "d24_emul") d24Emul(dir);
+    else if (c == "depth_tile") depthTile(dir);
     else if (c == "ycbcr") ycbcr(dir);
     else if (c == "robust") robust(dir);
     else if (c == "correctness") correctness(dir);

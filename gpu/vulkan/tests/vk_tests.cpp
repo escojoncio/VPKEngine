@@ -5640,6 +5640,279 @@ std::vector<uint32_t> earlyFragmentWords(bool store) {
   return w;
 }
 
+// Depth in tile (VPVK_DEPTH_TILE, commands.cpp planDepthTile): a 2-subpass MSAA pass whose subpass 1 reads the depth subpass 0 writes as
+// an input attachment. The translator adds a transient R32F colour attachment at slot 6 holding the depth, the draws of subpass 0 write
+// it, those of subpass 1 read it pixel-locally, and the frame compiler merges both subpasses into one encoder with no 4x store. Any unmet
+// condition (here a depth that loads, a reader that writes depth) leaves the pass as it was and logs depth_input_in_tile=0 reason=.
+// `mv`: multiview (view mask 0b11, two-layer images: the input attachment is read through the real lowering with the layer = the view);
+// `expectOn` false: the feature is switched off (VPVK_DEPTH_TILE=0 / VPVK_MSAA_STRICT=0): the pass keeps its cut and the log says why.
+void depthTileCase(bool mv, VkFormat depthFormat, bool expectOn) {
+  Ctx c(mv ? std::vector<const char*>{VK_KHR_MULTIVIEW_EXTENSION_NAME} : std::vector<const char*>{});
+  VkDeviceMemory m = alloc(c, 64 << 20, 0);
+  const uint32_t layers = mv ? 2 : 1;
+  VkImage color = image(c, VK_FORMAT_R8G8B8A8_UNORM, 64, layers,
+                        VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT, m, VK_SAMPLE_COUNT_4_BIT);
+  VkImage depth = image(c, depthFormat, 64, layers,
+                        VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT, m, VK_SAMPLE_COUNT_4_BIT);
+  CHECK(color != VK_NULL_HANDLE && depth != VK_NULL_HANDLE);
+  if (color == VK_NULL_HANDLE || depth == VK_NULL_HANDLE) return;
+  auto makeView = [&](VkImage im, VkImageAspectFlags aspect) {
+    VkImageViewCreateInfo vi{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+    vi.image = im;
+    vi.viewType = mv ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : VK_IMAGE_VIEW_TYPE_2D;
+    vi.subresourceRange = {aspect, 0, 1, 0, layers};
+    VkImageView v = VK_NULL_HANDLE;
+    vkCreateImageView(c.dev, &vi, nullptr, &v);
+    return v;
+  };
+  VkImageView views[2] = {makeView(color, VK_IMAGE_ASPECT_COLOR_BIT), makeView(depth, VK_IMAGE_ASPECT_DEPTH_BIT)};
+  auto renderPass = [&](VkAttachmentLoadOp depthLoad) {
+    VkAttachmentDescription att[2]{};
+    att[0].format = VK_FORMAT_R8G8B8A8_UNORM, att[0].samples = VK_SAMPLE_COUNT_4_BIT;
+    att[0].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR, att[0].storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    att[0].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE, att[0].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    att[0].initialLayout = att[0].finalLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    att[1].format = depthFormat, att[1].samples = VK_SAMPLE_COUNT_4_BIT;
+    att[1].loadOp = depthLoad, att[1].storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    att[1].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE, att[1].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    att[1].initialLayout = att[1].finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+    VkAttachmentReference cref{0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
+    VkAttachmentReference dw{1, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL}, dr{1, VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL};
+    VkAttachmentReference in{1, VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL};
+    VkSubpassDescription sp[2]{};
+    sp[0].colorAttachmentCount = 1, sp[0].pColorAttachments = &cref, sp[0].pDepthStencilAttachment = &dw;
+    sp[1].colorAttachmentCount = 1, sp[1].pColorAttachments = &cref, sp[1].pDepthStencilAttachment = &dr;
+    sp[1].inputAttachmentCount = 1, sp[1].pInputAttachments = &in;
+    const uint32_t masks[2] = {0b11, 0b11};
+    VkRenderPassMultiviewCreateInfo mvi{VK_STRUCTURE_TYPE_RENDER_PASS_MULTIVIEW_CREATE_INFO};
+    mvi.subpassCount = 2, mvi.pViewMasks = masks;
+    VkRenderPassCreateInfo rpi{VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO, mv ? &mvi : nullptr};
+    rpi.attachmentCount = 2, rpi.pAttachments = att, rpi.subpassCount = 2, rpi.pSubpasses = sp;
+    VkRenderPass rp = VK_NULL_HANDLE;
+    vkCreateRenderPass(c.dev, &rpi, nullptr, &rp);
+    VkFramebufferCreateInfo fi{VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO};
+    fi.renderPass = rp, fi.attachmentCount = 2, fi.pAttachments = views, fi.width = fi.height = 64, fi.layers = 1;
+    VkFramebuffer fb = VK_NULL_HANDLE;
+    vkCreateFramebuffer(c.dev, &fi, nullptr, &fb);
+    return std::pair<VkRenderPass, VkFramebuffer>(rp, fb);
+  };
+  VkDescriptorSetLayoutBinding sb{3, VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr};
+  VkDescriptorSetLayoutCreateInfo slci{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+  slci.bindingCount = 1, slci.pBindings = &sb;
+  VkDescriptorSetLayout dsl;
+  vkCreateDescriptorSetLayout(c.dev, &slci, nullptr, &dsl);
+  VkPipelineLayoutCreateInfo plain{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO}, withInput{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+  withInput.setLayoutCount = 1, withInput.pSetLayouts = &dsl;
+  VkPipelineLayout plPlain, plInput;
+  vkCreatePipelineLayout(c.dev, &plain, nullptr, &plPlain);
+  vkCreatePipelineLayout(c.dev, &withInput, nullptr, &plInput);
+  VkDescriptorPoolSize psz{VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT, 1};
+  VkDescriptorPoolCreateInfo dpi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+  dpi.maxSets = 1, dpi.poolSizeCount = 1, dpi.pPoolSizes = &psz;
+  VkDescriptorPool dpool;
+  vkCreateDescriptorPool(c.dev, &dpi, nullptr, &dpool);
+  VkDescriptorSetAllocateInfo dai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+  dai.descriptorPool = dpool, dai.descriptorSetCount = 1, dai.pSetLayouts = &dsl;
+  VkDescriptorSet set;
+  vkAllocateDescriptorSets(c.dev, &dai, &set);
+  VkDescriptorImageInfo dii{VK_NULL_HANDLE, views[1], VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL};
+  VkWriteDescriptorSet wds{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+  wds.dstSet = set, wds.dstBinding = 3, wds.descriptorCount = 1, wds.descriptorType = VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT, wds.pImageInfo = &dii;
+  vkUpdateDescriptorSets(c.dev, 1, &wds, 0, nullptr);
+
+  VkShaderModule vs = module(c, "uimask.vert.spv"), fsPlain = module(c, "uimask.frag.spv"), fsInput = module(c, "tile/depth_input.frag.spv");
+  VkPipelineVertexInputStateCreateInfo vis{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+  VkPipelineInputAssemblyStateCreateInfo ias{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
+  ias.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+  VkPipelineRasterizationStateCreateInfo rs{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
+  rs.lineWidth = 1;
+  VkPipelineMultisampleStateCreateInfo ms{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
+  ms.rasterizationSamples = VK_SAMPLE_COUNT_4_BIT;
+  VkViewport vp{0, 0, 64, 64, 0, 1};
+  VkRect2D sc{{0, 0}, {64, 64}};
+  VkPipelineViewportStateCreateInfo vps{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
+  vps.viewportCount = 1, vps.pViewports = &vp, vps.scissorCount = 1, vps.pScissors = &sc;
+  VkPipelineColorBlendAttachmentState cba{};
+  cba.colorWriteMask = 0xF;
+  VkPipelineColorBlendStateCreateInfo cbs{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
+  cbs.attachmentCount = 1, cbs.pAttachments = &cba;
+  auto pipeline = [&](VkRenderPass rp, uint32_t subpass, VkShaderModule fs, VkPipelineLayout layout, bool depthWrite, bool bias = false) {
+    VkPipelineShaderStageCreateInfo stg[2]{{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO},
+                                           {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO}};
+    stg[0].stage = VK_SHADER_STAGE_VERTEX_BIT, stg[0].module = vs, stg[0].pName = "main";
+    stg[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT, stg[1].module = fs, stg[1].pName = "main";
+    VkPipelineDepthStencilStateCreateInfo ds{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
+    ds.depthTestEnable = VK_TRUE, ds.depthWriteEnable = depthWrite, ds.depthCompareOp = VK_COMPARE_OP_GREATER_OR_EQUAL;
+    VkGraphicsPipelineCreateInfo gp{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
+    VkPipelineRasterizationStateCreateInfo rsb = rs;
+    rsb.depthBiasEnable = bias, rsb.depthBiasConstantFactor = 1.0f;
+    gp.stageCount = fs ? 2 : 1, gp.pStages = stg, gp.pVertexInputState = &vis, gp.pInputAssemblyState = &ias;
+    gp.pViewportState = &vps, gp.pRasterizationState = &rsb, gp.pMultisampleState = &ms, gp.pColorBlendState = &cbs;
+    gp.pDepthStencilState = &ds, gp.layout = layout, gp.renderPass = rp, gp.subpass = subpass;
+    VkPipeline p = VK_NULL_HANDLE;
+    CHECK(vkCreateGraphicsPipelines(c.dev, VK_NULL_HANDLE, 1, &gp, nullptr, &p) == VK_SUCCESS);
+    if (const PipelineObj* po = p ? from<PipelineObj>(p) : nullptr)
+      while (!po->resolved.load(std::memory_order_acquire)) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    return p;
+  };
+  VkCommandPoolCreateInfo pi{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+  VkCommandPool pool;
+  vkCreateCommandPool(c.dev, &pi, nullptr, &pool);
+  // Records the pass (subpass 0: one writing draw; subpass 1: one draw without the input, one reading it) and translates it.
+  auto record = [&](VkRenderPass rp, VkFramebuffer fb, VkPipeline p0, VkPipeline p1Plain, VkPipeline p1Input, vpgpu::Frame& frame) {
+    VkCommandBufferAllocateInfo ai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+    ai.commandPool = pool, ai.commandBufferCount = 1;
+    VkCommandBuffer cb;
+    vkAllocateCommandBuffers(c.dev, &ai, &cb);
+    VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    vkBeginCommandBuffer(cb, &bi);
+    VkClearValue clears[2]{};
+    clears[1].depthStencil = {0.0f, 0};
+    VkRenderPassBeginInfo rbi{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
+    rbi.renderPass = rp, rbi.framebuffer = fb, rbi.renderArea = {{0, 0}, {64, 64}}, rbi.clearValueCount = 2, rbi.pClearValues = clears;
+    vkCmdBeginRenderPass(cb, &rbi, VK_SUBPASS_CONTENTS_INLINE);
+    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, p0);
+    vkCmdDraw(cb, 3, 1, 0, 0);
+    vkCmdNextSubpass(cb, VK_SUBPASS_CONTENTS_INLINE);
+    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, p1Plain);
+    vkCmdDraw(cb, 3, 1, 0, 0);
+    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, p1Input);
+    vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, plInput, 0, 1, &set, 0, nullptr);
+    vkCmdDraw(cb, 3, 1, 0, 0);
+    vkCmdEndRenderPass(cb);
+    vkEndCommandBuffer(cb);
+    TranslateStats st;
+    translate(*from<CommandBuffer>(cb)->rec, frame, st, nullptr, nullptr, nullptr, nullptr, from<Device>(c.dev));
+  };
+  auto passes = [](const vpgpu::Frame& f) {
+    std::vector<const vpgpu::RenderPass*> out;
+    for (const auto& cmd : f.commands())
+      if (const auto* rp = std::get_if<vpgpu::RenderPass>(&cmd)) out.push_back(rp);
+    return out;
+  };
+  if (!expectOn) {  // switched off: the pass is what it always was and the log names the switch
+    CHECK(!depthTileOn());
+    auto [rp, fb] = renderPass(VK_ATTACHMENT_LOAD_OP_CLEAR);
+    VkPipeline p0 = pipeline(rp, 0, fsPlain, plPlain, true), p1a = pipeline(rp, 1, fsPlain, plPlain, false),
+               p1b = pipeline(rp, 1, fsInput, plInput, false);
+    CHECK(!from<PipelineObj>(p0)->depthTileSrc && from<PipelineObj>(p0)->depthVariants.empty());
+    vpgpu::Frame frame;
+    const std::string log = captureStderr([&] { record(rp, fb, p0, p1a, p1b, frame); });
+    CHECK(log.find("gpu.pass.fuse src=vk depth_input_in_tile=0 reason=disabled") != std::string::npos);
+    auto ps = passes(frame);
+    CHECK(ps.size() == 2 && !ps[0]->desc.colors[kDepthTileSlot].texture);
+    CHECK(vpgpu::compileFrame(frame, &c.gpu().resources()).encoders.size() == 2);
+    return;
+  }
+  CHECK(depthTileOn());
+  {  // the pass the feature is for
+    auto [rp, fb] = renderPass(VK_ATTACHMENT_LOAD_OP_CLEAR);
+    VkPipeline p0 = pipeline(rp, 0, fsPlain, plPlain, true), p1a = pipeline(rp, 1, fsPlain, plPlain, false),
+               p1b = pipeline(rp, 1, fsInput, plInput, false);
+    const PipelineObj *o0 = from<PipelineObj>(p0), *o1a = from<PipelineObj>(p1a), *o1b = from<PipelineObj>(p1b);
+    CHECK(o0 && o0->ok && o1a && o1a->ok && o1b && o1b->ok);
+    CHECK(o0->depthTileSrc && o1a->depthTileSrc && o1b->depthTileSrc && !o0->sources.empty());
+    vpgpu::Frame frame;
+    const std::string log = captureStderr([&] { record(rp, fb, p0, p1a, p1b, frame); });
+    CHECK(log.find("gpu.pass.fuse src=vk depth_input_in_tile=1 reason=ok") != std::string::npos);
+    CHECK(log.find("draws0=1 draws1=2 fetch_pipes=1") != std::string::npos);
+    if (log.find("depth_input_in_tile=1 reason=ok") == std::string::npos) std::fprintf(stderr, "%s\n", log.c_str());
+    auto ps = passes(frame);
+    CHECK(ps.size() == 2);
+    if (ps.size() == 2) {
+      const vpgpu::Attachment &s0 = ps[0]->desc.colors[kDepthTileSlot], &s1 = ps[1]->desc.colors[kDepthTileSlot];
+      CHECK(s0.texture && s0.texture == s1.texture);
+      CHECK(s0.load == vpgpu::LoadAction::Clear && s0.clear.color[0] == 0.0 && s1.load == vpgpu::LoadAction::Load);
+      CHECK(s1.store == vpgpu::StoreAction::DontCare);
+      vpgpu::TextureDesc td;
+      CHECK(c.gpu().textureDesc(s0.texture, td) && td.format == vpgpu::Format::R32Float && td.samples == 4 && td.transient && !td.persistent);
+      CHECK(ps[0]->draws.size() == 1 && ps[1]->draws.size() == 2);
+      if (ps[0]->draws.size() == 1 && ps[1]->draws.size() == 2) {
+        // Every draw of both subpasses has a variant (colour 6 declared in all of them); the reader reads the shadow instead of the depth.
+        for (const vpgpu::Draw& d : {ps[0]->draws[0], ps[1]->draws[0], ps[1]->draws[1]}) CHECK(d.pipeline.value != 0);
+        CHECK(ps[0]->draws[0].pipeline.value != o0->key.value && ps[1]->draws[0].pipeline.value != o1a->key.value);
+        bool shadowRead = false, depthRead = false;
+        for (const vpgpu::Access& a : ps[1]->draws[1].bindings) {
+          shadowRead = shadowRead || (a.pixelLocal && a.range.index == s0.texture.index);
+          depthRead = depthRead || (!a.pixelLocal && a.range.kind == vpgpu::ResourceRange::Kind::Texture);
+        }
+        CHECK(shadowRead && !depthRead && ps[1]->draws[1].views.empty());
+      }
+      const vpgpu::CompiledFrame cf = vpgpu::compileFrame(frame, &c.gpu().resources());
+      CHECK(cf.encoders.size() == 1);
+      if (cf.encoders.size() == 1) CHECK(cf.encoders[0].passes == 2 && !cf.encoders[0].feedback.texture);
+      CHECK(cf.stats.msaaStoreBytes == 0 && cf.stats.msaaLoadBytes == 0);
+    }
+    // The variants (translated once, found again): write / state for subpass 0's pipeline, state / fetch for subpass 1's.
+    CHECK(o0->depthVariants.size() == 1 && o0->depthVariants[0].kind == kDepthTileWrite && o0->depthVariants[0].ok);
+    CHECK(o1a->depthVariants.size() == 1 && o1a->depthVariants[0].kind == kDepthTileState);
+    CHECK(o1b->depthVariants.size() == 1 && o1b->depthVariants[0].kind == kDepthTileFetch && o1b->depthVariants[0].texSlot >= 0);
+    vpgpu::PipelineKey again;
+    CHECK(depthPipelineKey(from<Device>(c.dev), *o0, kDepthTileWrite, -1, again) && again.value == o0->depthVariants[0].key.value);
+    CHECK(o0->depthVariants.size() == 1);
+  }
+  {  // a depth that loads cannot be mirrored by a colour attachment that starts from nothing: the pass is left alone
+    auto [rp, fb] = renderPass(VK_ATTACHMENT_LOAD_OP_LOAD);
+    VkPipeline p0 = pipeline(rp, 0, fsPlain, plPlain, true), p1a = pipeline(rp, 1, fsPlain, plPlain, false),
+               p1b = pipeline(rp, 1, fsInput, plInput, false);
+    vpgpu::Frame frame;
+    const std::string log = captureStderr([&] { record(rp, fb, p0, p1a, p1b, frame); });
+    CHECK(log.find("gpu.pass.fuse src=vk depth_input_in_tile=0 reason=depth_load") != std::string::npos);
+    auto ps = passes(frame);
+    CHECK(ps.size() == 2 && !ps[0]->desc.colors[kDepthTileSlot].texture && !ps[1]->desc.colors[kDepthTileSlot].texture);
+    CHECK(vpgpu::compileFrame(frame, &c.gpu().resources()).encoders.size() == 2);  // the cut it always had
+  }
+  {  // a subpass-1 pipeline that writes depth would leave the shadow stale
+    auto [rp, fb] = renderPass(VK_ATTACHMENT_LOAD_OP_CLEAR);
+    VkPipeline p0 = pipeline(rp, 0, fsPlain, plPlain, true), p1a = pipeline(rp, 1, fsPlain, plPlain, true),
+               p1b = pipeline(rp, 1, fsInput, plInput, false);
+    vpgpu::Frame frame;
+    const std::string log = captureStderr([&] { record(rp, fb, p0, p1a, p1b, frame); });
+    CHECK(log.find("depth_input_in_tile=0 reason=reader_writes_depth") != std::string::npos);
+    auto ps = passes(frame);
+    CHECK(ps.size() == 2 && !ps[0]->desc.colors[kDepthTileSlot].texture);
+  }
+  {  // a writer with depth bias: the shadow would not carry the bias
+    auto [rp, fb] = renderPass(VK_ATTACHMENT_LOAD_OP_CLEAR);
+    VkPipeline p0 = pipeline(rp, 0, fsPlain, plPlain, true, true), p1a = pipeline(rp, 1, fsPlain, plPlain, false),
+               p1b = pipeline(rp, 1, fsInput, plInput, false);
+    vpgpu::Frame frame;
+    const std::string log = captureStderr([&] { record(rp, fb, p0, p1a, p1b, frame); });
+    CHECK(log.find("depth_input_in_tile=0 reason=depth_bias") != std::string::npos);
+    CHECK(passes(frame).size() == 2 && !passes(frame)[0]->desc.colors[kDepthTileSlot].texture);
+  }
+  {  // a depth-only writer (no fragment stage) has nothing to write the shadow with
+    auto [rp, fb] = renderPass(VK_ATTACHMENT_LOAD_OP_CLEAR);
+    VkPipeline p0 = pipeline(rp, 0, VK_NULL_HANDLE, plPlain, true), p1a = pipeline(rp, 1, fsPlain, plPlain, false),
+               p1b = pipeline(rp, 1, fsInput, plInput, false);
+    vpgpu::Frame frame;
+    const std::string log = captureStderr([&] { record(rp, fb, p0, p1a, p1b, frame); });
+    CHECK(log.find("depth_input_in_tile=0 reason=depth_only") != std::string::npos);
+    CHECK(passes(frame).size() == 2 && !passes(frame)[0]->desc.colors[kDepthTileSlot].texture);
+  }
+  {  // nobody reads the input: nothing to keep on tile
+    auto [rp, fb] = renderPass(VK_ATTACHMENT_LOAD_OP_CLEAR);
+    VkPipeline p0 = pipeline(rp, 0, fsPlain, plPlain, true), p1a = pipeline(rp, 1, fsPlain, plPlain, false);
+    vpgpu::Frame frame;
+    const std::string log = captureStderr([&] { record(rp, fb, p0, p1a, p1a, frame); });
+    CHECK(log.find("depth_input_in_tile=0 reason=no_reader") != std::string::npos);
+  }
+}
+
+void testDepthTile() {
+  depthTileCase(false, VK_FORMAT_D32_SFLOAT, true);
+  depthTileCase(false, VK_FORMAT_D24_UNORM_S8_UINT, true);  // Into The Radius 2's depth format (held as D32 by Metal; no D24 emulation by default)
+  depthTileCase(true, VK_FORMAT_D32_SFLOAT, true);          // multiview: the real lowering must produce the (x, y, view) fetch or the log says so
+}
+// ctest gpu_vulkan.depth_tile_off / depth_tile_strict_off: VPVK_DEPTH_TILE=0 and VPVK_MSAA_STRICT=0.
+void testDepthTileOff() {
+  if (depthTileOn()) {
+    std::printf("skipped (run with VPVK_DEPTH_TILE=0 or VPVK_MSAA_STRICT=0: ctest gpu_vulkan.depth_tile_off)\n");
+    return;
+  }
+  depthTileCase(false, VK_FORMAT_D32_SFLOAT, false);
+}
+
 // VPVK_D24_EMUL=1 (its own run: d24Emul() is read once per process, ctest gpu_vulkan.d24_emul): a pipeline that tests depth into a
 // D24UnormS8 attachment is translated with SpirvLowerOptions::d24Emul on its fragment stage only (the recipe input carries it and
 // the MSL writes the rounded [[depth(any)]]); the same pipeline over D32Float, and the vertex stage, are untouched.
@@ -7871,6 +8144,49 @@ void testStageKeys() {
       std::filesystem::remove_all(d3, ec);
     }
     CHECK(!d24Emul());  // off unless VPVK_D24_EMUL is set (not in the test environment)
+  }
+
+  // Depth in tile (VPVK_DEPTH_TILE): the shadow output slot and the depth fetch (slot, texture slot) are part of the stage input
+  // (other MSL, other key; the default key `h` above is untouched, so no recipe of another game is invalidated), next to the older
+  // flags, and survive the file.
+  {
+    StageInput w = in, f = in, f2 = in, wd = in, fm = in;
+    w.opt.depthShadowSlot = 6;
+    f.opt.depthFetchSlot = 6, f.opt.depthFetchTexSlot = 3;
+    f2.opt.depthFetchSlot = 6, f2.opt.depthFetchTexSlot = 4;
+    wd.opt.depthShadowSlot = 6, wd.opt.d24Emul = true;
+    fm.opt.depthFetchSlot = 6, fm.opt.depthFetchTexSlot = 3, fm.opt.sampleMask = 0x5u;
+    const uint64_t k[] = {h, w.hash(), f.hash(), f2.hash(), wd.hash(), fm.hash()};
+    for (size_t i = 0; i < 6; ++i)
+      for (size_t j = i + 1; j < 6; ++j) CHECK(k[i] != k[j]);
+    StageInput same2 = f;
+    CHECK(same2.hash() == f.hash());
+    char t4[] = "/tmp/vpvk_keys4_XXXXXX";
+    const char* d4 = mkdtemp(t4);
+    CHECK(d4 != nullptr);
+    if (d4) {
+      {
+        RecipeStore s(d4);
+        ShaderBlob b;
+        b.source = "// msl";
+        StageIface fi;
+        s.addStage(w, w.hash(), cull, 0x41, b, &fi);
+        s.addStage(f, f.hash(), cull, 0x42, b, &fi);
+        s.addStage(fm, fm.hash(), cull, 0x43, b, &fi);
+        s.addStage(in, h, cull, 0x44, b, &fi);
+      }
+      RecipeStore s(d4);
+      int shadows = 0, fetches = 0, plain = 0, masked2 = 0;
+      for (const StageInput& si : s.stageInputs()) {
+        shadows += si.opt.depthShadowSlot == 6 && si.opt.depthFetchSlot == -1;
+        fetches += si.opt.depthFetchSlot == 6 && si.opt.depthFetchTexSlot == 3 && si.opt.depthShadowSlot == -1;
+        masked2 += si.opt.depthFetchSlot == 6 && si.opt.sampleMask == 0x5u;
+        plain += si.opt.depthShadowSlot == -1 && si.opt.depthFetchSlot == -1 && si.opt.depthFetchTexSlot == -1;
+      }
+      CHECK(s.stageInputs().size() == 4 && shadows == 1 && fetches == 2 && masked2 == 1 && plain == 1);
+      std::filesystem::remove_all(d4, ec);
+    }
+    CHECK(depthTileOn());  // on unless VPVK_DEPTH_TILE=0 (not in the test environment)
   }
 
   // A module without multisample images keeps its key when MSAA forcing is toggled (cache entry reused).
@@ -13791,7 +14107,7 @@ int main(int argc, char** argv) {
       {"timeline", testTimeline}, {"queues", testQueues}, {"timeline_order", testTimelineOrder}, {"pending", testPending}, {"renderpass_ops", testRenderPassOps}, {"linear", testLinear}, {"images", testImages}, {"image_lifetime", testImageLifetime}, {"tex_hist", testTexHist}, {"tex_budget", testTexBudget},
       {"vertex_stores", testVertexStores}, {"profile", testProfile}, {"profile13", testProfile13}, {"quest_extras", testQuestExtras}, {"push_descriptor", testPushDescriptor}, {"report_geom", testReportGeomInterpolators}, {"pipeline_policy", testPipelinePolicy}, {"eds", testExtendedDynamicState},
       {"quest_gpu_name", testQuestGpuName}, {"native_identity", testNativeIdentity}, {"inline_uniform", testInlineUniformBlock}, {"bda", testBufferDeviceAddress}, {"ycbcr", testYcbcr},
-      {"taa_native", testTaaNative}, {"taa_eye_depth", testTaaEyeDepth}, {"taa_uimask", testTaaUiMask}, {"msaa_force", testMsaaForce}, {"d24_emul", testD24Emul}, {"prewarm_variants", testPrewarmVariants}, {"msaa_force_marked", testMsaaForceMarkedEye}, {"aot", testAot}, {"aniso", testAniso}, {"zeroinit", testZeroInit}, {"archive_index", testArchiveIndex}, {"foveation", testFoveation},
+      {"taa_native", testTaaNative}, {"taa_eye_depth", testTaaEyeDepth}, {"taa_uimask", testTaaUiMask}, {"msaa_force", testMsaaForce}, {"depth_tile", testDepthTile}, {"depth_tile_off", testDepthTileOff}, {"d24_emul", testD24Emul}, {"prewarm_variants", testPrewarmVariants}, {"msaa_force_marked", testMsaaForceMarkedEye}, {"aot", testAot}, {"aniso", testAniso}, {"zeroinit", testZeroInit}, {"archive_index", testArchiveIndex}, {"foveation", testFoveation},
       {"stage_keys", testStageKeys}, {"async_pipelines", testAsyncPipelines}, {"sync_pipelines", testSyncPipelines}, {"create_default", testCreateDefault}, {"pso_census", testPsoCensus}, {"cache_state", testCacheState}, {"hide_mesh", testHideMesh}, {"pass_drop", testPassDrop}, {"skip_reasons", testSkipReasons}, {"diag_census", testDiagCensus}, {"indirect_patch", testIndirectPatch}, {"astc3d", testAstc3d},
       {"perf", testPerf}, {"phase1b", testPhase1b}, {"suspend_resume", testSuspendResume}, {"translator_modes", testTranslatorModes}, {"capture", testCapture}, {"capture_images", testCaptureImages}, {"capture_hooks", testCaptureHooks}, {"capture_codec", testCaptureCodec}, {"capture_env", testCaptureEnv}, {"capture_pools", testCapturePools}, {"capture_host_frames", testCaptureHostFrames}, {"capture_corrupt", testCaptureCorrupt}, {"capture_env_host", testCaptureEnvHost}, {"capture_env_dir", testCaptureEnvDir}, {"capture_devices", testCaptureDevices}, {"capture_unhooked", testCaptureUnhooked}, {"capture_budget", testCaptureBudget}, {"capture_locks", testCaptureLocks}, {"png", testPng}, {"imgdiff", testImgDiff}, {"replay", testReplay}, {"replay_lvp", testReplayLvp}, {"refcaps", testRefCaps}};
   bool ran = false;

@@ -98,7 +98,7 @@ int transformed(const char* in, const char* expected, Pass pass) {
 
 // `; fetch-map: SLOT=ATTACHMENT ...`, `; nearest: SLOT ...`, one `; reject: SUBSTRING` per expected
 // rejection (in order). Without EXPECTED the module must come out unchanged.
-int fbfetch(const char* in, const char* expected) {
+int fbfetch(const char* in, const char* expected, bool depth = false) {
     return transformed(in, expected, [&](Module& m, const std::string& text) {
         std::map<uint32_t, uint32_t> att;
         std::set<uint32_t> nearest;
@@ -111,7 +111,7 @@ int fbfetch(const char* in, const char* expected) {
             for (uint32_t slot; ss >> slot;) nearest.insert(slot);
         }
         std::string before = print(m);
-        std::vector<FetchRejection> got = toFramebufferFetch(m, att, nearest);
+        std::vector<FetchRejection> got = depth ? toDepthFramebufferFetch(m, att) : toFramebufferFetch(m, att, nearest);
         std::vector<std::string> want = directives(text, "reject");
         std::string list;
         for (const FetchRejection& j : got) list += j.function + " %" + std::to_string(j.value) + ": " + j.reason + "\n";
@@ -200,7 +200,8 @@ int main(int argc, char** argv) {
     if (argc == 3 && mode == "roundtrip") return roundtrip(argv[2]);
     if (argc == 3 && mode == "reject") return reject(argv[2]);
     if ((argc == 3 || argc == 4) && mode == "fbfetch") return fbfetch(argv[2], argc == 4 ? argv[3] : nullptr);
+    if ((argc == 3 || argc == 4) && mode == "depthfetch") return fbfetch(argv[2], argc == 4 ? argv[3] : nullptr, true);
     if (argc == 4 && mode == "optimize")
         return transformed(argv[2], argv[3], [](Module& m, const std::string&) { return optimize(m), 0; });
-    return fail("usage: vpir_test builder | roundtrip FILE | reject FILE | fbfetch IN [EXPECTED] | optimize IN EXPECTED");
+    return fail("usage: vpir_test builder | roundtrip FILE | reject FILE | fbfetch IN [EXPECTED] | depthfetch IN [EXPECTED] | optimize IN EXPECTED");
 }

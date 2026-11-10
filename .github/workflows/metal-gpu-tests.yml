@@ -1,0 +1,78 @@
+name: Metal GPU tests
+
+# On demand: a manual run (Actions > Metal GPU tests > Run workflow, or `gh workflow run metal-gpu-tests.yml`), or a push to main
+# whose commit message says [build].
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: metal-gpu-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  metal-macos:
+    if: github.event_name == 'workflow_dispatch' || contains(github.event.head_commit.message, '[build]')
+    runs-on: macos-26
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      # First step: does the runner expose a Metal device? Hosted macOS VMs often have none or a paravirtual one; the tests then
+      # skip (ctest SKIP_RETURN_CODE 77) with this notice instead of failing.
+      - name: Probe Metal devices (MTLCopyAllDevices)
+        id: probe
+        shell: bash
+        run: |
+          mkdir -p build/probe
+          cat > build/probe/probe.m <<'OBJC'
+          #import <Metal/Metal.h>
+          #include <stdio.h>
+          int main(void) {
+            @autoreleasepool {
+              NSArray<id<MTLDevice>> *all = MTLCopyAllDevices();
+              id<MTLDevice> def = MTLCreateSystemDefaultDevice();
+              printf("MTLCopyAllDevices: %lu device(s)\n", (unsigned long)all.count);
+              for (id<MTLDevice> d in all)
+                printf("  %s lowPower=%d unifiedMemory=%d apple7=%d\n", d.name.UTF8String, (int)d.isLowPower, (int)d.hasUnifiedMemory,
+                       (int)[d supportsFamily:MTLGPUFamilyApple7]);
+              printf("MTLCreateSystemDefaultDevice: %s\n", def ? def.name.UTF8String : "(none)");
+              return def ? 0 : 3;
+            }
+          }
+          OBJC
+          clang -fobjc-arc -framework Metal -framework Foundation build/probe/probe.m -o build/probe/probe
+          if build/probe/probe; then echo "gpu=1" >> "$GITHUB_OUTPUT"
+          else
+            echo "gpu=0" >> "$GITHUB_OUTPUT"
+            echo "::warning title=No Metal device::the runner exposes no Metal GPU; Metal tests will be skipped, not failed"
+          fi
+      - name: Build (engine, Metal backend and tests)
+        run: |
+          cmake -S gpu -B build/gpu -DCMAKE_BUILD_TYPE=Release
+          cmake --build build/gpu -j4
+      - name: Metal tests (real GPU; skipped with a notice when the runner has none)
+        if: steps.probe.outputs.gpu == '1'
+        run: |
+          cd build/gpu
+          ctest -R 'gpu_metal' --output-on-failure --no-tests=error -V > metal.log 2>&1 || { tail -n 200 metal.log; exit 1; }
+          tail -n 60 metal.log
+          if grep -E "SKIP depth_tile|gpu_metal2.depth_tile.*(Skipped|skipped)" metal.log; then
+            echo "### depth_tile SKIPPED on a runner with a GPU: the fused path was NOT tested" >> "$GITHUB_STEP_SUMMARY"
+            echo "::error title=depth_tile skipped::the runner has a Metal device but gpu_metal2.depth_tile was skipped"
+            exit 1
+          fi
+          echo "### Metal tests ran (depth_tile included)" >> "$GITHUB_STEP_SUMMARY"
+      - name: Linux-portable tests (frame compiler, translator)
+        if: ${{ !cancelled() }}
+        run: cd build/gpu && ctest -j4 --output-on-failure -E 'gpu_metal'
+      - name: Metal tests skipped
+        if: steps.probe.outputs.gpu != '1'
+        run: |
+          echo "SKIPPED gpu_metal*: no Metal device on this runner (see the probe step)"
+          echo "### Metal tests NOT RUN: no Metal device on this runner" >> "$GITHUB_STEP_SUMMARY"

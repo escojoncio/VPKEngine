@@ -854,6 +854,48 @@ void testPassFuse() {
       CHECK(fl[0].find("own_depth_reads") == std::string::npos && fl[0].find("cut_tex") == std::string::npos);
     }
   }
+  {  // depth in tile (vk planDepthTile): the later subpass fetches a transient R32F shadow of the depth at colour slot 6 instead of
+     // sampling the 4x depth: one encoder, no Feedback cut, no 4x store or load, the shadow never reaches memory
+     // Scope: the scheduler's behaviour for this pass shape, built by hand (a guard on the core, which this feature does not change);
+     // the Vulkan side (what the translator emits) is tested by gpu_vulkan.depth_tile, which does fail with VPVK_DEPTH_TILE=0.
+    TextureDesc d;
+    d.format = Format::R32Float;
+    d.width = d.height = 256;
+    d.samples = 4;
+    d.usage = usage::colorTarget;
+    d.transient = true;
+    const TextureId shadow = s.res.createTexture(d);
+    RenderPassDesc w0 = sub0;
+    w0.colors[6].texture = shadow;
+    w0.colors[6].load = LoadAction::Clear;
+    w0.colors[6].store = StoreAction::Store;
+    RenderPassDesc w1 = sub1;
+    w1.colors[6].texture = shadow;
+    w1.colors[6].load = LoadAction::Load;
+    w1.colors[6].store = StoreAction::DontCare;
+    Frame g;
+    Scene::passWithDraw(g, w0);
+    Scene::passWithDraw(g, w1, {pixelLocalRead(shadow)});
+    const CompiledFrame cg = compileFrame(g, &s.res);
+    CHECK_EQ(cg.encoders.size(), size_t{1});
+    if (cg.encoders.size() == 1) {
+      CHECK_EQ(cg.encoders[0].passes, 2u);
+      CHECK(!cg.encoders[0].feedback.texture);
+      CHECK(cg.encoders[0].pass.depth.store == StoreAction::Resolve && cg.encoders[0].pass.depth.depthResolve == ResolveMode::Max);
+      CHECK(cg.encoders[0].pass.colors[6].store == StoreAction::DontCare);
+      CHECK(cg.encoders[0].tileLocal(6));
+    }
+    CHECK_EQ(cg.stats.msaaLoadBytes, uint64_t{0});
+    CHECK_EQ(cg.stats.msaaStoreBytes, uint64_t{0});
+    const auto fl = formatPassFuse(4, g, cg, &s.res);
+    CHECK_EQ(fl.size(), size_t{1});
+    if (fl.size() == 1) CHECK(fl[0].find(" passes=2 fused=1 ") != std::string::npos && fl[0].find("cut_tex") == std::string::npos);
+    // Not the shadow but the depth sampled again: the cut is back (what the Vulkan layer falls back to when a condition fails)
+    Frame h;
+    Scene::passWithDraw(h, w0);
+    Scene::passWithDraw(h, w1, {Scene::sample(depth)});
+    CHECK_EQ(compileFrame(h, &s.res).encoders.size(), size_t{2});
+  }
   for (const auto& l : fuse) std::printf("  %s\n", l.c_str());
   for (const auto& l : use) std::printf("  %s\n", l.c_str());
 }

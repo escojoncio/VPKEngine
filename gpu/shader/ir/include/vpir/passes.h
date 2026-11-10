@@ -38,4 +38,11 @@ struct FetchRejection {
 std::vector<FetchRejection> toFramebufferFetch(Module& module, const std::map<uint32_t, uint32_t>& attachments,
                                                const std::set<uint32_t>& nearestSamplers);
 
+// Depth in tile: the same rewrite for multisampled INPUT ATTACHMENTS whose image is a depth image (Apple GPUs read only colour
+// attachments from tile memory, so the driver keeps the depth in a colour attachment of the same render pass, `attachments`: texture
+// slot -> colour index). Rewritten: image_fetch (d2 or d2_array, vec4<f32>) at this fragment's pixel (array: any layer, the
+// invocation's own) whose sample operand is the SampleId builtin; the module then takes SampleId so the function runs per sample.
+// Everything else on a mapped slot is reported and left untouched.
+std::vector<FetchRejection> toDepthFramebufferFetch(Module& module, const std::map<uint32_t, uint32_t>& attachments);
+
 }  // namespace vpir

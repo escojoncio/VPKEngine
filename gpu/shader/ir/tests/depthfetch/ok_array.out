@@ -1,0 +1,12 @@
+module fragment
+
+input frag_pos : vec4<f32> builtin(position)
+input sid : u32 builtin(sample_id)
+input view : u32 builtin(layer)
+output color : vec4<f32> location(0)
+
+func main() {
+  %8 = framebuffer_fetch 6 : f32
+  %99 = construct %8, %8, %8, %8 : vec4<f32>
+  store_output color, %99
+}
