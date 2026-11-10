@@ -255,6 +255,7 @@ struct Renderer::Impl {
         uint64_t fillPath[5] = {}, fillPathBytes[5] = {};                  // none, GPU detile, CPU detile, linear upload, not filled
         uint64_t mirrorCalls = 0, mirrorCopies = 0, mirrorBytes = 0;
         uint64_t depthPartnerDraws = 0, depthPartnerRetroClears = 0;  // depth-only draws that kept their colour target attached / colour clears that became the load action of the open pass
+        uint64_t depthPartnerIdlePasses = 0;  // passes that held a partner and never wrote it
         // Multisampled colour draws the scene's depth cannot hide: no depth test (or Always, or no depth target), a viewport depth
         // range of their own, depth clamp; `sceneLines`: VPKENGINE_PROBE SCENEDRAW lines written (the first 60 of the first two).
         uint64_t sceneDrawsUntested = 0, sceneDrawsZRange = 0, sceneDrawsClamped = 0, sceneLines = 0;
@@ -4911,6 +4912,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         }
         if (Target* c = ct) {
             routed(ProbeStats::kCmpColorTarget, *c);
+            if (c->wid == partnerWid) partnerSampled = true;
             if (ownSize && (c->width != desc.width || c->height != desc.height)) {
                 const uint32_t wid = c->wid;
                 if (const TexRef m = mirrorTarget(desc, wid, false, msaaImage(desc), f); m.id) return m;
@@ -5800,14 +5802,27 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
     uint8_t passWritten = 0;          // colour slots its draws have written (a bit each)
     // A depth-only draw on a depth target keeps the colour target the draws that read that depth wrote attached (unwritten): the passes
     // around it are one pass, not a store and a reload of the colour (of every sample, when multisampled). By depth read address.
-    // VPKENGINE_DEPTH_ONLY_SPLIT=1: split as before.
+    // VPKENGINE_DEPTH_ONLY_SPLIT=1: split as before. By depth read address and host samples (a one-sample pass over a multisampled depth
+    // has a partner of its own). A pass that holds the partner without writing it (it stores the whole colour for nothing) counts as
+    // idle; after two in a row the partner is not attached for kPartnerPause frames.
     struct DepthPartner {
         unsigned slot;
         ColorTarget c;
         uint8_t samples;
         uint64_t frame;
+        TextureId id;  // what the draw that learned it wrote (latestColor)
+        uint8_t idle = 0;
+        uint64_t pausedUntil = 0;  // (frame)
     };
+    static constexpr uint64_t kPartnerPause = 60;
+    static uint64_t partnerKey(uint64_t depthAddress, uint8_t samples) { return depthAddress ^ (uint64_t(samples) << 56); }
     std::unordered_map<uint64_t, DepthPartner> depthPartners;
+    bool passPartner = false;  // the open pass holds a partner (key and slot), see closePass
+    uint64_t passPartnerKey = 0;
+    unsigned passPartnerSlot = 0;
+    uint32_t partnerWid = ~0u;     // the surface the draw being recorded keeps as its partner
+    bool partnerSampled = false;   // ... and one of its bindings reads it
+    bool noPartnerOnce = false;    // the draw is recorded again without it
     bool depthPartnerOff = optedOut("VPKENGINE_DEPTH_ONLY_SPLIT");
     // A one-sample pass that binds a multisampled depth surface (guest samples > 1, colour fragments 1) tests against that surface's
     // single-sample picture instead of a depth of its own that never holds the scene. VPKENGINE_DEPTH_1X_SEPARATE=1: a depth of its own.
@@ -5829,6 +5844,17 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
     // dispatch, a clear, another target, the end of the submit) stores them, and the pass that continues loads them.
     void closePass(const Surface* guestResolved = nullptr) {
         if (passOpen) {
+            if (passPartner) {
+                passPartner = false;
+                if (const auto it = depthPartners.find(passPartnerKey); it != depthPartners.end()) {
+                    if (passWritten >> passPartnerSlot & 1) {
+                        it->second.idle = 0;
+                    } else {
+                        ++pstat.depthPartnerIdlePasses;
+                        if (++it->second.idle >= 2) it->second.pausedUntil = r.frame_ + kPartnerPause, it->second.idle = 1;
+                    }
+                }
+            }
             keepSamplesAtCut(guestResolved);
             frame.endRenderPass();
         }
@@ -5917,6 +5943,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         uint32_t depthWid = 0;
         pendingViews.clear();
         attachedWids.clear();
+        partnerWid = ~0u, partnerSampled = false;
         if (probeOn) probePs = {};
         uint32_t width = 0, height = 0;
         // One sample count for the whole pass (msaa.h): the smallest of the bound surfaces' counts and the
@@ -5959,11 +5986,18 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         unsigned partnerSlot = 8;  // (the slot attached for it, 8 = none)
         bool colourOnTile = false, colourStored = false;  // a multisampled colour attachment keeps its samples on tile / stores them
         uint32_t keepWid = ~0u;                           // the target of colour 0 when it does (and VPKENGINE_MSAA_CUT_SAMPLES_OFF is not 1)
-        if (!depthPartnerOff && zf != vpgpu::Format::Undefined && !std::any_of(fragments.begin(), fragments.end(), [](uint8_t f) { return f != 0; })) {
-            const auto it = depthPartners.find(d.depth.zFormat ? d.depth.zAddress : d.depth.stencilAddress);
-            if (it != depthPartners.end() && it->second.samples == samples && it->second.c.width == d.depth.width && it->second.c.height == d.depth.height &&
-                it->second.c.sliceStart == d.depth.sliceStart && r.frame_ - it->second.frame <= 600)
-                partner = &it->second;
+        uint64_t partnerAt = 0;  // (its key)
+        if (!depthPartnerOff && !noPartnerOnce && zf != vpgpu::Format::Undefined &&
+            !std::any_of(fragments.begin(), fragments.end(), [](uint8_t f) { return f != 0; })) {
+            partnerAt = partnerKey(d.depth.zFormat ? d.depth.zAddress : d.depth.stencilAddress, samples);
+            const auto it = depthPartners.find(partnerAt);
+            if (it != depthPartners.end() && it->second.c.width == d.depth.width && it->second.c.height == d.depth.height &&
+                it->second.c.sliceStart == d.depth.sliceStart && it->second.c.sliceCount == d.depth.sliceCount &&
+                r.frame_ - it->second.frame <= 600 && r.frame_ >= it->second.pausedUntil) {
+                // (still the target of its memory: another one drawn there since is not what the opaque draws write)
+                const auto latest = latestColor.find(it->second.c.address);
+                if (latest != latestColor.end() && latest->second == it->second.id) partner = &it->second;
+            }
         }
         for (unsigned i = 0; i < 8; ++i) {
             const bool unwritten = partner && i == partner->slot;
@@ -6001,6 +6035,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
                 drawnColors.push_back({c.address, t.resolved ? t.resolved : t.render, t.wid});
             } else {
                 partnerSlot = i;
+                partnerWid = t.wid;
             }
             attachedWids.push_back(t.wid);
             desc.colors[i].texture = t.render;
@@ -6434,6 +6469,13 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         draw.views = std::move(pendingViews);
         pendingViews.clear();
         r.cpu_.bindMs += msSince(tBind);
+        if (partnerSampled) {  // a binding reads the colour the draw would keep attached: recorded again without it
+            noPartnerOnce = true;
+            --r.stats_.draws;
+            this->draw(d);
+            noPartnerOnce = false;
+            return;
+        }
 
         // Geometry.
         ps.primitive = toPrimitive(d.primitive);
@@ -6722,7 +6764,10 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         if (cap.user && zf != vpgpu::Format::Undefined)
             capSceneDraw(d, ps, samples, depth1x, colorIds.empty() ? -1 : int(colorIds[0].first), geom ? gsT->id : 0, {sl, stp, sr, sb}, depthWidth, depthHeight);
         for (const auto& entry : colorIds) passWritten |= uint8_t(1u << entry.first);
-        if (partnerSlot < 8) ++pstat.depthPartnerDraws;
+        if (partnerSlot < 8) {
+            ++pstat.depthPartnerDraws;
+            passPartner = true, passPartnerKey = partnerAt, passPartnerSlot = partnerSlot;
+        }
         if (depth1x) ++pstat.depth1xShared;
         if (colourOnTile) ++pstat.msaaColourOnTile;
         if (colourStored) ++pstat.msaaColourStored;
@@ -6753,8 +6798,10 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         if (!depthPartnerOff && zf != vpgpu::Format::Undefined && colorIds.size() == 1) {
             const unsigned slot = colorIds[0].first;
             const ColorTarget& c = d.color[slot];
-            if (c.width == z.width && c.height == z.height && c.sliceStart == z.sliceStart)
-                depthPartners[z.zFormat ? z.zAddress : z.stencilAddress] = {slot, c, samples, r.frame_};
+            if (c.width == z.width && c.height == z.height && c.sliceStart == z.sliceStart) {
+                DepthPartner& e = depthPartners[partnerKey(z.zFormat ? z.zAddress : z.stencilAddress, samples)];  // (keeps its idle count)
+                e.slot = slot, e.c = c, e.samples = samples, e.frame = r.frame_, e.id = drawnColors[0].id;
+            }
         }
         // What the pass wrote: those images now hold the newest bytes of their ranges.
         for (const Drawn& dc : drawnColors) {
@@ -7777,6 +7824,7 @@ void Renderer::publishProbe(uint64_t pictures) {
         C(f, "aligned_copies", ps.alignedCopies), C(f, "aligned_copy_bytes", im.alignedCopyBytes);
         C(f, "buffer_snapshots", ps.bufferSnapshots), C(f, "pointer_snapshots", ps.pointerSnapshots);
         C(f, "depth_partner_draws", ps.depthPartnerDraws), C(f, "depth_partner_retro_clears", ps.depthPartnerRetroClears);
+        C(f, "depth_partner_idle_passes", ps.depthPartnerIdlePasses);
         C(f, "depth_1x_shared", ps.depth1xShared);
         C(f, "repeat_draws", ps.repeatDraws), C(f, "same_program_as_prev_draw", ps.sameProgram), C(f, "same_userdata_as_prev_draw", ps.sameUserdata);
         C(f, "same_targets_as_prev_draw", ps.sameTargets), C(f, "same_state_as_prev_draw", ps.sameState), C(f, "same_all_as_prev_draw", ps.sameAll);
