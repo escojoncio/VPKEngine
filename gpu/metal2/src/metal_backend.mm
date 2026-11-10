@@ -52,6 +52,7 @@
 #include "vpgpu/core/perf.h"
 #include "vpgpu/core/probe.h"
 #include "vpgpu/core/pipeline_cache.h"
+#include "vpgpu/core/pso_fail.h"
 #include "vpgpu/core/scoped_pool.h"
 
 namespace vpgpu::metal2 {
@@ -1080,6 +1081,7 @@ struct MetalBackend::Impl {
   std::atomic<uint32_t> archiveAdded{0}, archiveSkipDepth{0}, archiveSkipOther{0}, archiveDup{0};
   std::atomic<uint32_t> archiveSerialized{0}, archiveSpilled{0}, archivePendingN{0}, archiveTrimDropped{0};
   std::atomic<uint32_t> psoFailLogged{0};  // vk.pso.fail lines written (capped at 64)
+  PsoFailLog psoFail;  // PSOFAIL lines and FAILED.metal files (probe on): the whole error text, capped
   NSArray<id<MTLBinaryArchive>>* archivesFor(uint64_t key) const {
     const auto it = keyFile.find(key);
     if (it != keyFile.end()) return keyedArchives[it->second];
@@ -8016,6 +8018,22 @@ bool MetalBackend::compilePipeline(const PipelineState& s, std::string& error) {
         char key[24];
         std::snprintf(key, sizeof key, "%016llx", (unsigned long long)s.key().value);
         impl_->info("vk.pso.fail reason=metal:" + why + " key=" + key);
+      }
+      if (probe::enabled()) {  // Modo diagnostico: the error text in full (gpu.err above is cut at 512 bytes) and the MSL that failed
+        const uint64_t cs = s.computeShader, vs = cs ? 0 : s.vertexShader, fs = cs ? 0 : s.fragmentShader;
+        const std::vector<std::string> lines = impl_->psoFail.note(s.key().value, s.label, vs, fs, cs, error);
+        for (const std::string& line : lines) impl_->info(line);
+        const char* dir = std::getenv("SHADPS4_PROBE_DIR");
+        if (!lines.empty() && dir && *dir) {  // (only for a failure just reported: the cap of distinct errors bounds the files)
+          const std::pair<uint64_t, const char*> stages[3] = {{vs, "vs"}, {fs, "ps"}, {cs, "cs"}};
+          for (const auto& st : stages) {
+            MslShader msl;
+            const bool found = st.first && ((s.fetch.mask && st.first == fs) ? impl_->shaders.findFetch(st.first, s.fetch, msl)
+                                                                              : impl_->shaders.find(st.first, msl));
+            if (!found) continue;
+            impl_->psoFail.writeMsl(dir, st.first, st.second, msl.source);  // shader-<id>-<stage>-FAILED.metal (ids as in the PSOFAIL line)
+          }
+        }
       }
       return false;
     }

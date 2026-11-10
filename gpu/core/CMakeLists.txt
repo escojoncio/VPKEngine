@@ -8,6 +8,7 @@ add_library(vpgpu_core STATIC
   src/label_queue.cpp
   src/device.cpp
   src/probe.cpp
+  src/pso_fail.cpp
   src/background.cpp)
 target_include_directories(vpgpu_core PUBLIC include)
 target_compile_features(vpgpu_core PUBLIC cxx_std_20)
@@ -36,7 +37,7 @@ if(BUILD_TESTING OR NOT DEFINED BUILD_TESTING)
     add_test(NAME gpu_probe.${t} COMMAND vpgpu_probe_tests ${t})
   endforeach()
   # One CTest entry per test case so failures are reported by name.
-  foreach(t resources commands merge copies hazards clearbarrier subresources cuts diagnostics pipelines device tile bindings astro fuzz copyrects bigframe rectenv mipchain deadstore rtmemory scopedpool background viewsplit tilehot submit hoist hold label_queue defaults locks parallel nullrun activity harvest automsaa required_dispatch gpuchain fold_equal label_span frameopt dispatch_hoist barrier_order)
+  foreach(t resources commands merge copies hazards clearbarrier subresources cuts diagnostics pipelines device tile bindings astro fuzz copyrects bigframe rectenv mipchain deadstore rtmemory scopedpool background viewsplit tilehot submit hoist hold label_queue defaults locks parallel nullrun activity harvest automsaa required_dispatch gpuchain fold_equal label_span frameopt dispatch_hoist barrier_order pso_fail)
     add_test(NAME gpu_core.${t} COMMAND vpgpu_core_tests ${t})
   endforeach()
 endif()

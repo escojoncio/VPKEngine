@@ -23,6 +23,7 @@
 #include "vpgpu/core/background.h"
 #include "vpgpu/core/device.h"
 #include "vpgpu/core/perf.h"
+#include "vpgpu/core/pso_fail.h"
 #include "vpgpu/core/label_queue.h"
 #include "vpgpu/core/submit_policy.h"
 #include "vpgpu/core/scoped_pool.h"
@@ -4852,6 +4853,79 @@ void testLabelSpan() {
   }
 }
 
+// PsoFailLog (probe on: why a pipeline failed): the whole error text in capped, one-line pieces with the shader ids, at most
+// kMaxErrors distinct failures, and the MSL of the shaders in <dir>/shader-<id>-<stage>-FAILED.metal.
+void testPsoFail() {
+  PsoFailLog log;
+  const std::string err = "msl compile: program_source:7:3: error: use of undeclared identifier 'x'\n  x = 1;\n  ^\n";
+  auto lines = log.note(0xAB, "my pso", 0x11, 0x22, 0, err);
+  CHECK_EQ(lines.size(), size_t{1});
+  CHECK(lines[0].rfind("VPKENGINE_PROBE PSOFAIL n=1 part=1/1 key=00000000000000ab label=my_pso vs=0000000000000011 ps=0000000000000022 cs=0000000000000000 ", 0) == 0);
+  CHECK(lines[0].find(" len=" + std::to_string(err.size()) + " trunc=0 error=msl compile: program_source:7:3: error: use of undeclared identifier 'x'\\n  x = 1;\\n  ^\\n") != std::string::npos);
+  CHECK(lines[0].find('\n') == std::string::npos);
+  CHECK(log.note(0xAC, "other label", 0x11, 0x22, 0, err).empty());  // same text and shaders: reported once
+  CHECK_EQ(log.note(0xAC, "x", 0x11, 0x23, 0, err).size(), size_t{1});  // another shader: new
+  CHECK_EQ(log.reported(), 2u);
+
+  {  // a long text is cut at kMaxErrorBytes and split in lines of at most kPartBytes of text, in order
+    PsoFailLog big;
+    const std::string text(10000, 'a');
+    const auto parts = big.note(1, "l", 1, 2, 0, text);
+    CHECK_EQ(parts.size(), (PsoFailLog::kMaxErrorBytes + PsoFailLog::kPartBytes - 1) / PsoFailLog::kPartBytes);
+    size_t total = 0;
+    for (size_t i = 0; i < parts.size(); ++i) {
+      CHECK(parts[i].find(" part=" + std::to_string(i + 1) + "/" + std::to_string(parts.size()) + " ") != std::string::npos);
+      CHECK(parts[i].find(" len=10000 trunc=1 error=") != std::string::npos);
+      total += parts[i].size() - parts[i].find(" error=") - 7;
+      CHECK(parts[i].size() < 2000);
+    }
+    CHECK_EQ(total, PsoFailLog::kMaxErrorBytes);
+    // never inside a UTF-8 sequence
+    PsoFailLog u;
+    std::string utf = "a";
+    for (int i = 0; i < 700; ++i) utf += "\xC3\xA9";  // 1401 bytes: the cut at 1000 falls inside a character
+    const auto up = u.note(1, "l", 1, 0, 0, utf);
+    CHECK_EQ(up.size(), size_t{2});
+    for (const std::string& l : up) {
+      const std::string text = l.substr(l.find(" error=") + 7);
+      CHECK((static_cast<unsigned char>(text[0]) & 0xC0) != 0x80);
+    }
+    PsoFailLog empty;
+    CHECK_EQ(empty.note(1, "l", 1, 0, 0, "").size(), size_t{1});
+  }
+  {  // 32 distinct failures per session, then nothing (not even the ones seen before)
+    PsoFailLog cap;
+    unsigned got = 0;
+    for (unsigned i = 0; i < 100; ++i) got += cap.note(i, "l", 1, 0, 0, "error " + std::to_string(i)).size();
+    CHECK_EQ(got, PsoFailLog::kMaxErrors);
+    CHECK_EQ(cap.reported(), PsoFailLog::kMaxErrors);
+    CHECK(cap.note(500, "l", 1, 0, 0, "error 3").empty());
+  }
+  {  // the MSL of the failed shaders: one file per (id, stage), under a total budget
+    const std::filesystem::path dir = std::filesystem::temp_directory_path() / "vpgpu_psofail_test";
+    std::filesystem::remove_all(dir);
+    std::filesystem::create_directories(dir);
+    PsoFailLog w;
+    CHECK(w.writeMsl("", 0x11, "vs", "x").empty());           // no dir
+    CHECK(w.writeMsl(dir.string(), 0, "vs", "x").empty());     // no shader
+    CHECK(w.writeMsl(dir.string(), 0x11, "vs", "").empty());   // no text
+    CHECK(w.writeMsl(dir.string(), 0x11, "vs", "vertex void f() {}") == "shader-0000000000000011-vs-FAILED.metal");
+    CHECK(w.writeMsl(dir.string(), 0x11, "vs", "again").empty());  // once
+    CHECK(w.writeMsl(dir.string(), 0x11, "ps", "fragment void g() {}") == "shader-0000000000000011-ps-FAILED.metal");
+    FILE* fp = std::fopen((dir / "shader-0000000000000011-vs-FAILED.metal").string().c_str(), "rb");
+    CHECK(fp != nullptr);
+    if (fp) {
+      char b[64] = {};
+      const size_t n = std::fread(b, 1, sizeof b - 1, fp);
+      std::fclose(fp);
+      CHECK(std::string(b, n) == "vertex void f() {}");
+    }
+    CHECK(w.writeMsl(dir.string(), 0x12, "cs", std::string(PsoFailLog::kMaxFileBytes, 'm')).empty());  // over the budget
+    CHECK(w.writeMsl((dir / "missing").string(), 0x13, "cs", "x").empty());                          // unwritable
+    std::filesystem::remove_all(dir);
+  }
+}
+
 int main(int argc, char** argv) {
   const std::vector<std::pair<const char*, std::function<void()>>> groups = {
       {"resources", testResources}, {"commands", testCommands}, {"merge", testMerge},
@@ -4867,7 +4941,7 @@ int main(int argc, char** argv) {
       {"label_queue", testLabelQueue}, {"defaults", testDefaults}, {"locks", testLocks}, {"parallel", testParallel},
       {"nullrun", testNullRun},
       {"automsaa", testAutoMsaa}, {"required_dispatch", testRequiredDispatch}, {"frameopt", testFrameOpt}, {"dispatch_hoist", testDispatchHoist}, {"barrier_order", testBarrierOrder},
-      {"fold_equal", testFoldEqual}, {"label_span", testLabelSpan}};
+      {"fold_equal", testFoldEqual}, {"label_span", testLabelSpan}, {"pso_fail", testPsoFail}};
   bool ran = false;
   for (const auto& [name, fn] : groups) {
     if (argc > 1 && std::strcmp(argv[1], name) != 0) continue;
