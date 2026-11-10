@@ -293,6 +293,9 @@ struct Dispatch {
   // An engine-internal kernel that later draws read the result of (the indirect-argument patch): Device::submit waits for its
   // pipeline whatever the frame hold says, and the backend counts it in the frame's missing pipelines if it still is not there.
   bool required = false;
+  // The kernel reads or writes memory through raw device addresses (buffer device address pointers) that `bindings` do not
+  // list: the frame compiler cannot see what it touches, so it never moves it relative to any other command.
+  bool opaque = false;
 };
 
 // Which part of a depth/stencil texture a buffer<->texture copy moves (Vulkan aspectMask): the

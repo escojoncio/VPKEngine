@@ -3715,6 +3715,9 @@ OpDispatch makeDispatch(Recorder& r, uint32_t x, uint32_t y, uint32_t z) {
   op.dispatch.pipeline = tv ? tv->key : p->key;
   op.dispatch.groups = {x, y, z};
   op.dispatch.label = p->state.label;
+  // With bufferDeviceAddress exposed (extraExtensions) a kernel may reach memory through pointers no descriptor lists: the frame
+  // compiler must not move it relative to other commands (the translator does not tell which pipelines do).
+  op.dispatch.opaque = extraExtensions();
   if (!resolveBindings(r, *p, r.bound.computeSets, op.dispatch.bindings, op.dispatch.views, op.zeroReads)) {
     op.ok = false;
     logSkip("unbound_descriptor", p);

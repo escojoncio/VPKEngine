@@ -362,8 +362,10 @@ AccessList accessesOf(const Command& cmd, bool copyRects, DrawFolder* folder) {
 // Phase 1: decide encoder grouping and command order.
 class Scheduler {
  public:
-  Scheduler(CompiledFrame& out, const ResourceTable* resources, const CompileOptions& options)
-      : out_(out), res_(resources), options_(options) {}
+  // `cmds`, `accesses` and `live` (false: dropped, never scheduled) are the whole frame: dispatch() looks ahead in them.
+  Scheduler(CompiledFrame& out, const ResourceTable* resources, const CompileOptions& options, const std::vector<Command>& cmds,
+            const std::vector<AccessList>& accesses, const std::vector<char>& live)
+      : out_(out), res_(resources), options_(options), cmds_(cmds), accesses_(accesses), live_(live) {}
 
   // `acc` is updated in place: pixel-local reads that cannot be served from the tile lose their
   // attachment tag; they are reported as bad fetches and their draws listed in badDraws.
@@ -456,19 +458,50 @@ class Scheduler {
 
   void dispatch(uint32_t i, AccessList acc) {
     // A dispatch that touches nothing the open render encoder or the copies sunk behind it touch runs ahead of it
-    // (the same test as a copy's), so the passes on either side of it stay one encoder. Its reads, writes and
-    // indirect arguments are all in `acc` (GDS, rings and counters are bindings), so that test is the whole of its
-    // dependencies; one that does conflict ends the encoder as before.
-    if (open_ >= 0 && options_.frameOpt && options_.dispatchHoist && !conflicts(acc, acc_[open_]) &&
-        !conflicts(acc, sunkAcc_))
+    // (the same test as a copy's), so the passes on either side of it stay one encoder. That test only sees what the
+    // dispatch declares in `bindings` (and its indirect buffer): GDS, rings and counters are bindings, but a kernel that
+    // reaches memory by raw device addresses (Dispatch::opaque, e.g. buffer device address pointers) has no ranges to
+    // test, so it never moves. And only when none of the dispatches and copies up to the next pass ends the encoder
+    // anyway (hoistPays): otherwise the encoder splits in two for nothing ([R][C d1 d2 d3] -> [C d1 d2][R][C d3]).
+    if (open_ >= 0 && options_.frameOpt && options_.dispatchHoist && !std::get<Dispatch>(cmds_[i]).opaque &&
+        !conflicts(acc, acc_[open_]) && !conflicts(acc, sunkAcc_) && hoistPays(i))
       return hoist(i, acc, CutReason::ComputeWork);
+    const bool opaque = std::get<Dispatch>(cmds_[i]).opaque;
     closeRender();
     computeWork(i, CutReason::ComputeWork, std::move(acc));
+    if (opaque) opaqueEnc_ = static_cast<int>(out_.encoders.size()) - 1;  // nothing hoists past it (see hoist)
   }
 
   void finish() { closeRender(); }
 
  private:
+  // Hoisting pays only when the next pass can join the open render encoder across the run of dispatches and copies from `i` to
+  // it: no dispatch of the run is opaque or conflicts with the encoder or the copies sunk behind it, no copy is sunk (already
+  // or later: that makes a compute encoder behind the render encoder that the run's dispatches would share, and hoisted they
+  // would be one more encoder), and the next pass has the same targets and meets the other tests of renderPass() for a merge
+  // (an approximation from its descriptor: a pass that renderPass() does join through a framebuffer fetch is not counted).
+  // Otherwise the hoist only moves the dispatch in front of an encoder that closes anyway: the run stays as it was recorded.
+  // Decided once per run: the encoder does not change inside it.
+  bool hoistPays(uint32_t i) {
+    if (!sunk_.empty()) return false;
+    if (i < paysUntil_) return true;
+    uint32_t j = i;
+    for (; j < cmds_.size(); ++j) {
+      if (!live_[j]) continue;
+      if (std::holds_alternative<RenderPass>(cmds_[j])) break;
+      if (conflicts(accesses_[j], acc_[open_]) || conflicts(accesses_[j], sunkAcc_)) return false;
+      if (const auto* d = std::get_if<Dispatch>(&cmds_[j]); d && d->opaque) return false;
+    }
+    if (j == cmds_.size()) return false;
+    const RenderPass& rp = std::get<RenderPass>(cmds_[j]);
+    const RenderPassDesc& open = out_.encoders[open_].pass;
+    if (!open.sameTargets(rp.desc) || resolveClash(open, rp.desc) || clearsExisting(open, rp.desc)) return false;
+    if (conflicts(rp.draws.empty() && !clears(rp.desc) ? resolveWrites(rp.desc) : accesses_[j], acc_[open_])) return false;
+    if (conflicts(accesses_[j], sunkAcc_)) return false;
+    paysUntil_ = j;
+    return true;
+  }
+
   // Puts command `i` (which does not conflict with the open render encoder nor the copies sunk behind it) in the earliest
   // compute encoder before the open one that nothing between conflicts with, else in a new one in front of the open encoder:
   // the work of a whole frame then gathers in a few compute encoders instead of one in front of every render encoder.
@@ -476,7 +509,7 @@ class Scheduler {
     int target = -1;
     for (int e = open_ - 1; e >= 0; --e) {
       if (out_.encoders[e].kind == Encoder::Kind::Compute) target = e;
-      if (conflicts(acc, acc_[e])) break;
+      if (conflicts(acc, acc_[e]) || e == opaqueEnc_) break;  // (an opaque dispatch may touch anything: nothing passes it)
     }
     if (target < 0) target = insertComputeBeforeOpen(reason);
     out_.encoders[target].commands.push_back(i);
@@ -616,6 +649,11 @@ class Scheduler {
   CompiledFrame& out_;
   const ResourceTable* res_;
   const CompileOptions& options_;
+  const std::vector<Command>& cmds_;
+  const std::vector<AccessList>& accesses_;
+  const std::vector<char>& live_;
+  int opaqueEnc_ = -1;            // the last encoder that holds an opaque dispatch
+  uint32_t paysUntil_ = 0;        // dispatches before this command were found to leave the open render encoder open
   std::vector<AccessIndex> acc_;  // parallel to out_.encoders
   int open_ = -1;                 // open render encoder
   std::vector<uint32_t> sunk_;    // copies deferred to right after the open render encoder
@@ -1330,8 +1368,13 @@ bool CompiledFrame::skipped(uint32_t command, uint32_t draw) const {
 // per pair. Items that conflict keep their order (the later one has the higher level), so every resource sees the same writes
 // in the same order. Done only when it saves barriers over a greedy placement in the recorded order (the model: a barrier
 // before an item that conflicts with one since the previous barrier).
-constexpr size_t kMaxLevelItems = 2048;  // the per-resource scan is quadratic in the worst case: bigger encoders keep their order
-void orderComputeByLevel(CompiledFrame& out, const std::vector<AccessList>& accesses) {
+// Only inside a run of consecutive dispatches or a run of consecutive copies: the Metal backend opens a compute or a blit
+// encoder at every change between them, so an item never moves across the other kind. A dispatch with Dispatch::opaque is a run
+// of its own (it may touch anything). Runs of more than kMaxLevelItems items, and runs whose scan needs more than
+// kMaxLevelChecks range comparisons, keep their order: the scan is quadratic in the worst case and compileFrame is on the CP's path.
+constexpr size_t kMaxLevelItems = 256;
+constexpr uint32_t kMaxLevelChecks = 8192;
+void orderComputeByLevel(CompiledFrame& out, const std::vector<Command>& cmds, const std::vector<AccessList>& accesses) {
   struct Rec {
     ResourceRange range;
     uint32_t level, index;
@@ -1339,42 +1382,53 @@ void orderComputeByLevel(CompiledFrame& out, const std::vector<AccessList>& acce
   struct Recs {
     std::vector<Rec> reads, writes;
   };
+  // 0: copy, 1: dispatch, 2: opaque dispatch
+  auto kindOf = [&](uint32_t command) {
+    const auto* d = std::get_if<Dispatch>(&cmds[command]);
+    return !d ? 0 : d->opaque ? 2 : 1;
+  };
   for (Encoder& enc : out.encoders) {
-    const size_t n = enc.commands.size();
-    if (enc.kind != Encoder::Kind::Compute || n < 4 || n > kMaxLevelItems) continue;
-    std::unordered_map<uint64_t, Recs> recs;
-    std::vector<uint32_t> level(n, 0);
-    uint32_t barriers = 0, last = 0, top = 0;
-    for (uint32_t k = 0; k < n; ++k) {
-      const AccessList& acc = accesses[enc.commands[k]];
-      uint32_t lv = 0;
-      int64_t dep = -1;
-      for (const Tagged& t : acc) {
-        if (t.access.range.kind == ResourceRange::Kind::Sampler) continue;
-        const auto it = recs.find(resourceKey(t.access.range));
-        if (it == recs.end()) continue;
-        auto scan = [&](const std::vector<Rec>& list) {
-          for (const Rec& r : list)
-            if (r.range.overlaps(t.access.range)) lv = std::max(lv, r.level + 1), dep = std::max<int64_t>(dep, r.index);
-        };
-        scan(it->second.writes);
-        if (t.access.write) scan(it->second.reads);
+    if (enc.kind != Encoder::Kind::Compute || enc.commands.size() < 4) continue;
+    for (size_t b = 0, e = 0; b < enc.commands.size(); b = e) {
+      const int kind = kindOf(enc.commands[b]);
+      for (e = b + 1; e < enc.commands.size() && kind != 2 && kindOf(enc.commands[e]) == kind; ++e) {}
+      const size_t n = e - b;
+      if (n < 4 || n > kMaxLevelItems) continue;
+      const uint32_t* items = enc.commands.data() + b;
+      std::unordered_map<uint64_t, Recs> recs;
+      std::vector<uint32_t> level(n, 0);
+      uint32_t barriers = 0, last = 0, top = 0, checks = 0;
+      for (uint32_t k = 0; k < n && checks <= kMaxLevelChecks; ++k) {
+        const AccessList& acc = accesses[items[k]];
+        uint32_t lv = 0;
+        int64_t dep = -1;
+        for (const Tagged& t : acc) {
+          if (t.access.range.kind == ResourceRange::Kind::Sampler) continue;
+          const auto it = recs.find(resourceKey(t.access.range));
+          if (it == recs.end()) continue;
+          auto scan = [&](const std::vector<Rec>& list) {
+            checks += static_cast<uint32_t>(list.size());
+            for (const Rec& r : list)
+              if (r.range.overlaps(t.access.range)) lv = std::max(lv, r.level + 1), dep = std::max<int64_t>(dep, r.index);
+          };
+          scan(it->second.writes);
+          if (t.access.write) scan(it->second.reads);
+        }
+        if (dep >= static_cast<int64_t>(last)) ++barriers, last = k;
+        level[k] = lv;
+        top = std::max(top, lv);
+        for (const Tagged& t : acc)
+          if (t.access.range.kind != ResourceRange::Kind::Sampler)
+            (t.access.write ? recs[resourceKey(t.access.range)].writes : recs[resourceKey(t.access.range)].reads)
+                .push_back({t.access.range, lv, k});
       }
-      if (dep >= static_cast<int64_t>(last)) ++barriers, last = k;
-      level[k] = lv;
-      top = std::max(top, lv);
-      for (const Tagged& t : acc)
-        if (t.access.range.kind != ResourceRange::Kind::Sampler)
-          (t.access.write ? recs[resourceKey(t.access.range)].writes : recs[resourceKey(t.access.range)].reads)
-              .push_back({t.access.range, lv, k});
+      if (checks > kMaxLevelChecks || top >= barriers) continue;
+      std::vector<uint32_t> idx(n), sorted(n);
+      for (uint32_t k = 0; k < n; ++k) idx[k] = k;
+      std::stable_sort(idx.begin(), idx.end(), [&](uint32_t x, uint32_t y) { return level[x] < level[y]; });
+      for (uint32_t k = 0; k < n; ++k) sorted[k] = items[idx[k]];
+      std::copy(sorted.begin(), sorted.end(), enc.commands.begin() + b);
     }
-    if (top >= barriers) continue;
-    std::vector<uint32_t> idx(n);
-    for (uint32_t k = 0; k < n; ++k) idx[k] = k;
-    std::stable_sort(idx.begin(), idx.end(), [&](uint32_t a, uint32_t b) { return level[a] < level[b]; });
-    std::vector<uint32_t> sorted(n);
-    for (uint32_t k = 0; k < n; ++k) sorted[k] = enc.commands[idx[k]];
-    enc.commands = std::move(sorted);
   }
 }
 
@@ -1383,7 +1437,7 @@ CompiledFrame compileFrame(const Frame& frame, const ResourceTable* resources, c
   const auto& cmds = frame.commands();
   out.stats.commands = static_cast<uint32_t>(cmds.size());
   std::vector<AccessList> accesses(cmds.size());
-  Scheduler scheduler(out, resources, options);
+  std::vector<char> live(cmds.size(), 1);
   static thread_local DrawFolder folder;
   for (uint32_t i = 0; i < cmds.size(); ++i) {
     accesses[i] = accessesOf(cmds[i], options.copyRects, options.foldFast ? &folder : nullptr);
@@ -1392,15 +1446,19 @@ CompiledFrame compileFrame(const Frame& frame, const ResourceTable* resources, c
       for (const Tagged& t : accesses[i]) ok = ok && alive(t.access.range, *resources);
       if (!ok) {
         ++out.stats.dropped;
-        continue;
+        live[i] = 0;
       }
     }
+  }
+  Scheduler scheduler(out, resources, options, cmds, accesses, live);
+  for (uint32_t i = 0; i < cmds.size(); ++i) {
+    if (!live[i]) continue;
     if (const auto* rp = std::get_if<RenderPass>(&cmds[i])) scheduler.renderPass(i, *rp, accesses[i]);
     else if (std::holds_alternative<Dispatch>(cmds[i])) scheduler.dispatch(i, accesses[i]);
     else scheduler.copy(i, accesses[i]);
   }
   scheduler.finish();
-  if (options.frameOpt && options.barrierOrder) orderComputeByLevel(out, accesses);
+  if (options.frameOpt && options.barrierOrder) orderComputeByLevel(out, cmds, accesses);
   out.stats.splitViews = options.splitViews;
   out.stats.tileMaxVertices = options.tileMaxVertices;
   if (resources) {
