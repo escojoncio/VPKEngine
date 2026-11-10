@@ -230,6 +230,10 @@ struct Renderer::Impl {
         // Multisampled colour draws the scene's depth cannot hide: no depth test (or Always, or no depth target), a viewport depth
         // range of their own, depth clamp; `sceneLines`: VPKENGINE_PROBE SCENEDRAW lines written (the first 60 of the first two).
         uint64_t sceneDrawsUntested = 0, sceneDrawsZRange = 0, sceneDrawsClamped = 0, sceneLines = 0;
+        // Unaligned constant buffers copied on the CPU when their draw was recorded while the GPU was the last writer of their
+        // range (the draw may get the bytes from before that write; the first 20 leave a VPKENGINE_PROBE UNALIGNED_CB_GPU line),
+        // and CLEARPASS lines written (see probeClearPass).
+        uint64_t unalignedCbGpuWritten = 0, clearPassLines = 0;
         uint64_t a2mUnwrittenDraws = 0;  // draws with DB_ALPHA_TO_MASK that write no colour (a prepass: masked by the shader's alpha all the same)
         uint64_t psSampleIdDraws = 0;  // multisampled draws whose pixel shader reads the sample id (run per sample on the host)
         uint64_t depth1xShared = 0;  // one-sample draws that tested against the single-sample picture of a multisampled depth surface (not a depth of their own)
@@ -941,15 +945,22 @@ struct Renderer::Impl {
         while (it != flatReach.end() && it->first <= hi) lo = std::min(lo, it->first), hi = std::max(hi, it->second), it = flatReach.erase(it);
         flatReach[lo] = hi;
     }
+    // (why a V# buffer was not copied by this rule: QUAL buffer_snapshot_no_*; one the cpAccess rule below then copies counts too)
+    uint64_t snapNo[7] = {};  // over kSnapshotBytes, unaligned, flat reach, not read on the CPU, history forgotten, GPU wrote it, label pending
     bool snapshotSafe(uint64_t address, uint64_t size) {
-        if (bufferLive || !size || size > kSnapshotBytes || address % 16 || overlaps(flatReach, false, address, size)) return false;
+        if (bufferLive || !size) return false;
+        if (size > kSnapshotBytes) return ++snapNo[0], false;
+        if (address % 16) return ++snapNo[1], false;
+        if (overlaps(flatReach, false, address, size)) return ++snapNo[2], false;
         // (once the CPU reads are no longer followed, everything counts as read: then only a range the old ranges cover whole does)
         const auto covering = cpuRead.upper_bound(address);
-        if (cpuReadAll ? covering == cpuRead.begin() || std::prev(covering)->second < address + size : !cpuReadSeen(address, size)) return false;
+        if (cpuReadAll ? covering == cpuRead.begin() || std::prev(covering)->second < address + size : !cpuReadSeen(address, size)) return ++snapNo[3], false;
         if (tracker.forgetHistoryCalls() != snapForgets)
             snapForgets = tracker.forgetHistoryCalls(), snapAfter = r.device_.submittedFrames() + 1;
-        if (r.device_.completedFrames() < snapAfter) return false;
-        return !tracker.gpuWritten(address, size) && !(r.device_.labelsQueued() && r.device_.labelPending(address, uint32_t(size)));
+        if (r.device_.completedFrames() < snapAfter) return ++snapNo[4], false;
+        if (tracker.gpuWritten(address, size)) return ++snapNo[5], false;
+        if (r.device_.labelsQueued() && r.device_.labelPending(address, uint32_t(size))) return ++snapNo[6], false;
+        return true;
     }
     // Ranges the command processor writes in order with the draws and had to wait for (Renderer::cpuAccessed: DUMP_CONST_RAM,
     // WRITE_DATA, a small DMA), merged. A read-only buffer bound by a bare pointer into one (no V#: its extent is not known)
@@ -965,11 +976,11 @@ struct Renderer::Impl {
         cpAccess[lo] = hi;
     }
     // (why a pointer inside such a range was still bound in place: QUAL pointer_snapshot_no_*)
-    uint64_t pointerNo[5] = {};  // unaligned, flat reach, history forgotten, GPU wrote it, label pending
+    uint64_t pointerNo[6] = {};  // unaligned, flat reach, history forgotten, GPU wrote it, label pending, not in cpAccess
     bool pointerSnapshotSafe(uint64_t address, uint64_t size) {
-        if (bufferLive || pointerLive || cpAccess.empty() || !size) return false;
+        if (bufferLive || pointerLive || !size) return false;
         const auto it = cpAccess.upper_bound(address);
-        if (it == cpAccess.begin() || std::prev(it)->second <= address) return false;
+        if (it == cpAccess.begin() || std::prev(it)->second <= address) return ++pointerNo[5], false;
         if (address % 16) return ++pointerNo[0], false;
         if (overlaps(flatReach, false, address, size)) return ++pointerNo[1], false;
         if (tracker.forgetHistoryCalls() != snapForgets)
@@ -3034,6 +3045,13 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
     // framecap-<n>-<i>-<kind>-<addr>-<fmt>-<w>x<h>-s<slice>.ppm (<= 768 px wide, capDisk in all: VPKENGINE_FRAMECAP_DISK bytes) for the first capture and for
     // the frame after a capture where a colour target of 512x512 or more has 1 % of its 8x8 tiles at zero (FRAMECAP_PATTERN),
     // at most one such every 30 s.
+    // The user's capture (Renderer::beginSceneCapture, with what is wrong on screen): every frame submitted until
+    // endSceneCapture is captured as above ("n=u<capture>.<frame>"), with pictures at full resolution of the images as big as
+    // a depth target that drew with colour (capUserDisk for each capture: VPKENGINE_SCENECAP_DISK bytes). When such a depth
+    // target is about to be cleared again (the next view: the other eye) the frame is cut first, so each view's images are read
+    // before the next one draws over them. Every draw with a depth target leaves a SCENEDRAW line (written when the capture
+    // ends, for the depth targets that drew with colour: the shadow maps' are left out). A capture the host does not end is
+    // over after kCapUserFrames frames.
     struct FrameCap {
         bool off = false, armed = false, files = false, pattern = false, started = false;
         uint32_t periodFrames = 0;
@@ -3045,6 +3063,16 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         std::vector<std::string> passes;
         std::string pass;
         uint32_t passDraws = 0;
+        // The user's capture: its number while it is on (0: off), captures so far, the frames and draws of this one, the bytes
+        // its pictures took (and those of every capture of the run). The depth targets (Z address) that drew with colour in it,
+        // those of them drawn since they were last read back, their sizes (width << 32 | height), the views started on each
+        // (its Z clears), and the SCENEDRAW lines kept until it ends (depth address, text). `userCut`: its cut of the frame is
+        // being submitted (capNewView).
+        uint64_t user = 0, users = 0, userFrame = 0, userDraws = 0, userDisk = 0, userDiskAll = 0;
+        bool userCut = false;
+        std::unordered_set<uint64_t> userDepths, userDirty, userSizes;
+        std::unordered_map<uint64_t, uint32_t> userViews;
+        std::vector<std::pair<uint64_t, std::string>> userLines;
     };
     static FrameCap makeFrameCap() {
         FrameCap c;
@@ -3059,6 +3087,76 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
     FrameCap cap = makeFrameCap();
     static constexpr uint32_t kCapImages = 24;
     const uint64_t capDisk = std::getenv("VPKENGINE_FRAMECAP_DISK") ? std::strtoull(std::getenv("VPKENGINE_FRAMECAP_DISK"), nullptr, 10) : 200ull << 20;
+    const uint64_t capUserDisk = std::getenv("VPKENGINE_SCENECAP_DISK") ? std::strtoull(std::getenv("VPKENGINE_SCENECAP_DISK"), nullptr, 10) : 384ull << 20;
+    static constexpr uint64_t kCapUserFrames = 32;
+    bool capUserSize(const Surface& s) const { return cap.userSizes.count(uint64_t(s.width) << 32 | s.height) != 0; }
+    // The user's capture: a draw clears the Z plane of `depth`, a new view starts on it. Drawn with colour since it was last read
+    // back: what is recorded goes to the GPU and is read back first, the way the host submits (Hooks::submit: its own
+    // bookkeeping runs). The clears that wait belong to what is drawn next: set aside meanwhile (no image is evicted by that
+    // submit: one of theirs would be gone when they come back).
+    void capNewView(uint64_t depth) {
+        if (cap.userDirty.erase(depth) && !frame.commands().empty()) {
+            std::vector<PendingClear> waiting;
+            waiting.swap(pendingClears);
+            cap.userCut = true;
+            if (r.hooks_.submit) r.hooks_.submit();
+            else r.submit();
+            cap.userCut = false;
+            pendingClears = std::move(waiting);
+        }
+        if (cap.user) ++cap.userViews[depth];  // (the cut may have been its last frame)
+    }
+    // The user's capture ends (the host's call, or kCapUserFrames frames): the SCENEDRAW lines of the depth targets that drew
+    // with colour, then SCENECAP ... end.
+    uint64_t capUserEnd(const char* why) {
+        const uint64_t n = cap.user;
+        cap.user = 0, cap.armed = false;
+        cap.wids.clear(), cap.seen.clear(), cap.compare.clear(), cap.passes.clear(), cap.drawSampled.clear(), cap.passSampled.clear(), cap.pass.clear();
+        uint64_t written = 0;
+        for (const auto& [depth, line] : cap.userLines)
+            if (cap.userDepths.count(depth)) log(line), ++written;
+        std::string depths;
+        for (const uint64_t depth : cap.userDepths) depths += (depths.empty() ? "" : " ") + hex(depth) + ":views=" + std::to_string(cap.userViews[depth]);
+        log("VPKENGINE_PROBE SCENECAP n=" + std::to_string(n) + " end frames=" + std::to_string(cap.userFrame) + " draws=" + std::to_string(written) +
+            "/" + std::to_string(cap.userLines.size()) + " depths=[" + depths + "] disk_mb=" + std::to_string(cap.userDisk >> 20) +
+            (cap.userDisk >= capUserDisk ? " disk_full=1 (pictures left out: VPKENGINE_SCENECAP_DISK)" : "") + why);
+        cap.userLines.clear(), cap.userDepths.clear(), cap.userDirty.clear(), cap.userSizes.clear(), cap.userViews.clear();
+        return n;
+    }
+    // The user's capture: the SCENEDRAW line of a recorded draw with a depth target (`slot`: its first colour target, < 0: none).
+    void capSceneDraw(const DrawState& d, const vpgpu::PipelineState& ps, unsigned samples, bool depth1x, int slot, uint64_t gs,
+                      const std::array<int32_t, 4>& scissor, uint32_t depthWidth, uint32_t depthHeight) {
+        const DepthTarget& z = d.depth;
+        const DepthStencil& ds = d.depthStencil;
+        const uint64_t depth = z.zFormat ? z.zAddress : z.stencilAddress;
+        if (slot >= 0) cap.userDepths.insert(depth), cap.userDirty.insert(depth), cap.userSizes.insert(uint64_t(depthWidth) << 32 | depthHeight);
+        const ViewportZ pz = viewportDepthRange(d.viewport, d.raster.clipSpaceZeroToW);
+        bool approximated = false;
+        const bool clamped = depthClamp(d.raster, approximated);
+        const auto n = [](uint64_t v) { return std::to_string(v); };
+        const auto face = [&](const DepthStencil::Face& f) {  // func/ref/read mask/write mask/fail,zpass,zfail/op value
+            return n(f.func) + "/" + n(f.ref) + "/" + n(f.readMask) + "/" + n(f.writeMask) + "/" + n(f.fail) + "," + n(f.zPass) + "," + n(f.zFail) + "/" + n(f.opVal);
+        };
+        std::string line = "VPKENGINE_PROBE SCENEDRAW cap=" + n(cap.user) + " i=" + n(cap.userDraws++) + " f=" + n(r.frame_) + " frame=" + n(cap.userFrame) +
+                           " pass=" + n(cap.passes.size()) + " view=" + n(cap.userViews[depth]) + " depth=" + hex(depth) + " samples=" + n(samples) +
+                           " d1x=" + n(depth1x) + " color=" + (slot < 0 ? std::string("none") : hex(d.color[size_t(slot)].address)) +
+                           " vs=" + hex(ps.vertexShader) + " ps=" + hex(ps.fragmentShader) + " gs=" + hex(gs) +
+                           " test=" + n(ds.depthTest) + " func=" + n(ds.depthFunc) + " write=" + n(ds.depthWrite) + " zro=" + n(z.zReadOnly) +
+                           " zclear=" + n(z.depthClear) + n(z.stencilClear) + " stencil=" + n(ds.stencilTest) + " sro=" + n(z.stencilReadOnly);
+        if (ds.stencilTest) line += " front=" + face(ds.front) + " back=" + (ds.backfaceEnable ? face(ds.back) : std::string("front"));
+        line += " znear=" + std::to_string(pz.znear) + " zfar=" + std::to_string(pz.zfar) + " clamp=" + n(clamped) + " cull=" + n(d.raster.cullFront) +
+                n(d.raster.cullBack) + " cw=" + n(d.raster.frontFaceClockwise);
+        if (slot >= 0) {
+            const Blend& b = d.blend[size_t(slot)];
+            line += " blend=" + n(b.enable) + ":" + n(b.colorSrc) + "," + n(b.colorDst) + "," + n(b.colorFunc) + ":" + n(b.alphaSrc) + "," + n(b.alphaDst) +
+                    "," + n(b.alphaFunc) + " mask=" + n(d.color[size_t(slot)].writeMask);
+        }
+        line += " a2m=" + n(d.alphaToMask) + " kill=" + n(d.psKill) + " expz=" + n(d.psExportsZ) + " earlyz=" + n(d.earlyZ) + " bounds=" + n(ds.depthBounds) +
+                ":" + std::to_string(z.boundsMin) + "," + std::to_string(z.boundsMax) + " scissor=" + std::to_string(scissor[0]) + "," +
+                std::to_string(scissor[1]) + "," + std::to_string(scissor[2]) + "," + std::to_string(scissor[3]) + " prim=" + n(uint64_t(d.primitive)) +
+                " count=" + n(d.count) + " instances=" + n(d.instances);
+        cap.userLines.emplace_back(depth, std::move(line));
+    }
     void capAdd(uint32_t wid) {
         if (wid && cap.seen.insert(wid).second) cap.wids.push_back(wid);
     }
@@ -3106,6 +3204,11 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         }
     }
     void capArm() {
+        if (cap.user) {  // (every frame of the user's capture, up to kCapUserFrames of them)
+            cap.armed = true, cap.files = cap.userDisk < capUserDisk;
+            if (++cap.userFrame >= kCapUserFrames) capUserEnd(" stopped=frames (the host did not end it)");
+            return;
+        }
         if (cap.off || cap.armed || !vpgpu::probe::enabled()) return;
         const char* dir = std::getenv("SHADPS4_PROBE_DIR");
         if (!dir || !*dir) return;
@@ -3121,14 +3224,14 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
     void capFinish() {
         cap.armed = false;
         const bool idle = r.device_.waitIdle(2'000'000'000ull);
-        const std::string n = std::to_string(cap.n);
+        const std::string n = cap.user ? "u" + std::to_string(cap.user) + "." + std::to_string(cap.userFrame) : std::to_string(cap.n);
         log("VPKENGINE_PROBE FRAMECAP n=" + n + " f=" + std::to_string(r.frame_) + " idle=" + (idle ? "1" : "0") + " passes=" +
             std::to_string(cap.passes.size()) + " images=" + std::to_string(cap.wids.size()) + " files=" + (cap.files ? "1" : "0") +
-            " disk_mb=" + std::to_string(cap.disk >> 20));
+            " disk_mb=" + std::to_string((cap.user ? cap.userDisk : cap.disk) >> 20));
         for (const std::string& p : cap.passes) log("VPKENGINE_PROBE FRAMECAP_PASS n=" + n + " " + p);
         const std::string dir = std::getenv("SHADPS4_PROBE_DIR") ? std::getenv("SHADPS4_PROBE_DIR") : "";
         static const char* const kindName[3] = {"color", "depth", "texture"};
-        if (cap.files && cap.disk == 0 && !dir.empty()) {  // (the pictures of an earlier run: this one's replace them)
+        if (cap.files && cap.disk == 0 && cap.userDiskAll == 0 && !dir.empty()) {  // (the pictures of an earlier run: this one's replace them)
             std::error_code ec;
             for (const auto& e : std::filesystem::directory_iterator(dir, ec)) {
                 const std::string name = e.path().filename().string();
@@ -3139,7 +3242,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         // (the images worth most first: sampled with compare, depth, big colour; the rest in the order seen)
         const auto rank = [&](uint32_t wid) {
             const Surface* s = surfaceOf(wid);
-            return !s ? 4 : cap.compare.count(wid) ? 0 : s->isDepth ? 1 : uint64_t(s->width) * s->height >= 512 * 512 ? 2 : 3;
+            return !s ? 4 : cap.compare.count(wid) || (cap.user && capUserSize(*s)) ? 0 : s->isDepth ? 1 : uint64_t(s->width) * s->height >= 512 * 512 ? 2 : 3;
         };
         std::stable_sort(cap.wids.begin(), cap.wids.end(), [&](uint32_t a, uint32_t b) { return rank(a) < rank(b); });
         framecap::Budget budget;
@@ -3221,20 +3324,21 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
                     std::snprintf(range, sizeof range, " lo=%.6g hi=%.6g", double(st.lo), double(st.hi));
                     l += range;
                 }
-                if (cap.files && !dir.empty() && cap.disk < capDisk) {
+                if (cap.files && !dir.empty() && (cap.user ? cap.userDisk < capUserDisk && capUserSize(*s) : cap.disk < capDisk)) {
                     const std::string file = "framecap-" + n + "-" + std::to_string(index - 1) + "-" + kindName[kind] + "-" + hex(s->address) + "-" +
                                              fi.name + "-" + std::to_string(s->width) + "x" + std::to_string(s->height) + "-s" + std::to_string(slice) + ".ppm";
                     uint64_t written = 0;
-                    if (framecap::writePpm(dir + "/" + file, out.data(), s->width, s->height, bpe, f, (s->width + 767) / 768, st, written))
-                        cap.disk += written, l += " file=" + file;
+                    if (framecap::writePpm(dir + "/" + file, out.data(), s->width, s->height, bpe, f, cap.user ? 1 : (s->width + 767) / 768, st, written))
+                        (cap.user ? cap.userDisk : cap.disk) += written, cap.userDiskAll += cap.user ? written : 0, l += " file=" + file;
                 }
                 log(l);
                 if (kind == 0 && s->width >= 512 && s->height >= 512 && framecap::permille(st.zero8, st.tiles8) >= 10) pattern = true;
             }
         }
         const Clock::time_point now = Clock::now();
-        if (cap.files) cap.nextFiles = now + std::chrono::seconds(30);
-        else if (pattern && now >= cap.nextFiles && cap.disk < capDisk) {
+        // (the periodic captures' pictures and their follow-up are not the user's)
+        if (cap.files && !cap.user) cap.nextFiles = now + std::chrono::seconds(30);
+        else if (pattern && !cap.user && now >= cap.nextFiles && cap.disk < capDisk) {
             cap.pattern = true;
             log("VPKENGINE_PROBE FRAMECAP_PATTERN n=" + n + " f=" + std::to_string(r.frame_) + " (the next frame is captured with pictures)");
         }
@@ -3900,7 +4004,28 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
             }
         return nullptr;
     }
-    void emitClear(const PendingClear& p) {
+    // Probe CLEARPASS (the first 20, then those of 8 frames in a row every 600: a whole picture of the title, which is several
+    // frames here): a clear that waited, as it is recorded: the target, whether
+    // it is the whole-target load action, its in-pass rectangles and the planes and values they clear, and what made it land:
+    // "in_pass" (the load action / clear draws of the pass that draws into the target), "draw" (the rectangle of the draw that
+    // carries the clear, in its own pass), or a pass of its own before a "sample", a "resolve", the one-sample pass of a
+    // multisampled depth ("1x"), the end of the frame ("submit") or another reader ("other").
+    bool probeClearPassOn() const { return vpgpu::probe::enabled() && (pstat.clearPassLines < 20 || r.frame_ % 600 < 8); }
+    void probeClearPass(const PendingClear& p, const char* why) {
+        if (!probeClearPassOn()) return;
+        std::string line = "VPKENGINE_PROBE CLEARPASS n=" + std::to_string(++pstat.clearPassLines) + " f=" + std::to_string(r.frame_) + " tex=" +
+                           capWho(capWidOf(p.texture)) + " whole=" + (p.whole ? "1" : "0") + " rects=" + std::to_string(p.rects.size());
+        bool depth = p.whole && p.depth, stencil = p.whole && p.depth;
+        std::string value = p.whole && p.depth ? std::to_string(p.value.depth) + "/" + std::to_string(p.value.stencil) : std::string();
+        for (const auto& rc : p.rects) {
+            depth = depth || rc->depth, stencil = stencil || rc->stencil;
+            value += (value.empty() ? "" : ",") + (rc->depth ? std::to_string(rc->depthValue) : std::string("-")) + "/" +
+                     (rc->stencil ? std::to_string(rc->stencilValue) : std::string("-"));
+        }
+        log(line + " depth=" + (depth ? "1" : "0") + " stencil=" + (stencil ? "1" : "0") + " value=" + (value.empty() ? "colour" : value) + " why=" + why);
+    }
+    void emitClear(const PendingClear& p, const char* why) {
+        probeClearPass(p, why);
         closePass();
         vpgpu::RenderPassDesc desc;
         vpgpu::Attachment& a = p.depth ? desc.depth : desc.colors[0];
@@ -3932,13 +4057,13 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         }
         ++r.stats_.passes;
     }
-    void flushClear(const Surface& c) {
+    void flushClear(const Surface& c, const char* why = "other") {
         if (pendingClears.empty()) return;
         for (size_t i = 0; i < pendingClears.size();)
             if (pendingClears[i].texture == c.ms || pendingClears[i].texture == c.id) {
                 const PendingClear p = pendingClears[i];
                 pendingClears.erase(pendingClears.begin() + long(i));
-                emitClear(p);
+                emitClear(p, why);
             } else {
                 ++i;
             }
@@ -3946,7 +4071,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
     void flushAllClears() {
         std::vector<PendingClear> all;
         all.swap(pendingClears);
-        for (const PendingClear& p : all) emitClear(p);
+        for (const PendingClear& p : all) emitClear(p, "submit");
     }
 
     // ---- Views
@@ -4549,7 +4674,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         if (std::find(attachedWids.begin(), attachedWids.end(), w->wid) != attachedWids.end()) return reject(kRejFeedback);
         if (tracker.writtenByOthers(w->address, w->bytes, w->wid, w->version)) return reject(kRejRange);
         if (!r.hooks_.view && inOrderOf(f, w->format) != w->format) return reject(kRejNoView);
-        flushClear(*w);  // (a clear that waits for the next pass lands first, as for a target a T# names)
+        flushClear(*w, "sample");  // (a clear that waits for the next pass lands first, as for a target a T# names)
         bool exact = true;
         const TexRef ref = sampleThrough(*w, desc, f, false, &exact);
         if (!exact) return reject(kRejNoView);
@@ -4590,7 +4715,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
                 note("T# smaller than its render target sampled through the whole target");
             }
             c->lastUse = r.frame_;
-            flushClear(*c);
+            flushClear(*c, "sample");
             if (!storage && msaaImage(desc) && c->ms) {  // the shader reads the samples themselves
                 makeSamplesReal(*c);  // (they were never stored while the target kept them on tile)
                 life.noteSamplesRead(c->ms, r.frame_);
@@ -4626,7 +4751,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
                 note("T# smaller than its depth target sampled through the whole target");
             }
             c->lastUse = r.frame_;
-            flushClear(*c);
+            flushClear(*c, "sample");
             if (!storage && msaaImage(desc) && c->ms) {
                 life.noteSamplesRead(c->ms, r.frame_);
                 return {c->ms, {}};
@@ -5373,6 +5498,10 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
                         GuestRegion g;
                         region(address, bytes, g);
                         noteCpuRead(address, bytes, "cbuf_copy");
+                        if (vpgpu::probe::enabled() && tracker.gpuWritten(address, bytes) && ++pstat.unalignedCbGpuWritten <= 20)
+                            log("VPKENGINE_PROBE UNALIGNED_CB_GPU n=" + std::to_string(pstat.unalignedCbGpuWritten) + " f=" + std::to_string(r.frame_) +
+                                " a=" + hex(address) + " bytes=" + std::to_string(bytes) + " stage=" + std::to_string(int(stage)) + " program=" +
+                                hex(s.address) + " shader=" + hex(t.id));
                         const Phase cbPhase(r.cpu_.bindCbMs);
                         auto at = alignedConstantCopy(address, bytes, static_cast<const uint8_t*>(g.host) + (address - g.base));
                         if (!at) return why = "upload ring full", false;
@@ -5509,6 +5638,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
     // ---- Draws ------------------------------------------------------------------------------------
 
     void draw(const DrawState& d) {
+        if (cap.user && d.depth.zFormat && d.depth.depthClear) capNewView(d.depth.zAddress);
         pollCache();
         ringRoom();
         const RegionScope regions(*this);
@@ -5670,7 +5800,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
             TextureId one;
             if (samples == 1 && z.samples > 1 && !(z.depthClear || z.stencilClear) && !depth1xSeparate)
                 if (Target* m = multisampledDepth(readAddress, zf, z.width, z.height, uint16_t(z.sliceStart + z.sliceCount), z.tileMode, depthPitch(z), depthRows(z))) {
-                    flushClear(*m);  // (a clear still waiting for the multisampled passes lands before the picture is read)
+                    flushClear(*m, "1x");  // (a clear still waiting for the multisampled passes lands before the picture is read)
                     if (passOpen && pass.depth.texture == m->ms) closePass();  // (it resolves into the picture when it ends)
                     requireDepthResolve(*m);
                     if ((one = depthCompanion(*m))) dt = m;
@@ -6234,6 +6364,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
             for (unsigned i = 0; i < desc.colors.size(); ++i) {
                 vpgpu::Attachment& a = desc.colors[i];
                 if (a.texture && takePendingClear(a.texture, pc)) {
+                    probeClearPass(pc, "in_pass");
                     a.load = vpgpu::LoadAction::Clear;
                     a.clear = pc.value;
                     clears = true;
@@ -6241,6 +6372,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
                 }
             }
             if (desc.depth.texture && takePendingClear(desc.depth.texture, pc)) {
+                probeClearPass(pc, "in_pass");
                 if (pc.whole) {
                     desc.depth.load = vpgpu::LoadAction::Clear;
                     desc.depth.clear = pc.value;
@@ -6312,12 +6444,19 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
             frame.draw(std::move(cd));
         }
         if (partialClear) {
+            if (probeClearPassOn()) {  // (CLEARPASS: the draw's own clear of one plane or part of its depth target)
+                PendingClear own;
+                own.texture = desc.depth.texture, own.depth = true, own.whole = false, own.rects.push_back(partialClear);
+                probeClearPass(own, "draw");
+            }
             vpgpu::Draw cd;
             cd.clear = std::move(partialClear);
             frame.draw(std::move(cd));
         }
         if (!frame.draw(std::move(draw))) return skip("no open pass");
         ++r.stats_.drawn;
+        if (cap.user && zf != vpgpu::Format::Undefined)
+            capSceneDraw(d, ps, samples, depth1x, colorIds.empty() ? -1 : int(colorIds[0].first), geom ? gsT->id : 0, {sl, stp, sr, sb}, depthWidth, depthHeight);
         for (const auto& entry : colorIds) passWritten |= uint8_t(1u << entry.first);
         if (partnerSlot < 8) ++pstat.depthPartnerDraws;
         if (depth1x) ++pstat.depth1xShared;
@@ -6504,7 +6643,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         for (Target& cand : found->second)
             if (cand.format == f && cand.width == c.width && cand.height == c.height) t = &cand;
         if (!t) return false;
-        flushClear(*t);  // (a fast clear / depth clear still waiting for a pass)
+        flushClear(*t, "sample");  // (a fast clear / depth clear still waiting for a pass)
         catchUpTwin(*t);
         life.noteRead(t->id, r.frame_);
         const vpgpu::FormatInfo& fi = vpgpu::formatInfo(f);
@@ -6665,7 +6804,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         // every pass (a texture copy). A resolve through a view of another format needs the samples themselves.
         if (differ && from->ms) makeSamplesReal(*from);
         const bool pictureOnly = from->samplesOnTile;
-        flushClear(*from);
+        flushClear(*from, "resolve");
         ResolveCase rc;
         const bool twinWanted = from->ms && life.wants(from->id, r.frame_);
         // (a wanted single-sample picture stays resolved by the passes; with another destination format the
@@ -6690,7 +6829,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
                     takePendingClear(pendingTex, dropped);
                     ++r.cpu_.resolveDestClearDropped;
                 } else {
-                    flushClear(*to);
+                    flushClear(*to, "resolve");
                     ++r.cpu_.resolveDestClearFlushed;
                 }
             }
@@ -6941,7 +7080,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         flushAllClears();  // (a clear nobody drew after still clears)
         closePass();
         // (the write backs of evicted images are recorded into this frame)
-        if (r.frame_ % 16 == 15) {
+        if (r.frame_ % 16 == 15 && !cap.userCut) {
             evict();
             closePass();
         }
@@ -7368,6 +7507,12 @@ void Renderer::publishProbe(uint64_t pictures) {
         C(f, "pointer_snapshot_no_align", impl_->pointerNo[0]), C(f, "pointer_snapshot_no_flat", impl_->pointerNo[1]);
         C(f, "pointer_snapshot_no_history", impl_->pointerNo[2]), C(f, "pointer_snapshot_no_gpu_wrote", impl_->pointerNo[3]);
         C(f, "pointer_snapshot_no_label", impl_->pointerNo[4]), C(f, "cp_access_ranges", impl_->cpAccess.size());
+        C(f, "pointer_snapshot_no_cp_access", impl_->pointerNo[5]);
+        C(f, "buffer_snapshot_no_big", impl_->snapNo[0]), C(f, "buffer_snapshot_no_align", impl_->snapNo[1]);
+        C(f, "buffer_snapshot_no_flat", impl_->snapNo[2]), C(f, "buffer_snapshot_no_cpu_read", impl_->snapNo[3]);
+        C(f, "buffer_snapshot_no_history", impl_->snapNo[4]), C(f, "buffer_snapshot_no_gpu_wrote", impl_->snapNo[5]);
+        C(f, "buffer_snapshot_no_label", impl_->snapNo[6]);
+        C(f, "unaligned_cb_gpu_written", ps.unalignedCbGpuWritten);
         C(f, "life_stores_dropped", im.lifeTotal.storesDropped);
         C(f, "life_samples_dropped", im.lifeTotal.samplesDropped), C(f, "life_resolves_dropped", im.lifeTotal.resolvesDropped);
         C(f, "life_resolves_deferred", im.lifeTotal.resolvesDeferred), C(f, "life_misses", im.lifeTotal.misses);
@@ -7642,6 +7787,15 @@ uint32_t* Renderer::gds() {
 
 std::string Renderer::describeAt(uint64_t address, uint64_t bytes) const { return impl_->describe(address, bytes); }
 
+uint64_t Renderer::beginSceneCapture() {
+    Impl::FrameCap& c = impl_->cap;
+    if (c.user || !vpgpu::probe::enabled()) return 0;
+    c.user = ++c.users, c.userFrame = 0, c.userDraws = 0, c.userDisk = 0;
+    c.armed = true, c.files = c.userDisk < impl_->capUserDisk;
+    impl_->log("VPKENGINE_PROBE SCENECAP n=" + std::to_string(c.user) + " begin f=" + std::to_string(frame_));
+    return c.user;
+}
+uint64_t Renderer::endSceneCapture() { return impl_->cap.user ? impl_->capUserEnd("") : 0; }
 void Renderer::setProbes(bool on) {
     impl_->probeOn = on;
     impl_->probes.clear();

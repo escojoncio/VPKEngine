@@ -56,6 +56,12 @@ public:
     // it is part of that. False = nothing to wait for.
     // `caller` names who asks (probe DMASYNC only: "fill", "copy", "owned_fault", "cp_read", ...).
     bool syncCpu(uint64_t a, uint64_t n, vpgpu::SubmitReason why, uint64_t b = 0, uint64_t m = 0, const char* caller = "");
+    // The command processor is about to write guest [a, +n) on the CPU, in order with the draws (IT_WRITE_DATA): syncCpu, and a
+    // small range it had to wait for is noted (Renderer::cpuAccessed, as the host does for a small DMA): read-only buffers the
+    // draws recorded from now on bind inside it are copied when recorded, each with the bytes of its place in the command
+    // stream, so the next write of the range waits for nothing. One the GPU writes too, or with a label write pending, stays
+    // bound in place and its write waits (the renderer's snapshot rule). VPKENGINE_WRITE_DATA_LIVE=1: not noted.
+    bool syncWrite(uint64_t a, uint64_t n);
     // A host DMA (fill / copy) over [a, +n) (and [b, +m)) is about to run: true = queued GPU work touches the range, so
     // syncCpu would wait; the caller records it on the GPU timeline (Renderer::fill / copy) instead, in order with that work,
     // with no wait and no submit. False = the CPU may do it in place after syncCpu (nothing GPU touches the range, a label
@@ -131,6 +137,7 @@ private:
     std::function<void()> hook_;
     bool dmaGpu_;  // false (VPKENGINE_DMA_CPU set): a DMA always waits and runs on the CPU
     bool supersede_;  // false (VPKENGINE_LABEL_KEEP set): a DMA over a pending label waits for it
+    bool noteWrites_;  // false (VPKENGINE_WRITE_DATA_LIVE set): a range syncWrite waited for is not noted
     double summarySince_ = 0;
     double openSince_ = -1, labelSince_ = -1;
     bool labelIrq_ = false;

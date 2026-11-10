@@ -95,6 +95,10 @@ struct Hooks {
     // shader provider before the pipeline compiles).
     std::function<void(uint64_t id, vpir::Stage, const vpmsl::MslShader&)> shader;
     std::function<void(const std::string&)> log;
+    // Optional: hands the recorded frame to the GPU the way the host does (its scheduler's submit, with the host's own
+    // bookkeeping), for the one case in which the renderer itself cuts the frame on purpose: the user's scene capture
+    // (beginSceneCapture). Without it the renderer calls its own submit().
+    std::function<void()> submit;
     // A texture was filled from guest memory [address, address + bytes) (optional; informational:
     // CPU writes are found by the renderer itself, comparing the source's content).
     std::function<void(uint64_t address, uint64_t bytes)> uploaded;
@@ -325,6 +329,17 @@ public:
     };
     void setProbes(bool on);
     std::vector<DrawProbe> takeProbes();
+    // Probe (diagnostics; the probe must be on, and SHADPS4_PROBE_DIR set for the pictures): the host's user asks for a capture
+    // of the scene, with what is wrong on screen. Between the two calls (the host makes them where one presented picture ends
+    // and the next begins, each right after its submit) every frame submitted is captured as FRAMECAP does (lines
+    // "FRAMECAP* n=u<capture>.<frame>"), with pictures at full resolution of the images as big as a depth target that drew with
+    // colour; the frame is cut before such a depth target is cleared again, so that each view's images (each eye's) are read
+    // before the next view draws over them; and every draw with such a depth target leaves a line "SCENEDRAW cap=<capture>"
+    // with its state (written by endSceneCapture, then "SCENECAP n=<capture> end"). They return the capture's number
+    // (1, 2, ...); 0: the probe is off or a capture is already on (begin), none was on (end). A capture not ended within 32
+    // frames ends by itself (the host's end then answers 0).
+    uint64_t beginSceneCapture();
+    uint64_t endSceneCapture();
     const Stats& stats() const { return stats_; }
     // The CPU time accumulated since the last call (then reset).
     CpuTimes takeCpuTimes();

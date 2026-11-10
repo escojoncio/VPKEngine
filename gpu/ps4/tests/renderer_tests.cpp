@@ -3315,6 +3315,58 @@ void bufferSnapshot() {
         drawWith(x, cb, 400);
         CHECK(x.f.renderer.gpuMayAccess(cb, 400) && snapshots(x) == snaps);
     }
+    // IT_WRITE_DATA over a small V# buffer the draws of the picture before are bound to (never read on the CPU: in place). The
+    // write waits for them once (Scheduler::syncWrite notes the range); the draws recorded after it copy the buffer, so the
+    // next picture's write neither submits nor waits, and each draw is bound to the bytes of its place in the command stream.
+    for (const bool live : {false, true}) {
+        if (live) setenv("VPKENGINE_WRITE_DATA_LIVE", "1", 1);
+        HostDma h;
+        unsetenv("VPKENGINE_WRITE_DATA_LIVE");
+        Sched& x = h.x;
+        const uint64_t wd = cb + 0xc000;
+        const auto write = [&](uint32_t v) {  // (the host's WriteDataOrdered)
+            const bool waited = x.s.syncWrite(wd, 256);
+            *x.f.at(wd) = v;
+            return waited;
+        };
+        *x.f.at(wd) = 0x11;
+        drawWith(x, wd, 256);
+        CHECK(x.f.renderer.gpuMayAccess(wd, 256));
+        x.s.present();
+        CHECK(write(0x22));  // (the picture before reads it in place)
+        drawWith(x, wd, 256);
+        CHECK(x.f.renderer.gpuMayAccess(wd, 256) == live);
+        x.s.present();
+        const size_t submits = x.submits(), waits = x.f.backend.waits.size();
+        CHECK(write(0x33) == live);
+        CHECK(live || (x.submits() == submits && x.f.backend.waits.size() == waits));
+        drawWith(x, wd, 256);
+        if (live) continue;
+        // The GPU writes the range too (a store recorded into it): memory is not the newest until that runs, so the buffer is
+        // bound in place again and the write after it waits, as before.
+        x.f.renderer.noteGpuWrite(wd, 4);
+        drawWith(x, wd, 256);
+        CHECK(x.f.renderer.gpuMayAccess(wd, 256));
+        CHECK(write(0x44));
+        x.s.finish();
+        const std::vector<uint32_t> words = bound(x, 256);  // (the first and the last draw read memory as it is now)
+        CHECK(words.size() == 4 && words[1] == 0x22 && words[2] == 0x33 && words[3] == 0x44);
+    }
+    {  // A write of part of the buffer is noted like one of all of it; one of more than 4 KiB is not (such a buffer is not copied).
+        HostDma h;
+        Sched& x = h.x;
+        const uint64_t part = cb + 0xd000, big = cb + 0xe000;
+        drawWith(x, part, 256);
+        x.s.present();
+        drawWith(x, big, 256);
+        x.s.present();
+        CHECK(x.s.syncWrite(part + 0x40, 16) && x.s.syncWrite(big, 8192));  // (each waits for its own frame)
+        drawWith(x, part, 256);
+        drawWith(x, big, 256);
+        CHECK(!x.f.renderer.gpuMayAccess(part, 256) && x.f.renderer.gpuMayAccess(big, 256));
+        x.s.present();
+        CHECK(!x.s.syncWrite(part + 0x40, 16) && x.s.syncWrite(big, 8192));
+    }
     {
         setenv("VPKENGINE_BUFFER_LIVE", "1", 1);
         HostDma h;

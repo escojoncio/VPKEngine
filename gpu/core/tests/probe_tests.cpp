@@ -70,6 +70,17 @@ void testBusyUnion() {
   u.add(400, 450);  // gap: +50
   CHECK_EQ(t.ns(), 250u);
   CHECK_EQ(t.calls(), 4u);
+  // Out of completion order (two queues, or handlers that overtake each other): what an earlier interval left idle still counts.
+  Timer late;
+  BusyUnion v(late);
+  v.add(2, 5);        // 3
+  v.add(0, 10);       // the two ends around it: +7
+  v.add(600, 1000);   // 400
+  v.add(100, 500);    // before it, in what was idle: +400
+  v.add(450, 550);    // +50 (500..550)
+  v.add(90, 1000);    // +10 (90..100) +50 (550..600)
+  CHECK_EQ(late.ns(), 920u);
+  CHECK_EQ(late.calls(), 6u);
 }
 
 void testHist() {
@@ -259,6 +270,7 @@ void testScopedAndMutex() {
   CHECK_EQ(timer("LOCK", "test_mutex_wait").calls(), uint64_t{0});  // not contended
   m.lock();
   std::thread other([&] {
+    threadTag = "t";  // (a thread with a name: its waits are also filed apart)
     std::lock_guard l(m);
   });
   std::this_thread::sleep_for(std::chrono::milliseconds(30));
@@ -266,6 +278,7 @@ void testScopedAndMutex() {
   other.join();
   CHECK_EQ(counter("LOCK", "test_mutex_acq").get(), uint64_t{3});
   CHECK_EQ(timer("LOCK", "test_mutex_wait").calls(), uint64_t{1});  // the second thread waited
+  CHECK_EQ(timer("LOCK", "test_mutex_wait_t").calls(), uint64_t{1});
   CHECK(timer("LOCK", "test_mutex_wait").ns() >= 10'000'000);
   TimedMutex<std::recursive_mutex> rm("test_recursive");
   rm.lock();

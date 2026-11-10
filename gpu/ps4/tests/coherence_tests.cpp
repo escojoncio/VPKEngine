@@ -135,6 +135,7 @@ constexpr uint64_t kDepth = kBase + 0x60000;  // 128x128 D32, 64 KiB
 struct Fixture {
     static inline uint64_t memSize = kSize;   // guest memory (a test of a big texture makes more)
     static inline unsigned workers = 0;       // pipeline compile workers (0: compiled inside the request)
+    static inline std::function<void(Fixture&)> hostSubmit;  // Hooks::submit of the fixtures made while it is set
     void* host = std::aligned_alloc(16384, memSize);
     Recording backend;
     std::vector<std::string> log;
@@ -161,6 +162,7 @@ struct Fixture {
         };
         h.shader = [](uint64_t, vpir::Stage, const vpmsl::MslShader&) {};
         h.log = [this](const std::string& s) { log.push_back(s); };
+        if (hostSubmit) h.submit = [this, host = hostSubmit] { host(*this); };
         h.watchWrites = [this](uint64_t a, uint64_t n) { watchedWrites.push_back({a, n}); };
         h.watchOwned = [this](uint64_t a, uint64_t n, bool on) { (on ? ownedOn : ownedOff).push_back({a, n}); };
         h.view = [this](const vpps4::ViewRequest& r) -> vpgpu::TextureId {
@@ -2973,6 +2975,105 @@ void frameCapture() {
                 images += l.find("read=ok") != std::string::npos, files += l.find(" file=") != std::string::npos;
         CHECK(images == 2 && files == 1);
         unsetenv("VPKENGINE_FRAMECAP_DISK");
+        if (failures) f.dump();
+    }
+    {  // The user's capture: every frame until it ends, however the periodic one is set. A depth target that drew with colour and
+       // is cleared again (the next view) cuts the frame first, and a clear that waits stays with what is drawn next; one
+       // SCENEDRAW line per draw on such a depth target, none for a depth target that never drew with colour.
+        ProbeOn probe;
+        setenv("VPKENGINE_FRAMECAP", "0", 1);
+        Fixture f;
+        CHECK(f.renderer.endSceneCapture() == 0);
+        CHECK(f.renderer.beginSceneCapture() == 1 && f.renderer.beginSceneCapture() == 0);
+        const vpps4::DrawState d = f.depthState(true);
+        vpps4::DrawState newView = d;
+        newView.depth.depthClear = true;
+        vpps4::DrawState shadow = d;  // (depth only, another depth target)
+        shadow.color[0] = {};
+        shadow.depth.zAddress = kDepth + 0x10000;
+        vpps4::DrawState clear = f.state();
+        clear.primitive = vpps4::PrimitiveType::RectList;
+        clear.color[0].fastClear = true;
+        clear.color[0].clearWord = {0xff204080u, 0};
+        f.renderer.draw(shadow);
+        f.renderer.draw(newView);
+        f.renderer.draw(d);
+        f.renderer.draw(clear);  // (waits for the next draw into the colour target)
+        const size_t frames = f.backend.compiled.size(), commands = f.backend.commands.size();
+        f.renderer.draw(newView);
+        CHECK(f.backend.compiled.size() == frames + 1);
+        for (size_t i = commands; i < f.backend.commands.size(); ++i)  // (the first view's frame: the clear is not in it)
+            if (const auto* rp = std::get_if<vpgpu::RenderPass>(&f.backend.commands[i])) CHECK(rp->desc.colors[0].load != vpgpu::LoadAction::Clear);
+        f.renderer.draw(d);
+        f.renderer.submit();
+        {
+            bool cleared = false;
+            for (size_t i = f.backend.commands.size(); i-- > commands;)
+                if (const auto* rp = std::get_if<vpgpu::RenderPass>(&f.backend.commands[i]); rp && rp->desc.colors[0].texture) {
+                    cleared = rp->desc.colors[0].load == vpgpu::LoadAction::Clear;  // (the first pass of the second view's frame)
+                    if (cleared) break;
+                }
+            CHECK(cleared);
+        }
+        CHECK(!find(f, "VPKENGINE_PROBE SCENEDRAW"));  // (written when the capture ends)
+        CHECK(f.renderer.endSceneCapture() == 1);
+        CHECK(find(f, "VPKENGINE_PROBE FRAMECAP n=u1.0 ") && find(f, "VPKENGINE_PROBE FRAMECAP n=u1.1 "));
+        CHECK(find(f, "VPKENGINE_PROBE CLEARPASS n=1 f=1 tex=") && find(f, " whole=1 rects=0 depth=0 stencil=0 value=colour why=in_pass"));
+        unsigned lines = 0;
+        for (const std::string& l : f.log) lines += l.find("VPKENGINE_PROBE SCENEDRAW cap=1 ") != std::string::npos;
+        CHECK(lines == 4);
+        CHECK(find(f, " frame=0 pass=1 view=1 depth=" + Fixture::hex(kDepth) + " samples=1 d1x=0 color=" + Fixture::hex(kRt)));
+        CHECK(find(f, " frame=1 pass=0 view=2 depth=" + Fixture::hex(kDepth)) && !find(f, " depth=" + Fixture::hex(kDepth + 0x10000) + " samples="));
+        CHECK(find(f, " test=1 func=1 write=1 zro=0 zclear=10 stencil=0 ") && find(f, " count=3 instances=1"));
+        CHECK(find(f, "VPKENGINE_PROBE SCENECAP n=1 end frames=2 draws=4/5 depths=[" + Fixture::hex(kDepth) + ":views=2] "));
+        f.renderer.draw(d);
+        f.renderer.submit();
+        CHECK(!find(f, "FRAMECAP n=u1.2 "));  // (over: nothing more is captured)
+        CHECK(f.renderer.beginSceneCapture() == 2);
+        f.renderer.draw(d);
+        f.renderer.submit();
+        CHECK(f.renderer.endSceneCapture() == 2 && find(f, "VPKENGINE_PROBE FRAMECAP n=u2.0 "));
+        if (failures) f.dump();
+    }
+    {  // The user's capture cuts the frame through the host's submit when it has one; one the host never ends is over after 32
+       // frames; its pictures have a budget of their own, for each capture, and the lines say what they took.
+        ProbeOn probe;
+        setenv("VPKENGINE_FRAMECAP", "0", 1);
+        setenv("VPKENGINE_SCENECAP_DISK", "1", 1);
+        unsigned hostCuts = 0;
+        Fixture::hostSubmit = [&](Fixture& x) { ++hostCuts, x.renderer.submit(); };
+        Fixture f;
+        Fixture::hostSubmit = nullptr;
+        unsetenv("VPKENGINE_SCENECAP_DISK");
+        constexpr uint64_t kBig = kBase + 0x90000;  // a texture as big as the depth target: its picture is kept
+        for (uint32_t i = 0; i < 128 * 128; ++i) f.at(kBig)[i] = 0xff102030u;
+        vpps4::DrawState d = f.depthState(true);
+        vpps4::DrawState newView = d;
+        newView.depth.depthClear = true;
+        const auto files = [&](const std::string& n) {
+            unsigned k = 0;
+            for (const std::string& l : f.log) k += l.find("FRAMECAP_IMG n=" + n) != std::string::npos && l.find(" file=framecap-" + n) != std::string::npos;
+            return k;
+        };
+        for (const char* n : {"u1.", "u2."}) {
+            CHECK(f.renderer.beginSceneCapture() != 0);
+            f.sample(kBig, 128, 128, 10, 0, 8);
+            f.renderer.draw(d);
+            f.renderer.draw(newView);  // (the cut: the host's submit)
+            f.renderer.draw(d);
+            f.renderer.submit();
+            CHECK(f.renderer.endSceneCapture() != 0);
+            CHECK(files(n) == 1);  // (two frames read the texture; the budget is one picture, for each capture)
+        }
+        CHECK(hostCuts == 2);
+        CHECK(find(f, "FRAMECAP n=u2.1 ") && find(f, "SCENECAP n=2 end frames=2 ") && find(f, " disk_mb=0 disk_full=1 "));
+        CHECK(f.renderer.beginSceneCapture() == 3);
+        for (int i = 0; i < 40; ++i) {
+            f.renderer.draw(d);
+            f.renderer.submit();
+        }
+        CHECK(find(f, "FRAMECAP n=u3.31 ") && !find(f, "FRAMECAP n=u3.32 ") && find(f, "SCENECAP n=3 end frames=32 ") && find(f, " stopped=frames"));
+        CHECK(f.renderer.endSceneCapture() == 0);
         if (failures) f.dump();
     }
     for (bool probeOn : {true, false}) {  // "0", and the probe off: nothing

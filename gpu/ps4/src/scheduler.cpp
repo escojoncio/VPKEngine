@@ -12,7 +12,7 @@ using vpgpu::SubmitReason;
 
 Scheduler::Scheduler(Renderer& r, vpgpu::Device& d, vpgpu::SubmitPolicy p, Clock c)
     : renderer_(r), device_(d), policy_(p), now_(std::move(c)), dmaGpu_(!std::getenv("VPKENGINE_DMA_CPU")),
-      supersede_(!std::getenv("VPKENGINE_LABEL_KEEP")) {
+      supersede_(!std::getenv("VPKENGINE_LABEL_KEEP")), noteWrites_(!std::getenv("VPKENGINE_WRITE_DATA_LIVE")) {
     summarySince_ = now_ ? now_() : 0;
 }
 
@@ -36,7 +36,13 @@ bool Scheduler::submit(SubmitReason why) {
     ++counters_.submits[size_t(why)];
     ++counters_.frames;
     if (hook_) hook_();
+    // (probe: which thread hands the frames over, and how long that takes it: SUBMIT by_<threadTag>)
+    const uint64_t t0 = vpgpu::probe::enabled() ? vpgpu::probe::nowNs() : 0;
     renderer_.submit();
+    if (t0) {
+        const char* tag = vpgpu::probe::threadTag;
+        vpgpu::probe::timer("SUBMIT", std::string("by_") + (tag ? tag : "other")).add(vpgpu::probe::nowNs() - t0);
+    }
     resetOpen();
     return true;
 }
@@ -110,6 +116,12 @@ bool Scheduler::syncCpu(uint64_t a, uint64_t n, SubmitReason why, uint64_t b, ui
     counters_.syncMs += now_() - tSync;
     if (probing) renderer_.noteCpuSync(caller, a, n, b, m, busyRange, frames, unsubmitted, now_() - t0);
     return frames != 0;
+}
+
+bool Scheduler::syncWrite(uint64_t a, uint64_t n) {
+    const bool waited = syncCpu(a, n, SubmitReason::WriteData, 0, 0, "write_data");
+    if (waited && n <= 4096 && noteWrites_) renderer_.cpuAccessed(a, n);
+    return waited;
 }
 
 bool Scheduler::dmaOnGpu(uint64_t dst, uint64_t n, uint64_t src) {

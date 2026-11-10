@@ -30,6 +30,9 @@ namespace vpgpu::probe {
 bool enabled();
 void setEnabled(bool on);
 uint64_t nowNs();  // steady clock
+// A short name the host gives the calling thread (static text; null: none). Per-thread figures are filed under it:
+// TimedMutex (LOCK <name>_wait_<tag>) and the PS4 scheduler's submits (SUBMIT by_<tag>).
+inline thread_local const char* threadTag = nullptr;
 
 // ---- Metrics ----------------------------------------------------------------------------------------------------
 
@@ -183,27 +186,47 @@ class ScopedHist {
 };
 
 // GPU busy time as the UNION of the intervals of work, not their sum (command buffers overlap in flight: the sum of their GPU
-// times exceeds the wall time). Intervals are reported in completion order (a queue: each ends no earlier than the one before);
-// the time not already covered by an earlier one is added to `timer` (calls = intervals, ms/s of the line = busy fraction).
+// times exceeds the wall time). The time of an interval not already covered by an earlier one is added to `timer` (calls =
+// intervals, ms/s of the line = busy fraction). Intervals mostly come in completion order (one queue: each ends no earlier than
+// the one before), but need not: the last kGaps idle stretches behind the newest end are kept, and an interval reported late
+// that falls in one still counts (a host may pace its frames by this figure).
 class BusyUnion {
  public:
   explicit BusyUnion(Timer& timer) : timer_(timer) {}
   void add(uint64_t startNs, uint64_t endNs) {
-    uint64_t cur = covered_.load(std::memory_order_relaxed);
-    uint64_t from;
-    do {
-      if (endNs <= cur) {
-        timer_.add(0);
-        return;
+    uint64_t added = 0;
+    {
+      std::lock_guard<std::mutex> g(mutex_);
+      if (startNs < covered_ && !gaps_.empty()) {
+        std::vector<std::pair<uint64_t, uint64_t>> rest;
+        for (const auto& [lo, hi] : gaps_) {
+          const uint64_t from = startNs > lo ? startNs : lo, to = endNs < hi ? endNs : hi;
+          if (from >= to) {
+            rest.push_back({lo, hi});
+            continue;
+          }
+          added += to - from;
+          if (lo < from) rest.push_back({lo, from});
+          if (to < hi) rest.push_back({to, hi});
+        }
+        gaps_.swap(rest);
       }
-      from = startNs > cur ? startNs : cur;
-    } while (!covered_.compare_exchange_weak(cur, endNs, std::memory_order_relaxed));
-    timer_.add(endNs - from);
+      if (endNs > covered_) {
+        if (startNs > covered_) gaps_.push_back({covered_, startNs});
+        added += endNs - (startNs > covered_ ? startNs : covered_);
+        covered_ = endNs;
+      }
+      if (gaps_.size() > kGaps) gaps_.erase(gaps_.begin(), gaps_.end() - kGaps);
+    }
+    timer_.add(added);
   }
 
  private:
+  static constexpr size_t kGaps = 16;
   Timer& timer_;
-  std::atomic<uint64_t> covered_{0};
+  std::mutex mutex_;
+  uint64_t covered_ = 0;
+  std::vector<std::pair<uint64_t, uint64_t>> gaps_;  // idle stretches behind covered_, oldest first
 };
 
 // ---- Registry and sampler ---------------------------------------------------------------------------------------
@@ -307,8 +330,8 @@ inline Timer& timer(std::string_view family, std::string_view name) { return reg
 inline Hist& hist(std::string_view family, std::string_view name) { return registry().hist(family, name); }
 
 // A mutex that measures the time threads wait for it (LOCK family: <name>_acq acquisitions, <name>_wait the
-// contended ones with their wait time) while the probe is on; a plain mutex otherwise. Works with the standard
-// lock guards and condition_variable_any.
+// contended ones with their wait time, <name>_wait_<tag> those of a thread with a threadTag) while the probe is on; a
+// plain mutex otherwise. Works with the standard lock guards and condition_variable_any.
 template <class M>
 class TimedMutex {
  public:
@@ -323,7 +346,18 @@ class TimedMutex {
     if (m_.try_lock()) return;
     const uint64_t t0 = nowNs();
     m_.lock();
-    s.waited->add(nowNs() - t0);
+    const uint64_t waited = nowNs() - t0;
+    s.waited->add(waited);
+    if (threadTag) {  // (its timer is looked up once per thread, mutex and tag: this runs with the mutex held)
+      thread_local const void* owner = nullptr;
+      thread_local const char* tag = nullptr;
+      thread_local Timer* tagged = nullptr;
+      if (owner != this || tag != threadTag) {
+        owner = this, tag = threadTag;
+        tagged = &timer("LOCK", std::string(name_) + "_wait_" + threadTag);
+      }
+      tagged->add(waited);
+    }
   }
   bool try_lock() { return m_.try_lock(); }
   void unlock() { m_.unlock(); }
