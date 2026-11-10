@@ -33,9 +33,12 @@ Device::Device(Backend& backend, unsigned pipelineWorkers, LogSink log)
   // VPVK_FRAME_OPT=0: no merge / hoist / sink in the frame compiler (CompileOptions::frameOpt). Anything else or unset = on.
   if (const char* e = std::getenv("VPVK_FRAME_OPT"); e && e[0] == '0' && !e[1]) compile_.frameOpt = false;
   log_(std::string("gpu.frame_opt enabled=") + (compile_.frameOpt ? "1" : "0"));
-  // VPVK_FRAME_HOIST_OFF=1 / VPVK_BARRIER_ORDER_OFF=1: no dispatch hoist / no dependency-level order of compute items (value starting with '1').
-  if (const char* e = std::getenv("VPVK_FRAME_HOIST_OFF"); e && e[0] == '1') compile_.dispatchHoist = false, log_("gpu.frame_hoist enabled=0");
-  if (const char* e = std::getenv("VPVK_BARRIER_ORDER_OFF"); e && e[0] == '1') compile_.barrierOrder = false, log_("gpu.barrier_order enabled=0");
+  // VPVK_FRAME_HOIST=1 / VPVK_BARRIER_ORDER=1: dispatch hoist / dependency-level order of compute items, both off by default
+  // (small gain, no viewer data yet). Only a value starting with '1' enables them.
+  if (const char* e = std::getenv("VPVK_FRAME_HOIST"); e && e[0] == '1') compile_.dispatchHoist = true;
+  if (const char* e = std::getenv("VPVK_BARRIER_ORDER"); e && e[0] == '1') compile_.barrierOrder = true;
+  log_(std::string("gpu.frame_hoist enabled=") + (compile_.dispatchHoist ? "1" : "0"));
+  log_(std::string("gpu.barrier_order enabled=") + (compile_.barrierOrder ? "1" : "0"));
   // VPVK_FRAME_FOLD=0: the frame compiler folds the accesses of the draws the slow way (CompileOptions::foldFast).
   if (const char* e = std::getenv("VPVK_FRAME_FOLD"); e && e[0] == '0' && !e[1]) compile_.foldFast = false;
   log_(std::string("gpu.frame_fold enabled=") + (compile_.foldFast ? "1" : "0"));

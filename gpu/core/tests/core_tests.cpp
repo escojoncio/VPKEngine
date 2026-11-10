@@ -590,6 +590,13 @@ void testCuts() {
   uint32_t total = 0;
   for (uint32_t n : cf.stats.cuts) total += n;
   CHECK_EQ(total, static_cast<uint32_t>(cf.encoders.size()));  // every encoder has exactly one reason
+  {  // the dispatch writes what the first pass reads, so the hoist / order options (off by default) change nothing here
+    CompileOptions hz;
+    hz.dispatchHoist = hz.barrierOrder = true;
+    const CompiledFrame ch = compileFrame(f, nullptr, hz);
+    CHECK_EQ(ch.encoders.size(), size_t{6});
+    CHECK_EQ(cuts(ch, CutReason::ComputeWork), 1u);
+  }
 
   // A frame starting with copies: its first render encoder is still FrameStart.
   Frame g;
@@ -2457,9 +2464,12 @@ void testCopyRects() {
     CHECK(rects.barriers.empty());
     CHECK_EQ(hazards(rects, HazardKind::WAW), 0u);
     CompileOptions unordered;
-    unordered.barrierOrder = false;
+    CHECK(!unordered.barrierOrder);  // off by default; `on` above ran in recorded order too
     CHECK_EQ(compileFrame(f, nullptr, unordered).stats.intraBarriers, 270u);  // off: 255 + 15, a chain per mip (mip 1 never conflicts with mip 0)
     CHECK_EQ(compileFrame(f, nullptr, {}).stats.intraBarriers, 270u);  // 272 copies: over kMaxLevelItems, recorded order
+    CompileOptions ordered = on;
+    ordered.barrierOrder = true;  // explicitly on: 272 items are over kMaxLevelItems, so still the recorded order and no barrier
+    CHECK(compileFrame(f, nullptr, ordered).barriers.empty());
   }
   {  // overlapping rects keep their barrier, partially or fully, and a whole-subresource access orders against all
     Frame f;
@@ -4336,12 +4346,18 @@ void testFrameOpt() {
     for (const Encoder& e : cf.encoders) for (uint32_t ci : e.commands) o.push_back(ci);
     return o;
   };
-  const std::vector<uint32_t> oa = order(a), ob = order(b);
+  CompileOptions hz = on;  // dispatch hoist and compute order are off by default: they only act when asked for
+  CHECK(!on.dispatchHoist && !on.barrierOrder);
+  hz.dispatchHoist = hz.barrierOrder = true;
+  const CompiledFrame h = compileFrame(f, &s.res, hz);
+  const std::vector<uint32_t> oa = order(a), ob = order(b), oc = order(h);
+  CHECK_EQ(oa.size(), cmds.size());
+  CHECK(oa == oc);  // (nothing in this frame for the two options to act on: the dispatch 5 ends its encoder either way)
   CHECK_EQ(ob.size(), cmds.size());
   for (uint32_t i = 0; i < ob.size() && i < cmds.size(); ++i) CHECK_EQ(ob[i], i);  // off: the recorded order
   // Same functional result: every pair of commands that conflicts (one writes what the other touches) runs in the recorded
   // order, so each resource sees the same writes in the same relative order, with opt on and off.
-  for (const std::vector<uint32_t>* o : {&oa, &ob}) {
+  for (const std::vector<uint32_t>* o : {&oa, &ob, &oc}) {
     std::vector<size_t> pos(cmds.size(), 0);
     for (size_t k = 0; k < o->size(); ++k) pos[(*o)[k]] = k;
     for (uint32_t i = 0; i < cmds.size(); ++i)
@@ -4377,6 +4393,23 @@ void testFrameOpt() {
       size_t lines = 0;
       for (const std::string& l : log) lines += l == (envOff ? "gpu.frame_opt enabled=0" : "gpu.frame_opt enabled=1");
       CHECK_EQ(lines, size_t{1});
+    }
+  }
+  {  // Device: dispatch hoist and compute order are off (logged enabled=0); VPVK_FRAME_HOIST=1 / VPVK_BARRIER_ORDER=1 turn them on
+    for (int mode = 0; mode < 3; ++mode) {  // unset, "1", "0" (only a value starting with '1' enables)
+      if (mode) setenv("VPVK_FRAME_HOIST", mode == 1 ? "1" : "0", 1), setenv("VPVK_BARRIER_ORDER", mode == 1 ? "1" : "0", 1);
+      std::vector<std::string> log;
+      NullBackend be;
+      Device dev(be, 0, [&](const std::string& l) { log.push_back(l); });
+      unsetenv("VPVK_FRAME_HOIST");
+      unsetenv("VPVK_BARRIER_ORDER");
+      size_t hoist = 0, order = 0;
+      for (const std::string& l : log) {
+        hoist += l == (mode == 1 ? "gpu.frame_hoist enabled=1" : "gpu.frame_hoist enabled=0");
+        order += l == (mode == 1 ? "gpu.barrier_order enabled=1" : "gpu.barrier_order enabled=0");
+      }
+      CHECK_EQ(hoist, size_t{1});
+      CHECK_EQ(order, size_t{1});
     }
   }
 }
@@ -4429,9 +4462,10 @@ void testDispatchHoist() {
   const TextureId c = s.rt();
   const BufferId ubo = s.buf(), vb = s.buf(), staging = s.buf(), x = s.buf();
   CompileOptions on, off, noOpt;
-  off.dispatchHoist = false;
+  on.dispatchHoist = true;  // off by default (VPVK_FRAME_HOIST=1 enables it)
   noOpt.frameOpt = false;
   CHECK(on.dispatchHoist);
+  CHECK(!off.dispatchHoist && !CompileOptions{}.dispatchHoist);
 
   {  // independent dispatch between two equal passes: one render encoder (before: render, compute, render)
     Frame f;
@@ -4447,6 +4481,10 @@ void testDispatchHoist() {
     CHECK_EQ(renderEncoders(b), size_t{2});
     CHECK_EQ(n.encoders.size(), size_t{3});
     CHECK((commandOrder(n) == std::vector<uint32_t>{0, 1, 2}));
+    // the defaults do not hoist: same as off
+    const CompiledFrame d = compileFrame(f, &s.res, {});
+    CHECK_EQ(d.encoders.size(), size_t{3});
+    CHECK((commandOrder(d) == std::vector<uint32_t>{0, 1, 2}));
   }
   {  // a dispatch after an earlier compute encoder joins it
     Frame f;
@@ -4578,9 +4616,10 @@ void testBarrierOrder() {
   std::vector<BufferId> ring, out;
   for (int i = 0; i < 15; ++i) ring.push_back(s.buf()), out.push_back(s.buf());
   CompileOptions on, off, noOpt;
-  off.barrierOrder = false;
+  on.barrierOrder = true;  // off by default (VPVK_BARRIER_ORDER=1 enables it)
   noOpt.frameOpt = false;
   CHECK(on.barrierOrder);
+  CHECK(!off.barrierOrder && !CompileOptions{}.barrierOrder);
   Frame f;
   for (int i = 0; i < 15; ++i) {
     f.dispatch(Scene::compute({read(ResourceRange::bytes(in, 0, 256), stage::compute),
@@ -4592,6 +4631,9 @@ void testBarrierOrder() {
   CHECK_EQ(a.encoders.size(), size_t{1});
   CHECK_EQ(b.stats.intraBarriers, 15u);
   CHECK_EQ(n.stats.intraBarriers, 15u);  // frameOpt off: recorded order
+  const CompiledFrame d = compileFrame(f, &s.res, {});
+  CHECK_EQ(d.stats.intraBarriers, 15u);  // defaults: recorded order
+  CHECK((commandOrder(d) == commandOrder(n)));
   CHECK_EQ(a.stats.intraBarriers, 1u);
   CHECK_EQ(a.barriers.size(), size_t{1});
   CHECK_EQ(a.barriers[0].item, 15u);  // in front of the first GS
