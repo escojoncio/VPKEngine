@@ -2459,7 +2459,7 @@ void testCopyRects() {
     CompileOptions unordered;
     unordered.barrierOrder = false;
     CHECK_EQ(compileFrame(f, nullptr, unordered).stats.intraBarriers, 270u);  // off: 255 + 15, a chain per mip (mip 1 never conflicts with mip 0)
-    CHECK_EQ(compileFrame(f, nullptr, {}).stats.intraBarriers, 255u);  // the two chains run side by side: one barrier per level
+    CHECK_EQ(compileFrame(f, nullptr, {}).stats.intraBarriers, 270u);  // 272 copies: over kMaxLevelItems, recorded order
   }
   {  // overlapping rects keep their barrier, partially or fully, and a whole-subresource access orders against all
     Frame f;
@@ -4518,6 +4518,57 @@ void testDispatchHoist() {
     const CompiledFrame a = compileFrame(f, &s.res, on);
     CHECK(conflictOrderKept(f, a));
   }
+  {  // a run of dispatches of which a later one depends on the pass: the encoder would split for nothing, so none is hoisted
+    Frame f;
+    Scene::passWithDraw(f, Scene::pass(c), {write(ResourceRange::bytes(x, 0, 256), stage::fragment)});  // 0
+    for (uint32_t k = 0; k < 4; ++k)
+      f.dispatch(Scene::compute({k < 2 ? write(ResourceRange::bytes(vb, 256 * k, 256), stage::compute)
+                                       : read(ResourceRange::bytes(x, 0, 256), stage::compute)}));      // 1, 2 free; 3, 4 read x
+    const CompiledFrame a = compileFrame(f, &s.res, on), b = compileFrame(f, &s.res, off);
+    CHECK_EQ(a.encoders.size(), size_t{2});  // [R0][C d1..d4], as before
+    CHECK((commandOrder(a) == std::vector<uint32_t>{0, 1, 2, 3, 4}));
+    CHECK_EQ(a.encoders.size(), b.encoders.size());
+    CHECK((commandOrder(a) == commandOrder(b)));
+    // ...but with only the free ones, and a pass after them to join, the hoist pays
+    Frame g;
+    Scene::passWithDraw(g, Scene::pass(c), {write(ResourceRange::bytes(x, 0, 256), stage::fragment)});
+    for (uint32_t k = 0; k < 2; ++k) g.dispatch(Scene::compute({write(ResourceRange::bytes(vb, 256 * k, 256), stage::compute)}));
+    Scene::passWithDraw(g, Scene::pass(c), {Scene::vsRead(ubo, 0)});
+    const CompiledFrame h = compileFrame(g, &s.res, on);
+    CHECK_EQ(h.encoders.size(), size_t{2});
+    CHECK_EQ(renderEncoders(h), size_t{1});
+    // a sunk copy that a later dispatch reads ends the encoder too
+    Frame k;
+    Scene::passWithDraw(k, Scene::pass(c), {Scene::vsRead(vb, 0)});                                  // 0
+    k.dispatch(Scene::compute({write(ResourceRange::bytes(x, 0, 256), stage::compute)}));            // 1: free
+    k.copyBuffer(Scene::span(staging), Scene::span(vb, 0));                                          // 2: WAR on vb -> sunk
+    k.dispatch(Scene::compute({read(ResourceRange::bytes(vb, 0, 256), stage::compute)}));            // 3: reads the sunk copy
+    const CompiledFrame kc = compileFrame(k, &s.res, on);
+    CHECK((commandOrder(kc) == std::vector<uint32_t>{0, 1, 2, 3}));
+    CHECK_EQ(kc.encoders.size(), size_t{2});
+  }
+  {  // Dispatch::opaque: never hoisted, and nothing is hoisted past it
+    Frame f;
+    Dispatch o = Scene::compute({write(ResourceRange::bytes(x, 0, 256), stage::compute)});
+    o.opaque = true;
+    Scene::passWithDraw(f, Scene::pass(c), {Scene::vsRead(ubo, 0)});
+    f.dispatch(std::move(o));
+    Scene::passWithDraw(f, Scene::pass(c), {Scene::vsRead(ubo, 256)});
+    CHECK_EQ(compileFrame(f, &s.res, on).encoders.size(), size_t{3});
+    CHECK((commandOrder(compileFrame(f, &s.res, on)) == std::vector<uint32_t>{0, 1, 2}));
+
+    const TextureId c2 = s.rt();
+    Frame g;
+    g.dispatch(Scene::compute({write(ResourceRange::bytes(vb, 0, 256), stage::compute)}));            // 0: C_a
+    Scene::passWithDraw(g, Scene::pass(c), {Scene::vsRead(ubo, 0)});                                 // 1
+    Dispatch o2 = Scene::compute({write(ResourceRange::bytes(x, 0, 256), stage::compute)});
+    o2.opaque = true;
+    g.dispatch(std::move(o2));                                                                        // 2: opaque, own compute encoder
+    Scene::passWithDraw(g, Scene::pass(c2), {Scene::vsRead(ubo, 256)});                              // 3
+    g.dispatch(Scene::compute({write(ResourceRange::bytes(staging, 0, 256), stage::compute)}));       // 4: free, but not above 2
+    const std::vector<uint32_t> og = commandOrder(compileFrame(g, &s.res, on));
+    CHECK(std::find(og.begin(), og.end(), 4u) > std::find(og.begin(), og.end(), 2u));
+  }
 }
 
 // CompileOptions::barrierOrder: ES/GS pairs of disjoint rings in one compute encoder take one barrier, not one per pair.
@@ -4579,6 +4630,50 @@ void testBarrierOrder() {
       g.dispatch(Scene::compute({write(ResourceRange::bytes(ring[i], 0, 256), stage::compute)}));
     }
     CHECK((commandOrder(compileFrame(g, &s.res, on)) == std::vector<uint32_t>{0, 1, 2}));
+  }
+  {  // a copy between two runs of dispatches: nothing moves across it, each run orders on its own
+    Frame g;
+    const auto rd = [&](BufferId b, uint64_t o = 0) { return read(ResourceRange::bytes(b, o, 256), stage::compute); };
+    const auto wr = [&](BufferId b, uint64_t o = 0) { return write(ResourceRange::bytes(b, o, 256), stage::compute); };
+    const BufferId a = s.buf(), b = s.buf();
+    for (int i = 0; i < 4; ++i) g.dispatch(Scene::compute({rd(in), wr(ring[i])})), g.dispatch(Scene::compute({rd(ring[i]), wr(out[i])}));
+    g.copyBuffer(Scene::span(a), Scene::span(b));  // 8
+    for (int i = 4; i < 8; ++i) g.dispatch(Scene::compute({rd(in), wr(ring[i])})), g.dispatch(Scene::compute({rd(ring[i]), wr(out[i])}));
+    const CompiledFrame c = compileFrame(g, &s.res, on);
+    CHECK_EQ(c.encoders.size(), size_t{1});
+    const std::vector<uint32_t> o = commandOrder(c);
+    CHECK_EQ(o[8], 8u);
+    for (uint32_t k = 0; k < 8; ++k) CHECK(o[k] < 8);
+    for (uint32_t k = 9; k < 17; ++k) CHECK(o[k] > 8);
+    CHECK_EQ(c.stats.intraBarriers, 2u);  // one per run (the copy takes none: it touches neither)
+    CHECK(conflictOrderKept(g, c));
+    // an opaque dispatch in a run is a run of its own
+    Frame h;
+    for (int i = 0; i < 3; ++i) h.dispatch(Scene::compute({rd(in), wr(ring[i])})), h.dispatch(Scene::compute({rd(ring[i]), wr(out[i])}));
+    Dispatch op = Scene::compute({rd(in), wr(ring[9])});
+    op.opaque = true;
+    h.dispatch(std::move(op));
+    for (int i = 3; i < 6; ++i) h.dispatch(Scene::compute({rd(in), wr(ring[i])})), h.dispatch(Scene::compute({rd(ring[i]), wr(out[i])}));
+    const std::vector<uint32_t> oh = commandOrder(compileFrame(h, &s.res, on));
+    CHECK_EQ(oh[6], 6u);
+    for (uint32_t k = 0; k < 6; ++k) CHECK(oh[k] < 6);
+  }
+  {  // the cost bound: more than kMaxLevelItems items in a run, or a scan needing too many comparisons, keep the recorded order
+    Scene big;
+    const BufferId in2 = big.buf(), ringBuf = big.buf(256 * 400), outBuf = big.buf(256 * 400);
+    const auto rd = [&](BufferId b, uint64_t o) { return read(ResourceRange::bytes(b, o, 256), stage::compute); };
+    const auto wr = [&](BufferId b, uint64_t o) { return write(ResourceRange::bytes(b, o, 256), stage::compute); };
+    const auto pairs = [&](int n) {
+      Frame g;
+      for (int i = 0; i < n; ++i) {
+        g.dispatch(Scene::compute({rd(in2, 0), wr(ringBuf, 256 * i)}));
+        g.dispatch(Scene::compute({rd(ringBuf, 256 * i), wr(outBuf, 256 * i)}));
+      }
+      return g;
+    };
+    CHECK_EQ(compileFrame(pairs(8), &big.res, on).stats.intraBarriers, 1u);     // ranges of one buffer: still ordered
+    CHECK_EQ(compileFrame(pairs(150), &big.res, on).stats.intraBarriers, 150u);  // 300 items: over the item cap
+    CHECK_EQ(compileFrame(pairs(100), &big.res, on).stats.intraBarriers, 100u);  // 200 items, ~20k comparisons: over the budget
   }
 }
 
