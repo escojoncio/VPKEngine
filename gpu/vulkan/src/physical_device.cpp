@@ -463,6 +463,11 @@ std::vector<VkExtensionProperties> deviceExtensions() {
   v.push_back({VK_EXT_VERTEX_ATTRIBUTE_DIVISOR_EXTENSION_NAME, 3});              // lower.cpp dividedInstance (vertex pulling)
   v.push_back({VK_EXT_ASTC_DECODE_MODE_EXTENSION_NAME, 1});                      // VkImageViewASTCDecodeModeEXT accepted, decoded as float
   v.push_back({VK_EXT_TEXEL_BUFFER_ALIGNMENT_EXTENSION_NAME, 1});                // properties + features in entry.cpp
+  // gl_Layer from the vertex stage (lower.cpp BuiltIn::Layer -> [[render_target_array_index]]; a write of gl_ViewportIndex
+  // is dropped: one viewport). The Quest 3 driver lists it and Unity takes "render target array index from any shader"
+  // from this name alone: without it a shader with a vertex SV_RenderTargetArrayIndex is unsupported there (Meta's
+  // environment depth preprocessing: "DrawProceduralNow requires a successful material.SetPass").
+  v.push_back({VK_EXT_SHADER_VIEWPORT_INDEX_LAYER_EXTENSION_NAME, 1});
   // What Half-Life: Alyx (Source 2) asks of a Vulkan 1.3 device and an Adreno does not list: native identity only,
   // never with the Quest identity (not even with VPVK_EXTRA_EXTENSIONS=1).
   if (nativeExtras()) {

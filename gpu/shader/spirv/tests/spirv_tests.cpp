@@ -154,6 +154,26 @@ void meshMultiview(const std::string& dir, const std::string& v) {
     o.vertexBuffers[1].divisor = 1;
 }
 
+// Vertex shader of a layered (not multiview) pass, VK_EXT_shader_viewport_index_layer: OpCapability ShaderViewportIndexLayerEXT;
+// gl_Layer = gl_InstanceIndex; gl_Position = (0,0,0,1). What Unity emits for a vertex SV_RenderTargetArrayIndex.
+const std::vector<uint32_t> kLayerFromInstanceVert = {
+    0x07230203, 0x00010000, 0x00000000, 0x00000012, 0x00000000, 0x00020011, 0x00000001, 0x00020011,
+    0x00001486, 0x000a000a, 0x5f565053, 0x5f545845, 0x64616873, 0x765f7265, 0x70776569, 0x5f74726f,
+    0x65646e69, 0x616c5f78, 0x00726579, 0x0003000e, 0x00000000, 0x00000001, 0x0008000f, 0x00000000,
+    0x0000000f, 0x6e69616d, 0x00000000, 0x00000006, 0x00000009, 0x0000000b, 0x00040047, 0x00000006,
+    0x0000000b, 0x00000000, 0x00040047, 0x00000009, 0x0000000b, 0x00000009, 0x00040047, 0x0000000b,
+    0x0000000b, 0x0000002b, 0x00020013, 0x00000001, 0x00030021, 0x00000002, 0x00000001, 0x00030016,
+    0x00000003, 0x00000020, 0x00040017, 0x00000004, 0x00000003, 0x00000004, 0x00040020, 0x00000005,
+    0x00000003, 0x00000004, 0x0004003b, 0x00000005, 0x00000006, 0x00000003, 0x00040015, 0x00000007,
+    0x00000020, 0x00000001, 0x00040020, 0x00000008, 0x00000003, 0x00000007, 0x0004003b, 0x00000008,
+    0x00000009, 0x00000003, 0x00040020, 0x0000000a, 0x00000001, 0x00000007, 0x0004003b, 0x0000000a,
+    0x0000000b, 0x00000001, 0x0004002b, 0x00000003, 0x0000000c, 0x00000000, 0x0004002b, 0x00000003,
+    0x0000000d, 0x3f800000, 0x0007002c, 0x00000004, 0x0000000e, 0x0000000c, 0x0000000c, 0x0000000c,
+    0x0000000d, 0x00050036, 0x00000001, 0x0000000f, 0x00000000, 0x00000002, 0x000200f8, 0x00000010,
+    0x0004003d, 0x00000007, 0x00000011, 0x0000000b, 0x0003003e, 0x00000009, 0x00000011, 0x0003003e,
+    0x00000006, 0x0000000e, 0x000100fd, 0x00010038,
+};
+
 // Fragment shader writing gl_ViewIndex to a uint colour (tests/asm style, assembled with spvasm.py):
 //   OpCapability MultiView; %vi = Input uint BuiltIn ViewIndex Flat; out uint Location 0; store load(%vi).
 const std::vector<uint32_t> kViewIndexFrag = {
@@ -317,6 +337,14 @@ void amplify(const std::string& dir, const std::string& v) {
         CHECK(l.ok);
         CHECK(l.msl.source.find("render_target_array_index") != std::string::npos);
         CHECK(l.msl.source.find("loc63") == std::string::npos);
+    }
+    {  // gl_Layer written by the vertex stage of a pass with no view mask: the render target layer, from the instance
+        spirv::SpirvLowerOptions v;
+        v.entry = "main", v.stage = vpir::Stage::Vertex;
+        Result r = runWords(kLayerFromInstanceVert, v);
+        CHECK(r.ok && !r.iface.amplified);
+        CHECK(r.msl.source.find("[[render_target_array_index]]") != std::string::npos);
+        CHECK(r.msl.source.find("[[instance_id]]") != std::string::npos && r.msl.source.find("vp_out.layer = ") != std::string::npos);
     }
     {  // declaresLayer (why a multiview pipeline is not amplified): BuiltIn Layer (9) on a variable; ViewIndex (0x1158) is not it
         auto layer = [](bool withLayer) {
