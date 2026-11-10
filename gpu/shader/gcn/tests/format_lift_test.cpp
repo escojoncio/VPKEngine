@@ -17,6 +17,7 @@
 #include "format_programs.inc"
 #include "vpgcn/formats.h"
 #include "vpgcn/lift.h"
+#include "vpir/text.h"
 #include "vpir/verify.h"
 
 using namespace vpgcn;
@@ -221,6 +222,62 @@ void testTypedBuffers() {
         }
     }
     std::printf("typed buffers: %u (dfmt,nfmt,n) store programs\n", combos);
+}
+
+// A typed load past the end of the records reads zeros, and one inside decodes the element, with the V#'s NUM_RECORDS at
+// the element's size, one byte under it and zero. The load reads through a clamped address and selects the result (no
+// `if` statement in the module), so the reads of the components can overlap.
+void testTypedRange() {
+    const std::vector<uint32_t> loads[4] = {prog(kLoadx), prog(kLoadxy), prog(kLoadxyz), prog(kLoadxyzw)};
+    unsigned combos = 0;
+    for (unsigned dfmt = 1; dfmt <= 14; ++dfmt) {
+        const FormatLayout& l = layoutOf(dfmt);
+        for (unsigned nfmt : {kUnorm, kUint, kFloat}) {
+            for (unsigned n = 1; n <= 4; ++n) {
+                Lifted ll;
+                if (!liftIt(ll, withFormat(loads[n - 1], dfmt, nfmt), ShaderStage::Compute, 12)) {
+                    CHECK(false, "lift load dfmt %u nfmt %u n %u", dfmt, nfmt, n);
+                    continue;
+                }
+                const int inSlot = ll.bufferSlot(4), outSlot = ll.bufferSlot(8);
+                if (inSlot < 0 || outSlot < 0) {
+                    CHECK(false, "load slots");
+                    continue;
+                }
+                // (the program's store of the four result dwords is four guarded stores: its `if` statements are the only ones)
+                const std::string text = V::print(ll.r.module);
+                unsigned ifs = 0;
+                for (size_t at = text.find("if %"); at != std::string::npos; at = text.find("if %", at + 1)) ++ifs;
+                CHECK(ifs <= 4, "dfmt %u nfmt %u n %u: %u `if` statements, the store's 4 alone wanted", dfmt, nfmt, n, ifs);
+                ++combos;
+                const unsigned bytes = std::max<unsigned>(1, l.bytes);
+                for (unsigned num : {0u, bytes - 1, bytes, 0x1000u}) {
+                    uint32_t words[4] = {~0u, ~0u, ~0u, ~0u};
+                    vpireval::Invocation inv;
+                    std::vector<uint32_t> vsharp(12, 0);
+                    vsharp[6] = num, vsharp[10] = 0x1000;
+                    userData(inv, ll, vsharp);
+                    inv.memory[inSlot].assign(reinterpret_cast<uint8_t*>(words), reinterpret_cast<uint8_t*>(words) + 16);
+                    inv.memory[outSlot] = std::vector<uint8_t>(16, 0xcd);
+                    std::string err;
+                    if (!vpireval::run(ll.r.module, inv, err)) {
+                        CHECK(false, "eval load dfmt %u nfmt %u num %u: %s", dfmt, nfmt, num, err.c_str());
+                        break;
+                    }
+                    uint32_t dec[4] = {}, got[4];
+                    const bool inside = num >= bytes;
+                    if (inside) decodeTexel(dfmt, nfmt, words, 0, dec);
+                    std::memcpy(got, inv.memory[outSlot].data(), 16);
+                    const bool integer = isIntegerNumFmt(nfmt);
+                    for (unsigned c = 0; c < 4; ++c)
+                        CHECK(sameValue(got[c], c < n ? dec[c] : 0, !integer), "load dfmt %u nfmt %u n %u num_records %u comp %u: got %08x want %08x", dfmt,
+                              nfmt, n, num, c, got[c], c < n ? dec[c] : 0);
+                    if (!inside) CHECK(got[0] == 0, "out of range load of dfmt %u nfmt %u gave %08x", dfmt, nfmt, got[0]);
+                }
+            }
+        }
+    }
+    std::printf("typed buffer range: %u (dfmt,nfmt,n) load programs\n", combos);
 }
 
 // ---- colour exports --------------------------------------------------------------------------------
@@ -566,6 +623,7 @@ void testTextures() {
 
 int main() {
     testTypedBuffers();
+    testTypedRange();
     testExports();
     testTextures();
     if (failures) {

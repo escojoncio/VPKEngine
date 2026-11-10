@@ -2537,6 +2537,15 @@ struct Lifter {
         return b->loadVar(t);
     }
 
+    // VPGCN_FETCH_GUARDS=1: the loads that read a wide or typed access guard each dword with its own `if`, as before.
+    static bool perDwordFetchGuards() {
+        static const bool on = [] {
+            const char* e = std::getenv("VPGCN_FETCH_GUARDS");
+            return e && e[0] == '1';
+        }();
+        return on;
+    }
+
     // Typed load: `n` components of format dfmt/nfmt at addr -> f32/u32 bit patterns. The element
     // is read as dwords (sub-dword elements from the dword that holds them) and converted by
     // FormatEmitter (vpgcn/formats.h: every data x number format).
@@ -2698,16 +2707,23 @@ struct Lifter {
         if (typed) {
             unsigned bytes = std::max(1u, unsigned(fl.bytes));
             ValueId ok = bin(V::Op::And, bufferInRange(ba, 0), bufferInRange(ba, bytes - 1), V::kBool);
-            std::vector<uint32_t> tmp;
-            for (unsigned k = 0; k < n; ++k) {
-                tmp.push_back(b->variable(U));
-                b->storeVar(tmp.back(), u(0));
+            if (perDwordFetchGuards()) {
+                std::vector<uint32_t> tmp;
+                for (unsigned k = 0; k < n; ++k) {
+                    tmp.push_back(b->variable(U));
+                    b->storeVar(tmp.back(), u(0));
+                }
+                b->beginIf(ok);
+                std::vector<ValueId> got = loadFormat(slot, addr, dfmt, nfmt, n);
+                for (unsigned k = 0; k < n; ++k) b->storeVar(tmp[k], got[k]);
+                b->end();
+                for (unsigned k = 0; k < n; ++k) vals.push_back(b->loadVar(tmp[k]));
+            } else {
+                // Out of range reads address 0 of the buffer (the host binds at least a zero page there) and the select
+                // gives 0: no branch, so the reads of the components can overlap.
+                std::vector<ValueId> got = loadFormat(slot, sel(ok, addr, u(0), U), dfmt, nfmt, n);
+                for (unsigned k = 0; k < n; ++k) vals.push_back(sel(ok, got[k], u(0), U));
             }
-            b->beginIf(ok);
-            std::vector<ValueId> got = loadFormat(slot, addr, dfmt, nfmt, n);
-            for (unsigned k = 0; k < n; ++k) b->storeVar(tmp[k], got[k]);
-            b->end();
-            for (unsigned k = 0; k < n; ++k) vals.push_back(b->loadVar(tmp[k]));
         } else if (name.ends_with("_ubyte") || name.ends_with("_sbyte") || name.ends_with("_ushort") || name.ends_with("_sshort")) {
             bool half = name.ends_with("short");
             ValueId a = half ? bin(V::Op::And, addr, u(~1u), U) : addr;
@@ -2721,8 +2737,30 @@ struct Lifter {
         } else {
             unsigned dw = name.ends_with("x4") ? 4 : name.ends_with("x3") ? 3 : name.ends_with("x2") ? 2 : 1;
             ValueId base = bin(V::Op::And, addr, u(~3u), U);
-            for (unsigned k = 0; k < dw; ++k)
-                vals.push_back(guardedValue(bufferInRange(ba, 4 * k), [&] { return b->load(slot, bin(V::Op::Add, base, u(4 * k), U), U); }));
+            if (dw == 1 || perDwordFetchGuards()) {
+                for (unsigned k = 0; k < dw; ++k)
+                    vals.push_back(guardedValue(bufferInRange(ba, 4 * k), [&] { return b->load(slot, bin(V::Op::Add, base, u(4 * k), U), U); }));
+            } else {
+                // One check for the whole access (first and last dword, and that the last address did not wrap past 2^32:
+                // then every dword in between is in range too). Inside: the loads in one block, none guarded. Else dword by
+                // dword: out of range reads 0, a dword inside the records keeps its data (the loads there read address 0
+                // when out of range and the select drops them).
+                ValueId whole = bin(V::Op::And, bufferInRange(ba, 0), bufferInRange(ba, 4 * (dw - 1)), V::kBool);
+                if (ba.hi == V::kNoValue)
+                    whole = bin(V::Op::And, whole, bin(V::Op::Ge, bin(V::Op::Add, ba.addr, u(4 * (dw - 1)), U), ba.addr, V::kBool), V::kBool);
+                std::vector<uint32_t> tmp;
+                for (unsigned k = 0; k < dw; ++k) tmp.push_back(b->variable(U));
+                b->beginIf(whole);
+                for (unsigned k = 0; k < dw; ++k) b->storeVar(tmp[k], b->load(slot, bin(V::Op::Add, base, u(4 * k), U), U));
+                b->beginElse();
+                for (unsigned k = 0; k < dw; ++k) {
+                    ValueId ok = bufferInRange(ba, 4 * k);
+                    ValueId got = b->load(slot, sel(ok, bin(V::Op::Add, base, u(4 * k), U), u(0), U), U);
+                    b->storeVar(tmp[k], sel(ok, got, u(0), U));
+                }
+                b->end();
+                for (unsigned k = 0; k < dw; ++k) vals.push_back(b->loadVar(tmp[k]));
+            }
         }
         if (x.mem.lds) {
             // The data goes to LDS instead of the VGPRs: at M0[15:0] + the instruction's offset + lane * 4.
