@@ -2698,7 +2698,7 @@ struct Lifter {
         if (typed) {
             unsigned bytes = std::max(1u, unsigned(fl.bytes));
             ValueId ok = bin(V::Op::And, bufferInRange(ba, 0), bufferInRange(ba, bytes - 1), V::kBool);
-            if (perDwordFetchGuards()) {
+            if (perDwordFetchGuards() || inDispatchLoop) {
                 std::vector<uint32_t> tmp;
                 for (unsigned k = 0; k < n; ++k) {
                     tmp.push_back(b->variable(U));
@@ -2729,7 +2729,7 @@ struct Lifter {
         } else {
             unsigned dw = name.ends_with("x4") ? 4 : name.ends_with("x3") ? 3 : name.ends_with("x2") ? 2 : 1;
             ValueId base = bin(V::Op::And, addr, u(~3u), U);
-            if (dw == 1 || perDwordFetchGuards()) {
+            if (dw == 1 || perDwordFetchGuards() || inDispatchLoop) {
                 for (unsigned k = 0; k < dw; ++k)
                     vals.push_back(guardedValue(bufferInRange(ba, 4 * k), [&] { return b->load(slot, bin(V::Op::Add, base, u(4 * k), U), U); }));
             } else {
@@ -4961,9 +4961,15 @@ struct Lifter {
         if (k >= 0 && k != stop && k != exit && w.ok) loopEdge(k, w);
     }
 
+    // Inside the dispatch loop the buffer loads keep the per-dword guards (VPGCN_FETCH_GUARDS=1): no whole-access `if` / `else`
+    // and no select form there: the code these programs had before the lighter loads (the dispatch loop shader that failed to
+    // build in LOGS_11 built with it in LOGS_8).
+    bool inDispatchLoop = false;
+
     void dispatchLoop() {
         uint32_t blk = b->variable(V::kU32);
         b->storeVar(blk, u(0));
+        inDispatchLoop = true;
         b->beginLoop();
         for (size_t k = 0; k < blocks.size(); ++k) {
             const BasicBlock& bb = blocks[k];
@@ -4982,6 +4988,7 @@ struct Lifter {
         }
         b->breakLoop();
         b->end();
+        inDispatchLoop = false;
     }
 
     // ---- Entry state ---------------------------------------------------------------------------
