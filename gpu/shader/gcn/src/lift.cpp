@@ -5165,7 +5165,8 @@ struct Lifter {
                     if (bi <= 6 && bi != 3) {
                         V::Interp ip = bi >= 4 ? V::Interp::Linear : V::Interp::Perspective;
                         unsigned mode = bi >= 4 ? bi - 4 : bi;
-                        V::Sampling sm = mode == 0 ? V::Sampling::Sample : mode == 2 ? V::Sampling::Centroid : V::Sampling::Center;
+                        V::Sampling sm = mode == 0 ? (in.psIterSample ? V::Sampling::Sample : V::Sampling::Centroid)
+                                         : mode == 2 ? V::Sampling::Centroid : V::Sampling::Center;
                         bary[v] = {ip, sm, false};
                         bary[v + 1] = {ip, sm, true};
                         b->storeVar(vVar(v), u(0));

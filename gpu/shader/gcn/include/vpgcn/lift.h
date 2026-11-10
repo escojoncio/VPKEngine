@@ -170,6 +170,10 @@ struct LiftInput {
     // Pixel: SPI_PS_INPUT_ADDR (the input VGPR layout, in the hardware order; the enabled inputs
     // are a subset of it).
     uint32_t psInputAddr = 0x2;        // default: perspective centre barycentrics only
+    // Pixel: the rasterizer runs the shader per sample (PA_SC_MODE_CNTL_1.PS_ITER_SAMPLE). Clear: a sample
+    // barycentric (PERSP_SAMPLE / LINEAR_SAMPLE) is interpolated at the centroid, as the host runs a shader
+    // that reads a sample-interpolated input once per sample.
+    bool psIterSample = true;
     // Vertex: VGPR_COMP_CNT (v0 vertex index; 3 adds v1-v3 with v3 the instance id).
     unsigned vgprCompCnt = 3;
     // VS: VGT_INSTANCE_STEP_RATE_0/1, the divisors of the instance id in v1 / v2 (0: unknown, the

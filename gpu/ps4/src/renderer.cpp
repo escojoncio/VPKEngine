@@ -227,8 +227,14 @@ struct Renderer::Impl {
         uint64_t fillPath[5] = {}, fillPathBytes[5] = {};                  // none, GPU detile, CPU detile, linear upload, not filled
         uint64_t mirrorCalls = 0, mirrorCopies = 0, mirrorBytes = 0;
         uint64_t depthPartnerDraws = 0, depthPartnerRetroClears = 0;  // depth-only draws that kept their colour target attached / colour clears that became the load action of the open pass
+        // Multisampled colour draws the scene's depth cannot hide: no depth test (or Always, or no depth target), a viewport depth
+        // range of their own, depth clamp; `sceneLines`: VPKENGINE_PROBE SCENEDRAW lines written (the first 60 of the first two).
+        uint64_t sceneDrawsUntested = 0, sceneDrawsZRange = 0, sceneDrawsClamped = 0, sceneLines = 0;
+        uint64_t a2mUnwrittenDraws = 0;  // draws with DB_ALPHA_TO_MASK that write no colour (a prepass: masked by the shader's alpha all the same)
+        uint64_t psSampleIdDraws = 0;  // multisampled draws whose pixel shader reads the sample id (run per sample on the host)
         uint64_t depth1xShared = 0;  // one-sample draws that tested against the single-sample picture of a multisampled depth surface (not a depth of their own)
         uint64_t msaaColourOnTile = 0, msaaColourStored = 0;  // draws whose multisampled colour attachment keeps its samples on tile (autoMsaa) / stores them
+        uint64_t psSampleBaryDraws = 0, psSampleIterDraws = 0;  // multisampled draws whose pixel shader reads the sample barycentrics / of those, that run per sample on the host
         uint64_t depthClearFills = 0, depthClearLines = 0;  // layers of a texture given the clear value of their depth buffer (Renderer::depthCleared)
         uint64_t depthAllocLines = 0, depthWritesUntracked = 0, flatTables = 0;  // depth targets made drawn smaller than their allocation (VPKENGINE_PROBE DEPTHALLOC)
         uint64_t msDraws[4][4] = {};  // samples the title asked for (1,2,4,8) x samples the host draws with
@@ -1518,6 +1524,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         in.geom.outPrim = s.geom.outPrim;
         in.geom.gsInstances = std::max(s.geom.gsInstances, 1u);
         in.psInputAddr = s.psInputAddr;
+        in.psIterSample = s.psIterSample;
         in.instanceStepRate[0] = s.instanceStepRate[0];
         in.instanceStepRate[1] = s.instanceStepRate[1];
         for (unsigned k = 0; k < 3; ++k) {
@@ -1550,6 +1557,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         h.value(s.vgprCompCnt);
         if (stage == vpgcn::ShaderStage::Pixel) {
             h.value(s.psInputAddr);
+            h.value(s.psIterSample);
             h.value(s.exportFormat);
             h.value(s.psNumInterp);
             h.value(s.dualSource);
@@ -5470,6 +5478,11 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
     // Multisampled colour targets keep their samples on tile (Attachment::autoMsaa) and only the single-sample picture travels between
     // passes. VPKENGINE_MSAA_COLOUR_STORED=1: the samples are stored and loaded at every pass boundary, as before.
     bool msaaColourStored = std::getenv("VPKENGINE_MSAA_COLOUR_STORED") != nullptr;
+    // A pixel shader that reads the sample barycentrics runs once per sample on the host. On the hardware that is a rasterizer
+    // state (PS_ITER_SAMPLE, Stage::psIterSample): without it the sample barycentrics are interpolated at the centroid and the shader
+    // runs once per pixel. VPKENGINE_PS_SAMPLE_RATE=1: always per sample, as before.
+    bool psSampleRateOff = std::getenv("VPKENGINE_PS_SAMPLE_RATE") != nullptr;
+    bool a2mWrittenOnly = std::getenv("VPKENGINE_A2M_WRITTEN_ONLY") != nullptr;  // (DB_ALPHA_TO_MASK only where colour 0 is written: see draw())
 
     void closePass() {
         if (passOpen) frame.endRenderPass();
@@ -5575,7 +5588,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
                 continue;
             }
             if (!plan.exact && plan.why) note(plan.why);
-            if (!unwritten) curExport[i] = plan.conv;
+            if (!unwritten || (i == 0 && d.alphaToMask && !a2mWrittenOnly)) curExport[i] = plan.conv;  // (the alpha of an unwritten colour 0 still masks)
             if (!linearTiling(c.tileMode)) note("render targets kept in GPU memory (guest copy not written)");
             vpgpu::Format viewAs = vpgpu::Format::Undefined;
             Target* tg = target(colorTargets, c.address, f, c.width, c.height, samples,
@@ -5851,10 +5864,14 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         ps.samples = samples;
         // DB_ALPHA_TO_MASK: Metal's alpha-to-coverage with several samples; with one, the pixel shader does an
         // alpha test at 0.5 (LiftInput::alphaTest), which is what the coverage mask comes to.
-        // (colour 0 must be bound for real: a slot left out, or with its write mask empty, has no alpha to test)
-        const bool color0 = ps.colorFormats[0] != vpgpu::Format::Undefined && partnerSlot != 0;  // (a partner only attached is not written)
+        // The mask comes from the alpha the shader exports to colour 0 whether or not that target is written (DB, not CB: a
+        // depth-only prepass of alpha-tested or fading geometry must leave the same holes as the colour pass): with colour 0
+        // attached, even unwritten, Metal's alpha-to-coverage (its write mask may be empty); with none, the alpha test.
+        // VPKENGINE_A2M_WRITTEN_ONLY=1: only where colour 0 is written, as before.
+        const bool color0 = ps.colorFormats[0] != vpgpu::Format::Undefined && (partnerSlot != 0 || !a2mWrittenOnly);
         ps.alphaToCoverage = d.alphaToMask && color0 && samples > 1;
-        alphaTestNow = d.alphaToMask && color0 && samples <= 1;
+        alphaTestNow = d.alphaToMask && (a2mWrittenOnly ? color0 && samples <= 1 : !ps.alphaToCoverage);
+        if (d.alphaToMask && colorIds.empty()) ++pstat.a2mUnwrittenDraws;
 
         // Foveation: a pass over two-slice targets renders both eyes through a rate map.
         viewIndexedNow = false;
@@ -5883,6 +5900,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         Stage vsStage = d.vs, psStage = d.ps;
         vsStage.clipSpaceGL = !d.raster.clipSpaceZeroToW;
         psStage.dualSource = dualSource;
+        psStage.psIterSample = d.ps.psIterSample || psSampleRateOff;
         const uint32_t inPrim = uint32_t(d.primitive);
         Stage vsCopy, esStage, gsStage;
         const Stage* vsSrc = &vsStage;
@@ -6305,6 +6323,28 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         if (depth1x) ++pstat.depth1xShared;
         if (colourOnTile) ++pstat.msaaColourOnTile;
         if (colourStored) ++pstat.msaaColourStored;
+        if (samples > 1 && fs && (d.ps.psInputAddr & 0x11)) {
+            ++pstat.psSampleBaryDraws;
+            if (psStage.psIterSample) ++pstat.psSampleIterDraws;
+        }
+        if (samples > 1 && fs && (d.ps.psInputAddr & 0x2000)) ++pstat.psSampleIdDraws;
+        if (samples > 1 && !colorIds.empty()) {
+            const ViewportZ pz = viewportDepthRange(d.viewport, d.raster.clipSpaceZeroToW);
+            bool clampApproximated = false;
+            const bool untested = zf == vpgpu::Format::Undefined || !ps.depthTest || ps.depthCompare == vpgpu::CompareOp::Always;
+            const bool zRange = pz.znear > 0.0f || pz.zfar < 1.0f;
+            const bool clamped = depthClamp(d.raster, clampApproximated);
+            pstat.sceneDrawsUntested += untested, pstat.sceneDrawsZRange += zRange, pstat.sceneDrawsClamped += clamped;
+            if ((untested || zRange) && vpgpu::probe::enabled() && pstat.sceneLines < 60) {
+                ++pstat.sceneLines;
+                log("VPKENGINE_PROBE SCENEDRAW n=" + std::to_string(pstat.sceneLines) + " f=" + std::to_string(r.frame_) + " color=" + hex(d.color[colorIds[0].first].address) +
+                    " depth=" + (zf == vpgpu::Format::Undefined ? std::string("none") : hex(z.zFormat ? z.zAddress : z.stencilAddress)) +
+                    " test=" + std::to_string(int(d.depthStencil.depthTest)) + " write=" + std::to_string(int(d.depthStencil.depthWrite)) +
+                    " func=" + std::to_string(int(d.depthStencil.depthFunc)) + " znear=" + std::to_string(pz.znear) + " zfar=" + std::to_string(pz.zfar) +
+                    " clamp=" + std::to_string(int(clamped)) + " blend=" + std::to_string(int(d.blend[colorIds[0].first].enable)) +
+                    " count=" + std::to_string(d.count) + " instances=" + std::to_string(d.instances) + " vs=" + hex(ps.vertexShader) + " ps=" + hex(ps.fragmentShader));
+            }
+        }
         // A draw that reads and writes one colour target of a multisampled depth target's size: the depth-only draws of that depth
         // keep it attached from now on.
         if (samples > 1 && zf != vpgpu::Format::Undefined && colorIds.size() == 1) {
@@ -7319,6 +7359,9 @@ void Renderer::publishProbe(uint64_t pictures) {
         C(f, "depth_partner_draws", ps.depthPartnerDraws), C(f, "depth_partner_retro_clears", ps.depthPartnerRetroClears);
         C(f, "depth_1x_shared", ps.depth1xShared);
         C(f, "msaa_colour_on_tile", ps.msaaColourOnTile), C(f, "msaa_colour_stored", ps.msaaColourStored);
+        C(f, "ps_sample_bary_draws", ps.psSampleBaryDraws), C(f, "ps_sample_iter_draws", ps.psSampleIterDraws);
+        C(f, "ps_sample_id_draws", ps.psSampleIdDraws); C(f, "a2m_unwritten_draws", ps.a2mUnwrittenDraws);
+        C(f, "scene_draws_untested", ps.sceneDrawsUntested), C(f, "scene_draws_zrange", ps.sceneDrawsZRange), C(f, "scene_draws_clamped", ps.sceneDrawsClamped);
         C(f, "pointer_snapshot_no_align", impl_->pointerNo[0]), C(f, "pointer_snapshot_no_flat", impl_->pointerNo[1]);
         C(f, "pointer_snapshot_no_history", impl_->pointerNo[2]), C(f, "pointer_snapshot_no_gpu_wrote", impl_->pointerNo[3]);
         C(f, "pointer_snapshot_no_label", impl_->pointerNo[4]), C(f, "cp_access_ranges", impl_->cpAccess.size());

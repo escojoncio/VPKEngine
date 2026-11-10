@@ -2187,6 +2187,67 @@ void depthOnlyKeepsPartner() {
     }
 }
 
+// What one depth-only draw with a pixel shader got: the pipeline state recorded for it.
+struct A2mDraw {
+    bool found = false, coverage = false, colour0 = false;
+    uint32_t writeMask = 0;
+    uint64_t fs = 0;
+    uint64_t unwritten = 0;  // a2m_unwritten_draws
+};
+// variant 0: the colour partner learned (4x), 1: a depth of another size, so no partner (4x), 2: one sample.
+A2mDraw a2mDepthDraw(bool alphaToMask, unsigned variant) {
+    Fixture f;
+    f.renderer.setMaxSamples(4);
+    if (variant != 2) {
+        vpps4::DrawState learn = colourDraw(f);
+        learn.color[0].numberType = 4;  // (uint: the export conversion of the partner is not the plain one, so it shows in the pixel shader)
+        f.renderer.draw(learn);  // (learns the partner)
+        f.renderer.submit();
+    }
+    const size_t before = f.backend.pipelines.size();
+    vpps4::DrawState d = depthOnlyDraw(f, variant == 1 ? 64 : 128);
+    if (variant == 2) d.depth.samples = 1;
+    d.ps = colourDraw(f).ps;
+    d.alphaToMask = alphaToMask;
+    f.renderer.draw(d);
+    f.renderer.submit();
+    A2mDraw out;
+    for (size_t i = before; i < f.backend.pipelines.size(); ++i) {
+        const vpgpu::PipelineState& s = f.backend.pipelines[i];
+        if (!s.fragmentShader || s.depthFormat == vpgpu::Format::Undefined) continue;
+        out.found = true;
+        out.coverage = s.alphaToCoverage;
+        out.colour0 = s.colorFormats[0] != vpgpu::Format::Undefined;
+        out.writeMask = s.blend[0].writeMask;
+        out.fs = s.fragmentShader;
+    }
+    out.unwritten = rate(f, "a2m_unwritten_draws");
+    if (failures) f.dump();
+    return out;
+}
+
+// DB_ALPHA_TO_MASK masks by the alpha the pixel shader exports to colour 0 whether or not that target is written: a depth-only draw
+// that keeps its colour partner attached (unwritten, write mask 0) gets the host's alpha-to-coverage; one with no colour 0 (no partner,
+// or one sample) gets the alpha test in its pixel shader (another translation than without DB_ALPHA_TO_MASK).
+// VPKENGINE_A2M_WRITTEN_ONLY=1: neither, as before.
+void a2mUnwrittenColour() {
+    ProbeOn probe;
+    for (const bool off : {false, true}) {
+        if (off) setenv("VPKENGINE_A2M_WRITTEN_ONLY", "1", 1);
+        for (unsigned v = 0; v < 3; ++v) {
+            const A2mDraw on = a2mDepthDraw(true, v), plain = a2mDepthDraw(false, v);
+            CHECK(on.found && plain.found);
+            CHECK(!plain.coverage && plain.unwritten == 0);
+            CHECK(on.colour0 == (v == 0) && plain.colour0 == (v == 0));
+            if (v == 0) CHECK(on.writeMask == 0 && plain.writeMask == 0);
+            CHECK(on.coverage == (!off && v == 0));
+            CHECK((on.fs != plain.fs) == !off);
+            CHECK(on.unwritten == 1);
+        }
+        if (off) unsetenv("VPKENGINE_A2M_WRITTEN_ONLY");
+    }
+}
+
 // A colour fast clear that comes while the open pass has that colour attached and no draw of the pass has written it (a depth-only
 // draw's partner) is the pass's load action: no cut. One that comes after a draw wrote it still waits for the next pass.
 void depthPartnerRetroClear() {
@@ -2410,6 +2471,59 @@ void msaaColourOnTile() {
         }
         CHECK(rate(f, "msaa_colour_on_tile") == 0 && rate(f, "msaa_colour_stored") == 1);
         unsetenv("VPKENGINE_MSAA_COLOUR_STORED");
+        if (failures) f.dump();
+    }
+}
+
+// A pixel shader that reads the sample barycentrics (SPI_PS_INPUT_ENA bit 0 / 4) makes the host run it once per sample; on the PS4 that
+// is the rasterizer state PS_ITER_SAMPLE (Stage::psIterSample). Without it the draw gets another translation of the pixel shader (the
+// barycentrics at the centroid: a pixel shader of its own, so the host runs it once per pixel). Counters: ps_sample_bary_draws
+// (multisampled draws that enable a sample barycentric), ps_sample_iter_draws (of those, the ones that still run per sample).
+// VPKENGINE_PS_SAMPLE_RATE=1: always per sample, as before.
+void psSampleRate() {
+    ProbeOn probe;
+    auto pixelPipelines = [](Fixture& f, std::vector<uint64_t>& keys) {  // the pipeline of each recorded draw
+        for (const vpgpu::Command& c : f.backend.commands)
+            if (const auto* rp = std::get_if<vpgpu::RenderPass>(&c))
+                for (const vpgpu::Draw& d : rp->draws)
+                    if (!d.clear) keys.push_back(d.pipeline.value);
+    };
+    for (const bool off : {false, true}) {
+        if (off) setenv("VPKENGINE_PS_SAMPLE_RATE", "1", 1);
+        Fixture f;
+        f.renderer.setMaxSamples(4);
+        vpps4::DrawState a = colourDraw(f);
+        a.ps.psInputAddr = 1;  // PERSP_SAMPLE (psIterSample defaults to true)
+        vpps4::DrawState b = a;
+        b.ps.psIterSample = false;
+        f.renderer.draw(a);
+        const uint64_t shadersA = f.renderer.stats().shaders;
+        f.renderer.draw(b);
+        const uint64_t shadersB = f.renderer.stats().shaders;
+        CHECK(shadersB == shadersA + (off ? 0u : 1u));  // (the vertex shader is shared, the pixel shader is not)
+        f.renderer.draw(a);
+        CHECK(f.renderer.stats().shaders == shadersB);
+        vpps4::DrawState lin = b;  // LINEAR_SAMPLE
+        lin.ps.psInputAddr = 0x10;
+        f.renderer.draw(lin);
+        vpps4::DrawState centre = a;  // no sample barycentric: not counted
+        centre.ps.psInputAddr = 2;
+        f.renderer.draw(centre);
+        vpps4::DrawState single = f.state();  // one sample on the host: not counted
+        single.ps.psInputAddr = 1;
+        single.ps.psIterSample = false;
+        f.renderer.draw(single);
+        f.renderer.submit();
+        std::vector<uint64_t> keys;
+        pixelPipelines(f, keys);
+        CHECK(keys.size() >= 5);
+        if (keys.size() >= 5) {
+            CHECK((keys[0] != keys[1]) == !off);
+            CHECK(keys[0] == keys[2]);
+        }
+        CHECK(rate(f, "ps_sample_bary_draws") == 4);
+        CHECK(rate(f, "ps_sample_iter_draws") == (off ? 4u : 2u));
+        if (off) unsetenv("VPKENGINE_PS_SAMPLE_RATE");
         if (failures) f.dump();
     }
 }
@@ -2918,9 +3032,11 @@ int main(int argc, char** argv) {
     else if (t == "compare_mismatch") compareMismatch();
     else if (t == "depth_cleared_texture") depthClearedTexture();
     else if (t == "depth_only_keeps_partner") depthOnlyKeepsPartner();
+    else if (t == "a2m_unwritten_colour") a2mUnwrittenColour();
     else if (t == "depth_partner_retro_clear") depthPartnerRetroClear();
     else if (t == "depth_1x_shares_ms") depth1xSharesMs();
     else if (t == "msaa_colour_on_tile") msaaColourOnTile();
+    else if (t == "ps_sample_rate") psSampleRate();
     else if (t == "compare_depth") compareDepth();
     else if (t == "compare_depth_array") compareDepthArray();
     else if (t == "tex_verify") texVerify();

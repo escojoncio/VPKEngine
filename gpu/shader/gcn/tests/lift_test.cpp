@@ -88,6 +88,10 @@ int main(int argc, char** argv) {
             std::string v;
             ls >> v;
             input.psInputAddr = uint32_t(std::stoul(v, nullptr, 0));
+        } else if (key == "ps_iter_sample") {
+            unsigned v = 1;
+            ls >> v;
+            input.psIterSample = v != 0;
         } else if (key == "lds_bytes") {
             ls >> input.ldsBytes;
         } else if (key == "tex_dim") {

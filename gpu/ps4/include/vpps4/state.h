@@ -176,6 +176,7 @@ struct Stage {
     uint32_t geomInputPrim = 0;            // (idem) the draw's primitive type, the GS's input
     bool rectList = false;                 // (idem) VS of a RectList draw
     uint32_t psInputAddr = 0;              // PS: SPI_PS_INPUT_ADDR
+    bool psIterSample = true;              // PS: PA_SC_MODE_CNTL_1.PS_ITER_SAMPLE (the rasterizer runs the pixel shader per sample); false: the sample barycentrics are interpolated at the centroid
     std::array<uint8_t, 8> exportFormat{}; // PS: SPI_SHADER_COL_FORMAT per target (0 zero ... 4 FP16_ABGR ...)
     std::array<uint32_t, 32> psInputCntl{};  // PS: SPI_PS_INPUT_CNTL_0..31 (OFFSET bits 0-5, FLAT_SHADE bit 10)
     uint8_t psNumInterp = 0;               // PS: SPI_PS_IN_CONTROL.NUM_INTERP (entries of psInputCntl in use)
