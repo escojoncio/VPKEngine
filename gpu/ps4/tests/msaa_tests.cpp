@@ -923,12 +923,12 @@ void rendererMsaa() {
     CHECK(e.pass.depth.load == LoadAction::Clear);
     CHECK(e.pass.depth.store == StoreAction::DontCare);
     CHECK(e.tileLocal(kDepthSlot));
-    // the first frames are stored in full while the planner warms up
+    // the first frames resolve and keep the picture while the planner warms up; the samples are on tile from the first frame
     const CompiledFrame& warm = f.backend.compiled.front();
     for (const Encoder& first : warm.encoders)
         if (first.kind == Encoder::Kind::Render) {
-            CHECK(first.pass.colors[0].store == StoreAction::StoreAndResolve);
-            CHECK(!first.tileLocal(0));
+            CHECK(first.pass.colors[0].autoMsaa && first.pass.colors[0].store == StoreAction::Resolve);
+            CHECK(first.tileLocal(0));
         }
     if (failures)
         for (const std::string& l : f.log) std::fprintf(stderr, "  %s\n", l.c_str());
@@ -1023,9 +1023,23 @@ void rendererWritable() {
         for (const std::string& l : f.log) std::fprintf(stderr, "  %s\n", l.c_str());
 }
 
+// The multisampled colour targets of these tests store their samples (VPKENGINE_MSAA_COLOUR_STORED=1): the resolves below are the
+// ones of a target that has real samples (done by the pass that drew them, or by a pass of its own). A target that keeps its samples on
+// tile resolves with a texture copy of its single-sample picture (coherence_tests msaa_colour_on_tile).
+struct StoredColour {
+    bool on;
+    explicit StoredColour(bool o = true) : on(o) {
+        if (on) setenv("VPKENGINE_MSAA_COLOUR_STORED", "1", 1);
+    }
+    ~StoredColour() {
+        if (on) unsetenv("VPKENGINE_MSAA_COLOUR_STORED");
+    }
+};
+
 // A resolve (CB_COLOR_CONTROL.MODE = RESOLVE) once the multisampled source's picture is no longer
 // looked at: done by the pass that drew the samples, into CB1, with no extra pass or copy.
 void rendererResolve() {
+    const StoredColour stored;
     Fixture f;
     f.renderer.setMaxSamples(4);
     vpps4::ColorTarget dst = f.state().color[0];
@@ -1062,6 +1076,7 @@ void rendererResolve() {
 // The resolve of a two-layer (stereo) multisampled target resolves BOTH layers: an attachment resolves one slice,
 // so the pass that drew cannot take it over and there is one pass of its own per layer.
 void rendererResolveLayers() {
+    const StoredColour stored;
     Fixture f;
     f.renderer.setMaxSamples(4);
     vpps4::ColorTarget dst = f.state().color[0];
@@ -1093,6 +1108,7 @@ void rendererResolveLayers() {
 // A pass that already resolves into another destination keeps it: a second resolve of the same samples (into a
 // different target) is a pass of its own, and neither destination loses its picture.
 void rendererResolveTwoDestinations() {
+    const StoredColour stored;
     Fixture f;
     f.renderer.setMaxSamples(4);
     vpps4::ColorTarget a = f.state().color[0], b = a;
@@ -1130,6 +1146,7 @@ void rendererResolveTwoDestinations() {
 // mode 0: pass that drew the samples resolves; 1: pass of its own (the pass already resolves elsewhere); 2: texture copy (young picture,
 // first frame); 3: clear not covered by the resolve.
 void rendererResolveDestClear(int mode) {
+    const StoredColour stored(mode <= 1);
     Fixture f;
     f.renderer.setMaxSamples(4);
     vpps4::ColorTarget dst = f.state().color[0];

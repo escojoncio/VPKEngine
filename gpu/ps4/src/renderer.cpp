@@ -227,6 +227,8 @@ struct Renderer::Impl {
         uint64_t fillPath[5] = {}, fillPathBytes[5] = {};                  // none, GPU detile, CPU detile, linear upload, not filled
         uint64_t mirrorCalls = 0, mirrorCopies = 0, mirrorBytes = 0;
         uint64_t depthPartnerDraws = 0, depthPartnerRetroClears = 0;  // depth-only draws that kept their colour target attached / colour clears that became the load action of the open pass
+        uint64_t depth1xShared = 0;  // one-sample draws that tested against the single-sample picture of a multisampled depth surface (not a depth of their own)
+        uint64_t msaaColourOnTile = 0, msaaColourStored = 0;  // draws whose multisampled colour attachment keeps its samples on tile (autoMsaa) / stores them
         uint64_t depthClearFills = 0, depthClearLines = 0;  // layers of a texture given the clear value of their depth buffer (Renderer::depthCleared)
         uint64_t depthAllocLines = 0, depthWritesUntracked = 0, flatTables = 0;  // depth targets made drawn smaller than their allocation (VPKENGINE_PROBE DEPTHALLOC)
         uint64_t msDraws[4][4] = {};  // samples the title asked for (1,2,4,8) x samples the host draws with
@@ -2040,6 +2042,12 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         bool zAuthoritative = false, stencilAuthoritative = false;
         float clearDepth = 1.0f;  // depth targets: DB_DEPTH_CLEAR of the last draw that cleared Z (`clearDepthKnown`)
         bool clearDepthKnown = false;
+        // Multisampled depth targets: a one-sample pass tests against its single-sample picture (see draw()); the passes that draw into it
+        // must resolve into that picture.
+        bool shared1x = false;
+        // Multisampled colour targets: the samples stay on tile and are never stored (Attachment::autoMsaa; the single-sample picture
+        // travels between passes). `samplesStored` (sticky): they have to exist (a shader reads them, see makeSamplesReal).
+        bool samplesOnTile = false, samplesStored = false;
         uint64_t lastDraw = ~uint64_t(0);  // colour targets: the frame (r.frame_) a pass last drew into it (~0: never; diagnostics)
         uint64_t draws = 0, drawsTaken = 0;  // draws into it, and those already handed to Renderer::takeTargetDraws
         int32_t lastScissor[4] = {};         // x, y, width, height / viewport of the last colour pass that drew into it (probe REFILL only)
@@ -3720,6 +3728,19 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         return t.id;
     }
 
+    // A one-sample pass tests against the single-sample picture of this multisampled depth target (draw(), depth1xShared): its passes
+    // resolve into that picture whatever the lifetime planner thinks of it, the last one recorded included.
+    void requireDepthResolve(Target& t) {
+        if (t.shared1x) return;
+        t.shared1x = true;
+        for (auto c = frame.mutableCommands().rbegin(); c != frame.mutableCommands().rend(); ++c)
+            if (auto* rp = std::get_if<vpgpu::RenderPass>(&*c))
+                if (rp->desc.depth.texture == t.ms) {
+                    rp->desc.depth.resolveRequired = true;
+                    break;
+                }
+    }
+
     // ---- Sampling render targets
 
     // Whether a shader reading this T# sees the multisampled surface (declared texture2d_ms, loads with a
@@ -3762,6 +3783,45 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         note("colour target recreated with storage usage (written by a compute pass)");
     }
 
+    // The samples of this multisampled colour target have to exist (a shader reads them, or a draw attaches it in a way the backend
+    // cannot seed): from now on it stores them at every pass boundary, as it did before it kept them on tile (Attachment::autoMsaa).
+    // What was drawn so far is only its single-sample picture: passes of their own load the samples, which the frame compiler seeds
+    // from the last picture resolved (every sample of a texel holds the picture's colour: the detail inside texels drawn before this
+    // point is gone), and store them. A layered target is anchored first, one layer at a time: the compiler seeds such a Load from
+    // the layer the last resolve wrote.
+    void makeSamplesReal(Target& c) {
+        const bool onTile = c.samplesOnTile;
+        c.samplesOnTile = false;
+        c.samplesStored = true;
+        if (!onTile || !c.ms || !c.id) return;
+        flushClear(c);
+        closePass();
+        for (uint16_t l = 0; l < c.layers; ++l) {
+            for (const bool anchor : {true, false}) {
+                if (anchor && c.layers < 2) continue;
+                vpgpu::RenderPassDesc desc;
+                vpgpu::Attachment& a = desc.colors[0];
+                a.texture = c.ms;
+                a.layer = l;
+                a.load = vpgpu::LoadAction::Load;
+                if (anchor) {
+                    a.autoMsaa = true;
+                    a.store = vpgpu::StoreAction::Resolve;
+                    a.resolve = c.id;
+                    a.resolveLayer = l;
+                } else {
+                    a.store = vpgpu::StoreAction::Store;
+                }
+                desc.label = std::string(anchor ? "samples anchor " : "samples ") + hex(c.address);
+                frame.beginRenderPass(desc);
+                frame.endRenderPass();
+                ++r.stats_.passes;
+            }
+        }
+        life.noteSamplesRead(c.ms, r.frame_);  // (the samples are stored from here on)
+        note("colour target samples made real (a shader reads them): stored at every pass boundary from now on");
+    }
+
     // The single-sample picture of a multisampled target lost this frame's resolve to a resolve into another
     // target (see resolve()) and somebody reads it now: resolve the samples into it in a pass of its own.
     void catchUpTwin(Surface& c) {
@@ -3794,6 +3854,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
     struct PendingClear {
         TextureId texture;            // the attachment texture (ms when multisampled)
         TextureId resolved;           // its single-sample companion (null for depth or 1x)
+        bool autoMsaa = false;        // the colour keeps its samples on tile: the clear resolves, it does not store them
         bool depth = false;
         vpgpu::ClearValue value;
         // A clear of the whole target is `whole` (the load action of the next pass). Clears of one plane or
@@ -3840,8 +3901,13 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         a.store = vpgpu::StoreAction::Store;
         if (p.resolved) {
             a.resolve = p.resolved;
-            a.store = vpgpu::StoreAction::StoreAndResolve;
-            a.keepSamples = true;
+            if (p.autoMsaa) {
+                a.autoMsaa = true;
+                a.store = vpgpu::StoreAction::Resolve;
+            } else {
+                a.store = vpgpu::StoreAction::StoreAndResolve;
+                a.keepSamples = true;
+            }
         }
         desc.label = "clear";
         if (p.whole && p.rects.empty()) {
@@ -4125,6 +4191,26 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         const bool stencil = z.stencilFormat && z.forceStencilDirty && z.forceStencilValid && z.stencilWriteAddress &&
                              z.stencilWriteAddress != z.stencilAddress;
         return depth || stencil;
+    }
+
+    // The multisampled depth target that target() would answer a draw of this shape with if its sample count matched, made by no
+    // one here (null: none yet).
+    Target* multisampledDepth(uint64_t address, vpgpu::Format f, uint32_t w, uint32_t h, uint16_t layers, uint8_t tile, uint32_t pitch, uint32_t rows) {
+        layers = std::max<uint16_t>(layers, 1);
+        const auto find = [&](uint64_t at) -> Target* {
+            const auto it = depthTargets.find(at);
+            if (it == depthTargets.end()) return nullptr;
+            for (Target& t : it->second)
+                if (t.ms && t.samples > 1 && t.format == f && t.width == w && t.height == h && t.tile == tile && t.layers >= layers &&
+                    (depthReuseAnyPitch || (t.pitch == pitch && t.rows == rows)))
+                    return &t;
+            return nullptr;
+        };
+        Target* m = nullptr;
+        if (const auto a = depthAliases.find(address); a != depthAliases.end()) m = find(a->second);
+        if (!m) m = find(address);
+        if (m) m->lastUse = r.frame_;
+        return m;
     }
 
     // The depth surface at `address` the passes drew into last, of any sample count (null: none yet).
@@ -4497,6 +4583,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
             c->lastUse = r.frame_;
             flushClear(*c);
             if (!storage && msaaImage(desc) && c->ms) {  // the shader reads the samples themselves
+                makeSamplesReal(*c);  // (they were never stored while the target kept them on tile)
                 life.noteSamplesRead(c->ms, r.frame_);
                 return {c->ms, {}};
             }
@@ -5091,11 +5178,17 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
     // ---- Bindings ---------------------------------------------------------------------------------
 
     // Adds the time of its scope to one of the bind() phase counters (CpuTimes).
+    // (hot: several per resource of every draw. One draw / dispatch in kPhaseEvery is timed and stands for that many.)
+    static constexpr unsigned kPhaseEvery = 16;
+    static inline bool phaseTimed = true;
     struct Phase {
         double& acc;
-        Clock::time_point t0 = Clock::now();
+        const bool on = phaseTimed;
+        Clock::time_point t0 = on ? Clock::now() : Clock::time_point{};
         explicit Phase(double& a) : acc(a) {}
-        ~Phase() { acc += msSince(t0); }
+        ~Phase() {
+            if (on) acc += msSince(t0) * kPhaseEvery;
+        }
     };
 
     // Texture bindings that bind a view of their texture (collected by bind(), taken by the draw).
@@ -5371,6 +5464,12 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
     };
     std::unordered_map<uint64_t, DepthPartner> depthPartners;
     bool depthPartnerOff = std::getenv("VPKENGINE_DEPTH_ONLY_SPLIT") != nullptr;
+    // A one-sample pass that binds a multisampled depth surface (guest samples > 1, colour fragments 1) tests against that surface's
+    // single-sample picture instead of a depth of its own that never holds the scene. VPKENGINE_DEPTH_1X_SEPARATE=1: a depth of its own.
+    bool depth1xSeparate = std::getenv("VPKENGINE_DEPTH_1X_SEPARATE") != nullptr;
+    // Multisampled colour targets keep their samples on tile (Attachment::autoMsaa) and only the single-sample picture travels between
+    // passes. VPKENGINE_MSAA_COLOUR_STORED=1: the samples are stored and loaded at every pass boundary, as before.
+    bool msaaColourStored = std::getenv("VPKENGINE_MSAA_COLOUR_STORED") != nullptr;
 
     void closePass() {
         if (passOpen) frame.endRenderPass();
@@ -5400,6 +5499,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         ringRoom();
         const RegionScope regions(*this);
         ++r.stats_.draws;
+        phaseTimed = r.stats_.draws % kPhaseEvery == 0;
         if (cap.armed) cap.drawSampled.clear();  // (what a dispatch sampled is not this draw's)
         if (d.count == 0 || d.instances == 0) return skip("empty draw");
         if (isDepthCopy(d)) return handled("depth copy"), depthCopy(d);
@@ -5456,6 +5556,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         // attached, unwritten: the passes around it are one pass (see depthPartners).
         const DepthPartner* partner = nullptr;
         unsigned partnerSlot = 8;  // (the slot attached for it, 8 = none)
+        bool colourOnTile = false, colourStored = false;  // a multisampled colour attachment keeps its samples on tile / stores them
         if (!depthPartnerOff && samples > 1 && zf != vpgpu::Format::Undefined && !std::any_of(fragments.begin(), fragments.end(), [](uint8_t f) { return f != 0; })) {
             const auto it = depthPartners.find(d.depth.zFormat ? d.depth.zAddress : d.depth.stencilAddress);
             if (it != depthPartners.end() && it->second.samples == samples && it->second.c.width == d.depth.width && it->second.c.height == d.depth.height &&
@@ -5507,8 +5608,20 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
                 // Resolved at the end of the pass; the lifetime planner decides what is kept (lifetime.h).
                 desc.colors[i].resolve = t.resolved;
                 desc.colors[i].resolveLayer = c.sliceStart;
-                desc.colors[i].store = vpgpu::StoreAction::StoreAndResolve;
-                desc.colors[i].keepSamples = true;
+                // The samples stay on tile, never stored: only the single-sample picture travels between passes (a later pass is
+                // seeded from it, Attachment::autoMsaa). Colour 0 of a float format (the only slot the backend seeds); a target that
+                // ever had to hold real samples (makeSamplesReal) or VPKENGINE_MSAA_COLOUR_STORED=1: stored as before.
+                if (!msaaColourStored && i == 0 && !tg->samplesStored && !vpgpu::formatInfo(f).integer()) {
+                    tg->samplesOnTile = true;
+                    desc.colors[i].autoMsaa = true;
+                    desc.colors[i].store = vpgpu::StoreAction::Resolve;
+                    colourOnTile = true;
+                } else {
+                    makeSamplesReal(*tg);
+                    desc.colors[i].store = vpgpu::StoreAction::StoreAndResolve;
+                    desc.colors[i].keepSamples = true;
+                    colourStored = true;
+                }
             }
             ps.colorFormats[i] = f;
             if (unwritten) {
@@ -5532,12 +5645,25 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         std::shared_ptr<vpgpu::ClearRects> partialClear;  // a clear of one plane, or of part of the target
         StencilResolved stencil;
         TargetIds depthIds;
+        bool depth1x = false;  // the depth attachment is the single-sample picture of a multisampled depth target
         if (zf != vpgpu::Format::Undefined) {
             if (!depthExact) note(z.zFormat == 2 ? "24-bit depth held as 32-bit float" : "16-bit depth with stencil held as 32-bit float");
             const uint64_t readAddress = z.zFormat ? z.zAddress : z.stencilAddress;
             const uint64_t writeAddress = z.zFormat ? z.zWriteAddress : z.stencilWriteAddress;
-            Target* dt = target(depthTargets, readAddress, zf, z.width, z.height,
-                                samples, uint16_t(z.sliceStart + z.sliceCount), true, z.tileMode, depthPitch(z), nullptr, depthRows(z));
+            // A one-sample draw (one-fragment colour) that binds a multisampled depth surface the scene was drawn into tests against that
+            // surface's single-sample picture: a depth of its own at this address would never hold the scene (depth1xSeparate).
+            Target* dt = nullptr;
+            TextureId one;
+            if (samples == 1 && z.samples > 1 && !(z.depthClear || z.stencilClear) && !depth1xSeparate)
+                if (Target* m = multisampledDepth(readAddress, zf, z.width, z.height, uint16_t(z.sliceStart + z.sliceCount), z.tileMode, depthPitch(z), depthRows(z))) {
+                    flushClear(*m);  // (a clear still waiting for the multisampled passes lands before the picture is read)
+                    if (passOpen && pass.depth.texture == m->ms) closePass();  // (it resolves into the picture when it ends)
+                    requireDepthResolve(*m);
+                    if ((one = depthCompanion(*m))) dt = m;
+                }
+            depth1x = bool(dt);
+            if (!dt) dt = target(depthTargets, readAddress, zf, z.width, z.height,
+                                 samples, uint16_t(z.sliceStart + z.sliceCount), true, z.tileMode, depthPitch(z), nullptr, depthRows(z));
             if (!dt) return skip("depth target creation failed");
             if (z.depthClear && z.zFormat) dt->clearDepth = z.clearDepth, dt->clearDepthKnown = true;
             {
@@ -5556,9 +5682,10 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
             else if (r.hooks_.seed) seedFromHost(*dt, nullptr);
             depthWid = dt->wid;
             attachedWids.push_back(dt->wid);
-            depthIds = idsOf(*dt);
+            depthIds = depth1x ? TargetIds{one, {}, false, dt->wid} : idsOf(*dt);
             if (samples > 1) dt->msCov = std::max<uint8_t>(samples, z.samples), dt->msFrag = samples;
-            dt->depthMode = depthResolveMode(z.depthCopy, z.copySample, d.depthStencil.depthTest ? d.depthStencil.depthFunc : uint8_t(7));
+            // (what a one-sample draw does not own: the sample layout and the resolve mode belong to the multisampled passes)
+            if (!depth1x) dt->depthMode = depthResolveMode(z.depthCopy, z.copySample, d.depthStencil.depthTest ? d.depthStencil.depthFunc : uint8_t(7));
             desc.depth.texture = depthIds.render;
             desc.depth.layer = z.sliceStart;
             if (depthIds.resolved) {
@@ -5567,6 +5694,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
                 desc.depth.store = vpgpu::StoreAction::StoreAndResolve;
                 desc.depth.keepSamples = true;
                 desc.depth.depthResolve = dt->depthMode;
+                desc.depth.resolveRequired = dt->shared1x;  // (a one-sample pass reads that picture)
             }
             ps.depthFormat = zf;
             width = width ? std::min(width, z.width) : z.width;
@@ -5578,6 +5706,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
                 aliasTarget(writeAddress, readAddress);
             ps.depthTest = ds.depthTest || ds.depthWrite;
             ps.depthWrite = ds.depthWrite && z.zFormat && !z.zReadOnly && !z.depthClear;
+            if (depth1x && ps.depthWrite) note("one-sample draw writes a multisampled depth surface: only its resolved picture gets it");
             ps.depthCompare = ds.depthTest ? compareOp(ds.depthFunc) : vpgpu::CompareOp::Always;
             ps.stencilTest = ds.stencilTest && z.stencilFormat;
             if (ps.stencilTest) {
@@ -5659,6 +5788,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
                 PendingClear pc;
                 pc.texture = t.render;
                 pc.resolved = t.resolved;
+                pc.autoMsaa = desc.colors[i].autoMsaa;
                 pc.value.color = fastClearColor(c.format, c.numberType, c.compSwap, c.clearWord, exact);
                 if (!exact) note("fast clear colour approximated (format not decoded)");
                 // The open pass has this colour attached and no draw of it has written it (a depth-only draw's partner): the clear
@@ -6172,6 +6302,9 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         ++r.stats_.drawn;
         for (const auto& entry : colorIds) passWritten |= uint8_t(1u << entry.first);
         if (partnerSlot < 8) ++pstat.depthPartnerDraws;
+        if (depth1x) ++pstat.depth1xShared;
+        if (colourOnTile) ++pstat.msaaColourOnTile;
+        if (colourStored) ++pstat.msaaColourStored;
         // A draw that reads and writes one colour target of a multisampled depth target's size: the depth-only draws of that depth
         // keep it attached from now on.
         if (samples > 1 && zf != vpgpu::Format::Undefined && colorIds.size() == 1) {
@@ -6227,6 +6360,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         ringRoom();
         const RegionScope regions(*this);
         ++r.stats_.dispatches;
+        phaseTimed = r.stats_.dispatches % kPhaseEvery == 0;
         probePass.clear();  // (the probe follows the passes that write a large colour target)
         if (d.cs.code.empty()) return skip("no compute shader");
         if (!d.indirectAddress && (!d.groups[0] || !d.groups[1] || !d.groups[2])) return skip("empty dispatch");
@@ -6487,12 +6621,16 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         to = static_cast<Target*>(surfaceOf(toWid));
         if (!from->ms) refresh(*from, nullptr);
         refresh(*to, nullptr);
+        // A source that keeps its samples on tile has none to resolve: its single-sample picture is the resolved image at the end of
+        // every pass (a texture copy). A resolve through a view of another format needs the samples themselves.
+        if (differ && from->ms) makeSamplesReal(*from);
+        const bool pictureOnly = from->samplesOnTile;
         flushClear(*from);
         ResolveCase rc;
         const bool twinWanted = from->ms && life.wants(from->id, r.frame_);
         // (a wanted single-sample picture stays resolved by the passes; with another destination format the
         // resolve is a pass of its own, so nothing replaces the picture's resolve either)
-        rc.sourceMultisampled = from->ms && (!twinWanted || differ);
+        rc.sourceMultisampled = from->ms && !pictureOnly && (!twinWanted || differ);
         rc.formatsMatch = !differ;
         rc.formatsViewable = differ;
         rc.destinationIsSource = from->id == to->id;
@@ -6600,7 +6738,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
             }
         }
         latestColor[dst.address] = to->id;
-        life.noteRead(from->ms ? from->ms : from->id, r.frame_);  // (the source is read by the resolve)
+        life.noteRead(from->ms && !pictureOnly ? from->ms : from->id, r.frame_);  // (the source is read by the resolve)
         markWriteWid(toWid);
         if (resolveProbe.due(r.frame_)) {  // P2: what the resolve took and what it wrote, and the other targets over the destination
             std::string others;
@@ -7179,6 +7317,8 @@ void Renderer::publishProbe(uint64_t pictures) {
         C(f, "aligned_copies", ps.alignedCopies), C(f, "aligned_copy_bytes", im.alignedCopyBytes);
         C(f, "buffer_snapshots", ps.bufferSnapshots), C(f, "pointer_snapshots", ps.pointerSnapshots);
         C(f, "depth_partner_draws", ps.depthPartnerDraws), C(f, "depth_partner_retro_clears", ps.depthPartnerRetroClears);
+        C(f, "depth_1x_shared", ps.depth1xShared);
+        C(f, "msaa_colour_on_tile", ps.msaaColourOnTile), C(f, "msaa_colour_stored", ps.msaaColourStored);
         C(f, "pointer_snapshot_no_align", impl_->pointerNo[0]), C(f, "pointer_snapshot_no_flat", impl_->pointerNo[1]);
         C(f, "pointer_snapshot_no_history", impl_->pointerNo[2]), C(f, "pointer_snapshot_no_gpu_wrote", impl_->pointerNo[3]);
         C(f, "pointer_snapshot_no_label", impl_->pointerNo[4]), C(f, "cp_access_ranges", impl_->cpAccess.size());

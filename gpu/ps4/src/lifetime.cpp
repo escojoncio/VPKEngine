@@ -301,12 +301,18 @@ LifetimeStats LifetimeTracker::plan(Frame& frame, const ResourceTable& res, uint
                 resolve = a.resolveRequired || (wanted && (lastPass || readLater));
                 resolveDeferred = !a.resolveRequired && wanted && !resolve;
             }
+            // An autoMsaa twin keeps its samples on tile and never stores them (the frame compiler seeds a later pass from the
+            // single-sample picture): that picture is what travels, so it is resolved wherever the contents are needed after this pass.
+            // Its resolve target stays even when nothing is resolved: it is the seed source of the next Load.
+            const bool tile = a.autoMsaa && twin;
+            if (tile && keepSamples && !resolve) resolve = true, resolveDeferred = false;
             const bool wasResolve = a.store == StoreAction::Resolve || a.store == StoreAction::StoreAndResolve;
-            if (resolve && keepSamples) a.store = StoreAction::StoreAndResolve, a.keepSamples = true;
+            if (tile) a.store = resolve ? StoreAction::Resolve : StoreAction::DontCare, a.keepSamples = false;
+            else if (resolve && keepSamples) a.store = StoreAction::StoreAndResolve, a.keepSamples = true;
             else if (resolve) a.store = StoreAction::Resolve;
             else if (keepSamples) a.store = StoreAction::Store;
             else a.store = StoreAction::DontCare;
-            if (!resolve) a.resolve = {};
+            if (!resolve && !tile) a.resolve = {};
             probe(a, true, nextAttach, readLater, wanted);
             if (twin && !resolveDeferred) {
                 // The companion is never an attachment, so no end-of-frame bookkeeping sees it: a dropped
@@ -334,12 +340,14 @@ LifetimeStats LifetimeTracker::plan(Frame& frame, const ResourceTable& res, uint
         auto note = [&](const Attachment& b) {
             if (!b.texture) return;
             const uint64_t k = keyOf(b.texture);
+            // (an autoMsaa twin that resolves is not lost: its next Load is seeded from the picture)
+            const StoreAction store = b.autoMsaa && b.store == StoreAction::Resolve ? StoreAction::Store : b.store;
             for (SubUse& s : subs_)
                 if (s.k == k && s.mip == b.mip && s.layer == b.layer) {
-                    s.lastStore = b.store;
+                    s.lastStore = store;
                     return;
                 }
-            subs_.push_back({k, b.mip, b.layer, b.load, b.store});
+            subs_.push_back({k, b.mip, b.layer, b.load, store});
         };
         for (const Attachment& b : p->desc.colors) note(b);
         note(p->desc.depth);

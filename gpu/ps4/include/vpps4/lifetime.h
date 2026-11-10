@@ -13,6 +13,8 @@
 //     looks at the companion (sampled/presented lately, or read later in the frame) or nobody reads
 //     the samples themselves; it keeps its samples only if a shader reads them (texture2d_ms) or a
 //     later pass loads them;
+//     An autoMsaa attachment (samples on tile, gpu/core Attachment::autoMsaa) never stores samples: it resolves wherever the
+//     contents are needed after the pass and keeps its resolve target as the seed source of the next Load;
 //   * only the last pass of a frame that draws into a texture resolves it, unless the companion is
 //     read in between;
 //   * a prediction that fails (a texture whose contents were dropped is read before it is written)

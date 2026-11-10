@@ -63,6 +63,7 @@ class Recording final : public vpgpu::Backend {
 public:
     vpgpu::NullBackend inner;
     std::vector<vpgpu::Command> commands;
+    std::vector<vpgpu::CompiledFrame> compiled;  // what the frame compiler made of each frame given
     std::map<uint32_t, uint8_t*> memory;  // host memory of the buffers that alias some (guest windows, upload rings), by index
 
     std::map<uint32_t, vpgpu::BufferDesc> bufferDescs;
@@ -115,6 +116,7 @@ public:
     void destroyPipeline(vpgpu::PipelineKey k) override { inner.destroyPipeline(k); }
     void submit(uint64_t n, const vpgpu::Frame& f, const vpgpu::CompiledFrame& c) override {
         commands.insert(commands.end(), f.commands().begin(), f.commands().end());
+        compiled.push_back(c);
         inner.submit(n, f, c);
     }
     bool takeTimings(uint64_t& n, vpgpu::GpuTimings& t) override { return inner.takeTimings(n, t); }
@@ -2226,6 +2228,192 @@ void depthPartnerRetroClear() {
     if (failures) f.dump();
 }
 
+// A one-sample pass (one-fragment colour target) that binds a multisampled depth surface the scene was drawn into tests against that
+// surface's single-sample picture: the multisampled pass resolves into it and the one-sample pass attaches it, no depth of its own
+// is made at that address. VPKENGINE_DEPTH_1X_SEPARATE=1: a depth of its own (before).
+void depth1xSharesMs() {
+    ProbeOn probe;
+    for (const bool separate : {false, true}) {
+        if (separate) setenv("VPKENGINE_DEPTH_1X_SEPARATE", "1", 1);
+        Fixture f;
+        f.renderer.setMaxSamples(4);
+        f.renderer.draw(colourDraw(f));  // the scene: 4x colour + 4x depth
+        vpps4::DrawState d = f.depthState(false);
+        d.color[0].address = kBase + 0xA0000;  // a one-fragment colour target of its own
+        d.depth.samples = 4;
+        const uint64_t targets = f.renderer.stats().targets;
+        f.renderer.draw(d);
+        CHECK(f.renderer.stats().targets - targets == (separate ? 2u : 1u));  // (colour; + a depth of its own)
+        f.renderer.submit();
+        std::vector<const vpgpu::RenderPass*> passes;
+        for (const vpgpu::Command& c : f.backend.commands)
+            if (const auto* rp = std::get_if<vpgpu::RenderPass>(&c)) passes.push_back(rp);
+        CHECK(passes.size() == 2);
+        if (passes.size() == 2) {
+            const vpgpu::Attachment &scene = passes[0]->desc.depth, &one = passes[1]->desc.depth;
+            CHECK(scene.texture && one.texture && scene.texture != one.texture);
+            if (separate) {
+                CHECK(!scene.resolve || scene.resolve != one.texture);
+            } else {
+                CHECK(scene.resolve == one.texture && scene.store == vpgpu::StoreAction::StoreAndResolve && scene.resolveRequired);
+                vpgpu::TextureDesc td;
+                CHECK(f.device.textureDesc(one.texture, td) && td.samples == 1);
+            }
+        }
+        CHECK(rate(f, "depth_1x_shared") == (separate ? 0u : 1u));
+        if (failures) f.dump();
+        if (separate) unsetenv("VPKENGINE_DEPTH_1X_SEPARATE");
+    }
+}
+
+// The render passes recorded so far, and the encoders of the last compiled frame that attach `texture` as colour 0.
+std::vector<const vpgpu::RenderPass*> recordedPasses(Fixture& f) {
+    std::vector<const vpgpu::RenderPass*> out;
+    for (const vpgpu::Command& c : f.backend.commands)
+        if (const auto* rp = std::get_if<vpgpu::RenderPass>(&c)) out.push_back(rp);
+    return out;
+}
+std::vector<const vpgpu::Encoder*> encodersOf(Fixture& f, vpgpu::TextureId texture) {
+    std::vector<const vpgpu::Encoder*> out;
+    if (!f.backend.compiled.empty())
+        for (const vpgpu::Encoder& e : f.backend.compiled.back().encoders)
+            if (e.kind == vpgpu::Encoder::Kind::Render && e.pass.colors[0].texture == texture) out.push_back(&e);
+    return out;
+}
+uint8_t samplesOf(Fixture& f, vpgpu::TextureId t) {
+    vpgpu::TextureDesc d;
+    return f.device.textureDesc(t, d) ? d.samples : 0;
+}
+
+// A multisampled colour target keeps its samples on tile (Attachment::autoMsaa): the single-sample picture is its resolve target and
+// the seed of the next pass that continues it, no pass stores the samples, the guest's resolve of it is a copy of the picture, and a
+// shader that reads the samples makes the target store them from then on. The depth attachment of the same pass is unchanged (its
+// samples are tested EQUAL by the colour pass). VPKENGINE_MSAA_COLOUR_STORED=1: stored at every pass boundary, as before.
+void msaaColourOnTile() {
+    ProbeOn probe;
+    const uint64_t other = kBase + 0xA0000, copyDst = kBase + 0xC0000;
+    {  // (a) the attachment, (b) a pass that continues the picture, (c) the guest's resolve
+        Fixture f;
+        f.renderer.setMaxSamples(4);
+        f.renderer.draw(colourDraw(f));
+        vpps4::DrawState o = f.state();  // a draw to another target cuts the pass
+        o.color[0].address = other;
+        f.renderer.draw(o);
+        f.renderer.draw(colourDraw(f));  // continues the picture of the first
+        vpps4::ColorTarget src = f.state().color[0], dst = src;
+        src.samples = 4;
+        dst.address = copyDst;
+        dst.samples = 1;
+        const uint64_t copies = f.renderer.stats().copies;
+        f.renderer.resolve(src, dst);
+        CHECK(f.renderer.stats().copies == copies + 1);
+        f.renderer.submit();
+        const auto passes = recordedPasses(f);
+        CHECK(passes.size() == 3);
+        if (passes.size() == 3) {
+            const vpgpu::Attachment& c = passes[0]->desc.colors[0];
+            CHECK(c.autoMsaa && !c.keepSamples && c.resolve && c.resolve != c.texture);
+            CHECK(samplesOf(f, c.texture) == 4 && samplesOf(f, c.resolve) == 1);
+            const vpgpu::Attachment& z = passes[0]->desc.depth;
+            CHECK(z.texture && !z.autoMsaa && samplesOf(f, z.texture) == 4);
+            const vpgpu::Attachment& again = passes[2]->desc.colors[0];
+            CHECK(again.autoMsaa && again.texture == c.texture && again.resolve == c.resolve && again.load == vpgpu::LoadAction::Load);
+            CHECK(!passes[1]->desc.colors[0].autoMsaa);  // (a one-sample target)
+            // The compiler: the second encoder is seeded from the picture, no encoder stores the samples.
+            const auto enc = encodersOf(f, c.texture);
+            CHECK(enc.size() == 2);
+            for (const vpgpu::Encoder* e : enc) {
+                const vpgpu::Attachment& a = e->pass.colors[0];
+                CHECK(e->tileLocal(0) && a.autoMsaa && a.store != vpgpu::StoreAction::Store && a.store != vpgpu::StoreAction::StoreAndResolve);
+            }
+            if (enc.size() == 2) {
+                CHECK(enc[0]->pass.colors[0].store == vpgpu::StoreAction::Resolve && !enc[0]->pass.colors[0].needsSeed);
+                const vpgpu::Attachment& second = enc[1]->pass.colors[0];
+                CHECK(second.needsSeed && second.seedSrc == c.resolve && second.load == vpgpu::LoadAction::DontCare);
+            }
+            CHECK(f.backend.compiled.back().stats.seedDraws >= 1);
+            // The guest's resolve: a copy of the single-sample picture, no pass of its own, the pass that drew keeps its resolve.
+            const vpgpu::Copy* cp = decodeCopy(f, "resolve " + Fixture::hex(kRt) + " -> " + Fixture::hex(copyDst));
+            CHECK(cp && cp->kind == vpgpu::CopyKind::TextureToTexture && cp->srcTexture.texture == c.resolve);
+            CHECK(f.renderer.stats().notes.count("MSAA resolve done by the pass that drew the samples") == 0);
+            CHECK(f.renderer.stats().notes.count("MSAA resolve in a pass of its own") == 0);
+        }
+        CHECK(rate(f, "msaa_colour_on_tile") == 2 && rate(f, "msaa_colour_stored") == 0);
+        if (failures) f.dump();
+    }
+    {  // (d) a shader reads the samples: they are made (a pass of its own, seeded from the picture) and kept from then on
+        Fixture f;
+        f.renderer.setMaxSamples(4);
+        f.renderer.draw(colourDraw(f));
+        f.sample(kRt, 128, 128, 10, 0, 8);
+        f.at(kBase + 0x200)[3] = (f.at(kBase + 0x200)[3] & ~(15u << 28)) | (14u << 28) | (2u << 16);
+        const auto ms = f.renderer.textureFor(vpps4::decodeImage(std::span<const uint32_t>(f.at(kBase + 0x200), 8)));
+        CHECK(ms && samplesOf(f, ms) == 4);
+        f.renderer.draw(colourDraw(f));
+        f.renderer.submit();
+        const auto passes = recordedPasses(f);
+        CHECK(passes.size() == 3);
+        if (passes.size() == 3) {
+            const vpgpu::Attachment &before = passes[0]->desc.colors[0], &made = passes[1]->desc.colors[0], &after = passes[2]->desc.colors[0];
+            CHECK(before.autoMsaa && before.texture == ms && made.texture == ms && after.texture == ms);
+            CHECK(!made.autoMsaa && made.load == vpgpu::LoadAction::Load && made.store == vpgpu::StoreAction::Store);
+            CHECK(!after.autoMsaa && after.keepSamples && after.store == vpgpu::StoreAction::StoreAndResolve && after.resolve == before.resolve);
+            const auto enc = encodersOf(f, ms);
+            CHECK(enc.size() == 3);
+            if (enc.size() == 3) {
+                CHECK(enc[0]->pass.colors[0].store == vpgpu::StoreAction::Resolve);  // (the picture the samples are made from)
+                const vpgpu::Attachment& seed = enc[1]->pass.colors[0];
+                CHECK(seed.needsSeed && seed.seedSrc == before.resolve && seed.store == vpgpu::StoreAction::Store);
+                CHECK(!enc[2]->pass.colors[0].needsSeed && enc[2]->pass.colors[0].load == vpgpu::LoadAction::Load);
+            }
+        }
+        CHECK(f.renderer.stats().notes.count("colour target samples made real (a shader reads them): stored at every pass boundary from now on") == 1);
+        CHECK(rate(f, "msaa_colour_on_tile") == 1 && rate(f, "msaa_colour_stored") == 1);
+        if (failures) f.dump();
+    }
+    {  // a target in colour slot 1 (the backend seeds colour 0 only) stores its samples: a layered one is anchored layer by layer
+        Fixture f;
+        f.renderer.setMaxSamples(4);
+        vpps4::DrawState a = f.state();
+        a.color[0].samples = 4;
+        a.color[0].sliceCount = 2;
+        f.renderer.draw(a);
+        vpps4::DrawState b = f.state();
+        b.color[0].address = other;
+        b.color[0].samples = 4;
+        b.color[1] = a.color[0];
+        f.renderer.draw(b);
+        f.renderer.submit();
+        const auto passes = recordedPasses(f);
+        CHECK(!passes.empty() && passes[0]->desc.colors[0].autoMsaa);
+        const vpgpu::TextureId ms = passes.empty() ? vpgpu::TextureId{} : passes[0]->desc.colors[0].texture;
+        std::set<uint16_t> seeded;
+        for (const vpgpu::Encoder* e : encodersOf(f, ms)) {
+            const vpgpu::Attachment& s = e->pass.colors[0];
+            if (!s.autoMsaa && s.needsSeed && s.seedSrc == passes[0]->desc.colors[0].resolve) seeded.insert(s.seedLayer);
+        }
+        CHECK(seeded == (std::set<uint16_t>{0, 1}));
+        CHECK(f.renderer.stats().notes.count("colour target samples made real (a shader reads them): stored at every pass boundary from now on") == 1);
+        if (failures) f.dump();
+    }
+    {  // (e) VPKENGINE_MSAA_COLOUR_STORED=1: the attachment as before
+        setenv("VPKENGINE_MSAA_COLOUR_STORED", "1", 1);
+        Fixture f;
+        f.renderer.setMaxSamples(4);
+        f.renderer.draw(colourDraw(f));
+        f.renderer.submit();
+        const auto passes = recordedPasses(f);
+        CHECK(passes.size() == 1);
+        if (passes.size() == 1) {
+            const vpgpu::Attachment& c = passes[0]->desc.colors[0];
+            CHECK(!c.autoMsaa && c.keepSamples && c.store == vpgpu::StoreAction::StoreAndResolve && samplesOf(f, c.texture) == 4 && c.resolve);
+        }
+        CHECK(rate(f, "msaa_colour_on_tile") == 0 && rate(f, "msaa_colour_stored") == 1);
+        unsetenv("VPKENGINE_MSAA_COLOUR_STORED");
+        if (failures) f.dump();
+    }
+}
+
 // A T# larger than every depth target drawn at its base (a 128x128 array of 4 over a depth array drawn 64x64, 2 slices), sampled
 // with compare: no depth target serves it and memory holds the bytes of the smaller layout (or of nothing). As the reference
 // renderer, which grows its image and does not read memory for it, the texture is not filled from memory: every layer takes the
@@ -2731,6 +2919,8 @@ int main(int argc, char** argv) {
     else if (t == "depth_cleared_texture") depthClearedTexture();
     else if (t == "depth_only_keeps_partner") depthOnlyKeepsPartner();
     else if (t == "depth_partner_retro_clear") depthPartnerRetroClear();
+    else if (t == "depth_1x_shares_ms") depth1xSharesMs();
+    else if (t == "msaa_colour_on_tile") msaaColourOnTile();
     else if (t == "compare_depth") compareDepth();
     else if (t == "compare_depth_array") compareDepthArray();
     else if (t == "tex_verify") texVerify();
