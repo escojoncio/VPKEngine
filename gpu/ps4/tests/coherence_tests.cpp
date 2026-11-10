@@ -2371,6 +2371,8 @@ void msaaColourOnTile() {
     ProbeOn probe;
     const uint64_t other = kBase + 0xA0000, copyDst = kBase + 0xC0000;
     {  // (a) the attachment, (b) a pass that continues the picture, (c) the guest's resolve
+        // (a draw to another target is a cut of the engine, which keeps the samples: msaa_colour_cut_keeps_samples; here the picture is seeded)
+        setenv("VPKENGINE_MSAA_CUT_SAMPLES_OFF", "1", 1);
         Fixture f;
         f.renderer.setMaxSamples(4);
         f.renderer.draw(colourDraw(f));
@@ -2417,6 +2419,7 @@ void msaaColourOnTile() {
             CHECK(f.renderer.stats().notes.count("MSAA resolve in a pass of its own") == 0);
         }
         CHECK(rate(f, "msaa_colour_on_tile") == 2 && rate(f, "msaa_colour_stored") == 0);
+        unsetenv("VPKENGINE_MSAA_CUT_SAMPLES_OFF");
         if (failures) f.dump();
     }
     {  // (d) a shader reads the samples: they are made (a pass of its own, seeded from the picture) and kept from then on
@@ -2488,6 +2491,339 @@ void msaaColourOnTile() {
         }
         CHECK(rate(f, "msaa_colour_on_tile") == 0 && rate(f, "msaa_colour_stored") == 1);
         unsetenv("VPKENGINE_MSAA_COLOUR_STORED");
+        if (failures) f.dump();
+    }
+}
+
+// A cut the engine makes in the middle of a multisampled colour pass (here a DMA between two draws) keeps the real samples: the pass that
+// ends stores them and the pass that continues loads them, instead of a resolve and a reseed of every sample from the picture (the
+// reseed mixes the clear colour into the samples of the edge texels: a dark line on polygon edges). The guest's own resolve is not such
+// a cut: the picture is what it asked for and the next pass is seeded from it. VPKENGINE_MSAA_CUT_SAMPLES_OFF=1: seeded as before.
+void msaaColourCutKeepsSamples() {
+    ProbeOn probe;
+    const uint64_t copyDst = kBase + 0xC0000;
+    // (a fast clear of the target waits and becomes the load action of its next pass: only a pass that begins with a clear is kept)
+    const auto clearRt = [](Fixture& f, uint64_t address = kRt, uint8_t samples = 4, uint16_t sliceStart = 0, uint16_t sliceCount = 1) {
+        vpps4::DrawState c = f.state();
+        c.primitive = vpps4::PrimitiveType::RectList;
+        c.color[0].address = address;
+        c.color[0].samples = samples;
+        c.color[0].sliceStart = sliceStart;
+        c.color[0].sliceCount = sliceCount;
+        c.color[0].fastClear = true;
+        c.color[0].clearWord = {0xff204080u, 0};
+        f.renderer.draw(c);
+    };
+    const auto guestResolve = [&](Fixture& f) {
+        vpps4::ColorTarget src = f.state().color[0], dst = src;
+        src.samples = 4;
+        dst.address = copyDst;
+        dst.samples = 1;
+        f.renderer.resolve(src, dst);
+    };
+    {  // (a) a DMA between two draws into one target
+        Fixture f;
+        f.renderer.setMaxSamples(4);
+        clearRt(f);
+        f.renderer.draw(colourDraw(f));
+        CHECK(f.renderer.copy(kBase + 0x6000, kBase + 0x5000, 64));
+        f.renderer.draw(colourDraw(f));
+        f.renderer.submit();
+        const auto passes = recordedPasses(f);
+        CHECK(passes.size() == 2);
+        if (passes.size() == 2) {
+            const vpgpu::Attachment &first = passes[0]->desc.colors[0], &second = passes[1]->desc.colors[0];
+            CHECK(!first.autoMsaa && !second.autoMsaa && first.texture == second.texture && first.resolve == second.resolve);
+            CHECK(first.load == vpgpu::LoadAction::Clear && second.load == vpgpu::LoadAction::Load);
+            const auto enc = encodersOf(f, first.texture);
+            CHECK(enc.size() == 2);
+            if (enc.size() == 2) {
+                const vpgpu::Attachment &a = enc[0]->pass.colors[0], &b = enc[1]->pass.colors[0];
+                CHECK(a.store == vpgpu::StoreAction::StoreAndResolve && a.resolve == first.resolve);  // (the samples and the picture)
+                CHECK(!b.needsSeed && b.load == vpgpu::LoadAction::Load);                              // (the samples, not a seed)
+            }
+            CHECK(f.backend.compiled.back().stats.seedDraws == 0);
+        }
+        CHECK(rate(f, "msaa_cut_kept") == 1);  // (the DMA; the end of the submit is not a cut)
+        if (failures) f.dump();
+    }
+    {  // (b) two cuts in a row: the pass between them stores what it loaded
+        Fixture f;
+        f.renderer.setMaxSamples(4);
+        clearRt(f);
+        f.renderer.draw(colourDraw(f));
+        CHECK(f.renderer.copy(kBase + 0x6000, kBase + 0x5000, 64));
+        f.renderer.draw(colourDraw(f));
+        CHECK(f.renderer.copy(kBase + 0x6000, kBase + 0x5000, 64));
+        f.renderer.draw(colourDraw(f));
+        f.renderer.submit();
+        const auto passes = recordedPasses(f);
+        CHECK(passes.size() == 3);
+        if (passes.size() == 3) {
+            CHECK(!passes[0]->desc.colors[0].autoMsaa && !passes[1]->desc.colors[0].autoMsaa && !passes[2]->desc.colors[0].autoMsaa);
+            const auto enc = encodersOf(f, passes[0]->desc.colors[0].texture);
+            CHECK(enc.size() == 3);
+            if (enc.size() == 3) {
+                CHECK(enc[0]->pass.colors[0].store == vpgpu::StoreAction::StoreAndResolve);
+                CHECK(enc[1]->pass.colors[0].store == vpgpu::StoreAction::StoreAndResolve && enc[1]->pass.colors[0].load == vpgpu::LoadAction::Load);
+                CHECK(!enc[2]->pass.colors[0].needsSeed && enc[2]->pass.colors[0].load == vpgpu::LoadAction::Load);
+            }
+        }
+        CHECK(rate(f, "msaa_cut_kept") == 2);
+        if (failures) f.dump();
+    }
+    {  // (c) the guest's resolve between the draws is not a cut of the engine: the pass is on tile and the next is seeded
+        Fixture f;
+        f.renderer.setMaxSamples(4);
+        clearRt(f);
+        f.renderer.draw(colourDraw(f));
+        guestResolve(f);
+        f.renderer.draw(colourDraw(f));
+        guestResolve(f);
+        f.renderer.submit();
+        const auto passes = recordedPasses(f);
+        CHECK(passes.size() == 2);
+        if (passes.size() == 2) CHECK(passes[0]->desc.colors[0].autoMsaa && passes[1]->desc.colors[0].autoMsaa);
+        CHECK(rate(f, "msaa_cut_kept") == 0);
+        if (failures) f.dump();
+    }
+    {  // (d) a pass that continues the picture (a Load: it is a seed) is not kept, and nothing is kept before a draw
+        Fixture f;
+        f.renderer.setMaxSamples(4);
+        CHECK(f.renderer.copy(kBase + 0x6000, kBase + 0x5000, 64));
+        f.renderer.draw(colourDraw(f));
+        f.renderer.submit();
+        const auto passes = recordedPasses(f);
+        CHECK(passes.size() == 1);
+        if (passes.size() == 1) CHECK(passes[0]->desc.colors[0].autoMsaa);
+        CHECK(rate(f, "msaa_cut_kept") == 0);
+        if (failures) f.dump();
+    }
+    {  // (f) the cut is made by the draw itself (another depth target: the pass cannot continue): it loads the samples the cut kept
+        Fixture f;
+        f.renderer.setMaxSamples(4);
+        clearRt(f);
+        f.renderer.draw(colourDraw(f));
+        vpps4::DrawState other = colourDraw(f);
+        other.depth.zAddress = other.depth.zWriteAddress = kDepth + 0x40000;
+        f.renderer.draw(other);
+        f.renderer.submit();
+        const auto passes = recordedPasses(f);
+        CHECK(passes.size() == 2);
+        if (passes.size() == 2) {
+            CHECK(!passes[0]->desc.colors[0].autoMsaa && !passes[1]->desc.colors[0].autoMsaa);
+            CHECK(passes[0]->desc.colors[0].texture == passes[1]->desc.colors[0].texture);
+            CHECK(passes[1]->desc.colors[0].load == vpgpu::LoadAction::Load);
+        }
+        CHECK(f.backend.compiled.back().stats.seedDraws == 0);
+        if (failures) f.dump();
+    }
+    {  // (g) the samples a cut kept are those of one slice: a pass of another slice of the target is seeded from the picture
+        Fixture f;
+        f.renderer.setMaxSamples(4);
+        clearRt(f, kRt, 4, 1, 1);
+        vpps4::DrawState one = colourDraw(f);
+        one.color[0].sliceStart = 1;
+        one.color[0].sliceCount = 1;
+        f.renderer.draw(one);
+        CHECK(f.renderer.copy(kBase + 0x6000, kBase + 0x5000, 64));  // (kept: slice 1)
+        vpps4::DrawState zero = colourDraw(f);
+        zero.color[0].sliceStart = 0;
+        zero.color[0].sliceCount = 2;  // (the same target: two slices, the first)
+        f.renderer.draw(zero);
+        guestResolve(f);  // (ends the pass without keeping it)
+        f.renderer.submit();
+        const auto passes = recordedPasses(f);
+        CHECK(passes.size() == 2);
+        if (passes.size() == 2) {
+            CHECK(passes[0]->desc.colors[0].texture == passes[1]->desc.colors[0].texture);
+            CHECK(!passes[0]->desc.colors[0].autoMsaa);
+            CHECK(passes[1]->desc.colors[0].autoMsaa && passes[1]->desc.colors[0].load == vpgpu::LoadAction::Load);
+        }
+        if (failures) f.dump();
+    }
+    {  // (h) the guest's resolve, whatever it flushes first (a clear waiting for its destination), ends the pass without keeping
+        Fixture f;
+        f.renderer.setMaxSamples(4);
+        clearRt(f, copyDst, 1);
+        clearRt(f);
+        f.renderer.draw(colourDraw(f));
+        vpps4::ColorTarget src = f.state().color[0], dst = src;
+        src.samples = 4;
+        dst.address = copyDst;
+        dst.samples = 1;
+        dst.width = dst.height = 64;  // (not the whole destination: its clear is flushed before the resolve, not dropped)
+        f.renderer.resolve(src, dst);
+        f.renderer.submit();
+        const auto passes = recordedPasses(f);
+        bool autoDrawn = false;
+        for (const vpgpu::RenderPass* rp : passes) autoDrawn = autoDrawn || (rp->desc.colors[0].autoMsaa && !rp->draws.empty());
+        CHECK(autoDrawn);
+        CHECK(rate(f, "msaa_cut_kept") == 0);
+        if (failures) f.dump();
+    }
+    {  // (i) a fast clear of the target ends the pass that drew into it without keeping, and what a cut kept before is gone
+        Fixture f;
+        f.renderer.setMaxSamples(4);
+        clearRt(f);
+        f.renderer.draw(colourDraw(f));
+        CHECK(f.renderer.copy(kBase + 0x6000, kBase + 0x5000, 64));  // (kept)
+        f.renderer.draw(colourDraw(f));
+        clearRt(f);
+        f.renderer.submit();  // (the clear lands as a pass of its own)
+        CHECK(rate(f, "msaa_cut_kept") == 1);  // (the DMA; not the clear, which discards what the open pass drew)
+        f.renderer.draw(colourDraw(f));
+        guestResolve(f);
+        f.renderer.submit();
+        const auto passes = recordedPasses(f);
+        CHECK(!passes.empty() && passes.back()->desc.colors[0].autoMsaa && passes.back()->desc.colors[0].load == vpgpu::LoadAction::Load);
+        if (failures) f.dump();
+    }
+    {  // (j) the picture of the target is written by somebody else (a refill from memory): the next pass is seeded from it
+        Fixture f;
+        f.renderer.setMaxSamples(4);
+        clearRt(f);
+        f.renderer.draw(colourDraw(f));
+        CHECK(f.renderer.copy(kBase + 0x6000, kBase + 0x5000, 64));  // (kept)
+        CHECK(f.renderer.fill(kRt, 64 * 1024, 0x01020304u));          // (a DMA over its memory)
+        f.renderer.draw(colourDraw(f));
+        guestResolve(f);
+        f.renderer.submit();
+        const auto passes = recordedPasses(f);
+        CHECK(!passes.empty() && passes.back()->desc.colors[0].autoMsaa);
+        if (failures) f.dump();
+    }
+    {  // (k) a pass that does not continue the kept slice and overwrites it (layered, an autoMsaa Load) forgets what was kept
+        Fixture f;
+        f.renderer.setMaxSamples(4);
+        clearRt(f, kRt, 4, 1, 1);
+        vpps4::DrawState one = colourDraw(f);
+        one.color[0].sliceStart = 1;
+        one.color[0].sliceCount = 1;
+        f.renderer.draw(one);
+        CHECK(f.renderer.copy(kBase + 0x6000, kBase + 0x5000, 64));  // (kept: slice 1)
+        vpps4::DrawState layered = colourDraw(f);
+        layered.color[0].sliceCount = 2;
+        layered.vs.vsOutCntl = 1u << 18;
+        f.renderer.draw(layered);
+        CHECK(f.renderer.copy(kBase + 0x6000, kBase + 0x5000, 64));  // (the layered pass is a Load: not kept)
+        f.renderer.draw(one);
+        guestResolve(f);
+        f.renderer.submit();
+        const auto passes = recordedPasses(f);
+        CHECK(passes.size() == 3);
+        if (passes.size() == 3) {
+            CHECK(passes[1]->desc.layerCount == 2 && passes[1]->desc.colors[0].autoMsaa);
+            CHECK(passes[2]->desc.colors[0].autoMsaa && passes[2]->desc.colors[0].load == vpgpu::LoadAction::Load);
+        }
+        if (failures) f.dump();
+    }
+    {  // (l) a compute that writes the picture of the target while a pass of it is open does not keep that pass
+        Fixture f;
+        f.renderer.setMaxSamples(4);
+        const auto rtWrite = [&](int times) {
+            std::array<uint32_t, 8> a{};
+            Fixture::tsharp(a.data(), kRt, 128, 128, 10, 0, 8);
+            vpps4::DispatchState x;
+            x.cs.code = f.atomic.code;
+            x.cs.fetch = f.atomic.fetch;
+            x.cs.address = kBase + 0x83000;
+            x.cs.userSgprs = 16;
+            for (int i = 0; i < 8; ++i) x.cs.userData[i] = a[i], x.cs.userData[8 + i] = a[i];
+            for (int i = 0; i < times; ++i) f.renderer.dispatch(x);
+        };
+        clearRt(f);
+        f.renderer.draw(colourDraw(f));
+        rtWrite(2);  // (the target is made writable: its pass ends)
+        clearRt(f);
+        f.renderer.draw(colourDraw(f));
+        rtWrite(1);  // (a pass that begins with a clear is open)
+        f.renderer.draw(colourDraw(f));
+        guestResolve(f);
+        f.renderer.submit();
+        const auto passes = recordedPasses(f);
+        CHECK(!passes.empty() && passes.back()->desc.colors[0].autoMsaa && passes.back()->desc.colors[0].load == vpgpu::LoadAction::Load);
+        if (failures) f.dump();
+    }
+    {  // (m) the end of a submit is not a cut: nothing is kept, and the next submit starts from the pictures
+        Fixture f;
+        f.renderer.setMaxSamples(4);
+        clearRt(f);
+        f.renderer.draw(colourDraw(f));
+        f.renderer.submit();
+        CHECK(rate(f, "msaa_cut_kept") == 0);
+        clearRt(f);
+        f.renderer.draw(colourDraw(f));
+        CHECK(f.renderer.copy(kBase + 0x6000, kBase + 0x5000, 64));  // (kept)
+        f.renderer.submit();
+        f.renderer.draw(colourDraw(f));
+        guestResolve(f);
+        f.renderer.submit();
+        const auto passes = recordedPasses(f);
+        CHECK(!passes.empty() && passes.back()->desc.colors[0].autoMsaa && passes.back()->desc.colors[0].load == vpgpu::LoadAction::Load);
+        if (failures) f.dump();
+    }
+    {  // (n) a fast clear of the target forgets what a cut kept, also when no pass is open and the clear lands on its own
+        Fixture f;
+        f.renderer.setMaxSamples(4);
+        clearRt(f);
+        f.renderer.draw(colourDraw(f));
+        CHECK(f.renderer.copy(kBase + 0x6000, kBase + 0x5000, 64));  // (kept)
+        clearRt(f);
+        vpps4::DrawState reader = f.state();  // (a draw to another target that samples the cleared one: the clear lands first)
+        reader.color[0].address = kBase + 0xA0000;
+        f.sample(kRt, 128, 128, 10, 4, 8);
+        f.renderer.draw(reader);
+        f.renderer.draw(colourDraw(f));
+        guestResolve(f);
+        f.renderer.submit();
+        const auto passes = recordedPasses(f);
+        CHECK(!passes.empty() && passes.back()->desc.colors[0].autoMsaa && passes.back()->desc.colors[0].load == vpgpu::LoadAction::Load);
+        if (failures) f.dump();
+    }
+    {  // (o) the guest's resolve forgets what a cut kept, also when no pass is open
+        Fixture f;
+        f.renderer.setMaxSamples(4);
+        clearRt(f);
+        f.renderer.draw(colourDraw(f));
+        CHECK(f.renderer.copy(kBase + 0x6000, kBase + 0x5000, 64));  // (kept)
+        guestResolve(f);
+        f.renderer.draw(colourDraw(f));
+        guestResolve(f);
+        f.renderer.submit();
+        const auto passes = recordedPasses(f);
+        CHECK(!passes.empty() && passes.back()->desc.colors[0].autoMsaa && passes.back()->desc.colors[0].load == vpgpu::LoadAction::Load);
+        if (failures) f.dump();
+    }
+    {  // (p) a shader that reads the samples ends the pass without keeping it: the samples are made from the picture, as before
+        Fixture f;
+        f.renderer.setMaxSamples(4);
+        clearRt(f);
+        f.renderer.draw(colourDraw(f));
+        f.sample(kRt, 128, 128, 10, 0, 8);
+        f.at(kBase + 0x200)[3] = (f.at(kBase + 0x200)[3] & ~(15u << 28)) | (14u << 28) | (2u << 16);
+        const auto ms = f.renderer.textureFor(vpps4::decodeImage(std::span<const uint32_t>(f.at(kBase + 0x200), 8)));
+        CHECK(ms && samplesOf(f, ms) == 4);
+        f.renderer.submit();
+        const auto passes = recordedPasses(f);
+        CHECK(!passes.empty() && passes[0]->desc.colors[0].autoMsaa);
+        CHECK(rate(f, "msaa_cut_kept") == 0);
+        if (failures) f.dump();
+    }
+    {  // (e) VPKENGINE_MSAA_CUT_SAMPLES_OFF=1: reseeded from the picture as before
+        setenv("VPKENGINE_MSAA_CUT_SAMPLES_OFF", "1", 1);
+        Fixture f;
+        f.renderer.setMaxSamples(4);
+        clearRt(f);
+        f.renderer.draw(colourDraw(f));
+        CHECK(f.renderer.copy(kBase + 0x6000, kBase + 0x5000, 64));
+        f.renderer.draw(colourDraw(f));
+        f.renderer.submit();
+        const auto passes = recordedPasses(f);
+        CHECK(passes.size() == 2);
+        if (passes.size() == 2) CHECK(passes[0]->desc.colors[0].autoMsaa && passes[1]->desc.colors[0].autoMsaa);
+        CHECK(f.backend.compiled.back().stats.seedDraws >= 1 && rate(f, "msaa_cut_kept") == 0);
+        unsetenv("VPKENGINE_MSAA_CUT_SAMPLES_OFF");
         if (failures) f.dump();
     }
 }
@@ -3152,6 +3488,7 @@ int main(int argc, char** argv) {
     else if (t == "depth_partner_retro_clear") depthPartnerRetroClear();
     else if (t == "depth_1x_shares_ms") depth1xSharesMs();
     else if (t == "msaa_colour_on_tile") msaaColourOnTile();
+    else if (t == "msaa_colour_cut_keeps_samples") msaaColourCutKeepsSamples();
     else if (t == "ps_sample_rate") psSampleRate();
     else if (t == "compare_depth") compareDepth();
     else if (t == "compare_depth_array") compareDepthArray();

@@ -265,6 +265,7 @@ struct Renderer::Impl {
         uint64_t psSampleIdDraws = 0;  // multisampled draws whose pixel shader reads the sample id (run per sample on the host)
         uint64_t depth1xShared = 0;  // one-sample draws that tested against the single-sample picture of a multisampled depth surface (not a depth of their own)
         uint64_t msaaColourOnTile = 0, msaaColourStored = 0;  // draws whose multisampled colour attachment keeps its samples on tile (autoMsaa) / stores them
+        uint64_t msaaCutKept = 0;  // passes of an on-tile colour target that ended in a cut of the engine and stored their samples (Surface::samplesKept)
         uint64_t psSampleBaryDraws = 0, psSampleIterDraws = 0;  // multisampled draws whose pixel shader reads the sample barycentrics / of those, that run per sample on the host
         uint64_t depthClearFills = 0, depthClearLines = 0;  // layers of a texture given the clear value of their depth buffer (Renderer::depthCleared)
         uint64_t depthAllocLines = 0, depthWritesUntracked = 0, flatTables = 0;  // depth targets made drawn smaller than their allocation (VPKENGINE_PROBE DEPTHALLOC)
@@ -2172,6 +2173,12 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         // Multisampled colour targets: the samples stay on tile and are never stored (Attachment::autoMsaa; the single-sample picture
         // travels between passes). `samplesStored` (sticky): they have to exist (a shader reads them, see makeSamplesReal).
         bool samplesOnTile = false, samplesStored = false;
+        // Multisampled colour targets on tile: a cut of the engine (not the guest's resolve) in the middle of the drawing stored the real
+        // samples (closePass), so the next pass loads them instead of being seeded from the single-sample picture (which holds the clear
+        // colour in the samples of the edge texels). Cleared by the guest's resolve, a clear and makeSamplesReal.
+        // (of one pass: the slice and layer count of the pass that stored them; a pass of other slices is seeded from the picture)
+        bool samplesKept = false;
+        uint16_t keptLayer = 0, keptLayers = 1;
         uint64_t lastDraw = ~uint64_t(0);  // colour targets: the frame (r.frame_) a pass last drew into it (~0: never; diagnostics)
         uint64_t draws = 0, drawsTaken = 0;  // draws into it, and those already handed to Renderer::takeTargetDraws
         int32_t lastScissor[4] = {};         // x, y, width, height / viewport of the last colour pass that drew into it (probe REFILL only)
@@ -3761,6 +3768,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         }
         ++pstat.refills[why];
         pstat.refillBytes[why] += s.bytes;
+        s.samplesKept = false;  // (the picture is new: the next pass is seeded from it)
         if (tex && vpgpu::probe::enabled()) probeTile(s, computeLayout(tiledOf(s)), true);
         fillFromMemory(s, tex);
         if (!s.filled) ++pstat.refillFailed;
@@ -4013,7 +4021,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         c.samplesStored = true;
         if (!onTile || !c.ms || !c.id) return;
         flushClear(c);
-        closePass();
+        closePass(&c);
         for (uint16_t l = 0; l < c.layers; ++l) {
             for (const bool anchor : {true, false}) {
                 if (anchor && c.layers < 2) continue;
@@ -4830,7 +4838,11 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
             if (storage && !c->writable) makeWritable(*c);
             refresh(*c, nullptr);
             probeSampled(desc, *c, "colour target", storage);
-            if (write) markWrite(*c);
+            if (write) {  // (written through its picture: the next pass is seeded from it, and the open pass is not kept at the compute that follows)
+                markWrite(*c);
+                c->samplesKept = false;
+                if (c->wid == passKeepWid) passKeepWid = ~0u;
+            }
             life.noteRead(c->id, r.frame_);
             return sampleThrough(*c, desc, f, storage);
         }
@@ -5713,22 +5725,67 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
     // Multisampled colour targets keep their samples on tile (Attachment::autoMsaa) and only the single-sample picture travels between
     // passes. VPKENGINE_MSAA_COLOUR_STORED=1: the samples are stored and loaded at every pass boundary, as before.
     bool msaaColourStored = std::getenv("VPKENGINE_MSAA_COLOUR_STORED") != nullptr;
+    // A cut of the engine in the middle of the drawing into an on-tile multisampled colour target keeps the real samples (closePass,
+    // Surface::samplesKept) instead of a resolve and a reseed. VPKENGINE_MSAA_CUT_SAMPLES_OFF=1: resolved and seeded as before.
+    bool msaaCutSamplesOff = [] { const char* e = std::getenv("VPKENGINE_MSAA_CUT_SAMPLES_OFF"); return e && e[0] == '1'; }();
     // A pixel shader that reads the sample barycentrics runs once per sample on the host. On the hardware that is a rasterizer
     // state (PS_ITER_SAMPLE, Stage::psIterSample): without it the sample barycentrics are interpolated at the centroid and the shader
     // runs once per pixel. VPKENGINE_PS_SAMPLE_RATE=1: always per sample, as before.
     bool psSampleRateOff = std::getenv("VPKENGINE_PS_SAMPLE_RATE") != nullptr;
     bool a2mWrittenOnly = std::getenv("VPKENGINE_A2M_WRITTEN_ONLY") != nullptr;  // (DB_ALPHA_TO_MASK only where colour 0 is written: see draw())
 
-    void closePass() {
-        if (passOpen) frame.endRenderPass();
+    // `guestResolved`: the surface the guest's own resolve (or makeSamplesReal) ends the pass for: its picture is what is wanted, the
+    // samples are not kept. Any other end of a pass that drew into an on-tile colour target (a cut of the engine: a copy, a compute
+    // dispatch, a clear, another target, the end of the submit) stores them, and the pass that continues loads them.
+    void closePass(const Surface* guestResolved = nullptr) {
+        if (passOpen) {
+            keepSamplesAtCut(guestResolved);
+            frame.endRenderPass();
+        }
         passOpen = false;
+        passKeepWid = ~0u;
         passAccess.clear();
     }
 
-    void openPass(const vpgpu::RenderPassDesc& want, bool clears, uint8_t samples) {
+    uint32_t passKeepWid = ~0u;  // the on-tile colour target (slot 0) of the open pass; ~0: none, or VPKENGINE_MSAA_CUT_SAMPLES_OFF=1
+    uint32_t resolvingWid = ~0u;  // the source of the guest's resolve being recorded (its passes end for the resolve: their samples are not kept)
+    void keepSamplesAtCut(const Surface* guestResolved) {
+        if (passKeepWid == ~0u) return;
+        Surface* s = surfaceOf(passKeepWid);
+        if (!s || !frame.openRenderPass()) return;
+        vpgpu::RenderPass& rp = std::get<vpgpu::RenderPass>(frame.mutableCommands().back());
+        vpgpu::Attachment& a = rp.desc.colors[0];
+        if (a.texture != s->ms) return;
+        if (s == guestResolved || passKeepWid == resolvingWid) return void(s->samplesKept = false);  // (the next pass is seeded from the picture)
+        // Only a pass whose start is its own: one that continues what a cut kept (loads real samples, not autoMsaa) or begins with a
+        // clear. An autoMsaa Load is a seed from the picture: made a Load of memory, it would read what the last writer of the texture
+        // stored (the samples of another slice, or none after a resolve of the guest). A pass that wrote no colour has none to keep.
+        if (a.autoMsaa && (a.load == vpgpu::LoadAction::Load || !(passWritten & 1))) return void(s->samplesKept = false);  // (it overwrites what was kept)
+        a.autoMsaa = false;
+        a.store = vpgpu::StoreAction::StoreAndResolve;
+        a.keepSamples = true;
+        a.resolveRequired = true;  // (the picture is resolved at the end of every pass, as with autoMsaa)
+        s->samplesKept = true, s->keptLayer = a.layer, s->keptLayers = rp.desc.layerCount;
+        ++pstat.msaaCutKept;
+    }
+
+    // `keepWid`: the on-tile colour target (slot 0) of the pass, if any. When a cut of the engine kept its real samples (keepSamplesAtCut:
+    // by the closePass just above, or an earlier one) the pass loads them instead of being seeded from the picture; a clear replaces them.
+    void openPass(const vpgpu::RenderPassDesc& want, bool clears, uint8_t samples, uint32_t keepWid) {
         if (passOpen && !clears && pass.sameTargets(want)) return;
         closePass();
         pass = want;
+        passKeepWid = keepWid;
+        if (keepWid != ~0u)
+            if (Surface* kept = surfaceOf(keepWid);
+                kept && kept->samplesKept && kept->keptLayer == pass.colors[0].layer && kept->keptLayers == pass.layerCount) {
+                if (pass.colors[0].load == vpgpu::LoadAction::Clear) {
+                    kept->samplesKept = false;
+                } else {
+                    pass.colors[0].autoMsaa = false;
+                    pass.colors[0].resolveRequired = true;
+                }
+            }
         passSamples = samples;
         passWritten = 0;
         frame.beginRenderPass(pass);
@@ -5811,6 +5868,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         const DepthPartner* partner = nullptr;
         unsigned partnerSlot = 8;  // (the slot attached for it, 8 = none)
         bool colourOnTile = false, colourStored = false;  // a multisampled colour attachment keeps its samples on tile / stores them
+        uint32_t keepWid = ~0u;                           // the target of colour 0 when it does (and VPKENGINE_MSAA_CUT_SAMPLES_OFF is not 1)
         if (!depthPartnerOff && samples > 1 && zf != vpgpu::Format::Undefined && !std::any_of(fragments.begin(), fragments.end(), [](uint8_t f) { return f != 0; })) {
             const auto it = depthPartners.find(d.depth.zFormat ? d.depth.zAddress : d.depth.stencilAddress);
             if (it != depthPartners.end() && it->second.samples == samples && it->second.c.width == d.depth.width && it->second.c.height == d.depth.height &&
@@ -5870,6 +5928,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
                     desc.colors[i].autoMsaa = true;
                     desc.colors[i].store = vpgpu::StoreAction::Resolve;
                     colourOnTile = true;
+                    if (!msaaCutSamplesOff) keepWid = t.wid;
                 } else {
                     makeSamplesReal(*tg);
                     desc.colors[i].store = vpgpu::StoreAction::StoreAndResolve;
@@ -6054,9 +6113,10 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
                     open->desc.colors[i].clear = pc.value;
                     ++pstat.depthPartnerRetroClears;
                 } else {
-                    closePass();
+                    closePass(surfaceOf(t.wid));  // (what the open pass drew into it is cleared away: nothing to keep)
                     setPendingClear(pc);
                 }
+                if (Surface* cleared = surfaceOf(t.wid)) cleared->samplesKept = false;
                 markWriteWid(t.wid);
                 any = true;
             }
@@ -6531,7 +6591,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
                     ++r.stats_.gsSplit;
                     note("geometry shader expansion reads what its render pass wrote: pass split");
                 }
-                closePass();
+                closePass(surfaceOf(passKeepWid));  // (a cut per draw of a geometry shader: resolved and seeded, not stored and loaded)
                 frame.dispatch(std::move(esJob));
                 frame.dispatch(std::move(gsJob));
             }
@@ -6543,7 +6603,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         // A title that stopped asking for occlusion results stops paying for the counting.
         if (vis.active && r.device_.submittedFrames() - vis.lastZpassFrame > Vis::kIdleFrames) vis.active = false;
         if (vis.active) draw.visibility = vpgpu::BufferSpan{vis.id, (vis.seq % kVisSlots) * 8, 8};
-        openPass(desc, clears, samples);
+        openPass(desc, clears, samples, keepWid);
         if (cap.armed) {
             cap.passSampled.insert(cap.passSampled.end(), cap.drawSampled.begin(), cap.drawSampled.end());
             cap.drawSampled.clear();
@@ -6909,6 +6969,12 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         // (the second target() may have moved the first when both live at one address)
         from = static_cast<Target*>(surfaceOf(fromWid));
         to = static_cast<Target*>(surfaceOf(toWid));
+        // The passes that end from here (the clears and refills below, the resolve itself) end for the guest's resolve of `from`.
+        resolvingWid = fromWid;
+        struct Resolving {
+            uint32_t& wid;
+            ~Resolving() { wid = ~0u; }
+        } resolving{resolvingWid};
         if (!from->ms) refresh(*from, nullptr);
         refresh(*to, nullptr);
         // A source that keeps its samples on tile has none to resolve: its single-sample picture is the resolved image at the end of
@@ -6945,7 +7011,8 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
                 }
             }
         }
-        closePass();
+        from->samplesKept = to->samplesKept = false;  // (the guest resolved it, and wrote the picture of `to`: the next pass is seeded from it)
+        closePass(from);
         vpgpu::RenderPass* last = rc.sourceMultisampled && !twinWanted ? lastPassWriting(from->ms, to->id) : nullptr;
         // The pass can take the resolve over only when it is an attachment of exactly this slice (mip 0, the
         // source's first layer), when it resolves nowhere else (nothing, the source's own picture, or already this
@@ -7188,6 +7255,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
 
     vpgpu::FrameReport submit() {
         flushReports();
+        closePass(surfaceOf(passKeepWid));  // (the end of a submit is not a cut: the planner drops the stores of stable chains, warm-up ones would be wasted)
         flushAllClears();  // (a clear nobody drew after still clears)
         closePass();
         // (the write backs of evicted images are recorded into this frame)
@@ -7195,6 +7263,8 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
             evict();
             closePass();
         }
+        for (auto& [address, targets] : colorTargets)
+            for (Target& t : targets) t.samplesKept = false;  // (the next submit starts from the pictures)
         ++r.cpu_.submits;
         if (frame.commands().empty()) {  // nothing recorded (a Flush after a Flush): no GPU frame
             ++r.cpu_.emptySubmits;
@@ -7611,7 +7681,7 @@ void Renderer::publishProbe(uint64_t pictures) {
         C(f, "buffer_snapshots", ps.bufferSnapshots), C(f, "pointer_snapshots", ps.pointerSnapshots);
         C(f, "depth_partner_draws", ps.depthPartnerDraws), C(f, "depth_partner_retro_clears", ps.depthPartnerRetroClears);
         C(f, "depth_1x_shared", ps.depth1xShared);
-        C(f, "msaa_colour_on_tile", ps.msaaColourOnTile), C(f, "msaa_colour_stored", ps.msaaColourStored);
+        C(f, "msaa_colour_on_tile", ps.msaaColourOnTile), C(f, "msaa_colour_stored", ps.msaaColourStored), C(f, "msaa_cut_kept", ps.msaaCutKept);
         C(f, "ps_sample_bary_draws", ps.psSampleBaryDraws), C(f, "ps_sample_iter_draws", ps.psSampleIterDraws);
         C(f, "ps_sample_id_draws", ps.psSampleIdDraws); C(f, "a2m_unwritten_draws", ps.a2mUnwrittenDraws);
         C(f, "scene_draws_untested", ps.sceneDrawsUntested), C(f, "scene_draws_zrange", ps.sceneDrawsZRange), C(f, "scene_draws_clamped", ps.sceneDrawsClamped);
