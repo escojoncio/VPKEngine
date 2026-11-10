@@ -3876,10 +3876,42 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdDraw(VkCommandBuffer cb, uint32_t co
   r.ops.emplace_back(makeDraw(r, first, count, instances, firstInstance, 0, false));
 }
 
+namespace vpvk {
+std::atomic<uint32_t> gHideIndexCount[kHideSlots];
+std::atomic<uint64_t> gHideDropped{0};
+}  // namespace vpvk
+
+// Does the draw about to be recorded write any colour attachment? (depth-only and shadow draws do not: they are never hidden, so
+// occlusion keeps working). The bound pipeline's blend state already has the outputs its shader does not write masked off; the
+// extended-dynamic-state colour write mask overrides it when the pipeline makes it dynamic.
+static bool drawWritesColor(const Recorder& r) {
+  const PipelineObj* p = r.bound.graphics;
+  if (!p) return false;
+  for (int c = 0; c < vpgpu::kMaxColorAttachments; ++c) {
+    if (p->state.colorFormats[c] == vpgpu::Format::Undefined) continue;
+    const bool dyn = r.bound.eds.colorWrite[c] >= 0 && p->isDynamic(VK_DYNAMIC_STATE_COLOR_WRITE_MASK_EXT);
+    if (dyn ? (r.bound.eds.colorWrite[c] & 0xF) && (p->fragmentOutputs >> c & 1) : p->state.blend[c].writeMask) return true;
+  }
+  return false;
+}
+
 VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdDrawIndexed(VkCommandBuffer cb, uint32_t count, uint32_t instances,
                                                         uint32_t firstIndex, int32_t vertexOffset, uint32_t firstInstance) {
   Recorder& r = rec(cb);
   if (!count || !instances) return;
+  // vpvk_hide_index_count: the host's scene mesh (a wireframe a game draws over passthrough) is identified by its index count. Only
+  // direct indexed draws are dropped; the rest of the frame is untouched. "vk.hide_mesh" reports the running total every ~5 s.
+  bool hide = false;
+  for (const auto& h : gHideIndexCount) hide = hide || h.load(std::memory_order_relaxed) == count;
+  if (hide && drawWritesColor(r)) {
+    static std::atomic<int64_t> last{0};
+    const uint64_t n = gHideDropped.fetch_add(1, std::memory_order_relaxed) + 1;
+    const int64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    int64_t was = last.load(std::memory_order_relaxed);
+    if (now - was >= 5000 && last.compare_exchange_strong(was, now))
+      logf("vk.hide_mesh: icount=%u dropped=%llu draws (acum)", count, (unsigned long long)n);
+    return;
+  }
   r.ops.emplace_back(makeDraw(r, firstIndex, count, instances, firstInstance, vertexOffset, true));
 }
 

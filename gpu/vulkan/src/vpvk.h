@@ -289,6 +289,10 @@ struct Image {
 // process' memory state (vpvk_texture_budget); read at vkCreateImage.
 uint32_t textureBudget();
 void setTextureBudget(uint32_t maxDim);
+// vpvk_hide_index_count: vkCmdDrawIndexed draws that write colour and have one of these index counts are dropped and counted.
+constexpr int kHideSlots = 4;                   // up to 4 index counts at a time; a new one replaces the oldest
+extern std::atomic<uint32_t> gHideIndexCount[kHideSlots];
+extern std::atomic<uint64_t> gHideDropped;
 // How many of its largest levels an image created from `ci` (core format `core`) loses under a budget of `cap` texels per axis.
 // 0 for what cannot shrink: not a plain 2D sampled texture (attachment, storage, host-transfer, multisampled, linear, sparse,
 // multi-planar), or a single-level block-compressed image (no smaller level to keep and no way to scale its blocks).

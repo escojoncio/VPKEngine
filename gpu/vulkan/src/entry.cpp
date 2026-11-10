@@ -4071,6 +4071,21 @@ VPVK_EXPORT uint32_t vpvk_device_wait_compiles(VkDevice dv) {
   return uint32_t(ms);
 }
 
+VPVK_EXPORT void vpvk_hide_index_count(unsigned n) {
+  static std::mutex mu;     // writers only (the draw path just reads the slots)
+  static unsigned next = 0;
+  std::lock_guard<std::mutex> lock(mu);
+  if (!n) {
+    for (auto& h : gHideIndexCount) h.store(0);
+    logf("vk.hide_mesh: off");
+    return;
+  }
+  for (const auto& h : gHideIndexCount) if (h.load() == n) return;   // already there: no log
+  gHideIndexCount[next].store(n);
+  next = (next + 1) % kHideSlots;
+  logf("vk.hide_mesh: icount=%u registered (direct indexed draws that write colour with this index count are dropped; up to %d counts, 0 = off)", n, kHideSlots);
+}
+
 VPVK_EXPORT void vpvk_texture_budget(unsigned max_dim) {
   if (max_dim == textureBudget()) return;
   setTextureBudget(max_dim);

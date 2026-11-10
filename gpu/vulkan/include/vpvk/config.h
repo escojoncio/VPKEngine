@@ -185,6 +185,9 @@ size_t vpvk_trim_memory(int level, char* out, size_t cap);
 // process' memory state and only ever tightens it within a run (copies between two textures then find the same levels on both).
 // "vk.tex_budget ..." lines report the cap and what it saved. Any thread.
 void vpvk_texture_budget(unsigned max_dim);
+// Hides a game's scene-mesh wireframe: vkCmdDrawIndexed draws whose index count is exactly `n` and that write colour are dropped (a
+// depth-only draw is kept); up to 4 counts at once (a new one replaces the oldest); 0 clears them all (the default). Indirect draws are never touched. "vk.hide_mesh: icount=N dropped=M draws (acum)" every ~5 s while it drops. Any thread.
+void vpvk_hide_index_count(unsigned n);
 // Releases what the guest destroyed that the backend keeps until a frame reuses a slot (the graveyard, and the
 // leftovers of frames that completed), without waiting for the GPU to go idle; min_idle_ms no longer gates it.
 // Any thread, never blocks (the submit mutex is try-locked: a busy device returns 0). Short key=value report into

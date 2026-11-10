@@ -501,14 +501,20 @@ FrameReport Device::submit(const Frame& frame) {
         v.clear();
       }
     }
-    if (!(done < 300 || done % 90 == 0 || t.frameMs > 12.0)) continue;  // slow frames always logged
+    // Slow frames: all of the first 200, then one in four (a game that runs slow throughout, ITR2, made
+    // this the loudest tag; gpu.sec above keeps p50/p95/max/over10 of every frame, so nothing is lost).
+    static uint64_t slowLogged = 0;
+    if (!(done < 300 || done % 90 == 0)) {
+      if (!(t.frameMs > 12.0)) continue;
+      if (slowLogged++ >= 200 && (slowLogged & 3)) continue;
+    }
     char buf[64];
     std::snprintf(buf, sizeof buf, "gpu.time f=%llu gpu_ms=%.3f", (unsigned long long)done, t.frameMs);
     std::string line = buf;
     // Slow frames carry each encoder's GPU time (submission order) so the costly pass shows
-    // without the "Diagnóstico de rendimiento" switch. Every 8th slow frame, to keep the log small.
+    // without the "Diagnóstico de rendimiento" switch. Every 2nd logged slow frame (1 in 8 of the slow ones), to keep the log small.
     static uint64_t slowSeen = 0;
-    if (t.frameMs > 12.0 && !t.encoderMs.empty() && (slowSeen++ % 8) == 0) {
+    if (t.frameMs > 12.0 && !t.encoderMs.empty() && (slowSeen++ % 2) == 0) {
       line += " enc_ms=";
       for (size_t i = 0; i < t.encoderMs.size() && i < 24; ++i) {
         char e[16];

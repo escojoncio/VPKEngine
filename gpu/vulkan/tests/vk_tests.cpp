@@ -4552,6 +4552,7 @@ struct PipeOpts {
   VkRect2D scissor{{0, 0}, {64, 64}};  // the pipeline's static scissor
   bool a2c = false;
   bool src1 = false;  // blend with the second-source factors (dual-source blending)
+  uint32_t colorMask = 0xF;
 };
 
 VkPipeline makePosPipeline(Ctx& c, DrawRig& rig, VkPipelineLayout pl, const PipeOpts& o, VkShaderModule vs, VkShaderModule fs) {
@@ -4581,7 +4582,7 @@ VkPipeline makePosPipeline(Ctx& c, DrawRig& rig, VkPipelineLayout pl, const Pipe
   ds.stencilTestEnable = o.stencilTest;
   ds.front = ds.back = {VK_STENCIL_OP_KEEP, VK_STENCIL_OP_KEEP, VK_STENCIL_OP_KEEP, VK_COMPARE_OP_ALWAYS, 0xFF, 0xFF, 0};
   VkPipelineColorBlendAttachmentState cba{};
-  cba.colorWriteMask = 0xF;
+  cba.colorWriteMask = o.colorMask;
   if (o.src1) {
     cba.blendEnable = VK_TRUE;
     cba.srcColorBlendFactor = VK_BLEND_FACTOR_SRC1_COLOR, cba.dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC1_COLOR;
@@ -9440,6 +9441,47 @@ void testSuspendResume() {
   vkFreeMemory(c.dev, m, nullptr);
 }
 
+// vpvk_hide_index_count: a direct indexed draw that writes colour with a registered index count is not recorded (up to 4 counts; the
+// oldest is replaced by a fifth); other counts are; a pipeline that writes no colour (depth-only) is kept; 0 switches it all off.
+void testHideMesh() {
+  Ctx c;
+  DrawRig rig(c);
+  VkShaderModule vs = module(c, "pos.vert.spv"), fs = module(c, "solid.frag.spv");
+  VkPipelineLayoutCreateInfo plci{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+  VkPipelineLayout pl;
+  vkCreatePipelineLayout(c.dev, &plci, nullptr, &pl);
+  PipeOpts depthOnly;
+  depthOnly.colorMask = 0;
+  VkPipeline colour = makePosPipeline(c, rig, pl, PipeOpts{}, vs, fs), noColour = makePosPipeline(c, rig, pl, depthOnly, vs, fs);
+  c.gpu().pipelines().waitIdle();
+  rig.begin();
+  vkCmdBindPipeline(rig.cb, VK_PIPELINE_BIND_POINT_GRAPHICS, colour);
+  const size_t base = vpvk::recordedOps(rig.cb);
+  const std::string said = captureStderr([] { vpvk_hide_index_count(197622); });
+  CHECK(said.find("vk.hide_mesh: icount=197622 registered") != std::string::npos);
+  const uint64_t d0 = gHideDropped.load();
+  vkCmdDrawIndexed(rig.cb, 197622, 1, 0, 0, 0);  // dropped
+  CHECK(vpvk::recordedOps(rig.cb) == base && gHideDropped.load() == d0 + 1);
+  vkCmdDrawIndexed(rig.cb, 197622, 3, 5, 2, 1);  // dropped whatever the instances / offsets
+  CHECK(vpvk::recordedOps(rig.cb) == base && gHideDropped.load() == d0 + 2);
+  vkCmdDrawIndexed(rig.cb, 197620, 1, 0, 0, 0);  // another count: recorded
+  vkCmdDraw(rig.cb, 197622, 1, 0, 0);            // not indexed: recorded
+  CHECK(vpvk::recordedOps(rig.cb) == base + 2 && gHideDropped.load() == d0 + 2);
+  vkCmdBindPipeline(rig.cb, VK_PIPELINE_BIND_POINT_GRAPHICS, noColour);
+  vkCmdDrawIndexed(rig.cb, 197622, 1, 0, 0, 0);  // writes no colour (depth / occlusion): recorded
+  CHECK(vpvk::recordedOps(rig.cb) == base + 3 && gHideDropped.load() == d0 + 2);
+  vkCmdBindPipeline(rig.cb, VK_PIPELINE_BIND_POINT_GRAPHICS, colour);
+  // four more counts: 197622 is the oldest of five and gives way
+  for (unsigned n : {1000u, 2000u, 3000u, 4000u}) vpvk_hide_index_count(n);
+  vkCmdDrawIndexed(rig.cb, 197622, 1, 0, 0, 0);  // replaced: recorded
+  vkCmdDrawIndexed(rig.cb, 4000, 1, 0, 0, 0);    // in the set: dropped
+  CHECK(vpvk::recordedOps(rig.cb) == base + 4 && gHideDropped.load() == d0 + 3);
+  const std::string off = captureStderr([] { vpvk_hide_index_count(0); });
+  CHECK(off.find("vk.hide_mesh: off") != std::string::npos);
+  vkCmdDrawIndexed(rig.cb, 4000, 1, 0, 0, 0);    // off: recorded
+  CHECK(vpvk::recordedOps(rig.cb) == base + 5 && gHideDropped.load() == d0 + 3);
+}
+
 // Draws dropped at record time say why (OpDraw::reason) and the replay counts them per reason (TranslateStats::skippedBy):
 // an empty scissor (alone, and outside the render area) and a static FRONT_AND_BACK cull; the draw that is fine is drawn.
 void testSkipReasons() {
@@ -13750,7 +13792,7 @@ int main(int argc, char** argv) {
       {"vertex_stores", testVertexStores}, {"profile", testProfile}, {"profile13", testProfile13}, {"quest_extras", testQuestExtras}, {"push_descriptor", testPushDescriptor}, {"report_geom", testReportGeomInterpolators}, {"pipeline_policy", testPipelinePolicy}, {"eds", testExtendedDynamicState},
       {"quest_gpu_name", testQuestGpuName}, {"native_identity", testNativeIdentity}, {"inline_uniform", testInlineUniformBlock}, {"bda", testBufferDeviceAddress}, {"ycbcr", testYcbcr},
       {"taa_native", testTaaNative}, {"taa_eye_depth", testTaaEyeDepth}, {"taa_uimask", testTaaUiMask}, {"msaa_force", testMsaaForce}, {"d24_emul", testD24Emul}, {"prewarm_variants", testPrewarmVariants}, {"msaa_force_marked", testMsaaForceMarkedEye}, {"aot", testAot}, {"aniso", testAniso}, {"zeroinit", testZeroInit}, {"archive_index", testArchiveIndex}, {"foveation", testFoveation},
-      {"stage_keys", testStageKeys}, {"async_pipelines", testAsyncPipelines}, {"sync_pipelines", testSyncPipelines}, {"create_default", testCreateDefault}, {"pso_census", testPsoCensus}, {"cache_state", testCacheState}, {"pass_drop", testPassDrop}, {"skip_reasons", testSkipReasons}, {"diag_census", testDiagCensus}, {"indirect_patch", testIndirectPatch}, {"astc3d", testAstc3d},
+      {"stage_keys", testStageKeys}, {"async_pipelines", testAsyncPipelines}, {"sync_pipelines", testSyncPipelines}, {"create_default", testCreateDefault}, {"pso_census", testPsoCensus}, {"cache_state", testCacheState}, {"hide_mesh", testHideMesh}, {"pass_drop", testPassDrop}, {"skip_reasons", testSkipReasons}, {"diag_census", testDiagCensus}, {"indirect_patch", testIndirectPatch}, {"astc3d", testAstc3d},
       {"perf", testPerf}, {"phase1b", testPhase1b}, {"suspend_resume", testSuspendResume}, {"translator_modes", testTranslatorModes}, {"capture", testCapture}, {"capture_images", testCaptureImages}, {"capture_hooks", testCaptureHooks}, {"capture_codec", testCaptureCodec}, {"capture_env", testCaptureEnv}, {"capture_pools", testCapturePools}, {"capture_host_frames", testCaptureHostFrames}, {"capture_corrupt", testCaptureCorrupt}, {"capture_env_host", testCaptureEnvHost}, {"capture_env_dir", testCaptureEnvDir}, {"capture_devices", testCaptureDevices}, {"capture_unhooked", testCaptureUnhooked}, {"capture_budget", testCaptureBudget}, {"capture_locks", testCaptureLocks}, {"png", testPng}, {"imgdiff", testImgDiff}, {"replay", testReplay}, {"replay_lvp", testReplayLvp}, {"refcaps", testRefCaps}};
   bool ran = false;
   for (const auto& [name, fn] : groups) {
