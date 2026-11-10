@@ -2327,8 +2327,9 @@ void depthPartner1x() {
         };
         size_t from = f.backend.commands.size();
         frame();  // (learning: the depth-only pass, the colour pass; the late depth-only draw joins it, or cuts again)
-        auto learn = passesFrom(f, from);
+        const auto learn = passesFrom(f, from);
         CHECK(learn.size() == (off ? 3u : 2u));
+        const vpgpu::TextureId learnt = learn.size() > 1 ? learn[1]->desc.colors[0].texture : vpgpu::TextureId{};  // (the commands move as more are recorded)
         from = f.backend.commands.size();
         frame();
         const auto merged = passesFrom(f, from);
@@ -2336,7 +2337,7 @@ void depthPartner1x() {
         if (!off && merged.size() == 1) {
             const vpgpu::Attachment& c = merged[0]->desc.colors[0];
             CHECK(merged[0]->draws.size() == 5);
-            CHECK(c.texture && learn.size() == 2 && c.texture == learn[1]->desc.colors[0].texture);  // (the colour the opaque draws write)
+            CHECK(c.texture && c.texture == learnt);  // (the colour the opaque draws write)
             CHECK(c.load == vpgpu::LoadAction::Load && c.store == vpgpu::StoreAction::Store);
             CHECK(!c.autoMsaa && !c.keepSamples && !c.resolve && merged[0]->desc.samples == 1);
             CHECK(merged[0]->desc.depth.texture && merged[0]->desc.depth.load == vpgpu::LoadAction::Load);
@@ -2511,6 +2512,172 @@ void depthPartner1x() {
         }
         if (failures) f.dump();
     }
+}
+
+// What learns a partner and what it is not used for.
+// (1) A one-sample pass over the multisampled depth (colour 1x) does not replace the partner the multisampled draws learned: the
+// next multisampled prepass is still one pass with its colour.
+void depthPartnerKeepsMs() {
+    ProbeOn probe;
+    Fixture f;
+    f.renderer.setMaxSamples(4);
+    auto frame = [&] {
+        f.renderer.draw(depthOnlyDraw(f));
+        f.renderer.draw(colourDraw(f));
+        f.renderer.submit();
+    };
+    frame();
+    const size_t from0 = f.backend.commands.size();
+    frame();
+    CHECK(passesFrom(f, from0).size() == 1);
+    vpps4::DrawState one = f.depthState(true);  // (colour 1x over the multisampled depth)
+    one.depth.samples = 4;
+    one.color[0].address = kBase + 0xb0000;
+    f.renderer.draw(one);
+    f.renderer.submit();
+    const size_t from = f.backend.commands.size();
+    frame();
+    CHECK(passesFrom(f, from).size() == 1);
+    if (failures) f.dump();
+}
+
+// (2) A partner a pass holds without writing it (Load + Store of the whole target for nothing) is dropped after two such passes in a
+// row, for 60 frames; a pass that writes it starts the count again. RATES depth_partner_idle_passes counts them.
+void depthPartnerIdle() {
+    ProbeOn probe;
+    const uint64_t colour2 = kBase + 0xb0000;
+    {  // the colour of the frame is written in two targets of one depth: the prepass attaches the last one, the opaque pass starts with the other
+        Fixture f;
+        f.renderer.setMaxSamples(1);
+        auto c2 = [&] {
+            vpps4::DrawState d = f.depthState(true);
+            d.color[0].address = colour2;
+            return d;
+        };
+        f.renderer.draw(f.depthState(true));
+        f.renderer.draw(c2());
+        f.renderer.submit();
+        for (int n = 0; n < 5; ++n) {
+            const size_t from = f.backend.commands.size();
+            f.renderer.draw(depthOnly1x(f));
+            f.renderer.draw(f.depthState(true));
+            f.renderer.draw(c2());
+            f.renderer.submit();
+            const auto passes = passesFrom(f, from);
+            CHECK(passes.size() == 3);
+            if (!passes.empty()) CHECK(bool(passes[0]->desc.colors[0].texture) == (n < 2));
+        }
+        CHECK(rate(f, "depth_partner_idle_passes") == 2);
+        for (int n = 0; n < 61; ++n) f.renderer.submit();  // (60 frames later it is tried again)
+        const size_t from = f.backend.commands.size();
+        f.renderer.draw(depthOnly1x(f));
+        f.renderer.draw(f.depthState(true));
+        f.renderer.draw(c2());
+        f.renderer.submit();
+        const auto passes = passesFrom(f, from);
+        CHECK(!passes.empty() && passes[0]->desc.colors[0].texture);
+        if (failures) f.dump();
+    }
+    {  // depth-only draws that no opaque draw follows; a pass that writes the colour in between starts the count again
+        Fixture f;
+        f.renderer.setMaxSamples(1);
+        f.renderer.draw(f.depthState(true));
+        f.renderer.submit();
+        auto lone = [&] {
+            const size_t from = f.backend.commands.size();
+            f.renderer.draw(depthOnly1x(f));
+            f.renderer.submit();
+            const auto passes = passesFrom(f, from);
+            return passes.size() == 1 && passes[0]->desc.colors[0].texture;
+        };
+        auto used = [&] {
+            const size_t from = f.backend.commands.size();
+            f.renderer.draw(depthOnly1x(f));
+            f.renderer.draw(f.depthState(true));
+            f.renderer.submit();
+            const auto passes = passesFrom(f, from);
+            return passes.size() == 1 && passes[0]->desc.colors[0].texture;
+        };
+        for (int n = 0; n < 3; ++n) CHECK(lone() && used());
+        CHECK(rate(f, "depth_partner_idle_passes") == 3);
+        CHECK(lone() && lone());  // (two in a row)
+        CHECK(!lone() && !lone());
+        CHECK(rate(f, "depth_partner_idle_passes") == 5);
+        if (failures) f.dump();
+    }
+}
+
+// (3) A depth-only draw whose pixel shader samples the colour of its partner is recorded without it (it would read what it is
+// attached to); one that samples another texture keeps it.
+void depthPartnerSamplesItself() {
+    ProbeOn probe;
+    Fixture f;
+    f.renderer.setMaxSamples(1);
+    f.renderer.draw(f.depthState(true));
+    f.renderer.submit();
+    for (const bool itself : {true, false}) {
+        vpps4::DrawState d = depthOnly1x(f);
+        d.ps = f.depthState(true).ps;
+        if (itself) f.sample(kRt, 128, 128, 10, 0, 8);
+        const uint64_t draws = f.renderer.stats().draws, drawn = f.renderer.stats().drawn;
+        const size_t from = f.backend.commands.size();
+        f.renderer.draw(d);
+        f.renderer.submit();
+        const auto passes = passesFrom(f, from);
+        CHECK(f.renderer.stats().draws == draws + 1 && f.renderer.stats().drawn == drawn + 1);
+        CHECK(passes.size() == 1 && passes[0]->draws.size() == 1);
+        if (passes.size() == 1) CHECK(bool(passes[0]->desc.colors[0].texture) == !itself);
+        f.sample(kTex, 64, 64, 10, 0, 8);
+    }
+    if (failures) f.dump();
+}
+
+// (4) The partner has as many slices as the depth of the draw that would take it (else the pass would have more layers than the colour).
+void depthPartnerSlices() {
+    ProbeOn probe;
+    Fixture f;
+    f.renderer.setMaxSamples(1);
+    vpps4::DrawState learn = f.depthState(true);
+    learn.depth.sliceCount = 2;  // (one slice of colour, two of depth)
+    f.renderer.draw(learn);
+    f.renderer.submit();
+    vpps4::DrawState d = depthOnly1x(f);
+    d.depth.sliceCount = 2;
+    d.vs.vsOutCntl |= 1u << 18;  // (layered: the pass takes the layers of the depth)
+    const size_t from = f.backend.commands.size();
+    f.renderer.draw(d);
+    f.renderer.submit();
+    const auto passes = passesFrom(f, from);
+    CHECK(passes.size() == 1 && !passes[0]->desc.colors[0].texture);
+    if (failures) f.dump();
+}
+
+// (5) A partner is the colour target of its memory: when another target was drawn at that address since (other format), it is not
+// attached.
+void depthPartnerStale() {
+    ProbeOn probe;
+    Fixture f;
+    f.renderer.setMaxSamples(1);
+    f.renderer.draw(f.depthState(true));  // (learns it: format 10 at kRt)
+    f.renderer.submit();
+    size_t from = f.backend.commands.size();
+    f.renderer.draw(depthOnly1x(f));
+    f.renderer.submit();
+    auto passes = passesFrom(f, from);
+    CHECK(passes.size() == 1 && passes[0]->desc.colors[0].texture);
+    vpps4::DrawState two = f.depthState(true);  // (two colour targets: learns nothing, writes kRt as 16)
+    two.color[0].format = 2;  // (16: another texel size, so another image)
+    two.color[1] = {kBase + 0xb0000, 128, 128, 128, 10, 0, 0, 8};
+    const uint64_t drawn = f.renderer.stats().drawn;
+    f.renderer.draw(two);
+    f.renderer.submit();
+    CHECK(f.renderer.stats().drawn == drawn + 1);
+    from = f.backend.commands.size();
+    f.renderer.draw(depthOnly1x(f));
+    f.renderer.submit();
+    passes = passesFrom(f, from);
+    CHECK(passes.size() == 1 && !passes[0]->desc.colors[0].texture);
+    if (failures) f.dump();
 }
 
 // A one-sample pass (one-fragment colour target) that binds a multisampled depth surface the scene was drawn into tests against that
@@ -3709,6 +3876,11 @@ int main(int argc, char** argv) {
     else if (t == "a2m_unwritten_colour") a2mUnwrittenColour();
     else if (t == "depth_partner_retro_clear") depthPartnerRetroClear();
     else if (t == "depth_partner_1x") depthPartner1x();
+    else if (t == "depth_partner_keeps_ms") depthPartnerKeepsMs();
+    else if (t == "depth_partner_idle") depthPartnerIdle();
+    else if (t == "depth_partner_samples_itself") depthPartnerSamplesItself();
+    else if (t == "depth_partner_slices") depthPartnerSlices();
+    else if (t == "depth_partner_stale") depthPartnerStale();
     else if (t == "depth_1x_shares_ms") depth1xSharesMs();
     else if (t == "msaa_colour_on_tile") msaaColourOnTile();
     else if (t == "msaa_colour_cut_keeps_samples") msaaColourCutKeepsSamples();
