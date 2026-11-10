@@ -6,6 +6,7 @@
 //       position of two programs that compute it with the same operations may differ in the last bits (fast math contracts a
 //       multiply and an add differently in each program): a depth test EQUAL / LEQUAL of the colour pass against the prepass then
 //       fails triangle by triangle (holes, flicker). The library key changes with the mode so archived pipelines are not mixed.
+//       (=2 also strips the [[invariant]] attribute from the MSL text.)
 //   VPKENGINE_MAX_ANISO=<n>     every sampler's anisotropy is capped to n (1 = none). Visible quality change.
 #pragma once
 
@@ -24,7 +25,10 @@ inline unsigned parseMaxAniso(const char* v) {
 }
 inline uint8_t capAniso(uint8_t aniso, unsigned cap) { return cap && aniso > cap ? uint8_t(cap) : aniso; }
 
-// Read at each call (a new shader library, a new sampler), not once: the variable may be set while the process runs.
+// Read at each call (a new shader library, a new sampler), not once: the variable may be set while the process runs. Changing it
+// mid-run reaches only what is created afterwards: libraries / pipelines and samplers already made keep the mode they were made
+// with (and a sampler is shared by its description), so a step that follows one run with the switch on starts contaminated unless
+// the process is restarted or the objects are new.
 inline unsigned vsFastMath() { return parseVsFastMath(std::getenv("VPKENGINE_VS_FASTMATH")); }
 inline unsigned maxAniso() { return parseMaxAniso(std::getenv("VPKENGINE_MAX_ANISO")); }
 
