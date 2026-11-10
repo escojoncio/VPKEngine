@@ -2322,6 +2322,21 @@ void depth1xSharesMs() {
             }
         }
         CHECK(rate(f, "depth_1x_shared") == (separate ? 0u : 1u));
+        if (!separate) {
+            // Only the last multisampled pass before a one-sample read, and the last of a frame, resolve the picture.
+            f.backend.commands.clear();
+            vpps4::DrawState other = d;  // a one-sample colour draw with no depth: it ends the 4x pass and reads no picture
+            other.depth = decltype(other.depth){};
+            f.renderer.draw(colourDraw(f));
+            f.renderer.draw(other);
+            f.renderer.draw(colourDraw(f));
+            f.renderer.submit();
+            std::vector<const vpgpu::RenderPass*> later;
+            for (const vpgpu::Command& c : f.backend.commands)
+                if (const auto* rp = std::get_if<vpgpu::RenderPass>(&c)) later.push_back(rp);
+            CHECK(later.size() == 3);
+            if (later.size() == 3) CHECK(!later[0]->desc.depth.resolveRequired && later[2]->desc.depth.resolveRequired);
+        }
         if (failures) f.dump();
         if (separate) unsetenv("VPKENGINE_DEPTH_1X_SEPARATE");
     }

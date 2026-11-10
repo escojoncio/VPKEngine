@@ -3738,8 +3738,9 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
 
     // A one-sample pass tests against the single-sample picture of this multisampled depth target (draw(), depth1xShared): its passes
     // resolve into that picture whatever the lifetime planner thinks of it, the last one recorded included.
+    // (Not every pass resolves: a resolve writes the whole picture. The last pass before a one-sample read does, and the
+    // last of every frame, so the picture is current across submits: see submit().)
     void requireDepthResolve(Target& t) {
-        if (t.shared1x) return;
         t.shared1x = true;
         for (auto c = frame.mutableCommands().rbegin(); c != frame.mutableCommands().rend(); ++c)
             if (auto* rp = std::get_if<vpgpu::RenderPass>(&*c))
@@ -5707,7 +5708,6 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
                 desc.depth.store = vpgpu::StoreAction::StoreAndResolve;
                 desc.depth.keepSamples = true;
                 desc.depth.depthResolve = dt->depthMode;
-                desc.depth.resolveRequired = dt->shared1x;  // (a one-sample pass reads that picture)
             }
             ps.depthFormat = zf;
             width = width ? std::min(width, z.width) : z.width;
@@ -6966,6 +6966,9 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
                 for (const uint32_t w : cap.wids)
                     if (const Surface* s = surfaceOf(w); s && s->id) life.noteRead(s->id, r.frame_);
             }
+            for (auto& [address, list] : depthTargets)  // (the picture a one-sample pass reads is current when the frame ends)
+                for (Target& t : list)
+                    if (t.shared1x && t.ms) requireDepthResolve(t);
             const auto tLife = Clock::now();
             const LifetimeStats ls = life.plan(frame, r.device_.resources(), r.frame_);
             r.cpu_.lifeMs += msSince(tLife);
