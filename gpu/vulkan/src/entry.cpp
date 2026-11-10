@@ -224,6 +224,11 @@ vpgpu::TextureDesc imageDesc(const VkImageCreateInfo& ci) {
   if (!d.usage) d.usage = vpgpu::usage::sampled;
   d.samplesReadable = (ci.usage & (VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT |
                                    VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_STORAGE_BIT)) != 0;
+  // (frame compiler: msaaDeadStore.) The stencil usage counts whether or not vkCreateImage merged it (that needs nativeExtras()).
+  VkImageUsageFlags stencilUsage = 0;
+  if (const auto* su = static_cast<const VkImageStencilUsageCreateInfo*>(findNext(ci.pNext, VK_STRUCTURE_TYPE_IMAGE_STENCIL_USAGE_CREATE_INFO)))
+    stencilUsage = su->stencilUsage;
+  d.shaderReadable = ((ci.usage | stencilUsage) & (VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT)) != 0;
   // The 1x images forced MSAA resolves into (and seeds samples from, Attachment::needsSeed): a shader reads them. The game's own
   // MSAA (gameMsaaAuto) adds nothing: commands.cpp gameAuto only serves resolve targets that are already readable.
   if (d.samples <= 1 && (ci.usage & (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT)) &&

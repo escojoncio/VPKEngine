@@ -495,6 +495,7 @@ class Scheduler {
       } else if (own.texture) {
         have.store = own.store;
         have.keepSamples = own.keepSamples;
+        have.keepOrigin = own.keepOrigin;
         have.autoMsaa = own.autoMsaa;
         have.resolve = own.resolve;
         have.resolveMip = own.resolveMip;
@@ -838,6 +839,7 @@ void placeTiles(CompiledFrame& out, const std::vector<Command>& cmds, std::vecto
     bool firstAttachLoads = false;  // ... and that attachment Loads it
     bool multi = false, pixelLocal = false, sampled = false, elsewhere = false, badFetch = false;
     bool multiLoads = false;      // an encoder after the first one that attaches it Loads it (needs the earlier contents)
+    bool partial = false;         // some encoder attaches only a layer / mip of it (what an elided whole-texture store left is incomplete)
   };
   std::unordered_map<uint64_t, Use> uses;
   auto key = [](uint32_t index, uint32_t generation) { return uint64_t{generation} << 32 | index; };
@@ -868,6 +870,8 @@ void placeTiles(CompiledFrame& out, const std::vector<Command>& cmds, std::vecto
       u.multiLoads = u.multiLoads || (again && loads);
       if (loads && u.encoder < 0 && u.firstRead < 0) u.firstRead = static_cast<int>(e);
       if (u.firstAttach < 0) u.firstAttach = static_cast<int>(e), u.firstAttachLoads = loads;
+      if (const TextureDesc* pd = res.get(a.texture); pd && (pd->type != TextureType::Tex2D || pd->mips != 1 || pd->layers != enc.pass.layerCount || a.layer))
+        u.partial = true;
       u.encoder = static_cast<int>(e);
       // resolved into memory (an autoMsaa slot only when it resolves: otherwise `resolve` is just its seed source)
       if (a.resolve && (!a.autoMsaa || a.store == StoreAction::Resolve || a.store == StoreAction::StoreAndResolve))
@@ -898,7 +902,9 @@ void placeTiles(CompiledFrame& out, const std::vector<Command>& cmds, std::vecto
       StoreObs o;
       o.texture = id;
       o.readFirst = u.firstRead >= 0 && (u.firstAttach < 0 || u.firstRead <= u.firstAttach);
-      if (o.readFirst && res.storeHistory(id).elided) {  // contents the elided store never wrote: this frame cannot be saved
+      // (A frame that attaches only part of a texture whose whole-texture store was elided leaves the rest undefined for good:
+      // the same miss, whatever its first access is.)
+      if ((o.readFirst || u.partial) && res.storeHistory(id).elided) {  // contents the elided store never wrote: this frame cannot be saved
         missed.insert(k);
         ++out.stats.elideMiss;
         out.elideMisses.push_back(id);
@@ -1068,8 +1074,9 @@ void placeTiles(CompiledFrame& out, const std::vector<Command>& cmds, std::vecto
       const bool transient = d->transient && !res.transientViolated(a.texture);
       const bool kept = a.store != StoreAction::DontCare && a.store != StoreAction::Resolve && !transient && !msaaResolve;
       // A client Store of MSAA samples may be a dead store: judged below as if it were dropped.
-      const bool deadCand = kept && options.msaaDeadStore && d->samples > 1 && !missed.count(k) &&
-                            !res.storeHistory(a.texture).banned;
+      // (Only an image no shader can read, and not a store the translator needs for its own reads: KeepOrigin::Required.)
+      const bool deadCand = kept && options.msaaDeadStore && !options.msaaDeadStoreHalt && d->samples > 1 && !d->shaderReadable &&
+                            a.keepOrigin != KeepOrigin::Required && !missed.count(k) && !res.storeHistory(a.texture).banned;
       if (kept && !deadCand) v = TileVerdict::None;
       else if (d->persistent && !msaaResolve) v = TileVerdict::Persistent;
       else if (u.elsewhere) v = TileVerdict::UsedElsewhere;

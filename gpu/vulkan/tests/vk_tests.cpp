@@ -3749,6 +3749,10 @@ void testRenderPassOps() {
         if (ps.size() == 1)
           CHECK(ps[0]->desc.colors[0].store == (store ? vpgpu::StoreAction::StoreAndResolve : vpgpu::StoreAction::Resolve) &&
                 ps[0]->desc.colors[0].keepSamples == store);
+        // ... and says it is the client's own STORE (msaaDeadStore may guess it away), of an image no shader can read.
+        CHECK(ps.size() == 1 && ps[0]->desc.colors[0].keepOrigin == (store ? vpgpu::KeepOrigin::Client : vpgpu::KeepOrigin::Unknown));
+        vpgpu::TextureDesc td;
+        CHECK(c.gpu().textureDesc(from<Image>(ms)->id, td) && !td.shaderReadable);
       }
       vkDestroyImageView(c.dev, mv, nullptr);
       vkDestroyImageView(c.dev, ov, nullptr);
@@ -3797,6 +3801,12 @@ void testRenderPassOps() {
             CHECK(cf.encoders[0].tileLocal(0) == tile);
             CHECK(cf.encoders[0].pass.colors[0].store ==
                   (tile ? vpgpu::StoreAction::Resolve : vpgpu::StoreAction::StoreAndResolve));
+            // Only the client STORE of the non-transient image is a dead-store candidate (CompileOptions::msaaDeadStore).
+            vpgpu::CompileOptions o;
+            o.msaaDeadStore = true;
+            bool candidate = false;
+            for (const vpgpu::StoreObs& ob : vpgpu::compileFrame(f, &c.gpu().resources(), o).storeObs) candidate = candidate || ob.candidate;
+            CHECK(candidate == (!transient && store));
           }
           vkDestroyImageView(c.dev, mv, nullptr);
           vkDestroyImageView(c.dev, ov, nullptr);
@@ -3804,6 +3814,95 @@ void testRenderPassOps() {
         vkDestroyImage(c.dev, ms, nullptr);
         vkDestroyImage(c.dev, single, nullptr);
       }
+  }
+  {  // TextureDesc::shaderReadable: only SAMPLED / STORAGE usage lets a shader read an MSAA image (msaaDeadStore needs it false)
+    struct Usage {
+      VkImageUsageFlags usage;
+      bool readable;
+    };
+    for (const Usage u : {Usage{VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT, false},
+                          Usage{VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                                    VK_IMAGE_USAGE_TRANSFER_DST_BIT, false},  // (Gundam's colour 0x93)
+                          Usage{VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, true},
+                          Usage{VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_STORAGE_BIT, true}}) {
+      VkImageCreateInfo ii{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+      ii.imageType = VK_IMAGE_TYPE_2D;
+      ii.format = VK_FORMAT_R8G8B8A8_UNORM;
+      ii.extent = {64, 64, 1};
+      ii.mipLevels = ii.arrayLayers = 1;
+      ii.samples = VK_SAMPLE_COUNT_4_BIT;
+      ii.usage = u.usage;
+      VkImage im = VK_NULL_HANDLE;
+      vkCreateImage(c.dev, &ii, nullptr, &im);
+      vkBindImageMemory(c.dev, im, m, 0);
+      vpgpu::TextureDesc td;
+      CHECK(im && c.gpu().textureDesc(from<Image>(im)->id, td) && td.shaderReadable == u.readable);
+      vkDestroyImage(c.dev, im, nullptr);
+    }
+  }
+  {  // Origins of a kept store: a DONT_CARE + resolve over a partial render area is promoted by the translator (Upgrade); an explicit
+     // vkCmdClearColorImage and the source of a vkCmdResolveImage are Required (msaaDeadStore never guesses them away)
+    VkImageCreateInfo ii{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+    ii.imageType = VK_IMAGE_TYPE_2D;
+    ii.format = VK_FORMAT_R8G8B8A8_UNORM;
+    ii.extent = {64, 64, 1};
+    ii.mipLevels = ii.arrayLayers = 1;
+    ii.samples = VK_SAMPLE_COUNT_4_BIT;
+    ii.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    VkImage ms = VK_NULL_HANDLE, single = VK_NULL_HANDLE;
+    vkCreateImage(c.dev, &ii, nullptr, &ms);
+    ii.samples = VK_SAMPLE_COUNT_1_BIT;
+    vkCreateImage(c.dev, &ii, nullptr, &single);
+    vkBindImageMemory(c.dev, ms, m, 0);
+    vkBindImageMemory(c.dev, single, m, 0);
+    CHECK(from<Image>(ms)->desc.samples > 1);
+    if (from<Image>(ms)->desc.samples > 1 && from<Image>(ms)->forcedFrom <= 1) {
+      VkImageView mv = makeView(ms, VK_IMAGE_ASPECT_COLOR_BIT, 1), ov = makeView(single, VK_IMAGE_ASPECT_COLOR_BIT, 1);
+      VkAttachmentDescription a = col, r = col;
+      a.samples = VK_SAMPLE_COUNT_4_BIT;
+      a.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR, a.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+      r.loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE, r.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+      VkAttachmentReference rref{1, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
+      VkSubpassDescription sd = one;
+      sd.pResolveAttachments = &rref;
+      Pass p = pass({a, r}, {sd}, {}, {mv, ov});
+      vpgpu::Frame f;
+      TranslateStats st;
+      run(p, {{0, 0}, {32, 32}}, nullptr, f, st);
+      auto ps = passes(f);
+      CHECK(ps.size() == 1 && ps[0]->desc.colors[0].store == vpgpu::StoreAction::StoreAndResolve && ps[0]->desc.colors[0].keepSamples &&
+            ps[0]->desc.colors[0].keepOrigin == vpgpu::KeepOrigin::Upgrade);
+      vkDestroyImageView(c.dev, mv, nullptr);
+      vkDestroyImageView(c.dev, ov, nullptr);
+      VkCommandBufferAllocateInfo ai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+      ai.commandPool = pool, ai.commandBufferCount = 1;
+      VkCommandBuffer cb;
+      vkAllocateCommandBuffers(c.dev, &ai, &cb);
+      VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+      vkBeginCommandBuffer(cb, &bi);
+      VkClearColorValue cc{};
+      VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+      vkCmdClearColorImage(cb, ms, VK_IMAGE_LAYOUT_GENERAL, &cc, 1, &range);
+      VkImageResolve rr{};
+      rr.srcSubresource = rr.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+      rr.extent = {64, 64, 1};
+      vkCmdResolveImage(cb, ms, VK_IMAGE_LAYOUT_GENERAL, single, VK_IMAGE_LAYOUT_GENERAL, 1, &rr);
+      vkEndCommandBuffer(cb);
+      vpgpu::Frame g;
+      TranslateStats sg;
+      translate(*from<CommandBuffer>(cb)->rec, g, sg);
+      auto pg = passes(g);
+      bool clear = false, resolve = false;
+      for (const auto* q : pg) {
+        const vpgpu::Attachment& a0 = q->desc.colors[0];
+        if (q->desc.label == "vk.clear") clear = a0.texture == from<Image>(ms)->id && a0.keepOrigin == vpgpu::KeepOrigin::Required;
+        if (q->desc.label == "vk.resolve")
+          resolve = a0.texture == from<Image>(ms)->id && a0.keepSamples && a0.keepOrigin == vpgpu::KeepOrigin::Required;
+      }
+      CHECK(clear && resolve);
+    }
+    vkDestroyImage(c.dev, ms, nullptr);
+    vkDestroyImage(c.dev, single, nullptr);
   }
   vkDestroyCommandPool(c.dev, pool, nullptr);
   for (const Pass& p : made) {
@@ -5381,6 +5480,7 @@ void testTaaEyeDepth() {
     td.transient = true;
     const vpgpu::TextureId eyeDepth = c.gpu().createTexture(td), otherDepth = c.gpu().createTexture(td);
     CHECK(eyeDepth && otherDepth && !c.gpu().resources().transientViolated(eyeDepth));
+    vpgpu::KeepOrigin depthOrigin = vpgpu::KeepOrigin::Unknown;  // of the last pass()'s depth store
     auto pass = [&](vpgpu::TextureId depthTex, uint32_t w) {
       UiMaskState um;
       Recorder rec;
@@ -5394,12 +5494,16 @@ void testTaaEyeDepth() {
       vpgpu::Frame f;
       TranslateStats st;
       translate(rec, f, st, &j, &um, nullptr, nullptr, d);
+      for (const auto& cmd : f.commands())
+        if (const auto* rp = std::get_if<vpgpu::RenderPass>(&cmd)) depthOrigin = rp->desc.depth.keepOrigin;
       return st.passes;
     };
     CHECK(pass(otherDepth, 64) == 1);
     CHECK(!c.gpu().resources().transientViolated(otherDepth));
+    CHECK(depthOrigin != vpgpu::KeepOrigin::Required);
     CHECK(pass(eyeDepth, 1920) == 1);
     CHECK(c.gpu().resources().transientViolated(eyeDepth));
+    CHECK(depthOrigin == vpgpu::KeepOrigin::Required);  // msaaDeadStore must never guess away the depth VPKTAA reads
     c.gpu().destroy(eyeDepth);
     c.gpu().destroy(otherDepth);
   }
@@ -5666,7 +5770,7 @@ void depthTileCase(bool mv, VkFormat depthFormat, bool expectOn) {
     return v;
   };
   VkImageView views[2] = {makeView(color, VK_IMAGE_ASPECT_COLOR_BIT), makeView(depth, VK_IMAGE_ASPECT_DEPTH_BIT)};
-  auto renderPass = [&](VkAttachmentLoadOp depthLoad) {
+  auto renderPass = [&](VkAttachmentLoadOp depthLoad, uint32_t nsub = 2, int inputSub = -1) {
     VkAttachmentDescription att[2]{};
     att[0].format = VK_FORMAT_R8G8B8A8_UNORM, att[0].samples = VK_SAMPLE_COUNT_4_BIT;
     att[0].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR, att[0].storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
@@ -5679,15 +5783,16 @@ void depthTileCase(bool mv, VkFormat depthFormat, bool expectOn) {
     VkAttachmentReference cref{0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
     VkAttachmentReference dw{1, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL}, dr{1, VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL};
     VkAttachmentReference in{1, VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL};
-    VkSubpassDescription sp[2]{};
+    VkSubpassDescription sp[3]{};  // subpass 0 writes the depth, the last one reads it as an input attachment (nsub 3: one between only tests it)
     sp[0].colorAttachmentCount = 1, sp[0].pColorAttachments = &cref, sp[0].pDepthStencilAttachment = &dw;
-    sp[1].colorAttachmentCount = 1, sp[1].pColorAttachments = &cref, sp[1].pDepthStencilAttachment = &dr;
-    sp[1].inputAttachmentCount = 1, sp[1].pInputAttachments = &in;
-    const uint32_t masks[2] = {0b11, 0b11};
+    for (uint32_t k = 1; k < nsub; ++k) sp[k].colorAttachmentCount = 1, sp[k].pColorAttachments = &cref, sp[k].pDepthStencilAttachment = &dr;
+    const uint32_t reader = inputSub < 0 ? nsub - 1 : uint32_t(inputSub);
+    sp[reader].inputAttachmentCount = 1, sp[reader].pInputAttachments = &in;
+    const uint32_t masks[3] = {0b11, 0b11, 0b11};
     VkRenderPassMultiviewCreateInfo mvi{VK_STRUCTURE_TYPE_RENDER_PASS_MULTIVIEW_CREATE_INFO};
-    mvi.subpassCount = 2, mvi.pViewMasks = masks;
+    mvi.subpassCount = nsub, mvi.pViewMasks = masks;
     VkRenderPassCreateInfo rpi{VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO, mv ? &mvi : nullptr};
-    rpi.attachmentCount = 2, rpi.pAttachments = att, rpi.subpassCount = 2, rpi.pSubpasses = sp;
+    rpi.attachmentCount = 2, rpi.pAttachments = att, rpi.subpassCount = nsub, rpi.pSubpasses = sp;
     VkRenderPass rp = VK_NULL_HANDLE;
     vkCreateRenderPass(c.dev, &rpi, nullptr, &rp);
     VkFramebufferCreateInfo fi{VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO};
@@ -5759,7 +5864,8 @@ void depthTileCase(bool mv, VkFormat depthFormat, bool expectOn) {
   VkCommandPool pool;
   vkCreateCommandPool(c.dev, &pi, nullptr, &pool);
   // Records the pass (subpass 0: one writing draw; subpass 1: one draw without the input, one reading it) and translates it.
-  auto record = [&](VkRenderPass rp, VkFramebuffer fb, VkPipeline p0, VkPipeline p1Plain, VkPipeline p1Input, vpgpu::Frame& frame) {
+  auto record = [&](VkRenderPass rp, VkFramebuffer fb, VkPipeline p0, VkPipeline p1Plain, VkPipeline p1Input, vpgpu::Frame& frame,
+                    VkPipeline mid = VK_NULL_HANDLE, VkPipeline tail = VK_NULL_HANDLE) {
     VkCommandBufferAllocateInfo ai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
     ai.commandPool = pool, ai.commandBufferCount = 1;
     VkCommandBuffer cb;
@@ -5774,11 +5880,21 @@ void depthTileCase(bool mv, VkFormat depthFormat, bool expectOn) {
     vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, p0);
     vkCmdDraw(cb, 3, 1, 0, 0);
     vkCmdNextSubpass(cb, VK_SUBPASS_CONTENTS_INLINE);
+    if (mid) {  // (a subpass between the writer and the reader)
+      vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, mid);
+      vkCmdDraw(cb, 3, 1, 0, 0);
+      vkCmdNextSubpass(cb, VK_SUBPASS_CONTENTS_INLINE);
+    }
     vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, p1Plain);
     vkCmdDraw(cb, 3, 1, 0, 0);
     vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, p1Input);
     vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, plInput, 0, 1, &set, 0, nullptr);
     vkCmdDraw(cb, 3, 1, 0, 0);
+    if (tail) {  // (a subpass after the reader)
+      vkCmdNextSubpass(cb, VK_SUBPASS_CONTENTS_INLINE);
+      vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, tail);
+      vkCmdDraw(cb, 3, 1, 0, 0);
+    }
     vkCmdEndRenderPass(cb);
     vkEndCommandBuffer(cb);
     TranslateStats st;
@@ -5896,6 +6012,63 @@ void depthTileCase(bool mv, VkFormat depthFormat, bool expectOn) {
     vpgpu::Frame frame;
     const std::string log = captureStderr([&] { record(rp, fb, p0, p1a, p1a, frame); });
     CHECK(log.find("depth_input_in_tile=0 reason=no_reader") != std::string::npos);
+  }
+  {  // three subpasses: 0 writes the depth, 1 only tests against it, 2 reads it as an input attachment: the shadow follows all
+     // three into one encoder and is stored by none of them for the read
+    auto [rp, fb] = renderPass(VK_ATTACHMENT_LOAD_OP_CLEAR, 3);
+    VkPipeline p0 = pipeline(rp, 0, fsPlain, plPlain, true), pm = pipeline(rp, 1, fsPlain, plPlain, false),
+               p2a = pipeline(rp, 2, fsPlain, plPlain, false), p2b = pipeline(rp, 2, fsInput, plInput, false);
+    vpgpu::Frame frame;
+    const std::string log = captureStderr([&] { record(rp, fb, p0, p2a, p2b, frame, pm); });
+    CHECK(log.find("gpu.pass.fuse src=vk depth_input_in_tile=1 reason=ok") != std::string::npos);
+    CHECK(log.find("draws0=1 draws1=3 fetch_pipes=1") != std::string::npos);
+    auto ps = passes(frame);
+    CHECK(ps.size() == 3);
+    if (ps.size() == 3) {
+      const vpgpu::Attachment &s0 = ps[0]->desc.colors[kDepthTileSlot], &s1 = ps[1]->desc.colors[kDepthTileSlot],
+                              &s2 = ps[2]->desc.colors[kDepthTileSlot];
+      CHECK(s0.texture && s0.texture == s1.texture && s1.texture == s2.texture);
+      CHECK(s0.load == vpgpu::LoadAction::Clear && s1.load == vpgpu::LoadAction::Load && s2.load == vpgpu::LoadAction::Load);
+      CHECK(s1.store == vpgpu::StoreAction::Store && s2.store == vpgpu::StoreAction::DontCare);  // (only the last subpass lets go of it)
+      CHECK(ps[0]->draws.size() == 1 && ps[1]->draws.size() == 1 && ps[2]->draws.size() == 2);
+      const vpgpu::CompiledFrame cf = vpgpu::compileFrame(frame, &c.gpu().resources());
+      CHECK(cf.encoders.size() == 1);
+      if (cf.encoders.size() == 1) CHECK(cf.encoders[0].passes == 3 && !cf.encoders[0].feedback.texture);
+      CHECK(cf.stats.msaaStoreBytes == 0 && cf.stats.msaaLoadBytes == 0);
+    }
+  }
+  {  // the reader in the middle: 0 writes, 1 reads the input (plain and fetching draws), 2 only tests against the depth
+    auto [rp, fb] = renderPass(VK_ATTACHMENT_LOAD_OP_CLEAR, 3, 1);
+    VkPipeline p0 = pipeline(rp, 0, fsPlain, plPlain, true), p1a = pipeline(rp, 1, fsPlain, plPlain, false),
+               p1b = pipeline(rp, 1, fsInput, plInput, false), p2 = pipeline(rp, 2, fsPlain, plPlain, false);
+    vpgpu::Frame frame;
+    const std::string log = captureStderr([&] { record(rp, fb, p0, p1a, p1b, frame, VK_NULL_HANDLE, p2); });
+    CHECK(log.find("gpu.pass.fuse src=vk depth_input_in_tile=1 reason=ok") != std::string::npos);
+    CHECK(log.find("draws0=1 draws1=3 fetch_pipes=1") != std::string::npos);
+    auto ps = passes(frame);
+    CHECK(ps.size() == 3);
+    if (ps.size() == 3) {
+      const vpgpu::Attachment &s0 = ps[0]->desc.colors[kDepthTileSlot], &s1 = ps[1]->desc.colors[kDepthTileSlot],
+                              &s2 = ps[2]->desc.colors[kDepthTileSlot];
+      CHECK(s0.texture && s0.texture == s1.texture && s1.texture == s2.texture);
+      CHECK(s1.load == vpgpu::LoadAction::Load && s1.store == vpgpu::StoreAction::Store && s2.load == vpgpu::LoadAction::Load &&
+            s2.store == vpgpu::StoreAction::DontCare);
+      bool shadowRead = false;
+      for (const vpgpu::Access& a : ps[1]->draws[1].bindings) shadowRead = shadowRead || (a.pixelLocal && a.range.index == s0.texture.index);
+      CHECK(ps[1]->draws.size() == 2 && shadowRead);
+      const vpgpu::CompiledFrame cf = vpgpu::compileFrame(frame, &c.gpu().resources());
+      CHECK(cf.encoders.size() == 1 && cf.stats.msaaStoreBytes == 0 && cf.stats.msaaLoadBytes == 0);
+      if (cf.encoders.size() == 1) CHECK(cf.encoders[0].passes == 3);
+    }
+  }
+  {  // ... and a middle subpass that writes the depth leaves the shadow stale for the reader: refused, with the reason
+    auto [rp, fb] = renderPass(VK_ATTACHMENT_LOAD_OP_CLEAR, 3);
+    VkPipeline p0 = pipeline(rp, 0, fsPlain, plPlain, true), pm = pipeline(rp, 1, fsPlain, plPlain, true),
+               p2a = pipeline(rp, 2, fsPlain, plPlain, false), p2b = pipeline(rp, 2, fsInput, plInput, false);
+    vpgpu::Frame frame;
+    const std::string log = captureStderr([&] { record(rp, fb, p0, p2a, p2b, frame, pm); });
+    CHECK(log.find("depth_input_in_tile=0 reason=reader_writes_depth") != std::string::npos);
+    CHECK(passes(frame).size() == 3 && !passes(frame)[0]->desc.colors[kDepthTileSlot].texture);
   }
 }
 
@@ -7288,6 +7461,28 @@ void testTaaUiMask() {
           CHECK(a5 && b5 && !a5->desc.colors[taa::kUiMaskSlot].texture);
           CHECK(b5 && bool(b5->desc.colors[taa::kUiMaskSlot].texture) == (other == 1));
           CHECK(st5.ui.maskedPasses == (other ? 1u : 0u));
+        }
+        // A warm-up pass (more draws than CompileOptions::tileMaxDraws) gets no mask: it is HeavyGeometry anyway and the mask's
+        // multisample twin would only stop the compiler splitting it. At the limit it still has one; VPVK_UIMASK_HEAVY=1 keeps it.
+        {
+          const uint32_t limit = vpgpu::CompileOptions{}.tileMaxDraws;
+          for (const uint32_t total : {limit, limit + 1})
+            for (int keep = 0; keep < 2; ++keep) {
+              Recorder rec3;
+              rec3.ops.emplace_back(scene);
+              for (uint32_t i = 0; i + 1 < total; ++i) rec3.ops.emplace_back(opq);
+              rec3.ops.emplace_back(gls), rec3.ops.emplace_back(OpEndPass{});
+              if (keep) setenv("VPVK_UIMASK_HEAVY", "1", 1);
+              vpgpu::Frame f6;
+              TranslateStats st6;
+              dev->uiMask.maskedPasses = 0;
+              translate(rec3, f6, st6, &j64, &dev->uiMask);
+              unsetenv("VPVK_UIMASK_HEAVY");
+              const auto* p6 = f6.commands().empty() ? nullptr : std::get_if<vpgpu::RenderPass>(&f6.commands()[0]);
+              const bool masked = total == limit || keep;
+              CHECK(p6 && p6->draws.size() == total && bool(p6->desc.colors[taa::kUiMaskSlot].texture) == masked);
+              CHECK(st6.ui.maskedPasses == (masked ? 1u : 0u));
+            }
         }
       }
       vkDestroyCommandPool(c.dev, cp, nullptr);

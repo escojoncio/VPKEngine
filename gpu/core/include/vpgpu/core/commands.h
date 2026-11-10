@@ -103,6 +103,9 @@ struct ClearValue {
 // sample 0, min and max for depth and sample 0 for stencil). None: that aspect is not resolved.
 enum class ResolveMode : uint8_t { Sample0, Min, Max, None };
 
+// Why an Attachment keeps its multisample contents (Attachment::keepOrigin).
+enum class KeepOrigin : uint8_t { Unknown, Client, Upgrade, Required };
+
 struct Attachment {
   TextureId texture;  // null = unused slot
   uint16_t mip = 0, layer = 0;
@@ -117,10 +120,12 @@ struct Attachment {
   // Undefined = the texture's format. Hazards stay on `texture`.
   Format format = Format::Undefined;
   // StoreAndResolve only: the multisample contents must reach memory (CompileOptions::msaaResolveOnTile /
-  // msaaColorResolveOnTile never drop this store). The Vulkan translator sets it where it turned a Store / Resolve into
-  // StoreAndResolve for correctness (partial render area, later subpass, self-dependency, resolve as a pass, VPKTAA depth);
-  // a client's own STORE + resolve leaves it false.
+  // msaaColorResolveOnTile never drop this store). The Vulkan translator sets it on EVERY StoreAndResolve it emits (the client's
+  // own STORE + resolve, and the upgrades for partial render area, later subpass, self-dependency, resolve as a pass, VPKTAA
+  // depth); only a DONT_CARE + resolve stays a Resolve. keepOrigin says which of those it was (CompileOptions::msaaDeadStore
+  // may still drop a speculative one, never a Required one).
   bool keepSamples = false;
+  KeepOrigin keepOrigin = KeepOrigin::Unknown;  // (Unknown: not tracked, e.g. a Store set by another client)
   // VPVulkan forced MSAA (VPVK_MSAA_FORCE): `texture` is a transient N-sample twin of the 1x image `resolve`, which the game
   // renders as 1x. The samples are ALWAYS tile memory: the frame compiler (placeTiles) keeps the slot TileLocal whatever the
   // encoder's geometry, the load becomes Clear / DontCare and the store Resolve / DontCare (never a sample store); a Load of

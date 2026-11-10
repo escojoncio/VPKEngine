@@ -123,6 +123,10 @@ struct TextureDesc {
   // attachment (no SAMPLED / INPUT_ATTACHMENT / TRANSFER_SRC / STORAGE in Vulkan). The Vulkan translator then treats a
   // resolved attachment of it as Attachment::autoMsaa (VPVK_GAME_MSAA_AUTO). True = unknown / readable (the default).
   bool samplesReadable = true;
+  // Multisampled textures: false when the client's usage rules out a shader ever reading the image (no SAMPLED / STORAGE in
+  // Vulkan), so a client Store of its samples can only be consumed by a later Load, a copy or a resolve: the frame compiler may then
+  // treat that Store as a dead-store candidate (CompileOptions::msaaDeadStore). True = unknown / readable (the default).
+  bool shaderReadable = true;
   std::string label;
 };
 bool validate(const TextureDesc&);

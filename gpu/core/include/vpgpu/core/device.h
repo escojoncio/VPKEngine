@@ -57,6 +57,8 @@ class Device {
   void setPassTiming(uint64_t every) { passEvery_ = every; }
   // Frame hold (see holdMs_): 0 = never hold a frame for compiling pipelines (the client decides what to do with
   // draws whose pipeline is not ready). Set before the first submit.
+  // CompileOptions::tileMaxDraws as this Device was started (env VPVK_TILE_MAX_DRAWS): the heavy-encoder draw limit.
+  uint32_t tileMaxDraws() const { return compile_.tileMaxDraws; }
   void setHoldMs(uint32_t ms) { holdMs_ = ms; }
   uint32_t holdMs() const { return holdMs_; }
   // Total ms submit() has held frames for compiling pipelines (written by submit(): read it from the submit thread).
@@ -80,6 +82,9 @@ class Device {
   LogSink log_;
   uint64_t frame_ = 0, detailEvery_ = 0;
   uint32_t nonMemorylessSeen_ = 0;  // bit per TileVerdict already reported by gpu.msaa.nonmemoryless
+  uint32_t deadStoreMisses_ = 0;    // elided MSAA stores a later frame needed (CompileOptions::msaaDeadStore is switched off at a limit)
+  // times each texture kept its MSAA store per (slot, origin, verdict) key (gpu.msaa.kept_store); a texture's entry goes with it
+  std::unordered_map<uint64_t, std::unordered_map<uint32_t, uint32_t>> keptStoreSeen_;
   uint32_t msaaRejectLogs_ = 0;  // gpu.msaa rejected lines written (capped)
   uint32_t splitSkipLogs_ = 0;   // gpu.tile split_skip lines written (the first 8, then one frame in 600)
   CompileOptions compile_;  // copyRects: env VPVK_COPY_RECT_HAZARD=1

@@ -4153,11 +4153,14 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdBeginRendering(VkCommandBuffer cb, c
       }
     }
     t.store = toStore(a.storeOp, resolve);
+    const vpgpu::StoreAction clientStore = t.store;
     // A suspending chunk keeps everything for the chunk that resumes it, whatever storeOp says.
     if (suspending) t.store = vpgpu::StoreAction::Store;
     if (keepOthers && t.store == vpgpu::StoreAction::DontCare) t.store = vpgpu::StoreAction::Store;
     if (keepOthers && t.store == vpgpu::StoreAction::Resolve) t.store = vpgpu::StoreAction::StoreAndResolve;
     if (t.store == vpgpu::StoreAction::StoreAndResolve) t.keepSamples = true;  // see attach() in commands.cpp
+    if (t.store == vpgpu::StoreAction::Store || t.store == vpgpu::StoreAction::StoreAndResolve)
+      t.keepOrigin = !suspending && t.store == clientStore ? vpgpu::KeepOrigin::Client : vpgpu::KeepOrigin::Upgrade;
     if (!depth && !keepOthers && !suspending && !v->image->eye && t.store == vpgpu::StoreAction::Store)
       op.dropColor |= 1u << unsigned(&t - d.colors.data());
   };
@@ -4228,9 +4231,9 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdBeginRendering(VkCommandBuffer cb, c
       return a && (a->storeOp == VK_ATTACHMENT_STORE_OP_STORE || a->storeOp == VK_ATTACHMENT_STORE_OP_NONE);
     };
     const bool keep = stores(da) || stores(sa) || (fi.depth() && !da) || (fi.stencil() && !sa) || keepOthers;
-    if (keep && d.depth.store == vpgpu::StoreAction::DontCare) d.depth.store = vpgpu::StoreAction::Store;
+    if (keep && d.depth.store == vpgpu::StoreAction::DontCare) d.depth.store = vpgpu::StoreAction::Store, d.depth.keepOrigin = vpgpu::KeepOrigin::Upgrade;
     if (keep && d.depth.store == vpgpu::StoreAction::Resolve)
-      d.depth.store = vpgpu::StoreAction::StoreAndResolve, d.depth.keepSamples = true;
+      d.depth.store = vpgpu::StoreAction::StoreAndResolve, d.depth.keepSamples = true, d.depth.keepOrigin = vpgpu::KeepOrigin::Upgrade;
     if (!depthForced && !keepOthers && !suspending && !v->image->eye && !(fi.depth() && !da) && !(fi.stencil() && !sa) &&
         d.depth.store == vpgpu::StoreAction::Store)
       op.dropDepth = uint8_t((stores(da) ? 1 : 0) | (stores(sa) ? 2 : 0));

@@ -275,9 +275,10 @@ bool attach(const OpBeginPass& b, uint32_t sub, uint32_t index, uint32_t resolve
       resolve = true;
     }
   }
-  out.store = int(sub) == u.last && !(mask && !fullViewMask(mask))
-                  ? toStore(storeOpOf(d, fi), resolve)
-                  : (resolve ? vpgpu::StoreAction::StoreAndResolve : vpgpu::StoreAction::Store);
+  const bool clientEnd = int(sub) == u.last && !(mask && !fullViewMask(mask));  // this subpass ends with the client's own store op
+  out.store = clientEnd ? toStore(storeOpOf(d, fi), resolve)
+                        : (resolve ? vpgpu::StoreAction::StoreAndResolve : vpgpu::StoreAction::Store);
+  const vpgpu::StoreAction clientStore = out.store;
   if (partial && !(v->image && v->image->desc.transient)) {  // pixels outside the area survive
     if (out.store == vpgpu::StoreAction::DontCare) out.store = vpgpu::StoreAction::Store;
     if (out.store == vpgpu::StoreAction::Resolve) out.store = vpgpu::StoreAction::StoreAndResolve;
@@ -285,6 +286,8 @@ bool attach(const OpBeginPass& b, uint32_t sub, uint32_t index, uint32_t resolve
   // Every StoreAndResolve the translator emits keeps its samples (the client's own STORE, or an upgrade for a later
   // subpass / partial area): only a client Resolve (DONT_CARE + resolve attachment) stays memoryless.
   if (out.store == vpgpu::StoreAction::StoreAndResolve) out.keepSamples = true;
+  if (out.store == vpgpu::StoreAction::Store || out.store == vpgpu::StoreAction::StoreAndResolve)
+    out.keepOrigin = clientEnd && out.store == clientStore ? vpgpu::KeepOrigin::Client : vpgpu::KeepOrigin::Upgrade;
   if (index < b.clears.size()) out.clear = toClear(b.clears[index], depthFmt, cf);
   return true;
 }
@@ -646,8 +649,9 @@ bool beginPass(const OpBeginPass& b, uint32_t sub, vpgpu::RenderPassDesc& desc,
   if (keepForSplit && selfReads(*b.pass, sub)) {
     auto keep = [](vpgpu::Attachment& a) {
       if (!a.texture) return;
-      if (a.store == vpgpu::StoreAction::DontCare) a.store = vpgpu::StoreAction::Store;
-      if (a.store == vpgpu::StoreAction::Resolve) a.store = vpgpu::StoreAction::StoreAndResolve, a.keepSamples = true;
+      if (a.store == vpgpu::StoreAction::DontCare) a.store = vpgpu::StoreAction::Store, a.keepOrigin = vpgpu::KeepOrigin::Upgrade;
+      if (a.store == vpgpu::StoreAction::Resolve)
+        a.store = vpgpu::StoreAction::StoreAndResolve, a.keepSamples = true, a.keepOrigin = vpgpu::KeepOrigin::Upgrade;
     };
     for (vpgpu::Attachment& a : desc.colors) keep(a);
     keep(desc.depth);
@@ -765,10 +769,10 @@ struct Translator {
   // an in-pass barrier read through a copy: attachment texture -> its copy. Null device (tests): no copies.
   Device* device = nullptr;
   std::vector<std::pair<vpgpu::TextureId, vpgpu::TextureId>> localCopies;
-  // Depth in tile (VPVK_DEPTH_TILE, planDepthTile): a 2-subpass pass whose subpass 1 reads the multisampled depth the subpass 0 writes
-  // as an input attachment. Colour attachment kDepthTileSlot (a memoryless R32F texture) holds the depth in both subpasses: the
-  // draws of subpass 0 also write it, those of subpass 1 read it by framebuffer fetch per sample (pixel-local), so the frame
-  // compiler merges the subpasses into one encoder and the 4x depth is never stored for the read. `uses`: the pipeline variant
+  // Depth in tile (VPVK_DEPTH_TILE, planDepthTile): a pass of N >= 2 subpasses whose later subpasses read the multisampled depth the
+  // subpass 0 writes as an input attachment. Colour attachment kDepthTileSlot (a memoryless R32F texture) holds the depth in every
+  // subpass: the draws of subpass 0 also write it, those of the later subpasses read it by framebuffer fetch per sample
+  // (pixel-local), so the frame compiler merges the subpasses into one encoder and the 4x depth is never stored for the read. `uses`: the pipeline variant
   // of every (pipeline, subpass) the pass draws with (depthPipelineKey).
   struct DepthTile {
     struct Use {
@@ -915,6 +919,7 @@ struct Translator {
       if (d.depth.store == vpgpu::StoreAction::DontCare) d.depth.store = vpgpu::StoreAction::Store;
       if (d.depth.store == vpgpu::StoreAction::Resolve)
         d.depth.store = vpgpu::StoreAction::StoreAndResolve, d.depth.keepSamples = true;
+      d.depth.keepOrigin = vpgpu::KeepOrigin::Required;  // VPKTAA reads these samples after the frame: msaaDeadStore must not guess
       // A TRANSIENT depth would still be dropped with the tile (the compiler keeps no Store of a transient texture): it is
       // an ordinary texture from now on, with memory the VPKTAA pass can read.
       if (const Device* dv = anyDevice())
@@ -1014,8 +1019,9 @@ struct Translator {
           // The pass is split at the barrier (localReadSplit): every attachment stores there, the next part loads it.
           auto keep = [](vpgpu::Attachment& a) {
             if (!a.texture) return;
-            if (a.store == vpgpu::StoreAction::DontCare) a.store = vpgpu::StoreAction::Store;
-            if (a.store == vpgpu::StoreAction::Resolve) a.store = vpgpu::StoreAction::StoreAndResolve, a.keepSamples = true;
+            if (a.store == vpgpu::StoreAction::DontCare) a.store = vpgpu::StoreAction::Store, a.keepOrigin = vpgpu::KeepOrigin::Upgrade;
+            if (a.store == vpgpu::StoreAction::Resolve)
+              a.store = vpgpu::StoreAction::StoreAndResolve, a.keepSamples = true, a.keepOrigin = vpgpu::KeepOrigin::Upgrade;
           };
           for (vpgpu::Attachment& a : bd.colors) keep(a);
           keep(bd.depth);
@@ -1067,7 +1073,7 @@ struct Translator {
           // subpass is not visible from here: it keeps storing).
           if (selfFinal && secondaryDepth == 0 && !barrierAhead(rec.ops, opIx)) {
             auto own = [](vpgpu::Attachment& a, const vpgpu::Attachment& f) {
-              if (a.texture && a.texture == f.texture && !a.autoMsaa) a.store = f.store, a.keepSamples = f.keepSamples;
+              if (a.texture && a.texture == f.texture && !a.autoMsaa) a.store = f.store, a.keepSamples = f.keepSamples, a.keepOrigin = f.keepOrigin;
             };
             for (int c = 0; c < vpgpu::kMaxColorAttachments; ++c) own(d.colors[c], selfFinal->colors[c]);
             own(d.depth, selfFinal->depth);
@@ -1117,7 +1123,7 @@ struct Translator {
             a.mip = static_cast<uint16_t>(mip);
             a.layer = static_cast<uint16_t>(is3d ? l : cc->range.baseArrayLayer + l);
             a.load = vpgpu::LoadAction::Clear;
-            a.store = vpgpu::StoreAction::Store;
+            a.store = vpgpu::StoreAction::Store, a.keepOrigin = vpgpu::KeepOrigin::Required;  // (an explicit write: never a dead-store guess)
             a.clear.color = clearColor(cc->color, cc->image->desc.format);
             if (isSwappedRB(cc->image->info.format)) std::swap(a.clear.color[0], a.clear.color[2]);
             d.label = "vk.clear";
@@ -1135,7 +1141,7 @@ struct Translator {
             d.depth.mip = static_cast<uint16_t>(cd->range.baseMipLevel + m);
             d.depth.layer = static_cast<uint16_t>(cd->range.baseArrayLayer + l);
             d.depth.load = vpgpu::LoadAction::Clear;
-            d.depth.store = vpgpu::StoreAction::Store;
+            d.depth.store = vpgpu::StoreAction::Store, d.depth.keepOrigin = vpgpu::KeepOrigin::Required;
             d.depth.clear.depth = cd->value.depth;
             d.depth.clear.stencil = static_cast<uint8_t>(cd->value.stencil);
             d.label = "vk.clear";
@@ -1725,6 +1731,9 @@ struct Translator {
     st.taaTargetH = std::max(st.taaTargetH, taaH);
   }
 
+  uint32_t scanDraws = 0;  // draws scanPass counted (uiPass resets it)
+  int keepHeavyMask = -1;  // VPVK_UIMASK_HEAVY=1 (read once per translate)
+
   // Pre-scan of the eye pass that is about to open (ops after `at` up to its end): classifies its
   // draws in order and tells whether any is UI and which sample count the draws render at.
   // Returns true when the pass ended inside `ops` (false: it goes on, e.g. after a secondary buffer).
@@ -1733,6 +1742,7 @@ struct Translator {
       const Op& op = ops[i];
       if (const auto* d = std::get_if<OpDraw>(&op)) {
         if (!d->ok) continue;
+        ++scanDraws;
         const taa::DrawClass c = classifier().classify(factsOf(*d));
         classes[d] = c;
         hasUi = hasUi || c == taa::DrawClass::Ui;
@@ -1766,6 +1776,7 @@ struct Translator {
     classifier().beginPass(desc.depth.load == vpgpu::LoadAction::Load);
     bool hasUi = false, dualSource = false;
     uint8_t samples = 1;
+    scanDraws = 0;
     scanPass(ops, at + 1, hasUi, samples, dualSource);
     if (forceN) samples = std::max(samples, forceN);  // the mask twin has the pass's samples (the draws' pipelines are N-sample variants)
     ++st.ui.passes;
@@ -1783,6 +1794,27 @@ struct Translator {
       if (n.fetch_add(1) < 6)
         logf("vk.taa uimask skipped_pass why=no_free_slot_or_color samples=%u", unsigned(samples));
       return;
+    }
+    // A shader warm-up pass (more draws than the frame compiler's heavy limit, CompileOptions::tileMaxDraws) is HeavyGeometry whatever
+    // we do, and is not shown: the mask's multisample twin would only get memory there, and as an attachment of its own it stops the
+    // compiler cutting the game's forced-MSAA twins into tile-sized chunks (splitHeavyAuto). No mask for it (the UI of that pass is
+    // sharpened like the rest). VPVK_UIMASK_HEAVY=1 keeps the mask there.
+    // (The limit is the Device's own, VPVK_TILE_MAX_DRAWS. A pass near it can flip between masked and not from frame to frame: the
+    // sharpening of its UI then flickers; the log names the limit.)
+    const Device* mdev = anyDevice();
+    const uint32_t maskLimit = mdev && mdev->gpu ? mdev->gpu->tileMaxDraws() : vpgpu::CompileOptions{}.tileMaxDraws;
+    if (samples > 1 && scanDraws > maskLimit) {
+      if (keepHeavyMask < 0) {
+        const char* keep = getenv("VPVK_UIMASK_HEAVY");
+        keepHeavyMask = keep && keep[0] == '1' && !keep[1] ? 1 : 0;
+      }
+      if (!keepHeavyMask) {
+        static std::atomic<unsigned> n{0};
+        if (n.fetch_add(1) < 6)
+          logf("vk.taa uimask skipped_pass why=heavy_pass draws=%u limit=%u samples=%u (VPVK_UIMASK_HEAVY=1 keeps the mask)", scanDraws,
+               maskLimit, unsigned(samples));
+        return;
+      }
     }
     // The game's own MSAA pass that continues the pass before it (same colour 0 and depth, depth Loaded: a later subpass,
     // or the second part of a split pass). The mask would be an attachment the pass it continues does not have, so the frame compiler could
@@ -2056,18 +2088,18 @@ struct Translator {
   static uint64_t depthTileKey(const PipelineObj* p, uint32_t sub) { return uint64_t(reinterpret_cast<uintptr_t>(p)) * 2 + (sub ? 1 : 0); }
 
   // "gpu.pass.fuse src=vk depth_input_in_tile=N reason=..": the decision for a pass that reads a multisampled depth as an input
-  // attachment. The first lines, then one in 2000.
+  // attachment. The first 64 lines, then one in 2000.
   void depthTileLog(const OpBeginPass& b, bool on, const char* why, uint32_t att, size_t draws0 = 0, size_t draws1 = 0, size_t fetchPipes = 0) {
     static std::atomic<unsigned> n{0};
     const unsigned k = n.fetch_add(1);
-    if (k >= 24 && k % 2000) return;
+    if (k >= 64 && k % 2000) return;
     logf("gpu.pass.fuse src=vk depth_input_in_tile=%d reason=%s att=%u fb=%ux%u draws0=%zu draws1=%zu fetch_pipes=%zu", on ? 1 : 0, why, att,
          b.framebuffer ? b.framebuffer->width : 0, b.framebuffer ? b.framebuffer->height : 0, draws0, draws1, fetchPipes);
   }
 
   // Decides, when subpass 0 of `b` opens as `desc`, whether the depth the later subpass reads as an input attachment can stay on
   // tile; if so adds the shadow attachment to `desc` and fills `dt`. Any unmet condition leaves everything as it was (the
-  // subpass 1 samples the stored depth: the encoder is cut) and logs why. A pass without such an input says nothing.
+  // later subpass samples the stored depth: the encoder is cut) and logs why. A pass without such an input says nothing.
   void planDepthTile(const OpBeginPass& b, const std::vector<Op>& ops, size_t at, vpgpu::RenderPassDesc& desc, bool areaDepth) {
     dt = DepthTile{};
     if (!b.pass || !b.framebuffer) return;
@@ -2088,16 +2120,20 @@ struct Translator {
     if (!depthTileOn()) return no("disabled");
     Device* dev = devForce();
     if (!dev || !dev->gpu || !img->id) return no("no_device");
-    if (sps.size() != 2 || !sps[0].inputs.empty()) return no("subpasses");
-    const RenderPassObj::Subpass &s0 = sps[0], &s1 = sps[1];
-    if (!s0.hasDepth || s0.depth.attachment != att || !s1.hasDepth || s1.depth.attachment != att) return no("depth_attachment");
-    for (const VkAttachmentReference2& r : s1.inputs)
-      if (r.attachment != att) return no("other_inputs");
-    if (s0.viewMask != s1.viewMask) return no("view_mask");
-    for (size_t c = 0; c < s1.colors.size(); ++c) {
-      const uint32_t a1 = s1.colors[c].attachment;
-      const uint32_t a0 = c < s0.colors.size() ? s0.colors[c].attachment : VK_ATTACHMENT_UNUSED;
-      if (a1 != VK_ATTACHMENT_UNUSED && a1 != a0) return no("colors");
+    if (sps.size() < 2 || !sps[0].inputs.empty()) return no("subpasses");
+    const RenderPassObj::Subpass& s0 = sps[0];
+    if (!s0.hasDepth || s0.depth.attachment != att) return no("depth_attachment");
+    for (size_t s = 1; s < sps.size(); ++s) {  // every later subpass: the same depth, no other input, the colours of subpass 0
+      const RenderPassObj::Subpass& sn = sps[s];
+      if (!sn.hasDepth || sn.depth.attachment != att) return no("depth_attachment");
+      for (const VkAttachmentReference2& r : sn.inputs)
+        if (r.attachment != att) return no("other_inputs");
+      if (s0.viewMask != sn.viewMask) return no("view_mask");
+      for (size_t c = 0; c < sn.colors.size(); ++c) {
+        const uint32_t an = sn.colors[c].attachment;
+        const uint32_t a0 = c < s0.colors.size() ? s0.colors[c].attachment : VK_ATTACHMENT_UNUSED;
+        if (an != VK_ATTACHMENT_UNUSED && an != a0) return no("colors");
+      }
     }
     // (the VPKTAA jitter only moves the viewport and the mask variant is what jitter() would replace: those stay out)
     if (maskPass || forceN || desc.rateMap || (fovs && taaPass)) return no("pass_state");
@@ -2109,7 +2145,7 @@ struct Translator {
     if (areaDepth || partialArea(b.area, dv)) return no("area_clear");
     if (dv->range.baseMipLevel != 0 || img->desc.type != vpgpu::TextureType::Tex2D) return no("depth_view");
     if (img->desc.layers < desc.layerCount) return no("layers");
-    // The draws: subpass 0 must leave the shadow equal to its depth, subpass 1 must not change the depth.
+    // The draws: subpass 0 must leave the shadow equal to its depth, the later subpasses must not change the depth.
     struct Seen {
       const PipelineObj* p;
       uint32_t sub;
@@ -2188,7 +2224,7 @@ struct Translator {
     for (size_t i = at + 1; i < ops.size(); ++i)
       if (visit(visit, ops[i])) break;
     if (bad) return no(bad);
-    if (sub != 1) return no("subpasses");
+    if (sub + 1 != sps.size()) return no("subpasses");
     // The variants: all translated first (nothing requested or recorded), committed only when every one exists and the pass is taken.
     std::unordered_map<uint64_t, DepthTile::Use> uses;
     size_t fetchPipes = 0;
@@ -2223,7 +2259,7 @@ struct Translator {
     depthTileLog(b, true, "ok", att, draws[0], draws[1], fetchPipes);
   }
 
-  // Subpass 1 of a depth-tile pass: the shadow is read, never written, and not needed after.
+  // A later subpass (1..N-1) of a depth-tile pass: the shadow is read, never written, and not needed after the last one.
   void depthTileReader(vpgpu::RenderPassDesc& desc) {
     if (!dt.active) return;
     if (maskPass || forceN || (fovs && taaPass)) {  // (subpass 1 is judged on its own): it samples the stored depth, as before
@@ -2232,7 +2268,9 @@ struct Translator {
     }
     desc.colors[kDepthTileSlot] = dt.shadow;
     desc.colors[kDepthTileSlot].load = vpgpu::LoadAction::Load;
-    desc.colors[kDepthTileSlot].store = vpgpu::StoreAction::DontCare;
+    // (a subpass that another one follows keeps it, like subpass 0: the core drops the store when the next subpass merges)
+    desc.colors[kDepthTileSlot].store = pass && pass->pass && subpass + 1 < pass->pass->subpasses.size() ? vpgpu::StoreAction::Store
+                                                                                                          : vpgpu::StoreAction::DontCare;
   }
 
   // The draw with the pipeline variant of the depth-tile pass and, for a fetch, the shadow read pixel-locally instead of the depth.
@@ -2423,6 +2461,7 @@ struct Translator {
       a.load = vpgpu::LoadAction::Load;
       a.store = vpgpu::StoreAction::StoreAndResolve;
       a.keepSamples = true;  // vkCmdResolveImage: the source samples are the data
+      a.keepOrigin = vpgpu::KeepOrigin::Required;
       a.resolve = rs.dst->id;
       a.resolveMip = uint16_t(g.dstSubresource.mipLevel);
       a.resolveLayer = uint16_t(g.dstSubresource.baseArrayLayer + l);

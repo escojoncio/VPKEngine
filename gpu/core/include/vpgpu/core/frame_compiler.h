@@ -261,8 +261,9 @@ struct CompileOptions {
   // written to memory every frame (only the store bandwidth is saved: a persistent texture is still allocated by the
   // backend). The persistent flag is ignored for it. Attachment::keepSamples opts an attachment out: the Vulkan translator
   // sets it on EVERY StoreAndResolve it emits (a client STORE + resolve, and the upgrades for a later subpass, a partial
-  // area, self-dependencies, a resolve recorded as a pass, VPKTAA depth), so in Vulkan clients only a DONT_CARE + resolve
-  // (already a Resolve) is memoryless. A read of the samples in a LATER submit would see undefined samples
+  // area, self-dependencies, a resolve recorded as a pass, VPKTAA depth; Attachment::keepOrigin tells which), so for Vulkan
+  // clients this flag changes nothing: a client STORE + resolve is only dropped by msaaDeadStore (below), and only a
+  // DONT_CARE + resolve (already a Resolve) is memoryless otherwise. A read of the samples in a LATER submit would see undefined samples
   // (CompiledFrame::stats.msaaStaleReads counts such reads: msaa_stale in the frame report). Not to be confused with
   // VPVK_MSAA_TILE (gpu/vulkan): that one decides whether game attachments are created deferred / memoryless.
   // This flag covers colour AND depth; it is OFF by default (Device: VP_MSAA_TILE=1 / "depth").
@@ -275,11 +276,15 @@ struct CompileOptions {
   bool copyRects = false;
   // A client Store of an MSAA attachment that nothing in the frame reads afterwards is dropped (DontCare / Resolve, so the
   // texture can stay on tile) once ResourceTable::StoreHistory shows 3 consecutive frames whose next first access did not need
-  // those contents. A frame that then needs them (miss) bans the texture from it. OFF by default and opt-in (Device:
-  // VPVK_MSAA_DEAD_STORE=1). Speculative: "nothing read it for 3 frames" does not prove the next frame will not, so a miss
-  // costs one frame of undefined samples before the per-texture ban. The proper long-term fix is an explicit keepSamples /
-  // real-storeOp hint from the Vulkan translator.
+  // those contents. A frame that then needs them (miss) bans the texture from it. Only for textures no shader can read
+  // (TextureDesc::shaderReadable false) and never for a store the translator needs (Attachment::keepOrigin Required, e.g. the
+  // depth VPKTAA reads after the frame). Off in a bare CompileOptions; Device turns it on by default (VPVK_MSAA_DEAD_STORE=0
+  // turns it off, and 8 misses switch it off for the run). Speculative: "nothing read it for 3 frames" does not prove the next
+  // frame will not, so a miss costs one frame of undefined samples before the per-texture ban.
   bool msaaDeadStore = false;
+  // msaaDeadStore stops guessing (no new store is elided; Device sets it after too many misses) but keeps watching: a texture whose
+  // store was already elided still gets its miss counted and logged, and is banned, when a later frame needs its contents.
+  bool msaaDeadStoreHalt = false;
   // A two-layer render pass that would be HeavyGeometry as one encoder, whose draws are all vertex amplified and that only draws
   // (no writes to resources, no framebuffer fetch, no occlusion queries; in-pass clears are fine, each encoder clears the rects of
   // its view; a rate map only with multisampled attachments, which gpu/metal2 never foveates) becomes two encoders, one per view

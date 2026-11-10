@@ -12,7 +12,11 @@ namespace vpgpu {
 
 namespace {
 const auto kProcessStart = std::chrono::steady_clock::now();  // gpu.time t= counts from here
-}
+// Elided MSAA stores that a later frame needed (CompileOptions::msaaDeadStore), over the whole run, before dead-store elision is switched off.
+constexpr uint32_t kDeadStoreMissLimit = 8;
+// Times an MSAA store must be seen kept (same texture, slot, origin and verdict), before gpu.msaa.kept_store reports it.
+constexpr uint32_t kKeptStoreSeen = 8;
+}  // namespace
 
 Device::Device(Backend& backend, unsigned pipelineWorkers, LogSink log)
     : backend_(backend), pipelines_(backend, pipelineWorkers), log_(std::move(log)) {
@@ -27,9 +31,11 @@ Device::Device(Backend& backend, unsigned pipelineWorkers, LogSink log)
   // Copies to disjoint rectangles of one texture subresource without a barrier between them (off by default: see
   // CompileOptions::copyRects and the backend note about ordering inside a blit encoder).
   if (const char* e = std::getenv("VPVK_COPY_RECT_HAZARD"); e && *e && *e != '0') compile_.copyRects = true;
-  // VPVK_MSAA_DEAD_STORE=1: drop client Stores of MSAA attachments nothing reads (opt-in, speculative: see
-  // CompileOptions::msaaDeadStore). Anything else or unset = off.
-  if (const char* e = std::getenv("VPVK_MSAA_DEAD_STORE"); e && e[0] == '1' && !e[1]) compile_.msaaDeadStore = true;
+  // Drop client Stores of MSAA attachments nothing reads (CompileOptions::msaaDeadStore, speculative but banned per texture on a
+  // miss, and off for good after kDeadStoreMissLimit misses). On by default; VPVK_MSAA_DEAD_STORE=0 turns it off.
+  compile_.msaaDeadStore = true;
+  if (const char* e = std::getenv("VPVK_MSAA_DEAD_STORE"); e && e[0] == '0' && !e[1]) compile_.msaaDeadStore = false;
+  log_(std::string("gpu.msaa dead_store=") + (compile_.msaaDeadStore ? "1" : "0 (VPVK_MSAA_DEAD_STORE=0)"));
   // VPVK_FRAME_OPT=0: no merge / hoist / sink in the frame compiler (CompileOptions::frameOpt). Anything else or unset = on.
   if (const char* e = std::getenv("VPVK_FRAME_OPT"); e && e[0] == '0' && !e[1]) compile_.frameOpt = false;
   log_(std::string("gpu.frame_opt enabled=") + (compile_.frameOpt ? "1" : "0"));
@@ -125,6 +131,7 @@ void Device::destroy(TextureId id) {
   {
     std::lock_guard lock(resMutex_);
     gone = resources_.destroy(id);
+    if (gone) keptStoreSeen_.erase(uint64_t{id.generation} << 32 | id.index);
   }
   if (gone) backend_.destroyTexture(id);
 }
@@ -216,6 +223,34 @@ void Device::trackRenderTargets(uint64_t index, const CompiledFrame& compiled, s
         r.memoryless = false, r.why = e.tile[slot];
       }
       r.store = a.store, r.keepSamples = a.keepSamples;
+      // A store of MSAA samples that stays in memory (not elided, not tile-local): who asked for it, and what kept it, reported
+      // once it has been seen kKeptStoreSeen times (gpu.msaa.nonmemoryless skips why=None and has no origin).
+      if (d->samples > 1 && !a.autoMsaa && (a.store == StoreAction::Store || a.store == StoreAction::StoreAndResolve) &&
+          !e.tileLocal(slot)) {
+        const uint64_t tex = uint64_t{a.texture.generation} << 32 | a.texture.index;
+        const uint32_t key = uint32_t(slot) << 16 | uint32_t(a.keepOrigin) << 8 | uint32_t(e.tile[slot]);
+        uint32_t* seen = nullptr;
+        if (const auto it = keptStoreSeen_.find(tex); it != keptStoreSeen_.end() || keptStoreSeen_.size() < 1024) seen = &keptStoreSeen_[tex][key];
+        if (seen && ++*seen == kKeptStoreSeen) {
+          static const char* const kOrigin[] = {"unknown", "client", "upgrade", "required"};
+          const ResourceTable::StoreHistory h = resources_.storeHistory(a.texture);
+          bool cand = false;
+          for (const StoreObs& o : compiled.storeObs) cand = cand || (o.texture == a.texture && o.candidate);
+          std::string label = d->label.empty() ? "-" : d->label.substr(0, 40);
+          for (char& c : label)
+            if (c == ' ') c = '_';
+          char buf[400];
+          std::snprintf(buf, sizeof buf,
+                        "gpu.msaa.kept_store f=%llu rp=%s tex=%u %ux%ux%u s%u fmt=%s slot=%s origin=%s store=%s resolve=%d load=%d why=%s "
+                        "dead_cand=%d dead=%u banned=%d shader_readable=%d persistent=%d transient=%d heavy=%d dead_store=%d",
+                        (unsigned long long)index, label.c_str(), a.texture.index, d->width, d->height, unsigned(d->layers),
+                        unsigned(d->samples), formatInfo(d->format).name, slot == kDepthSlot ? "depth" : "colour",
+                        kOrigin[unsigned(a.keepOrigin) & 3], a.store == StoreAction::Store ? "S" : "SR", a.resolve ? 1 : 0, int(a.load),
+                        toString(e.tile[slot]), cand ? 1 : 0, unsigned(h.dead), h.banned ? 1 : 0, d->shaderReadable ? 1 : 0,
+                        d->persistent ? 1 : 0, d->transient ? 1 : 0, e.heavy >= 1.0f ? 1 : 0, compile_.msaaDeadStore && !compile_.msaaDeadStoreHalt ? 1 : 0);
+          lines.emplace_back(buf);
+        }
+      }
     }
   }
   const auto now = std::chrono::steady_clock::now();
@@ -398,6 +433,11 @@ FrameReport Device::submit(const Frame& frame) {
     std::snprintf(buf, sizeof buf, "gpu.msaa elide_miss f=%llu tex=%u (elided store was needed; elision banned)",
                   (unsigned long long)index, t.index);
     log_(buf);
+  }
+  deadStoreMisses_ += uint32_t(compiled.elideMisses.size());
+  if (compile_.msaaDeadStore && !compile_.msaaDeadStoreHalt && deadStoreMisses_ >= kDeadStoreMissLimit) {  // the guess keeps failing: stop guessing
+    compile_.msaaDeadStoreHalt = true;  // (already elided stores keep being watched)
+    log_("gpu.msaa dead_store=0 (" + std::to_string(deadStoreMisses_) + " elided stores were needed: switched off)");
   }
   {
     static std::atomic<uint32_t> observed{0};  // VPVK_TILE_HEAVY=observe: the first 40 heavy encoders, then one frame in 600

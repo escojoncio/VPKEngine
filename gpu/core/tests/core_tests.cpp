@@ -2143,6 +2143,7 @@ void testDeadStore() {
       d.width = d.height = 64;
       d.samples = 4;
       d.usage = usage::colorTarget;
+      d.shaderReadable = false;  // (the Vulkan layer's MSAA attachment without SAMPLED / STORAGE usage)
       ms = s.res.createTexture(d);
       other = s.rt(64);
     }
@@ -2241,9 +2242,9 @@ void testDeadStore() {
       CHECK(cf.encoders[0].tile[0] == TileVerdict::None && cf.stats.storesElided == 0u && cf.storeObs.empty());
     }
   }
-  {  // (d') Device: off unless VPVK_MSAA_DEAD_STORE=1, and the miss reaches the log once
-    for (int envOn = 0; envOn < 2; ++envOn) {
-      if (envOn) setenv("VPVK_MSAA_DEAD_STORE", "1", 1);
+  {  // (d') Device: on unless VPVK_MSAA_DEAD_STORE=0, and the miss reaches the log once
+    for (int envOff = 0; envOff < 2; ++envOff) {
+      if (envOff) setenv("VPVK_MSAA_DEAD_STORE", "0", 1);
       std::vector<std::string> log;
       NullBackend be;
       Device dev(be, 0, [&](const std::string& l) { log.push_back(l); });
@@ -2253,6 +2254,7 @@ void testDeadStore() {
       d.width = d.height = 64;
       d.samples = 4;
       d.usage = usage::colorTarget;
+      d.shaderReadable = false;
       const TextureId ms = dev.createTexture(d);
       auto frame = [&](LoadAction load) {
         Frame f;
@@ -2267,9 +2269,169 @@ void testDeadStore() {
       for (int n = 0; n < 4; ++n) misses += frame(LoadAction::Clear).compile.elideMiss;
       size_t logged = 0;
       for (const std::string& l : log) logged += l.starts_with("gpu.msaa elide_miss");
-      CHECK_EQ(elided, envOn ? 4u : 0u);
-      CHECK_EQ(misses, envOn ? 1u : 0u);
-      CHECK_EQ(logged, envOn ? size_t{1} : size_t{0});
+      CHECK_EQ(elided, envOff ? 0u : 4u);
+      CHECK_EQ(misses, envOff ? 0u : 1u);
+      CHECK_EQ(logged, envOff ? size_t{0} : size_t{1});
+      bool said = false;
+      for (const std::string& l : log) said = said || l == (envOff ? "gpu.msaa dead_store=0 (VPVK_MSAA_DEAD_STORE=0)" : "gpu.msaa dead_store=1");
+      CHECK(said);
+    }
+  }
+  {  // (d'') Device: 8 misses over the run stop the guessing for good (each texture is banned after its own miss), but a store that
+     // was already elided is still watched: its miss is counted and logged, and no new store is elided
+    std::vector<std::string> log;
+    NullBackend be;
+    Device dev(be, 0, [&](const std::string& l) { log.push_back(l); });
+    TextureDesc d;
+    d.format = Format::RGBA8Unorm;
+    d.width = d.height = 64;
+    d.samples = 4;
+    d.usage = usage::colorTarget;
+    d.shaderReadable = false;
+    auto frame = [&](TextureId ms, LoadAction load) {
+      Frame f;
+      RenderPassDesc w = Scene::pass(ms, {}, load);
+      w.colors[0].store = StoreAction::Store;
+      Scene::passWithDraw(f, w);
+      return dev.submit(f);
+    };
+    const TextureId pending = dev.createTexture(d);  // elided now, loaded after the switch-off
+    uint32_t pendingElided = 0;
+    for (int n = 0; n < 6; ++n) pendingElided += frame(pending, LoadAction::Clear).compile.storesElided;
+    CHECK(pendingElided > 0);
+    uint32_t misses = 0, elidedAfter = 0;
+    for (int t = 0; t < 10; ++t) {
+      const TextureId ms = dev.createTexture(d);
+      uint32_t el = 0;
+      for (int n = 0; n < 6; ++n) el += frame(ms, LoadAction::Clear).compile.storesElided;
+      misses += frame(ms, LoadAction::Load).compile.elideMiss;
+      if (t >= 8) elidedAfter += el;
+    }
+    CHECK_EQ(misses, 8u);  // (the 9th and 10th textures are never elided)
+    CHECK_EQ(elidedAfter, 0u);
+    size_t off = 0;
+    for (const std::string& l : log) off += l.starts_with("gpu.msaa dead_store=0 (8 elided stores were needed");
+    CHECK_EQ(off, size_t{1});
+    const FrameReport late = frame(pending, LoadAction::Load);  // the elided one needs its contents after all
+    CHECK_EQ(late.compile.elideMiss, 1u);
+    size_t missLines = 0;
+    for (const std::string& l : log) missLines += l.starts_with("gpu.msaa elide_miss");
+    CHECK_EQ(missLines, size_t{9});
+    CHECK_EQ(frame(pending, LoadAction::Clear).compile.storesElided, 0u);
+  }
+  {  // (d4) the kept-store diagnostic does not run dry: a destroyed texture frees its entry
+    std::vector<std::string> log;
+    NullBackend be;
+    Device dev(be, 0, [&](const std::string& l) { log.push_back(l); });
+    TextureDesc d;
+    d.format = Format::RGBA8Unorm;
+    d.width = d.height = 64;
+    d.samples = 4;
+    d.usage = usage::colorTarget;
+    for (int t = 0; t < 1030; ++t) {
+      const TextureId ms = dev.createTexture(d);
+      for (int n = 0; n < 8; ++n) {
+        Frame f;
+        RenderPassDesc w = Scene::pass(ms, {}, LoadAction::Clear);
+        w.colors[0].store = StoreAction::Store;
+        Scene::passWithDraw(f, w);
+        dev.submit(f);
+      }
+      dev.destroy(ms);
+    }
+    size_t kept = 0;
+    for (const std::string& l : log) kept += l.starts_with("gpu.msaa.kept_store");
+    CHECK_EQ(kept, size_t{1030});
+  }
+  {  // (f) only an image no shader can read, and a store the translator does not need itself (KeepOrigin::Required), is guessed
+    struct Case {
+      bool shaderReadable;
+      KeepOrigin origin;
+      bool elides;
+    };
+    for (const Case c : {Case{true, KeepOrigin::Client, false}, Case{false, KeepOrigin::Required, false}, Case{false, KeepOrigin::Unknown, true},
+                         Case{false, KeepOrigin::Client, true}, Case{false, KeepOrigin::Upgrade, true}}) {
+      Scene s;
+      TextureDesc d;
+      d.format = Format::RGBA8Unorm;
+      d.width = d.height = 64;
+      d.samples = 4;
+      d.usage = usage::colorTarget;
+      d.shaderReadable = c.shaderReadable;
+      const TextureId ms = s.res.createTexture(d);
+      uint32_t elided = 0;
+      for (int n = 0; n < 8; ++n) {
+        Frame f;
+        RenderPassDesc w = Scene::pass(ms, {}, LoadAction::Clear);
+        w.colors[0].store = StoreAction::Store, w.colors[0].keepOrigin = c.origin;
+        Scene::passWithDraw(f, w);
+        const CompiledFrame cf = compileFrame(f, &s.res, Ms::on());
+        commitMemory(cf, s.res);
+        elided += cf.stats.storesElided;
+        CHECK(c.elides || cf.encoders[0].pass.colors[0].store == StoreAction::Store);
+      }
+      CHECK_EQ(elided > 0, c.elides);
+    }
+  }
+  {  // (f') depth: a client STORE + resolve of an MSAA depth (the Vulkan translator's keepSamples) nobody reads loses its samples
+    // too; the depth VPKTAA reads after the frame (Required) keeps them
+    for (int required = 0; required < 2; ++required) {
+      Scene s;
+      TextureDesc c, dp;
+      c.format = Format::RGBA8Unorm, dp.format = Format::D32Float;
+      c.width = c.height = dp.width = dp.height = 64;
+      c.samples = dp.samples = 4;
+      c.usage = usage::colorTarget, dp.usage = usage::depthTarget;
+      c.shaderReadable = dp.shaderReadable = false;
+      const TextureId msC = s.res.createTexture(c), msD = s.res.createTexture(dp), res = s.depthRt(64);
+      uint32_t elided = 0;
+      for (int n = 0; n < 8; ++n) {
+        Frame f;
+        RenderPassDesc w = Scene::pass(msC, msD, LoadAction::Clear);
+        w.colors[0].store = StoreAction::DontCare;
+        w.depth.store = StoreAction::StoreAndResolve, w.depth.resolve = res, w.depth.keepSamples = true;
+        w.depth.keepOrigin = required ? KeepOrigin::Required : KeepOrigin::Client;
+        Scene::passWithDraw(f, w);
+        const CompiledFrame cf = compileFrame(f, &s.res, Ms::on());
+        commitMemory(cf, s.res);
+        elided += cf.stats.storesElided;
+        const Attachment& dd = cf.encoders[0].pass.depth;
+        if (!required && n >= 4) CHECK(cf.encoders[0].tileLocal(kDepthSlot) && dd.store == StoreAction::Resolve && dd.resolve == res);
+        if (required) CHECK(cf.encoders[0].tile[kDepthSlot] == TileVerdict::None && dd.store == StoreAction::StoreAndResolve);
+      }
+      CHECK_EQ(elided, required ? 0u : 4u);
+    }
+  }
+  {  // (g) a store that stays kept is reported once, with who asked for it
+    std::vector<std::string> log;
+    NullBackend be;
+    Device dev(be, 0, [&](const std::string& l) { log.push_back(l); });
+    TextureDesc d;
+    d.format = Format::RGBA8Unorm;
+    d.width = d.height = 64;
+    d.samples = 4;
+    d.usage = usage::colorTarget;  // (shaderReadable stays true: never a dead-store candidate)
+    d.label = "unity rt";
+    const TextureId ms = dev.createTexture(d);
+    auto lines = [&] {
+      std::vector<std::string> out;
+      for (const std::string& l : log)
+        if (l.starts_with("gpu.msaa.kept_store")) out.push_back(l);
+      return out;
+    };
+    for (int n = 0; n < 12; ++n) {
+      Frame f;
+      RenderPassDesc w = Scene::pass(ms, {}, LoadAction::Clear);
+      w.colors[0].store = StoreAction::Store, w.colors[0].keepOrigin = KeepOrigin::Client;
+      Scene::passWithDraw(f, w);
+      dev.submit(f);
+      if (n < 7) CHECK(lines().empty());
+    }
+    const std::vector<std::string> got = lines();
+    CHECK_EQ(got.size(), size_t{1});
+    if (got.size() == 1) {
+      for (const char* want : {"rp=unity_rt", "slot=colour", "origin=client", "store=S", "why=None", "dead_cand=0", "shader_readable=1", "dead_store=1"})
+        CHECK(got[0].find(want) != std::string::npos);
     }
   }
   {  // (e) elided, then a frame that touches only part of it (layer 1), then a Load of all of it: banned at the partial frame
@@ -2280,6 +2442,7 @@ void testDeadStore() {
     d.layers = 2;
     d.samples = 4;
     d.usage = usage::colorTarget;
+    d.shaderReadable = false;
     const TextureId ms = s.res.createTexture(d);
     auto frame = [&](LoadAction load, bool layer1Only) {
       Frame f;
@@ -2297,6 +2460,8 @@ void testDeadStore() {
     CHECK(!s.res.storeHistory(ms).banned);
     const CompiledFrame part = frame(LoadAction::Clear, true);  // verdict Partial: the elided layer 0 stays undefined
     CHECK(part.encoders[0].tile[0] == TileVerdict::None && part.stats.storesElided == 0u);
+    CHECK_EQ(part.stats.elideMiss, 1u);  // a miss too, counted and listed for the log (not only a silent ban)
+    CHECK(part.elideMisses.size() == 1 && part.elideMisses[0] == ms);
     CHECK(s.res.storeHistory(ms).banned);
     frame(LoadAction::Load, false);
     for (int n = 0; n < 10; ++n) {
