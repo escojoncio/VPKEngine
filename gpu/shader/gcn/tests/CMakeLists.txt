@@ -66,6 +66,10 @@ if(TARGET vpgcn_ref AND TARGET vpgcn_lift)
   add_test(NAME gcn.lift.differential_buf COMMAND vpgcn_wave_diff ${CMAKE_CURRENT_SOURCE_DIR}/diff/programs_buf.txt --buf --lds 8192)
   add_test(NAME gcn.lift.differential_buf_known COMMAND vpgcn_wave_diff ${CMAKE_CURRENT_SOURCE_DIR}/diff/programs_buf.txt --buf --known-layout --lds 8192)
   set_tests_properties(gcn.lift.differential_buf gcn.lift.differential_buf_known PROPERTIES TIMEOUT 600)
+  # The guarded multi-dword / typed loads (diff/gen_buf_fetch.py): one range check for the whole access, straddling the end keeps the
+  # dwords inside; the "ifmax" lines also bound the number of `if` statements the lifted loads add.
+  add_test(NAME gcn.lift.differential_buf_fetch COMMAND vpgcn_wave_diff ${CMAKE_CURRENT_SOURCE_DIR}/diff/programs_buf_fetch.txt --buf --lds 8192)
+  add_test(NAME gcn.lift.differential_buf_fetch_known COMMAND vpgcn_wave_diff ${CMAKE_CURRENT_SOURCE_DIR}/diff/programs_buf_fetch.txt --buf --known-layout --lds 8192)
   # MIMG on storage images of every dimension: load / load_mip / store (dmask) / the 17 atomics / get_resinfo (diff/gen_img.py,
   # ref/gcn_ref_img.cpp); cubes are seen as 2D arrays of faces.
   add_test(NAME gcn.lift.differential_img COMMAND vpgcn_wave_diff ${CMAKE_CURRENT_SOURCE_DIR}/diff/programs_img.txt --img)
