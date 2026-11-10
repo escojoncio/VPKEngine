@@ -116,6 +116,13 @@ struct Encoder {
   // calls that HeavyGeometry (the tile verdict of a split pass; "still heavy" by draws alone does not stop the split).
   uint64_t splitViewVerts = 0;
   bool splitHeavyAfter = false;
+  // render, reason Feedback (diagnostic only): the first thing the pass read or wrote that the render encoder it could not join
+  // touches. texture null = not found (the conflict was a resolve write). prevDepth: it is that encoder's depth attachment;
+  // write: the new pass writes it (else it samples / copies it, a read of what the earlier encoder wrote).
+  struct FeedbackInfo {
+    TextureId texture;
+    bool prevDepth = false, write = false;
+  } feedback;
   bool tileLocal(int slot) const { return tile[slot] == TileVerdict::TileLocal; }
 };
 
@@ -154,6 +161,9 @@ struct CompileStats {
   uint32_t storesElided = 0;   // client Stores of MSAA attachments dropped as dead (CompileOptions::msaaDeadStore)
   uint32_t elideMiss = 0;      // frames' first access needed contents whose store had been elided (the texture is banned from it)
   uint32_t transientViolations = 0;  // TextureDesc::transient textures first caught needing memory (CompiledFrame::transientViolations)
+  // Estimated bytes of multisampled attachments the render encoders load from / store to memory this frame (final decisions,
+  // after placeTiles: a tile-local attachment counts nothing; samples x texel size of the format, one layer per rendered view).
+  uint64_t msaaLoadBytes = 0, msaaStoreBytes = 0;
   bool splitViews = false;     // CompileOptions::splitViews was on for this frame
   uint32_t splitEncoders = 0;  // render encoders split per view (each is now two: Encoder::view 0 and 1)
 };

@@ -766,6 +766,98 @@ struct Deferred {
 };
 
 // Unity's final MSAA resolve: a pass without draws after the pass that rendered the MSAA colour.
+// Unreal's mobile MSAA pass with a soft-particle subpass (Into the Radius 2): subpass 0 draws colour + depth 4x, subpass 1
+// samples the depth 4x as an input attachment (a texture binding) and resolves both. The compiler cuts the encoder (Feedback);
+// the diagnostics must say so, with the texture, the depth input not in tile, the 4x traffic and what reads the resolve targets.
+void testPassFuse() {
+  Scene s;
+  auto ms = [&](Format f, uint8_t samples) {
+    TextureDesc d;
+    d.format = f;
+    d.width = d.height = 256;
+    d.samples = samples;
+    d.usage = usage::sampled | (formatInfo(f).depth() ? usage::depthTarget : usage::colorTarget);
+    return s.res.createTexture(d);
+  };
+  const TextureId colour = ms(Format::RGBA8Unorm, 4), depth = ms(Format::D32Float, 4);
+  const TextureId colour1 = ms(Format::RGBA8Unorm, 1), depth1 = ms(Format::D32Float, 1);
+  const TextureId other = s.rt();
+  RenderPassDesc sub0 = Scene::pass(colour, depth, LoadAction::Clear);  // client stores both (the later subpass loads them)
+  RenderPassDesc sub1 = Scene::pass(colour, depth);
+  sub1.colors[0].store = StoreAction::Resolve, sub1.colors[0].resolve = colour1;
+  sub1.depth.store = StoreAction::Resolve, sub1.depth.resolve = depth1;
+  sub1.depth.depthResolve = ResolveMode::Max;
+  Frame f;
+  Scene::passWithDraw(f, sub0);
+  Scene::passWithDraw(f, sub1, {Scene::sample(depth)});
+  Scene::passWithDraw(f, Scene::pass(other), {Scene::sample(colour1)});
+  RenderPassDesc next = Scene::pass({}, depth1);
+  Scene::passWithDraw(f, next);
+  const CompiledFrame cf = compileFrame(f, &s.res);
+  CHECK_EQ(cf.encoders.size(), size_t{4});
+  CHECK(cf.encoders[1].reason == CutReason::Feedback);
+  CHECK(cf.encoders[1].feedback.texture == depth);
+  CHECK(cf.encoders[1].feedback.prevDepth && !cf.encoders[1].feedback.write);
+  CHECK(!cf.encoders[0].feedback.texture);  // only Feedback cuts carry the detail
+  // The depth resolve is the pass's own store action (no extra pass): Resolve with the client's mode, the 4x depth not stored by it.
+  CHECK(cf.encoders[1].pass.depth.store == StoreAction::Resolve && cf.encoders[1].pass.depth.depthResolve == ResolveMode::Max);
+  CHECK(cf.encoders[1].pass.depth.resolve == depth1);
+  const uint64_t mib = 1024 * 1024;  // 256 x 256 x 4 samples x 4 bytes, colour and depth
+  CHECK_EQ(cf.stats.msaaLoadBytes, 2 * mib);   // subpass 1 loads both
+  CHECK_EQ(cf.stats.msaaStoreBytes, 2 * mib);  // subpass 0 stores both (subpass 1 only resolves)
+  FrameReport r = makeReport(1, f, cf);
+  CHECK(formatReport(r)[0].find(" msaa_load_mb=2.0 msaa_store_mb=2.0") != std::string::npos);
+  const auto fuse = formatPassFuse(1, f, cf, &s.res);
+  CHECK_EQ(fuse.size(), size_t{1});
+  if (fuse.size() == 1) {
+    CHECK(fuse[0].starts_with("gpu.pass.fuse f=1 enc=1 passes=1 fused=0 reason=Feedback draws=1 "));
+    CHECK(fuse[0].find(" own_depth_reads=sampled:1,tile:0 depth_input_in_tile=0 ") != std::string::npos);
+    CHECK(fuse[0].find(" cut_is_prev_depth=1 cut_write=0 ") != std::string::npos);
+    CHECK(fuse[0].find(" cut_fmt=D32Float cut_s=4 ") != std::string::npos);
+    CHECK(fuse[0].find("  ") == std::string::npos);
+  }
+  const auto use = formatResolveUse(1, f, cf, &s.res);
+  CHECK_EQ(use.size(), size_t{2});
+  if (use.size() == 2) {
+    CHECK(use[0].find(" slot=c0 ") != std::string::npos && use[0].find(" later_sampled_draws=1 ") != std::string::npos);
+    CHECK(use[0].find(" dead_this_frame=0") != std::string::npos);
+    CHECK(use[1].find(" slot=d ") != std::string::npos && use[1].find(" later_loaded=1 ") != std::string::npos);
+    CHECK(use[1].find(" dead_this_frame=0") != std::string::npos);
+  }
+  {  // a resolve nobody reads in the frame is reported dead
+    Frame g;
+    Scene::passWithDraw(g, sub1);
+    const auto dead = formatResolveUse(2, g, compileFrame(g, &s.res), &s.res);
+    CHECK_EQ(dead.size(), size_t{2});
+    for (const auto& l : dead) CHECK(l.find(" dead_this_frame=1") != std::string::npos);
+  }
+  {  // fused passes (pixel-local fetch of the encoder's own colour): fused=1, no depth reads, no Feedback detail
+    TextureDesc d;
+    d.format = Format::RGBA8Unorm;
+    d.width = d.height = 256;
+    d.usage = usage::colorTarget | usage::sampled;
+    const TextureId g0 = s.res.createTexture(d);
+    RenderPassDesc w = Scene::pass(g0, {}, LoadAction::Clear);
+    w.colors[0].store = StoreAction::DontCare;
+    RenderPassDesc rd;  // writes slot 3, so slot 0 stays the first pass's and is fetched from the tile
+    rd.colors[3].texture = other;
+    rd.colors[3].load = LoadAction::Clear;
+    Frame g;
+    Scene::passWithDraw(g, w);
+    Scene::passWithDraw(g, rd, {pixelLocalRead(g0)});
+    const CompiledFrame cg = compileFrame(g, &s.res);
+    CHECK_EQ(cg.encoders.size(), size_t{1});
+    const auto fl = formatPassFuse(3, g, cg, &s.res);
+    CHECK_EQ(fl.size(), size_t{1});
+    if (fl.size() == 1) {
+      CHECK(fl[0].find(" passes=2 fused=1 ") != std::string::npos);
+      CHECK(fl[0].find("own_depth_reads") == std::string::npos && fl[0].find("cut_tex") == std::string::npos);
+    }
+  }
+  for (const auto& l : fuse) std::printf("  %s\n", l.c_str());
+  for (const auto& l : use) std::printf("  %s\n", l.c_str());
+}
+
 void testEmptyResolve() {
   struct Setup {
     Scene s;
@@ -3346,7 +3438,7 @@ int main(int argc, char** argv) {
       {"bigframe", testBigFrameLog}, {"rectenv", testRectEnv}, {"mipchain", testMipChain},
       {"deadstore", testDeadStore}, {"rtmemory", testRtMemory}, {"scopedpool", testScopedPool},
       {"background", testBackground}, {"viewsplit", testViewSplit}, {"tilehot", testTileHot}, {"activity", testActivity}, {"harvest", testHarvest},
-      {"automsaa", testAutoMsaa}, {"required_dispatch", testRequiredDispatch}, {"frameopt", testFrameOpt}};
+      {"passfuse", testPassFuse}, {"automsaa", testAutoMsaa}, {"required_dispatch", testRequiredDispatch}, {"frameopt", testFrameOpt}};
   bool ran = false;
   for (const auto& [name, fn] : groups) {
     if (argc > 1 && std::strcmp(argv[1], name) != 0) continue;

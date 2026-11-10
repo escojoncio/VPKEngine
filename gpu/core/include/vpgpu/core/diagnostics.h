@@ -35,6 +35,16 @@ std::vector<std::string> formatReport(const FrameReport&);
 std::vector<std::string> formatEncoders(uint64_t frame, const Frame&, const CompiledFrame&,
                                         const GpuTimings* = nullptr);
 
+// "gpu.pass.fuse": one line per render encoder that merged several client passes (fused=1), was cut by Feedback, or has draws that
+// read its own depth attachment: how (sampled = the samples must be in memory, so the pass could not join the encoder that wrote
+// the depth; tile = pixel-local, depth_input_in_tile=1) and, for a Feedback cut, the first texture that caused it. At most 8 lines.
+std::vector<std::string> formatPassFuse(uint64_t frame, const Frame&, const CompiledFrame&, const ResourceTable* res);
+
+// "gpu.resolve.use": one line per Resolve / StoreAndResolve attachment of a render encoder: what the encoders after it do with the
+// resolve target in this frame (sampled draws, Loads and other attachments, copies, dispatches). dead_this_frame=1: nothing reads
+// it later in the frame (a read in a later frame is not visible). At most 8 lines.
+std::vector<std::string> formatResolveUse(uint64_t frame, const Frame&, const CompiledFrame&, const ResourceTable* res);
+
 // One "gpu.bigframe" line for a frame that will cost many Metal encoders (encoders + barriers inside compute
 // encoders, see bigFrame): encoders by kind, cuts, hazards, copies per label, and the destination textures with
 // the most copies (format, size, mips/layers, label, copies, distinct rects). `res` may be null.

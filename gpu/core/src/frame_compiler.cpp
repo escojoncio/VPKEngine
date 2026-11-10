@@ -146,6 +146,28 @@ bool conflicts(const AccessList& a, const AccessIndex& b) {
   return false;
 }
 
+// The first access of `a` that makes `conflicts(a, b)` true, as Encoder::FeedbackInfo (diagnostics: why a pass was cut).
+Encoder::FeedbackInfo firstConflict(const AccessList& a, const AccessIndex& b, TextureId openDepth) {
+  for (const Tagged& x : a) {
+    const auto& map = x.access.write ? b.byResource : b.writesByResource;
+    auto it = map.find(resourceKey(x.access.range));
+    if (it == map.end()) continue;
+    for (uint32_t i : it->second) {
+      const Tagged& y = b.list[i];
+      if (x.attachment && y.attachment) continue;
+      if (!x.access.range.overlaps(y.access.range)) continue;
+      Encoder::FeedbackInfo f;
+      f.write = x.access.write;
+      if (x.access.range.kind == ResourceRange::Kind::Texture) {
+        f.texture = TextureId{x.access.range.index, x.access.range.generation};
+        f.prevDepth = f.texture == openDepth;
+      }
+      return f;
+    }
+  }
+  return {};
+}
+
 void append(AccessList& to, const AccessList& from) { to.insert(to.end(), from.begin(), from.end()); }
 
 // Folds accesses that are the same in everything but their stages (many draws of one pass bind the
@@ -342,6 +364,7 @@ class Scheduler {
     append(acc, added);
 
     CutReason reason;
+    Encoder::FeedbackInfo feedback;
     if (open_ >= 0) {
       Encoder& r = out_.encoders[open_];
       // A pass with other targets may still join when it reads the encoder's attachments on tile:
@@ -362,6 +385,7 @@ class Scheduler {
         reason = CutReason::Feedback;
       else if (conflicts(acc, sunkAcc_)) reason = CutReason::PinnedCopy;
       else return merge(i, desc, need, acc);
+      if (reason == CutReason::Feedback) feedback = firstConflict(acc, acc_[open_], r.pass.depth.texture);
       closeRender();
     } else if (!haveLastRender_) {
       reason = CutReason::FrameStart;
@@ -373,6 +397,7 @@ class Scheduler {
     open_ = push(Encoder::Kind::Render, reason, i, acc);
     out_.encoders[open_].pass = need;
     out_.encoders[open_].passes = 1;
+    out_.encoders[open_].feedback = feedback;
   }
 
   void copy(uint32_t i, AccessList acc) {
@@ -1201,6 +1226,22 @@ bool CompiledFrame::skipped(uint32_t command, uint32_t draw) const {
   return std::binary_search(badDraws.begin(), badDraws.end(), DrawRef{command, draw});
 }
 
+// CompileStats::msaaLoadBytes / msaaStoreBytes: what the final load and store actions move for multisampled attachments.
+static void msaaTraffic(CompiledFrame& out, const ResourceTable& res) {
+  for (const Encoder& enc : out.encoders) {
+    if (enc.kind != Encoder::Kind::Render) continue;
+    const uint32_t layers = enc.view >= 0 ? 1 : std::max<uint32_t>(1, enc.pass.layerCount);
+    forEachSlot(enc.pass, [&](const Attachment& a, int) {
+      const TextureDesc* d = a.texture ? res.get(a.texture) : nullptr;
+      if (!d || d->samples < 2) return;
+      const uint64_t bytes = uint64_t{std::max(1u, d->width >> a.mip)} * std::max(1u, d->height >> a.mip) * layers * d->samples *
+                             formatInfo(a.format != Format::Undefined ? a.format : d->format).bytesPerBlock;
+      if (a.load == LoadAction::Load) out.stats.msaaLoadBytes += bytes;
+      if (a.store == StoreAction::Store || a.store == StoreAction::StoreAndResolve) out.stats.msaaStoreBytes += bytes;
+    });
+  }
+}
+
 CompiledFrame compileFrame(const Frame& frame, const ResourceTable* resources, const CompileOptions& options) {
   CompiledFrame out;
   const auto& cmds = frame.commands();
@@ -1229,6 +1270,7 @@ CompiledFrame compileFrame(const Frame& frame, const ResourceTable* resources, c
     placeTiles(out, cmds, accesses, *resources, options);
     trackMemory(out, accesses, *resources);
     splitViewEncoders(out);
+    msaaTraffic(out, *resources);
   }
 
   BarrierPlacer placer(out);

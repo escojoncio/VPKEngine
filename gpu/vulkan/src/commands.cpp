@@ -430,6 +430,62 @@ bool resolveTargetClear(const OpBeginPass& b, uint32_t sub, uint16_t layers, vpg
   return true;
 }
 
+// "vk.rp_dump" fuse{...}: for a pass whose subpass reads a multisampled depth image as an input attachment, what keeping that
+// read on tile (a colour attachment holding the depth, written by the earlier subpass) would have to touch: the input (attachment,
+// format, samples) and, per subpass, the draws, the distinct pipelines and the pipelines that read an input attachment. Today the
+// read is a sampled texture (depth_input_in_tile=0): the core cuts the encoder (gpu.pass.fuse says how it ended). Empty when no
+// subpass reads such an image.
+std::string fuseCensus(const OpBeginPass& b, const std::vector<Op>& ops, size_t at) {
+  std::string in;
+  for (size_t s = 0; s < b.pass->subpasses.size(); ++s)
+    for (const VkAttachmentReference2& r : b.pass->subpasses[s].inputs) {
+      const ImageView* v = r.attachment < b.framebuffer->views.size() ? b.framebuffer->views[r.attachment] : nullptr;
+      if (!v || !v->image || v->image->desc.samples < 2) continue;
+      const vpgpu::FormatInfo& fi = vpgpu::formatInfo(v->image->desc.format);
+      if (fi.depth() || fi.stencil())
+        in += (in.empty() ? "" : ",") + std::string("sub") + std::to_string(s) + ":att" + std::to_string(r.attachment) + "=" + fi.name + "/s" +
+              std::to_string(unsigned(v->image->desc.samples));
+    }
+  if (in.empty()) return in;
+  struct Sub {
+    uint32_t draws = 0;
+    std::vector<const PipelineObj*> pipes, inPipes;
+  };
+  std::vector<Sub> subs(1);
+  auto note = [&](std::vector<const PipelineObj*>& v, const PipelineObj* p) {
+    if (std::find(v.begin(), v.end(), p) == v.end()) v.push_back(p);
+  };
+  auto visit = [&](auto&& self, const Op& op) -> bool {  // true: the pass ended
+    if (const auto* d = std::get_if<OpDraw>(&op)) {
+      if (!d->ok || !d->pipe) return false;
+      Sub& cur = subs.back();
+      ++cur.draws;
+      note(cur.pipes, d->pipe);
+      for (const PipelineObj::Used& u : d->pipe->used)
+        if (u.slot.type == VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT) {
+          note(cur.inPipes, d->pipe);
+          break;
+        }
+    } else if (const auto* e = std::get_if<OpExecute>(&op)) {
+      if (e->secondary)
+        for (const Op& so : e->secondary->ops)
+          if (self(self, so)) return true;
+    } else if (std::holds_alternative<OpNextSubpass>(op)) {
+      subs.emplace_back();
+    } else if (std::holds_alternative<OpEndPass>(op) || std::holds_alternative<OpBeginPass>(op) || std::holds_alternative<OpBeginRendering>(op)) {
+      return true;
+    }
+    return false;
+  };
+  for (size_t i = at + 1; i < ops.size(); ++i)
+    if (visit(visit, ops[i])) break;
+  in += " depth_input_in_tile=0";
+  for (size_t s = 0; s < subs.size(); ++s)
+    in += " sub" + std::to_string(s) + "{draws=" + std::to_string(subs[s].draws) + " pipes=" + std::to_string(subs[s].pipes.size()) +
+          " in_att_pipes=" + std::to_string(subs[s].inPipes.size()) + "}";
+  return in;
+}
+
 // "vk.rp_dump": what the game asked for in a multisampled render pass of 1 Mpx or more, as Vulkan states it (attachment
 // ops, usage, subpasses) and the order of what it records inside (draw counts between subpass changes, barriers and
 // clears). The first 6 such passes with a different shape, then one in 3000. One submit's core encoders (gpu.enc) only
@@ -521,6 +577,9 @@ void rpDump(const OpBeginPass& b, const std::vector<Op>& ops, size_t at, uint64_
   logf("vk.rp_dump submit=%llu area=%d,%d+%ux%u fb=%ux%ux%u att{%s} sub{%s} seq{%s}", static_cast<unsigned long long>(submit),
        b.area.offset.x, b.area.offset.y, b.area.extent.width, b.area.extent.height, b.framebuffer->width, b.framebuffer->height,
        unsigned(b.framebuffer->layers), att.c_str(), subs.c_str(), seq.c_str());
+  if (const std::string fuse = fuseCensus(b, ops, at); !fuse.empty())
+    logf("vk.pass.fuse submit=%llu fb=%ux%ux%u in=%s", static_cast<unsigned long long>(submit), b.framebuffer->width,
+         b.framebuffer->height, unsigned(b.framebuffer->layers), fuse.c_str());
 }
 
 // Does subpass `sub` read one of its own colour / depth attachments as an input attachment?

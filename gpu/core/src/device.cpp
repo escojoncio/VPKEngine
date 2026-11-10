@@ -395,8 +395,16 @@ FrameReport Device::submit(const Frame& frame) {
         log_(buf);
       }
   }
-  if (detailEvery_ && index % detailEvery_ == 0)
+  if (detailEvery_ && index % detailEvery_ == 0) {
     for (const std::string& line : formatEncoders(index, frame, compiled)) log_(line);
+    std::vector<std::string> fuse;
+    {
+      std::lock_guard lock(resMutex_);
+      fuse = formatPassFuse(index, frame, compiled, &resources_);
+      for (std::string& line : formatResolveUse(index, frame, compiled, &resources_)) fuse.push_back(std::move(line));
+    }
+    for (const std::string& line : fuse) log_(line);
+  }
   // MSAA attachments the resolve-on-tile option could not keep on tile: the first few of the run and then
   // one frame in every detailEvery_ (the first rejects fall in the menu; the scene's matter), with
   // everything the verdict was decided on (so a log says why, not just tile_rejected=N).

@@ -78,6 +78,9 @@ std::vector<std::string> formatReport(const FrameReport& r) {
   kv(l, " tile_max=%llu heavy_enc=%u", (unsigned long long)r.compile.tileMaxVertices, r.compile.heavyEncoders);
   if (r.compile.tileRaised) kv(l, " tile_raised=%u", r.compile.tileRaised);  // encoders light only because of the raised limit
   if (r.compile.msaaStaleReads) kv(l, " msaa_stale=%u", r.compile.msaaStaleReads);
+  if (r.compile.msaaLoadBytes || r.compile.msaaStoreBytes)  // estimated: samples moved between tile and memory (final load / store actions)
+    kv(l, " msaa_load_mb=%.1f msaa_store_mb=%.1f", double(r.compile.msaaLoadBytes) / (1024.0 * 1024.0),
+       double(r.compile.msaaStoreBytes) / (1024.0 * 1024.0));
   if (r.compile.badFetch) kv(l, " bad_fetch=%u", r.compile.badFetch);
   kv(l, " cpu_ms=%.3f", r.cpuCompileMs);
   if (r.gpu.frameMs > 0) kv(l, " gpu_ms=%.3f", r.gpu.frameMs);
@@ -152,6 +155,101 @@ std::vector<std::string> formatEncoders(uint64_t frame, const Frame& f, const Co
       if (!first.empty()) l += " label=" + first.substr(0, 48);
     }
     lines.push_back(std::move(l));
+  }
+  return lines;
+}
+
+namespace {
+
+bool isTexture(const ResourceRange& r, TextureId t) {
+  return t && r.kind == ResourceRange::Kind::Texture && r.index == t.index && r.generation == t.generation;
+}
+
+}  // namespace
+
+std::vector<std::string> formatPassFuse(uint64_t frame, const Frame& f, const CompiledFrame& c, const ResourceTable* res) {
+  std::vector<std::string> lines;
+  constexpr size_t kMaxLines = 8;
+  for (size_t i = 0; i < c.encoders.size() && lines.size() < kMaxLines; ++i) {
+    const Encoder& e = c.encoders[i];
+    if (e.kind != Encoder::Kind::Render) continue;
+    // Draws that read the encoder's own depth attachment: sampled (a texture binding: needs the samples in memory) or pixel-local.
+    uint32_t draws = 0, sampled = 0, tile = 0;
+    for (uint32_t ci : e.commands) {
+      const auto* rp = std::get_if<RenderPass>(&f.commands()[ci]);
+      if (!rp) continue;
+      for (const Draw& d : rp->draws) {
+        if (d.clear) continue;
+        ++draws;
+        bool s = false, t = false;
+        for (const Access& b : d.bindings)
+          if (isTexture(b.range, e.pass.depth.texture)) (b.pixelLocal ? t : s) = true;
+        sampled += s, tile += t;
+      }
+    }
+    if (e.passes < 2 && !e.feedback.texture && !sampled && !tile) continue;
+    std::string l = "gpu.pass.fuse";
+    kv(l, " f=%llu enc=%zu passes=%u fused=%d reason=%s draws=%u", (unsigned long long)frame, i, e.passes, e.passes > 1 ? 1 : 0,
+       toString(e.reason), draws);
+    if (sampled || tile) kv(l, " own_depth_reads=sampled:%u,tile:%u depth_input_in_tile=%d", sampled, tile, sampled == 0 ? 1 : 0);
+    if (e.feedback.texture) {
+      kv(l, " cut_tex=%u cut_is_prev_depth=%d cut_write=%d", e.feedback.texture.index, e.feedback.prevDepth ? 1 : 0, e.feedback.write ? 1 : 0);
+      if (const TextureDesc* d = res ? res->get(e.feedback.texture) : nullptr)
+        kv(l, " cut_fmt=%s cut_s=%u", formatInfo(d->format).name, unsigned(d->samples));
+    }
+    if (const TextureDesc* d = res && e.pass.depth.texture ? res->get(e.pass.depth.texture) : nullptr)
+      kv(l, " depth=%s,s%u,%ux%u", formatInfo(d->format).name, unsigned(d->samples), d->width, d->height);
+    lines.push_back(std::move(l));
+  }
+  return lines;
+}
+
+std::vector<std::string> formatResolveUse(uint64_t frame, const Frame& f, const CompiledFrame& c, const ResourceTable* res) {
+  std::vector<std::string> lines;
+  constexpr size_t kMaxLines = 8;
+  for (size_t i = 0; i < c.encoders.size() && lines.size() < kMaxLines; ++i) {
+    const Encoder& e = c.encoders[i];
+    if (e.kind != Encoder::Kind::Render) continue;
+    for (int s = 0; s <= kMaxColorAttachments && lines.size() < kMaxLines; ++s) {
+      const Attachment& a = s == kDepthSlot ? e.pass.depth : e.pass.colors[s];
+      if (!a.texture || !a.resolve || (a.store != StoreAction::Resolve && a.store != StoreAction::StoreAndResolve)) continue;
+      // What the encoders after this one do with the resolve target in this frame (a read next frame is not visible here).
+      uint32_t sampled = 0, loaded = 0, attached = 0, copied = 0, dispatched = 0;
+      for (size_t j = i + 1; j < c.encoders.size(); ++j) {
+        for (uint32_t ci : c.encoders[j].commands) {
+          const Command& cmd = f.commands()[ci];
+          if (const auto* rp = std::get_if<RenderPass>(&cmd)) {
+            const RenderPassDesc& d = rp->desc;
+            auto look = [&](const Attachment& x) {
+              if (x.texture == a.resolve) ++(x.load == LoadAction::Load ? loaded : attached);
+            };
+            for (const Attachment& x : d.colors) look(x);
+            look(d.depth);
+            for (const Draw& dr : rp->draws) {
+              bool hit = false;
+              for (const Access& b : dr.bindings) hit = hit || (!b.pixelLocal && isTexture(b.range, a.resolve));
+              sampled += hit;
+            }
+          } else if (const auto* cp = std::get_if<Copy>(&cmd)) {
+            copied += cp->srcTexture.texture == a.resolve;
+          } else if (const auto* dp = std::get_if<Dispatch>(&cmd)) {
+            bool hit = false;
+            for (const Access& b : dp->bindings) hit = hit || isTexture(b.range, a.resolve);
+            dispatched += hit;
+          }
+        }
+      }
+      std::string l = "gpu.resolve.use";
+      kv(l, " f=%llu enc=%zu slot=%s src=%u dst=%u store=%s", (unsigned long long)frame, i,
+         s == kDepthSlot ? "d" : ("c" + std::to_string(s)).c_str(), a.texture.index, a.resolve.index,
+         a.store == StoreAction::Resolve ? "R" : "SR");
+      if (const TextureDesc* d = res ? res->get(a.texture) : nullptr)
+        kv(l, " fmt=%s s=%u %ux%ux%u", formatInfo(d->format).name, unsigned(d->samples), d->width, d->height, unsigned(e.pass.layerCount));
+      kv(l, " later_sampled_draws=%u later_loaded=%u later_attached=%u", sampled, loaded, attached);
+      kv(l, " later_copy_src=%u later_dispatch=%u dead_this_frame=%d", copied, dispatched,
+         sampled + loaded + attached + copied + dispatched == 0 ? 1 : 0);
+      lines.push_back(std::move(l));
+    }
   }
   return lines;
 }
