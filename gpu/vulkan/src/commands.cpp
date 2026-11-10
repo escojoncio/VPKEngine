@@ -424,6 +424,88 @@ bool resolveTargetClear(const OpBeginPass& b, uint32_t sub, uint16_t layers, vpg
   return true;
 }
 
+// "vk.rp_dump": what the game asked for in a multisampled render pass of 1 Mpx or more, as Vulkan states it (attachment
+// ops, usage, subpasses) and the order of what it records inside (draw counts between subpass changes, barriers and
+// clears). The first 3 such passes with a different shape, then one in 3000. One submit's core encoders (gpu.enc) only
+// show what the translator made of it; this line is the request itself.
+void rpDump(const OpBeginPass& b, const std::vector<Op>& ops, size_t at, uint64_t submit) {
+  if (!b.pass || !b.framebuffer) return;
+  bool big = false;
+  for (const ImageView* v : b.framebuffer->views)
+    big = big || (v && v->image && v->image->desc.samples > 1 && uint64_t(v->image->desc.width) * v->image->desc.height >= 1000000);
+  if (!big) return;
+  // Shape: attachment count, subpass count and ops, so a second pass kind in the same frame is also shown.
+  uint64_t shape = b.pass->attachments.size() * 131 + b.pass->subpasses.size();
+  for (const VkAttachmentDescription2& d : b.pass->attachments)
+    shape = shape * 1000003 + uint64_t(d.format) * 64 + uint64_t(d.samples) * 16 + uint64_t(d.loadOp) * 4 + uint64_t(d.storeOp);
+  static std::mutex mu;
+  static std::vector<uint64_t> seen;
+  static uint64_t count = 0;
+  {
+    std::lock_guard<std::mutex> l(mu);
+    const bool fresh = std::find(seen.begin(), seen.end(), shape) == seen.end();
+    if (fresh && seen.size() < 3) seen.push_back(shape);
+    else if (++count % 3000) return;
+  }
+  std::string att;
+  for (size_t i = 0; i < b.pass->attachments.size(); ++i) {
+    const VkAttachmentDescription2& d = b.pass->attachments[i];
+    const ImageView* v = i < b.framebuffer->views.size() ? b.framebuffer->views[i] : nullptr;
+    char buf[200];
+    std::snprintf(buf, sizeof buf, "%s%zu:f%d/s%d/l%d.%d/st%d.%d/lay%d>%d/u0x%x/%ux%ux%u%s", i ? " " : "", i, int(d.format),
+                  int(d.samples), int(d.loadOp), int(d.stencilLoadOp), int(d.storeOp), int(d.stencilStoreOp), int(d.initialLayout),
+                  int(d.finalLayout), v && v->image ? unsigned(v->image->info.usage) : 0u, v && v->image ? v->image->desc.width : 0u,
+                  v && v->image ? v->image->desc.height : 0u, v && v->image ? unsigned(v->image->desc.layers) : 0u,
+                  v && v->image && v->image->desc.transient ? "/T" : "");
+    att += buf;
+  }
+  std::string subs;
+  auto refs = [](const std::vector<VkAttachmentReference2>& r) {
+    std::string o;
+    for (const VkAttachmentReference2& a : r) o += (o.empty() ? "" : ",") + (a.attachment == VK_ATTACHMENT_UNUSED ? std::string("-") : std::to_string(a.attachment));
+    return o;
+  };
+  for (size_t i = 0; i < b.pass->subpasses.size(); ++i) {
+    const RenderPassObj::Subpass& sp = b.pass->subpasses[i];
+    subs += (i ? " | " : "") + std::to_string(i) + ":c[" + refs(sp.colors) + "] r[" + refs(sp.resolves) + "] in[" + refs(sp.inputs) + "] d" +
+            (sp.hasDepth && sp.depth.attachment != VK_ATTACHMENT_UNUSED ? std::to_string(sp.depth.attachment) + "/lay" + std::to_string(int(sp.depth.layout)) : std::string("-")) +
+            " dr" + (sp.depthResolve == VK_ATTACHMENT_UNUSED ? std::string("-") : std::to_string(sp.depthResolve)) + " vm0x" + std::to_string(sp.viewMask);
+  }
+  // What is recorded inside: D<n> = n draws, N = next subpass, B = barrier, C(...) = vkCmdClearAttachments, X = secondary buffer.
+  std::string seq;
+  uint32_t draws = 0;
+  auto flush = [&] {
+    if (draws) seq += "D" + std::to_string(draws) + " ";
+    draws = 0;
+  };
+  for (size_t i = at + 1; i < ops.size() && seq.size() < 400; ++i) {
+    const Op& op = ops[i];
+    if (const auto* d = std::get_if<OpDraw>(&op)) draws += d->ok ? 1u : 0u;
+    else if (const auto* e = std::get_if<OpExecute>(&op)) {
+      if (e->secondary)
+        for (const Op& so : e->secondary->ops)
+          if (const auto* sd = std::get_if<OpDraw>(&so)) draws += sd->ok ? 1u : 0u;
+    } else if (std::holds_alternative<OpNextSubpass>(op)) flush(), seq += "N ";
+    else if (std::holds_alternative<OpPassBarrier>(op)) flush(), seq += "B ";
+    else if (const auto* ca = std::get_if<OpClearAttachments>(&op)) {
+      flush();
+      seq += "C(";
+      for (const VkClearAttachment& a : ca->attachments)
+        seq += (a.aspectMask & VK_IMAGE_ASPECT_COLOR_BIT ? "c" + std::to_string(a.colorAttachment) : std::string("")) +
+               (a.aspectMask & VK_IMAGE_ASPECT_DEPTH_BIT ? "d" : "") + (a.aspectMask & VK_IMAGE_ASPECT_STENCIL_BIT ? "s" : "");
+      seq += ":" + std::to_string(ca->rects.size()) + "r";
+      if (!ca->rects.empty())
+        seq += " " + std::to_string(ca->rects[0].rect.extent.width) + "x" + std::to_string(ca->rects[0].rect.extent.height);
+      seq += ") ";
+    } else if (std::holds_alternative<OpEndPass>(op) || std::holds_alternative<OpBeginPass>(op) || std::holds_alternative<OpBeginRendering>(op))
+      break;
+  }
+  flush();
+  logf("vk.rp_dump submit=%llu area=%d,%d+%ux%u fb=%ux%ux%u att{%s} sub{%s} seq{%s}", static_cast<unsigned long long>(submit),
+       b.area.offset.x, b.area.offset.y, b.area.extent.width, b.area.extent.height, b.framebuffer->width, b.framebuffer->height,
+       unsigned(b.framebuffer->layers), att.c_str(), subs.c_str(), seq.c_str());
+}
+
 // Does subpass `sub` read one of its own colour / depth attachments as an input attachment?
 bool selfReads(const RenderPassObj& rp, uint32_t sub) {
   if (sub >= rp.subpasses.size()) return false;
@@ -557,6 +639,7 @@ struct Translator {
   bool eyeScene = false;
   EyeWhy eyeWhy;  // why eyeScene is false (forceMsaa's "eye" rejection diagnostics)
   uint8_t forceN = 0;
+  vpgpu::TextureId lastColor0, lastDepth;  // colour 0 and depth of the pass opened last in this translation (open)
   // VPKTAA UI mask. uiOn: classify the draws of eye passes (taa::DrawClassifier) and leave the UI
   // unjittered; `um` also lets the pass carry the R8 mask (maskPass) the UI draws mark.
   bool uiOn = false;
@@ -709,6 +792,7 @@ struct Translator {
   }
 
   void open(vpgpu::RenderPassDesc d) {
+    lastColor0 = d.colors[0].texture, lastDepth = d.depth.texture;  // what the next pass may continue (uiPass)
     // An eye pass keeps its depth: VPKTAA reads it after the frame, outside anything the frame
     // compiler can see, so a DONT_CARE store must not let the depth live only in tile memory.
     // (A forced-MSAA depth twin resolves into the game's image instead: forceMsaa.)
@@ -771,6 +855,7 @@ struct Translator {
       if (const auto* b = std::get_if<OpBeginPass>(&op)) {
         pass = b;
         subpass = 0;
+        rpDump(*b, rec.ops, opIx, device ? device->submits + 1 : 0);
         vpgpu::RenderPassDesc desc;
         pendingResolves.clear();
         fovSuppressed = false;
@@ -1555,6 +1640,17 @@ struct Translator {
       static std::atomic<unsigned> n{0};
       if (n.fetch_add(1) < 6)
         logf("vk.taa uimask skipped_pass why=no_free_slot_or_color samples=%u", unsigned(samples));
+      return;
+    }
+    // The game's own MSAA pass that continues the pass before it (same colour 0 and depth, depth Loaded: a later subpass,
+    // or the second part of a split pass). The mask would be an attachment the pass it continues does not have, so the frame compiler could
+    // not merge the two and every sample would go through memory between them (store + load of 4x colour and depth:
+    // Into the Radius 2, 2784x2260x2, ~900 MiB per frame). Such a pass keeps the game's attachments and has no mask
+    // (RCAS then also sharpens its UI/translucent pixels). Forced MSAA twins are seeded, not loaded: unaffected.
+    if (!forceN && samples > 1 && desc.depth.texture && desc.depth.load == vpgpu::LoadAction::Load &&
+        desc.colors[0].texture == lastColor0 && desc.depth.texture == lastDepth) {
+      static std::atomic<unsigned> n{0};
+      if (n.fetch_add(1) < 6) logf("vk.taa uimask skipped_pass why=msaa_continuation samples=%u", unsigned(samples));
       return;
     }
     const uint32_t slotIx = um->maskedPasses++ & 1u;

@@ -6705,6 +6705,27 @@ void testTaaUiMask() {
           CHECK(mk.load == vpgpu::LoadAction::Clear && mk.store == vpgpu::StoreAction::Resolve && mk.resolve == t.tex);
           CHECK(dev->uiMask.live[0].valid && dev->uiMask.live[0].t.tex == t.tex);
         }
+        // The game's MSAA scene in two passes over the same colour and depth (the second Loads the depth: a later subpass,
+        // Into the Radius 2): the UI pass gets no mask, so the frame compiler can merge it with the pass it continues and the
+        // samples stay on tile. With another depth it is no continuation and keeps its mask.
+        for (int other = 0; other < 2; ++other) {
+          vpgpu::TextureId dep2 = dep;
+          if (other) dep2.index = 13;
+          Recorder rec2;
+          OpBeginRendering first = scene, second = scene;
+          second.desc.depth.texture = dep2, second.desc.depth.load = vpgpu::LoadAction::Load;
+          rec2.ops.emplace_back(first), rec2.ops.emplace_back(opq), rec2.ops.emplace_back(OpEndPass{});
+          rec2.ops.emplace_back(second), rec2.ops.emplace_back(gls), rec2.ops.emplace_back(OpEndPass{});
+          vpgpu::Frame f5;
+          TranslateStats st5;
+          dev->uiMask.maskedPasses = 0;
+          translate(rec2, f5, st5, &j64, &dev->uiMask);
+          const auto* a5 = f5.commands().size() < 2 ? nullptr : std::get_if<vpgpu::RenderPass>(&f5.commands()[0]);
+          const auto* b5 = f5.commands().size() < 2 ? nullptr : std::get_if<vpgpu::RenderPass>(&f5.commands()[1]);
+          CHECK(a5 && b5 && !a5->desc.colors[taa::kUiMaskSlot].texture);
+          CHECK(b5 && bool(b5->desc.colors[taa::kUiMaskSlot].texture) == (other == 1));
+          CHECK(st5.ui.maskedPasses == (other ? 1u : 0u));
+        }
       }
       vkDestroyCommandPool(c.dev, cp, nullptr);
     }
