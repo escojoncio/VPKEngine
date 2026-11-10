@@ -2291,6 +2291,228 @@ void depthPartnerRetroClear() {
     if (failures) f.dump();
 }
 
+// The same at one sample (no multisampled depth target): a depth-only draw of the depth that an earlier colour pass was drawn with
+// keeps that colour attached, unwritten, so the prepass and the opaque pass are one render pass. The colour is loaded and stored as
+// any attachment (no samples to keep: no autoMsaa, no kept samples). Learned from the first colour draw; a depth of another size has
+// no partner; a clear of the colour that comes before any draw wrote it is the pass's load action; a guest resolve, a depth clear
+// of the whole target and a colour written first still cut. VPKENGINE_DEPTH_ONLY_SPLIT=1: split as before (any other value: not).
+vpps4::DrawState depthOnly1x(Fixture& f, uint32_t size = 128) {
+    vpps4::DrawState d = f.depthState(true);
+    d.color[0] = {};
+    d.ps = {};
+    d.depth.width = d.depth.height = size;
+    return d;
+}
+std::vector<const vpgpu::RenderPass*> passesFrom(Fixture& f, size_t from) {
+    std::vector<const vpgpu::RenderPass*> out;
+    for (size_t i = from; i < f.backend.commands.size(); ++i)
+        if (const auto* rp = std::get_if<vpgpu::RenderPass>(&f.backend.commands[i])) out.push_back(rp);
+    return out;
+}
+void depthPartner1x() {
+    ProbeOn probe;
+    for (const char* mode : {"", "0", "1"}) {
+        const bool off = mode[0] == '1';
+        if (mode[0]) setenv("VPKENGINE_DEPTH_ONLY_SPLIT", mode, 1);
+        // Prepass, opaque pass and a later depth-only draw of the frame.
+        Fixture f;
+        f.renderer.setMaxSamples(1);
+        auto frame = [&] {
+            f.renderer.draw(depthOnly1x(f));
+            f.renderer.draw(depthOnly1x(f));
+            f.renderer.draw(f.depthState(true));
+            f.renderer.draw(f.depthState(true));
+            f.renderer.draw(depthOnly1x(f));
+            f.renderer.submit();
+        };
+        size_t from = f.backend.commands.size();
+        frame();  // (learning: the depth-only pass, the colour pass; the late depth-only draw joins it, or cuts again)
+        auto learn = passesFrom(f, from);
+        CHECK(learn.size() == (off ? 3u : 2u));
+        from = f.backend.commands.size();
+        frame();
+        const auto merged = passesFrom(f, from);
+        CHECK(merged.size() == (off ? 3u : 1u));
+        if (!off && merged.size() == 1) {
+            const vpgpu::Attachment& c = merged[0]->desc.colors[0];
+            CHECK(merged[0]->draws.size() == 5);
+            CHECK(c.texture && learn.size() == 2 && c.texture == learn[1]->desc.colors[0].texture);  // (the colour the opaque draws write)
+            CHECK(c.load == vpgpu::LoadAction::Load && c.store == vpgpu::StoreAction::Store);
+            CHECK(!c.autoMsaa && !c.keepSamples && !c.resolve && merged[0]->desc.samples == 1);
+            CHECK(merged[0]->desc.depth.texture && merged[0]->desc.depth.load == vpgpu::LoadAction::Load);
+        }
+        size_t withColour = 0, written = 0;  // the depth-only states that have the colour format / the states that write it
+        vpgpu::Format colourFormat = vpgpu::Format::Undefined;
+        for (const vpgpu::PipelineState& st : f.backend.pipelines) {
+            if (!st.fragmentShader && st.depthFormat != vpgpu::Format::Undefined && st.colorFormats[0] != vpgpu::Format::Undefined) {
+                ++withColour;
+                colourFormat = st.colorFormats[0];
+                CHECK(st.blend[0].writeMask == 0 && !st.blend[0].enabled && st.samples == 1);
+            } else if (st.fragmentShader && st.blend[0].writeMask != 0) {
+                ++written;
+            }
+        }
+        CHECK(withColour == (off ? 0u : 1u) && written >= 1);
+        CHECK(rate(f, "depth_partner_draws") == (off ? 0u : 4u));  // (the late one of the learning frame, and three of this one)
+        if (!off) {  // (the format of the partner is the one the opaque draws write)
+            for (const vpgpu::PipelineState& st : f.backend.pipelines)
+                if (st.fragmentShader && st.depthFormat != vpgpu::Format::Undefined) CHECK(st.colorFormats[0] == colourFormat);
+        }
+        // A depth of another size at the same address: not the depth the colour was drawn with. Neither is a pass that never
+        // gets its opaque draws: the colour stays attached, loaded and stored unchanged.
+        from = f.backend.commands.size();
+        f.renderer.draw(depthOnly1x(f, 64));
+        f.renderer.submit();
+        auto other = passesFrom(f, from);
+        CHECK(other.size() == 1 && !other[0]->desc.colors[0].texture);
+        from = f.backend.commands.size();
+        f.renderer.draw(depthOnly1x(f));
+        f.renderer.submit();
+        auto alone = passesFrom(f, from);
+        CHECK(alone.size() == 1 && alone[0]->draws.size() == 1);
+        if (!off && alone.size() == 1)
+            CHECK(alone[0]->desc.colors[0].texture && alone[0]->desc.colors[0].load == vpgpu::LoadAction::Load &&
+                  alone[0]->desc.colors[0].store == vpgpu::StoreAction::Store);
+        if (failures) f.dump();
+        if (mode[0]) unsetenv("VPKENGINE_DEPTH_ONLY_SPLIT");
+    }
+    // A fast clear of the colour that comes while the open pass holds it unwritten (the partner) is the pass's load action; one that
+    // comes after a draw wrote it cuts.
+    {
+        Fixture f;
+        f.renderer.setMaxSamples(1);
+        f.renderer.draw(f.depthState(true));  // (learns the partner)
+        f.renderer.submit();
+        auto clear = [&] {
+            vpps4::DrawState c = f.state();
+            c.primitive = vpps4::PrimitiveType::RectList;
+            c.color[0].fastClear = true;
+            c.color[0].clearWord = {0xff204080u, 0};
+            f.renderer.draw(c);
+        };
+        size_t from = f.backend.commands.size();
+        f.renderer.draw(depthOnly1x(f));
+        clear();
+        f.renderer.draw(f.depthState(true));
+        f.renderer.submit();
+        auto passes = passesFrom(f, from);
+        CHECK(passes.size() == 1 && passes[0]->draws.size() == 2);
+        if (passes.size() == 1) {
+            CHECK(passes[0]->desc.colors[0].load == vpgpu::LoadAction::Clear);
+            CHECK(std::abs(passes[0]->desc.colors[0].clear.color[0] - 128.0 / 255) < 1e-9);
+        }
+        CHECK(rate(f, "depth_partner_retro_clears") == 1);
+        from = f.backend.commands.size();
+        f.renderer.draw(depthOnly1x(f));
+        f.renderer.draw(f.depthState(true));
+        clear();
+        f.renderer.draw(f.depthState(true));
+        f.renderer.submit();
+        CHECK(passesFrom(f, from).size() == 2);
+        CHECK(rate(f, "depth_partner_retro_clears") == 1);
+        if (failures) f.dump();
+    }
+    // A depth clear: by the depth-only draw itself it is the load action of the one pass; a whole-target clear (rectangle) cuts
+    // the pass and is the load action of the next one, which keeps the colour all the same.
+    {
+        Fixture f;
+        f.renderer.setMaxSamples(1);
+        f.renderer.draw(f.depthState(true));
+        f.renderer.submit();
+        size_t from = f.backend.commands.size();
+        vpps4::DrawState c = depthOnly1x(f);
+        c.depth.depthClear = true;
+        f.renderer.draw(c);
+        f.renderer.draw(f.depthState(true));
+        f.renderer.submit();
+        auto passes = passesFrom(f, from);
+        CHECK(passes.size() == 1 && passes[0]->draws.size() == 2);
+        if (passes.size() == 1)
+            CHECK(passes[0]->desc.depth.load == vpgpu::LoadAction::Clear && passes[0]->desc.colors[0].texture &&
+                  passes[0]->desc.colors[0].load == vpgpu::LoadAction::Load);
+        from = f.backend.commands.size();
+        f.renderer.draw(depthOnly1x(f));
+        vpps4::DrawState r = depthOnly1x(f);
+        r.primitive = vpps4::PrimitiveType::RectList;
+        r.depth.depthClear = true;
+        f.renderer.draw(r);
+        f.renderer.draw(depthOnly1x(f));
+        f.renderer.draw(f.depthState(true));
+        f.renderer.submit();
+        passes = passesFrom(f, from);
+        CHECK(passes.size() == 2);
+        if (passes.size() == 2) {
+            CHECK(passes[1]->draws.size() == 2 && passes[1]->desc.depth.load == vpgpu::LoadAction::Clear);
+            CHECK(passes[1]->desc.colors[0].texture && passes[1]->desc.colors[0].load == vpgpu::LoadAction::Load);
+        }
+        if (failures) f.dump();
+    }
+    // The colour of the last opaque draw is the partner (another format at the same depth), and a guest resolve of the colour
+    // between the prepass and the opaque pass cuts them.
+    {
+        Fixture f;
+        f.renderer.setMaxSamples(1);
+        f.renderer.draw(f.depthState(true));
+        vpps4::DrawState b = f.depthState(true);
+        b.color[0].format = 5;  // 16_16 unorm
+        f.renderer.draw(b);
+        f.renderer.submit();
+        size_t from = f.backend.commands.size();
+        f.renderer.draw(depthOnly1x(f));
+        f.renderer.draw(b);
+        f.renderer.submit();
+        CHECK(passesFrom(f, from).size() == 1);
+        vpgpu::Format partnerFormat = vpgpu::Format::Undefined, wrote = vpgpu::Format::Undefined, first = vpgpu::Format::Undefined;
+        for (const vpgpu::PipelineState& st : f.backend.pipelines) {
+            if (!st.fragmentShader) partnerFormat = st.colorFormats[0];
+            else if (first == vpgpu::Format::Undefined) first = st.colorFormats[0];
+            else wrote = st.colorFormats[0];
+        }
+        CHECK(partnerFormat != vpgpu::Format::Undefined && partnerFormat == wrote && wrote != first);
+        from = f.backend.commands.size();
+        f.renderer.draw(depthOnly1x(f));
+        vpps4::ColorTarget src = b.color[0], dst = src;
+        dst.address = kBase + 0x70000;
+        f.renderer.resolve(src, dst);
+        f.renderer.draw(b);
+        f.renderer.submit();
+        CHECK(passesFrom(f, from).size() == 2);
+        if (failures) f.dump();
+    }
+    // Both eyes as layers of one pair of two-slice targets, foveated: the depth-only draw gets the rate map and both layers of the
+    // pass of the opaque draws (else it could not join it). Another eye (other targets) is another pass, not mixed in.
+    for (const bool fov : {false, true}) {
+        Fixture f;
+        f.renderer.setMaxSamples(1);
+        f.renderer.setFoveation(fov);
+        const uint64_t colour2 = kBase + 0xb0000, depth2 = kBase + 0x90000;  // (not adjacent: the tracker would see one span)
+        auto eye = [&](bool second, bool depthOnly) {
+            vpps4::DrawState d = f.depthState(true);
+            d.color[0].sliceCount = 2;
+            d.depth.sliceCount = 2;
+            if (second) d.color[0].address = colour2, d.depth.zAddress = depth2;
+            if (depthOnly) d.color[0] = {}, d.ps = {};
+            return d;
+        };
+        for (int n = 0; n < 2; ++n) {  // (the first frame learns)
+            const size_t from = f.backend.commands.size();
+            for (const bool second : {false, true}) {
+                f.renderer.draw(eye(second, true));
+                f.renderer.draw(eye(second, false));
+            }
+            f.renderer.submit();
+            const auto passes = passesFrom(f, from);
+            CHECK(passes.size() == (n == 0 ? 4u : 2u));
+            if (n == 1 && passes.size() == 2)
+                for (const vpgpu::RenderPass* rp : passes) {
+                    CHECK(rp->draws.size() == 2 && rp->desc.colors[0].texture);
+                    CHECK((rp->desc.rateMap != nullptr) == fov && rp->desc.layerCount == (fov ? 2u : 1u));
+                }
+        }
+        if (failures) f.dump();
+    }
+}
+
 // A one-sample pass (one-fragment colour target) that binds a multisampled depth surface the scene was drawn into tests against that
 // surface's single-sample picture: the multisampled pass resolves into it and the one-sample pass attaches it, no depth of its own
 // is made at that address. VPKENGINE_DEPTH_1X_SEPARATE=1: a depth of its own (before).
@@ -3486,6 +3708,7 @@ int main(int argc, char** argv) {
     else if (t == "depth_only_keeps_partner") depthOnlyKeepsPartner();
     else if (t == "a2m_unwritten_colour") a2mUnwrittenColour();
     else if (t == "depth_partner_retro_clear") depthPartnerRetroClear();
+    else if (t == "depth_partner_1x") depthPartner1x();
     else if (t == "depth_1x_shares_ms") depth1xSharesMs();
     else if (t == "msaa_colour_on_tile") msaaColourOnTile();
     else if (t == "msaa_colour_cut_keeps_samples") msaaColourCutKeepsSamples();
