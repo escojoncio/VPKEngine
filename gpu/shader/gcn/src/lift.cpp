@@ -2537,15 +2537,6 @@ struct Lifter {
         return b->loadVar(t);
     }
 
-    // VPGCN_FETCH_GUARDS=1: the loads that read a wide or typed access guard each dword with its own `if`, as before.
-    static bool perDwordFetchGuards() {
-        static const bool on = [] {
-            const char* e = std::getenv("VPGCN_FETCH_GUARDS");
-            return e && e[0] == '1';
-        }();
-        return on;
-    }
-
     // Typed load: `n` components of format dfmt/nfmt at addr -> f32/u32 bit patterns. The element
     // is read as dwords (sub-dword elements from the dword that holds them) and converted by
     // FormatEmitter (vpgcn/formats.h: every data x number format).
@@ -2719,8 +2710,9 @@ struct Lifter {
                 b->end();
                 for (unsigned k = 0; k < n; ++k) vals.push_back(b->loadVar(tmp[k]));
             } else {
-                // Out of range reads address 0 of the buffer (the host binds at least a zero page there) and the select
-                // gives 0: no branch, so the reads of the components can overlap.
+                // Out of range reads address 0 of the buffer and the select gives 0: no branch, so the reads of the components
+                // can overlap. (Only a null / unmapped V# is bound to 64 KiB of zeros; a mapped V# with fewer than 16 bytes of
+                // range can make that read leave the bound buffer: its value is dropped by the select.)
                 std::vector<ValueId> got = loadFormat(slot, sel(ok, addr, u(0), U), dfmt, nfmt, n);
                 for (unsigned k = 0; k < n; ++k) vals.push_back(sel(ok, got[k], u(0), U));
             }
@@ -2744,7 +2736,8 @@ struct Lifter {
                 // One check for the whole access (first and last dword, and that the last address did not wrap past 2^32:
                 // then every dword in between is in range too). Inside: the loads in one block, none guarded. Else dword by
                 // dword: out of range reads 0, a dword inside the records keeps its data (the loads there read address 0
-                // when out of range and the select drops them).
+                // when out of range, which for a mapped V# with fewer than 16 bytes of range can leave the bound buffer;
+                // the select drops the value).
                 ValueId whole = bin(V::Op::And, bufferInRange(ba, 0), bufferInRange(ba, 4 * (dw - 1)), V::kBool);
                 if (ba.hi == V::kNoValue)
                     whole = bin(V::Op::And, whole, bin(V::Op::Ge, bin(V::Op::Add, ba.addr, u(4 * (dw - 1)), U), ba.addr, V::kBool), V::kBool);
@@ -5515,6 +5508,14 @@ LiftResult liftWith(const LiftInput& input, bool wave, bool& wants) {
 // A first pass in the per-lane model; when it met something that needs a real wave (cross-lane reads, lane masks as
 // data) and the workgroup is a single wave (compute, up to 64 invocations), the program is lifted again in wave
 // mode. The wave-mode result is used when it lifts without errors.
+bool perDwordFetchGuards() {
+    static const bool on = [] {
+        const char* e = std::getenv("VPGCN_FETCH_GUARDS");
+        return e && e[0] == '1';
+    }();
+    return on;
+}
+
 LiftResult lift(const LiftInput& input) {
     bool wants = false;
     LiftResult out = liftWith(input, false, wants);

@@ -2107,6 +2107,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
             }
         h.value(viewIndexedNow && stage != vpgcn::ShaderStage::Compute);
         h.value(alphaTestNow && stage == vpgcn::ShaderStage::Pixel);
+        if (vpgcn::perDwordFetchGuards()) h.value(uint8_t(1));  // (VPGCN_FETCH_GUARDS=1 lifts differently; unset: the keys as before)
         const uint64_t key2 = h.h;
         auto it2 = translated.find(key2);
         if (it2 != translated.end()) {
