@@ -4036,9 +4036,9 @@ void testTexHist() {
   vkBeginCommandBuffer(cb, &bi);
   VkDeviceMemory mem = alloc(c, 1 << 20, 1);
   VkBuffer staging = buffer(c, 64 * 64 * 4, mem, 0);
-  auto make = [&](VkFormat f, uint32_t mips, VkImageUsageFlags usage) {
+  auto make = [&](VkFormat f, uint32_t mips, VkImageUsageFlags usage, uint32_t side = 64) {
     VkImageCreateInfo ii{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
-    ii.imageType = VK_IMAGE_TYPE_2D, ii.format = f, ii.extent = {64, 64, 1}, ii.mipLevels = mips, ii.arrayLayers = 1;
+    ii.imageType = VK_IMAGE_TYPE_2D, ii.format = f, ii.extent = {side, side / 2, 1}, ii.mipLevels = mips, ii.arrayLayers = 1;
     ii.samples = VK_SAMPLE_COUNT_1_BIT, ii.tiling = VK_IMAGE_TILING_OPTIMAL, ii.usage = usage;
     VkImage i = VK_NULL_HANDLE;
     CHECK(vkCreateImage(c.dev, &ii, nullptr, &i) == VK_SUCCESS);
@@ -4047,7 +4047,7 @@ void testTexHist() {
   auto upload = [&](VkImage im, uint32_t mip) {
     VkBufferImageCopy r{};
     r.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, mip, 0, 1};
-    r.imageExtent = {std::max(1u, 64u >> mip), std::max(1u, 64u >> mip), 1};
+    r.imageExtent = {std::max(1u, 64u >> mip), std::max(1u, 32u >> mip), 1};
     vkCmdCopyBufferToImage(cb, staging, im, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &r);
   };
   const VkImageUsageFlags tex = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
@@ -4071,10 +4071,65 @@ void testTexHist() {
   const std::string line = texHistFormat(a);
   CHECK(line.find("sampled=4 | m0 n=1 ") == 0 && line.find(" | m6p n=1 ") != std::string::npos);
   CHECK(line.find(" | partial=1 top0_unwritten=1 | rt n=1 ") != std::string::npos);
-  // The registry the tick walks holds these images: forced, the tick prints the line (it is 5 s apart otherwise).
+  // top{}: the same images by the larger side of level 0 (attachments apart): four of 64, and one of 2048 in an accumulator of its own.
+  CHECK(line.find(" | top{64=4,128=0,256=0,512=0,1024=0,2048p=0}") + std::strlen(" | top{64=4,128=0,256=0,512=0,1024=0,2048p=0}") == line.size());
+  VkImage big = make(VK_FORMAT_ASTC_4x4_UNORM_BLOCK, 12, tex, 2048), edge = make(VK_FORMAT_R8G8B8A8_UNORM, 1, tex, 1024);
+  TexHistAcc a2;
+  texHistAdd(a2, *from<Image>(big)), texHistAdd(a2, *from<Image>(edge));
+  CHECK(a2.top[5] == 1 && a2.top[4] == 1 && texHistFormat(a2).find(" | top{64=0,128=0,256=0,512=0,1024=1,2048p=1}") != std::string::npos);
+  // The registry the tick walks holds these images: forced, the tick prints the line (it is 5 s apart otherwise), with the
+  // sampled non-attachment images created and destroyed since the previous line (here the 6 made above, none destroyed).
   const std::string tick = captureStderr([] { texHistTick(true); });
-  CHECK(countOf(tick, "vk.tex_hist t=") == 1);
-  for (VkImage im : {astcFull, low, mid, none, rt, notSampled}) vkDestroyImage(c.dev, im, nullptr);
+  CHECK(countOf(tick, "vk.tex_hist t=") == 1 && tick.find("2048p=1} | new=6 gone=0\n") != std::string::npos);
+  CHECK(captureStderr([] { texHistTick(true); }).empty());  // nothing moved: no line
+  vkDestroyImage(c.dev, big, nullptr);
+  vkDestroyImage(c.dev, rt, nullptr);  // (an attachment: not one of them)
+  const std::string tick2 = captureStderr([] { texHistTick(true); });
+  CHECK(countOf(tick2, "vk.tex_hist t=") == 1 && tick2.find("2048p=0} | new=0 gone=1\n") != std::string::npos);
+  rt = make(VK_FORMAT_R8G8B8A8_UNORM, 1, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT);
+
+  // --- vk.mem_seen: what the game is told about memory, once per question (the heaps; the budget when it asks for it).
+  VkPhysicalDeviceMemoryProperties mp{};
+  const std::string heaps = captureStderr([&] {
+    vkGetPhysicalDeviceMemoryProperties(c.pd, &mp);
+    vkGetPhysicalDeviceMemoryProperties(c.pd, &mp);
+  });
+  CHECK(heaps == "vk.mem_seen heaps=1 heap0=6442450944 heap0_flags=0x1 types=4\n");
+  VkPhysicalDeviceMemoryBudgetPropertiesEXT bud{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT};
+  VkPhysicalDeviceMemoryProperties2 mp2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2, &bud};
+  const std::string budget = captureStderr([&] {
+    vkGetPhysicalDeviceMemoryProperties2(c.pd, &mp2);
+    vkGetPhysicalDeviceMemoryProperties2(c.pd, &mp2);
+  });
+  char wantBudget[160];
+  std::snprintf(wantBudget, sizeof wantBudget, "vk.mem_seen budget_asked=1 filled=1 budget0=%llu usage0=%llu heap0=6442450944\n",
+                (unsigned long long)bud.heapBudget[0], (unsigned long long)bud.heapUsage[0]);
+  CHECK(budget == wantBudget && bud.heapBudget[0] > 0);
+
+  // --- vk.memreq: the size and alignment told for an image, once per distinct shape, through the three calls that answer it.
+  VkMemoryRequirements mr{};
+  VkMemoryRequirements2 mr2{VK_STRUCTURE_TYPE_MEMORY_REQUIREMENTS_2};
+  VkImageMemoryRequirementsInfo2 mri{VK_STRUCTURE_TYPE_IMAGE_MEMORY_REQUIREMENTS_INFO_2, nullptr, mid};
+  VkImageCreateInfo di{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+  di.imageType = VK_IMAGE_TYPE_2D, di.format = VK_FORMAT_R8G8B8A8_UNORM, di.extent = {128, 128, 1}, di.mipLevels = 8, di.arrayLayers = 2;
+  di.samples = VK_SAMPLE_COUNT_1_BIT, di.tiling = VK_IMAGE_TILING_OPTIMAL, di.usage = tex;
+  VkDeviceImageMemoryRequirements dq{VK_STRUCTURE_TYPE_DEVICE_IMAGE_MEMORY_REQUIREMENTS, nullptr, &di, VK_IMAGE_ASPECT_COLOR_BIT};
+  const auto devReq = reinterpret_cast<PFN_vkGetDeviceImageMemoryRequirements>(vkGetDeviceProcAddr(c.dev, "vkGetDeviceImageMemoryRequirements"));
+  CHECK(devReq != nullptr);
+  const std::string req = captureStderr([&] {
+    vkGetImageMemoryRequirements2(c.dev, &mri, &mr2);
+    if (devReq) devReq(c.dev, &dq, &mr2), devReq(c.dev, &dq, &mr2);
+    vkGetImageMemoryRequirements(c.dev, astcFull, &mr);
+    vkGetImageMemoryRequirements(c.dev, low, &mr);
+    vkGetImageMemoryRequirements(c.dev, low, &mr);
+  });
+  char wantReq[160];
+  std::snprintf(wantReq, sizeof wantReq, "vk.memreq fmt=37 64x32x1 mips=5 layers=1 samples=1 usage=0x6 size=%llu align=256\n",
+                (unsigned long long)mr.size);
+  CHECK(countOf(req, "vk.memreq fmt=") == 4 && req.find(wantReq) != std::string::npos && mr.size > 0);
+  CHECK(req.find("vk.memreq fmt=37 64x32x1 mips=4 layers=1 ") == 0 && req.find("vk.memreq fmt=37 128x128x1 mips=8 layers=2 ") != std::string::npos);
+  CHECK(req.find("vk.memreq fmt=157 64x32x1 mips=6 layers=1 samples=1 usage=0x6 size=") != std::string::npos);
+  for (VkImage im : {astcFull, low, mid, none, rt, notSampled, edge}) vkDestroyImage(c.dev, im, nullptr);
   vkDestroyCommandPool(c.dev, pool, nullptr);
   vkFreeMemory(c.dev, mem, nullptr);
 }
@@ -4410,7 +4465,7 @@ void testImages() {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Fixture for tests that record draws: a 64x64 colour + D32S8 pass, our trivial position/solid
+// Fixture for tests that record draws: a 64x64 (or `size`) colour + D32S8 pass, our trivial position/solid
 // shaders (shader/spirv/tests/*.spvasm), and a command buffer inside the pass.
 // ---------------------------------------------------------------------------------------------
 struct DrawRig {
@@ -4422,10 +4477,10 @@ struct DrawRig {
   VkFramebuffer fb = VK_NULL_HANDLE;
   VkCommandPool cp = VK_NULL_HANDLE;
   VkCommandBuffer cb = VK_NULL_HANDLE;
-  explicit DrawRig(Ctx& ctx) : c(ctx) {
-    m = alloc(c, 8 << 20, 0);
-    color = image(c, VK_FORMAT_R8G8B8A8_UNORM, 64, 1, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT, m);
-    depth = image(c, VK_FORMAT_D32_SFLOAT_S8_UINT, 64, 1, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT, m);
+  explicit DrawRig(Ctx& ctx, uint32_t size = 64) : c(ctx) {
+    m = alloc(c, std::max<VkDeviceSize>(8 << 20, VkDeviceSize(size) * size * 8), 0);
+    color = image(c, VK_FORMAT_R8G8B8A8_UNORM, size, 1, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT, m);
+    depth = image(c, VK_FORMAT_D32_SFLOAT_S8_UINT, size, 1, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT, m);
     const VkFormat fm[2] = {VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_D32_SFLOAT_S8_UINT};
     const VkImage im[2] = {color, depth};
     for (int i = 0; i < 2; ++i) {
@@ -4449,7 +4504,7 @@ struct DrawRig {
     rpi.attachmentCount = 2, rpi.pAttachments = att, rpi.subpassCount = 1, rpi.pSubpasses = &sp;
     vkCreateRenderPass(c.dev, &rpi, nullptr, &rp);
     VkFramebufferCreateInfo fi{VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO};
-    fi.renderPass = rp, fi.attachmentCount = 2, fi.pAttachments = views, fi.width = 64, fi.height = 64, fi.layers = 1;
+    fi.renderPass = rp, fi.attachmentCount = 2, fi.pAttachments = views, fi.width = size, fi.height = size, fi.layers = 1;
     vkCreateFramebuffer(c.dev, &fi, nullptr, &fb);
     VkCommandPoolCreateInfo cpi{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
     vkCreateCommandPool(c.dev, &cpi, nullptr, &cp);
@@ -9500,14 +9555,31 @@ void testSkipReasons() {
     rig.finish(f4, s4);
     CHECK(ipc.indirectDraws - draws0 == 5 && ipc.indirectCountDraws - countDraws0 == 2);
     CHECK(ipc.indirectCpuReadable - readable0 == 3 && ipc.indirectNotReadable - unread0 == 2 && ipc.indirectOverCap - over0 == 3);
+    // scanned / zero_inst: the records looked at and those with instanceCount 0 (a draw the game culled: nothing is drawn).
+    const uint64_t scanned0 = ipc.indirectScanned.load(), zero0 = ipc.indirectZeroInst.load();
+    ap = nullptr;
+    CHECK(vkMapMemory(c.dev, am, 0, VK_WHOLE_SIZE, 0, &ap) == VK_SUCCESS);
+    const uint32_t zrec[3][4] = {{3, 0, 0, 0}, {3, 1, 0, 0}, {6, 0, 0, 0}};
+    std::memcpy(ap, zrec, sizeof zrec);
+    vkUnmapMemory(c.dev, am);
+    rig.begin();
+    vkCmdBindPipeline(rig.cb, VK_PIPELINE_BIND_POINT_GRAPHICS, scissored);
+    vkCmdSetScissor(rig.cb, 0, 1, &fine);
+    vkCmdDrawIndirect(rig.cb, ab, 0, 3, 16);
+    vpgpu::Frame f5;
+    TranslateStats s5;
+    CHECK(rig.finish(f5, s5).size() == 1);
+    CHECK(ipc.indirectScanned - scanned0 == 3 && ipc.indirectZeroInst - zero0 == 2 && scanned0 >= 8);
     // The line: cumulative values, every 5 s, only when a draw was recorded since the previous one, 720 lines at most.
     const std::string body = indirectStatsLine(ipc);
     char want[256];
     std::snprintf(want, sizeof want,
-                  "draws=%llu count_variants=%llu max_count=2147483647 max_instances=2147483647 cpu_readable=%llu not_readable=%llu over_cap_seen=%llu",
+                  "draws=%llu count_variants=%llu max_count=2147483647 max_instances=2147483647 cpu_readable=%llu not_readable=%llu over_cap_seen=%llu "
+                  "scanned=%llu zero_inst=%llu",
                   (unsigned long long)ipc.indirectDraws.load(), (unsigned long long)ipc.indirectCountDraws.load(),
                   (unsigned long long)ipc.indirectCpuReadable.load(), (unsigned long long)ipc.indirectNotReadable.load(),
-                  (unsigned long long)ipc.indirectOverCap.load());
+                  (unsigned long long)ipc.indirectOverCap.load(), (unsigned long long)ipc.indirectScanned.load(),
+                  (unsigned long long)ipc.indirectZeroInst.load());
     CHECK(body == want);
     const std::string first = captureStderr([&] { indirectStatsLog(10'000'000'000LL); });
     CHECK(first == "vk.indirect_stats " + body + "\n");
@@ -9606,6 +9678,122 @@ void testSkipReasons() {
 // (vk.indirect_patch) is dispatched before the pass begins, requested when the device is created, never silently skipped; a kernel that
 // is not there sends the draw to the CPU path (counted, logged), and a draw-count draw, which has none, is skipped with a reason.
 // indirectPatchRef mirrors the kernel's MSL (vp_main): the expected vectors are the multiview doubling and the garbage-count guard.
+// vk.draw_census (one line per pipeline and subpass the first time it is drawn in a pass 1024 wide or more), vk.pso.census
+// drawn= / dispatched=, and vk.comp_census (one line per compute pipeline at its first dispatch).
+void testDiagCensus() {
+  Ctx c;
+  DrawRig big(c, 1024), small(c);
+  VkShaderModule vs = module(c, "pos.vert.spv"), fs = module(c, "solid.frag.spv");
+  VkPipelineLayoutCreateInfo plci{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+  VkPipelineLayout pl;
+  vkCreatePipelineLayout(c.dev, &plci, nullptr, &pl);
+  PipeOpts plain, back;
+  back.cull = VK_CULL_MODE_BACK_BIT;
+  VkPipeline p1 = makePosPipeline(c, big, pl, plain, vs, fs), p2 = makePosPipeline(c, big, pl, back, vs, fs);
+  CHECK(from<PipelineObj>(p1)->ok && from<PipelineObj>(p2)->ok);
+  c.gpu().pipelines().waitIdle();
+  PipelineCounters& pc = pipelineCounters();
+  const uint64_t drawn0 = pc.pipelinesDrawn.load(), disp0 = pc.pipelinesDispatched.load();
+  // A pass under 1024: the pipeline counts as drawn, without a line.
+  small.begin();
+  vkCmdBindPipeline(small.cb, VK_PIPELINE_BIND_POINT_GRAPHICS, p2);
+  const std::string quiet = captureStderr([&] { vkCmdDraw(small.cb, 3, 1, 0, 0); });
+  vpgpu::Frame f0;
+  TranslateStats s0;
+  small.finish(f0, s0);
+  CHECK(quiet.find("vk.draw_census") == std::string::npos && pc.pipelinesDrawn - drawn0 == 1);
+  // The large pass: one line per pipeline at its first draw there (p2 was drawn before, but not in a large pass).
+  big.begin();
+  const std::string lines = captureStderr([&] {
+    vkCmdBindPipeline(big.cb, VK_PIPELINE_BIND_POINT_GRAPHICS, p1);
+    vkCmdDraw(big.cb, 3, 1, 0, 0);
+    vkCmdDraw(big.cb, 9, 4, 0, 0);  // the same pipeline in the same subpass: nothing
+    vkCmdBindPipeline(big.cb, VK_PIPELINE_BIND_POINT_GRAPHICS, p2);
+    vkCmdDraw(big.cb, 6, 2, 0, 0);
+  });
+  vpgpu::Frame f1;
+  TranslateStats s1;
+  CHECK(big.finish(f1, s1).size() == 3);
+  CHECK(countOf(lines, "vk.draw_census key=") == 2 && countOf(lines, " cull=0 ") == 1 && countOf(lines, " cull=2 ") == 1);
+  CHECK(lines.find(" sub=0 ok=1 count=3 inst=1 indexed=0 indirect=0 vbs=1 tb=0 in_att=0 in_ms=0 fb=1024x1024x1 samples=1 stencilRef=0 ") !=
+        std::string::npos);
+  CHECK(lines.find(" sub=0 ok=1 count=6 inst=2 indexed=0 indirect=0 ") != std::string::npos && lines.find("count=9") == std::string::npos);
+  CHECK(pc.pipelinesDrawn - drawn0 == 2);
+  big.begin();  // drawn again in another frame: no line, no count
+  vkCmdBindPipeline(big.cb, VK_PIPELINE_BIND_POINT_GRAPHICS, p1);
+  CHECK(captureStderr([&] { vkCmdDraw(big.cb, 3, 1, 0, 0); }).empty());
+  vpgpu::Frame f2;
+  TranslateStats s2;
+  big.finish(f2, s2);
+  CHECK(pc.pipelinesDrawn - drawn0 == 2);
+
+  // vk.comp_census: a compute pipeline writing a storage buffer the game may also draw from (INDIRECT_BUFFER usage).
+  VkDescriptorSetLayoutBinding lb{0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
+  VkDescriptorSetLayoutCreateInfo lci{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+  lci.bindingCount = 1, lci.pBindings = &lb;
+  VkDescriptorSetLayout sl;
+  vkCreateDescriptorSetLayout(c.dev, &lci, nullptr, &sl);
+  VkPipelineLayoutCreateInfo cplci{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+  cplci.setLayoutCount = 1, cplci.pSetLayouts = &sl;
+  VkPipelineLayout cpl;
+  vkCreatePipelineLayout(c.dev, &cplci, nullptr, &cpl);
+  VkShaderModule cs = module(c, "zeroinit.comp.spv");
+  VkComputePipelineCreateInfo ci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+  ci.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+  ci.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT, ci.stage.module = cs, ci.stage.pName = "main";
+  ci.layout = cpl;
+  VkPipeline cp;
+  vkCreateComputePipelines(c.dev, VK_NULL_HANDLE, 1, &ci, nullptr, &cp);
+  CHECK(from<PipelineObj>(cp)->ok);
+  c.gpu().pipelines().waitIdle();
+  VkDeviceMemory mem = alloc(c, 1 << 16, 1);
+  VkBufferCreateInfo bi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+  bi.size = 4096, bi.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT;
+  VkBuffer buf;
+  vkCreateBuffer(c.dev, &bi, nullptr, &buf);
+  vkBindBufferMemory(c.dev, buf, mem, 0);
+  VkDescriptorPoolSize ps{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1};
+  VkDescriptorPoolCreateInfo dpi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+  dpi.maxSets = 1, dpi.poolSizeCount = 1, dpi.pPoolSizes = &ps;
+  VkDescriptorPool dp;
+  vkCreateDescriptorPool(c.dev, &dpi, nullptr, &dp);
+  VkDescriptorSetAllocateInfo dai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+  dai.descriptorPool = dp, dai.descriptorSetCount = 1, dai.pSetLayouts = &sl;
+  VkDescriptorSet ds;
+  vkAllocateDescriptorSets(c.dev, &dai, &ds);
+  VkDescriptorBufferInfo dbi{buf, 1024, VK_WHOLE_SIZE};
+  VkWriteDescriptorSet w{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+  w.dstSet = ds, w.dstBinding = 0, w.descriptorCount = 1, w.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, w.pBufferInfo = &dbi;
+  vkUpdateDescriptorSets(c.dev, 1, &w, 0, nullptr);
+  VkCommandBufferBeginInfo bgi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+  vkBeginCommandBuffer(small.cb, &bgi);
+  vkCmdBindPipeline(small.cb, VK_PIPELINE_BIND_POINT_COMPUTE, cp);
+  vkCmdBindDescriptorSets(small.cb, VK_PIPELINE_BIND_POINT_COMPUTE, cpl, 0, 1, &ds, 0, nullptr);
+  const std::string comp = captureStderr([&] {
+    vkCmdDispatch(small.cb, 2, 1, 1);
+    vkCmdDispatch(small.cb, 4, 1, 1);  // dispatched before: nothing
+  });
+  vkEndCommandBuffer(small.cb);
+  CHECK(countOf(comp, "vk.comp_census label=") == 1);
+  CHECK(comp.find(" groups=2x1x1 ok=1 bufs=1{3072wi} imgs=0{} tb=0 indirect_out=1\n") != std::string::npos);
+  CHECK(pc.pipelinesDispatched - disp0 == 1 && pc.pipelinesDrawn - drawn0 == 2);
+  // vk.pso.census carries both counts.
+  char wantCensus[96];
+  std::snprintf(wantCensus, sizeof wantCensus, " drawn=%llu dispatched=%llu", (unsigned long long)pc.pipelinesDrawn.load(),
+                (unsigned long long)pc.pipelinesDispatched.load());
+  const std::string census = psoCensusLine(pc, c.gpu().pipelines().totals(), Platform::ArchiveCensus{});
+  CHECK(census.size() > std::strlen(wantCensus) && census.compare(census.size() - std::strlen(wantCensus), std::string::npos, wantCensus) == 0);
+
+  vkDestroyDescriptorPool(c.dev, dp, nullptr);
+  vkDestroyBuffer(c.dev, buf, nullptr);
+  vkFreeMemory(c.dev, mem, nullptr);
+  for (VkPipeline p : {p1, p2, cp}) vkDestroyPipeline(c.dev, p, nullptr);
+  for (VkShaderModule m : {vs, fs, cs}) vkDestroyShaderModule(c.dev, m, nullptr);
+  vkDestroyPipelineLayout(c.dev, pl, nullptr);
+  vkDestroyPipelineLayout(c.dev, cpl, nullptr);
+  vkDestroyDescriptorSetLayout(c.dev, sl, nullptr);
+}
+
 void testIndirectPatch() {
   // The reference against known records (words: count, instances, first, base vertex, first instance), 2 views, 5 words each.
   {
@@ -13562,7 +13750,7 @@ int main(int argc, char** argv) {
       {"vertex_stores", testVertexStores}, {"profile", testProfile}, {"profile13", testProfile13}, {"quest_extras", testQuestExtras}, {"push_descriptor", testPushDescriptor}, {"report_geom", testReportGeomInterpolators}, {"pipeline_policy", testPipelinePolicy}, {"eds", testExtendedDynamicState},
       {"quest_gpu_name", testQuestGpuName}, {"native_identity", testNativeIdentity}, {"inline_uniform", testInlineUniformBlock}, {"bda", testBufferDeviceAddress}, {"ycbcr", testYcbcr},
       {"taa_native", testTaaNative}, {"taa_eye_depth", testTaaEyeDepth}, {"taa_uimask", testTaaUiMask}, {"msaa_force", testMsaaForce}, {"d24_emul", testD24Emul}, {"prewarm_variants", testPrewarmVariants}, {"msaa_force_marked", testMsaaForceMarkedEye}, {"aot", testAot}, {"aniso", testAniso}, {"zeroinit", testZeroInit}, {"archive_index", testArchiveIndex}, {"foveation", testFoveation},
-      {"stage_keys", testStageKeys}, {"async_pipelines", testAsyncPipelines}, {"sync_pipelines", testSyncPipelines}, {"create_default", testCreateDefault}, {"pso_census", testPsoCensus}, {"cache_state", testCacheState}, {"pass_drop", testPassDrop}, {"skip_reasons", testSkipReasons}, {"indirect_patch", testIndirectPatch}, {"astc3d", testAstc3d},
+      {"stage_keys", testStageKeys}, {"async_pipelines", testAsyncPipelines}, {"sync_pipelines", testSyncPipelines}, {"create_default", testCreateDefault}, {"pso_census", testPsoCensus}, {"cache_state", testCacheState}, {"pass_drop", testPassDrop}, {"skip_reasons", testSkipReasons}, {"diag_census", testDiagCensus}, {"indirect_patch", testIndirectPatch}, {"astc3d", testAstc3d},
       {"perf", testPerf}, {"phase1b", testPhase1b}, {"suspend_resume", testSuspendResume}, {"translator_modes", testTranslatorModes}, {"capture", testCapture}, {"capture_images", testCaptureImages}, {"capture_hooks", testCaptureHooks}, {"capture_codec", testCaptureCodec}, {"capture_env", testCaptureEnv}, {"capture_pools", testCapturePools}, {"capture_host_frames", testCaptureHostFrames}, {"capture_corrupt", testCaptureCorrupt}, {"capture_env_host", testCaptureEnvHost}, {"capture_env_dir", testCaptureEnvDir}, {"capture_devices", testCaptureDevices}, {"capture_unhooked", testCaptureUnhooked}, {"capture_budget", testCaptureBudget}, {"capture_locks", testCaptureLocks}, {"png", testPng}, {"imgdiff", testImgDiff}, {"replay", testReplay}, {"replay_lvp", testReplayLvp}, {"refcaps", testRefCaps}};
   bool ran = false;
   for (const auto& [name, fn] : groups) {

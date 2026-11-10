@@ -314,6 +314,7 @@ std::vector<std::string> deviceRequestLines(VkPhysicalDevice pd, const VkDeviceC
 struct TexHistAcc {
   struct Bucket { uint64_t n = 0, bytes = 0, astcN = 0, astcBytes = 0; } b[4];  // 0 mips written, 1-2, 3-5, 6+
   uint64_t sampled = 0, partial = 0, top0Missing = 0, rtN = 0, rtBytes = 0;
+  uint64_t top[6] = {};  // by the larger side of level 0 as the game created it: up to 64, 128, 256, 512, 1024, above
 };
 void texHistAdd(TexHistAcc& a, const Image& im);
 std::string texHistFormat(const TexHistAcc& a);
@@ -531,6 +532,9 @@ struct PipelineObj {
   std::atomic<bool> resolved{true};
   TranslatePool::JobPtr job;  // set once, before the object is published; kept until destroy
   bool ok = false;  // shaders translated; draws with a failed pipeline are skipped
+  // Census (pipelines.cpp drawCensus / compCensus): bit 15 = drawn or dispatched at least once; bit s = its vk.draw_census
+  // line for subpass s (7 and later share bit 7) of a pass with a framebuffer 1024 wide or more was asked for.
+  mutable std::atomic<uint16_t> census{0};
   // Synchronous creation with VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT: failOnCompile is the create
   // flag; compileRequired says the pipeline was not in the cache / recipe store, nothing was requested and the
   // vkCreate*Pipelines call deletes the object (VK_PIPELINE_COMPILE_REQUIRED).

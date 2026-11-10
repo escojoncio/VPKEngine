@@ -707,10 +707,11 @@ std::string psoCensusLine(const PipelineCounters& c, const vpgpu::PipelineStats&
   std::snprintf(b, sizeof b,
                 "created=%llu compiled=%u failed=%llu timed_out=%llu archived=%u not_archived_depth_only=%u "
                 "not_archived_other=%u archive_hits=%u compiled_in_session=%u archive_dup=%u archive_pending=%u "
-                "archive_spilled=%u archive_trim_dropped=%u compile_required=%llu",
+                "archive_spilled=%u archive_trim_dropped=%u compile_required=%llu drawn=%llu dispatched=%llu",
                 (unsigned long long)c.pipelinesCreated.load(), t.compiled, (unsigned long long)(t.failed + c.translateFailed.load()),
                 (unsigned long long)c.createTimedOut.load(), a.archived, a.depthOnly, a.other, a.hits, a.compiled, a.dup,
-                a.pending, a.spilled, a.trimDropped, (unsigned long long)(c.probeGraphics.load() + c.probeCompute.load()));
+                a.pending, a.spilled, a.trimDropped, (unsigned long long)(c.probeGraphics.load() + c.probeCompute.load()),
+                (unsigned long long)c.pipelinesDrawn.load(), (unsigned long long)c.pipelinesDispatched.load());
   return b;
 }
 
@@ -768,7 +769,8 @@ std::string RecipeUse::keysLine(const RecipeStore* recipes) const {
   return "prewarmed_unused=[" + unused + "] requested_not_prewarmed=[" + fresh + "]";
 }
 
-// created = vkCreate*Pipelines objects made; compiled / failed = the cache's backend compiles (failed also counts the
+// created = vkCreate*Pipelines objects made; drawn / dispatched = those of them a draw / dispatch was recorded with at least
+// once (graphics / compute); compiled / failed = the cache's backend compiles (failed also counts the
 // translations that never got there); timed_out = creations that came back unready after VPVK_PIPELINE_CREATE_WAIT_MS
 // (synchronous mode only: the asynchronous mode never waits). archived ... compiled_in_session: Platform::ArchiveCensus
 // (depth-only pipelines are archived in files of their own; not_archived_depth_only = those whose archive failed).
@@ -3219,6 +3221,86 @@ static bool widenIndexU8(Recorder& r, uint64_t first, uint64_t n, bool restart, 
   return true;
 }
 
+// The descriptor bound now to each slot the pipeline's shaders use (element 0 of an arrayed binding): fn(used, descriptor).
+template <typename Fn>
+static void forEachBound(const PipelineObj& p, const std::array<BoundState::Set, 8>& sets, Fn&& fn) {
+  for (const PipelineObj::Used& u : p.used) {
+    if (u.slot.set >= sets.size() || !sets[u.slot.set].set) continue;
+    const DescriptorSetObj* set = sets[u.slot.set].set;
+    for (size_t k = 0; k < set->layout->bindings.size(); ++k)
+      if (set->layout->bindings[k].binding == u.slot.binding) {
+        if (!set->slots[k].empty()) fn(u, set->slots[k][0]);
+        break;
+      }
+  }
+}
+
+// vk.draw_census: one line per (pipeline, subpass) the first time it is drawn in a pass whose framebuffer is 1024 wide or
+// more, 600 lines at most: everything a game draws into its large passes and how (state, counts, texel buffers, the input
+// attachments its shaders read and whether one bound now is multisampled). An indirect draw has no counts at record time
+// (count=1 inst=1). Sets the "drawn" bit of PipelineObj::census as well (vk.pso.census drawn=). makeDraw tests the bits
+// first: only the first draw of a pipeline in a subpass comes here.
+static void drawCensus(const Recorder& r, const PipelineObj& p, uint16_t want, bool ok, uint32_t count, uint32_t instances,
+                       bool indexed, bool indirect, unsigned stencilRef) {
+  const uint16_t had = p.census.fetch_or(want, std::memory_order_relaxed);
+  PipelineCounters& pc = pipelineCounters();
+  if (!(had & 0x8000)) pc.pipelinesDrawn.fetch_add(1, std::memory_order_relaxed);
+  if (!(want & ~had & 0xFF) || pc.drawCensusLines.fetch_add(1, std::memory_order_relaxed) >= 600) return;
+  unsigned inAtt = 0, inMs = 0;
+  forEachBound(p, r.bound.graphicsSets, [&](const PipelineObj::Used& u, const Descriptor& d) {
+    if (u.slot.type != VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT) return;
+    ++inAtt;
+    if (d.view && d.view->image && d.view->image->gameSamples > 1) inMs = 1;
+  });
+  char more[320];
+  std::snprintf(more, sizeof more,
+                "sub=%u ok=%d count=%u inst=%u indexed=%d indirect=%d vbs=%zu tb=%zu in_att=%u in_ms=%u fb=%ux%ux%u samples=%u "
+                "stencilRef=%u rawDepth=%d%d:%d cullMode=%u gameSamples=%u",
+                r.bound.subpass, int(ok), count, instances, int(indexed), int(indirect), p.vertexBuffers.size(), p.texel.size(),
+                inAtt, inMs, r.bound.fbWidth, r.bound.fbHeight, r.bound.fbLayers, unsigned(r.bound.passSamples), stencilRef,
+                int(p.rawDepth.test), int(p.rawDepth.write), int(p.rawDepth.compare), unsigned(p.cullMode), unsigned(p.gameSamples));
+  log("vk.draw_census " + vpgpu::describePipelineState(p.state, more));
+}
+
+// vk.comp_census: one line per compute pipeline the first time it is dispatched, 64 lines at most: its groups and what is
+// bound to the slots its shader uses. bufs{} lists up to 8 buffers as <bytes> with w = written by the shader and i = the
+// VkBuffer was created with INDIRECT_BUFFER usage (indirect_out counts the written ones: draw arguments made on the GPU);
+// imgs{} up to 6 images as WxHxL. An indirect dispatch has no groups at record time (1x1x1). Sets the "dispatched" bit of
+// PipelineObj::census (vk.pso.census dispatched=).
+static void compCensus(const Recorder& r, const PipelineObj& p, bool ok, uint32_t x, uint32_t y, uint32_t z) {
+  PipelineCounters& pc = pipelineCounters();
+  if (p.census.fetch_or(0x8000, std::memory_order_relaxed) & 0x8000) return;
+  pc.pipelinesDispatched.fetch_add(1, std::memory_order_relaxed);
+  if (pc.compCensusLines.fetch_add(1, std::memory_order_relaxed) >= 64) return;
+  unsigned bufs = 0, imgs = 0, indirectOut = 0;
+  std::string bl, il;
+  char b[48];
+  forEachBound(p, r.bound.computeSets, [&](const PipelineObj::Used& u, const Descriptor& d) {
+    const Buffer* buf = d.buffer ? d.buffer : d.texel ? d.texel->buffer : nullptr;
+    if (buf) {
+      const VkDeviceSize off = d.buffer ? d.offset : d.texel->offset, range = d.buffer ? d.range : d.texel->range;
+      const bool ind = (buf->usage & VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT) != 0;
+      indirectOut += u.written && ind;
+      if (bufs++ < 8) {
+        std::snprintf(b, sizeof b, "%s%llu%s%s", bl.empty() ? "" : ",",
+                      (unsigned long long)std::min<VkDeviceSize>(range, buf->size > off ? buf->size - off : 0), u.written ? "w" : "",
+                      ind ? "i" : "");
+        bl += b;
+      }
+    } else if (d.view && d.view->image) {
+      const VkImageCreateInfo& ii = d.view->image->info;
+      if (imgs++ < 6) {
+        std::snprintf(b, sizeof b, "%s%ux%ux%u%s", il.empty() ? "" : ",", ii.extent.width, ii.extent.height,
+                      std::max(ii.extent.depth, ii.arrayLayers), u.written ? "w" : "");
+        il += b;
+      }
+    }
+  });
+  logf("vk.comp_census label=%s key=%016llx groups=%ux%ux%u ok=%d bufs=%u{%s} imgs=%u{%s} tb=%zu indirect_out=%u",
+       p.state.label.c_str(), (unsigned long long)p.key.value, x, y, z, int(ok), bufs, bl.c_str(), imgs, il.c_str(), p.texel.size(),
+       indirectOut);
+}
+
 OpDraw makeDraw(Recorder& r, uint32_t first, uint32_t count, uint32_t instances, uint32_t firstInstance,
                 int32_t baseVertex, bool indexed, bool widenIndex) {
   OpDraw op;
@@ -3437,16 +3519,11 @@ OpDraw makeDraw(Recorder& r, uint32_t first, uint32_t count, uint32_t instances,
   d.frontFace = front == VK_FRONT_FACE_CLOCKWISE ? vpgpu::Winding::Clockwise : vpgpu::Winding::CounterClockwise;
   if (QueryPoolObj* q = r.bound.queryPool; q && q->device && q->device->visibility.id)
     d.visibility = vpgpu::BufferSpan{q->device->visibility.id, uint64_t(q->base + r.bound.query) * 8, 8};
-  // vk.sub_draw: every draw of a later subpass (a mobile forward pass draws decals, fog and translucency there, reading
-  // the depth of the first one), with its state: which effects the game issues and how. Armed by vkCmdNextSubpass.
-  if (r.bound.subDump) {
-    --r.bound.subDump;
-    char more[200];
-    std::snprintf(more, sizeof more, "sub=%u ok=%d count=%u inst=%u indexed=%d vbs=%zu stencilRef=%u rawDepth=%d%d:%d cullMode=%u gameSamples=%u",
-                  r.bound.subpass, int(op.ok), count, instances, int(indexed), p->vertexBuffers.size(), unsigned(d.stencilRef),
-                  int(p->rawDepth.test), int(p->rawDepth.write), int(p->rawDepth.compare), unsigned(p->cullMode), unsigned(p->gameSamples));
-    log("vk.sub_draw " + vpgpu::describePipelineState(p->state, more));
-  }
+  // vk.draw_census / vk.pso.census drawn=: the first draw of this pipeline (in this subpass of a large pass). `widenIndex`
+  // is false for the indirect draws only.
+  const uint16_t want = uint16_t(0x8000u | (r.bound.fbWidth >= 1024 ? 1u << std::min<uint32_t>(r.bound.subpass, 7) : 0u));
+  if ((p->census.load(std::memory_order_relaxed) & want) != want)
+    drawCensus(r, *p, want, op.ok, count, instances, indexed, !widenIndex, d.stencilRef);
   return op;
 }
 
@@ -3562,10 +3639,12 @@ bool indirectPatch(Device* d, vpgpu::PipelineKey& key) {
 std::string indirectStatsLine(const PipelineCounters& c) {
   char b[256];
   std::snprintf(b, sizeof b,
-                "draws=%llu count_variants=%llu max_count=%u max_instances=%u cpu_readable=%llu not_readable=%llu over_cap_seen=%llu",
+                "draws=%llu count_variants=%llu max_count=%u max_instances=%u cpu_readable=%llu not_readable=%llu over_cap_seen=%llu "
+                "scanned=%llu zero_inst=%llu",
                 (unsigned long long)c.indirectDraws.load(), (unsigned long long)c.indirectCountDraws.load(), c.indirectMaxCount.load(),
                 c.indirectMaxInstances.load(), (unsigned long long)c.indirectCpuReadable.load(),
-                (unsigned long long)c.indirectNotReadable.load(), (unsigned long long)c.indirectOverCap.load());
+                (unsigned long long)c.indirectNotReadable.load(), (unsigned long long)c.indirectOverCap.load(),
+                (unsigned long long)c.indirectScanned.load(), (unsigned long long)c.indirectZeroInst.load());
   return b;
 }
 
@@ -3588,6 +3667,7 @@ void indirectStatsLog(int64_t nowNs) {
 // vk.indirect_stats: counts the draw and looks at up to kIndirectScan of its records when they sit in host-visible memory (what the CPU path
 // would read; for a Count draw the count word must be readable too and bounds the records). Device-local buffers are only counted.
 // With arguments the GPU generates, the host-visible bytes may be what an earlier frame left: the maxima are then stale data.
+// scanned = records looked at, zero_inst = those with instanceCount 0 (a culled draw: nothing is drawn).
 static constexpr uint32_t kIndirectScan = 64;  // records looked at per command
 static void noteIndirectArgs(const Buffer* b, VkDeviceSize off, uint32_t n, uint32_t stride, bool indexed,
                              const Buffer* countBuf, VkDeviceSize countOff) {
@@ -3615,6 +3695,7 @@ static void noteIndirectArgs(const Buffer* b, VkDeviceSize off, uint32_t n, uint
     uint32_t cur = a.load(std::memory_order_relaxed);
     while (v > cur && !a.compare_exchange_weak(cur, v, std::memory_order_relaxed)) {}
   };
+  uint32_t scanned = 0, zeroInst = 0;
   for (uint32_t i = 0; i < std::min(records, kIndirectScan); ++i) {
     const uint8_t* src = host(b, off + VkDeviceSize(i) * stride, size);
     if (!src) break;
@@ -3630,7 +3711,9 @@ static void noteIndirectArgs(const Buffer* b, VkDeviceSize off, uint32_t n, uint
     }
     atomicMax(pc.indirectMaxCount, count), atomicMax(pc.indirectMaxInstances, instances);
     if (count > (1u << 25) || instances > (1u << 20)) ++pc.indirectOverCap;  // commands.cpp kMaxIndirectCount / kMaxIndirectInstances
+    ++scanned, zeroInst += instances == 0;
   }
+  pc.indirectScanned.fetch_add(scanned, std::memory_order_relaxed), pc.indirectZeroInst.fetch_add(zeroInst, std::memory_order_relaxed);
 }
 
 // vkCmdDraw(Indexed)Indirect(Count). GPU-read arguments whenever the draw is recorded inside a
@@ -3769,6 +3852,7 @@ OpDispatch makeDispatch(Recorder& r, uint32_t x, uint32_t y, uint32_t z) {
     op.ok = false;
     logSkip("unbound_descriptor", p);
   }
+  if (!(p->census.load(std::memory_order_relaxed) & 0x8000)) compCensus(r, *p, op.ok, x, y, z);
   return op;
 }
 
@@ -3847,18 +3931,6 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdNextSubpass(VkCommandBuffer cb, VkSu
   Recorder& r = rec(cb);
   r.ops.emplace_back(OpNextSubpass{});
   ++r.bound.subpass;
-  {  // vk.sub_draw: the first 2 later subpasses of an eye-sized pass, then one in 3000
-    static std::atomic<uint32_t> seen{0};
-    r.bound.subDump = 0;
-    if (r.bound.fbWidth >= 1024) {
-      const uint32_t n = seen.fetch_add(1, std::memory_order_relaxed);
-      if (n < 2 || n % 3000 == 0) {
-        r.bound.subDump = 64;
-        logf("vk.sub_dump subpass=%u fb=%ux%ux%u area=%ux%u samples=%u", r.bound.subpass, r.bound.fbWidth, r.bound.fbHeight,
-             r.bound.fbLayers, r.bound.renderArea.extent.width, r.bound.renderArea.extent.height, unsigned(r.bound.passSamples));
-      }
-    }
-  }
   if (r.bound.pass && r.bound.framebuffer) r.bound.passSamples = subpassSamples(*r.bound.pass, *r.bound.framebuffer, r.bound.subpass, true, markedEyeOf(r.device));
 }
 VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdNextSubpass2(VkCommandBuffer cb, const VkSubpassBeginInfo*, const VkSubpassEndInfo*) {
@@ -4069,6 +4141,7 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdBeginRendering(VkCommandBuffer cb, c
   r.bound.renderArea = ri->renderArea;
   r.bound.fbWidth = r.bound.fbHeight = 0;
   r.bound.fbLayers = ri->layerCount;
+  r.bound.subpass = 0;  // (vk.draw_census: a render pass before this one in the command buffer may have left its own)
   if (ri->colorAttachmentCount && ri->pColorAttachments[0].imageView) {
     const ImageView* v = from<ImageView>(ri->pColorAttachments[0].imageView);
     if (v && v->image)

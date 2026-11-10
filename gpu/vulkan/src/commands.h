@@ -289,7 +289,6 @@ struct BoundState {
   VkRect2D renderArea{};
   uint32_t fbWidth = 0, fbHeight = 0, fbLayers = 0;
   uint32_t subpass = 0;
-  uint16_t subDump = 0;  // vk.sub_draw lines still to write for the subpass being recorded (pipelines.cpp vkCmdNextSubpass)
   const RenderPassObj* pass = nullptr;
   const Framebuffer* framebuffer = nullptr;
   uint8_t passSamples = 0;  // effective sample count of the open pass's attachments (0 = unknown)
@@ -346,8 +345,14 @@ struct PipelineCounters {
   // vk.indirect_stats (indirectStatsLog): vkCmdDraw*Indirect* recorded (indirectDraws; indirectCountDraws = the Count variants), and what
   // the CPU could see of their records in host-visible memory (never a GPU readback): the largest count / instance count, commands
   // whose records were readable / not, and records past the caps of commands.cpp (count > 2^25 or instances > 2^20).
+  // indirectScanned = the records looked at, indirectZeroInst = those of them with instanceCount 0 (nothing drawn).
   std::atomic<uint64_t> indirectDraws{0}, indirectCountDraws{0}, indirectCpuReadable{0}, indirectNotReadable{0}, indirectOverCap{0};
+  std::atomic<uint64_t> indirectScanned{0}, indirectZeroInst{0};
   std::atomic<uint32_t> indirectMaxCount{0}, indirectMaxInstances{0};
+  // vk.pso.census drawn= / dispatched=: pipeline objects drawn / dispatched at least once (PipelineObj::census), and the
+  // vk.draw_census / vk.comp_census lines asked for so far (written up to their caps).
+  std::atomic<uint64_t> pipelinesDrawn{0}, pipelinesDispatched{0};
+  std::atomic<uint32_t> drawCensusLines{0}, compCensusLines{0};
 };
 PipelineCounters& pipelineCounters();
 struct GateResult {

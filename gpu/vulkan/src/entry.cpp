@@ -1033,9 +1033,15 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkGetPhysicalDeviceQueueFamilyProperties2
   if (*count) vkGetPhysicalDeviceQueueFamilyProperties(pd, count, &out[0].queueFamilyProperties);
 }
 
+// vk.mem_seen: what a game was told about memory, once per question (the heaps; the budget when it chains
+// VkPhysicalDeviceMemoryBudgetPropertiesEXT: filled=0 = not answered, the extension is not announced with this identity).
 VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkGetPhysicalDeviceMemoryProperties(
     VkPhysicalDevice, VkPhysicalDeviceMemoryProperties* m) {
   *m = memoryProperties();
+  static std::atomic<bool> seen{false};
+  if (!internalClient() && !seen.exchange(true))
+    logf("vk.mem_seen heaps=%u heap0=%llu heap0_flags=%#x types=%u", m->memoryHeapCount, (unsigned long long)m->memoryHeaps[0].size,
+         unsigned(m->memoryHeaps[0].flags), m->memoryTypeCount);
 }
 
 VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkGetPhysicalDeviceMemoryProperties2(
@@ -1059,6 +1065,13 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkGetPhysicalDeviceMemoryProperties2(
     b->heapUsage[0] = used;
     b->heapBudget[0] = std::max(used, avail ? std::min(heap, used + avail) : heap / 10 * 8);  // never under the usage
   }
+  static std::atomic<bool> seen{false};
+  if (const auto* b = static_cast<const VkPhysicalDeviceMemoryBudgetPropertiesEXT*>(
+          findNextOut(m->pNext, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT));
+      b && !internalClient() && !seen.exchange(true))
+    logf("vk.mem_seen budget_asked=1 filled=%d budget0=%llu usage0=%llu heap0=%llu", int(nativeExtras()),
+         (unsigned long long)(nativeExtras() ? b->heapBudget[0] : 0), (unsigned long long)(nativeExtras() ? b->heapUsage[0] : 0),
+         (unsigned long long)m->memoryProperties.memoryHeaps[0].size);
 }
 
 VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkGetPhysicalDeviceFormatProperties(VkPhysicalDevice,
@@ -1409,8 +1422,14 @@ std::vector<std::string> deviceRequestLines(VkPhysicalDevice pd, const VkDeviceC
 namespace {
 std::mutex& imgRegMutex() { static auto* m = new std::mutex; return *m; }  // leaked on purpose, like liveDeviceMutex
 std::unordered_set<const Image*>& imgReg() { static auto* s = new std::unordered_set<const Image*>; return *s; }
-void imgRegAdd(const Image* im) { std::lock_guard<std::mutex> l(imgRegMutex()); imgReg().insert(im); }
-void imgRegRemove(const Image* im) { std::lock_guard<std::mutex> l(imgRegMutex()); imgReg().erase(im); }
+// Sampled images that are not attachments (the population of vk.tex_hist): created / destroyed so far, under imgRegMutex.
+uint64_t g_texNew = 0, g_texGone = 0;
+bool texHistCounts(const Image* im) {
+  return (im->info.usage & VK_IMAGE_USAGE_SAMPLED_BIT) &&
+         !(im->info.usage & (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT));
+}
+void imgRegAdd(const Image* im) { std::lock_guard<std::mutex> l(imgRegMutex()); imgReg().insert(im); g_texNew += texHistCounts(im); }
+void imgRegRemove(const Image* im) { std::lock_guard<std::mutex> l(imgRegMutex()); imgReg().erase(im); g_texGone += texHistCounts(im); }
 bool isAstcFormat(VkFormat f) {
   return (f >= VK_FORMAT_ASTC_4x4_UNORM_BLOCK && f <= VK_FORMAT_ASTC_12x12_SRGB_BLOCK) ||
          (f >= VK_FORMAT_ASTC_4x4_SFLOAT_BLOCK_EXT && f <= VK_FORMAT_ASTC_12x12_SFLOAT_BLOCK_EXT);
@@ -1432,6 +1451,8 @@ void texHistAdd(TexHistAcc& a, const Image& im) {
   const int written = __builtin_popcount(mask);
   auto& b = a.b[written == 0 ? 0 : written <= 2 ? 1 : written <= 5 ? 2 : 3];
   ++a.sampled, ++b.n, b.bytes += bytes;
+  const uint32_t side = std::max(im.info.extent.width, im.info.extent.height);
+  ++a.top[side <= 64 ? 0 : side <= 128 ? 1 : side <= 256 ? 2 : side <= 512 ? 3 : side <= 1024 ? 4 : 5];
   if (isAstcFormat(im.info.format)) ++b.astcN, b.astcBytes += bytes;
   if (written > 0 && uint32_t(written) < im.info.mipLevels) ++a.partial;
   if (written > 0 && !(mask & 1u)) ++a.top0Missing;  // some mips came in but the base one never did: the streamer has not delivered the top
@@ -1448,12 +1469,20 @@ std::string texHistFormat(const TexHistAcc& a) {
   }
   std::snprintf(buf, sizeof buf, " | partial=%llu top0_unwritten=%llu | rt n=%llu mib=%.1f", (unsigned long long)a.partial,
                 (unsigned long long)a.top0Missing, (unsigned long long)a.rtN, double(a.rtBytes) / 1048576.0);
+  s += buf;
+  // The same images by the larger side of their level 0: a streamer that never brings the large levels keeps them in 64.
+  std::snprintf(buf, sizeof buf, " | top{64=%llu,128=%llu,256=%llu,512=%llu,1024=%llu,2048p=%llu}", (unsigned long long)a.top[0],
+                (unsigned long long)a.top[1], (unsigned long long)a.top[2], (unsigned long long)a.top[3], (unsigned long long)a.top[4],
+                (unsigned long long)a.top[5]);
   return s + buf;
 }
 
 // Every 5 s from the submit tick (psoCensus's place): the residency of sampled images by how many mips got a copy recorded (m0 =
 // none: render-target-like or not streamed yet), ASTC apart, so a streamer that keeps lacking mips shows as a flat line. Printed
 // when the numbers changed, at most 240 lines. "Written" = a copy/blit into that mip was RECORDED (not necessarily executed yet).
+// new= / gone= : the sampled non-attachment images created / destroyed since the previous line (a streamer swapping textures
+// in and out moves them even when the histogram stays the same; the image vkGetDeviceImageMemoryRequirements makes to answer
+// counts once in both).
 void texHistTick(bool force) {
   static std::atomic<int64_t> nextNs{0};
   const int64_t nowNs = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
@@ -1461,16 +1490,20 @@ void texHistTick(bool force) {
   nextNs.store(nowNs + 5'000'000'000LL, std::memory_order_relaxed);
   static std::string last;
   static unsigned lines = 0;
+  static uint64_t lastNew = 0, lastGone = 0;
   static const int64_t startNs = nowNs;
   TexHistAcc a;
+  uint64_t made, gone;
   {
     std::lock_guard<std::mutex> l(imgRegMutex());
     for (const Image* im : imgReg()) texHistAdd(a, *im);
+    made = g_texNew, gone = g_texGone;
   }
   const std::string body = texHistFormat(a);
-  if (body == last || lines >= 240) return;
-  last = body, ++lines;
-  logf("vk.tex_hist t=%llus %s", (unsigned long long)((nowNs - startNs) / 1'000'000'000LL), body.c_str());
+  if ((body == last && made == lastNew && gone == lastGone) || lines >= 240) return;
+  logf("vk.tex_hist t=%llus %s | new=%llu gone=%llu", (unsigned long long)((nowNs - startNs) / 1'000'000'000LL), body.c_str(),
+       (unsigned long long)(made - lastNew), (unsigned long long)(gone - lastGone));
+  last = body, ++lines, lastNew = made, lastGone = gone;
 }
 }  // namespace vpvk
 
@@ -2216,6 +2249,25 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkGetImageMemoryRequirements(VkDevice, Vk
   for (const auto& p : i->planes) r->size += imageBytes(p->desc);
   r->alignment = 256;
   r->memoryTypeBits = (i->info.usage & VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT) ? 0xF : 0x7;
+  // vk.memreq: the size and alignment a game is told for an image (what a streaming pool budgets with), for the first 32
+  // distinct shapes of block-compressed formats and the first 32 of the others (render targets and the 1x1 defaults of an
+  // engine come first and must not use up the textures' lines). vkGetImageMemoryRequirements2 and
+  // vkGetDeviceImageMemoryRequirements answer through here too.
+  static std::atomic<unsigned> lines[2];
+  const int blocks = vpgpu::formatInfo(toCoreFormat(i->info.format)).blockSize > 1;
+  if (lines[blocks].load(std::memory_order_relaxed) < 32 && !internalClient()) {
+    char b[200];
+    std::snprintf(b, sizeof b, "fmt=%d %ux%ux%u mips=%u layers=%u samples=%u usage=%#x size=%llu align=%llu", int(i->info.format),
+                  i->info.extent.width, i->info.extent.height, i->info.extent.depth, i->info.mipLevels, i->info.arrayLayers,
+                  unsigned(i->info.samples), unsigned(i->info.usage), (unsigned long long)r->size, (unsigned long long)r->alignment);
+    static std::mutex mu;
+    static std::set<std::string> seen[2];
+    std::lock_guard<std::mutex> lock(mu);
+    if (seen[blocks].size() < 32 && seen[blocks].insert(b).second) {
+      lines[blocks].store(unsigned(seen[blocks].size()), std::memory_order_relaxed);
+      logf("vk.memreq %s", b);
+    }
+  }
 }
 
 VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkGetImageMemoryRequirements2(
@@ -2951,7 +3003,6 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdBeginRenderPass(VkCommandBuffer cb,
   r.bound.pass = op.pass;
   r.bound.framebuffer = op.framebuffer;
   r.bound.subpass = 0;
-  r.bound.subDump = 0;
   r.bound.passSamples = op.pass && op.framebuffer ? subpassSamples(*op.pass, *op.framebuffer, 0, true, vpvk::markedEyeOf(r.device)) : 0;
   r.bound.targetWidth = uint32_t(op.area.offset.x) + op.area.extent.width;
   r.bound.targetHeight = uint32_t(op.area.offset.y) + op.area.extent.height;
