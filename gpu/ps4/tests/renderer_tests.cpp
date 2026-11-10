@@ -22,6 +22,8 @@
 #include "vpps4/fixed_function.h"
 #include "vpps4/renderer.h"
 #include "vpps4/scheduler.h"
+#include "vpps4/shader_stats.h"
+#include "vpps4/formats.h"
 #include <atomic>
 #include <thread>
 #include "vpps4/report.h"
@@ -3526,6 +3528,168 @@ void tileProbe() {
     pr::registry().reset();
 }
 
+
+// What the probe says of the draws after another: RATES same_*_as_prev_draw (program, user data, targets, state), the CPU time of
+// the draws that took long (slow_draws, by cause), and the SHADERSTAT lines of the shaders drawn most.
+void probeRepeat() {
+    namespace pr = vpgpu::probe;
+    pr::setEnabled(true);
+    pr::registry().reset();
+    const fs::path dir = fs::temp_directory_path() / ("vpps4_shaderstat_" + std::to_string(::getpid()));
+    fs::remove_all(dir);
+    fs::create_directories(dir);
+    ::setenv("SHADPS4_PROBE_DIR", dir.c_str(), 1);
+    {
+        Fixture f;
+        vpps4::DrawState d = f.state();
+        f.renderer.draw(d);  // (no draw before it)
+        f.renderer.draw(d);  // everything the same
+        d.vs.userData[0] = 7;
+        f.renderer.draw(d);  // other user data
+        d.blend[0].enable = true;
+        f.renderer.draw(d);  // other state
+        d.color[0].address = kBase + 0x50000;
+        f.renderer.draw(d);  // other target
+        for (int i = 0; i < 60; ++i) f.renderer.draw(d);  // (enough uses for SHADERSTAT)
+        f.renderer.submit();
+        f.renderer.publishProbe(1);
+        std::string rates, time;
+        for (const std::string& l : pr::registry().sample(1.0)) {
+            if (l.find("VPKENGINE_PROBE RATES ") == 0) rates += l;
+            if (l.find("VPKENGINE_PROBE TIME ") == 0) time += l;
+        }
+        CHECK(rates.find(" repeat_draws=64 ") != std::string::npos);
+        CHECK(rates.find(" same_program_as_prev_draw=64 ") != std::string::npos);
+        CHECK(rates.find(" same_userdata_as_prev_draw=63 ") != std::string::npos);
+        CHECK(rates.find(" same_targets_as_prev_draw=63 ") != std::string::npos);
+        CHECK(rates.find(" same_state_as_prev_draw=63 ") != std::string::npos);
+        CHECK(rates.find(" same_all_as_prev_draw=61 ") != std::string::npos);
+        // The first draw translated its shaders: a slow draw, for that reason; every slow draw has one cause.
+        const auto value = [&](const char* key) -> long {
+            const size_t at = rates.find(std::string(" ") + key + "=");
+            return at == std::string::npos ? -1 : std::strtol(rates.c_str() + at + std::strlen(key) + 2, nullptr, 10);
+        };
+        CHECK(value("slow_draws") >= 1 && value("slow_draw_shader") >= 1);
+        CHECK(value("slow_draws") == value("slow_draw_shader") + value("slow_draw_target") + value("slow_draw_texture") +
+                                         value("slow_draw_snapshot") + value("slow_draw_hazard") + value("slow_draw_other"));
+        CHECK(time.find(" draw_cp_us_p50=") != std::string::npos);
+        // SHADERSTAT: one line for the vertex shader and one for the pixel shader, and their MSL in the directory.
+        size_t vsLines = 0, psLines = 0;
+        for (const std::string& l : f.log)
+            if (l.find("VPKENGINE_PROBE SHADERSTAT id=") == 0) {
+                vsLines += l.find(" stage=vs ") != std::string::npos, psLines += l.find(" stage=ps ") != std::string::npos;
+                CHECK(l.find(" ifs=") != std::string::npos && l.find(" privarrays=") != std::string::npos && l.find(" mbcnt=0 ") != std::string::npos);
+                CHECK(l.find(" draws=65 ") != std::string::npos && l.find(" file=shader-") != std::string::npos);
+            }
+        CHECK(vsLines == 1 && psLines == 1);
+        size_t files = 0;
+        for (const auto& e : fs::directory_iterator(dir)) files += e.path().extension() == ".metal" && fs::file_size(e.path()) > 0;
+        CHECK(files == 2);
+        // A second publication reports nothing new.
+        f.log.clear();
+        f.renderer.publishProbe(2);
+        for (const std::string& l : f.log) CHECK(l.find("SHADERSTAT") == std::string::npos);
+    }
+    ::unsetenv("SHADPS4_PROBE_DIR");
+    fs::remove_all(dir);
+    pr::setEnabled(false);
+    pr::registry().reset();
+}
+
+// Off, the probe's draw bookkeeping does nothing (no counters, no shader lines).
+void probeRepeatOff() {
+    namespace pr = vpgpu::probe;
+    pr::setEnabled(false);
+    Fixture f;
+    vpps4::DrawState d = f.state();
+    for (int i = 0; i < 60; ++i) f.renderer.draw(d);
+    pr::setEnabled(true);
+    pr::registry().reset();
+    f.renderer.publishProbe(1);
+    std::string rates;
+    for (const std::string& l : pr::registry().sample(1.0))
+        if (l.find("VPKENGINE_PROBE RATES ") == 0) rates += l;
+    CHECK(rates.find(" repeat_draws=0 ") != std::string::npos);
+    CHECK(rates.find(" slow_draws=0 ") != std::string::npos);
+    for (const std::string& l : f.log) CHECK(l.find("SHADERSTAT") == std::string::npos);
+    pr::setEnabled(false);
+    pr::registry().reset();
+}
+
+// The MSL statistics and the dump limits (shaders reported, bytes written, minimum uses).
+void shaderStats() {
+    const std::string msl =
+        "#include <metal_stdlib>\n"
+        "kernel void vp_main() {\n"
+        "    uint l0{};\n"
+        "    bool l1{};\n"
+        "    uint4 vp_p0[2] = {};\n"
+        "    threadgroup uint4 vp_shared[4];\n"
+        "    const uint v1 = (*(constant uint*)(vp_args.user_data + 4u));\n"
+        "    const float4 v2 = vp_args.tex0.sample(vp_args.smp0, v1);\n"
+        "    *(device uint*)(vp_args.buf0 + v1) = v1;\n"
+        "    if (v1) { l0 = *(const device uint*)(p); }\n"
+        "    uint vp_guard0 = 0u;\n"
+        "    while (true) {\n"
+        "        if (++vp_guard0 > 8192u) break;\n"
+        "        vp_shared[0] = 1;\n"
+        "    }\n"
+        "    for (uint i = 0u; i < 64u; ++i) {}\n"
+        "}\n";
+    const vpps4::ShaderStat s = vpps4::analyzeMsl(msl);
+    CHECK(s.ifs == 1 && s.loads == 2 && s.samples == 1 && s.loops == 2 && s.locals == 2 && s.privArrays == 1 && s.lds == 1);
+    CHECK(s.lines == 17 && s.mbcnt == -1);
+    CHECK(vpps4::analyzeMsl("").lines == 0);
+
+    const fs::path dir = fs::temp_directory_path() / ("vpps4_shaderdump_" + std::to_string(::getpid()));
+    fs::remove_all(dir);
+    fs::create_directories(dir);
+    vpps4::ShaderDump dump;
+    dump.limits.minDraws = 2, dump.limits.round = 2, dump.limits.maxShaders = 3;
+    dump.limits.maxFileBytes = 2 * msl.size() + 1;
+    for (uint64_t id = 1; id <= 4; ++id) dump.add(id, id == 1 ? "vs" : "ps", msl, 1);
+    dump.add(1, "vs", "other text", 0);  // (already registered: kept as it was)
+    const auto use = [&](uint64_t id, int n) {
+        for (int i = 0; i < n; ++i) dump.use(id);
+    };
+    use(1, 10), use(2, 5), use(3, 3), use(4, 1), use(99, 100);  // (an unknown id is ignored)
+    const std::vector<std::string> first = dump.flush(dir.string());
+    CHECK(first.size() == 2);
+    CHECK(first[0].find("SHADERSTAT id=0000000000000001 stage=vs ifs=1 loads=2 samples=1 loops=2 locals=2 privarrays=1 lds=1 mbcnt=1 lines=17 draws=10 file=shader-0000000000000001-vs.metal") == 0);
+    CHECK(first[1].find("id=0000000000000002 stage=ps ") != std::string::npos && first[1].find(" draws=5 ") != std::string::npos);
+    CHECK(fs::file_size(dir / "shader-0000000000000001-vs.metal") == msl.size());
+    const std::vector<std::string> second = dump.flush(dir.string());  // third most used: over the byte limit
+    CHECK(second.size() == 1 && second[0].find("id=0000000000000003 ") != std::string::npos && second[0].find(" file=skipped_size") != std::string::npos);
+    CHECK(dump.reported() == 3 && dump.fileBytes() == 2 * msl.size());
+    use(4, 5);
+    CHECK(dump.flush(dir.string()).empty());  // three shaders reported: the limit
+    // No directory: lines only.
+    vpps4::ShaderDump bare;
+    bare.limits.minDraws = 1;
+    bare.add(7, "cs", msl, -1);
+    bare.use(7);
+    const std::vector<std::string> lines = bare.flush("");
+    CHECK(lines.size() == 1 && lines[0].find(" mbcnt=-1 ") != std::string::npos && lines[0].find(" file=no_dir") != std::string::npos);
+    // The retention budget spent: statistics, no text.
+    vpps4::ShaderDump small;
+    small.limits.minDraws = 1, small.limits.maxRetainedBytes = 10;
+    small.add(8, "ps", msl, 0);
+    small.use(8);
+    const std::vector<std::string> noText = small.flush(dir.string());
+    CHECK(noText.size() == 1 && noText[0].find(" file=no_source") != std::string::npos && noText[0].find(" samples=1 ") != std::string::npos);
+    fs::remove_all(dir);
+}
+
+// VPKENGINE_MAX_ANISO caps the anisotropy of a decoded sampler (expected value in VPPS4_TEST_EXPECT_ANISO; the ctest entries set both).
+void samplerAniso() {
+    const char* want = std::getenv("VPPS4_TEST_EXPECT_ANISO");
+    CHECK(want != nullptr);
+    uint32_t words[4] = {4u << 9, 0, (2u << 20) | (2u << 22) | (1u << 26), 0};  // 16x, anisotropic filters, linear mips
+    CHECK(vpps4::decodeSampler({words, 4}).maxAnisotropy == (want ? unsigned(std::atoi(want)) : 0u));
+    words[2] = 0;  // point filters: no anisotropy whatever the cap
+    CHECK(vpps4::decodeSampler({words, 4}).maxAnisotropy == 1);
+}
+
 int main(int argc, char** argv) {
     const std::string t = argc > 1 ? argv[1] : "";
     if (t == "resolved_hook") resolvedHook();
@@ -3540,6 +3704,10 @@ int main(int argc, char** argv) {
     else if (t == "resolved_cleared") resolvedCleared();
     else if (t == "probe_publish") probePublish();
     else if (t == "tile_probe") tileProbe();
+    else if (t == "probe_repeat") probeRepeat();
+    else if (t == "probe_repeat_off") probeRepeatOff();
+    else if (t == "shader_stats") shaderStats();
+    else if (t == "sampler_aniso") samplerAniso();
     else if (t == "program_rewritten_in_place") programRewrittenInPlace();
     else if (t == "clear_and_draw") clearAndDraw();
     else if (t == "textured") textured();

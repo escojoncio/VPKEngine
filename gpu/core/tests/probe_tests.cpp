@@ -9,6 +9,7 @@
 #include <thread>
 #include <vector>
 
+#include "vpgpu/core/ab_switch.h"
 #include "vpgpu/core/probe.h"
 
 using namespace vpgpu::probe;
@@ -378,10 +379,34 @@ void testLog() {
   CHECK_EQ(hot.calls(), uint64_t{160});  // off: nothing is counted
 }
 
+// The A/B switches act only on the values they name: VPKENGINE_VS_FASTMATH starting with 1 or 2, VPKENGINE_MAX_ANISO a positive number.
+void testAbSwitch() {
+  namespace ab = vpgpu::ab;
+  CHECK_EQ(ab::parseVsFastMath(nullptr), 0u);
+  CHECK_EQ(ab::parseVsFastMath(""), 0u);
+  CHECK_EQ(ab::parseVsFastMath("0"), 0u);
+  CHECK_EQ(ab::parseVsFastMath("true"), 0u);
+  CHECK_EQ(ab::parseVsFastMath("1"), 1u);
+  CHECK_EQ(ab::parseVsFastMath("1x"), 1u);
+  CHECK_EQ(ab::parseVsFastMath("2"), 2u);
+  CHECK_EQ(ab::parseMaxAniso(nullptr), 0u);
+  CHECK_EQ(ab::parseMaxAniso(""), 0u);
+  CHECK_EQ(ab::parseMaxAniso("0"), 0u);
+  CHECK_EQ(ab::parseMaxAniso("-4"), 0u);
+  CHECK_EQ(ab::parseMaxAniso("x4"), 0u);
+  CHECK_EQ(ab::parseMaxAniso("1"), 1u);
+  CHECK_EQ(ab::parseMaxAniso("4"), 4u);
+  CHECK_EQ(ab::parseMaxAniso("64"), 16u);
+  CHECK_EQ(unsigned(ab::capAniso(16, 0)), 16u);  // off: untouched
+  CHECK_EQ(unsigned(ab::capAniso(16, 4)), 4u);
+  CHECK_EQ(unsigned(ab::capAniso(2, 4)), 2u);  // never raised
+  CHECK_EQ(unsigned(ab::capAniso(1, 1)), 1u);
+}
+
 int main(int argc, char** argv) {
   const std::vector<std::pair<const char*, std::function<void()>>> groups = {
       {"hist", testHist}, {"busy_union", testBusyUnion}, {"lines", testLines}, {"names", testNamesAndNumbers}, {"csv", testCsv},
-      {"summary", testSummary}, {"mutex", testScopedAndMutex}, {"bigalloc", testBigAlloc}, {"log", testLog}};
+      {"summary", testSummary}, {"mutex", testScopedAndMutex}, {"bigalloc", testBigAlloc}, {"log", testLog}, {"ab_switch", testAbSwitch}};
   bool ran = false;
   for (const auto& [name, fn] : groups) {
     if (argc > 1 && std::strcmp(argv[1], name) != 0) continue;

@@ -31,6 +31,7 @@
 #include "frame_capture.h"
 #include "translation_cache.h"
 #include "vpps4/report.h"
+#include "vpps4/shader_stats.h"
 #include "vpps4/tiling.h"
 
 namespace vpps4 {
@@ -306,7 +307,86 @@ struct Renderer::Impl {
         std::unordered_map<std::string, uint64_t> lastReason;  // family/name -> its total at the previous publishProbe
         std::set<std::string> published;                         // names of the open-ended families already given a column
         uint64_t lastPictures = 0;
+        // Draws recorded after another one (RATES same_*_as_prev_draw): of them, those with the same programs, the same user data
+        // words of the stages, the same targets, the same pipeline state and dynamic state, and all four (what reusing the previous
+        // draw's bindings could save; the user data words are pointers, the memory behind them may have changed).
+        uint64_t repeatDraws = 0, sameProgram = 0, sameUserdata = 0, sameTargets = 0, sameState = 0, sameAll = 0;
+        // Renderer::draw calls that took more than kSlowDrawUs of CPU (RATES slow_draws), by the first cause that fits (QUAL
+        // slow_draw_*): a shader translated, a target made, a texture made or refilled, a buffer snapshot taken, memory coherence
+        // work (refill, write-back, eviction), none of those.
+        enum SlowCause : unsigned { kSlowShader, kSlowTarget, kSlowTexture, kSlowSnapshot, kSlowHazard, kSlowOther, kSlowCauses };
+        static constexpr uint64_t kSlowDrawUs = 15;
+        uint64_t slowDraws = 0, slowCause[kSlowCauses] = {};
     } pstat;
+    // The previous recorded draw, for ProbeStats::same*.
+    struct PrevDraw {
+        bool valid = false;
+        uint64_t program = 0, userdata = 0, targets = 0, state = 0;
+    } prevDraw;
+    ShaderDump shaderDump;  // the MSL and statistics of the most used shaders (probe on)
+    // Counters read around Renderer::draw (probe on) to find what made a slow draw slow.
+    struct SlowMark {
+        bool valid = false;
+        uint64_t shaders = 0, targets = 0, textures = 0, snapshots = 0, hazard = 0;
+    };
+    SlowMark slowMark() const {
+        SlowMark m;
+        if (!vpgpu::probe::enabled()) return m;
+        m.valid = true;
+        const Stats& s = r.stats_;
+        m.shaders = s.shaders + s.shadersCached + s.shaderErrors, m.targets = s.targets, m.textures = s.textures + s.detiled;
+        m.snapshots = pstat.bufferSnapshots + pstat.pointerSnapshots, m.hazard = s.refilled + s.retiled + s.evicted;
+        return m;
+    }
+    void noteDrawTime(const SlowMark& before, double ms) {
+        if (!before.valid) return;
+        static vpgpu::probe::Hist& drawHist = vpgpu::probe::hist("TIME", "draw_cp_us");
+        drawHist.addMs(ms);
+        if (ms * 1000.0 <= double(ProbeStats::kSlowDrawUs)) return;
+        const SlowMark now = slowMark();
+        ++pstat.slowDraws;
+        ++pstat.slowCause[now.shaders != before.shaders   ? ProbeStats::kSlowShader
+                          : now.targets != before.targets ? ProbeStats::kSlowTarget
+                          : now.textures != before.textures ? ProbeStats::kSlowTexture
+                          : now.snapshots != before.snapshots ? ProbeStats::kSlowSnapshot
+                          : now.hazard != before.hazard ? ProbeStats::kSlowHazard
+                                                        : ProbeStats::kSlowOther];
+    }
+    // The draw about to be recorded, against the one before it (probe on).
+    void noteRepeat(const DrawState& d, const vpgpu::PipelineState& ps, const vpgpu::Draw& draw, uint64_t esId, uint64_t gsId) {
+        Hash program, userdata, targets, state;
+        program.value(ps.vertexShader), program.value(ps.fragmentShader), program.value(esId), program.value(gsId);
+        for (uint64_t id : {ps.vertexShader, ps.fragmentShader, esId, gsId})
+            if (id) shaderDump.use(id);
+        for (const Stage* s : {&d.vs, &d.ps, &d.es, &d.gs}) {
+            userdata.value(s->userSgprs);
+            userdata.bytes(s->userData.data(), std::min<size_t>(s->userSgprs, s->userData.size()) * 4);
+        }
+        for (const ColorTarget& c : d.color) {
+            if (!c.format || !c.writeMask) continue;
+            targets.value(c.address), targets.value(c.width), targets.value(c.height), targets.value(c.format), targets.value(c.numberType);
+            targets.value(c.compSwap), targets.value(c.tileMode), targets.value(c.sliceStart), targets.value(c.sliceCount), targets.value(c.samples);
+            targets.value(c.writeMask);
+        }
+        const DepthTarget& z = d.depth;
+        targets.value(z.zAddress), targets.value(z.stencilAddress), targets.value(z.zFormat), targets.value(z.stencilFormat);
+        targets.value(z.width), targets.value(z.height), targets.value(z.sliceStart), targets.value(z.sliceCount), targets.value(z.samples);
+        targets.value(z.depthClear), targets.value(z.stencilClear);
+        state.value(ps.key().value), state.value(uint8_t(draw.primitive)), state.value(draw.stencilRef), state.value(draw.stencilRefBack);
+        for (float f : draw.blendColor) state.value(f);
+        for (int16_t m : draw.stencilReadMask) state.value(m);
+        for (int16_t m : draw.stencilWriteMask) state.value(m);
+        const vpgpu::Viewport& v = draw.viewport;
+        for (float f : {v.x, v.y, v.width, v.height, v.znear, v.zfar, draw.depthBias, draw.depthBiasSlope, draw.depthBiasClamp}) state.value(f);
+        state.value(draw.scissor.x), state.value(draw.scissor.y), state.value(draw.scissor.width), state.value(draw.scissor.height);
+        state.value(uint8_t(draw.frontFace)), state.value(draw.depthClamp), state.value(draw.wireframe);
+        if (prevDraw.valid) {
+            const bool p = program.h == prevDraw.program, u = userdata.h == prevDraw.userdata, t = targets.h == prevDraw.targets, s = state.h == prevDraw.state;
+            ++pstat.repeatDraws, pstat.sameProgram += p, pstat.sameUserdata += u, pstat.sameTargets += t, pstat.sameState += s;
+            pstat.sameAll += p && u && t && s;
+        }
+        prevDraw = {true, program.h, userdata.h, targets.h, state.h};
+    }
     // The probe's tables are fed only while it is on, and hold at most kProbeMaxEntries entries each.
     static constexpr size_t kProbeMaxEntries = 512;
     static constexpr uint16_t kNoApprox = 0xFFFF;
@@ -1513,6 +1593,12 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
     tcache::Loaded pendingLoad;
     size_t mergedPrograms = 0, mergedTranslations = 0, mergedPipelines = 0;
 
+    // A guest shader registered with the host: its text and statistics go to the shader dump (probe on).
+    void shaderSeen(uint64_t id, vpgcn::ShaderStage stage, const vpmsl::MslShader& msl, int mbcnt) {
+        if (!vpgpu::probe::enabled()) return;
+        static const char* const names[] = {"vs", "ps", "cs", "es", "gs", "copy"};
+        shaderDump.add(id, names[size_t(stage)], msl.source, mbcnt);
+    }
     static vpir::Stage irStage(vpgcn::ShaderStage stage) {
         return stage == vpgcn::ShaderStage::Vertex || stage == vpgcn::ShaderStage::CopyVertex ? vpir::Stage::Vertex
              : stage == vpgcn::ShaderStage::Pixel ? vpir::Stage::Fragment
@@ -1582,8 +1668,10 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         x.resources = std::move(t.resources);
         x.userDataSlot = t.userDataSlot;
         x.snapIndex = snapIndexFor(pi->second, x.bindings);
-        if (registered.insert(x.id).second && r.hooks_.shader)
-            r.hooks_.shader(x.id, irStage(vpgcn::ShaderStage(t.stage)), t.shader);
+        if (registered.insert(x.id).second) {
+            shaderSeen(x.id, vpgcn::ShaderStage(t.stage), t.shader, -1);
+            if (r.hooks_.shader) r.hooks_.shader(x.id, irStage(vpgcn::ShaderStage(t.stage)), t.shader);
+        }
         translated.emplace(t.key2, std::move(x));
         t.id = 0;
         t.shader = {};
@@ -2074,8 +2162,10 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
                 t.resources = lifted.module.resources;
                 t.userDataSlot = lifted.userDataSlot;
                 t.snapIndex = snapIndexFor(it1->second, lifted.bindings);
-                if (registered.insert(t.id).second && r.hooks_.shader) {
-                    r.hooks_.shader(t.id, irStage(stage), msl.shader);
+                if (registered.insert(t.id).second) {
+                    shaderSeen(t.id, stage, msl.shader,
+                               int(std::any_of(lifted.notes.begin(), lifted.notes.end(), [](const std::string& n) { return n.find("v_mbcnt") != std::string::npos; })));
+                    if (r.hooks_.shader) r.hooks_.shader(t.id, irStage(stage), msl.shader);
                 }
                 if (cache)
                     cache->append(tcache::TranslationRec{key1, key2, t.id, uint8_t(stage), msl.shader, lifted.bindings,
@@ -6624,6 +6714,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
             cd.clear = std::move(partialClear);
             frame.draw(std::move(cd));
         }
+        if (vpgpu::probe::enabled()) noteRepeat(d, ps, draw, esT ? esT->id : 0, gsT ? gsT->id : 0);
         if (!frame.draw(std::move(draw))) return skip("no open pass");
         ++r.stats_.drawn;
         if (cap.user && zf != vpgpu::Format::Undefined)
@@ -6717,6 +6808,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         const Translated* cs = shader(d.cs, vpgcn::ShaderStage::Compute);
         if (!cs->ok) return skip("compute shader not translated");
         countApprox(cs);
+        if (vpgpu::probe::enabled()) shaderDump.use(cs->id);
         if (r.hooks_.computeBuffers && (!r.hooks_.computeBuffersWanted || r.hooks_.computeBuffersWanted())) {
             std::vector<ComputeBuffer> buffers;
             bool complete = true;  // every buffer the program accesses is in `buffers`
@@ -7488,9 +7580,12 @@ struct Renderer::ResolvedScope {
 void Renderer::draw(const DrawState& d) {
     const ResolvedScope scope(*this, Resolved::Kind::Draw);
     const auto t0 = Clock::now();
+    const Impl::SlowMark mark = impl_->slowMark();
     impl_->draw(d);
-    cpu_.drawMs += msSince(t0);
+    const double ms = msSince(t0);
+    cpu_.drawMs += ms;
     ++cpu_.calls;
+    impl_->noteDrawTime(mark, ms);
     guardRunaway();
 }
 void Renderer::dispatch(const DispatchState& d) {
@@ -7681,6 +7776,11 @@ void Renderer::publishProbe(uint64_t pictures) {
         C(f, "buffer_snapshots", ps.bufferSnapshots), C(f, "pointer_snapshots", ps.pointerSnapshots);
         C(f, "depth_partner_draws", ps.depthPartnerDraws), C(f, "depth_partner_retro_clears", ps.depthPartnerRetroClears);
         C(f, "depth_1x_shared", ps.depth1xShared);
+        C(f, "repeat_draws", ps.repeatDraws), C(f, "same_program_as_prev_draw", ps.sameProgram), C(f, "same_userdata_as_prev_draw", ps.sameUserdata);
+        C(f, "same_targets_as_prev_draw", ps.sameTargets), C(f, "same_state_as_prev_draw", ps.sameState), C(f, "same_all_as_prev_draw", ps.sameAll);
+        C(f, "slow_draws", ps.slowDraws);
+        static const char* const slowNames[Impl::ProbeStats::kSlowCauses] = {"shader", "target", "texture", "snapshot", "hazard", "other"};
+        for (unsigned k = 0; k < Impl::ProbeStats::kSlowCauses; ++k) C(f, std::string("slow_draw_") + slowNames[k], ps.slowCause[k]);
         C(f, "msaa_colour_on_tile", ps.msaaColourOnTile), C(f, "msaa_colour_stored", ps.msaaColourStored), C(f, "msaa_cut_kept", ps.msaaCutKept);
         C(f, "ps_sample_bary_draws", ps.psSampleBaryDraws), C(f, "ps_sample_iter_draws", ps.psSampleIterDraws);
         C(f, "ps_sample_id_draws", ps.psSampleIdDraws); C(f, "a2m_unwritten_draws", ps.a2mUnwrittenDraws);
@@ -7704,6 +7804,13 @@ void Renderer::publishProbe(uint64_t pictures) {
                 C(f, std::string("tiler_") + kernels[k], tc.dispatches[k]), C(f, std::string("tiler_") + kernels[k] + "_bytes", tc.bytes[k]);
             C(f, "tiler_not_ready", tc.notReady);
         }
+    }
+
+    // ---- SHADERSTAT: the most used shaders (a line each, once; their MSL goes to SHADPS4_PROBE_DIR when it is set)
+    {
+        const char* dir = std::getenv("SHADPS4_PROBE_DIR");
+        for (const std::string& line : im.shaderDump.flush(dir ? dir : "")) im.log("VPKENGINE_PROBE " + line);
+        C("RATES", "shaders_dumped", im.shaderDump.reported());
     }
 
     // ---- ENG: what the renderer holds

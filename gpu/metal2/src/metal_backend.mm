@@ -45,6 +45,7 @@
 #include <unordered_set>
 #include <vector>
 
+#include "vpgpu/core/ab_switch.h"
 #include "vpgpu/core/activity_gauge.h"
 #include "vpgpu/core/archive_harvest.h"
 #include "vpgpu/core/background.h"
@@ -2224,6 +2225,10 @@ id<MTLFunction> MetalBackend::Impl::function(uint64_t shaderId, const FetchInput
   // Same for a fragment FragDepth write in a pass without a depth attachment.
   noFragDepth = noFragDepth && shader.source.find("VP_NO_FDEPTH") != std::string::npos;
   if (noFragDepth) key = (key ^ 0x4644E9ull) * 1099511628211ull;
+  // VPKENGINE_VS_FASTMATH (A/B test, ab_switch.h): the libraries it compiles differently get a key of their own, so the pipelines archived by a
+  // run without it (or with the other level) are not taken for theirs.
+  const unsigned vsFastMath = shader.source.find("invariant]]") != std::string::npos ? vpgpu::ab::vsFastMath() : 0;
+  if (vsFastMath) key = (key ^ (0x56464Dull + vsFastMath)) * 1099511628211ull;
   if (keyOut) *keyOut = key;
   if (prewarm) {
     // Speculative: nothing to do when a thread already has or is making it, and it must not compete with the compiles a
@@ -2288,13 +2293,14 @@ id<MTLFunction> MetalBackend::Impl::function(uint64_t shaderId, const FetchInput
   // [[invariant]] positions (SPIR-V Invariant) only stay invariant with this set; no effect on the rest,
   // so the key above needs no constant (only MSL text that declares [[position, invariant]] is affected).
   const bool invariantMsl = shader.source.find("invariant]]") != std::string::npos;
-  if (invariantMsl) o.preserveInvariance = YES;
+  if (invariantMsl && vsFastMath != 2) o.preserveInvariance = YES;
   // ... and with the arithmetic left as written: under fast math the compiler contracts a multiply and an add into an
   // fma (or reassociates) differently in each program, so two programs that compute the position with the same
   // operations still differ in the last bits (the depth prepass against the colour pass). The reference recompiler marks
   // every operation NoContraction. Programs that export a position only (vertex stages); a text archived before this
   // keeps the pipelines it has.
-  if (invariantMsl) o.mathMode = MTLMathModeSafe;
+  // (VPKENGINE_VS_FASTMATH=1|2: left in fast math, the risk is in ab_switch.h; =2 also without preserveInvariance)
+  if (invariantMsl && !vsFastMath) o.mathMode = MTLMathModeSafe;
   NSMutableDictionary<NSString*, NSObject*>* macros = [NSMutableDictionary dictionary];
   if (noPointSize) macros[@"VP_PSZ"] = @"user(vp_psz)";
   if (noFragDepth) macros[@"VP_NO_FDEPTH"] = @"1";
@@ -7879,7 +7885,7 @@ void MetalBackend::createSampler(SamplerId handle, const SamplerDesc& d) {
   s.sAddressMode = addressMode(d.u);
   s.tAddressMode = addressMode(d.v);
   s.rAddressMode = addressMode(d.w);
-  s.maxAnisotropy = std::max<uint8_t>(1, d.maxAnisotropy);
+  s.maxAnisotropy = std::max<uint8_t>(1, vpgpu::ab::capAniso(d.maxAnisotropy, vpgpu::ab::maxAniso()));  // VPKENGINE_MAX_ANISO: an A/B test
   if (d.compare) s.compareFunction = compareFn(*d.compare);
   s.borderColor = d.border == BorderColor::OpaqueWhite   ? MTLSamplerBorderColorOpaqueWhite
                   : d.border == BorderColor::OpaqueBlack ? MTLSamplerBorderColorOpaqueBlack
