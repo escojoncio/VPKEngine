@@ -62,13 +62,19 @@ jobs:
           cd build/gpu
           ctest -R 'gpu_metal' --output-on-failure --no-tests=error -V > metal.log 2>&1 || { tail -n 200 metal.log; exit 1; }
           tail -n 60 metal.log
+          # A paravirtual runner device has no Metal 3 / bindless: gpu_metal2 exits 77 (SKIP all). That is the runner, not a failure.
+          if grep -q "SKIP all: no Metal 3 bindless" metal.log; then
+            echo "### Metal tests NOT RUN: runner sin Metal 3 (bindless)" >> "$GITHUB_STEP_SUMMARY"
+            echo "::warning title=Metal tests not run::runner sin Metal 3: tests Metal no ejecutados"
+            exit 0
+          fi
           if grep -E "SKIP depth_tile|gpu_metal2.depth_tile.*(Skipped|skipped)" metal.log; then
             echo "### depth_tile SKIPPED on a runner with a GPU: the fused path was NOT tested" >> "$GITHUB_STEP_SUMMARY"
             echo "::error title=depth_tile skipped::the runner has a Metal device but gpu_metal2.depth_tile was skipped"
             exit 1
           fi
           echo "### Metal tests ran (depth_tile included)" >> "$GITHUB_STEP_SUMMARY"
-      - name: Linux-portable tests (frame compiler, translator)
+      - name: Tests portables (sin GPU)
         if: ${{ !cancelled() }}
         run: cd build/gpu && ctest -j4 --output-on-failure -E 'gpu_metal'
       - name: Metal tests skipped

@@ -3948,10 +3948,14 @@ void testEs31() {
         CHECK(err() == gl::NO_ERROR && r == 1 && occCalls == 1);
         // The GPU gets up to date: reads wait normally again (a late count, then the real zero: a counted query that saw no
         // samples is occluded).
-        occStuck = occFenceStuck = false, occLate = 3, occCount = 0, occCalls = 0;
+        // (A real GPU may still be running the stuck period's submissions: finish them first, or the read finds the GPU behind and
+        // looks once without waiting. Its count is the GPU's own, 0 or 1 here; the null backend draws nothing: 0.)
+        occStuck = occFenceStuck = false;
+        settle();
+        occLate = 3, occCount = 0, occCalls = 0;
         r = 99;
         glGetQueryObjectuiv(qw, gl::QUERY_RESULT, &r);
-        CHECK(err() == gl::NO_ERROR && r == 0 && occLate == 0 && occCalls == 3);  // (the call that finds the count goes through uncounted)
+        CHECK(err() == gl::NO_ERROR && r <= 1 && occLate == 0 && occCalls == 3);  // (the call that finds the count goes through uncounted)
         glDeleteQueries(50, qm);
         glDeleteQueries(1, &qw);
     }
