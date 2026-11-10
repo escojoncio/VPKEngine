@@ -4378,6 +4378,139 @@ void testFrameOpt() {
   }
 }
 
+
+// The frame compiler's fold of a pass's accesses (CompileOptions::foldFast, VPVK_FRAME_FOLD=0 off) leaves the compiled frame the
+// way the slow fold does: random passes whose draws bind the same buffers and textures at the same positions with other stages
+// (the case the fast fold answers from the draw before), writes, pixel-local reads, dispatches and copies between them.
+void testFoldEqual() {
+  std::mt19937 rng(777);
+  auto R = [&](unsigned n) { return unsigned(rng() % n); };
+  const auto digest = [](const CompiledFrame& c) {
+    std::string out;
+    const auto v = [&](uint64_t x) { out.append(reinterpret_cast<const char*>(&x), sizeof x); };
+    v(c.encoders.size());
+    for (const Encoder& e : c.encoders) {
+      v(uint64_t(e.kind)), v(uint64_t(e.reason)), v(e.commands.size());
+      for (uint32_t k : e.commands) v(k);
+      v(e.passes), v(e.drawBegin), v(e.drawEnd), v(e.heavy);
+    }
+    v(c.barriers.size());
+    for (const Barrier& b : c.barriers) v(b.encoder), v(b.item), v(b.after), v(b.before), v(b.hazards);
+    v(c.badDraws.size());
+    for (const DrawRef& d : c.badDraws) v(d.command), v(d.draw);
+    for (uint32_t x : c.stats.cuts) v(x);
+    for (uint32_t x : c.stats.hazards) v(x);
+    v(c.stats.commands), v(c.stats.passesMerged), v(c.stats.copiesHoisted), v(c.stats.copiesSunk), v(c.stats.dropped);
+    v(c.stats.intraBarriers), v(c.stats.tileLocal), v(c.stats.tileRejected), v(c.stats.badFetch);
+    return out;
+  };
+  uint32_t barriers = 0, wide = 0, merged = 0;
+  for (int it = 0; it < 600; ++it) {
+    Scene s;
+    std::vector<TextureId> tex;
+    for (int i = 0; i < 4; ++i) tex.push_back(s.rt());
+    std::vector<BufferId> buf;
+    for (int i = 0; i < 4; ++i) buf.push_back(s.buf(8192));
+    const StageMask stages[3] = {stage::vertex, stage::fragment, stage::vertex | stage::fragment};
+    const auto binding = [&](unsigned position) {
+      const unsigned kind = (position + R(8) / 7) % 3;  // (mostly the same kind at the same position, as one material's draws)
+      const StageMask st = stages[R(3)];
+      if (kind == 0) {
+        const ResourceRange r = ResourceRange::bytes(buf[position % 4], 256 * R(2 + R(2)), 256);
+        return R(12) ? read(r, st) : write(r, st);
+      }
+      if (kind == 1) return read(ResourceRange::subresource(tex[R(4)], 0, 1, 0, 1), st);
+      return read(ResourceRange::bytes(buf[R(4)], 0, 8192), st);
+    };
+    Frame f;
+    for (int cmd = 1 + int(R(6)); cmd > 0; --cmd) {
+      const unsigned what = R(10);
+      if (what == 0) {
+        f.dispatch(Scene::compute({write(ResourceRange::bytes(buf[R(4)], 256 * R(4), 512), stage::compute),
+                                   read(ResourceRange::bytes(buf[R(4)], 0, 8192), stage::compute)}));
+      } else if (what == 1) {
+        f.copyBuffer(Scene::span(buf[R(4)], 256 * R(4)), Scene::span(buf[R(4)], 256 * R(4)));
+      } else {
+        const TextureId color = tex[R(2)];
+        f.beginRenderPass(Scene::pass(color));
+        const unsigned width = 3 + R(5);
+        for (int d = 1 + int(R(14)); d > 0; --d) {
+          std::vector<Access> b;
+          for (unsigned k = 0; k < width + (R(9) == 0); ++k) b.push_back(binding(k));
+          if (!R(6)) b.push_back(pixelLocalRead(color));
+          f.draw(Scene::draw(std::move(b)));
+        }
+        f.endRenderPass();
+      }
+    }
+    CompileOptions slow, fast;
+    slow.foldFast = false;
+    CHECK(fast.foldFast);
+    const CompiledFrame a = compileFrame(f, &s.res, fast), b = compileFrame(f, &s.res, slow);
+    CHECK(digest(a) == digest(b));
+    barriers += uint32_t(a.barriers.size());
+    merged += a.stats.passesMerged;
+    for (const Barrier& x : a.barriers) wide += (x.after & stage::vertex) && (x.after & stage::fragment);
+  }
+  std::printf("  fold: 600 frames, %u barriers (%u over both stages), %u passes merged\n", barriers, wide, merged);
+  CHECK(barriers > 0 && wide > 0);  // the generator reaches the stage union
+  {  // Device: VPVK_FRAME_FOLD=0 logs gpu.frame_fold enabled=0; anything else or unset is on
+    for (const char* value : {static_cast<const char*>(nullptr), "0", "1"}) {
+      if (value) setenv("VPVK_FRAME_FOLD", value, 1);
+      std::vector<std::string> log;
+      NullBackend be;
+      Device dev(be, 0, [&](const std::string& l) { log.push_back(l); });
+      unsetenv("VPVK_FRAME_FOLD");
+      size_t lines = 0;
+      for (const std::string& l : log) lines += l == (value && value[0] == '0' ? "gpu.frame_fold enabled=0" : "gpu.frame_fold enabled=1");
+      CHECK_EQ(lines, size_t{1});
+    }
+  }
+}
+
+// LabelQueue::pending() answers a range outside the span of the queued entries without the lock (VPKENGINE_HAZARD_MEMO_OFF=1: always
+// under it): the same answers as the long way for random adds, releases, drops and queries at the span's edges.
+void testLabelSpan() {
+  std::mt19937 rng(4242);
+  auto R = [&](unsigned n) { return unsigned(rng() % n); };
+  for (int round = 0; round < 200; ++round) {
+    unsetenv("VPKENGINE_HAZARD_MEMO_OFF");
+    LabelQueue fast;
+    setenv("VPKENGINE_HAZARD_MEMO_OFF", "1", 1);
+    LabelQueue slow;
+    unsetenv("VPKENGINE_HAZARD_MEMO_OFF");
+    uint64_t frame = 0, completed = 0;
+    const auto both = [&](auto&& f) {
+      f(fast);
+      f(slow);
+    };
+    for (int op = 0; op < 60; ++op) {
+      const unsigned what = R(10);
+      const uint64_t address = 0x1000 + 16 * R(64);
+      const uint32_t size = R(6) == 0 ? 0 : 4 * (1 + R(8));
+      if (what < 3) {
+        const bool pure = R(2);
+        both([&](LabelQueue& q) { q.add(frame, address, size, [] {}, pure); });
+        if (R(3) == 0) ++frame;
+      } else if (what == 3) {
+        both([&](LabelQueue& q) { q.markOrdered(address, size); });
+      } else if (what == 4) {
+        both([&](LabelQueue& q) { q.supersede(address, 16 * R(32), 0, 0); });
+      } else if (what == 5) {
+        completed = std::min(frame + 1, completed + R(3));
+        both([&](LabelQueue& q) { q.release(completed); });
+      }
+      for (int k = 0; k < 8; ++k) {  // queries at and around every edge
+        const uint64_t a = 0x1000 + 16 * R(70) - (R(2) ? 4 : 0);
+        const uint32_t n = R(5) ? 4 * (1 + R(6)) : R(3);
+        CHECK(fast.pending(a, n) == slow.pending(a, n));
+        CHECK(fast.waitTarget(a, n) == slow.waitTarget(a, n));
+      }
+      CHECK(fast.empty() == slow.empty() && fast.size() == slow.size());
+    }
+  }
+}
+
 int main(int argc, char** argv) {
   const std::vector<std::pair<const char*, std::function<void()>>> groups = {
       {"resources", testResources}, {"commands", testCommands}, {"merge", testMerge},
@@ -4392,7 +4525,8 @@ int main(int argc, char** argv) {
       {"submit", testSubmit},       {"hoist", testHoist},       {"hold", testHold},
       {"label_queue", testLabelQueue}, {"defaults", testDefaults}, {"locks", testLocks}, {"parallel", testParallel},
       {"nullrun", testNullRun},
-      {"automsaa", testAutoMsaa}, {"required_dispatch", testRequiredDispatch}, {"frameopt", testFrameOpt}};
+      {"automsaa", testAutoMsaa}, {"required_dispatch", testRequiredDispatch}, {"frameopt", testFrameOpt},
+      {"fold_equal", testFoldEqual}, {"label_span", testLabelSpan}};
   bool ran = false;
   for (const auto& [name, fn] : groups) {
     if (argc > 1 && std::strcmp(argv[1], name) != 0) continue;

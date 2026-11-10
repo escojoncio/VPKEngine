@@ -8,6 +8,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <cstdlib>
 #include <deque>
 #include <functional>
 #include <mutex>
@@ -73,6 +74,14 @@ class LabelQueue {
   std::atomic<bool> again_{false};  // a tryRelease found runMutex_ taken: the holder looks again
   std::deque<Entry> queue_;
   std::atomic<size_t> count_{0};  // queue_.size(), written under mutex_
+  // The memory span [spanLo_, spanHi_) of every entry queued since the queue was last empty (written under mutex_): pending() of a
+  // range outside it is answered without the lock (a host asks it for every small buffer of every draw while a few labels wait
+  // somewhere else in memory). VPKENGINE_HAZARD_MEMO_OFF=1: always under the lock, as before.
+  std::atomic<uint64_t> spanLo_{~uint64_t(0)}, spanHi_{0};
+  const bool spanCheck_ = [] {
+    const char* e = std::getenv("VPKENGINE_HAZARD_MEMO_OFF");
+    return !(e && e[0] == '1');
+  }();
 };
 
 }  // namespace vpgpu

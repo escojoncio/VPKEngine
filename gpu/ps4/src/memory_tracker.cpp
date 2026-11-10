@@ -17,6 +17,18 @@ std::map<uint64_t, MemoryTracker::Span>::const_iterator MemoryTracker::firstOver
 
 void MemoryTracker::assign(uint64_t begin, uint64_t end, const Span& value) {
     if (begin >= end) return;
+    // (the same range again, e.g. an image that marks its write at every draw into it: the span is that one, with the new value.
+    // The long way below cuts it to nothing, erases it and inserts it again)
+    if (const auto same = rewriteInPlace_ ? spans_.find(begin) : spans_.end(); same != spans_.end() && same->second.end == end) {
+        // (an image that writes its own interval again changes its version only: see layout())
+        if (!isImage(value.writer) || same->second.writer != value.writer || same->second.stale != value.stale) ++layout_;
+        same->second = value;
+        same->second.end = end;
+        peak_ = std::max(peak_, spans_.size());
+        if (spans_.size() > kMaxIntervals) forgetHistory();
+        return;
+    }
+    ++layout_;
     auto it = spans_.upper_bound(begin);
     if (it != spans_.begin()) {
         auto p = std::prev(it);
@@ -128,18 +140,21 @@ void MemoryTracker::staleOwners(uint64_t address, uint64_t size, std::vector<Own
 }
 
 void MemoryTracker::markSynced(WriterId writer) {
+    ++layout_;
     ++sweeps_, swept_ += spans_.size();
     for (auto& [b, s] : spans_)
         if (s.writer == writer) s.stale = false;
 }
 
 void MemoryTracker::release(WriterId writer) {
+    ++layout_;
     ++sweeps_, swept_ += spans_.size();
     for (auto& [b, s] : spans_)
         if (s.writer == writer) s.writer = kNone, s.stale = false;
 }
 
 void MemoryTracker::forgetHistory() {
+    ++layout_;
     ++forgetCalls_;
     floor_ = counter_;
     for (auto it = spans_.begin(); it != spans_.end();) {

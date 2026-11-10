@@ -206,12 +206,39 @@ vpgpu::BindKind bindKind(vpir::ResourceKind k) {
     return vpgpu::BindKind::Auto;
 }
 
+// An opt-out variable is on only with the value 1.
+bool optedOut(const char* name) {
+    const char* e = std::getenv(name);
+    return e && e[0] == '1';
+}
+
 }  // namespace
 
 struct Renderer::Impl {
-    explicit Impl(Renderer& owner) : r(owner) {}
+    explicit Impl(Renderer& owner) : r(owner) { tracker.setRewriteInPlace(hazardMemo); }
     Renderer& r;
     vpgpu::Frame frame;
+    // Per-draw shortcuts (each records exactly what the long way records; the equivalence tests of perdraw_tests.cpp run every
+    // script both ways). VPKENGINE_HAZARD_MEMO_OFF=1: the hazard bookkeeping of a draw (touch, noteCpuRead, the tracker) looks its
+    // ranges up in the maps every time. VPKENGINE_PROGRAM_MEMO_OFF=1: a program's words are hashed at every draw instead of compared
+    // with the copy kept of them. VPKENGINE_BIND_MEMO_OFF=1: a stage's user data is looked for among all the recent uploads.
+    bool hazardMemo = !optedOut("VPKENGINE_HAZARD_MEMO_OFF");
+    bool programMemoOn = !optedOut("VPKENGINE_PROGRAM_MEMO_OFF");
+    bool bindMemo = !optedOut("VPKENGINE_BIND_MEMO_OFF");
+    // Ranges a map of ranges (cpuRead, busy) was found to hold whole, by where the range asked for starts (direct mapped). The maps
+    // only grow (ranges merge, none is taken out but by a clear, which clears this too), so each is inside a range of the map as it
+    // is now, and finding a range inside one says what the map would say, without walking it.
+    struct RecentRanges {
+        std::array<std::pair<uint64_t, uint64_t>, 64> range{};
+        static size_t slot(uint64_t lo) { return size_t((lo >> 8) * 0x9E3779B97F4A7C15ull >> 58); }
+        const std::pair<uint64_t, uint64_t>* holding(uint64_t lo, uint64_t hi) const {
+            const auto& x = range[slot(lo)];
+            return lo >= x.first && hi <= x.second ? &x : nullptr;
+        }
+        // The map holds [lo, hi) whole, in its range [first, last).
+        void note(uint64_t lo, uint64_t first, uint64_t last) { range[slot(lo)] = {first, last}; }
+        void clear() { range.fill({0, 0}); }
+    };
 
     // Why a T# whose memory an image of the renderer wrote last is not read through that image (see aliasWriter; QUAL alias_rejected_*).
     enum AliasReject : unsigned { kRejDepth, kRejAddress, kRejShape, kRejLayout, kRejMips, kRejSamples, kRejFormat, kRejNoView, kRejRange, kRejFeedback, kAliasReasons };
@@ -310,6 +337,22 @@ struct Renderer::Impl {
     static constexpr uint64_t kRefusedFrames = 120;
     // By (base, size) of the region: windows with the same base and another end (one widened over a boundary) coexist.
     std::map<std::pair<uint64_t, uint64_t>, GuestBuffer> guestBuffers;
+    // What the tracker says of a range no GPU writer has an interval in: nothing to write back before a raw access of it, and its
+    // version. Remembered per range (direct mapped) for as long as the tracker's intervals stay as they are (MemoryTracker::layout),
+    // so the buffers every draw binds again are not looked up in the tracker's map three times each. A range the GPU wrote is not
+    // remembered: the tracker is asked every time.
+    struct QuietRange {
+        uint64_t address = 0, size = 0, layout = ~uint64_t(0), version = 0;
+    };
+    std::array<QuietRange, 256> quietRanges;
+    const QuietRange* quiet(uint64_t address, uint64_t size) {
+        if (!hazardMemo) return nullptr;
+        QuietRange& q = quietRanges[size_t(((address >> 4) ^ size * 0x9E3779B1ull) * 0x9E3779B97F4A7C15ull >> 56)];
+        if (q.address == address && q.size == size && q.layout == tracker.layout()) return &q;
+        if (tracker.gpuWritten(address, size)) return nullptr;
+        q = {address, size, tracker.layout(), tracker.version(address, size)};
+        return &q;
+    }
     // Buffers replaced while frames in flight may still use them: destroyed kFrames submits later.
     struct Retired {
         BufferId id;
@@ -375,6 +418,7 @@ struct Renderer::Impl {
     // for the first time while a recorded DMA over it is pending is not covered (it reads old bytes).
     std::map<uint64_t, uint64_t> cpuRead;
     uint64_t cpuReadLo = 0, cpuReadHi = 0;
+    RecentRanges cpuReadRecent;
     bool cpuReadAll = false;  // too many ranges: no DMA goes to the GPU any more
     static constexpr size_t kCpuReadRanges = 4096;
     std::map<uint64_t, std::pair<uint64_t, const char*>> cpuReadFirst;  // probe: [start] -> (end, first reader), unmerged, capped
@@ -399,14 +443,28 @@ struct Renderer::Impl {
             probeStaleRead(a, n, by);
             if (cpuReadFirst.size() < kCpuReadRanges) cpuReadFirst.emplace(lo, std::pair{hi, by});
         }
+        // (a draw reads the same few ranges as the one before, in turn: code, tables, constants. One already read whole leaves the
+        // map as it is; the long way takes its range out and puts it back)
+        if (hazardMemo)
+            if (const auto* known = cpuReadRecent.holding(lo, hi)) {
+                cpuReadLo = known->first, cpuReadHi = known->second;
+                return;
+            }
+        const uint64_t asked = lo;
         auto it = cpuRead.upper_bound(lo);
         if (it != cpuRead.begin()) {
             auto prev = std::prev(it);
+            if (hazardMemo && prev->second >= hi) {
+                cpuReadLo = prev->first, cpuReadHi = prev->second;
+                cpuReadRecent.note(asked, cpuReadLo, cpuReadHi);
+                return;
+            }
             if (prev->second >= lo) lo = prev->first, hi = std::max(hi, prev->second), it = cpuRead.erase(prev);
         }
         while (it != cpuRead.end() && it->first <= hi) hi = std::max(hi, it->second), it = cpuRead.erase(it);
         cpuRead[lo] = hi;
         cpuReadLo = lo, cpuReadHi = hi;
+        if (hazardMemo) cpuReadRecent.note(asked, lo, hi);
         if (cpuRead.size() > kCpuReadRanges) {  // merge neighbours closer than 1 MiB; still too many: give up
             for (auto m = cpuRead.begin(); m != cpuRead.end();) {
                 auto next = std::next(m);
@@ -572,6 +630,11 @@ struct Renderer::Impl {
     // The last range touch() left in `busy` (merged): most buffers of a draw lie in it already.
     // Whoever empties `busy` forgets it.
     uint64_t touchedLo = 0, touchedHi = 0;
+    RecentRanges touchedRecent;  // (and the few before it: a draw's buffers lie in several ranges, bound in turn)
+    void forgetTouched() {
+        touchedLo = touchedHi = 0;
+        touchedRecent.clear();
+    }
     // Probe only: what made each range of `busy` (by its start; a merged range keeps the first one's), `touchWho` being
     // what is recording now (see Who). DMASYNC names it.
     std::map<uint64_t, const char*> busyWho;
@@ -588,6 +651,11 @@ struct Renderer::Impl {
         const vpgpu::probe::ScopedSampled touchScope(touchTimer);  // (hot: calls exact, time estimated from 1 in 16)
         uint64_t lo = a, hi = a + n < a ? ~uint64_t(0) : a + n;
         if (lo >= touchedLo && hi <= touchedHi) return;
+        if (hazardMemo)
+            if (const auto* known = touchedRecent.holding(lo, hi)) {
+                touchedLo = known->first, touchedHi = known->second;
+                return;
+            }
         const bool probing = vpgpu::probe::enabled();
         const char* who = touchWho;
         auto it = busy.upper_bound(lo);
@@ -596,6 +664,7 @@ struct Renderer::Impl {
             if (prev->second >= lo) {
                 if (prev->second >= hi) {  // already covered
                     touchedLo = prev->first, touchedHi = prev->second;
+                    if (hazardMemo) touchedRecent.note(a, touchedLo, touchedHi);
                     return;
                 }
                 lo = prev->first;
@@ -612,6 +681,7 @@ struct Renderer::Impl {
         busy[lo] = hi;
         if (probing) busyWho[lo] = who;
         touchedLo = lo, touchedHi = hi;
+        if (hazardMemo) touchedRecent.note(a, lo, hi);
         if (busy.size() > kBusyRanges) coalesceBusy();
     }
     // Too many ranges: the closest neighbours merge (a quarter of them) instead of everything becoming busy, so
@@ -633,7 +703,7 @@ struct Renderer::Impl {
                 ++it;
             }
         }
-        touchedLo = touchedHi = 0;
+        forgetTouched();
     }
     bool busyOverlaps(uint64_t a, uint64_t n) const {
         if (busyAll) return true;
@@ -885,14 +955,25 @@ struct Renderer::Impl {
     };
     std::array<UserDataCopy, 128> userDataCopies;
     unsigned userDataNext = 0;
+    // Most user data is new (a pointer to the draw's own constants): a bit per hash value of the copies made into the current
+    // ring says at once that none of the remembered ones can match, without looking at all of them. A bit stays set when its
+    // copy is forgotten: it then only costs the look.
+    std::array<uint64_t, 256> userDataBits{};
+    uint64_t userDataBitsGeneration = ~uint64_t(0);
     std::optional<uint64_t> uploadUserData(const std::array<uint32_t, 16>& d) {
         uint64_t h = 0xcbf29ce484222325ull;
         for (uint32_t w : d) h = (h ^ w) * 0x100000001b3ull;
-        for (const UserDataCopy& c : userDataCopies)
-            if (c.hash == h && c.generation == ringGeneration && c.data == d) {
-                ++r.cpu_.userDataReused;
-                return c.at;
-            }
+        const size_t bit = size_t(h ^ h >> 32) % (64 * userDataBits.size());
+        const auto syncBits = [&] {
+            if (userDataBitsGeneration != ringGeneration) userDataBits.fill(0), userDataBitsGeneration = ringGeneration;
+        };
+        syncBits();
+        if (!bindMemo || (userDataBits[bit / 64] >> (bit % 64) & 1))
+            for (const UserDataCopy& c : userDataCopies)
+                if (c.hash == h && c.generation == ringGeneration && c.data == d) {
+                    ++r.cpu_.userDataReused;
+                    return c.at;
+                }
         auto at = upload(d.data(), sizeof d, 16);
         if (!at) return at;
         UserDataCopy& c = userDataCopies[userDataNext++ % userDataCopies.size()];
@@ -900,6 +981,8 @@ struct Renderer::Impl {
         c.hash = h;
         c.at = *at;
         c.generation = ringGeneration;
+        syncBits();  // (the upload may have chained the ring: the copies before it are gone)
+        userDataBits[bit / 64] |= uint64_t(1) << (bit % 64);
         return at;
     }
 
@@ -953,12 +1036,17 @@ struct Renderer::Impl {
         if (address % 16) return ++snapNo[1], false;
         if (overlaps(flatReach, false, address, size)) return ++snapNo[2], false;
         // (once the CPU reads are no longer followed, everything counts as read: then only a range the old ranges cover whole does)
-        const auto covering = cpuRead.upper_bound(address);
-        if (cpuReadAll ? covering == cpuRead.begin() || std::prev(covering)->second < address + size : !cpuReadSeen(address, size)) return ++snapNo[3], false;
+        const auto covered = [&] {
+            const auto covering = cpuRead.upper_bound(address);
+            return covering != cpuRead.begin() && std::prev(covering)->second >= address + size;
+        };
+        // (a range the last draws read on the CPU, whole, was seen: no walk of the map)
+        const bool recent = hazardMemo && !cpuReadAll && cpuReadRecent.holding(address, address + size);
+        if (!recent && (cpuReadAll ? !covered() : !cpuReadSeen(address, size))) return ++snapNo[3], false;
         if (tracker.forgetHistoryCalls() != snapForgets)
             snapForgets = tracker.forgetHistoryCalls(), snapAfter = r.device_.submittedFrames() + 1;
         if (r.device_.completedFrames() < snapAfter) return ++snapNo[4], false;
-        if (tracker.gpuWritten(address, size)) return ++snapNo[5], false;
+        if (hazardMemo ? !quiet(address, size) : tracker.gpuWritten(address, size)) return ++snapNo[5], false;
         if (r.device_.labelsQueued() && r.device_.labelPending(address, uint32_t(size))) return ++snapNo[6], false;
         return true;
     }
@@ -986,13 +1074,14 @@ struct Renderer::Impl {
         if (tracker.forgetHistoryCalls() != snapForgets)
             snapForgets = tracker.forgetHistoryCalls(), snapAfter = r.device_.submittedFrames() + 1;
         if (r.device_.completedFrames() < snapAfter) return ++pointerNo[2], false;
-        if (tracker.gpuWritten(address, size)) return ++pointerNo[3], false;
+        if (hazardMemo ? !quiet(address, size) : tracker.gpuWritten(address, size)) return ++pointerNo[3], false;
         if (r.device_.labelsQueued() && r.device_.labelPending(address, uint32_t(size))) return ++pointerNo[4], false;
         return true;
     }
     std::optional<uint64_t> alignedConstantCopy(uint64_t address, uint64_t bytes, const void* host) {
         if (alignedGeneration != ringGeneration || alignedCopies.size() >= kAlignedCopies) forgetAlignedCopies();
-        const AlignedKey key{address, bytes, tracker.version(address, bytes)};
+        const QuietRange* q = quiet(address, bytes);
+        const AlignedKey key{address, bytes, q ? q->version : tracker.version(address, bytes)};
         const auto it = alignedCopies.find(key);
         // (the CPU may have rewritten the source without the tracker hearing of it: the bytes decide)
         if (it != alignedCopies.end() && std::memcmp(static_cast<const uint8_t*>(rings[ringIndex].memory) + it->second, host, bytes) == 0) {
@@ -1687,8 +1776,13 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         size_t codeWords = 0, fetchWords = 0;
         uint64_t rest = 0, key = 0, generation = ~uint64_t(0);
         uint64_t content = 0;  // sampleRange of the code and the fetch words when the key was made
+        // A program whose code and fetch words sampleRange would hash whole (kSampleWhole each): the words themselves when the
+        // key was made (code, then fetch), compared instead of hashed (the same answer, several times faster). `copied`: set.
+        std::vector<uint32_t> words;
+        bool copied = false;
     };
-    std::array<ProgramMemo, 64> programMemo;
+    // (64 entries with VPKENGINE_PROGRAM_MEMO_OFF, as before: a title's hundred programs shared them two to an entry)
+    std::array<ProgramMemo, 256> programMemo;
     uint64_t programGeneration = 0;
     FetchAddressMemo fetchMemo;
     uint64_t programKeyCached(const Stage& s, vpgcn::ShaderStage stage) {
@@ -1699,15 +1793,26 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         noteCpuRead(s.address, s.code.size() * 4, "code");
         if (!s.fetch.empty())  // (the fetch subroutine is read on the CPU too: where it lives is what the user data and the code say)
             if (const uint64_t fa = fetchMemo.address(s.code, s.userData, s.userSgprs)) noteCpuRead(fa, s.fetch.size() * 4, "fetch");
+        ProgramMemo& m = programMemo[(reinterpret_cast<uintptr_t>(s.code.data()) >> 4 ^ uintptr_t(stage)) % (programMemoOn ? programMemo.size() : 64)];
+        const bool sameSpans = m.generation == programGeneration && m.code == s.code.data() && m.codeWords == s.code.size() &&
+                               m.fetch == s.fetch.data() && m.fetchWords == s.fetch.size() && m.rest == rest;
+        if (programMemoOn && s.code.size() * 4 <= kSampleWhole && s.fetch.size() * 4 <= kSampleWhole) {
+            if (sameSpans && m.copied && (s.code.empty() || std::memcmp(m.words.data(), s.code.data(), s.code.size() * 4) == 0) &&
+                (s.fetch.empty() || std::memcmp(m.words.data() + s.code.size(), s.fetch.data(), s.fetch.size() * 4) == 0))
+                return m.key;
+            m.code = s.code.data(), m.fetch = s.fetch.data(), m.codeWords = s.code.size(), m.fetchWords = s.fetch.size();
+            m.rest = rest, m.generation = programGeneration, m.content = 0, m.copied = true;
+            m.words.assign(s.code.begin(), s.code.end());
+            m.words.insert(m.words.end(), s.fetch.begin(), s.fetch.end());
+            return m.key = programKey(s, stage);
+        }
         const uint64_t content =
             mix(sampleRange(reinterpret_cast<const uint8_t*>(s.code.data()), s.code.size() * 4),
                 sampleRange(reinterpret_cast<const uint8_t*>(s.fetch.data()), s.fetch.size() * 4));
-        ProgramMemo& m = programMemo[(reinterpret_cast<uintptr_t>(s.code.data()) >> 4 ^ uintptr_t(stage)) % programMemo.size()];
-        if (m.generation == programGeneration && m.code == s.code.data() && m.codeWords == s.code.size() &&
-            m.fetch == s.fetch.data() && m.fetchWords == s.fetch.size() && m.rest == rest && m.content == content)
-            return m.key;
-        m = {s.code.data(), s.fetch.data(), s.code.size(), s.fetch.size(), rest, programKey(s, stage), programGeneration, content};
-        return m.key;
+        if (sameSpans && !m.copied && m.content == content) return m.key;
+        m.code = s.code.data(), m.fetch = s.fetch.data(), m.codeWords = s.code.size(), m.fetchWords = s.fetch.size();
+        m.rest = rest, m.generation = programGeneration, m.content = content, m.copied = false;
+        return m.key = programKey(s, stage);
     }
 
     // The sample layout an FMASK T# describes: the multisampled colour surface it belongs to. Its base
@@ -2842,7 +2947,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
     // is not written back (the write takes its bytes over). True if work was recorded.
     bool syncRefused = false;  // set by syncOwners when an image ahead of memory could not be written back
     bool syncOwners(uint64_t address, uint64_t size, bool write, uint32_t except = 0) {
-        if (!size || tracker.ownerImage(address, size) == 0) return false;
+        if (!size || quiet(address, size) || tracker.ownerImage(address, size) == 0) return false;
         std::vector<MemoryTracker::Owner> owners;
         tracker.staleOwners(address, size, owners, except);
         bool any = false;
@@ -4797,7 +4902,6 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         td.usage = vpgpu::usage::sampled | (storage ? vpgpu::usage::storage : 0);
         if (r.hooks_.view && vpgpu::formatInfo(f).blockSize == 1 && !vpgpu::formatInfo(f).depth())
             td.usage |= vpgpu::usage::formatView;
-        td.label = "tex " + hex(d.address);
 
         Hash h;
         h.value(f);
@@ -4861,6 +4965,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
             ++texGen;
         }
         if (!tex.id) {
+            td.label = "tex " + hex(d.address);  // (only a texture that is made has a use for it)
             tex.id = r.device_.createTexture(td);
             if (!tex.id) return texWhy = invalidTexture(td), TexRef{};
             tex.storage = storage;
@@ -5637,6 +5742,14 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
 
     // ---- Draws ------------------------------------------------------------------------------------
 
+    struct Drawn {
+        uint64_t address;
+        TextureId id;
+        uint32_t wid;
+    };
+    std::vector<Drawn> drawnScratch;
+    std::vector<std::pair<unsigned, TargetIds>> colorIdsScratch;
+
     void draw(const DrawState& d) {
         if (cap.user && d.depth.zFormat && d.depth.depthClear) capNewView(d.depth.zAddress);
         pollCache();
@@ -5652,12 +5765,8 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         // Targets.
         vpgpu::RenderPassDesc desc;
         vpgpu::PipelineState ps;
-        struct Drawn {
-            uint64_t address;
-            TextureId id;
-            uint32_t wid;
-        };
-        std::vector<Drawn> drawnColors;
+        std::vector<Drawn>& drawnColors = drawnScratch;  // (the draw's own lists, kept for their capacity)
+        drawnColors.clear();
         uint32_t depthWid = 0;
         pendingViews.clear();
         attachedWids.clear();
@@ -5695,7 +5804,8 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
             msFragments = samples;
         }
         if (plan.eqaa && samples > 1) note("EQAA: the depth buffer has more samples than the colour stores; the host draws with the colour's");
-        std::vector<std::pair<unsigned, TargetIds>> colorIds;
+        std::vector<std::pair<unsigned, TargetIds>>& colorIds = colorIdsScratch;
+        colorIds.clear();
         // A depth-only draw on a multisampled depth target keeps the colour target the draws that read that depth wrote
         // attached, unwritten: the passes around it are one pass (see depthPartners).
         const DepthPartner* partner = nullptr;
@@ -6165,6 +6275,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
             gsJob.views = std::move(pendingViews);
             pendingViews.clear();
         }
+        draw.bindings.reserve(vs->bindings.size() + (fs ? fs->bindings.size() : 0) + 2);  // (both stages' and their user data: one allocation)
         if (!bind(*vsSrc, *vs, geom ? vpgcn::ShaderStage::CopyVertex : vpgcn::ShaderStage::Vertex, vpgpu::stage::vertex, draw.bindings, why))
             return skip("vs: " + why);
         if (fs && !bind(psStage, *fs, vpgcn::ShaderStage::Pixel, vpgpu::stage::fragment, draw.bindings, why)) return skip("ps: " + why);
@@ -7089,7 +7200,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
             ++r.cpu_.emptySubmits;
             busy.clear(), busyWho.clear();  // (ranges bound by draws that were skipped afterwards)
             busyAll = false;
-            touchedLo = touchedHi = 0;  // (touch() skips ranges inside the last one it added: that set is gone)
+            forgetTouched();  // (touch() skips ranges inside the last ones it added: that set is gone)
             return {};
         }
         const auto t0 = Clock::now();
@@ -7158,7 +7269,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
             busy.clear();
             busyWho.clear();
             busyAll = false;
-            touchedLo = touchedHi = 0;
+            forgetTouched();
             if (inFlight.size() > 64) {  // a GPU far behind: fold the oldest into one "everything"
                 inFlight.pop_front();
                 inFlight.front().all = true;
@@ -7408,7 +7519,7 @@ void Renderer::gpuIdle() {
     impl_->busy.clear();
     impl_->busyWho.clear();
     impl_->busyAll = false;
-    impl_->touchedLo = impl_->touchedHi = 0;
+    impl_->forgetTouched();
     impl_->inFlight.clear();
     impl_->retireOwned(true);
 }

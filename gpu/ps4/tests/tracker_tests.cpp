@@ -141,6 +141,48 @@ void counters() {
     CHECK(t.peakIntervals() == MemoryTracker::kMaxIntervals + 1);
 }
 
+// layout() moves with every change of the intervals but one image writing its own interval again whole (the renderer remembers
+// what the tracker said of a range for as long as it stays the same).
+void layoutCounter() {
+    MemoryTracker t;
+    const auto img = t.newImage(), other = t.newImage();
+    uint64_t seen = t.layout();
+    const auto moved = [&] {
+        const bool m = t.layout() != seen;
+        seen = t.layout();
+        return m;
+    };
+    t.markCpuWrite(0x1000, 0x100);
+    CHECK(moved());  // a new interval
+    t.markCpuWrite(0x1000, 0x100);
+    CHECK(moved());  // the CPU rewrites it in place
+    t.markGpuWrite(0x1000, 0x100, img);
+    CHECK(moved());  // an image takes it from the CPU
+    t.markGpuWrite(0x1000, 0x100, img);
+    CHECK(!moved());  // the same image, the same interval: only its version changes
+    t.markGpuWrite(0x1000, 0x100, other);
+    CHECK(moved());  // another image
+    t.markGpuWrite(0x1000, 0x100, MemoryTracker::kGpuRaw);
+    CHECK(moved());  // a raw write
+    t.markGpuWrite(0x1000, 0x100, img);
+    CHECK(moved());
+    t.markGpuWrite(0x1000, 0x80, img);
+    CHECK(moved());  // part of the interval
+    t.markSynced(img);
+    CHECK(moved());
+    t.markGpuWrite(0x1000, 0x80, img);
+    CHECK(moved());  // the image's claim was synced: it is stale again
+    t.release(img);
+    CHECK(moved());
+    t.forgetHistory();
+    CHECK(moved());  // (a call of its own: it moves the floor of every version)
+    t.setRewriteInPlace(false);
+    t.markGpuWrite(0x2000, 0x100, img);
+    moved();
+    t.markGpuWrite(0x2000, 0x100, img);
+    CHECK(moved());  // (rewriting in place off: the long way always counts)
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -151,6 +193,7 @@ int main(int argc, char** argv) {
     else if (n == "forgetting") forgetting();
     else if (n == "bounded") bounded();
     else if (n == "counters") counters();
+    else if (n == "layout") layoutCounter();
     else return std::fprintf(stderr, "unknown test\n"), 2;
     return failures ? 1 : 0;
 }

@@ -19,6 +19,10 @@ void LabelQueue::add(uint64_t frame, uint64_t address, uint32_t size, std::funct
   std::lock_guard lock(mutex_);
   // Frames only grow: an entry never needs to run before one added earlier.
   if (!queue_.empty()) frame = std::max(frame, queue_.back().frame);
+  if (size) {
+    spanLo_.store(std::min(spanLo_.load(std::memory_order_relaxed), address), std::memory_order_relaxed);
+    spanHi_.store(std::max(spanHi_.load(std::memory_order_relaxed), address + size), std::memory_order_relaxed);
+  }
   queue_.push_back({frame, address, size, std::move(action), pureWrite});
   count_.store(queue_.size(), std::memory_order_release);
 }
@@ -98,6 +102,7 @@ size_t LabelQueue::runOnce(const std::function<uint64_t()>& completed) {
       std::lock_guard lock(mutex_);
       queue_.pop_front();
       count_.store(queue_.size(), std::memory_order_release);
+      if (queue_.empty()) spanLo_.store(~uint64_t(0), std::memory_order_relaxed), spanHi_.store(0, std::memory_order_relaxed);
     }
     ++ran;
   }
@@ -128,6 +133,8 @@ size_t LabelQueue::supersede(uint64_t address, uint64_t size, uint64_t keepAddre
 }
 
 bool LabelQueue::pending(uint64_t address, uint32_t size) const {
+  if (spanCheck_ && (address >= spanHi_.load(std::memory_order_relaxed) || address + size <= spanLo_.load(std::memory_order_relaxed)))
+    return false;
   std::lock_guard lock(mutex_);
   for (const Entry& e : queue_)
     if (overlap(address, size, e.address, e.size)) return true;

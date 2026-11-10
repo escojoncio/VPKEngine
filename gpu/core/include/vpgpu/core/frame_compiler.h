@@ -281,6 +281,9 @@ struct CompileOptions {
   // false (Device: VPVK_FRAME_OPT=0): no pass is merged into an open render encoder and no copy is hoisted or sunk: every command
   // keeps its recorded position (an A/B switch against the optimiser; the hazards still get their barriers). Default true.
   bool frameOpt = true;
+  // false (Device: VPVK_FRAME_FOLD=0): the accesses of a render pass's draws are folded through a map, one vector per draw,
+  // as before. The compiled frame is the same either way (only the time to build it differs). Default true.
+  bool foldFast = true;
   // The limit Device started with while tileMaxVertices is a raised one (0 = not raised): CompileStats::tileRaised counts the
   // encoders that only the raised limit keeps off HeavyGeometry.
   uint64_t tileBaseVertices = 0;

@@ -274,13 +274,79 @@ uint64_t colorBytes(const RenderPassDesc& a, const RenderPassDesc& b, const Reso
   return n;
 }
 
-AccessList accessesOf(const Command& cmd, bool copyRects) {
+// foldInto for the draws of one render pass without a map node per folded access nor a vector per draw (a pass of a few
+// hundred draws spent most of compileFrame there): the folded accesses are found through an open-addressed table of their
+// indices in the list, and a binding that is the same as the one at its position in the draw before (the usual case: one
+// material drawn many times) is found there without hashing. The list it leaves is the one foldInto leaves: the same
+// accesses in the same order (first sighting), stages OR-ed. Kept between passes and frames for its capacity only.
+class DrawFolder {
+ public:
+  void pass(AccessList& out, const RenderPass& rp) {
+    slots_.assign(256, 0);
+    used_ = 0;
+    prev_.clear();
+    for (const Draw& d : rp.draws) {
+      scratch_.clear();
+      appendDrawAccesses(d, scratch_);
+      prev_.resize(scratch_.size(), UINT32_MAX);
+      for (size_t k = 0; k < scratch_.size(); ++k) prev_[k] = fold(out, scratch_[k], prev_[k]);
+    }
+  }
+
+ private:
+  static FoldKey keyOf(const Access& a, bool attachment) {
+    const ResourceRange& r = a.range;
+    return {r.index, r.generation, r.begin, r.end, uint32_t{r.mipBegin} << 16 | r.mipEnd, uint32_t{r.layerBegin} << 16 | r.layerEnd,
+            static_cast<uint8_t>(r.kind), static_cast<uint8_t>(a.write | a.pixelLocal << 1 | attachment << 2)};
+  }
+  // Index in `out` of the access `a` folds into (`hint`: where the same position of the draw before went).
+  uint32_t fold(AccessList& out, const Access& a, uint32_t hint) {
+    const FoldKey k = keyOf(a, a.pixelLocal);
+    if (hint != UINT32_MAX && keyOf(out[hint].access, out[hint].attachment) == k) {
+      out[hint].access.stages |= a.stages;
+      return hint;
+    }
+    if (2 * (used_ + 1) > slots_.size()) grow(out);
+    size_t i = FoldHash()(k) & (slots_.size() - 1);
+    for (; slots_[i]; i = (i + 1) & (slots_.size() - 1)) {
+      const Tagged& t = out[slots_[i] - 1];
+      if (keyOf(t.access, t.attachment) == k) {
+        out[slots_[i] - 1].access.stages |= a.stages;
+        return slots_[i] - 1;
+      }
+    }
+    out.push_back({a, a.pixelLocal});
+    slots_[i] = static_cast<uint32_t>(out.size());
+    ++used_;
+    return static_cast<uint32_t>(out.size() - 1);
+  }
+  void grow(const AccessList& out) {
+    std::vector<uint32_t> old(4 * slots_.size(), 0);
+    old.swap(slots_);
+    for (uint32_t s : old) {
+      if (!s) continue;
+      size_t i = FoldHash()(keyOf(out[s - 1].access, out[s - 1].attachment)) & (slots_.size() - 1);
+      while (slots_[i]) i = (i + 1) & (slots_.size() - 1);
+      slots_[i] = s;
+    }
+  }
+  std::vector<uint32_t> slots_;  // index in the list + 1 of a folded access; 0: free
+  size_t used_ = 0;
+  std::vector<uint32_t> prev_;   // by position in the draw: where the draw before folded it
+  std::vector<Access> scratch_;
+};
+
+AccessList accessesOf(const Command& cmd, bool copyRects, DrawFolder* folder) {
   AccessList out;
   auto add = [&](const std::vector<Access>& list, bool attachment) {
     for (const Access& a : list) out.push_back({a, attachment});
   };
   if (const auto* rp = std::get_if<RenderPass>(&cmd)) {
     add(attachmentAccesses(rp->desc), true);
+    if (folder) {
+      folder->pass(out, *rp);
+      return out;
+    }
     std::unordered_map<FoldKey, uint32_t, FoldHash> seen;
     for (const Draw& d : rp->draws)
       for (const Access& a : drawAccesses(d)) foldInto(out, seen, a, a.pixelLocal);
@@ -1252,8 +1318,9 @@ CompiledFrame compileFrame(const Frame& frame, const ResourceTable* resources, c
   out.stats.commands = static_cast<uint32_t>(cmds.size());
   std::vector<AccessList> accesses(cmds.size());
   Scheduler scheduler(out, resources, options);
+  static thread_local DrawFolder folder;
   for (uint32_t i = 0; i < cmds.size(); ++i) {
-    accesses[i] = accessesOf(cmds[i], options.copyRects);
+    accesses[i] = accessesOf(cmds[i], options.copyRects, options.foldFast ? &folder : nullptr);
     if (resources) {
       bool ok = true;
       for (const Tagged& t : accesses[i]) ok = ok && alive(t.access.range, *resources);

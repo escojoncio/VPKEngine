@@ -94,6 +94,13 @@ public:
     bool staleAt(uint64_t address) const;
 
     static constexpr size_t kMaxIntervals = 1u << 17;
+    // On by default: a write over exactly one existing interval changes it in place (the intervals come out the same; only the
+    // time differs). Off: every write rebuilds the intervals it covers (the renderer's VPKENGINE_HAZARD_MEMO_OFF).
+    void setRewriteInPlace(bool on) { rewriteInPlace_ = on; }
+    // A counter that changes whenever the intervals change in anything but the version of one that the image which wrote it last
+    // writes again whole (a render target marking its write at every draw). While it stays the same, a range that no GPU writer
+    // (image, raw or DMA) has an interval in gets the same answers from version(), gpuWritten(), ownerImage() and writtenByOthers().
+    uint64_t layout() const { return layout_; }
 
 private:
     struct Span {
@@ -108,6 +115,8 @@ private:
     size_t peak_ = 0;
     uint64_t forgetCalls_ = 0;
     uint64_t sweeps_ = 0, swept_ = 0;
+    bool rewriteInPlace_ = true;
+    uint64_t layout_ = 0;
 
     void assign(uint64_t begin, uint64_t end, const Span&);
     std::map<uint64_t, Span>::const_iterator firstOverlap(uint64_t begin) const;
