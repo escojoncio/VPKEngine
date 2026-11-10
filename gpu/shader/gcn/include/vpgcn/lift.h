@@ -239,4 +239,9 @@ struct LiftResult {
 
 LiftResult lift(const LiftInput& input);
 
+// VPGCN_FETCH_GUARDS=1 (read once): the multi-dword and typed buffer loads guard each dword with its own `if`, as before the
+// single range check. It changes the lifted code, so whoever caches translations keys them by it (the build fingerprint
+// of a cache does not include the environment).
+bool perDwordFetchGuards();
+
 }  // namespace vpgcn

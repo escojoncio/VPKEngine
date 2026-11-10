@@ -454,7 +454,7 @@ struct Machine {
                 uint32_t addr = a[0].bits[0];
                 auto rd = [&](uint32_t at) {
                     uint32_t w = 0;
-                    if (at + 4 <= mem.size()) std::memcpy(&w, &mem[at], 4);
+                    if (uint64_t(at) + 4 <= mem.size()) std::memcpy(&w, &mem[at], 4);  // (an address at the top of 32 bits does not wrap)
                     return w;
                 };
                 auto wr = [&](uint32_t at, uint32_t w) {
@@ -462,6 +462,9 @@ struct Machine {
                     std::memcpy(&mem[at], &w, 4);
                 };
                 if (in.op == Op::Load) {
+                    if (in.sym < m.resources.size() && m.resources[in.sym].kind == vpir::ResourceKind::Buffer &&
+                        uint64_t(addr) + 4ull * in.type.width > mem.size())
+                        ++inv.outOfBufferReads;
                     for (unsigned c = 0; c < in.type.width; ++c) out.bits[c] = rd(addr + 4 * c);
                     break;
                 }

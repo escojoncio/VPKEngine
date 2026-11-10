@@ -48,6 +48,9 @@ struct Invocation {
     // Results.
     std::map<uint32_t, Value> outputs;  // output index -> last stored value
     bool discarded = false;
+    // Loads of a storage buffer that reach past the bytes held for it (they read 0 there): a test that must see which
+    // addresses a lifted load puts on the bus even when it throws the value away counts them.
+    uint64_t outOfBufferReads = 0;
     // Set by runWorkgroup: the invocations that run together, and this one's index among them.
     WaveState* wave = nullptr;
     unsigned lane = 0;
