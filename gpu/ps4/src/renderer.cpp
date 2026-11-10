@@ -226,6 +226,7 @@ struct Renderer::Impl {
         uint64_t refillSkipped = 0, refillSkippedBytes = 0, refillLines = 0;  // refills of a target left out because only images wrote its range (R1)
         uint64_t fillPath[5] = {}, fillPathBytes[5] = {};                  // none, GPU detile, CPU detile, linear upload, not filled
         uint64_t mirrorCalls = 0, mirrorCopies = 0, mirrorBytes = 0;
+        uint64_t depthPartnerDraws = 0, depthPartnerRetroClears = 0;  // depth-only draws that kept their colour target attached / colour clears that became the load action of the open pass
         uint64_t depthClearFills = 0, depthClearLines = 0;  // layers of a texture given the clear value of their depth buffer (Renderer::depthCleared)
         uint64_t depthAllocLines = 0, depthWritesUntracked = 0, flatTables = 0;  // depth targets made drawn smaller than their allocation (VPKENGINE_PROBE DEPTHALLOC)
         uint64_t msDraws[4][4] = {};  // samples the title asked for (1,2,4,8) x samples the host draws with
@@ -5211,7 +5212,8 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
                         size = d.bytes();
                         stride = d.stride;
                     }
-                    if (!pointer && !a.write && snapshotSafe(address, size)) {
+                    // (also a V# buffer inside a range the command processor writes in order and had to wait for: cpAccess)
+                    if (!pointer && !a.write && (snapshotSafe(address, size) || (size <= kSnapshotBytes && pointerSnapshotSafe(address, size)))) {
                         GuestRegion g;
                         if (region(address, size, g)) {
                             const Phase cbPhase(r.cpu_.bindCbMs);
@@ -5356,6 +5358,19 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
     vpgpu::RenderPassDesc pass;
     bool passOpen = false;
     vpgpu::PassAccessSet passAccess;  // incremental read/write set of the open pass (ES/GS hoisting)
+    uint8_t passSamples = 0;          // host samples of the open pass
+    uint8_t passWritten = 0;          // colour slots its draws have written (a bit each)
+    // A depth-only draw on a multisampled depth target keeps the colour target the draws that read that depth wrote attached
+    // (unwritten): the passes around it are one pass, not a store and a reload of every sample. By depth read address.
+    // VPKENGINE_DEPTH_ONLY_SPLIT=1: split as before.
+    struct DepthPartner {
+        unsigned slot;
+        ColorTarget c;
+        uint8_t samples;
+        uint64_t frame;
+    };
+    std::unordered_map<uint64_t, DepthPartner> depthPartners;
+    bool depthPartnerOff = std::getenv("VPKENGINE_DEPTH_ONLY_SPLIT") != nullptr;
 
     void closePass() {
         if (passOpen) frame.endRenderPass();
@@ -5363,10 +5378,12 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         passAccess.clear();
     }
 
-    void openPass(const vpgpu::RenderPassDesc& want, bool clears) {
+    void openPass(const vpgpu::RenderPassDesc& want, bool clears, uint8_t samples) {
         if (passOpen && !clears && pass.sameTargets(want)) return;
         closePass();
         pass = want;
+        passSamples = samples;
+        passWritten = 0;
         frame.beginRenderPass(pass);
         passOpen = true;
         ++r.stats_.passes;
@@ -5435,9 +5452,20 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         }
         if (plan.eqaa && samples > 1) note("EQAA: the depth buffer has more samples than the colour stores; the host draws with the colour's");
         std::vector<std::pair<unsigned, TargetIds>> colorIds;
+        // A depth-only draw on a multisampled depth target keeps the colour target the draws that read that depth wrote
+        // attached, unwritten: the passes around it are one pass (see depthPartners).
+        const DepthPartner* partner = nullptr;
+        unsigned partnerSlot = 8;  // (the slot attached for it, 8 = none)
+        if (!depthPartnerOff && samples > 1 && zf != vpgpu::Format::Undefined && !std::any_of(fragments.begin(), fragments.end(), [](uint8_t f) { return f != 0; })) {
+            const auto it = depthPartners.find(d.depth.zFormat ? d.depth.zAddress : d.depth.stencilAddress);
+            if (it != depthPartners.end() && it->second.samples == samples && it->second.c.width == d.depth.width && it->second.c.height == d.depth.height &&
+                it->second.c.sliceStart == d.depth.sliceStart && r.frame_ - it->second.frame <= 600)
+                partner = &it->second;
+        }
         for (unsigned i = 0; i < 8; ++i) {
-            const ColorTarget& c = d.color[i];
-            if (!c.format || !c.writeMask) continue;
+            const bool unwritten = partner && i == partner->slot;
+            const ColorTarget& c = unwritten ? partner->c : d.color[i];
+            if (!unwritten && (!c.format || !c.writeMask)) continue;
             const ColorPlan plan = colorPlan(c.format, c.numberType, c.compSwap);
             const vpgpu::Format f = plan.format;
             if (f == vpgpu::Format::Undefined) {
@@ -5446,24 +5474,31 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
                 continue;
             }
             if (!plan.exact && plan.why) note(plan.why);
-            curExport[i] = plan.conv;
+            if (!unwritten) curExport[i] = plan.conv;
             if (!linearTiling(c.tileMode)) note("render targets kept in GPU memory (guest copy not written)");
             vpgpu::Format viewAs = vpgpu::Format::Undefined;
             Target* tg = target(colorTargets, c.address, f, c.width, c.height, samples,
                                 uint16_t(c.sliceStart + c.sliceCount), false, c.tileMode, c.pitch, &viewAs);
-            if (!tg) return skip("colour target creation failed");
+            if (!tg) {
+                if (unwritten) continue;  // (left out, as before)
+                return skip("colour target creation failed");
+            }
             if (samples > 1) tg->msCov = std::max<uint8_t>(samples, c.coverage), tg->msFrag = samples;
             tg->lastDraw = r.frame_;
-            ++tg->draws;
+            if (!unwritten) ++tg->draws;
             refresh(*tg, nullptr);  // another writer changed its memory since it last held it?
-            if (resolved_) {
+            if (resolved_ && !unwritten) {
                 ResolvedTarget& rt = resolved_->color[i];
                 rt = {true, c.address, tg->width, tg->height, c.pitch, c.format, c.numberType, c.compSwap, c.tileMode,
                       c.sliceStart, c.sliceCount, c.samples, vpgpu::formatInfo(f).name, false};  // (`cleared`: set below, when a clear that waited becomes the pass's load action)
             }
             const TargetIds t = idsOf(*tg);
-            colorIds.push_back({i, t});
-            drawnColors.push_back({c.address, t.resolved ? t.resolved : t.render, t.wid});
+            if (!unwritten) {
+                colorIds.push_back({i, t});
+                drawnColors.push_back({c.address, t.resolved ? t.resolved : t.render, t.wid});
+            } else {
+                partnerSlot = i;
+            }
             attachedWids.push_back(t.wid);
             desc.colors[i].texture = t.render;
             desc.colors[i].layer = c.sliceStart;
@@ -5476,13 +5511,17 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
                 desc.colors[i].keepSamples = true;
             }
             ps.colorFormats[i] = f;
-            const BlendResolved br = resolveBlend(d.blend[i], c, vpgpu::formatInfo(f).integer());
-            ps.blend[i] = br.state;
-            if (plan.conv.kind != vpgcn::ExportConv::Packed)
-                ps.blend[i].writeMask = permuteWriteMask(ps.blend[i].writeMask, plan.conv.select);
-            if (br.state.enabled && !br.exact) note("blend factor with an undefined encoding: zero");
-            if (i == 0 && br.dualSource) dualSource = true;
-            if (i != 0 && br.dualSource) note("dual-source blend on a target other than 0 ignored");
+            if (unwritten) {
+                ps.blend[i].writeMask = 0;
+            } else {
+                const BlendResolved br = resolveBlend(d.blend[i], c, vpgpu::formatInfo(f).integer());
+                ps.blend[i] = br.state;
+                if (plan.conv.kind != vpgcn::ExportConv::Packed)
+                    ps.blend[i].writeMask = permuteWriteMask(ps.blend[i].writeMask, plan.conv.select);
+                if (br.state.enabled && !br.exact) note("blend factor with an undefined encoding: zero");
+                if (i == 0 && br.dualSource) dualSource = true;
+                if (i != 0 && br.dualSource) note("dual-source blend on a target other than 0 ignored");
+            }
             width = width ? std::min(width, c.width) : c.width;
             height = height ? std::min(height, c.height) : c.height;
         }
@@ -5622,8 +5661,19 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
                 pc.resolved = t.resolved;
                 pc.value.color = fastClearColor(c.format, c.numberType, c.compSwap, c.clearWord, exact);
                 if (!exact) note("fast clear colour approximated (format not decoded)");
-                closePass();
-                setPendingClear(pc);
+                // The open pass has this colour attached and no draw of it has written it (a depth-only draw's partner): the clear
+                // is that pass's load action, which the recorded pass keeps (`pass` is Load by now), not a cut.
+                vpgpu::RenderPass* open = passOpen && !(passWritten >> i & 1) && pass.colors[i].sameTarget(desc.colors[i]) && frame.openRenderPass()
+                                              ? &std::get<vpgpu::RenderPass>(frame.mutableCommands().back())
+                                              : nullptr;
+                if (open && open->desc.colors[i].load == vpgpu::LoadAction::Load) {
+                    open->desc.colors[i].load = vpgpu::LoadAction::Clear;
+                    open->desc.colors[i].clear = pc.value;
+                    ++pstat.depthPartnerRetroClears;
+                } else {
+                    closePass();
+                    setPendingClear(pc);
+                }
                 markWriteWid(t.wid);
                 any = true;
             }
@@ -5672,7 +5722,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         // DB_ALPHA_TO_MASK: Metal's alpha-to-coverage with several samples; with one, the pixel shader does an
         // alpha test at 0.5 (LiftInput::alphaTest), which is what the coverage mask comes to.
         // (colour 0 must be bound for real: a slot left out, or with its write mask empty, has no alpha to test)
-        const bool color0 = ps.colorFormats[0] != vpgpu::Format::Undefined;
+        const bool color0 = ps.colorFormats[0] != vpgpu::Format::Undefined && partnerSlot != 0;  // (a partner only attached is not written)
         ps.alphaToCoverage = d.alphaToMask && color0 && samples > 1;
         alphaTestNow = d.alphaToMask && color0 && samples <= 1;
 
@@ -6102,7 +6152,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         // A title that stopped asking for occlusion results stops paying for the counting.
         if (vis.active && r.device_.submittedFrames() - vis.lastZpassFrame > Vis::kIdleFrames) vis.active = false;
         if (vis.active) draw.visibility = vpgpu::BufferSpan{vis.id, (vis.seq % kVisSlots) * 8, 8};
-        openPass(desc, clears);
+        openPass(desc, clears, samples);
         if (cap.armed) {
             cap.passSampled.insert(cap.passSampled.end(), cap.drawSampled.begin(), cap.drawSampled.end());
             cap.drawSampled.clear();
@@ -6120,6 +6170,16 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         }
         if (!frame.draw(std::move(draw))) return skip("no open pass");
         ++r.stats_.drawn;
+        for (const auto& entry : colorIds) passWritten |= uint8_t(1u << entry.first);
+        if (partnerSlot < 8) ++pstat.depthPartnerDraws;
+        // A draw that reads and writes one colour target of a multisampled depth target's size: the depth-only draws of that depth
+        // keep it attached from now on.
+        if (samples > 1 && zf != vpgpu::Format::Undefined && colorIds.size() == 1) {
+            const unsigned slot = colorIds[0].first;
+            const ColorTarget& c = d.color[slot];
+            if (c.width == z.width && c.height == z.height && c.sliceStart == z.sliceStart)
+                depthPartners[z.zFormat ? z.zAddress : z.stencilAddress] = {slot, c, samples, r.frame_};
+        }
         // What the pass wrote: those images now hold the newest bytes of their ranges.
         for (const Drawn& dc : drawnColors) {
             latestColor[dc.address] = dc.id;
@@ -6973,6 +7033,7 @@ void Renderer::submittedIdle() {
     impl_->retireOwned(true);
 }
 bool Renderer::hasRecordedWork() const { return !impl_->frame.commands().empty(); }
+bool Renderer::multisampledPassOpen() const { return impl_->passOpen && impl_->passSamples > 1; }
 uint64_t Renderer::recordedCommands() const { return impl_->frame.commands().size(); }
 uint64_t Renderer::waitTarget(uint64_t a, uint64_t n, uint64_t b, uint64_t m) const {
     Impl& i = *impl_;
@@ -7117,6 +7178,7 @@ void Renderer::publishProbe(uint64_t pictures) {
         C(f, "pictures", pictures);
         C(f, "aligned_copies", ps.alignedCopies), C(f, "aligned_copy_bytes", im.alignedCopyBytes);
         C(f, "buffer_snapshots", ps.bufferSnapshots), C(f, "pointer_snapshots", ps.pointerSnapshots);
+        C(f, "depth_partner_draws", ps.depthPartnerDraws), C(f, "depth_partner_retro_clears", ps.depthPartnerRetroClears);
         C(f, "pointer_snapshot_no_align", impl_->pointerNo[0]), C(f, "pointer_snapshot_no_flat", impl_->pointerNo[1]);
         C(f, "pointer_snapshot_no_history", impl_->pointerNo[2]), C(f, "pointer_snapshot_no_gpu_wrote", impl_->pointerNo[3]);
         C(f, "pointer_snapshot_no_label", impl_->pointerNo[4]), C(f, "cp_access_ranges", impl_->cpAccess.size());

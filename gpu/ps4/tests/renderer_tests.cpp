@@ -2245,6 +2245,52 @@ void unknownExtentBusy() {
     CHECK(optOut.first && optOut.second);
 }
 
+// A label that waits on the recorded work is not submitted at its grace while a multisampled pass is open (a cut there stores and
+// reloads every sample): SubmitPolicy::passSlackMs (passSlackIrqMs with an interrupt) more. With none open, the grace as before.
+void labelWaitsForMsaaPass() {
+    for (const bool ms : {true, false}) {
+        {
+            Sched x;
+            x.f.renderer.setMaxSamples(4);
+            vpps4::DrawState d = x.f.state();
+            d.color[0].samples = ms ? 4 : 1;
+            x.f.renderer.draw(d);
+            x.s.noteWork();
+            x.s.scheduleLabel(kBase + 0x100, 4, false, [] {});
+            CHECK(x.f.renderer.multisampledPassOpen() == ms);
+            x.t += 5;
+            CHECK(!x.s.tick());
+            x.t += 2;  // 7 ms: past the grace (6)
+            if (ms) CHECK(x.s.nextCheckMs() > 6.9 && x.s.nextCheckMs() < 7.1);  // (14 - 7)
+            CHECK(x.s.tick() == !ms);
+            if (ms) {
+                x.t += 6;  // 13
+                CHECK(!x.s.tick() && x.submits() == 0);
+                x.t += 1.5;  // 14.5: past grace + slack
+                CHECK(x.s.tick() && x.submits() == 1);
+            }
+            CHECK(x.submits() == 1 && x.s.counters().submits[size_t(vpgpu::SubmitReason::LabelGrace)] == 1);
+        }
+        {  // with an interrupt: 1 ms, and 2 more
+            Sched x;
+            x.f.renderer.setMaxSamples(4);
+            vpps4::DrawState d = x.f.state();
+            d.color[0].samples = ms ? 4 : 1;
+            x.f.renderer.draw(d);
+            x.s.noteWork();
+            x.s.scheduleLabel(kBase + 0x100, 4, true, [] {});
+            x.t += 1.5;
+            CHECK(x.s.tick() == !ms);
+            if (ms) {
+                x.t += 1;  // 2.5
+                CHECK(!x.s.tick());
+                x.t += 1;  // 3.5
+                CHECK(x.s.tick() && x.submits() == 1);
+            }
+        }
+    }
+}
+
 // Label writes happen when the GPU is done with the work before them, in order, with their interrupt.
 void labelOrdering() {
     Sched x;
@@ -3231,6 +3277,22 @@ void bufferSnapshot() {
         drawWith(x, cb + 0xb000, 400);
         CHECK(!x.f.renderer.gpuMayAccess(cb + 0xb000, 400) && snapshots(x) == snaps3 + 1);
     }
+    {  // A V# buffer inside a range the command processor wrote (cpuAccessed) is copied too, even when the CPU reads are no longer
+       // followed for new ranges (cpuAccessed added it to cpuRead only below 1024 of them): the pointer rule's conditions hold.
+        HostDma h;
+        Sched& x = h.x;
+        readOnCpu(x, cb + 0x5000);  // (the draw's own CPU reads, noted before the ranges below)
+        for (uint64_t i = 0; i < 1100; ++i) {
+            const uint64_t far = 0x7100000000ull + i * 0x400000;
+            x.f.renderer.cpuAccessed(far, 4);
+            if (!x.f.renderer.cpuReadSeen(far, 4)) break;
+        }
+        x.f.renderer.cpuAccessed(cb + 0x6000, 0x1000);
+        CHECK(!x.f.renderer.cpuReadSeen(cb + 0x6000, 256));
+        const long long snaps = snapshots(x);
+        drawWith(x, cb + 0x6000, 256);
+        CHECK(!x.f.renderer.gpuMayAccess(cb + 0x6000, 256) && snapshots(x) == snaps + 1);
+    }
     {  // A FLAT store writes anywhere in the regions its table maps: they are bound in place.
         HostDma h;
         Sched& x = h.x;
@@ -3496,6 +3558,7 @@ int main(int argc, char** argv) {
     else if (t == "index_scan_memo") indexScanMemo();
     else if (t == "abandon_owners") abandonOwners();
     else if (t == "label_ordering") labelOrdering();
+    else if (t == "label_waits_for_msaa_pass") labelWaitsForMsaaPass();
     else if (t == "gpu_ordered_label_wait") gpuOrderedLabelWait();
     else if (t == "finish_all") finishAll();
     else if (t == "hold_pipeline") holdPipeline();

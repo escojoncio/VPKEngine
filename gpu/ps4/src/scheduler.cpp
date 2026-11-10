@@ -49,6 +49,7 @@ vpgpu::SubmitState stateOf(const Renderer& r, double now, double openSince, doub
     s.labelWaiting = labelSince >= 0;
     s.labelMs = s.labelWaiting ? now - labelSince : 0;
     s.labelIrq = irq;
+    s.costlyCut = r.multisampledPassOpen();
     return s;
 }
 }  // namespace

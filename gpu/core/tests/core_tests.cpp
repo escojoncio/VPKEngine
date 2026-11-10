@@ -2161,6 +2161,31 @@ void testSubmit() {
     st.labelWaiting = true, st.labelMs = 1;
     CHECK(nextCheckMs(p, st) < 5.1);
     CHECK(nextCheckMs(p, SubmitState{}) < 0);
+    // A multisampled pass open (a cut stores and reloads every sample): a label and the age bound wait passSlack more.
+    st = {};
+    st.commands = 100, st.costlyCut = true, st.labelWaiting = true, st.labelMs = 7;
+    CHECK(decide(p, st) == SubmitReason::Count);
+    st.labelMs = 6 + p.passSlackMs;
+    CHECK(decide(p, st) == SubmitReason::LabelGrace);
+    st.labelIrq = true, st.labelMs = 1 + p.passSlackIrqMs - 0.5;
+    CHECK(decide(p, st) == SubmitReason::Count);
+    st.labelMs = 1 + p.passSlackIrqMs;
+    CHECK(decide(p, st) == SubmitReason::LabelGrace);
+    st = {};
+    st.commands = 5, st.costlyCut = true, st.openMs = p.maxOpenMs + 1;
+    CHECK(decide(p, st) == SubmitReason::Count);
+    st.openMs = p.maxOpenMs + p.passSlackMs;
+    CHECK(decide(p, st) == SubmitReason::Age);
+    st.commands = p.maxCommands;  // (the size bound has no slack)
+    st.openMs = 0;
+    CHECK(decide(p, st) == SubmitReason::Size);
+    st = {};
+    st.commands = 5, st.costlyCut = true, st.openMs = 10;
+    CHECK(nextCheckMs(p, st) > 37.0 && nextCheckMs(p, st) < 39.0);
+    st.labelWaiting = true, st.labelMs = 1;
+    CHECK(nextCheckMs(p, st) > 12.9 && nextCheckMs(p, st) < 13.1);
+    st.labelIrq = true;
+    CHECK(nextCheckMs(p, st) > 1.9 && nextCheckMs(p, st) < 2.1);
   }
 }
 

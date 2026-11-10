@@ -105,7 +105,9 @@ public:
     uint64_t bufferAddress(vpgpu::BufferId i) const override { return inner.bufferAddress(i); }
     static inline bool refuseBcKernel = false;  // the block decoding kernel does not compile (the CPU decoder takes over)
     static inline std::atomic<bool> holdBcKernel{false};  // ... is still compiling (on a compile worker, see Fixture::workers)
+    std::vector<vpgpu::PipelineState> pipelines;  // every state compiled
     bool compilePipeline(const vpgpu::PipelineState& s, std::string& e) override {
+        pipelines.push_back(s);
         if (refuseBcKernel && s.label == "bcdecode") return e = "refused", false;
         while (holdBcKernel && s.label == "bcdecode") std::this_thread::sleep_for(std::chrono::milliseconds(1));
         return inner.compilePipeline(s, e);
@@ -2109,6 +2111,121 @@ void depthHintSample() {
     }
 }
 
+uint64_t rate(Fixture& f, const std::string& name) {  // (RATES counters are published only while the probe is on)
+    f.renderer.publishProbe(1);
+    return vpgpu::probe::counter("RATES", name).get();
+}
+// The frames' render passes recorded from command `from` on: how many, and the last one.
+size_t renderPasses(Fixture& f, size_t from, const vpgpu::RenderPass** last = nullptr) {
+    size_t n = 0;
+    for (size_t i = from; i < f.backend.commands.size(); ++i)
+        if (const auto* rp = std::get_if<vpgpu::RenderPass>(&f.backend.commands[i])) ++n, last && (*last = rp);
+    return n;
+}
+// The draws of the prepass / colour pass of an eye: 4x depth, depth-only, then 4x colour + depth.
+vpps4::DrawState depthOnlyDraw(Fixture& f, uint32_t size = 128) {
+    vpps4::DrawState d = f.depthState(true);
+    d.color[0] = {};
+    d.ps = {};
+    d.depth.width = d.depth.height = size;
+    d.depth.samples = 4;
+    return d;
+}
+vpps4::DrawState colourDraw(Fixture& f) {
+    vpps4::DrawState d = f.depthState(true);
+    d.color[0].samples = 4;
+    d.depth.samples = 4;
+    return d;
+}
+
+// A depth-only draw on a multisampled depth target keeps the colour target that the draws reading that depth wrote attached
+// (unwritten): the prepass, the colour pass and a later depth-only draw are one pass, not a store and a reload of every sample
+// each. Learned from the first colour draw; a depth of another size has no partner.
+// VPKENGINE_DEPTH_ONLY_SPLIT=1: split as before.
+void depthOnlyKeepsPartner() {
+    ProbeOn probe;
+    for (const bool off : {false, true}) {
+        if (off) setenv("VPKENGINE_DEPTH_ONLY_SPLIT", "1", 1);
+        Fixture f;
+        f.renderer.setMaxSamples(4);
+        auto frame = [&] {
+            f.renderer.draw(depthOnlyDraw(f));
+            f.renderer.draw(depthOnlyDraw(f));
+            f.renderer.draw(colourDraw(f));
+            f.renderer.draw(colourDraw(f));
+            f.renderer.submit();
+        };
+        const uint64_t p0 = f.renderer.stats().passes;
+        frame();  // (learning: depth-only pass, then colour pass)
+        CHECK(f.renderer.stats().passes - p0 == 2);
+        const uint64_t p1 = f.renderer.stats().passes;
+        const size_t from = f.backend.commands.size();
+        frame();
+        const vpgpu::RenderPass* rp = nullptr;
+        CHECK(f.renderer.stats().passes - p1 == (off ? 2u : 1u) && renderPasses(f, from, &rp) == (off ? 2u : 1u));
+        if (!off) CHECK(rp && rp->draws.size() == 4 && rp->desc.colors[0].texture && rp->desc.colors[0].load == vpgpu::LoadAction::Load);
+        size_t withColour = 0;  // the depth-only states that have the colour format
+        for (const vpgpu::PipelineState& s : f.backend.pipelines)
+            if (!s.fragmentShader && s.depthFormat != vpgpu::Format::Undefined && s.colorFormats[0] != vpgpu::Format::Undefined) {
+                ++withColour;
+                CHECK(s.blend[0].writeMask == 0 && !s.blend[0].enabled && s.samples == 4);
+            }
+        CHECK(withColour == (off ? 0u : 1u));
+        CHECK(rate(f, "depth_partner_draws") == (off ? 0u : 2u));
+        // Another size at the same address: not the depth the colour target was drawn with.
+        const uint64_t p2 = f.renderer.stats().passes;
+        const size_t from2 = f.backend.commands.size();
+        f.renderer.draw(depthOnlyDraw(f, 64));
+        f.renderer.submit();
+        rp = nullptr;
+        CHECK(f.renderer.stats().passes - p2 == 1 && renderPasses(f, from2, &rp) == 1 && rp && !rp->desc.colors[0].texture);
+        CHECK(rate(f, "depth_partner_draws") == (off ? 0u : 2u));
+        if (failures) f.dump();
+        if (off) unsetenv("VPKENGINE_DEPTH_ONLY_SPLIT");
+    }
+}
+
+// A colour fast clear that comes while the open pass has that colour attached and no draw of the pass has written it (a depth-only
+// draw's partner) is the pass's load action: no cut. One that comes after a draw wrote it still waits for the next pass.
+void depthPartnerRetroClear() {
+    ProbeOn probe;
+    Fixture f;
+    f.renderer.setMaxSamples(4);
+    f.renderer.draw(colourDraw(f));  // (learns the partner)
+    f.renderer.submit();
+    auto clear = [&] {
+        vpps4::DrawState c = f.state();
+        c.primitive = vpps4::PrimitiveType::RectList;
+        c.color[0].samples = 4;
+        c.color[0].fastClear = true;
+        c.color[0].clearWord = {0xff204080u, 0};
+        f.renderer.draw(c);
+    };
+    const uint64_t p0 = f.renderer.stats().passes;
+    const size_t from = f.backend.commands.size();
+    f.renderer.draw(depthOnlyDraw(f));
+    f.renderer.draw(depthOnlyDraw(f));
+    clear();
+    f.renderer.draw(colourDraw(f));
+    f.renderer.draw(colourDraw(f));
+    f.renderer.submit();
+    const vpgpu::RenderPass* rp = nullptr;
+    CHECK(f.renderer.stats().passes - p0 == 1 && renderPasses(f, from, &rp) == 1);
+    CHECK(rp && rp->draws.size() == 4 && rp->desc.colors[0].load == vpgpu::LoadAction::Clear);
+    CHECK(rp && std::abs(rp->desc.colors[0].clear.color[0] - 128.0 / 255) < 1e-9 && std::abs(rp->desc.colors[0].clear.color[2] - 32.0 / 255) < 1e-9);
+    CHECK(rate(f, "depth_partner_draws") == 2 && rate(f, "depth_partner_retro_clears") == 1);
+    // Written by a draw of the pass first: the clear cuts it, as before.
+    const uint64_t p1 = f.renderer.stats().passes;
+    f.renderer.draw(depthOnlyDraw(f));
+    f.renderer.draw(colourDraw(f));
+    clear();
+    f.renderer.draw(colourDraw(f));
+    f.renderer.submit();
+    CHECK(f.renderer.stats().passes - p1 == 2);
+    CHECK(rate(f, "depth_partner_retro_clears") == 1);
+    if (failures) f.dump();
+}
+
 // A T# larger than every depth target drawn at its base (a 128x128 array of 4 over a depth array drawn 64x64, 2 slices), sampled
 // with compare: no depth target serves it and memory holds the bytes of the smaller layout (or of nothing). As the reference
 // renderer, which grows its image and does not read memory for it, the texture is not filled from memory: every layer takes the
@@ -2612,6 +2729,8 @@ int main(int argc, char** argv) {
     else if (t == "small_then_big_targets") smallThenBigTargets();
     else if (t == "compare_mismatch") compareMismatch();
     else if (t == "depth_cleared_texture") depthClearedTexture();
+    else if (t == "depth_only_keeps_partner") depthOnlyKeepsPartner();
+    else if (t == "depth_partner_retro_clear") depthPartnerRetroClear();
     else if (t == "compare_depth") compareDepth();
     else if (t == "compare_depth_array") compareDepthArray();
     else if (t == "tex_verify") texVerify();

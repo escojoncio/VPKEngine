@@ -246,6 +246,8 @@ public:
     void waitedBelow(uint64_t frames);
     // Commands recorded and not submitted yet.
     bool hasRecordedWork() const;
+    // A render pass is open and draws with several host samples (a submit now stores and reloads every sample of its targets).
+    bool multisampledPassOpen() const;
     uint64_t recordedCommands() const;
     // Whether the renderer has ever read guest [a, +n) on the CPU (descriptors, indices, program code, texture sources, constant
     // copies). A DMA recorded on the GPU timeline lands later than a CPU read would see, so such a range is DMA'd by the CPU.
