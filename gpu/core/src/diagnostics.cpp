@@ -340,6 +340,7 @@ std::vector<std::string> formatPassDump(uint64_t frame, const Frame& f, const Co
   };
 
   std::vector<std::string> passLines;
+  uint32_t renderPasses = 0;  // render passes before command i: the `rp=` of its line
   for (uint32_t i = 0; i < cmds.size(); ++i) {
     if (const auto* dp = std::get_if<Dispatch>(&cmds[i])) {
       for (const Access& a : dp->bindings) accessEv(a, i);
@@ -410,7 +411,7 @@ std::vector<std::string> formatPassDump(uint64_t frame, const Frame& f, const Co
       if (d.index) ++resUse[{1, d.index->buffer.index, d.index->buffer.generation}].reads;
     }
     std::string l = "gpu.pdump.pass";
-    kv(l, " f=%llu pass=%u enc=%d", fr, i, encOf[i]);
+    kv(l, " f=%llu pass=%u rp=%u enc=%d", fr, i, renderPasses++, encOf[i]);
     if (enc2Of[i] >= 0) kv(l, " enc2=%d", enc2Of[i]);
     kv(l, " label=%s layers=%u area=%ux%u", clean(pd.label, 40).c_str(), unsigned(pd.layerCount), pd.renderWidth, pd.renderHeight);
     l += " att{" + att + "}";

@@ -503,18 +503,20 @@ void recordInPassBarrier(Recorder&);
 // pipeline); the draw is then left out of the mask pass logic by the caller.
 bool maskPipelineKey(Device*, const PipelineObj& p, PipelineObj::TexelVariant* tv, uint8_t passSamples, bool ui,
                      vpgpu::PipelineKey& out);
-// Depth in tile (pipelines.cpp): the key of pipeline `p` for a draw of a pass that keeps the depth in colour attachment
-// kDepthTileSlot. kind: kDepthTileWrite (fragment shader retranslated to also write the depth), kDepthTileFetch (retranslated to
-// read the multisampled depth input attachment at texture slot `texSlot` from it), kDepthTileState (the plain shaders, the
-// attachment bound with write mask 0). False: the variant cannot be made (no fragment source, translation failed).
+// Depth in tile (pipelines.cpp): the key of pipeline `p` (or its texel variant `tv`) for a draw of a pass that keeps the depth in
+// colour attachment kDepthTileSlot. kind: kDepthTileWrite (fragment shader retranslated to also write the depth), kDepthTileFetch
+// (retranslated to read the multisampled depth input attachment at texture slot `texSlot` from it), kDepthTileState (the plain
+// shaders, the attachment bound with write mask 0). False: the variant cannot be made (no fragment source, translation failed).
 // True for a render pass where one subpass writes a multisampled depth attachment another reads as an input attachment.
 bool depthInputPass(const RenderPassObj&);
+// The line limit of "gpu.pass.fuse src=vk depth_input_in_tile=" (commands.cpp depthTileLog) starts again, with no reason logged yet.
+void depthTileLogReset();  // tests
 inline constexpr int kDepthTileSlot = 6;
 enum DepthTileKind { kDepthTileWrite = 0, kDepthTileFetch = 1, kDepthTileState = 2 };
 // commit=false only translates and caches: nothing is requested from the pipeline cache or recorded in the recipes until a call with
 // commit=true (a plan that fails half-way leaves no variant behind). atCreate: called while the pipeline is created.
 bool depthPipelineKey(Device*, const PipelineObj& p, int kind, int texSlot, vpgpu::PipelineKey& out, bool commit = true,
-                      bool atCreate = false);
+                      bool atCreate = false, const PipelineObj::TexelVariant* tv = nullptr);
 // The subpass of `rp` (index) that writes (0) or reads (1) a multisampled depth attachment through an input attachment, else -1.
 int8_t depthInputRole(const RenderPassObj& rp, uint32_t subpass);
 // Synchronous pipeline mode: waits once (VPVK_PIPELINE_DRAW_WAIT_MS) for the mask variants maskPipelineKey requested since

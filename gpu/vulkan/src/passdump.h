@@ -1,12 +1,18 @@
 // Pass diagnostics of the translator (one global mechanism, no per-game code), all behind two environment switches read once:
 //   VPVK_PASS_DUMP=1 | <start> | <start>,<frames>
-//       Explains a few frames pass by pass. Frames with render work are counted from the first one; the dump covers `frames` of them
-//       from number `start` on (defaults 1200 and 4, at most 8 frames), then a "vk.pdump.sum" line every 5 s (the totals since the
-//       previous one). A dumped frame logs the core's "gpu.pdump.*" lines (diagnostics.h) plus, per pass index, "vk.pdump.drop"
-//       (draws skipped or routed to a fallback, with the reason) and "vk.pdump.tex" (residency of the textures its draws sample).
-//   VPVK_SKIP_PASS=<list>   e.g. "5,6" or "4-7" (at most 32 entries): the translator drops every draw of those passes, in every
-//       frame (the pass keeps its load / store / clear; only its draws vanish). Off by default; "vk.skip_pass active" once when on.
-// A pass index is the index of the pass among the commands of the vpgpu::Frame of one submission (the `pass=` of gpu.pdump.pass).
+//       Explains a few frames pass by pass. Only scene frames count: submissions holding a multiview or multisampled render pass,
+//       or at least 64 draws (menus, loading screens and the UI layer's own submissions do not). They are counted from the first
+//       one; a dump window covers `frames` of them from number `start` on (defaults 1200 and 2, at most 8 frames) and opens again
+//       every 60 s, 5 windows in a run. A "vk.pdump.sum" line every 5 s gives the totals of every frame since the previous one. A
+//       dumped frame logs the core's "gpu.pdump.*" lines (diagnostics.h) plus, per pass index, "vk.pdump.drop" (draws skipped or
+//       routed to a fallback, with the reason) and "vk.pdump.tex" (residency of the textures its draws sample); at most 300 lines.
+//   VPVK_SKIP_PASS=<list>   e.g. "5,6" or "4-7" (at most 32 entries): the translator drops every draw of those render passes, in
+//       every submission (the pass keeps its load / store / clear; only its draws vanish). Off by default; "vk.skip_pass active"
+//       once when on. The numbers are render-pass ordinals: the `rp=` of gpu.pdump.pass and of gpu.passtime.
+// Three numberings, all per submission (one vpgpu::Frame): `pass=` of gpu.pdump.* / vk.pdump.* is the index of the pass among the
+// frame's commands (copies and dispatches included); `rp=` is its ordinal among the render passes alone (clears are render passes
+// too); the `pass=` of gpu.passtime is the index of the compiled encoder (the `enc=` of gpu.pdump.pass), which may run several
+// render passes. A frame of another shape (a menu, a submission of only UI) numbers its passes on its own.
 #pragma once
 
 #include <cstdint>
@@ -15,6 +21,7 @@
 #include <vector>
 
 namespace vpgpu {
+class Device;
 class Frame;
 }
 
@@ -22,8 +29,11 @@ namespace vpvk {
 
 struct Image;
 
-constexpr uint64_t kPassDumpStart = 1200;  // render frames before the dump window (warm-up)
-constexpr uint32_t kPassDumpFrames = 4, kPassDumpMaxFrames = 8;
+constexpr uint64_t kPassDumpStart = 1200;  // scene frames before the first dump window (warm-up)
+constexpr uint32_t kPassDumpFrames = 2, kPassDumpMaxFrames = 8;  // frames of a window
+constexpr uint32_t kPassDumpWindows = 5;                         // windows of a run
+constexpr int64_t kPassDumpPeriodNs = 60'000'000'000LL;          // from the start of a window to the next one
+constexpr uint32_t kPassDumpSceneDraws = 64;                     // draws that make a submission a scene frame (passDumpScene)
 constexpr size_t kMaxSkipPasses = 32;
 constexpr size_t kSkipSlots = 16;  // room for SkipReason::Count (commands.h asserts it)
 
@@ -66,7 +76,10 @@ struct PassDump {
   bool on = false;
   uint64_t start = kPassDumpStart;
   uint32_t frames = kPassDumpFrames;
-  uint64_t seen = 0;  // frames with render work so far
+  uint64_t seen = 0;       // scene frames so far
+  uint32_t windows = 0;    // dump windows opened so far
+  uint64_t windowEnd = 0;  // the open window covers the scene frames below this number
+  int64_t nextNs = 0;      // when the next window may open
 };
 // Parses the value of VPVK_PASS_DUMP (null, "", "0" = off).
 PassDump parsePassDump(const char* value);
@@ -76,8 +89,11 @@ std::vector<uint32_t> parseSkipPasses(const char* value);
 // The process' settings: read from the environment at the first call (tests assign to them).
 PassDump& passDump();
 std::vector<uint32_t>& skipPasses();
-// Counts a frame with render work; true when it falls inside the dump window.
-bool passDumpNext(PassDump&);
+// Is the frame a scene frame: one with a multiview or multisampled render pass, or kPassDumpSceneDraws draws in its render passes?
+bool passDumpScene(const vpgpu::Frame&, vpgpu::Device&);
+// Counts a scene frame; true when it falls inside a dump window (the first one at `start`, the next ones kPassDumpPeriodNs after
+// the previous one opened, kPassDumpWindows in all). nowNs < 0 = the steady clock.
+bool passDumpNext(PassDump&, int64_t nowNs = -1);
 
 // TexFlag bits of a sampled image.
 uint8_t texCensusFlags(const Image&);

@@ -5752,6 +5752,7 @@ std::vector<uint32_t> earlyFragmentWords(bool store) {
 // `expectOn` false: the feature is switched off (VPVK_DEPTH_TILE=0 / VPVK_MSAA_STRICT=0): the pass keeps its cut and the log says why.
 void depthTileCase(bool mv, VkFormat depthFormat, bool expectOn) {
   Ctx c(mv ? std::vector<const char*>{VK_KHR_MULTIVIEW_EXTENSION_NAME} : std::vector<const char*>{});
+  depthTileLogReset();  // (the lines this case reads do not depend on how many the process logged before it)
   VkDeviceMemory m = alloc(c, 64 << 20, 0);
   const uint32_t layers = mv ? 2 : 1;
   VkImage color = image(c, VK_FORMAT_R8G8B8A8_UNORM, 64, layers,
@@ -5826,7 +5827,20 @@ void depthTileCase(bool mv, VkFormat depthFormat, bool expectOn) {
   vkUpdateDescriptorSets(c.dev, 1, &wds, 0, nullptr);
 
   VkShaderModule vs = module(c, "uimask.vert.spv"), fsPlain = module(c, "uimask.frag.spv"), fsInput = module(c, "tile/depth_input.frag.spv");
+  VkShaderModule fsInput0 = module(c, "tile/depth_input_s0.frag.spv");  // reads sample 0, not gl_SampleID
+  VkShaderModule fsColor6 = module(c, "tile/color6.frag.spv");          // writes colour 6, the slot of the depth's shadow
+  VkShaderModule fsTexel = module(c, "tile/texel_color.frag.spv");      // reads a uniform texel buffer
+  VkShaderModule vsPos = module(c, "pos.vert.spv"), fsSolid = module(c, "solid.frag.spv");  // (a vertex buffer: stride variants)
   VkPipelineVertexInputStateCreateInfo vis{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+  const VkVertexInputBindingDescription vbd{0, 16, VK_VERTEX_INPUT_RATE_VERTEX};
+  const VkVertexInputAttributeDescription vad{0, 0, VK_FORMAT_R32G32B32A32_SFLOAT, 0};
+  VkPipelineVertexInputStateCreateInfo visPos{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+  visPos.vertexBindingDescriptionCount = 1, visPos.pVertexBindingDescriptions = &vbd;
+  visPos.vertexAttributeDescriptionCount = 1, visPos.pVertexAttributeDescriptions = &vad;
+  const VkDynamicState dynStates[2] = {VK_DYNAMIC_STATE_VERTEX_INPUT_BINDING_STRIDE, VK_DYNAMIC_STATE_CULL_MODE};
+  VkPipelineDynamicStateCreateInfo dys{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
+  dys.dynamicStateCount = 2, dys.pDynamicStates = dynStates;
+  VkBuffer vbuf = buffer(c, 4096, m, 48 << 20);
   VkPipelineInputAssemblyStateCreateInfo ias{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
   ias.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
   VkPipelineRasterizationStateCreateInfo rs{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
@@ -5841,19 +5855,21 @@ void depthTileCase(bool mv, VkFormat depthFormat, bool expectOn) {
   cba.colorWriteMask = 0xF;
   VkPipelineColorBlendStateCreateInfo cbs{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
   cbs.attachmentCount = 1, cbs.pAttachments = &cba;
-  auto pipeline = [&](VkRenderPass rp, uint32_t subpass, VkShaderModule fs, VkPipelineLayout layout, bool depthWrite, bool bias = false) {
+  auto pipeline = [&](VkRenderPass rp, uint32_t subpass, VkShaderModule fs, VkPipelineLayout layout, bool depthWrite, bool bias = false,
+                      bool dyn = false) {
     VkPipelineShaderStageCreateInfo stg[2]{{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO},
                                            {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO}};
-    stg[0].stage = VK_SHADER_STAGE_VERTEX_BIT, stg[0].module = vs, stg[0].pName = "main";
+    stg[0].stage = VK_SHADER_STAGE_VERTEX_BIT, stg[0].module = dyn ? vsPos : vs, stg[0].pName = "main";
     stg[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT, stg[1].module = fs, stg[1].pName = "main";
     VkPipelineDepthStencilStateCreateInfo ds{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
     ds.depthTestEnable = VK_TRUE, ds.depthWriteEnable = depthWrite, ds.depthCompareOp = VK_COMPARE_OP_GREATER_OR_EQUAL;
     VkGraphicsPipelineCreateInfo gp{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
     VkPipelineRasterizationStateCreateInfo rsb = rs;
     rsb.depthBiasEnable = bias, rsb.depthBiasConstantFactor = 1.0f;
-    gp.stageCount = fs ? 2 : 1, gp.pStages = stg, gp.pVertexInputState = &vis, gp.pInputAssemblyState = &ias;
+    gp.stageCount = fs ? 2 : 1, gp.pStages = stg, gp.pVertexInputState = dyn ? &visPos : &vis, gp.pInputAssemblyState = &ias;
     gp.pViewportState = &vps, gp.pRasterizationState = &rsb, gp.pMultisampleState = &ms, gp.pColorBlendState = &cbs;
     gp.pDepthStencilState = &ds, gp.layout = layout, gp.renderPass = rp, gp.subpass = subpass;
+    gp.pDynamicState = dyn ? &dys : nullptr;
     VkPipeline p = VK_NULL_HANDLE;
     CHECK(vkCreateGraphicsPipelines(c.dev, VK_NULL_HANDLE, 1, &gp, nullptr, &p) == VK_SUCCESS);
     if (const PipelineObj* po = p ? from<PipelineObj>(p) : nullptr)
@@ -5864,8 +5880,10 @@ void depthTileCase(bool mv, VkFormat depthFormat, bool expectOn) {
   VkCommandPool pool;
   vkCreateCommandPool(c.dev, &pi, nullptr, &pool);
   // Records the pass (subpass 0: one writing draw; subpass 1: one draw without the input, one reading it) and translates it.
+  // `before0` runs between binding subpass 0's pipeline and its draw.
   auto record = [&](VkRenderPass rp, VkFramebuffer fb, VkPipeline p0, VkPipeline p1Plain, VkPipeline p1Input, vpgpu::Frame& frame,
-                    VkPipeline mid = VK_NULL_HANDLE, VkPipeline tail = VK_NULL_HANDLE) {
+                    VkPipeline mid = VK_NULL_HANDLE, VkPipeline tail = VK_NULL_HANDLE,
+                    const std::function<void(VkCommandBuffer)>& before0 = {}) {
     VkCommandBufferAllocateInfo ai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
     ai.commandPool = pool, ai.commandBufferCount = 1;
     VkCommandBuffer cb;
@@ -5878,6 +5896,7 @@ void depthTileCase(bool mv, VkFormat depthFormat, bool expectOn) {
     rbi.renderPass = rp, rbi.framebuffer = fb, rbi.renderArea = {{0, 0}, {64, 64}}, rbi.clearValueCount = 2, rbi.pClearValues = clears;
     vkCmdBeginRenderPass(cb, &rbi, VK_SUBPASS_CONTENTS_INLINE);
     vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, p0);
+    if (before0) before0(cb);
     vkCmdDraw(cb, 3, 1, 0, 0);
     vkCmdNextSubpass(cb, VK_SUBPASS_CONTENTS_INLINE);
     if (mid) {  // (a subpass between the writer and the reader)
@@ -5928,6 +5947,8 @@ void depthTileCase(bool mv, VkFormat depthFormat, bool expectOn) {
     const PipelineObj *o0 = from<PipelineObj>(p0), *o1a = from<PipelineObj>(p1a), *o1b = from<PipelineObj>(p1b);
     CHECK(o0 && o0->ok && o1a && o1a->ok && o1b && o1b->ok);
     CHECK(o0->depthTileSrc && o1a->depthTileSrc && o1b->depthTileSrc && !o0->sources.empty());
+    // No pass of this render pass has kept its depth on tile yet: creating its pipelines makes (and compiles) no variant.
+    CHECK(o0->depthVariants.empty() && o1a->depthVariants.empty() && o1b->depthVariants.empty());
     vpgpu::Frame frame;
     const std::string log = captureStderr([&] { record(rp, fb, p0, p1a, p1b, frame); });
     CHECK(log.find("gpu.pass.fuse src=vk depth_input_in_tile=1 reason=ok") != std::string::npos);
@@ -5966,6 +5987,221 @@ void depthTileCase(bool mv, VkFormat depthFormat, bool expectOn) {
     vpgpu::PipelineKey again;
     CHECK(depthPipelineKey(from<Device>(c.dev), *o0, kDepthTileWrite, -1, again) && again.value == o0->depthVariants[0].key.value);
     CHECK(o0->depthVariants.size() == 1);
+    // From then on a pipeline of that render pass gets its variant while it is created (off the submit thread).
+    const PipelineObj* late = from<PipelineObj>(pipeline(rp, 0, fsPlain, plPlain, true));
+    CHECK(late && late->depthVariants.size() == 1 && late->depthVariants[0].kind == kDepthTileWrite && late->depthVariants[0].committed);
+  }
+  {  // a writer drawn through a stride variant (vkCmdBindVertexBuffers2): the depth variant derives from that variant; a draw whose
+     // key carries extended dynamic state is still refused
+    auto [rp, fb] = renderPass(VK_ATTACHMENT_LOAD_OP_CLEAR);
+    VkPipeline p0 = pipeline(rp, 0, fsSolid, plPlain, true, false, true), p1a = pipeline(rp, 1, fsPlain, plPlain, false),
+               p1b = pipeline(rp, 1, fsInput, plInput, false);
+    const PipelineObj* o0 = from<PipelineObj>(p0);
+    CHECK(o0 && o0->ok && o0->dynStride);
+    const VkDeviceSize off = 0, size = 2048, stride = 32;
+    vpgpu::Frame frame;
+    const std::string log = captureStderr([&] {
+      record(rp, fb, p0, p1a, p1b, frame, VK_NULL_HANDLE, VK_NULL_HANDLE, [&](VkCommandBuffer cb) { vkCmdBindVertexBuffers2(cb, 0, 1, &vbuf, &off, &size, &stride); });
+    });
+    CHECK(o0->texelVariants.size() == 1 && o0->texelVariants.front().ok);
+    CHECK(log.find("gpu.pass.fuse src=vk depth_input_in_tile=1 reason=ok") != std::string::npos);
+    if (log.find("depth_input_in_tile=1 reason=ok") == std::string::npos) std::fprintf(stderr, "%s\n", log.c_str());
+    auto ps = passes(frame);
+    CHECK(ps.size() == 2 && ps[0]->desc.colors[kDepthTileSlot].texture && ps[0]->draws.size() == 1);
+    CHECK(o0->depthVariants.size() == 1 && o0->depthVariants[0].ok);
+    if (ps.size() == 2 && ps[0]->draws.size() == 1 && o0->depthVariants.size() == 1 && o0->texelVariants.size() == 1) {
+      const PipelineObj::TexelVariant& tv = o0->texelVariants.front();
+      const PipelineObj::DepthVariant& dv = o0->depthVariants[0];
+      CHECK(dv.tv == &tv && dv.kind == kDepthTileWrite);
+      CHECK(ps[0]->draws[0].pipeline.value == dv.key.value && dv.key.value != tv.key.value && dv.key.value != o0->key.value);
+      CHECK(dv.state.vertexShader == tv.state.vertexShader && dv.state.vertexShader != o0->state.vertexShader);  // the 32-byte stride
+      CHECK(dv.state.fragmentShader != tv.state.fragmentShader && dv.state.colorFormats[kDepthTileSlot] == vpgpu::Format::R32Float);
+      CHECK(vpgpu::compileFrame(frame, &c.gpu().resources()).encoders.size() == 1);
+    }
+    vpgpu::Frame eds;
+    const std::string edsLog = captureStderr([&] {
+      record(rp, fb, p0, p1a, p1b, eds, VK_NULL_HANDLE, VK_NULL_HANDLE, [&](VkCommandBuffer cb) {
+        vkCmdBindVertexBuffers(cb, 0, 1, &vbuf, &off);
+        vkCmdSetCullMode(cb, VK_CULL_MODE_FRONT_BIT);
+      });
+    });
+    CHECK(edsLog.find("depth_input_in_tile=0 reason=pipeline_variant") != std::string::npos);
+    CHECK(passes(eds).size() == 2 && !passes(eds)[0]->desc.colors[kDepthTileSlot].texture);
+  }
+  // The depth variant of pipeline `o` made from its texel variant `tv` (null: from the pipeline itself), when there is exactly one.
+  auto depthVariantOf = [](const PipelineObj* o, const PipelineObj::TexelVariant* tv) {
+    const PipelineObj::DepthVariant* found = nullptr;
+    size_t n = 0;
+    for (const PipelineObj::DepthVariant& v : o->depthVariants)
+      if (v.tv == tv) found = &v, ++n;
+    return n == 1 ? found : nullptr;
+  };
+  {  // the same writer drawn in one subpass as itself and through two stride variants: each draw gets the depth variant made from
+     // the object it is drawn with, never another's, and finds it again in the next frame
+    auto [rp, fb] = renderPass(VK_ATTACHMENT_LOAD_OP_CLEAR);
+    VkPipeline p0 = pipeline(rp, 0, fsSolid, plPlain, true, false, true), p1a = pipeline(rp, 1, fsPlain, plPlain, false),
+               p1b = pipeline(rp, 1, fsInput, plInput, false);
+    const PipelineObj* o0 = from<PipelineObj>(p0);
+    const VkDeviceSize off = 0, size = 2048, s32 = 32, s48 = 48;
+    for (int round = 0; round < 2; ++round) {
+      vpgpu::Frame frame;
+      const std::string log = captureStderr([&] {
+        record(rp, fb, p0, p1a, p1b, frame, VK_NULL_HANDLE, VK_NULL_HANDLE, [&](VkCommandBuffer cb) {
+          vkCmdBindVertexBuffers(cb, 0, 1, &vbuf, &off);  // the pipeline's own stride: no variant
+          vkCmdDraw(cb, 3, 1, 0, 0);
+          vkCmdBindVertexBuffers2(cb, 0, 1, &vbuf, &off, &size, &s32);
+          vkCmdDraw(cb, 3, 1, 0, 0);
+          vkCmdBindVertexBuffers2(cb, 0, 1, &vbuf, &off, &size, &s48);  // (for the draw `record` adds)
+        });
+      });
+      CHECK(log.find("depth_input_in_tile=1 reason=ok att=1 fb=64x64 draws0=3 draws1=2 fetch_pipes=1") != std::string::npos);
+      auto ps = passes(frame);
+      CHECK(ps.size() == 2 && ps[0]->draws.size() == 3 && o0->texelVariants.size() == 2 && o0->depthVariants.size() == 3);
+      if (ps.size() != 2 || ps[0]->draws.size() != 3 || o0->texelVariants.size() != 2) break;
+      const PipelineObj::TexelVariant* tvs[3] = {nullptr, &o0->texelVariants[0], &o0->texelVariants[1]};
+      CHECK(tvs[1]->strides == std::vector<uint32_t>{32} && tvs[2]->strides == std::vector<uint32_t>{48});
+      uint64_t keys[3] = {0, 0, 0};
+      for (int i = 0; i < 3; ++i) {
+        const PipelineObj::DepthVariant* dv = depthVariantOf(o0, tvs[i]);
+        CHECK(dv && dv->ok && dv->kind == kDepthTileWrite);
+        if (!dv) continue;
+        keys[i] = dv->key.value;
+        CHECK(ps[0]->draws[size_t(i)].pipeline.value == dv->key.value);
+        CHECK(dv->state.vertexShader == (tvs[i] ? tvs[i]->state.vertexShader : o0->state.vertexShader));  // its own stride
+        CHECK(dv->state.colorFormats[kDepthTileSlot] == vpgpu::Format::R32Float);
+      }
+      CHECK(keys[0] && keys[1] && keys[2] && keys[0] != keys[1] && keys[0] != keys[2] && keys[1] != keys[2]);
+    }
+  }
+  {  // a writer that reads a uniform texel buffer, drawn in one subpass with views of three formats (the one the pipeline was
+     // lowered with, then a texel variant each): the fragment stage of each depth variant is translated again with the formats
+     // of the object it is made from
+    VkDescriptorSetLayoutBinding tb{0, VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr};
+    VkDescriptorSetLayoutCreateInfo tlci{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+    tlci.bindingCount = 1, tlci.pBindings = &tb;
+    VkDescriptorSetLayout tdsl;
+    vkCreateDescriptorSetLayout(c.dev, &tlci, nullptr, &tdsl);
+    VkPipelineLayoutCreateInfo tpli{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    tpli.setLayoutCount = 1, tpli.pSetLayouts = &tdsl;
+    VkPipelineLayout plTexel;
+    vkCreatePipelineLayout(c.dev, &tpli, nullptr, &plTexel);
+    VkDescriptorPoolSize tps{VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER, 3};
+    VkDescriptorPoolCreateInfo tdpi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+    tdpi.maxSets = 3, tdpi.poolSizeCount = 1, tdpi.pPoolSizes = &tps;
+    VkDescriptorPool tpool;
+    vkCreateDescriptorPool(c.dev, &tdpi, nullptr, &tpool);
+    VkBufferCreateInfo tbi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+    tbi.size = 4096, tbi.usage = VK_BUFFER_USAGE_UNIFORM_TEXEL_BUFFER_BIT;
+    VkBuffer tbuf;
+    vkCreateBuffer(c.dev, &tbi, nullptr, &tbuf);
+    vkBindBufferMemory(c.dev, tbuf, m, 50 << 20);
+    const VkFormat fmts[3] = {VK_FORMAT_R32_SFLOAT, VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_R32G32B32A32_SFLOAT};
+    VkDescriptorSet tsets[3];
+    for (int i = 0; i < 3; ++i) {
+      VkBufferViewCreateInfo bvi{VK_STRUCTURE_TYPE_BUFFER_VIEW_CREATE_INFO};
+      bvi.buffer = tbuf, bvi.format = fmts[i], bvi.range = VK_WHOLE_SIZE;
+      VkBufferView bv = VK_NULL_HANDLE;
+      CHECK(vkCreateBufferView(c.dev, &bvi, nullptr, &bv) == VK_SUCCESS);
+      VkDescriptorSetAllocateInfo tai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+      tai.descriptorPool = tpool, tai.descriptorSetCount = 1, tai.pSetLayouts = &tdsl;
+      vkAllocateDescriptorSets(c.dev, &tai, &tsets[i]);
+      VkWriteDescriptorSet tw{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+      tw.dstSet = tsets[i], tw.dstBinding = 0, tw.descriptorCount = 1, tw.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER;
+      tw.pTexelBufferView = &bv;
+      vkUpdateDescriptorSets(c.dev, 1, &tw, 0, nullptr);
+    }
+    auto [rp, fb] = renderPass(VK_ATTACHMENT_LOAD_OP_CLEAR);
+    VkPipeline p0 = pipeline(rp, 0, fsTexel, plTexel, true), p1a = pipeline(rp, 1, fsPlain, plPlain, false),
+               p1b = pipeline(rp, 1, fsInput, plInput, false);
+    const PipelineObj* o0 = from<PipelineObj>(p0);
+    CHECK(o0 && o0->ok && o0->texel.size() == 1 && o0->texel[0].lowered == toCoreFormat(fmts[0]));
+    vpgpu::Frame frame;
+    const std::string log = captureStderr([&] {
+      record(rp, fb, p0, p1a, p1b, frame, VK_NULL_HANDLE, VK_NULL_HANDLE, [&](VkCommandBuffer cb) {
+        for (int i = 0; i < 3; ++i) {
+          vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, plTexel, 0, 1, &tsets[i], 0, nullptr);
+          if (i < 2) vkCmdDraw(cb, 3, 1, 0, 0);  // (`record` adds the third draw)
+        }
+      });
+    });
+    CHECK(log.find("depth_input_in_tile=1 reason=ok att=1 fb=64x64 draws0=3 draws1=2 fetch_pipes=1") != std::string::npos);
+    if (log.find("depth_input_in_tile=1 reason=ok") == std::string::npos) std::fprintf(stderr, "%s\n", log.c_str());
+    auto ps = passes(frame);
+    CHECK(ps.size() == 2 && ps[0]->draws.size() == 3 && o0->texelVariants.size() == 2 && o0->depthVariants.size() == 3);
+    if (ps.size() == 2 && ps[0]->draws.size() == 3 && o0->texelVariants.size() == 2) {
+      const PipelineObj::TexelVariant* tvs[3] = {nullptr, &o0->texelVariants[0], &o0->texelVariants[1]};
+      uint64_t frag[3] = {0, 0, 0};
+      for (int i = 0; i < 3; ++i) {
+        if (tvs[i]) CHECK(tvs[i]->ok && tvs[i]->formats == std::vector<vpgpu::Format>{toCoreFormat(fmts[i])});
+        const PipelineObj::DepthVariant* dv = depthVariantOf(o0, tvs[i]);
+        CHECK(dv && dv->ok && dv->kind == kDepthTileWrite);
+        if (!dv) continue;
+        frag[i] = dv->state.fragmentShader;
+        CHECK(ps[0]->draws[size_t(i)].pipeline.value == dv->key.value);
+        CHECK(frag[i] != (tvs[i] ? tvs[i]->state.fragmentShader : o0->state.fragmentShader));  // (translated again: it also writes the depth)
+      }
+      // The format is part of the shader: a variant translated with the formats of another object would have that one's shader.
+      CHECK(frag[0] && frag[1] && frag[2] && frag[0] != frag[1] && frag[0] != frag[2] && frag[1] != frag[2]);
+    }
+  }
+  {  // a reader whose input cannot be read from the tile (a constant sample, not gl_SampleID): refused with the reason and the
+     // real draw counts. No pass of this render pass had kept its depth on tile, so it is given up: not planned again (not even
+     // a pass whose reader does lower), nothing translated for it and nothing more logged
+    auto [rp, fb] = renderPass(VK_ATTACHMENT_LOAD_OP_CLEAR);
+    VkPipeline p0 = pipeline(rp, 0, fsPlain, plPlain, true), p1a = pipeline(rp, 1, fsPlain, plPlain, false),
+               p1b = pipeline(rp, 1, fsInput, plInput, false), p1c = pipeline(rp, 1, fsInput0, plInput, false);
+    CHECK(from<PipelineObj>(p1c)->ok);
+    const RenderPassObj* rpo = from<RenderPassObj>(rp);
+    vpgpu::Frame frame;
+    const std::string log = captureStderr([&] { record(rp, fb, p0, p1a, p1c, frame); });
+    CHECK(log.find("depth_input_in_tile=0 reason=lowering_fetch att=1 fb=64x64 draws0=1 draws1=2 fetch_pipes=1") != std::string::npos);
+    CHECK(passes(frame).size() == 2 && !passes(frame)[0]->desc.colors[kDepthTileSlot].texture);
+    CHECK(vpgpu::compileFrame(frame, &c.gpu().resources()).encoders.size() == 2);  // the cut it always had
+    CHECK(from<PipelineObj>(p0)->depthVariants.empty());  // the reader failed first: the writer's variant was not even translated
+    CHECK(rpo->depthTile.load() == -1);
+    vpgpu::Frame again;
+    const std::string log2 = captureStderr([&] { record(rp, fb, p0, p1a, p1b, again); });
+    CHECK(log2.find("depth_input_in_tile") == std::string::npos);
+    CHECK(passes(again).size() == 2 && !passes(again)[0]->desc.colors[kDepthTileSlot].texture);
+    CHECK(from<PipelineObj>(p0)->depthVariants.empty() && from<PipelineObj>(p1b)->depthVariants.empty());
+    CHECK(rpo->depthTile.load() == -1);
+  }
+  {  // ... but a render pass that did keep its depth on tile is not given up for such a reader: the passes drawn with it are
+     // refused, one by one, and the others stay on tile
+    auto [rp, fb] = renderPass(VK_ATTACHMENT_LOAD_OP_CLEAR);
+    VkPipeline p0 = pipeline(rp, 0, fsPlain, plPlain, true), p1a = pipeline(rp, 1, fsPlain, plPlain, false),
+               p1b = pipeline(rp, 1, fsInput, plInput, false), p1c = pipeline(rp, 1, fsInput0, plInput, false);
+    const RenderPassObj* rpo = from<RenderPassObj>(rp);
+    CHECK(rpo->depthTile.load() == 0);
+    vpgpu::Frame first, bad[2], later;
+    const std::string log = captureStderr([&] { record(rp, fb, p0, p1a, p1b, first); });
+    CHECK(log.find("depth_input_in_tile=1 reason=ok") != std::string::npos && rpo->depthTile.load() == 1);
+    for (vpgpu::Frame& f : bad) {
+      const std::string badLog = captureStderr([&] { record(rp, fb, p0, p1a, p1c, f); });
+      CHECK(badLog.find("depth_input_in_tile=0 reason=lowering_fetch att=1 fb=64x64 draws0=1 draws1=2 fetch_pipes=1") != std::string::npos);
+      CHECK(passes(f).size() == 2 && !passes(f)[0]->desc.colors[kDepthTileSlot].texture && rpo->depthTile.load() == 1);
+    }
+    const std::string laterLog = captureStderr([&] { record(rp, fb, p0, p1a, p1b, later); });
+    CHECK(laterLog.find("depth_input_in_tile=1 reason=ok") != std::string::npos);
+    CHECK(passes(later).size() == 2 && passes(later)[0]->desc.colors[kDepthTileSlot].texture);
+    CHECK(vpgpu::compileFrame(later, &c.gpu().resources()).encoders.size() == 1);
+  }
+  {  // a writer whose variant cannot be made (its fragment shader writes colour 6, the shadow's slot): the render pass is given up
+     // the same way, with its own reason
+    auto [rp, fb] = renderPass(VK_ATTACHMENT_LOAD_OP_CLEAR);
+    VkPipeline p0 = pipeline(rp, 0, fsColor6, plPlain, true), p1a = pipeline(rp, 1, fsPlain, plPlain, false),
+               p1b = pipeline(rp, 1, fsInput, plInput, false);
+    CHECK(from<PipelineObj>(p0)->ok);
+    const RenderPassObj* rpo = from<RenderPassObj>(rp);
+    vpgpu::Frame frame;
+    const std::string log = captureStderr([&] { record(rp, fb, p0, p1a, p1b, frame); });
+    CHECK(log.find("depth_input_in_tile=0 reason=lowering_write att=1 fb=64x64 draws0=1 draws1=2 fetch_pipes=1") != std::string::npos);
+    CHECK(passes(frame).size() == 2 && !passes(frame)[0]->desc.colors[kDepthTileSlot].texture);
+    CHECK(rpo->depthTile.load() == -2);
+    vpgpu::Frame again;
+    const std::string log2 = captureStderr([&] { record(rp, fb, p0, p1a, p1b, again); });
+    CHECK(log2.find("depth_input_in_tile") == std::string::npos && rpo->depthTile.load() == -2);
+    CHECK(passes(again).size() == 2 && !passes(again)[0]->desc.colors[kDepthTileSlot].texture);
   }
   {  // a depth that loads cannot be mirrored by a colour attachment that starts from nothing: the pass is left alone
     auto [rp, fb] = renderPass(VK_ATTACHMENT_LOAD_OP_LOAD);
@@ -6011,7 +6247,8 @@ void depthTileCase(bool mv, VkFormat depthFormat, bool expectOn) {
     VkPipeline p0 = pipeline(rp, 0, fsPlain, plPlain, true), p1a = pipeline(rp, 1, fsPlain, plPlain, false);
     vpgpu::Frame frame;
     const std::string log = captureStderr([&] { record(rp, fb, p0, p1a, p1a, frame); });
-    CHECK(log.find("depth_input_in_tile=0 reason=no_reader") != std::string::npos);
+    CHECK(log.find("depth_input_in_tile=0 reason=no_reader att=1 fb=64x64 draws0=1 draws1=2 fetch_pipes=0") != std::string::npos);
+    CHECK(from<PipelineObj>(p0)->depthVariants.empty() && from<PipelineObj>(p1a)->depthVariants.empty());  // (and no variant translated)
   }
   {  // three subpasses: 0 writes the depth, 1 only tests against it, 2 reads it as an input attachment: the shadow follows all
      // three into one encoder and is stored by none of them for the read
@@ -6069,6 +6306,31 @@ void depthTileCase(bool mv, VkFormat depthFormat, bool expectOn) {
     const std::string log = captureStderr([&] { record(rp, fb, p0, p2a, p2b, frame, pm); });
     CHECK(log.find("depth_input_in_tile=0 reason=reader_writes_depth") != std::string::npos);
     CHECK(passes(frame).size() == 3 && !passes(frame)[0]->desc.colors[kDepthTileSlot].texture);
+  }
+  {  // the log is rate limited after its first 64 lines (counted from depthTileLogReset: what was logged before does not matter),
+     // but a reason not logged before still gets its line, once
+    auto [rp, fb] = renderPass(VK_ATTACHMENT_LOAD_OP_CLEAR);
+    VkPipeline p0 = pipeline(rp, 0, fsPlain, plPlain, true), p1a = pipeline(rp, 1, fsPlain, plPlain, false);
+    depthTileLogReset();
+    const std::string many = captureStderr([&] {
+      for (int i = 0; i < 70; ++i) {
+        vpgpu::Frame frame;
+        record(rp, fb, p0, p1a, p1a, frame);
+      }
+    });
+    CHECK(countOf(many, "depth_input_in_tile=0 reason=no_reader") == 64 && countOf(many, "depth_input_in_tile") == 64);
+    auto cleared = [&] {
+      vpgpu::Frame frame;
+      return captureStderr([&] {
+        record(rp, fb, p0, p1a, p1a, frame, VK_NULL_HANDLE, VK_NULL_HANDLE, [&](VkCommandBuffer cb) {
+          const VkClearAttachment ca{VK_IMAGE_ASPECT_COLOR_BIT, 0, {}};
+          const VkClearRect cr{{{0, 0}, {64, 64}}, 0, 1};
+          vkCmdClearAttachments(cb, 1, &ca, 1, &cr);
+        });
+      });
+    };
+    CHECK(countOf(cleared(), "depth_input_in_tile=0 reason=clear_attachments") == 1);
+    CHECK(countOf(cleared(), "depth_input_in_tile") == 0);  // (logged before, past the 64 lines)
   }
 }
 
@@ -10237,10 +10499,18 @@ void testPassDump() {
   PassDump pd = parsePassDump("3000,6");
   CHECK(pd.on && pd.start == 3000 && pd.frames == 6);
   CHECK(parsePassDump("50,99").frames == kPassDumpMaxFrames && parsePassDump("50,0").frames == kPassDumpFrames);
-  PassDump win = parsePassDump("2,2");  // the 3rd and 4th frames with render work
+  PassDump win = parsePassDump("2,2");  // the 3rd and 4th scene frames
   bool seen[5];
-  for (bool& b : seen) b = passDumpNext(win);
+  const int64_t t0 = 1000, sec = 1'000'000'000LL;
+  for (bool& b : seen) b = passDumpNext(win, t0);
   CHECK(!seen[0] && !seen[1] && seen[2] && seen[3] && !seen[4] && win.seen == 5);
+  // ... and again every 60 s from the start of the window before, kPassDumpWindows windows in all.
+  CHECK(!passDumpNext(win, t0 + 59 * sec) && win.windows == 1);
+  for (uint32_t w = 1; w < kPassDumpWindows; ++w) {
+    const int64_t t = t0 + int64_t(w) * 60 * sec;
+    CHECK(passDumpNext(win, t) && passDumpNext(win, t + 1) && !passDumpNext(win, t + 2) && win.windows == w + 1);
+  }
+  CHECK(!passDumpNext(win, t0 + 1000 * sec) && win.windows == kPassDumpWindows && win.seen == 7 + 3 * (kPassDumpWindows - 1));
   CHECK((parseSkipPasses("5,6") == std::vector<uint32_t>{5, 6}) && (parseSkipPasses("4-7") == std::vector<uint32_t>{4, 5, 6, 7}));
   CHECK((parseSkipPasses(" 3 , x, 9-8, 2,2") == std::vector<uint32_t>{2, 3}) && parseSkipPasses(nullptr).empty() && parseSkipPasses("a").empty());
   CHECK(parseSkipPasses("0-1000").size() == kMaxSkipPasses);
@@ -10292,9 +10562,10 @@ void testPassDump() {
   w.dstSet = set, w.descriptorCount = 1, w.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, w.pImageInfo = &dii;
   vkUpdateDescriptorSets(c.dev, 1, &w, 0, nullptr);
 
-  // One pass: draw 0 has no descriptor set bound (refused), 1 and 2 sample the 64 px texture, 3 has an empty scissor.
+  // One pass: draw 0 has no descriptor set bound (refused), 1 and 2 sample the 64 px texture (and `more` draws like them), the
+  // last one has an empty scissor.
   const VkRect2D fine{{0, 0}, {32, 32}}, empty{{4, 4}, {0, 0}};
-  auto record = [&] {
+  auto record = [&](int more = 0) {
     rig.begin();
     vkCmdBindPipeline(rig.cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
     vkCmdSetScissor(rig.cb, 0, 1, &fine);
@@ -10302,6 +10573,7 @@ void testPassDump() {
     vkCmdBindDescriptorSets(rig.cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pl, 0, 1, &set, 0, nullptr);
     vkCmdDraw(rig.cb, 3, 1, 0, 0);
     vkCmdDraw(rig.cb, 6, 1, 0, 0);
+    for (int i = 0; i < more; ++i) vkCmdDraw(rig.cb, 3, 1, 0, 0);
     vkCmdSetScissor(rig.cb, 0, 1, &empty);
     vkCmdDraw(rig.cb, 3, 1, 0, 0);
   };
@@ -10329,10 +10601,41 @@ void testPassDump() {
     passDumpAccumulate(ts.passNotes, 3);
     CHECK(passDumpSummary(1000 + 4'000'000'000LL).empty());
     const std::string sum = passDumpSummary(1000 + 5'000'000'000LL);
-    CHECK(sum.starts_with("vk.pdump.sum t=5s frames=1 render_seen=") && sum.find(" passes=1 draws=2 gate_dropped=3 skipped{unbound=1,scissor=1} unbound{set_null=1} ") != std::string::npos);
+    CHECK(sum.starts_with("vk.pdump.sum t=5s frames=1 scene_seen=") && sum.find(" passes=1 draws=2 gate_dropped=3 skipped{unbound=1,scissor=1} unbound{set_null=1} ") != std::string::npos);
     CHECK(sum.find("tex{sampled=1,le64=1,decl_le64=1,unwritten=1} hide_mesh=") != std::string::npos && sum.ends_with(" skip_pass=off"));
     passDumpAccumulate(ts.passNotes, 0);
     CHECK(passDumpSummary(1000 + 6'000'000'000LL).empty() && passDumpSummary(1000 + 10'000'000'000LL).find(" frames=1 ") != std::string::npos);
+  }
+
+  // Scene frames (the only ones the dump window counts): a multiview or multisampled pass, or 64 draws; not a few 1x draws.
+  {
+    CHECK(!passDumpScene(frame, c.gpu()) && !passDumpScene(vpgpu::Frame(), c.gpu()));
+    record(62);
+    vpgpu::Frame busy;
+    TranslateStats bs;
+    rig.finish(busy, bs);
+    CHECK(bs.draws == 64 && passDumpScene(busy, c.gpu()));
+    const vpgpu::RenderPass* one = std::get_if<vpgpu::RenderPass>(&frame.commands()[0]);
+    CHECK(one != nullptr);
+    if (one) {
+      vpgpu::RenderPassDesc both = one->desc;  // the same pass over two layers (both eyes)
+      both.layerCount = 2;
+      vpgpu::Frame mv;
+      mv.beginRenderPass(both);
+      mv.endRenderPass();
+      CHECK(passDumpScene(mv, c.gpu()));
+      vpgpu::TextureDesc td;
+      CHECK(c.gpu().textureDesc(one->desc.colors[0].texture, td));
+      td.samples = 4, td.label = "pdump.msaa";
+      const vpgpu::TextureId ms = c.gpu().createTexture(td);
+      vpgpu::RenderPassDesc sampled;
+      sampled.colors[0].texture = ms;
+      vpgpu::Frame msaa;
+      msaa.beginRenderPass(sampled);
+      msaa.endRenderPass();
+      CHECK(passDumpScene(msaa, c.gpu()));
+      c.gpu().destroy(ms);
+    }
   }
 
   // Off (the default): nothing is collected.
@@ -10363,26 +10666,45 @@ void testPassDump() {
   TranslateStats ot;
   rig.finish(otherFrame, ot);
   CHECK(ot.draws == 2 && ot.skippedBy[size_t(SkipReason::Experiment)] == 0);
+  // The number is the pass's ordinal among the frame's render passes (the rp= of gpu.pdump.pass and gpu.passtime), not its index
+  // among the commands: a copy ahead of the pass does not shift it.
+  for (uint32_t skip : {0u, 1u}) {
+    skipPasses() = {skip};
+    record();
+    vpgpu::Frame mixed;
+    mixed.fillBuffer({}, 0);  // command 0; the pass is command 1 and render pass 0
+    TranslateStats mx;
+    rig.finish(mixed, mx);
+    CHECK(mixed.commands().size() == 2 && std::holds_alternative<vpgpu::RenderPass>(mixed.commands()[1]));
+    CHECK(mx.draws == (skip == 0 ? 0u : 2u) && mx.skippedBy[size_t(SkipReason::Experiment)] == (skip == 0 ? 2u : 0u));
+  }
 
-  // Through vkQueueSubmit: the first frame with render work is dumped (window 0..1): vk.pdump.* and the core's gpu.pdump.* name the same frame.
+  // Through vkQueueSubmit. A submission of a few 1x draws (menus, loading screens, the UI layer) is not a scene frame: it is
+  // neither counted nor dumped. The first scene frame (here 64 draws) is dumped (window 0..1): vk.pdump.* and the core's
+  // gpu.pdump.* name the same frame.
   skipPasses().clear();
   passDump() = parsePassDump("1");
   passDump().start = 0, passDump().frames = 1, passDump().seen = 0;
+  auto submit = [&](int more) {
+    record(more);
+    vkCmdEndRenderPass(rig.cb);
+    vkEndCommandBuffer(rig.cb);
+    VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+    si.commandBufferCount = 1, si.pCommandBuffers = &rig.cb;
+    CHECK(vkQueueSubmit(c.queue, 1, &si, VK_NULL_HANDLE) == VK_SUCCESS);
+  };
+  const std::string ui = captureStderr([&] {
+    for (int i = 0; i < 3; ++i) submit(0);
+  });
+  CHECK(passDump().seen == 0 && countOf(ui, "gpu.pdump.") == 0 && countOf(ui, "vk.pdump.drop") == 0);
   const std::string logged = captureStderr([&] {
-    for (int i = 0; i < 2; ++i) {  // (the second submit brings the first frame's GPU times)
-      record();
-      vkCmdEndRenderPass(rig.cb);
-      vkEndCommandBuffer(rig.cb);
-      VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
-      si.commandBufferCount = 1, si.pCommandBuffers = &rig.cb;
-      CHECK(vkQueueSubmit(c.queue, 1, &si, VK_NULL_HANDLE) == VK_SUCCESS);
-    }
+    for (int i = 0; i < 2; ++i) submit(62);  // (the second submit brings the first frame's GPU times)
   });
   CHECK(countOf(logged, "vk.pdump.drop f=") == 1 && countOf(logged, "vk.pdump.tex f=") == 1 && countOf(logged, "gpu.pdump.frame f=") == 1);
   const size_t at = logged.find("vk.pdump.drop f=");
   const std::string fr = at == std::string::npos ? "?" : logged.substr(at + 14, logged.find(' ', at + 14) - at - 14);  // "f=<n>"
-  CHECK(logged.find("gpu.pdump.pass " + fr + " pass=0 ") != std::string::npos && logged.find("gpu.pdump.time " + fr + " ") != std::string::npos);
-  CHECK(logged.find("gpu.pdump.pipe " + fr + " pass=0 draws=2 ") != std::string::npos && logged.find(" vs=") != std::string::npos);
+  CHECK(logged.find("gpu.pdump.pass " + fr + " pass=0 rp=0 ") != std::string::npos && logged.find("gpu.pdump.time " + fr + " ") != std::string::npos);
+  CHECK(logged.find("gpu.pdump.pipe " + fr + " pass=0 draws=64 ") != std::string::npos && logged.find(" vs=") != std::string::npos);
   CHECK(logged.find("gpu.pdump.link " + fr + " tex=") != std::string::npos);
   CHECK(passDump().seen == 2);
 

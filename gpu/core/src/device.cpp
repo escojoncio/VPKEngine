@@ -520,6 +520,9 @@ FrameReport Device::submit(const Frame& frame) {
       passNext_ = index + passEvery_;
       std::lock_guard resGuard(resMutex_);  // resources_.get below
       std::vector<std::string> desc;
+      std::vector<uint32_t> rpOf(frame.commands().size());  // ordinal of each render pass among the frame's render passes
+      for (uint32_t c = 0, n = 0; c < rpOf.size(); ++c)
+        if (std::holds_alternative<RenderPass>(frame.commands()[c])) rpOf[c] = n++;
       for (size_t i = 0; i < compiled.encoders.size(); ++i) {
         const Encoder& e = compiled.encoders[i];
         char buf[256];
@@ -528,18 +531,32 @@ FrameReport Device::submit(const Frame& frame) {
           const TextureDesc* td = a.texture ? resources_.get(a.texture) : nullptr;
           uint32_t draws = 0;
           std::string label;
+          std::vector<uint32_t> ords;  // the render passes the encoder runs
           for (uint32_t c : e.commands)
             if (const auto* rp = std::get_if<RenderPass>(&frame.commands()[c])) {
               draws += uint32_t(rp->draws.size());
               if (label.empty()) label = rp->desc.label;
+              ords.push_back(rpOf[c]);
             }
           for (char& ch : label)
             if (ch == ' ') ch = '_';
-          std::snprintf(buf, sizeof buf, "pass=%zu kind=render label=%s fmt=%s %ux%ux%u samples=%u draws=%u merged=%u",
+          std::sort(ords.begin(), ords.end());
+          std::string rps;  // "3" / "3-5,8": runs of consecutive ordinals (the first 8 runs)
+          for (size_t k = 0, runs = 0; k < ords.size(); ++runs) {
+            size_t end = k;
+            while (end + 1 < ords.size() && ords[end + 1] <= ords[end] + 1) ++end;
+            if (runs == 8) {
+              rps += ",..";
+              break;
+            }
+            rps += (rps.empty() ? "" : ",") + std::to_string(ords[k]) + (ords[end] != ords[k] ? "-" + std::to_string(ords[end]) : "");
+            k = end + 1;
+          }
+          std::snprintf(buf, sizeof buf, "pass=%zu kind=render label=%s fmt=%s %ux%ux%u samples=%u draws=%u merged=%u rp=%s",
                         i, label.empty() ? "-" : label.substr(0, 40).c_str(),
                         td ? formatInfo(td->format).name : "-", td ? td->width >> a.mip : 0u,
                         td ? td->height >> a.mip : 0u, unsigned(e.pass.layerCount), td ? unsigned(td->samples) : 0u,
-                        draws, e.passes);
+                        draws, e.passes, rps.empty() ? "-" : rps.c_str());
         } else {
           uint32_t dispatches = 0, copies = 0;
           for (uint32_t c : e.commands)

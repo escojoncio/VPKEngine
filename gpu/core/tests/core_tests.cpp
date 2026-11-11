@@ -3714,6 +3714,24 @@ void testPassDump() {
   Scene::passWithDraw(quiet, Scene::pass(color));
   dev.submit(quiet);
   for (size_t i = n; i < log.size(); ++i) CHECK(!log[i].starts_with("gpu.pdump.pass"));  // only flagged frames are dumped
+  {  // `rp=`: the pass's ordinal among the frame's render passes, whatever sits between them (`pass=` is the command index).
+     // gpu.passtime numbers the encoders (`pass=`) and names the render passes each one runs the same way (`rp=`, a range when merged).
+    const BufferId buf = dev.createBuffer({4096, nullptr, ""});
+    dev.setPassTiming(1);
+    Frame g;
+    g.setPassDump(true);
+    g.fillBuffer(Scene::span(buf), 0);            // x0
+    Scene::passWithDraw(g, Scene::pass(color));   // p1 = rp 0
+    g.fillBuffer(Scene::span(buf), 0);            // x2
+    Scene::passWithDraw(g, Scene::pass(other));   // p3 = rp 1
+    Scene::passWithDraw(g, Scene::pass(other));   // p4 = rp 2: merged with p3 into one encoder
+    dev.submit(g);
+    CHECK(!find("gpu.pdump.pass f=2 pass=1 rp=0 enc=").empty() && !find("gpu.pdump.pass f=2 pass=3 rp=1 enc=").empty());
+    CHECK(!find("gpu.pdump.pass f=2 pass=4 rp=2 enc=").empty());
+    CHECK(!find("gpu.passtime f=2 pass=", " kind=render label=- fmt=RGBA8Unorm 128x128x1 samples=1 draws=1 merged=1 rp=0 ms=").empty());
+    CHECK(!find("gpu.passtime f=2 pass=", " kind=render label=- fmt=RGBA8Unorm 128x128x1 samples=1 draws=2 merged=2 rp=1-2 ms=").empty());
+    CHECK(find("gpu.passtime f=2 pass=", " kind=compute ").find(" rp=") == std::string::npos);
+  }
   for (const std::string& l : log) CHECK(l.find("  ") == std::string::npos || !l.starts_with("gpu.pdump"));
 }
 

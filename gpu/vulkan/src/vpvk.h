@@ -452,6 +452,11 @@ struct RenderPassObj {
   };
   std::vector<Subpass> subpasses;
   int32_t densityMap = -1;  // VK_EXT_fragment_density_map attachment index
+  // Depth in tile (commands.cpp planDepthTile), what the passes of this render pass have shown so far: 0 = nothing yet, 1 = one kept
+  // its depth on tile (pipelines created for it from then on get their variant at creation; it stays 1: a later pass with a pipeline
+  // that cannot be lowered is refused alone), < 0 = a pipeline's variant could not be lowered before any pass kept its depth on tile
+  // (-1 a reader's fetch, -2 a writer): no pass of it is planned or logged again and no variant is made for its pipelines.
+  mutable std::atomic<int8_t> depthTile{0};
 };
 
 // ---- shaders, descriptors, pipelines (pipelines.cpp) ----
@@ -629,6 +634,7 @@ struct PipelineObj {
   bool a2cTest = false;  // alpha-to-coverage pipeline created at 1x (MSAA forced off): alpha test in the fragment shader
   bool d24Emul = false;  // d24Emul() and the pipeline tests depth into a D24UnormS8 image: its fragment stage rounds the depth to 24 bits
   bool depthTileSrc = false;  // a pass of this pipeline's render pass may keep its depth input on tile: `sources` stay for depthPipelineKey
+  bool depthTileEarly = false;  // ... and one already did when the pipeline was created (RenderPassObj::depthTile): its variant is made with it
   bool d24Skipped = false;  // ... except a shader with early fragment tests that may write resources (spirv::d24EmulSkipped): hardware depth
   uint16_t colorIntKinds = 0;  // SpirvLowerOptions::colorIntKinds of the fragment stage
   uint8_t fragmentOutputs = 0;  // colour outputs the fragment shader writes (a dynamic colour write mask never enables others)
@@ -656,10 +662,12 @@ struct PipelineObj {
   mutable std::vector<MaskVariant> maskVariants;
   // Depth in tile (depthPipelineKey): variants for the draws of a render pass whose depth is kept in a colour attachment
   // (commands.cpp planDepthTile). kind 0 = fragment shader also writes the depth into it, 1 = reads the depth input attachment at
-  // texture slot `texSlot` from it, 2 = same shaders, the attachment bound with write mask 0. Under variantMutex.
+  // texture slot `texSlot` from it, 2 = same shaders, the attachment bound with write mask 0. `tv` = the texel variant they derive
+  // from (null = the pipeline itself). Under variantMutex.
   struct DepthVariant {
     uint8_t kind = 0;
     int32_t texSlot = -1;
+    const TexelVariant* tv = nullptr;
     bool ok = false, committed = false;  // committed: requested from the pipeline cache and recorded in the recipes
     vpgpu::PipelineKey key{};
     vpgpu::PipelineState state;

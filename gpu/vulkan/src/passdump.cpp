@@ -47,8 +47,9 @@ std::vector<uint32_t> parseSkipPasses(const char* v) {
 PassDump& passDump() {
   static PassDump p = [] {
     PassDump d = parsePassDump(std::getenv("VPVK_PASS_DUMP"));
-    if (d.on) logf("vk.pdump armed start=%llu frames=%u (VPVK_PASS_DUMP: render frames from number start; one vk.pdump.sum every 5 s)",
-                   (unsigned long long)d.start, d.frames);
+    if (d.on) logf("vk.pdump armed start=%llu frames=%u windows=%u period_s=%lld (VPVK_PASS_DUMP: scene frames from number start, again "
+                   "every period; a scene frame has a multiview or multisampled pass or >= %u draws; one vk.pdump.sum every 5 s)",
+                   (unsigned long long)d.start, d.frames, kPassDumpWindows, (long long)(kPassDumpPeriodNs / 1'000'000'000LL), kPassDumpSceneDraws);
     return d;
   }();
   return p;
@@ -68,16 +69,41 @@ std::vector<uint32_t>& skipPasses() {
     if (!l.empty()) {
       std::string s;
       for (uint32_t i : l) s += (s.empty() ? "" : ",") + std::to_string(i);
-      log("vk.skip_pass active passes=[" + s + "] (VPVK_SKIP_PASS: every draw of those pass indices is dropped, in every frame)");
+      log("vk.skip_pass active passes=[" + s + "] (VPVK_SKIP_PASS: every draw of those render passes is dropped, in every submission; "
+          "the numbers are the rp= of gpu.pdump.pass / gpu.passtime)");
     }
     return l;
   }();
   return v;
 }
 
-bool passDumpNext(PassDump& p) {
+bool passDumpScene(const vpgpu::Frame& frame, vpgpu::Device& gpu) {
+  uint64_t draws = 0;
+  for (const vpgpu::Command& c : frame.commands()) {
+    const auto* rp = std::get_if<vpgpu::RenderPass>(&c);
+    if (!rp) continue;
+    if (rp->desc.layerCount > 1) return true;
+    draws += rp->draws.size();
+    for (int s = 0; s <= vpgpu::kMaxColorAttachments; ++s) {
+      const vpgpu::Attachment& a = s == vpgpu::kMaxColorAttachments ? rp->desc.depth : rp->desc.colors[s];
+      vpgpu::TextureDesc td;
+      if (a.texture && gpu.textureDesc(a.texture, td) && td.samples > 1) return true;
+    }
+  }
+  return draws >= kPassDumpSceneDraws;
+}
+
+bool passDumpNext(PassDump& p, int64_t nowNs) {
   const uint64_t n = p.seen++;
-  return n >= p.start && n < p.start + p.frames;
+  if (n < p.start) return false;
+  if (n < p.windowEnd) return true;
+  if (p.windows >= kPassDumpWindows) return false;
+  if (nowNs < 0) nowNs = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+  if (p.windows && nowNs < p.nextNs) return false;
+  ++p.windows;
+  p.windowEnd = n + p.frames;
+  p.nextNs = nowNs + kPassDumpPeriodNs;
+  return true;
 }
 
 uint8_t texCensusFlags(const Image& im) {
@@ -185,7 +211,7 @@ std::string passDumpSummary(int64_t nowNs) {
   std::string sp;
   for (uint32_t i : skip) sp += (sp.empty() ? "" : ",") + std::to_string(i);
   std::string l = "vk.pdump.sum t=" + std::to_string((nowNs - s.startNs) / 1'000'000'000LL) + "s frames=" + std::to_string(t.frames) +
-                  " render_seen=" + std::to_string(passDump().seen) + " passes=" + std::to_string(t.passes) + " draws=" + std::to_string(t.draws) +
+                  " scene_seen=" + std::to_string(passDump().seen) + " passes=" + std::to_string(t.passes) + " draws=" + std::to_string(t.draws) +
                   " gate_dropped=" + std::to_string(t.gateSkipped) + " skipped{" + nonZero(t.skipped, kSkipReasonNames, size_t(SkipReason::Count)) +
                   "} unbound{" + nonZero(t.bindFail, kBindFailNames, size_t(BindFail::Count)) + "} fallback{mask_plain=" +
                   std::to_string(t.fallbackMask) + ",depth_tile_plain=" + std::to_string(t.fallbackDepthTile) + "} tex{sampled=" +

@@ -3542,12 +3542,10 @@ void runBatches(Device* d, std::vector<DeferredBatch>& list, size_t count) {
       ++cbs;
     }
   const uint64_t perfTranslateUs = perfUsSince(perfT0);
-  PassDump& pdump = passDump();  // VPVK_PASS_DUMP (passdump.h): a few frames pass by pass
+  PassDump& pdump = passDump();  // VPVK_PASS_DUMP (passdump.h): a few scene frames pass by pass
   bool dumpFrame = false;
   if (pdump.on) {
-    bool render = false;
-    for (const vpgpu::Command& c : frame.commands()) render = render || std::holds_alternative<vpgpu::RenderPass>(c);
-    dumpFrame = render && passDumpNext(pdump);
+    dumpFrame = passDumpScene(frame, *d->gpu) && passDumpNext(pdump);
     frame.setPassDump(dumpFrame);
   }
   if (!zl.touches.empty()) {

@@ -9,6 +9,7 @@
 #include <cstdio>
 #include <cstring>
 #include <optional>
+#include <set>
 #include <unordered_map>
 
 #include "texdecode.h"
@@ -773,7 +774,7 @@ struct Translator {
   // subpass 0 writes as an input attachment. Colour attachment kDepthTileSlot (a memoryless R32F texture) holds the depth in every
   // subpass: the draws of subpass 0 also write it, those of the later subpasses read it by framebuffer fetch per sample
   // (pixel-local), so the frame compiler merges the subpasses into one encoder and the 4x depth is never stored for the read. `uses`: the pipeline variant
-  // of every (pipeline, subpass) the pass draws with (depthPipelineKey).
+  // of every (pipeline or texel variant of it, subpass) the pass draws with (depthPipelineKey).
   struct DepthTile {
     struct Use {
       int kind = kDepthTileState;
@@ -2001,10 +2002,16 @@ struct Translator {
     }
     return v.back();
   }
-  // VPVK_SKIP_PASS: is the open pass one whose draws are dropped?
-  bool skippedPass() const {
+  // VPVK_SKIP_PASS: is the open pass one whose draws are dropped? Its number is its ordinal among the frame's render passes (the
+  // `rp=` of gpu.pdump.pass and gpu.passtime): the open pass is the last command, so the render passes up to it are counted.
+  size_t rpScanned = 0;   // commands of the frame counted so far
+  uint32_t rpCount = 0;   // render passes among them
+  bool skippedPass() {
     const std::vector<uint32_t>& l = skipPasses();
-    return !l.empty() && passOpen && std::binary_search(l.begin(), l.end(), uint32_t(frame.commands().size() - 1));
+    if (l.empty() || !passOpen) return false;
+    const std::vector<vpgpu::Command>& cmds = frame.commands();
+    for (; rpScanned < cmds.size(); ++rpScanned) rpCount += std::holds_alternative<vpgpu::RenderPass>(cmds[rpScanned]);
+    return rpCount && std::binary_search(l.begin(), l.end(), rpCount - 1);
   }
 
   // Dynamic rendering: does an in-pass barrier come before a draw that reads an attachment of this pass?
@@ -2107,14 +2114,32 @@ struct Translator {
       }
   }
 
-  static uint64_t depthTileKey(const PipelineObj* p, uint32_t sub) { return uint64_t(reinterpret_cast<uintptr_t>(p)) * 2 + (sub ? 1 : 0); }
+  // (a texel variant is an object of its own: the draws through it get their own depth variant)
+  static uint64_t depthTileKey(const PipelineObj* p, const PipelineObj::TexelVariant* tv, uint32_t sub) {
+    return uint64_t(reinterpret_cast<uintptr_t>(tv ? static_cast<const void*>(tv) : p)) * 2 + (sub ? 1 : 0);
+  }
 
+  struct DepthTileLogState {  // depthTileLog's line count and logged reasons (depthTileLogReset starts them again)
+    std::atomic<unsigned> n{0};
+    std::mutex seenMutex;
+    std::set<std::string> seen;
+  };
+  static DepthTileLogState& depthTileLogState() {
+    static DepthTileLogState s;
+    return s;
+  }
   // "gpu.pass.fuse src=vk depth_input_in_tile=N reason=..": the decision for a pass that reads a multisampled depth as an input
-  // attachment. The first 64 lines, then one in 2000.
+  // attachment, with the draws of subpass 0 / of the later subpasses and the reader pipelines the plan saw (0 when it was refused
+  // before looking at the draws). The first 64 lines, then one in 2000; a reason not logged before always gets its line.
   void depthTileLog(const OpBeginPass& b, bool on, const char* why, uint32_t att, size_t draws0 = 0, size_t draws1 = 0, size_t fetchPipes = 0) {
-    static std::atomic<unsigned> n{0};
-    const unsigned k = n.fetch_add(1);
-    if (k >= 64 && k % 2000) return;
+    DepthTileLogState& s = depthTileLogState();
+    const unsigned k = s.n.fetch_add(1);
+    bool fresh;
+    {
+      std::lock_guard<std::mutex> lock(s.seenMutex);
+      fresh = s.seen.insert(why).second;
+    }
+    if (!fresh && k >= 64 && k % 2000) return;
     logf("gpu.pass.fuse src=vk depth_input_in_tile=%d reason=%s att=%u fb=%ux%u draws0=%zu draws1=%zu fetch_pipes=%zu", on ? 1 : 0, why, att,
          b.framebuffer ? b.framebuffer->width : 0, b.framebuffer ? b.framebuffer->height : 0, draws0, draws1, fetchPipes);
   }
@@ -2138,8 +2163,22 @@ struct Translator {
       }
     if (!dv) return;
     const Image* img = dv->image;
-    auto no = [&](const char* why) { depthTileLog(b, false, why, att); };
+    struct Seen {
+      const PipelineObj* p;
+      const PipelineObj::TexelVariant* tv;
+      uint32_t sub;
+      int kind, texSlot;
+    };
+    std::vector<Seen> seen;
+    size_t draws[2] = {0, 0};
+    auto no = [&](const char* why) {
+      const size_t fetchPipes = size_t(std::count_if(seen.begin(), seen.end(), [](const Seen& x) { return x.kind == kDepthTileFetch; }));
+      depthTileLog(b, false, why, att, draws[0], draws[1], fetchPipes);
+    };
     if (!depthTileOn()) return no("disabled");
+    // A render pass given up (RenderPassObj::depthTile < 0) is not looked at again (its draws would be walked, and the variants of
+    // its new pipelines translated, in every frame for nothing), nor logged again: the pass that gave it up said why.
+    if (b.pass->depthTile.load(std::memory_order_relaxed) < 0) return;
     Device* dev = devForce();
     if (!dev || !dev->gpu || !img->id) return no("no_device");
     if (sps.size() < 2 || !sps[0].inputs.empty()) return no("subpasses");
@@ -2167,67 +2206,65 @@ struct Translator {
     if (areaDepth || partialArea(b.area, dv)) return no("area_clear");
     if (dv->range.baseMipLevel != 0 || img->desc.type != vpgpu::TextureType::Tex2D) return no("depth_view");
     if (img->desc.layers < desc.layerCount) return no("layers");
-    // The draws: subpass 0 must leave the shadow equal to its depth, the later subpasses must not change the depth.
-    struct Seen {
-      const PipelineObj* p;
-      uint32_t sub;
-      int kind, texSlot;
-    };
-    std::vector<Seen> seen;
+    // The draws: subpass 0 must leave the shadow equal to its depth, the later subpasses must not change the depth. The whole pass
+    // is walked whatever is found (the log gives its draws and readers with the first reason).
     std::unordered_map<uint64_t, size_t> seenAt;  // depthTileKey -> index in `seen`
-    size_t draws[2] = {0, 0};
     uint32_t sub = 0;
     const char* bad = nullptr;
+    auto refuse = [&](const char* why) {  // (the first reason stands; false: the walk goes on)
+      if (!bad) bad = why;
+      return false;
+    };
     auto visit = [&](auto&& self, const Op& op) -> bool {  // true: stop
       if (const auto* d = std::get_if<OpDraw>(&op)) {
         if (!d->ok) return false;
-        if (!d->pipe || !d->pipe->ok || !d->pipe->depthTileSrc || d->pipe->sources.empty()) return bad = "pipeline", true;
-        if (d->edsVariant || d->texelVariant) return bad = "pipeline_variant", true;
+        ++draws[sub ? 1 : 0];
+        if (!d->pipe || !d->pipe->ok || !d->pipe->depthTileSrc || d->pipe->sources.empty()) return refuse("pipeline");
+        if (d->edsVariant) return refuse("pipeline_variant");  // (a texel / stride variant has its own depth variant: depthPipelineKey)
         const PipelineObj& p = *d->pipe;
         const bool writes = p.state.depthTest && p.state.depthWrite;
-        if (p.dualSource) return bad = "dual_source", true;
-        if (d->passSamples && d->passSamples != p.state.samples) return bad = "pass_samples", true;
-        if (d->draw.depthClamp) return bad = "depth_clamp", true;
-        ++draws[sub ? 1 : 0];
+        if (p.dualSource) return refuse("dual_source");
+        if (d->passSamples && d->passSamples != p.state.samples) return refuse("pass_samples");
+        if (d->draw.depthClamp) return refuse("depth_clamp");
         int kind = kDepthTileState, texSlot = -1;
         if (sub == 0) {
-          if (d->draw.depthBias != 0 || d->draw.depthBiasSlope != 0) return bad = "depth_bias", true;
+          if (d->draw.depthBias != 0 || d->draw.depthBiasSlope != 0) return refuse("depth_bias");
           if (writes) {
-            if (p.d24Emul) return bad = "d24_emul", true;
+            if (p.d24Emul) return refuse("d24_emul");
             bool frag = false;
             for (const PipelineObj::StageSrc& src : p.sources) frag = frag || (src.stage == VK_SHADER_STAGE_FRAGMENT_BIT && !src.synthetic);
-            if (!frag) return bad = "depth_only", true;
+            if (!frag) return refuse("depth_only");
             kind = kDepthTileWrite;
           }
         } else {
-          if (writes) return bad = "reader_writes_depth", true;
+          if (writes) return refuse("reader_writes_depth");
           int inputs = 0;
           for (const PipelineObj::Used& u : p.used)
             if (u.slot.type == VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT) {
               ++inputs;
               texSlot = int(u.slot.slot);
-              if (u.slot.count != 1) return bad = "input_array", true;
+              if (u.slot.count != 1) return refuse("input_array");
             }
-          if (inputs > 1) return bad = "other_inputs", true;
+          if (inputs > 1) return refuse("other_inputs");
           if (inputs) {
             kind = kDepthTileFetch;
             bool found = false;
             for (const vpgpu::Access& a : d->draw.bindings)
               if (a.slot == texSlot && vpgpu::bindKind(a) == vpgpu::BindKind::Texture && !a.pixelLocal) {
                 if (a.range.kind != vpgpu::ResourceRange::Kind::Texture || a.range.index != img->id.index || a.range.generation != img->id.generation)
-                  return bad = "input_not_depth", true;
+                  return refuse("input_not_depth");
                 found = true;
               }
-            if (!found) return bad = "input_not_depth", true;
+            if (!found) return refuse("input_not_depth");
           }
         }
-        const auto [it, fresh] = seenAt.emplace(depthTileKey(d->pipe, sub), seen.size());
+        const auto [it, fresh] = seenAt.emplace(depthTileKey(d->pipe, d->texelVariant, sub), seen.size());
         if (!fresh) {
           const Seen& x = seen[it->second];
-          if (x.kind != kind || x.texSlot != texSlot) return bad = "pipeline_mixed", true;
+          if (x.kind != kind || x.texSlot != texSlot) return refuse("pipeline_mixed");
           return false;
         }
-        seen.push_back({d->pipe, sub, kind, texSlot});
+        seen.push_back({d->pipe, d->texelVariant, sub, kind, texSlot});
       } else if (const auto* e = std::get_if<OpExecute>(&op)) {
         if (e->secondary)
           for (const Op& so : e->secondary->ops)
@@ -2235,9 +2272,9 @@ struct Translator {
       } else if (std::holds_alternative<OpNextSubpass>(op)) {
         ++sub;
       } else if (std::holds_alternative<OpPassBarrier>(op)) {
-        return bad = "barrier", true;
+        return refuse("barrier");
       } else if (std::holds_alternative<OpClearAttachments>(op)) {
-        return bad = "clear_attachments", true;
+        return refuse("clear_attachments");
       } else if (std::holds_alternative<OpEndPass>(op) || std::holds_alternative<OpBeginPass>(op) || std::holds_alternative<OpBeginRendering>(op)) {
         return true;
       }
@@ -2248,16 +2285,24 @@ struct Translator {
     if (bad) return no(bad);
     if (sub + 1 != sps.size()) return no("subpasses");
     // The variants: all translated first (nothing requested or recorded), committed only when every one exists and the pass is taken.
+    // The readers' first: theirs are the ones that may not lower, and then no writer is translated for nothing (nor when there is
+    // no reader at all).
+    const size_t fetchPipes =
+        size_t(std::stable_partition(seen.begin(), seen.end(), [](const Seen& x) { return x.kind == kDepthTileFetch; }) - seen.begin());
+    if (!fetchPipes) return no("no_reader");
     std::unordered_map<uint64_t, DepthTile::Use> uses;
-    size_t fetchPipes = 0;
     for (const Seen& x : seen) {
       DepthTile::Use u;
       u.kind = x.kind, u.texSlot = x.texSlot;
-      if (!depthPipelineKey(dev, *x.p, x.kind, x.texSlot, u.key, false)) return no(x.kind == kDepthTileFetch ? "lowering_fetch" : "lowering_write");
-      fetchPipes += x.kind == kDepthTileFetch;
-      uses[depthTileKey(x.p, x.sub)] = u;
+      if (!depthPipelineKey(dev, *x.p, x.kind, x.texSlot, u.key, false, false, x.tv)) {
+        // The render pass is given up only while none of its passes has kept its depth on tile: after that this pass alone is refused.
+        const bool fetch = x.kind == kDepthTileFetch;
+        int8_t none = 0;
+        b.pass->depthTile.compare_exchange_strong(none, fetch ? -1 : -2, std::memory_order_relaxed);
+        return no(fetch ? "lowering_fetch" : "lowering_write");
+      }
+      uses[depthTileKey(x.p, x.tv, x.sub)] = u;
     }
-    if (!fetchPipes) return no("no_reader");
     if (!img->depthTileShadow) {
       vpgpu::TextureDesc td = img->desc;
       td.format = vpgpu::Format::R32Float;
@@ -2274,7 +2319,8 @@ struct Translator {
     dt.shadow.load = desc.depth.load == vpgpu::LoadAction::Clear ? vpgpu::LoadAction::Clear : vpgpu::LoadAction::DontCare;
     dt.shadow.clear.color = {double(desc.depth.clear.depth), 0, 0, 0};
     dt.shadow.store = vpgpu::StoreAction::Store;  // (the core drops it when the next subpass merges and the texture is transient)
-    for (const Seen& x : seen) depthPipelineKey(dev, *x.p, x.kind, x.texSlot, uses[depthTileKey(x.p, x.sub)].key, true);
+    for (const Seen& x : seen) depthPipelineKey(dev, *x.p, x.kind, x.texSlot, uses[depthTileKey(x.p, x.tv, x.sub)].key, true, false, x.tv);
+    b.pass->depthTile.store(1, std::memory_order_relaxed);
     dt.uses = std::move(uses);
     dt.active = true;
     desc.colors[kDepthTileSlot] = dt.shadow;
@@ -2298,7 +2344,7 @@ struct Translator {
   // The draw with the pipeline variant of the depth-tile pass and, for a fetch, the shadow read pixel-locally instead of the depth.
   bool depthTileDraw(const OpDraw& d, const vpgpu::Draw& base, vpgpu::Draw& out) {
     if (!dt.active || !d.pipe) return false;
-    const auto it = dt.uses.find(depthTileKey(d.pipe, subpass));
+    const auto it = dt.uses.find(depthTileKey(d.pipe, d.texelVariant, subpass));
     if (it == dt.uses.end()) {
       if (passDump().on) ++passNote().fallbackDepthTile;  // the draw keeps its plain pipeline
       return false;
@@ -2954,6 +3000,13 @@ void UiMaskState::release() {
     if (p.tex && dev && dev->platform) dev->platform->releaseNative(p.tex);
     p = Published{};
   }
+}
+
+void depthTileLogReset() {
+  Translator::DepthTileLogState& s = Translator::depthTileLogState();
+  std::lock_guard<std::mutex> lock(s.seenMutex);
+  s.n = 0;
+  s.seen.clear();
 }
 
 void translate(const Recorder& rec, vpgpu::Frame& frame, TranslateStats& st, const TaaJitter* taa, UiMaskState* um,

@@ -2186,8 +2186,9 @@ void finishGraphics(Device* d, PipelineObj* p, std::vector<PipelineObj::StageSrc
     retainKey(d, *p, p->key);
     d->gpu->pipelines().request(st, p->key, vpgpu::Priority::Visible);
     if (d->recipes) d->recipes->addPipeline(st, inputs);
-  }  // Depth in tile: the variant the pipeline will need (by its subpass) is made here, off the submit thread.
-  if (ok && p->depthTileSrc && !p->sources.empty() && p->layout) {
+  }  // Depth in tile: the variant the pipeline will need (by its subpass) is made here, off the submit thread. Only for a render
+  // pass that already kept a depth on tile (depthTileEarly): a variant is one more pipeline to compile, wasted while no pass uses it.
+  if (ok && p->depthTileEarly && !p->sources.empty() && p->layout) {
     const bool real = std::any_of(p->sources.begin(), p->sources.end(), [](const PipelineObj::StageSrc& x) {
       return x.stage == VK_SHADER_STAGE_FRAGMENT_BIT && !x.synthetic;
     });
@@ -2328,8 +2329,10 @@ PipelineObj* createGraphics(Device* d, const VkGraphicsPipelineCreateInfo& ci) {
   p->d24Emul = d24Emul() && st.depthFormat == vpgpu::Format::D24UnormS8 &&
                (st.depthTest || p->isDynamic(VK_DYNAMIC_STATE_DEPTH_TEST_ENABLE));
   if (ci.renderPass && depthTileOn()) {
-    p->depthTileSub = depthInputRole(*from<RenderPassObj>(ci.renderPass), ci.subpass);
+    const RenderPassObj& rp = *from<RenderPassObj>(ci.renderPass);
+    p->depthTileSub = depthInputRole(rp, ci.subpass);
     p->depthTileSrc = p->depthTileSub >= 0;
+    p->depthTileEarly = p->depthTileSrc && rp.depthTile.load(std::memory_order_relaxed) > 0;
   }
 
   // Integer colour attachments by signedness (fragment outputs take the attachment's type).
@@ -3164,26 +3167,31 @@ int8_t depthInputRole(const RenderPassObj& rp, uint32_t subpass) {
   return -1;
 }
 
-bool depthPipelineKey(Device* dev, const PipelineObj& p, int kind, int texSlot, vpgpu::PipelineKey& out, bool commit, bool atCreate) {
+bool depthPipelineKey(Device* dev, const PipelineObj& p, int kind, int texSlot, vpgpu::PipelineKey& out, bool commit, bool atCreate,
+                      const PipelineObj::TexelVariant* tv) {
   if (!dev || p.compute || !p.ok || kind < 0 || kind > kDepthTileState) return false;
   if (kind != kDepthTileFetch) texSlot = -1;
   std::unique_lock<std::mutex> lock(p.variantMutex);
   PipelineObj::DepthVariant* dv = nullptr;
   for (PipelineObj::DepthVariant& v : p.depthVariants)
-    if (v.kind == kind && v.texSlot == texSlot) dv = &v;
+    if (v.kind == kind && v.texSlot == texSlot && v.tv == tv) dv = &v;
   if (!dv) {
     PipelineObj::DepthVariant n;
-    n.kind = uint8_t(kind), n.texSlot = texSlot;
-    n.state = p.state;
-    n.inputs = p.inputs;
+    n.kind = uint8_t(kind), n.texSlot = texSlot, n.tv = tv;
+    n.state = tv ? tv->state : p.state;
+    n.inputs = tv ? tv->inputs : p.inputs;
     vpgpu::PipelineState& st = n.state;
     static const char* const kSuffix[] = {".dtw", ".dtf", ".dts"};
     st.label += kSuffix[kind];
     bool translated = kind == kDepthTileState;
     if (kind != kDepthTileState) {
+      // The fragment stage again (with the texel variant's formats; its strides only matter to the vertex stage, kept from `tv`).
+      std::vector<PipelineObj::TexelBinding> tb = p.texel;
+      if (tv)
+        for (size_t i = 0; i < tb.size() && i < tv->formats.size(); ++i) tb[i].lowered = tv->formats[i];
       for (const PipelineObj::StageSrc& src : p.sources) {
         if (src.stage != VK_SHADER_STAGE_FRAGMENT_BIT || src.synthetic) continue;
-        StageOut o = translateStage(dev, src, *p.layout, p.viewCount, p.attrs, p.vertexBuffers, st.label, p.viewMask, nullptr,
+        StageOut o = translateStage(dev, src, *p.layout, p.viewCount, p.attrs, p.vertexBuffers, st.label, p.viewMask, tv ? &tb : nullptr,
                                     p.colorIntKinds, -1, false, p.a2cTest, p.sampleMask, p.d24Emul,
                                     kind == kDepthTileWrite ? kDepthTileSlot : -1, kind == kDepthTileFetch ? kDepthTileSlot : -1, texSlot);
         if (o.ok) st.fragmentShader = o.id, n.inputs[1] = o.input, translated = true;

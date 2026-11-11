@@ -54,6 +54,8 @@ class Device {
   void setDetailEvery(uint64_t n) { detailEvery_ = n; }
   // Diagnostic: one "gpu.passtime" line per encoder (GPU ms from stage-boundary timestamps) for
   // one rendering frame every `every` frames (0 = off). Also enabled by env VP_PASS_TIMING=1.
+  // `pass=` is the encoder's index (render and compute ones); a render encoder also names the render passes it runs by their
+  // ordinal among the frame's render passes, `rp=3` or `rp=3-5,8` (the `rp=` of gpu.pdump.pass).
   void setPassTiming(uint64_t every) { passEvery_ = every; }
   // Frame hold (see holdMs_): 0 = never hold a frame for compiling pipelines (the client decides what to do with
   // draws whose pipeline is not ready). Set before the first submit.
