@@ -1338,6 +1338,172 @@ void equalTargets() {
     }, 40, {true, true});
 }
 
+// ---- The draw cache, observed ----------------------------------------------------------------------------------------
+// With the probe on the renderer makes the draw cache's keys and looks its blocks up without taking anything from them
+// (RATES dc_*). Frames that are the same find their blocks good, and the blocks hold what the draws resolve; each thing
+// that makes a block stale does; none of it changes what is drawn; with the probe off nothing is counted.
+struct DcCounts {
+    uint64_t fixedHit, fixedMiss, stageHit, stageMiss, differ, invalid[5], slow[4], texTarget, texMemory;
+};
+DcCounts dcCounts(vpps4::Renderer& r) {
+    r.publishProbe(1);
+    const auto c = [](const char* name) { return vpgpu::probe::counter("RATES", name).get(); };
+    return {c("dc_fixed_hit"), c("dc_fixed_miss"), c("dc_stage_hit"), c("dc_stage_miss"), c("dc_would_differ"),
+            {c("dc_invalid_frame"), c("dc_invalid_layout"), c("dc_invalid_surface"), c("dc_invalid_pass"), c("dc_invalid_clear")},
+            {c("dc_slow_path_gs"), c("dc_slow_path_rectlist"), c("dc_slow_path_indirect"), c("dc_slow_path_otro")},
+            c("dc_tex_target"), c("dc_tex_memory")};
+}
+void drawCacheFrames() {
+    namespace pr = vpgpu::probe;
+    enum { kFrame, kLayout, kSurface, kPass, kClear };
+    constexpr unsigned kFrames = 5, kEye0 = 40, kEye1 = 24;
+    std::vector<DcCounts> marks;
+    const auto script = [&marks](Scene& sc) {
+        Script s;
+        const auto draw = [&s](const vpps4::DrawState& d) {
+            Step st;
+            st.draw = d;
+            s.push_back(std::move(st));
+        };
+        const auto mark = [&] { s.push_back(call([&marks](vpps4::Renderer& r) { marks.push_back(dcCounts(r)); })); };
+        vpps4::DrawState eye[2];
+        for (unsigned e = 0; e < 2; ++e) {
+            eye[e] = Scene::passState(Scene::kEyeColor + Scene::kTargetStride * e, Scene::kEyeDepth + Scene::kTargetStride * e, Scene::kEyeW,
+                                      Scene::kEyeH);
+            eye[e].depthStencil.depthTest = true;
+            eye[e].depthStencil.depthFunc = 3;
+        }
+        // (the objects' constants are written once: every frame is the same)
+        for (unsigned k = 0; k < (kEye0 + kEye1) * 0x1c0 / 4; ++k) sc.g.words(kArena)[k] = sc.rnd();
+        const auto object = [&](unsigned e, unsigned i) {
+            return sc.materialDraw(eye[e], 1 + i % 4, i % Scene::kMeshes, 4 + e, kArena + 0x1c0ull * (e * kEye0 + i), true);
+        };
+        // Identical frames: two passes of draws with one fixed state each, a mark after each frame.
+        for (unsigned f = 0; f < kFrames; ++f) {
+            for (unsigned i = 0; i < kEye0; ++i) draw(object(0, i));
+            for (unsigned i = 0; i < kEye1; ++i) draw(object(1, i));
+            s.push_back(submitStep());
+            mark();
+        }
+        // What makes a block stale, each followed by the same draw twice (a mark after each): the first finds its block
+        // stale, the second good again.
+        const vpps4::DrawState a = object(0, 0);
+        const auto twice = [&] {
+            mark();
+            draw(a), mark();
+            draw(a), mark();
+        };
+        draw(a), draw(a);
+        // 1. Another pass: a draw into other targets.
+        draw(object(1, 0));
+        twice();
+        // 2. A clear: of the draw's depth target (a RectList; the draw after it carries the clear into its pass).
+        draw(Scene::depthClear(Scene::passState(0, Scene::kEyeDepth, Scene::kEyeW, Scene::kEyeH)));
+        draw(a);
+        twice();
+        // 3. The target given again: its memory drawn as a target of another size.
+        draw(sc.materialDraw(Scene::passState(Scene::kEyeColor, 0, Scene::kEyeW / 2, Scene::kEyeH / 2), 1, 0, 4, kArena, true));
+        twice();
+        // 4. A texture of the draw written by the title (the host's watch reports it).
+        const uint64_t texture = kTex + 0x8000ull * 7;  // (material 1's first)
+        s.push_back(call([&sc](vpps4::Renderer& r) {
+            for (unsigned k = 0; k < 64; ++k) sc.g.words(texture)[k] ^= 0x00FF00FF;
+            r.invalidate(texture, Scene::kTexSize * Scene::kTexSize * 4);
+        }));
+        twice();
+        // 5. The tracker's intervals: the GPU writes a range of its own.
+        s.push_back(call([](vpps4::Renderer& r) { r.noteGpuWrite(kArena + kArenaBytes, 4096); }));
+        twice();
+        // A texture that is a render target (the second full-screen draw samples what the first drew, twice).
+        draw(sc.postDraw(0, sc.postTables[1]));
+        draw(sc.postDraw(1, sc.postTables[0])), draw(sc.postDraw(1, sc.postTables[0]));
+        s.push_back(submitStep());
+        mark();
+        return s;
+    };
+    pr::setEnabled(true);
+    pr::registry().reset();
+    const Outcome on = run(script, false);
+    pr::setEnabled(false);
+    pr::registry().reset();
+    CHECK(marks.size() == kFrames + 5 * 3 + 1);
+    if (marks.size() != kFrames + 5 * 3 + 1) return;
+    const auto delta = [&](size_t k) {
+        DcCounts d = marks[k];
+        const DcCounts& b = marks[k - 1];
+        d.fixedHit -= b.fixedHit, d.fixedMiss -= b.fixedMiss, d.stageHit -= b.stageHit, d.stageMiss -= b.stageMiss, d.differ -= b.differ;
+        d.texTarget -= b.texTarget, d.texMemory -= b.texMemory;
+        for (unsigned i = 0; i < 5; ++i) d.invalid[i] -= b.invalid[i];
+        for (unsigned i = 0; i < 4; ++i) d.slow[i] -= b.slow[i];
+        return d;
+    };
+    if (std::getenv("VPPS4_SHOW_COUNTS"))
+        for (size_t k = 0; k < marks.size(); ++k) {
+            const DcCounts d = k ? delta(k) : marks[0];
+            std::printf("mark %zu: fixed %llu/%llu stage %llu/%llu differ %llu invalid f%llu l%llu s%llu p%llu c%llu slow %llu %llu %llu %llu tex %llu/%llu\n", k,
+                        (unsigned long long)d.fixedHit, (unsigned long long)d.fixedMiss, (unsigned long long)d.stageHit,
+                        (unsigned long long)d.stageMiss, (unsigned long long)d.differ, (unsigned long long)d.invalid[0],
+                        (unsigned long long)d.invalid[1], (unsigned long long)d.invalid[2], (unsigned long long)d.invalid[3],
+                        (unsigned long long)d.invalid[4], (unsigned long long)d.slow[0], (unsigned long long)d.slow[1],
+                        (unsigned long long)d.slow[2], (unsigned long long)d.slow[3], (unsigned long long)d.texTarget,
+                        (unsigned long long)d.texMemory);
+        }
+    // The first frame makes the blocks: every draw is looked at, none finds a good block of an earlier frame.
+    CHECK(marks[0].fixedHit + marks[0].fixedMiss == kEye0 + kEye1 && marks[0].stageHit + marks[0].stageMiss == 2 * (kEye0 + kEye1));
+    CHECK(marks[0].fixedMiss >= 2 && marks[0].invalid[kFrame] == 0);
+    // The frames after it: all but the first draw of each pass find their fixed block good (that one finds it of another
+    // frame and pass), every stage finds its block, and no good block holds anything else than what the draw resolved.
+    for (size_t k = 2; k < kFrames; ++k) {
+        const DcCounts d = delta(k);
+        CHECK(d.fixedHit + d.fixedMiss == kEye0 + kEye1 && d.fixedHit * 10 >= (kEye0 + kEye1) * 9);
+        CHECK(d.fixedMiss == 2 && d.invalid[kFrame] == 2 && d.invalid[kPass] == 2);
+        CHECK(d.stageHit == 2 * (kEye0 + kEye1) && d.stageMiss == 0);
+        CHECK(d.differ == 0);
+        CHECK(d.texMemory == 3 * (kEye0 + kEye1) && d.texTarget == 0);  // (three textures of guest memory per pixel stage)
+        for (uint64_t n : d.slow) CHECK(n == 0);
+    }
+    // Each adverse case: the draw after it does not find its block good, for that reason; the same draw again does.
+    const auto stale = [&](size_t at, unsigned part) {
+        const DcCounts first = delta(at + 1), second = delta(at + 2);
+        CHECK(first.fixedHit == 0 && first.fixedMiss == 1 && first.invalid[part] == 1);
+        CHECK(second.fixedHit == 1 && second.fixedMiss == 0);
+        for (unsigned i = 0; i < 5; ++i) CHECK(second.invalid[i] == 0);
+        return first;
+    };
+    size_t at = kFrames;
+    stale(at, kPass);
+    {
+        // (the clear itself and the draw that carries it are not draws a block can serve)
+        const DcCounts before = delta(at += 3);
+        CHECK(before.slow[1] == 1 && before.slow[3] == 1 && before.fixedHit + before.fixedMiss == 0);
+        stale(at, kClear);
+    }
+    stale(at += 3, kSurface);
+    {
+        const DcCounts d = stale(at += 3, kLayout);
+        CHECK(d.invalid[kSurface] == 0 && d.invalid[kClear] == 0);
+    }
+    {
+        const DcCounts d = stale(at += 3, kLayout);
+        CHECK(d.invalid[kSurface] == 0 && d.invalid[kClear] == 0 && d.invalid[kPass] == 0 && d.invalid[kFrame] == 0);
+    }
+    // A texture an image backs is not one a block holds (resolved in every draw): counted apart.
+    CHECK(delta(marks.size() - 1).texTarget == 2);
+    CHECK(marks.back().differ == 0);
+    CHECK(marks.back().slow[0] == 0 && marks.back().slow[2] == 0);
+    // Looking changes nothing of what is drawn, and with the probe off nothing is looked at.
+    marks.clear();
+    const Outcome off = run(script, false);
+    CHECK(same(on, off, "draw cache observed"));
+    CHECK(on.drawn >= kFrames * (kEye0 + kEye1));
+    pr::setEnabled(true);
+    for (const char* name : {"dc_fixed_hit", "dc_fixed_miss", "dc_stage_hit", "dc_stage_miss", "dc_would_differ", "dc_slow_path_rectlist",
+                             "dc_slow_path_otro", "dc_invalid_frame", "dc_invalid_pass"})
+        CHECK(pr::counter("RATES", name).get() == 0);
+    pr::setEnabled(false);
+    pr::registry().reset();
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -1353,6 +1519,7 @@ int main(int argc, char** argv) {
     else if (t == "equal_programs") equalPrograms();
     else if (t == "equal_targets") equalTargets();
     else if (t == "equal_caches") equalCaches();
+    else if (t == "draw_cache_frames") drawCacheFrames();
     else return std::fprintf(stderr, "unknown test %s\n", t.c_str()), 2;
     return failures ? 1 : 0;
 }
