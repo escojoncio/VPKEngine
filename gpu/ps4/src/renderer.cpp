@@ -29,6 +29,7 @@
 #include "vpps4/foveation.h"
 #include "vpps4/lifetime.h"
 #include "vpps4/msaa.h"
+#include "draw_cache.h"
 #include "frame_capture.h"
 #include "translation_cache.h"
 #include "vpps4/report.h"
@@ -3732,6 +3733,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         if (!clearedDepthFills || !zAddress) return;
         ClearedDepth& c = clearedDepths[zAddress];
         if (c.mask == ~uint32_t(0) && c.value == value) return;
+        ++clearSerial;
         c.value = value, c.mask = ~uint32_t(0), c.stamp = ++clearedDepthStamp;
         c.version = tracker.current();
     }
@@ -3741,6 +3743,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         uint32_t bits = 0;
         for (uint32_t i = sliceStart; i < sliceStart + sliceCount && i < 32; ++i) bits |= 1u << i;
         if (!(it->second.mask & bits)) return;
+        ++clearSerial;
         it->second.mask &= ~bits, it->second.stamp = ++clearedDepthStamp;
         if (!it->second.mask) clearedDepths.erase(it);
     }
@@ -4116,6 +4119,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         life.noteSticky(rw, r.frame_);
         c.id = rw;
         c.writable = true;
+        ++surfaceEpoch;
         note("colour target recreated with storage usage (written by a compute pass)");
     }
 
@@ -4127,6 +4131,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
     // the layer the last resolve wrote.
     void makeSamplesReal(Target& c) {
         const bool onTile = c.samplesOnTile;
+        if (!c.samplesStored) ++surfaceEpoch;
         c.samplesOnTile = false;
         c.samplesStored = true;
         if (!onTile || !c.ms || !c.id) return;
@@ -4203,6 +4208,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
 
     // A whole-target clear replaces what waited for the texture (its partial clears included).
     void setPendingClear(PendingClear c) {
+        ++clearSerial;
         for (PendingClear& p : pendingClears)
             if (p.texture == c.texture) return void(p = c);
         pendingClears.push_back(c);
@@ -4221,6 +4227,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
     const PendingClear* takePendingClear(TextureId t, PendingClear& out) {
         for (size_t i = 0; i < pendingClears.size(); ++i)
             if (pendingClears[i].texture == t) {
+                ++clearSerial;
                 out = pendingClears[i];
                 pendingClears.erase(pendingClears.begin() + long(i));
                 return &out;
@@ -4334,6 +4341,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
     }
     // Retires `s`'s GPU texture (and its views): destroyed kFrames submits later.
     void retireTexture(const Surface& s) {
+        ++surfaceEpoch;
         if (s.ms) retiredTextures.push_back({s.ms, r.frame_ + kFrames});
         if (!s.id) return;
         retireViews(s.id);
@@ -4509,7 +4517,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
                 std::to_string(samples) + " fmt=" + std::to_string(int(f)));
         t.lastUse = r.frame_;
         ++r.stats_.targets;
-        ++texGen;
+        ++texGen, ++surfaceEpoch;
         life.noteRead(t.id ? t.id : t.ms, r.frame_);  // (born now: stored while it warms up)
         surfaceRefs[t.wid] = {uint8_t(depth ? 1 : 0), address, 0};
         auto at = list.begin();
@@ -4536,7 +4544,10 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
     // The depth surface read at `from` also answers for `to` (written at another address than it is
     // read from): later lookups at `to` find it.
     std::map<uint64_t, uint64_t> depthAliases;
-    void aliasTarget(uint64_t to, uint64_t from) { depthAliases[to] = from; }
+    void aliasTarget(uint64_t to, uint64_t from) {
+        uint64_t& alias = depthAliases[to];
+        if (alias != from) alias = from, ++surfaceEpoch;
+    }
 
     // A draw with colour off that forces depth (or stencil) dirty and valid copies the surface it
     // reads into the one it writes (a depth copy / decompression done with a draw).
@@ -4835,7 +4846,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
             m.address = desc.address;
             m.bytes = 0;  // (never filled from memory: the target is its source)
             m.filled = true;
-            ++texGen;
+            ++texGen, ++surfaceEpoch;
         }
         Texture& m = atAddress[h.h];
         m.lastUse = c->lastUse = r.frame_;
@@ -5085,7 +5096,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
             retireTexture(tex);
             tex.id = {};
             tex.filled = false;
-            ++texGen;
+            ++texGen, ++surfaceEpoch;
         }
         if (!tex.id) {
             td.label = "tex " + hex(d.address);  // (only a texture that is made has a use for it)
@@ -5118,7 +5129,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
             tex.version = 0;
             tex.filled = false;
             ++r.stats_.textures;
-            ++texGen;
+            ++texGen, ++surfaceEpoch;
             if (vpgpu::probe::enabled()) {
                 const bool srgbAsUnorm = plan.conv.srgb && !vpgpu::formatInfo(f).srgb();
                 const uint8_t flags = uint8_t((srgbAsUnorm ? 1 : 0) | (plan.exact ? 0 : 2) | (plan.softBc ? 4 : 0) | (storage ? 8 : 0));
@@ -5194,6 +5205,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
 
     // Destroys the image: written back first if it holds newer bytes than memory.
     void destroySurface(uint32_t wid) {
+        ++surfaceEpoch;
         Surface* s = surfaceOf(wid);
         if (!s) {
             surfaceRefs.erase(wid);
@@ -5878,6 +5890,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
             }
             keepSamplesAtCut(guestResolved);
             frame.endRenderPass();
+            ++passSerial;
         }
         passOpen = false;
         passKeepWid = ~0u;
@@ -5927,6 +5940,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         passWritten = 0;
         frame.beginRenderPass(pass);
         passOpen = true;
+        ++passSerial;
         ++r.stats_.passes;
         if (cap.armed) capPassBegin(pass);
         // Later draws on the same targets continue it: no clear on reopen.
@@ -5944,6 +5958,252 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
     std::vector<Drawn> drawnScratch;
     std::vector<std::pair<unsigned, TargetIds>> colorIdsScratch;
 
+    // ---- Draw cache: observation (probe on; nothing is taken from it yet) ---------------------------
+    // The keys and blocks of draw_cache.h are made and looked up for every draw a block could serve, and the draw is resolved
+    // as ever. Counted (RATES dc_*), when the draw is recorded: the draws and stages whose block was there and good
+    // (dc_fixed_hit, dc_stage_hit) or not (dc_fixed_miss, dc_stage_miss; for a fixed block that was there, the parts of its
+    // witness that had moved: dc_invalid_*), and the good blocks that did not hold what the draw resolved (dc_would_differ: the
+    // key or the witness is not enough). Counted when they come: the draws no block can serve (dc_slow_path_*).
+    struct DrawWork;
+    uint64_t surfaceEpoch = 0;  // a target or a texture made, destroyed or replaced, a depth alias changed
+    uint64_t passSerial = 0;    // a render pass of the draws begun or ended
+    uint64_t clearSerial = 0;   // a clear recorded, taken by a pass, or drawn over
+    dc::Witness dcNow() const {
+        dc::Witness w;
+        w.part = {r.frame_, tracker.layout(), surfaceEpoch, passSerial, clearSerial};
+        return w;
+    }
+    struct DcStats {
+        enum Slow : unsigned { kGs, kRectList, kIndirect, kOther, kSlowPaths };
+        uint64_t fixedHit = 0, fixedMiss = 0, stageHit = 0, stageMiss = 0, wouldDiffer = 0;
+        uint64_t invalid[dc::Witness::Parts] = {}, slowPath[kSlowPaths] = {};
+        uint64_t texTarget = 0, texMemory = 0;  // texture bindings an image backs or the GPU wrote (resolved in every draw) / of plain memory
+    } dcStat;
+    dc::Table<dc::FixedBlock> dcFixed{1024};
+    dc::Table<dc::StageBlock> dcStages{8192};
+    // The draw being looked at: its keys, what was found for them and what the draw resolved, until it is recorded.
+    struct DcDraw {
+        dc::FixedKey key;
+        uint64_t hash = 0;
+        bool found = false;   // its fixed key had a block when the draw began
+        unsigned stale = 0;   // ... and these parts of its witness had moved
+        unsigned differs = 0;
+        std::vector<uint8_t> resolved;
+        dc::Witness mid;  // after the prologue: what the stages' blocks are judged under
+        size_t bound = 0, views = 0;  // where the next stage's bindings and views begin in the draw's
+        struct Stage {
+            bool on = false, good = false;
+            dc::StageKey key;
+            uint64_t hash = 0, translated = 0;
+            std::vector<dc::BindItem> items;
+            uint32_t texTarget = 0, texMemory = 0;
+        } stage[2];
+    } dcDraw;
+
+    // Whether a block could serve the draw: no geometry shader, RectList, indirect arguments, patches, converted primitives,
+    // indices to prepare, clears (its own or waiting), depth copy, nor a host that looks at the draw or seeds its targets.
+    // The others are counted by what keeps them out. A draw recorded again without its partner was counted the first time.
+    bool dcBegin(const DrawState& d) {
+        if (noPartnerOnce) return false;
+        const bool other = d.primitive == PrimitiveType::Patch || needsConversion(d.primitive) ||
+                           (d.indexAddress && indicesNeedPrep(d) && !indicesKnownClean(d)) || d.depth.depthClear || d.depth.stencilClear ||
+                           isDepthCopy(d) || !pendingClears.empty() || resolved_ || cap.armed || cap.user || probeOn || r.hooks_.seed;
+        if (d.geom.enabled || d.primitive == PrimitiveType::RectList || d.indirectAddress || other) {
+            ++dcStat.slowPath[d.geom.enabled ? DcStats::kGs : d.primitive == PrimitiveType::RectList ? DcStats::kRectList
+                              : d.indirectAddress ? DcStats::kIndirect : DcStats::kOther];
+            return false;
+        }
+        DcDraw& o = dcDraw;
+        dc::fixedKey(d, r.maxSamples_, o.key);
+        o.hash = o.key.hash();
+        const dc::FixedBlock* b = dcFixed.find(o.key, o.hash);
+        o.found = b != nullptr;
+        o.stale = b ? b->seal.stale(dcNow()) : 0;
+        o.differs = 0;
+        o.stage[0].on = o.stage[1].on = false;
+        return true;
+    }
+    static uint64_t dcId(vpgpu::TextureId t) { return uint64_t(t.generation) << 32 | t.index; }
+    // What the prologue resolved (drawFixed), as a block would hold it; a block that was good must hold the same.
+    void dcResolved(DrawWork& w) {
+        DcDraw& o = dcDraw;
+        if (w.desc.rateMap) {  // (foveated: no block serves it)
+            ++dcStat.slowPath[DcStats::kOther];
+            w.watch = false;
+            return;
+        }
+        std::vector<uint8_t>& out = o.resolved;
+        out.clear();
+        const auto put = [&out](const auto&... v) {
+            (out.insert(out.end(), reinterpret_cast<const uint8_t*>(&v), reinterpret_cast<const uint8_t*>(&v) + sizeof v), ...);
+        };
+        const auto attachment = [&](const vpgpu::Attachment& a) {
+            put(dcId(a.texture), a.mip, a.layer, a.load, a.store, a.clear.depth, a.clear.stencil, dcId(a.resolve), a.resolveMip, a.resolveLayer,
+                a.resolveRequired, a.depthResolve, a.stencilResolve, a.format, a.keepSamples, a.autoMsaa);
+        };
+        for (const vpgpu::Attachment& a : w.desc.colors) attachment(a);
+        attachment(w.desc.depth);
+        put(w.desc.layerCount, w.ps.key().value, w.depthWid, w.width, w.height, w.dualSource, w.zf, w.samples, w.partnerSlot, w.colourOnTile,
+            w.colourStored, w.keepWid, w.partnerAt, w.clears, w.depthWidth, w.depthHeight, w.depthLayers, w.stencil.refFront, w.stencil.refBack,
+            w.depth1x, w.scissorSet, w.sl, w.stp, w.sr, w.sb, w.clearsZ, w.clearsStencil, partnerWid, alphaTestNow, viewIndexedNow);
+        for (const vpgcn::ExportConv& e : curExport) put(e.kind, e.select, e.srgb, e.bits, e.dfmt, e.nfmt);
+        for (const auto& [slot, t] : colorIdsScratch) put(slot, dcId(t.render), dcId(t.resolved), t.multisampled, t.wid);
+        for (const Drawn& c : drawnScratch) put(c.address, dcId(c.id), c.wid);
+        for (uint32_t wid : attachedWids) put(wid);
+        if (w.samples > 1) put(msCoverage, msFragments);
+        o.mid = dcNow();
+        if (o.found && !o.stale)
+            if (const dc::FixedBlock* b = dcFixed.find(o.key, o.hash); b && b->resolved != out) ++o.differs;
+    }
+    // Whether `id`, bound for a T# at `address`, is the image of plain guest memory: no render target behind it and no
+    // GPU writer in its range (what a block could hold of a texture; the others are resolved in every draw).
+    bool dcMemoryTexture(uint64_t address, uint64_t id) const {
+        const auto at = textures.find(address);
+        if (at == textures.end()) return false;
+        for (const auto& [shape, t] : at->second)
+            if (dcId(t.id) == id) return t.bytes && !t.mirrorSrc && !tracker.gpuWritten(t.address, t.bytes);
+        return false;
+    }
+    // A stage of the draw, its bindings just resolved (the last of `bound`): its key (the sampler of an S# stands for its
+    // dwords, which are not read again), what a block of it would hold, and whether the block it has, if good, holds that.
+    void dcStage(unsigned which, const Stage& s, const Translated& t, vpgcn::ShaderStage stage, const std::vector<Access>& bound) {
+        DcDraw& o = dcDraw;
+        DcDraw::Stage& st = o.stage[which];
+        const size_t first = which ? o.bound : 0, firstView = which ? o.views : 0;
+        o.bound = bound.size(), o.views = pendingViews.size();
+        if (bound.size() - first != t.bindings.size() + (t.userDataSlot ? 1 : 0)) return;  // (a binding that is several: not looked at)
+        st.key.clear();
+        st.key.program = programKeyCached(s, stage);
+        Hash env;  // (what shader() adds to the program and the descriptors)
+        if (stage == vpgcn::ShaderStage::Pixel) {
+            for (const vpgcn::ExportConv& e : curExport)
+                env.value(e.kind), env.bytes(e.select, 4), env.value(e.srgb), env.bytes(e.bits, 4), env.value(e.dfmt), env.value(e.nfmt);
+            env.value(alphaTestNow);
+        }
+        env.value(viewIndexedNow);
+        st.key.env = env.h;
+        st.key.stage = uint8_t(stage);
+        st.items.clear();
+        st.texTarget = st.texMemory = 0;
+        const std::vector<Snap>& snap = snaps[size_t(stage)];
+        for (size_t bi = 0; bi < t.bindings.size(); ++bi) {
+            const vpgcn::Binding& b = t.bindings[bi];
+            const Access& a = bound[first + bi];
+            const int at = bi < t.snapIndex.size() ? t.snapIndex[bi] : -1;
+            const uint32_t* words = at >= 0 && size_t(at) < snap.size() && snap[at].ok ? snap[at].w.data() : nullptr;
+            dc::BindItem item;
+            item.bind = uint8_t(a.kind), item.stages = a.stages, item.write = a.write, item.slot = a.slot;
+            const uint64_t id = uint64_t(a.range.generation) << 32 | a.range.index;
+            if (a.range.kind == ResourceRange::Kind::Sampler) {
+                item.kind = dc::BindItem::Sampler, item.id = id;
+                st.key.sampler(id);
+            } else if (a.range.kind == ResourceRange::Kind::Texture && words) {
+                st.key.texture(words, b.dwords);
+                item.id = id;
+                for (size_t v = firstView; v < pendingViews.size(); ++v)
+                    if (pendingViews[v].kind == a.kind && pendingViews[v].slot == a.slot) item.view = dcId(pendingViews[v].view);
+                const bool memory = dcMemoryTexture(decodeImage({words, b.dwords}).address, id);
+                item.kind = memory ? dc::BindItem::Texture : dc::BindItem::Live;
+                ++(memory ? st.texMemory : st.texTarget);
+            } else if (a.range.kind == ResourceRange::Kind::Buffer && words) {
+                item.kind = dc::BindItem::Buffer;
+                st.key.buffer(words, b.dwords);
+            } else {
+                item.kind = a.range.kind == ResourceRange::Kind::Buffer ? dc::BindItem::Buffer : dc::BindItem::Live;
+                st.key.other();
+            }
+            st.items.push_back(item);
+        }
+        if (t.userDataSlot) {
+            const Access& a = bound.back();
+            dc::BindItem item;
+            item.bind = uint8_t(a.kind), item.stages = a.stages, item.write = a.write, item.slot = a.slot;
+            st.items.push_back(item);
+        }
+        st.hash = st.key.hash();
+        st.translated = t.id;
+        const dc::StageBlock* b = dcStages.find(st.key, st.hash);
+        // (its translation follows the targets that exist; a texture it holds, everything but the pass)
+        st.good = b && !b->seal.stale(o.mid, 1u << dc::Witness::Surface);
+        st.on = true;
+        if (!st.good) return;
+        const bool sealed = !b->seal.stale(o.mid, dc::Witness::kAll & ~(1u << dc::Witness::Pass));
+        bool same = b->translated == st.translated && b->items.size() == st.items.size();
+        for (size_t i = 0; same && i < st.items.size(); ++i) {
+            const dc::BindItem &was = b->items[i], &now = st.items[i];
+            same = was.sameShape(now) && (was.kind != dc::BindItem::Sampler || was.id == now.id) &&
+                   (was.kind != dc::BindItem::Texture || !sealed || (was.id == now.id && was.view == now.view));
+        }
+        if (!same) ++o.differs;
+    }
+    // The draw was recorded: counted, and its blocks are what it resolved, under the witness as the draw leaves it.
+    void dcRecord() {
+        DcDraw& o = dcDraw;
+        const dc::Witness now = dcNow();
+        ++(o.found && !o.stale ? dcStat.fixedHit : dcStat.fixedMiss);
+        for (unsigned p = 0; p < dc::Witness::Parts; ++p) dcStat.invalid[p] += o.stale >> p & 1;
+        dcStat.wouldDiffer += o.differs;
+        dc::FixedBlock* b = dcFixed.find(o.key, o.hash);
+        if (!b) b = &dcFixed.make(o.key, o.hash, r.frame_);
+        b->used = r.frame_, b->seal = now, b->resolved = o.resolved;
+        for (const DcDraw::Stage& st : o.stage) {
+            if (!st.on) continue;
+            ++(st.good ? dcStat.stageHit : dcStat.stageMiss);
+            dcStat.texTarget += st.texTarget, dcStat.texMemory += st.texMemory;
+            dc::StageBlock* sb = dcStages.find(st.key, st.hash);
+            if (!sb) sb = &dcStages.make(st.key, st.hash, r.frame_);
+            sb->used = r.frame_, sb->seal = now, sb->translated = st.translated, sb->items = st.items;
+        }
+    }
+    void dcPublish() const {
+        const auto C = [](const std::string& name, uint64_t v) { vpgpu::probe::counter("RATES", name).set(v); };
+        C("dc_fixed_hit", dcStat.fixedHit), C("dc_fixed_miss", dcStat.fixedMiss), C("dc_stage_hit", dcStat.stageHit), C("dc_stage_miss", dcStat.stageMiss);
+        C("dc_would_differ", dcStat.wouldDiffer), C("dc_tex_target", dcStat.texTarget), C("dc_tex_memory", dcStat.texMemory);
+        for (unsigned p = 0; p < dc::Witness::Parts; ++p) C(std::string("dc_invalid_") + dc::kWitnessParts[p], dcStat.invalid[p]);
+        static const char* const slow[DcStats::kSlowPaths] = {"gs", "rectlist", "indirect", "otro"};
+        for (unsigned k = 0; k < DcStats::kSlowPaths; ++k) C(std::string("dc_slow_path_") + slow[k], dcStat.slowPath[k]);
+    }
+
+    // What the phases of a draw hand on to the next one: drawFixed (targets, pass and fixed state), drawStages (shaders and
+    // bindings), drawEmit (geometry, pipeline, the draw and what it leaves). `go`: the phase ended with the draw still to be recorded.
+    struct DrawWork {
+        bool go = false;
+        bool watch = false;  // the draw cache looks at this draw (probe on, see dcBegin)
+        // drawFixed
+        vpgpu::RenderPassDesc desc;
+        vpgpu::PipelineState ps;
+        uint32_t depthWid = 0;
+        uint32_t width = 0, height = 0;
+        bool dualSource = false;
+        vpgpu::Format zf = vpgpu::Format::Undefined;
+        uint8_t samples = 1;
+        unsigned partnerSlot = 8;  // (the slot attached for the depth partner, 8 = none)
+        bool colourOnTile = false, colourStored = false;  // a multisampled colour attachment keeps its samples on tile / stores them
+        uint32_t keepWid = ~0u;                           // the target of colour 0 when it does (and VPKENGINE_MSAA_CUT_SAMPLES_OFF is not 1)
+        uint64_t partnerAt = 0;  // (its key)
+        bool clears = false;
+        uint32_t depthWidth = 0, depthHeight = 0;  // the depth image (a clear that leaves part of it alone does not make it the guest's)
+        uint16_t depthLayers = 1;
+        std::shared_ptr<vpgpu::ClearRects> partialClear;  // a clear of one plane, or of part of the target
+        StencilResolved stencil;
+        bool depth1x = false;  // the depth attachment is the single-sample picture of a multisampled depth target
+        bool scissorSet = false;
+        int32_t sl = 0, stp = 0, sr = 0, sb = 0;
+        bool clearsZ = false, clearsStencil = false;
+        bool geom = false, rect = false;
+        // drawStages
+        bool psIterSample = false;  // (of the pixel stage as it was translated)
+        const Translated* vs = nullptr;
+        const Translated* esT = nullptr;
+        const Translated* gsT = nullptr;
+        const Translated* fs = nullptr;
+        vpgpu::Draw draw;
+        std::string why;
+        vpgpu::Dispatch esJob, gsJob;
+        uint64_t gsDrawIndices = 0;
+        uint32_t rectCount = 0;
+    };
+
     void draw(const DrawState& d) {
         if (cap.user && d.depth.zFormat && d.depth.depthClear) capNewView(d.depth.zAddress);
         pollCache();
@@ -5953,31 +6213,54 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         phaseTimed = r.stats_.draws % kPhaseEvery == 0;
         if (cap.armed) cap.drawSampled.clear();  // (what a dispatch sampled is not this draw's)
         if (d.count == 0 || d.instances == 0) return skip("empty draw");
+        const bool watch = vpgpu::probe::enabled() && dcBegin(d);
         if (isDepthCopy(d)) return handled("depth copy"), depthCopy(d);
         if (d.raster.cullFront && d.raster.cullBack) return skip("both faces culled");
+        DrawWork w;
+        w.watch = watch;
+        drawFixed(d, w);
+        if (!w.go) return;
+        if (w.watch) dcResolved(w);
+        drawStages(d, w);
+        if (!w.go) return;
+        drawEmit(d, w);
+        if (w.watch && w.go) dcRecord();
+    }
 
+    // The planes a depth/stencil clear leaves whole in the image (so that the image is what the guest holds there, see
+    // Surface::zAuthoritative), once the clear is recorded: the scissor takes all of the image, and so do the slices
+    // cleared (`layers`: those of the pass's load action, else those of the clear rectangle).
+    void clearDone(const DrawWork& w, const DepthTarget& z, uint16_t layers) {
+        Surface* t = w.clearsZ || w.clearsStencil ? surfaceOf(w.depthWid) : nullptr;
+        if (!t || z.sliceStart != 0 || layers < w.depthLayers) return;
+        if (w.clearsZ) t->zAuthoritative = true;
+        if (w.clearsStencil) t->stencilAuthoritative = true;
+    }
+
+    void drawFixed(const DrawState& d, DrawWork& w) {
+        w.go = false;
         // Targets.
-        vpgpu::RenderPassDesc desc;
-        vpgpu::PipelineState ps;
+        vpgpu::RenderPassDesc& desc = w.desc;
+        vpgpu::PipelineState& ps = w.ps;
         std::vector<Drawn>& drawnColors = drawnScratch;  // (the draw's own lists, kept for their capacity)
         drawnColors.clear();
-        uint32_t depthWid = 0;
+        uint32_t& depthWid = w.depthWid;
         pendingViews.clear();
         attachedWids.clear();
         partnerWid = ~0u, partnerSampled = false;
         if (probeOn) probePs = {};
-        uint32_t width = 0, height = 0;
+        uint32_t &width = w.width, &height = w.height;
         // One sample count for the whole pass (msaa.h): the smallest of the bound surfaces' counts and the
         // app's limit; EQAA depth with more samples than the colour stores keeps the colour's.
         std::array<uint8_t, 8> fragments{};
-        bool dualSource = false;
+        bool& dualSource = w.dualSource;
         for (unsigned i = 0; i < 8; ++i)
             if (d.color[i].format && d.color[i].writeMask) fragments[i] = std::max<uint8_t>(d.color[i].samples, 1);
         bool depthExact = true;
-        const vpgpu::Format zf = depthFormat(d.depth.zFormat, d.depth.stencilFormat, &depthExact);
+        const vpgpu::Format zf = w.zf = depthFormat(d.depth.zFormat, d.depth.stencilFormat, &depthExact);
         const SamplePlan plan = planSamples(fragments, zf != vpgpu::Format::Undefined ? std::max<uint8_t>(d.depth.samples, 1) : 0,
                                             r.maxSamples_);
-        const uint8_t samples = plan.host;
+        const uint8_t samples = w.samples = plan.host;
         {
             const auto slot = [](unsigned n) { return n >= 8 ? 3u : n >= 4 ? 2u : n >= 2 ? 1u : 0u; };
             unsigned asked = zf != vpgpu::Format::Undefined ? std::max<uint8_t>(d.depth.samples, 1) : 1u;
@@ -6004,10 +6287,10 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         // A depth-only draw on a depth target keeps the colour target the draws that read that depth wrote
         // attached, unwritten: the passes around it are one pass (see depthPartners).
         const DepthPartner* partner = nullptr;
-        unsigned partnerSlot = 8;  // (the slot attached for it, 8 = none)
-        bool colourOnTile = false, colourStored = false;  // a multisampled colour attachment keeps its samples on tile / stores them
-        uint32_t keepWid = ~0u;                           // the target of colour 0 when it does (and VPKENGINE_MSAA_CUT_SAMPLES_OFF is not 1)
-        uint64_t partnerAt = 0;  // (its key)
+        unsigned& partnerSlot = w.partnerSlot;  // (the slot attached for it, 8 = none)
+        bool &colourOnTile = w.colourOnTile, &colourStored = w.colourStored;
+        uint32_t& keepWid = w.keepWid;
+        uint64_t& partnerAt = w.partnerAt;  // (its key)
         if (!depthPartnerOff && !noPartnerOnce && zf != vpgpu::Format::Undefined &&
             !std::any_of(fragments.begin(), fragments.end(), [](uint8_t f) { return f != 0; })) {
             partnerAt = partnerKey(d.depth.zFormat ? d.depth.zAddress : d.depth.stencilAddress, samples);
@@ -6097,14 +6380,14 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
             width = width ? std::min(width, c.width) : c.width;
             height = height ? std::min(height, c.height) : c.height;
         }
-        bool clears = false;
+        bool& clears = w.clears;
         const DepthTarget& z = d.depth;
-        uint32_t depthWidth = 0, depthHeight = 0;  // the depth image (a clear that leaves part of it alone does not make it the guest's)
-        uint16_t depthLayers = 1;
-        std::shared_ptr<vpgpu::ClearRects> partialClear;  // a clear of one plane, or of part of the target
-        StencilResolved stencil;
+        uint32_t &depthWidth = w.depthWidth, &depthHeight = w.depthHeight;
+        uint16_t& depthLayers = w.depthLayers;
+        std::shared_ptr<vpgpu::ClearRects>& partialClear = w.partialClear;
+        StencilResolved& stencil = w.stencil;
         TargetIds depthIds;
-        bool depth1x = false;  // the depth attachment is the single-sample picture of a multisampled depth target
+        bool& depth1x = w.depth1x;
         if (zf != vpgpu::Format::Undefined) {
             if (!depthExact) note(z.zFormat == 2 ? "24-bit depth held as 32-bit float" : "16-bit depth with stencil held as 32-bit float");
             const uint64_t readAddress = z.zFormat ? z.zAddress : z.stencilAddress;
@@ -6192,8 +6475,9 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         // Scissor: the registers' combination, clipped to the targets.
         Scissor sc = d.scissor;
         if (d.scissorRegs.present) sc = combineScissor(d.scissorRegs);
-        const bool scissorSet = d.scissorRegs.present || sc.right > sc.left || sc.bottom > sc.top;
-        int32_t sl = 0, stp = 0, sr = int32_t(width), sb = int32_t(height);
+        const bool scissorSet = w.scissorSet = d.scissorRegs.present || sc.right > sc.left || sc.bottom > sc.top;
+        int32_t &sl = w.sl, &stp = w.stp, &sr = w.sr, &sb = w.sb;
+        sl = 0, stp = 0, sr = int32_t(width), sb = int32_t(height);
         if (scissorSet) {
             sl = std::max(0, sc.left), stp = std::max(0, sc.top);
             sr = std::min<int32_t>(sc.right, int32_t(width)), sb = std::min<int32_t>(sc.bottom, int32_t(height));
@@ -6201,17 +6485,9 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         }
         const bool scissorFull = sl == 0 && stp == 0 && sr == int32_t(width) && sb == int32_t(height);
 
-        // The planes a depth/stencil clear leaves whole in the image (so that the image is what the guest holds there, see
-        // Surface::zAuthoritative), once the clear is recorded: the scissor takes all of the image, and so do the slices
-        // cleared (`layers`: those of the pass's load action, else those of the clear rectangle).
+        // (the planes a depth/stencil clear leaves whole in the image: see clearDone)
         const bool clearCoversImage = zf != vpgpu::Format::Undefined && scissorFull && width == depthWidth && height == depthHeight;
-        const bool clearsZ = clearCoversImage && z.depthClear && z.zFormat, clearsStencil = clearCoversImage && z.stencilClear && z.stencilFormat;
-        const auto clearDone = [&](uint16_t layers) {
-            Surface* t = clearsZ || clearsStencil ? surfaceOf(depthWid) : nullptr;
-            if (!t || z.sliceStart != 0 || layers < depthLayers) return;
-            if (clearsZ) t->zAuthoritative = true;
-            if (clearsStencil) t->stencilAuthoritative = true;
-        };
+        w.clearsZ = clearCoversImage && z.depthClear && z.zFormat, w.clearsStencil = clearCoversImage && z.stencilClear && z.stencilFormat;
         // A depth/stencil clear: the whole target in the pass's load action when every plane of the
         // format is cleared; otherwise (one plane, or less than the target) a clear inside the pass.
         if (zf != vpgpu::Format::Undefined && (z.depthClear || z.stencilClear)) {
@@ -6275,14 +6551,14 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
                 pc.value = desc.depth.clear;
                 closePass();
                 setPendingClear(pc);
-                clearDone(depthLayers);
+                clearDone(w, z, depthLayers);
                 markWriteWid(depthWid);
                 any = true;
             } else if (partialClear) {
                 note("RectList depth/stencil clear done as a clear inside the next pass that draws into the target");
                 closePass();
                 addPendingRects(depthIds.render, depthIds.resolved, std::move(partialClear));
-                clearDone(z.sliceCount);
+                clearDone(w, z, z.sliceCount);
                 markWriteWid(depthWid);
                 any = true;
             }
@@ -6338,10 +6614,16 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
                 }
             }
         }
-        const bool geom = d.geom.enabled;
-        const bool rect = d.primitive == PrimitiveType::RectList && !geom;
+        const bool geom = w.geom = d.geom.enabled;
+        w.rect = d.primitive == PrimitiveType::RectList && !geom;
         if (geom && (d.es.code.empty() || d.gs.code.empty())) return skip("geometry shader without ES or GS program");
+        w.go = true;
+    }
 
+    void drawStages(const DrawState& d, DrawWork& w) {
+        w.go = false;
+        const bool geom = w.geom, rect = w.rect, dualSource = w.dualSource;
+        vpgpu::PipelineState& ps = w.ps;
         // Shaders.
         if (d.vs.code.empty()) return skip(geom ? "no copy shader" : "no vertex shader");
         auto tShader = Clock::now();
@@ -6372,17 +6654,17 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
             esStage.geomInputPrim = gsStage.geomInputPrim = inPrim;
         }
         if (rect && d.indirectAddress) return skip("indirect RectList draw");
-        const Translated* vs = shader(*vsSrc, geom ? vpgcn::ShaderStage::CopyVertex : vpgcn::ShaderStage::Vertex);
+        const Translated* vs = w.vs = shader(*vsSrc, geom ? vpgcn::ShaderStage::CopyVertex : vpgcn::ShaderStage::Vertex);
         if (!vs->ok) return skip(geom ? "copy shader not translated" : "vertex shader not translated");
-        const Translated* esT = nullptr;
-        const Translated* gsT = nullptr;
+        const Translated*& esT = w.esT;
+        const Translated*& gsT = w.gsT;
         if (geom) {
             esT = shader(esStage, vpgcn::ShaderStage::Export);
             if (!esT->ok) return skip("export shader not translated");
             gsT = shader(gsStage, vpgcn::ShaderStage::Geometry);
             if (!gsT->ok) return skip("geometry shader not translated");
         }
-        const Translated* fs = nullptr;
+        const Translated*& fs = w.fs;
         if (!d.ps.code.empty()) {
             fs = shader(psStage, vpgcn::ShaderStage::Pixel);
             if (!fs->ok) return skip("pixel shader not translated");
@@ -6393,12 +6675,12 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         ps.fragmentShader = fs ? fs->id : 0;
 
         // Geometry pipeline / RectList: the buffers its kernels work on.
-        vpgpu::Draw draw;
-        std::string why;
+        vpgpu::Draw& draw = w.draw;
+        std::string& why = w.why;
         ringBinds = {};
-        vpgpu::Dispatch esJob, gsJob;
-        uint64_t gsDrawIndices = 0;
-        uint32_t rectCount = 0;
+        vpgpu::Dispatch &esJob = w.esJob, &gsJob = w.gsJob;
+        uint64_t& gsDrawIndices = w.gsDrawIndices;
+        uint32_t& rectCount = w.rectCount;
         if (geom) {
             const GeometryState& g = d.geom;
             const uint32_t entries = d.count;
@@ -6486,17 +6768,51 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         draw.bindings.reserve(vs->bindings.size() + (fs ? fs->bindings.size() : 0) + 2);  // (both stages' and their user data: one allocation)
         if (!bind(*vsSrc, *vs, geom ? vpgcn::ShaderStage::CopyVertex : vpgcn::ShaderStage::Vertex, vpgpu::stage::vertex, draw.bindings, why))
             return skip("vs: " + why);
+        if (w.watch) dcStage(0, *vsSrc, *vs, vpgcn::ShaderStage::Vertex, draw.bindings);
         if (fs && !bind(psStage, *fs, vpgcn::ShaderStage::Pixel, vpgpu::stage::fragment, draw.bindings, why)) return skip("ps: " + why);
+        if (w.watch && fs) dcStage(1, psStage, *fs, vpgcn::ShaderStage::Pixel, draw.bindings);
         draw.views = std::move(pendingViews);
         pendingViews.clear();
         r.cpu_.bindMs += msSince(tBind);
         if (partnerSampled) {  // a binding reads the colour the draw would keep attached: recorded again without it
+            if (w.watch) ++dcStat.slowPath[DcStats::kOther];
             noPartnerOnce = true;
             --r.stats_.draws;
             this->draw(d);
             noPartnerOnce = false;
             return;
         }
+        w.psIterSample = psStage.psIterSample;
+        w.go = true;
+    }
+
+    void drawEmit(const DrawState& d, DrawWork& w) {
+        w.go = false;
+        const bool geom = w.geom, rect = w.rect;
+        vpgpu::RenderPassDesc& desc = w.desc;
+        vpgpu::PipelineState& ps = w.ps;
+        vpgpu::Draw& draw = w.draw;
+        std::string& why = w.why;
+        vpgpu::Dispatch &esJob = w.esJob, &gsJob = w.gsJob;
+        const Translated *const vs = w.vs, *const esT = w.esT, *const gsT = w.gsT, *const fs = w.fs;
+        const uint64_t gsDrawIndices = w.gsDrawIndices;
+        const uint32_t rectCount = w.rectCount;
+        const vpgpu::Format zf = w.zf;
+        const DepthTarget& z = d.depth;
+        const uint8_t samples = w.samples;
+        const uint32_t width = w.width, height = w.height, depthWid = w.depthWid, keepWid = w.keepWid;
+        const uint32_t depthWidth = w.depthWidth, depthHeight = w.depthHeight;
+        const StencilResolved& stencil = w.stencil;
+        const bool scissorSet = w.scissorSet;
+        const int32_t sl = w.sl, stp = w.stp, sr = w.sr, sb = w.sb;
+        bool& clears = w.clears;
+        std::shared_ptr<vpgpu::ClearRects>& partialClear = w.partialClear;
+        const unsigned partnerSlot = w.partnerSlot;
+        const uint64_t partnerAt = w.partnerAt;
+        const bool depth1x = w.depth1x, colourOnTile = w.colourOnTile, colourStored = w.colourStored;
+        const bool clearsZ = w.clearsZ, clearsStencil = w.clearsStencil;
+        std::vector<Drawn>& drawnColors = drawnScratch;
+        std::vector<std::pair<unsigned, TargetIds>>& colorIds = colorIdsScratch;
 
         // Geometry.
         ps.primitive = toPrimitive(d.primitive);
@@ -6794,7 +7110,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         if (colourStored) ++pstat.msaaColourStored;
         if (samples > 1 && fs && (d.ps.psInputAddr & 0x11)) {
             ++pstat.psSampleBaryDraws;
-            if (psStage.psIterSample) ++pstat.psSampleIterDraws;
+            if (w.psIterSample) ++pstat.psSampleIterDraws;
         }
         if (samples > 1 && fs && (d.ps.psInputAddr & 0x2000)) ++pstat.psSampleIdDraws;
         if (samples > 1 && !colorIds.empty()) {
@@ -6835,12 +7151,13 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
                 }
         }
         if (probeOn && !drawnColors.empty()) noteProbe(drawnColors[0].address, geom, d.geom.maxVertOut, gsDrawIndices);
-        if (depthWid) clearDone(clears ? desc.layerCount : z.sliceCount);  // (a clear of one plane or of part of the target is a rectangle inside the pass)
+        if (depthWid) clearDone(w, z, clears ? desc.layerCount : z.sliceCount);  // (a clear of one plane or of part of the target is a rectangle inside the pass)
         if (depthWid && (clears || clearsZ || clearsStencil || (d.depthStencil.depthWrite && z.zFormat) || (d.depthStencil.stencilTest && z.stencilFormat)))
             markWriteWid(depthWid);
         // (a draw that writes Z: its slices no longer hold the clear value alone; a clear leaves that value, a read does nothing)
         if (depthWid && d.depthStencil.depthWrite && z.zFormat && !z.zReadOnly && !z.depthClear && !clears && !clearsZ)
             depthDrawn(z.zAddress, z.sliceStart, z.sliceCount);
+        w.go = true;
     }
 
     // Whether a compute program has what the reference translation emits as a bitwise xor 32: v_xor_b32, s_xor_b32,
@@ -8042,6 +8359,7 @@ void Renderer::publishProbe(uint64_t pictures) {
         C(f, "depth_1x_shared", ps.depth1xShared);
         C(f, "repeat_draws", ps.repeatDraws), C(f, "same_program_as_prev_draw", ps.sameProgram), C(f, "same_userdata_as_prev_draw", ps.sameUserdata);
         C(f, "same_targets_as_prev_draw", ps.sameTargets), C(f, "same_state_as_prev_draw", ps.sameState), C(f, "same_all_as_prev_draw", ps.sameAll);
+        im.dcPublish();
         C(f, "slow_draws", ps.slowDraws);
         static const char* const slowNames[Impl::ProbeStats::kSlowCauses] = {"shader", "target", "texture", "snapshot", "hazard", "other"};
         for (unsigned k = 0; k < Impl::ProbeStats::kSlowCauses; ++k) C(f, std::string("slow_draw_") + slowNames[k], ps.slowCause[k]);
