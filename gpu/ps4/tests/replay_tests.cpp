@@ -165,7 +165,7 @@ void timed() {
     std::remove(path.c_str());
 }
 
-void everyScript() { equalPicture(), equalBuffers(), equalTextures(), equalReuse(), equalCaches(), equalPrograms(), equalTargets(); }
+void everyScript() { equalPicture(), equalBuffers(), equalTextures(), equalReuse(), equalCaches(), equalPrograms(), equalTargets(), equalFrames(); }
 
 }  // namespace
 

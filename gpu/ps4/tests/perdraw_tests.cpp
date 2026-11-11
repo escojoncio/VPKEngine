@@ -65,7 +65,7 @@ struct OptOut {
     const char* value;
 };
 const OptOut kOptOuts[] = {{"VPKENGINE_BIND_MEMO_OFF", "1"}, {"VPKENGINE_PROGRAM_MEMO_OFF", "1"}, {"VPKENGINE_HAZARD_MEMO_OFF", "1"},
-                           {"VPVK_FRAME_FOLD", "0"}};
+                           {"VPVK_FRAME_FOLD", "0"}, {"VPKENGINE_DRAW_CACHE_OFF", "1"}};
 void setOptOuts(bool off, const char* only = nullptr) {
     for (const OptOut& o : kOptOuts) {
         if (off && (!only || std::strcmp(only, o.name) == 0)) setenv(o.name, o.value, 1);
@@ -559,7 +559,7 @@ Outcome run(const std::function<Script(Scene&)>& make, bool off, const char* onl
           << " detiled=" << st.detiled << " refilled=" << st.refilled << " retiled=" << st.retiled << " evicted=" << st.evicted
           << " viewsMade=" << st.viewsMade << " syncs=" << st.syncs << " ringChains=" << st.ringChains << " calls=" << t.calls
           << " submits=" << t.submits << " emptySubmits=" << t.emptySubmits << " userDataReused=" << t.userDataReused
-          << " alignedCopyReused=" << t.alignedCopyReused << " regionHits=" << t.regionHits << " regionMisses=" << t.regionMisses;
+          << " alignedCopyReused=" << t.alignedCopyReused;  // (regionHits and regionMisses are costs: the draw cache changes them)
         for (const auto& [why, n] : st.skipped) c << " skip[" << why << "]=" << n;
         for (const auto& [why, n] : st.handled) c << " handled[" << why << "]=" << n;
         for (const auto& [why, n] : st.notes) c << " note[" << why << "]=" << n;
@@ -1151,12 +1151,71 @@ void equalTargets() {
     }, 40, {true, true});
 }
 
+// Whole frames repeated, the draw cache taking the prologue, the translation and the textures of their draws from the frame
+// before, and between them everything that makes one of those stale: textures and programs rewritten with and without a word
+// to the renderer, a T# rewritten under the same pointer, other sizes for a target, the command processor and a label on the
+// memory, a clear of a target a draw samples, a depth pass with a partner, idle frames that evict, a map that changes.
+void equalFrames() {
+    for (const RunOptions options : {RunOptions{true, false}, RunOptions{false, false}, RunOptions{true, true}}) {
+        equivalent(!options.watches ? "frames, no watches" : options.evict ? "frames, evicting" : "frames", [](Scene& sc) {
+            Adverse t(sc);
+            Guest* g = &sc.g;
+            const vpps4::DrawState a = t.of(3, 5, 0), b = t.of(4, 6, 1), c = t.of(33, 5, 2);
+            const uint64_t table = sc.materials[3].textures, ps = sc.ps[3].address;
+            const uint64_t tex = uint64_t(g->words(table)[0]) << 8;
+            const uint64_t texBytes = 4ull * Scene::kTexSize * Scene::kTexSize;
+            const vpps4::DrawState fill = sc.postDraw(1, sc.materials[7].textures), read = sc.postDraw(2, sc.postTables[1]);
+            vpps4::DrawState pre = Scene::passState(0, Scene::kEyeDepth, Scene::kEyeW, Scene::kEyeH);
+            pre.depthStencil.depthTest = pre.depthStencil.depthWrite = true;
+            pre.depthStencil.depthFunc = 1;
+            const vpps4::DrawState depthOnly = sc.materialDraw(pre, 3, 5, 4, t.arena(3), false);
+            const auto frame = [&](unsigned n = 1) {
+                for (unsigned k = 0; k < n; ++k) t.draw(a, 2), t.draw(b), t.draw(c), t.draw(a), t.draw(b), t.submit();
+            };
+            frame(3);
+            // A texture of the draws rewritten: told, not told, told only after the next frame has started.
+            t.write(tex, 4096, 1), t.then([=](vpps4::Renderer& r) { r.invalidate(tex, texBytes); }), frame(2);
+            t.write(tex, 4096, 2), frame(2);
+            t.write(tex + 256, 16, 3), t.draw(a), t.then([=](vpps4::Renderer& r) { r.coherencePoint(tex, texBytes); }), frame(2);
+            // A program rewritten where it is, the constants of the draws, the T# in its table under the same pointer.
+            t.then([=](vpps4::Renderer&) { g->words(ps)[Scene::kProgramWords - 1] ^= 0x10; }), frame(2);
+            t.write(t.arena(0) + 0x120, 8, 4), frame(2);
+            t.then([=](vpps4::Renderer&) { tsharp(g->words(table), kTex + 0x8000ull * 200, Scene::kTexSize, 8); }), frame(2);
+            t.then([=](vpps4::Renderer&) { tsharp(g->words(table), tex, Scene::kTexSize, 8); }), frame(2);
+            // The same inside one frame, between draws that share a block.
+            t.draw(a, 2), t.write(tex, 4096, 5), t.then([=](vpps4::Renderer& r) { r.invalidate(tex, texBytes); }), t.draw(a, 2), t.draw(b);
+            t.write(tex, 4096, 6), t.draw(a, 2), t.then([=](vpps4::Renderer&) { g->words(ps)[Scene::kProgramWords - 1] ^= 0x10; }), t.draw(a, 2), t.draw(c);
+            t.then([=](vpps4::Renderer&) { tsharp(g->words(table), kTex + 0x8000ull * 200, Scene::kTexSize, 8); }), t.draw(a, 2);
+            t.then([=](vpps4::Renderer&) { tsharp(g->words(table), tex, Scene::kTexSize, 8); }), t.draw(a, 2), t.submit(), frame();
+            // The command processor and a label on the memory the draws read, in the middle of a frame and between frames.
+            t.then([=](vpps4::Renderer& r) { r.cpuAccessed(t.arena(1), 0x1c0); }), frame();
+            t.draw(a), t.then([=](vpps4::Renderer& r) { r.afterGpu(t.arena(0) + 0x120, 8, [] {}, true); }), t.draw(b), t.draw(a), t.submit(), frame();
+            t.then([=](vpps4::Renderer& r) { r.noteGpuWrite(tex, texBytes); }), frame(2);
+            // A target read by the draws' pass: filled, read, cleared, drawn on after the clear; another size, the same memory.
+            t.draw(fill), t.draw(read, 2), frame(), t.draw(fill), t.draw(read), frame();
+            t.draw(Scene::depthClear(pre)), frame(2);
+            t.draw(sc.materialDraw(Scene::passState(Scene::kEyeColor, 0, Scene::kEyeW / 2, Scene::kEyeH / 2), 3, 5, 4, t.arena(0), true));
+            frame(2);
+            // A depth pass whose pixel-less draws have a partner in the colour pass, kept going and then stopped.
+            for (unsigned k = 0; k < 3; ++k) t.draw(Scene::depthClear(pre)), t.draw(depthOnly, 2), frame();
+            t.draw(depthOnly), frame(2), t.draw(depthOnly, 2), t.draw(a), t.submit(), t.draw(depthOnly), frame(2);
+            // The map changes, buffers are dropped, the GPU idles, and long idle stretches evict what the blocks name.
+            t.then([g](vpps4::Renderer&) { ++g->generation; }), frame(2);
+            t.then([](vpps4::Renderer& r) { r.dropGuestBuffers(); }), frame(2);
+            t.then([](vpps4::Renderer& r) { r.gpuIdle(); }), frame(2);
+            for (unsigned k = 0; k < 40; ++k) t.submit();
+            frame(3);
+            return t.done();
+        }, 150, options);
+    }
+}
+
 // ---- The draw cache, observed ----------------------------------------------------------------------------------------
 // With the probe on the renderer makes the draw cache's keys and looks its blocks up without taking anything from them
 // (RATES dc_*). Frames that are the same find their blocks good, and the blocks hold what the draws resolve; each thing
 // that makes a block stale does; none of it changes what is drawn; with the probe off nothing is counted.
 struct DcCounts {
-    uint64_t fixedHit, fixedMiss, stageHit, stageMiss, differ, invalid[5], slow[4], texTarget, texMemory;
+    uint64_t fixedHit, fixedMiss, stageHit, stageMiss, differ, invalid[5], slow[4], texTarget, texMemory, servedFixed, servedStage, servedTex;
 };
 DcCounts dcCounts(vpps4::Renderer& r) {
     r.publishProbe(1);
@@ -1164,7 +1223,7 @@ DcCounts dcCounts(vpps4::Renderer& r) {
     return {c("dc_fixed_hit"), c("dc_fixed_miss"), c("dc_stage_hit"), c("dc_stage_miss"), c("dc_would_differ"),
             {c("dc_invalid_frame"), c("dc_invalid_layout"), c("dc_invalid_surface"), c("dc_invalid_pass"), c("dc_invalid_clear")},
             {c("dc_slow_path_gs"), c("dc_slow_path_rectlist"), c("dc_slow_path_indirect"), c("dc_slow_path_otro")},
-            c("dc_tex_target"), c("dc_tex_memory")};
+            c("dc_tex_target"), c("dc_tex_memory"), c("dc_served_fixed"), c("dc_served_stage"), c("dc_served_texture")};
 }
 void drawCacheFrames() {
     namespace pr = vpgpu::probe;
@@ -1246,6 +1305,7 @@ void drawCacheFrames() {
         const DcCounts& b = marks[k - 1];
         d.fixedHit -= b.fixedHit, d.fixedMiss -= b.fixedMiss, d.stageHit -= b.stageHit, d.stageMiss -= b.stageMiss, d.differ -= b.differ;
         d.texTarget -= b.texTarget, d.texMemory -= b.texMemory;
+        d.servedFixed -= b.servedFixed, d.servedStage -= b.servedStage, d.servedTex -= b.servedTex;
         for (unsigned i = 0; i < 5; ++i) d.invalid[i] -= b.invalid[i];
         for (unsigned i = 0; i < 4; ++i) d.slow[i] -= b.slow[i];
         return d;
@@ -1272,14 +1332,17 @@ void drawCacheFrames() {
         CHECK(d.fixedMiss == 2 && d.invalid[kFrame] == 2 && d.invalid[kPass] == 2);
         CHECK(d.stageHit == 2 * (kEye0 + kEye1) && d.stageMiss == 0);
         CHECK(d.differ == 0);
+        // The cache is not only looked at: the prologue of each draw whose block is good is taken from it, so is the translation of
+        // each stage, and so is the texture of a binding that was resolved earlier in the frame.
+        CHECK(d.servedFixed == d.fixedHit && d.servedStage == 2 * (kEye0 + kEye1) && d.servedTex * 10 >= d.texMemory * 8);
         CHECK(d.texMemory == 3 * (kEye0 + kEye1) && d.texTarget == 0);  // (three textures of guest memory per pixel stage)
         for (uint64_t n : d.slow) CHECK(n == 0);
     }
     // Each adverse case: the draw after it does not find its block good, for that reason; the same draw again does.
     const auto stale = [&](size_t at, unsigned part) {
         const DcCounts first = delta(at + 1), second = delta(at + 2);
-        CHECK(first.fixedHit == 0 && first.fixedMiss == 1 && first.invalid[part] == 1);
-        CHECK(second.fixedHit == 1 && second.fixedMiss == 0);
+        CHECK(first.fixedHit == 0 && first.fixedMiss == 1 && first.invalid[part] == 1 && first.servedFixed == 0);
+        CHECK(second.fixedHit == 1 && second.fixedMiss == 0 && second.servedFixed == 1);
         for (unsigned i = 0; i < 5; ++i) CHECK(second.invalid[i] == 0);
         return first;
     };
@@ -1311,7 +1374,7 @@ void drawCacheFrames() {
     CHECK(on.drawn >= kFrames * (kEye0 + kEye1));
     pr::setEnabled(true);
     for (const char* name : {"dc_fixed_hit", "dc_fixed_miss", "dc_stage_hit", "dc_stage_miss", "dc_would_differ", "dc_slow_path_rectlist",
-                             "dc_slow_path_otro", "dc_invalid_frame", "dc_invalid_pass"})
+                             "dc_slow_path_otro", "dc_invalid_frame", "dc_invalid_pass", "dc_served_fixed", "dc_served_stage", "dc_served_texture"})
         CHECK(pr::counter("RATES", name).get() == 0);
     pr::setEnabled(false);
     pr::registry().reset();
@@ -1324,7 +1387,7 @@ int main(int argc, char** argv) {
     if (t == "bench") return bench() ? 1 : 0;
     else if (t == "digest") {
         digestMode = true;
-        equalPicture(), equalBuffers(), equalTextures(), equalReuse(), equalPrograms(), equalTargets();
+        equalPicture(), equalBuffers(), equalTextures(), equalReuse(), equalPrograms(), equalTargets(), equalFrames();
     } else if (t == "equal_picture") equalPicture();
     else if (t == "equal_buffers") equalBuffers();
     else if (t == "equal_textures") equalTextures();
@@ -1332,6 +1395,7 @@ int main(int argc, char** argv) {
     else if (t == "equal_programs") equalPrograms();
     else if (t == "equal_targets") equalTargets();
     else if (t == "equal_caches") equalCaches();
+    else if (t == "equal_frames") equalFrames();
     else if (t == "draw_cache_frames") drawCacheFrames();
     else return std::fprintf(stderr, "unknown test %s\n", t.c_str()), 2;
     return failures ? 1 : 0;

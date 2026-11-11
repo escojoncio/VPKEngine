@@ -55,7 +55,7 @@ inline constexpr const char* kWitnessParts[Witness::Parts] = {"frame", "layout",
 // ---- The fixed key -------------------------------------------------------------------------------------------------
 // The DrawState without what changes from one draw to the next of a run: the programs (code, fetch, address), their user
 // data, the geometry (indices, counts, first vertex, indirect arguments). Its fields one after the other, as bytes (no
-// padding gets in), and the host's sample limit, which the targets follow.
+// padding gets in), the host's sample limit, which the targets follow, and whether it foveates.
 struct FixedKey {
     static constexpr size_t kCapacity = sizeof(DrawState) + 1;  // (its fields are part of the DrawState's own bytes: they fit)
     std::array<uint8_t, kCapacity> bytes;  // (only the first `size`)
@@ -73,22 +73,27 @@ namespace detail {
         all(__VA_ARGS__);                            \
     }
 struct Put {
-    FixedKey& k;
+    uint8_t* at;  // where the next field goes
     template <class... T>
     void all(const T&... v) {
         (put(v), ...);
     }
     template <class T>
-    void put(const T& v) {
+    __attribute__((always_inline)) void put(const T& v) {
         static_assert(std::is_arithmetic_v<T> || std::is_enum_v<T>);
-        std::memcpy(k.bytes.data() + k.size, &v, sizeof v);
-        k.size += uint32_t(sizeof v);
+        std::memcpy(at, &v, sizeof v);
+        at += sizeof v;
     }
     template <class T, size_t N>
     void put(const std::array<T, N>& a) {
-        for (const T& x : a) put(x);
+        if constexpr (std::is_arithmetic_v<T> || std::is_enum_v<T>) {  // (an array of scalars: its bytes)
+            std::memcpy(at, a.data(), sizeof a);
+            at += sizeof a;
+        } else {
+            for (const T& x : a) put(x);
+        }
     }
-    void put(const ColorTarget& c) {
+    __attribute__((always_inline)) void put(const ColorTarget& c) {
         VPPS4_DC_FIELDS(c, address, width, height, pitch, format, numberType, compSwap, tileMode, sliceStart, sliceCount, samples, writeMask,
                         forceDstAlpha1, blendClamp, blendBypass, coverage, fastClear, clearWord)
     }
@@ -139,11 +144,12 @@ struct Put {
 #undef VPPS4_DC_FIELDS
 }  // namespace detail
 
-inline void fixedKey(const DrawState& d, uint8_t maxSamples, FixedKey& k) {
-    k.size = 0;
-    detail::Put put{k};
+inline void fixedKey(const DrawState& d, uint8_t maxSamples, FixedKey& k, bool foveation = false) {
+    detail::Put put{k.bytes.data()};
     put.put(d);
     put.put(maxSamples);
+    put.put(foveation);
+    k.size = uint32_t(put.at - k.bytes.data());
 }
 
 // ---- The stage key -------------------------------------------------------------------------------------------------
@@ -184,7 +190,7 @@ struct FixedBlock {
 };
 
 // What a binding of a stage resolved to. Texture: a texture of guest memory no GPU writer has an interval in, good under
-// the block's seal; Sampler: the same for the same descriptor; Buffer, Live (a texture an image backs, the user data):
+// its own seal; Sampler: the same for the same descriptor; Buffer, Live (a texture an image backs, the user data):
 // resolved in every draw, only their place in the stage's bindings is kept.
 struct BindItem {
     enum Kind : uint8_t { Texture, Sampler, Buffer, Live };
@@ -193,6 +199,8 @@ struct BindItem {
     bool write = false;
     uint16_t slot = 0;
     uint64_t id = 0, view = 0;  // Texture, Sampler: the resource bound and the view of it
+    uint32_t wid = 0;           // Texture: the tracker's writer id of the texture (taken again while `seal` is good)
+    Witness seal;               // ... what it was resolved under
     // (the same place and kind of binding, whatever is bound)
     bool sameShape(const BindItem& o) const { return kind == o.kind && bind == o.bind && stages == o.stages && write == o.write && slot == o.slot; }
 };
@@ -202,6 +210,7 @@ struct StageBlock {
     bool live = false;
     Witness seal;
     uint64_t translated = 0;  // the translation the stage got (its shader id)
+    const void* handle = nullptr;  // ... and the owner's own record of it
     std::vector<BindItem> items;
 };
 
