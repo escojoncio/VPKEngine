@@ -1,6 +1,8 @@
 #include "vpgpu/core/diagnostics.h"
 
 #include <algorithm>
+#include <array>
+#include <cctype>
 #include <cstdio>
 #include <map>
 #include <set>
@@ -13,7 +15,7 @@ namespace {
 // Appends " key=value" to a line; printf-style keeps the formatting in one place.
 template <class... Args>
 void kv(std::string& line, const char* fmt, Args... args) {
-  char buf[96];
+  char buf[256];
   std::snprintf(buf, sizeof buf, fmt, args...);
   line += buf;
 }
@@ -252,6 +254,304 @@ std::vector<std::string> formatResolveUse(uint64_t frame, const Frame& f, const 
     }
   }
   return lines;
+}
+
+// ---- gpu.pdump.* ----
+namespace {
+
+std::string cmdId(const std::vector<Command>& cmds, size_t i) {
+  return std::string(std::holds_alternative<RenderPass>(cmds[i]) ? "p" : std::holds_alternative<Dispatch>(cmds[i]) ? "d" : "x") +
+         std::to_string(i);
+}
+
+// A label that cannot break the key=value and list syntax of the dump lines.
+std::string clean(std::string s, size_t max) {
+  s = s.substr(0, max);
+  for (char& c : s)
+    if (!(std::isalnum(static_cast<unsigned char>(c)) || c == '.' || c == '_' || c == '-')) c = '_';
+  return s.empty() ? "-" : s;
+}
+
+std::string usageStr(uint8_t u) {
+  std::string s;
+  if (u & usage::sampled) s += 'S';
+  if (u & usage::storage) s += 'G';
+  if (u & usage::colorTarget) s += 'C';
+  if (u & usage::depthTarget) s += 'D';
+  if (u & usage::formatView) s += 'F';
+  return s.empty() ? "-" : s;
+}
+
+std::string attStr(const char* slot, const Attachment& a, uint16_t layers, const ResourceTable* res) {
+  static const char* const kStore[] = {"D", "S", "R", "SR"};
+  const TextureDesc* d = res ? res->get(a.texture) : nullptr;
+  const char ld = a.load == LoadAction::Load ? 'L' : a.load == LoadAction::Clear ? 'C' : 'D';
+  char b[160];
+  std::snprintf(b, sizeof b, "%s=t%u/%s/s%u/%ux%ux%u/m%u/l%u/%c%s/u%s", slot, a.texture.index,
+                d ? formatInfo(a.format != Format::Undefined ? a.format : d->format).name : "?", d ? unsigned(d->samples) : 0u,
+                d ? std::max(1u, d->width >> a.mip) : 0u, d ? std::max(1u, d->height >> a.mip) : 0u, unsigned(layers),
+                unsigned(a.mip), unsigned(a.layer), ld, kStore[int(a.store)], d ? usageStr(d->usage).c_str() : "?");
+  std::string o = b;
+  if (a.resolve) o += "->t" + std::to_string(a.resolve.index);
+  if (d && !d->label.empty()) o += "/" + clean(d->label, 24);
+  return o;
+}
+
+std::string listOf(const std::vector<uint32_t>& v, const std::vector<Command>& cmds, size_t cap = 8) {
+  std::string s = "[";
+  for (size_t i = 0; i < v.size() && i < cap; ++i) s += (i ? "," : "") + cmdId(cmds, v[i]);
+  if (v.size() > cap) s += "+" + std::to_string(v.size() - cap);
+  return s + "]";
+}
+
+// What happens to one texture over the frame, by command index.
+struct TexEv {
+  std::vector<uint32_t> w, wdc, r, load;
+  bool target = false;
+};
+
+}  // namespace
+
+std::vector<std::string> formatPassDump(uint64_t frame, const Frame& f, const CompiledFrame& c, const ResourceTable* res,
+                                        const PipelineCache* pipes) {
+  constexpr size_t kMaxLinks = 40, kMaxList = 24, kMaxPipes = 3;
+  const std::vector<Command>& cmds = f.commands();
+  const unsigned long long fr = frame;
+  std::vector<int> encOf(cmds.size(), -1), enc2Of(cmds.size(), -1);
+  for (size_t e = 0; e < c.encoders.size(); ++e)
+    for (uint32_t ci : c.encoders[e].commands)
+      if (ci < cmds.size()) (encOf[ci] < 0 ? encOf : enc2Of)[ci] = int(e);
+
+  std::string head = "gpu.pdump.frame";
+  size_t nRender = 0, nDispatch = 0, nCopy = 0;
+  for (const Command& cmd : cmds) (std::holds_alternative<RenderPass>(cmd) ? nRender : std::holds_alternative<Dispatch>(cmd) ? nDispatch : nCopy)++;
+  kv(head, " f=%llu cmds=%zu render=%zu dispatch=%zu copy=%zu encoders=%zu", fr, cmds.size(), nRender, nDispatch, nCopy, c.encoders.size());
+
+  std::map<uint64_t, TexEv> ev;  // by generation << 32 | index
+  auto add = [&](std::vector<uint32_t> TexEv::*list, TextureId t, uint32_t cmd, bool target = false) {
+    TexEv& e = ev[uint64_t{t.generation} << 32 | t.index];
+    std::vector<uint32_t>& v = e.*list;
+    if (v.empty() || v.back() != cmd) v.push_back(cmd);
+    e.target = e.target || target;
+  };
+  auto accessEv = [&](const Access& a, uint32_t cmd) {
+    if (a.range.kind != ResourceRange::Kind::Texture || a.pixelLocal) return;
+    add(a.write ? &TexEv::w : &TexEv::r, TextureId{a.range.index, a.range.generation}, cmd);
+  };
+
+  std::vector<std::string> passLines;
+  for (uint32_t i = 0; i < cmds.size(); ++i) {
+    if (const auto* dp = std::get_if<Dispatch>(&cmds[i])) {
+      for (const Access& a : dp->bindings) accessEv(a, i);
+      continue;
+    }
+    if (const auto* cp = std::get_if<Copy>(&cmds[i])) {
+      for (const Access& a : copyAccesses(*cp)) accessEv(a, i);
+      continue;
+    }
+    const RenderPass& rp = std::get<RenderPass>(cmds[i]);
+    const RenderPassDesc& pd = rp.desc;
+    std::string att;
+    for (int s = 0; s <= kMaxColorAttachments; ++s) {
+      const Attachment& a = s == kDepthSlot ? pd.depth : pd.colors[s];
+      if (!a.texture) continue;
+      att += (att.empty() ? "" : ",") + attStr(s == kDepthSlot ? "d" : ("c" + std::to_string(s)).c_str(), a, pd.layerCount, res);
+      const bool stored = a.store == StoreAction::Store || a.store == StoreAction::StoreAndResolve;
+      const bool resolved = a.store == StoreAction::Resolve || a.store == StoreAction::StoreAndResolve;
+      if (a.load == LoadAction::Load) add(&TexEv::load, a.texture, i, true);
+      add(stored ? &TexEv::w : &TexEv::wdc, a.texture, i, true);
+      if (resolved && a.resolve) add(&TexEv::w, a.resolve, i, true);
+    }
+    struct PipeUse {
+      uint32_t draws = 0, inst = 0;
+      uint64_t count = 0;
+    };
+    struct ResUse {
+      uint32_t reads = 0, writes = 0;
+    };
+    std::map<uint64_t, PipeUse> pipeUse;
+    std::map<std::array<float, 4>, uint32_t> vps;
+    std::map<std::array<uint32_t, 4>, uint32_t> scs;
+    std::map<std::tuple<int, uint32_t, uint32_t>, ResUse> resUse;  // 0 texture / 1 buffer, index, generation
+    uint32_t draws = 0, clears = 0, indirect = 0, instMax = 0, status[5] = {};  // ready, pending, failed, missing, unknown (no cache)
+    uint64_t idx = 0, verts = 0, inst = 0, work = 0;
+    std::map<uint64_t, uint8_t> statusOf;
+    for (const Draw& d : rp.draws) {
+      if (d.clear) {
+        ++clears;
+        continue;
+      }
+      ++draws;
+      PipeUse& pu = pipeUse[d.pipeline.value];
+      ++pu.draws;
+      if (d.indirect) {
+        ++indirect;  // count is the upper bound only
+      } else {
+        (d.index ? idx : verts) += d.count;
+        inst += d.instances, instMax = std::max(instMax, d.instances);
+        work += uint64_t{d.count} * d.instances;
+        pu.count += d.count, pu.inst += d.instances;
+      }
+      ++vps[{d.viewport.x, d.viewport.y, d.viewport.width, d.viewport.height}];
+      ++scs[{d.scissor.x, d.scissor.y, d.scissor.width, d.scissor.height}];
+      auto [it, fresh] = statusOf.emplace(d.pipeline.value, pipes ? 3 : 4);
+      if (fresh && pipes) {
+        const PipelineCache::Status st = pipes->status(d.pipeline);
+        it->second = st == PipelineCache::Status::Ready ? 0 : st == PipelineCache::Status::Failed ? 2
+                     : st == PipelineCache::Status::Missing ? 3 : 1;
+      }
+      ++status[it->second];
+      for (const Access& b : d.bindings) {
+        accessEv(b, i);
+        if (b.range.kind == ResourceRange::Kind::Sampler || b.pixelLocal) continue;
+        ResUse& u = resUse[{b.range.kind == ResourceRange::Kind::Texture ? 0 : 1, b.range.index, b.range.generation}];
+        ++(b.write ? u.writes : u.reads);
+      }
+      if (d.index) ++resUse[{1, d.index->buffer.index, d.index->buffer.generation}].reads;
+    }
+    std::string l = "gpu.pdump.pass";
+    kv(l, " f=%llu pass=%u enc=%d", fr, i, encOf[i]);
+    if (enc2Of[i] >= 0) kv(l, " enc2=%d", enc2Of[i]);
+    kv(l, " label=%s layers=%u area=%ux%u", clean(pd.label, 40).c_str(), unsigned(pd.layerCount), pd.renderWidth, pd.renderHeight);
+    l += " att{" + att + "}";
+    kv(l, " draws=%u clears=%u indirect=%u idx=%llu verts=%llu inst=%llu inst_max=%u work=%llu pipes=%zu", draws, clears, indirect,
+       (unsigned long long)idx, (unsigned long long)verts, (unsigned long long)inst, instMax, (unsigned long long)work, pipeUse.size());
+    if (pipes) kv(l, " pipe_state{ready=%u pending=%u failed=%u missing=%u}", status[0], status[1], status[2], status[3]);
+    auto top = [&](const auto& m, const char* name, auto fmt) {  // the 3 most used rectangles
+      std::vector<std::pair<uint32_t, std::decay_t<decltype(m.begin()->first)>>> v;
+      for (auto& [k, n] : m) v.push_back({n, k});
+      std::sort(v.begin(), v.end(), [](auto& a, auto& b) { return a.first > b.first; });
+      l += std::string(" ") + name + "{";
+      for (size_t k = 0; k < v.size() && k < 3; ++k) l += (k ? ";" : "") + fmt(v[k].second) + ":" + std::to_string(v[k].first);
+      if (v.size() > 3) l += ";+" + std::to_string(v.size() - 3);
+      l += "}";
+    };
+    char b[96];
+    top(vps, "vp", [&](const std::array<float, 4>& v) {
+      std::snprintf(b, sizeof b, "%g,%g,%gx%g", v[0], v[1], v[2], v[3]);
+      return std::string(b);
+    });
+    top(scs, "sc", [&](const std::array<uint32_t, 4>& v) {
+      std::snprintf(b, sizeof b, "%u,%u,%ux%u", v[0], v[1], v[2], v[3]);
+      return std::string(b);
+    });
+    passLines.push_back(std::move(l));
+
+    std::vector<std::pair<uint64_t, uint64_t>> busiest;  // draws, key
+    for (auto& [k, u] : pipeUse) busiest.push_back({u.draws, k});
+    std::sort(busiest.begin(), busiest.end(), [](auto& a, auto& b2) { return a.first > b2.first; });
+    for (size_t k = 0; k < busiest.size() && k < kMaxPipes; ++k) {
+      const PipeUse& u = pipeUse[busiest[k].second];
+      static const char* const kStatus[] = {"ready", "pending", "failed", "missing", "unknown"};
+      std::string pl = "gpu.pdump.pipe";
+      kv(pl, " f=%llu pass=%u draws=%u count=%llu inst=%u status=%s", fr, i, u.draws, (unsigned long long)u.count, u.inst,
+         kStatus[statusOf[busiest[k].second]]);
+      PipelineState ps;
+      if (pipes && pipes->stateOf(PipelineKey{busiest[k].second}, ps)) {
+        ps.label = clean(ps.label, 40);  // (the game's own name: no spaces, '=' or line breaks)
+        pl += " " + describePipelineState(ps);
+      }
+      else kv(pl, " key=%016llx state=unknown", (unsigned long long)busiest[k].second);
+      passLines.push_back(std::move(pl));
+    }
+
+    for (int dir = 0; dir < 2; ++dir) {  // 0 read, 1 written
+      struct Item {
+        uint32_t uses;
+        std::string text;
+      };
+      std::vector<Item> items;
+      uint32_t nTex = 0, nBuf = 0;
+      for (auto& [k, u] : resUse) {
+        const uint32_t uses = dir ? u.writes : u.reads;
+        if (!uses) continue;
+        const auto [kind, index, gen] = k;
+        char t[160];
+        if (kind == 0) {
+          ++nTex;
+          const TextureDesc* d = res ? res->get(TextureId{index, gen}) : nullptr;
+          std::snprintf(t, sizeof t, "t%u:%s:%ux%ux%u:m%u:s%u:%u", index, d ? formatInfo(d->format).name : "?", d ? d->width : 0u,
+                        d ? d->height : 0u, d ? unsigned(d->layers) : 0u, d ? unsigned(d->mips) : 0u, d ? unsigned(d->samples) : 0u, uses);
+        } else {
+          ++nBuf;
+          const BufferDesc* d = res ? res->get(BufferId{index, gen}) : nullptr;
+          std::snprintf(t, sizeof t, "b%u:%llu:%u", index, d ? (unsigned long long)d->size : 0ull, uses);
+        }
+        items.push_back({uses, t});
+      }
+      if (items.empty()) continue;
+      std::stable_sort(items.begin(), items.end(), [](const Item& a, const Item& b2) { return a.uses > b2.uses; });
+      std::string rl = "gpu.pdump.res";
+      kv(rl, " f=%llu pass=%u dir=%s n=%zu tex=%u buf=%u shown=%zu list=[", fr, i, dir ? "w" : "r", items.size(), nTex, nBuf,
+         std::min(items.size(), kMaxList));
+      for (size_t k = 0; k < items.size() && k < kMaxList; ++k) rl += (k ? "," : "") + items[k].text;
+      passLines.push_back(rl + "]");
+    }
+  }
+
+  // Producers and consumers of every render target (colour and depth) of the frame.
+  struct Link {
+    bool stale;
+    uint64_t key;
+    std::string text;
+  };
+  std::vector<Link> links;
+  for (const auto& [key, e] : ev) {
+    if (!e.target) continue;
+    const auto firstW = [&](uint32_t before, bool inclusive) {  // is there a stored write of the frame earlier than `before`?
+      for (uint32_t w : e.w)
+        if (w < before || (inclusive && w == before)) return true;
+      return false;
+    };
+    std::vector<uint32_t> staleRead, staleLoad, self;
+    for (uint32_t r : e.r) {
+      if (firstW(r, false)) continue;
+      (firstW(r, true) ? self : staleRead).push_back(r);
+    }
+    for (uint32_t r : e.load)
+      if (!firstW(r, false)) staleLoad.push_back(r);
+    const TextureId t{uint32_t(key & 0xffffffffu), uint32_t(key >> 32)};
+    const TextureDesc* d = res ? res->get(t) : nullptr;
+    std::string l = "gpu.pdump.link";
+    kv(l, " f=%llu tex=%u kind=%s fmt=%s s=%u size=%ux%ux%u label=%s", fr, t.index, d && formatInfo(d->format).depth() ? "depth" : "color",
+       d ? formatInfo(d->format).name : "?", d ? unsigned(d->samples) : 0u, d ? d->width : 0u, d ? d->height : 0u, d ? unsigned(d->layers) : 0u,
+       d ? clean(d->label, 24).c_str() : "-");
+    l += " w=" + listOf(e.w, cmds) + " wdc=" + listOf(e.wdc, cmds) + " r=" + listOf(e.r, cmds) + " stale_read=" + listOf(staleRead, cmds) +
+         " stale_load=" + listOf(staleLoad, cmds) + " self=" + listOf(self, cmds);
+    links.push_back({!staleRead.empty() || !staleLoad.empty(), key, std::move(l)});
+  }
+  std::stable_sort(links.begin(), links.end(), [](const Link& a, const Link& b) { return a.stale > b.stale; });
+
+  std::vector<std::string> lines{std::move(head)};
+  for (size_t k = 0; k < links.size() && k < kMaxLinks; ++k) lines.push_back(std::move(links[k].text));
+  for (std::string& l : passLines) lines.push_back(std::move(l));
+  return lines;
+}
+
+void capPassDump(uint64_t frame, std::vector<std::string>& lines, size_t max) {
+  if (lines.size() <= max) return;
+  const size_t dropped = lines.size() - max;
+  lines.resize(max);
+  lines.push_back("gpu.pdump.cut f=" + std::to_string(frame) + " dropped=" + std::to_string(dropped));
+}
+
+std::vector<std::string> passDumpEncoders(const Frame& f, const CompiledFrame& c) {
+  std::vector<std::string> out;
+  for (size_t e = 0; e < c.encoders.size(); ++e) {
+    std::string s = "e" + std::to_string(e) + "[";
+    const std::vector<uint32_t>& cs = c.encoders[e].commands;
+    for (size_t k = 0; k < cs.size() && k < 6; ++k) s += (k ? "+" : "") + cmdId(f.commands(), cs[k]);
+    if (cs.size() > 6) s += "+" + std::to_string(cs.size() - 6);
+    out.push_back(s + "]");
+  }
+  return out;
+}
+
+std::string formatPassDumpTime(uint64_t frame, const std::vector<std::string>& encoders, const GpuTimings& t) {
+  std::string l = "gpu.pdump.time";
+  kv(l, " f=%llu gpu_ms=%.3f stamps=%zu", (unsigned long long)frame, t.frameMs, t.encoderMs.size());
+  for (size_t e = 0; e < encoders.size() && e < t.encoderMs.size() && e < 64; ++e) kv(l, " %s=%.2f", encoders[e].c_str(), t.encoderMs[e]);
+  return l;
 }
 
 bool bigFrame(const CompiledFrame& c, uint32_t threshold) {

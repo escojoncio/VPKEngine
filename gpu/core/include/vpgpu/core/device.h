@@ -125,6 +125,8 @@ class Device {
   double holdTotalMs_ = 0;
   // Frames waiting for their timings: index + one descriptor per encoder ("pass=i label=.. fmt=.. WxH draws=..").
   std::deque<std::pair<uint64_t, std::vector<std::string>>> passPending_;
+  // Frames dumped by Frame::setPassDump waiting for their timings: index + the commands each encoder runs (gpu.pdump.time).
+  std::deque<std::pair<uint64_t, std::vector<std::string>>> pdumpPending_;
   // GPU frame times of the current second (gpu.sec summary line).
   std::vector<float> secMs_;
   std::chrono::steady_clock::time_point secStart_{};

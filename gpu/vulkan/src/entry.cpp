@@ -3542,6 +3542,14 @@ void runBatches(Device* d, std::vector<DeferredBatch>& list, size_t count) {
       ++cbs;
     }
   const uint64_t perfTranslateUs = perfUsSince(perfT0);
+  PassDump& pdump = passDump();  // VPVK_PASS_DUMP (passdump.h): a few frames pass by pass
+  bool dumpFrame = false;
+  if (pdump.on) {
+    bool render = false;
+    for (const vpgpu::Command& c : frame.commands()) render = render || std::holds_alternative<vpgpu::RenderPass>(c);
+    dumpFrame = render && passDumpNext(pdump);
+    frame.setPassDump(dumpFrame);
+  }
   if (!zl.touches.empty()) {
     vpgpu::Frame zeros;
     if (const size_t n = zeroInitResolve(*d, zl, zeros)) {
@@ -3550,7 +3558,16 @@ void runBatches(Device* d, std::vector<DeferredBatch>& list, size_t count) {
     }
   }
   awaitFreshVariants(d);  // synchronous mode: the UI-mask variants this submission requested, awaited together
-  gateFramePipelines(d, frame, d->submits + 1);  // pipelines still compiling: a short wait, else their draws wait a frame
+  const std::vector<uint32_t> drawsBeforeGate = dumpFrame ? passDrawCounts(frame) : std::vector<uint32_t>{};
+  const GateResult gate = gateFramePipelines(d, frame, d->submits + 1);  // pipelines still compiling: a short wait, else their draws wait a frame
+  if (pdump.on) {
+    if (dumpFrame) {
+      std::vector<uint32_t> gateDropped = passDrawCounts(frame);
+      for (size_t i = 0; i < gateDropped.size() && i < drawsBeforeGate.size(); ++i) gateDropped[i] = drawsBeforeGate[i] - gateDropped[i];
+      for (std::string& l : passDumpLines(d->gpu->submittedFrames(), st.passNotes, gateDropped)) frame.dumpLine(std::move(l));  // (logged by the core, under its line cap)
+    }
+    passDumpAccumulate(st.passNotes, gate.skipped);
+  }
   vpgpu::FrameReport perfReport;
   uint64_t perfBackendUs = 0;
   const bool perfSent = !frame.commands().empty();
@@ -3641,6 +3658,10 @@ void runBatches(Device* d, std::vector<DeferredBatch>& list, size_t count) {
     if (!hl.empty()) logf("%s", hl.c_str());
   }
   perfTick(d);
+  if (pdump.on) {
+    const std::string sum = passDumpSummary();
+    if (!sum.empty()) log(sum);
+  }
   const uint64_t frames = d->gpu->submittedFrames();
   pendingFrames(*d, frames);
   for (size_t i = 0; i < count; ++i)

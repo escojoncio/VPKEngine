@@ -1713,6 +1713,7 @@ struct Translator {
     if (maskPass && um && d.pipe && !d.edsVariant) {
       vpgpu::PipelineKey k;
       if (maskPipelineKey(um->dev, *d.pipe, d.texelVariant, forceN ? forceN : d.passSamples, cls == taa::DrawClass::Ui, k)) dr.pipeline = k;
+      else if (passDump().on) ++passNote().fallbackMask;  // no mask variant: the draw keeps its plain pipeline
     }
     if (cls == taa::DrawClass::Ui) {  // 2D drawn into the eye buffer: no jitter, the mask marks it
       ++st.taaSkipped;
@@ -1980,9 +1981,30 @@ struct Translator {
     ++st.fovUiSplits;
   }
 
-  void skipDraw(SkipReason why) {
+  void skipDraw(SkipReason why, BindFail bind = BindFail::None) {
     ++st.skippedDraws;
     ++st.skippedBy[size_t(why)];
+    if (!passDump().on) return;
+    PassNote& n = passNote();
+    ++n.skipped[size_t(why)];
+    if (bind != BindFail::None) ++n.bindFail[size_t(bind)];
+  }
+
+  // VPVK_PASS_DUMP: the note of the open pass (its index among the frame's commands), or of the draws outside any pass.
+  PassNote& passNote() {
+    const uint32_t ix = passOpen ? uint32_t(frame.commands().size() - 1) : kNoPass;
+    std::vector<PassNote>& v = st.passNotes;
+    if (v.empty() || v.back().pass != ix) {  // (draws outside any pass may come between the draws of one pass)
+      const auto it = std::find_if(v.rbegin(), v.rend(), [ix](const PassNote& n) { return n.pass == ix; });
+      if (it != v.rend()) return *it;
+      v.emplace_back().pass = ix;
+    }
+    return v.back();
+  }
+  // VPVK_SKIP_PASS: is the open pass one whose draws are dropped?
+  bool skippedPass() const {
+    const std::vector<uint32_t>& l = skipPasses();
+    return !l.empty() && passOpen && std::binary_search(l.begin(), l.end(), uint32_t(frame.commands().size() - 1));
   }
 
   // Dynamic rendering: does an in-pass barrier come before a draw that reads an attachment of this pass?
@@ -2277,7 +2299,10 @@ struct Translator {
   bool depthTileDraw(const OpDraw& d, const vpgpu::Draw& base, vpgpu::Draw& out) {
     if (!dt.active || !d.pipe) return false;
     const auto it = dt.uses.find(depthTileKey(d.pipe, subpass));
-    if (it == dt.uses.end()) return false;
+    if (it == dt.uses.end()) {
+      if (passDump().on) ++passNote().fallbackDepthTile;  // the draw keeps its plain pipeline
+      return false;
+    }
     out = base;
     out.pipeline = it->second.key;
     if (it->second.kind != kDepthTileFetch) return true;
@@ -2297,9 +2322,22 @@ struct Translator {
     return true;
   }
 
+  // The last step of a draw: into the frame, or (VPVK_SKIP_PASS) dropped here, after everything else the draw does (pass splits, zero-init
+  // touches, jitter and census counters), so the pass numbering is the same with and without the skip.
+  void emit(const OpDraw& d, vpgpu::Draw dr) {
+    if (skippedPass()) return skipDraw(SkipReason::Experiment);
+    if (passDump().on) {
+      PassNote& n = passNote();
+      ++n.draws;
+      for (const auto& [id, flags] : d.bind.tex) n.tex[id] |= flags;
+    }
+    frame.draw(std::move(dr));
+    ++st.draws;
+  }
+
   void draw(const OpDraw& d, size_t opIx) {
     if (!d.ok || !passOpen) {
-      skipDraw(d.ok ? SkipReason::Pass : d.reason);
+      skipDraw(d.ok ? SkipReason::Pass : d.reason, d.bind.fail);
       if (d.ok) logSkip("no_open_pass", d.pipe, "op=%zu", opIx);
       return;
     }
@@ -2327,13 +2365,12 @@ struct Translator {
       if (taaPass) {
         vpgpu::Draw dr = *base;
         jitter(dr, d);
-        frame.draw(std::move(dr));
+        emit(d, std::move(dr));
       } else {
         if (eyeScene) noteDepthDraw(dd, *base, d);
-        if (base == &tiled) frame.draw(std::move(tiled));  // (the variant copy is the draw: no second copy)
-        else frame.draw(*base);
+        if (base == &tiled) emit(d, std::move(tiled));  // (the variant copy is the draw: no second copy)
+        else emit(d, vpgpu::Draw(*base));
       }
-      ++st.draws;
       return;
     }
     const bool indexed = base->index.has_value();
@@ -2345,8 +2382,7 @@ struct Translator {
         dr.indirect = vpgpu::Indirect{d.gpuBuffer, d.gpuOffset + uint64_t(i) * d.indirectStride};
         dr.drawIndex = i;
         jitter(dr, d);
-        frame.draw(std::move(dr));
-        ++st.draws;
+        emit(d, std::move(dr));
       }
       return;
     }
@@ -2386,8 +2422,7 @@ struct Translator {
       }
       if (dr.instances > std::max<uint32_t>(1, d.viewCount)) ++st.instancedDraws;
       jitter(dr, d);
-      frame.draw(std::move(dr));
-      ++st.draws;
+      emit(d, std::move(dr));
     }
   }
 

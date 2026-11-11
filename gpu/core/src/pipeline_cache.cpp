@@ -170,6 +170,14 @@ PipelineCache::Status PipelineCache::status(PipelineKey key) const {
   return it == entries_.end() ? Status::Missing : it->second.status;
 }
 
+bool PipelineCache::stateOf(PipelineKey key, PipelineState& out) const {
+  std::lock_guard lock(mutex_);
+  auto it = entries_.find(key.value);
+  if (it == entries_.end()) return false;
+  out = it->second.state;
+  return true;
+}
+
 void PipelineCache::retain(PipelineKey key) {
   std::lock_guard lock(mutex_);
   ++owners_[key.value];

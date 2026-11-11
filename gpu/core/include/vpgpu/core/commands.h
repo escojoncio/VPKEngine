@@ -362,6 +362,12 @@ class Frame {
   void clear(RenderPassDesc desc);
 
   const std::vector<Command>& commands() const { return commands_; }
+  // Diagnostic (VPVK_PASS_DUMP): Device::submit logs the "gpu.pdump.*" lines for this frame (diagnostics.h formatPassDump).
+  void setPassDump(bool on) { passDump_ = on; }
+  bool passDump() const { return passDump_; }
+  // Lines the client wants in that dump (they share its line cap, diagnostics.h capPassDump); logged by Device::submit.
+  void dumpLine(std::string line) { dumpLines_.push_back(std::move(line)); }
+  const std::vector<std::string>& dumpLines() const { return dumpLines_; }
   // Removes the draws `drop(const Draw&)` selects from every render pass (client policy, e.g. draws whose pipeline is
   // still compiling). In-pass clears are never offered to it. Returns how many were removed.
   template <class F>
@@ -379,6 +385,8 @@ class Frame {
  private:
   std::vector<Command> commands_;
   bool inPass_ = false;
+  bool passDump_ = false;
+  std::vector<std::string> dumpLines_;
 };
 
 }  // namespace vpgpu

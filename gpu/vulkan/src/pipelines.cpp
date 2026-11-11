@@ -2878,12 +2878,17 @@ void logSkip(const char* why, const PipelineObj* p, const char* fmt, ...) {
 
 namespace {
 
+// `bc` (VPVK_PASS_DUMP; null otherwise) gets why a binding was refused and the sampled textures of the draw.
 bool resolveBindings(Recorder& r, const PipelineObj& p, const std::array<BoundState::Set, 8>& sets,
                      std::vector<vpgpu::Access>& out, std::vector<vpgpu::ViewBinding>& views,
-                     std::vector<vpgpu::TextureId>& zeroReads) {
+                     std::vector<vpgpu::TextureId>& zeroReads, BindCensus* bc = nullptr) {
+  const auto bad = [bc](BindFail why) {
+    if (bc) bc->fail = why;
+    return false;
+  };
   for (const PipelineObj::Used& u : p.used) {
     const LayoutSlot& ls = u.slot;
-    if (ls.set >= sets.size() || !sets[ls.set].set) return false;
+    if (ls.set >= sets.size() || !sets[ls.set].set) return bad(BindFail::SetNull);
     const DescriptorSetObj* set = sets[ls.set].set;
     size_t bi = SIZE_MAX;
     uint32_t dynBase = 0;
@@ -2896,7 +2901,7 @@ bool resolveBindings(Recorder& r, const PipelineObj& p, const std::array<BoundSt
       if (lb.type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC || lb.type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC)
         dynBase += lb.count;
     }
-    if (bi == SIZE_MAX) return false;
+    if (bi == SIZE_MAX) return bad(BindFail::BindingMissing);
     const auto& elems = set->slots[bi];
     for (uint32_t e = 0; e < ls.count && e < elems.size(); ++e) {
       const Descriptor& d = elems[e];
@@ -2905,11 +2910,12 @@ bool resolveBindings(Recorder& r, const PipelineObj& p, const std::array<BoundSt
         case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC:
         case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER:
         case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC: {
-          if (!d.buffer || !d.buffer->id) return false;
+          if (!d.buffer) return bad(BindFail::BufferNull);
+          if (!d.buffer->id) return bad(BindFail::BufferUnbacked);
           VkDeviceSize off = d.offset, range = d.range;
           bool dynamic = ls.type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC || ls.type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC;
           if (dynamic && dynBase + e < sets[ls.set].dynamicOffsets.size()) off += sets[ls.set].dynamicOffsets[dynBase + e];
-          if (off >= d.buffer->size) return false;
+          if (off >= d.buffer->size) return bad(BindFail::OffsetOob);
           range = std::min<VkDeviceSize>(range, d.buffer->size - off);
           vpgpu::Access a{vpgpu::ResourceRange::bytes(d.buffer->id, off, range), u.stages, u.written};
           a.kind = ls.kind, a.slot = uint16_t(ls.slot + e);
@@ -2918,7 +2924,7 @@ bool resolveBindings(Recorder& r, const PipelineObj& p, const std::array<BoundSt
         }
         case VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER:
         case VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER: {
-          if (!d.texel || !d.texel->buffer || !d.texel->buffer->id) return false;
+          if (!d.texel || !d.texel->buffer || !d.texel->buffer->id) return bad(BindFail::TexelNull);
           VkDeviceSize range = d.texel->range == VK_WHOLE_SIZE ? d.texel->buffer->size - d.texel->offset : d.texel->range;
           vpgpu::Access a{vpgpu::ResourceRange::bytes(d.texel->buffer->id, d.texel->offset, range), u.stages, u.written};
           a.kind = vpgpu::BindKind::Buffer, a.slot = uint16_t(ls.slot + e);
@@ -2939,25 +2945,27 @@ bool resolveBindings(Recorder& r, const PipelineObj& p, const std::array<BoundSt
           break;
         }
         case VK_DESCRIPTOR_TYPE_SAMPLER: {
-          if (!d.sampler || !d.sampler->id) return false;
+          if (!d.sampler || !d.sampler->id) return bad(BindFail::SamplerNull);
           out.push_back(vpgpu::samplerBinding(d.sampler->id, u.stages, uint16_t(ls.slot + e)));
           break;
         }
         default: {  // images
-          if (!d.view || !d.view->image || !d.view->image->id) return false;
+          if (!d.view || !d.view->image || !d.view->image->id) return bad(BindFail::ImageNull);
           vpgpu::Access a{vpgpu::ResourceRange::wholeTexture(d.view->image->id), u.stages, u.written};
           a.kind = ls.kind, a.slot = uint16_t(ls.slot + e);
           if (ls.type == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE && d.view->storageView)
             views.push_back({ls.kind, a.slot, d.view->storageView});  // cube storage: texture2d_array
           else if (d.view->view) views.push_back({ls.kind, a.slot, d.view->view});
           out.push_back(a);
+          if (bc && (ls.type == VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE || ls.type == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER))
+            bc->tex.push_back({uint64_t{d.view->image->id.generation} << 32 | d.view->image->id.index, texCensusFlags(*d.view->image)});
           if (zeroPendingImage(d.view->image)) zeroReads.push_back(d.view->image->id);
           if (ls.ycbcr) {  // planes 1 and 2 of the multi-planar image
             const unsigned others = ls.ycbcr->spec.planes - 1u;
-            if (d.view->planeViews.size() < others) return false;
+            if (d.view->planeViews.size() < others) return bad(BindFail::PlaneMissing);
             for (unsigned k = 0; k < others; ++k) {
               const ImageView* pv = d.view->planeViews[k];
-              if (!pv->image || !pv->image->id) return false;
+              if (!pv->image || !pv->image->id) return bad(BindFail::PlaneMissing);
               vpgpu::Access pa{vpgpu::ResourceRange::wholeTexture(pv->image->id), u.stages, false};
               pa.kind = vpgpu::BindKind::Texture, pa.slot = uint16_t(ls.planeSlot[k] + e);
               if (pv->view) views.push_back({pa.kind, pa.slot, pv->view});
@@ -2966,7 +2974,7 @@ bool resolveBindings(Recorder& r, const PipelineObj& p, const std::array<BoundSt
             }
           }
           if (ls.type == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER) {
-            if (!d.sampler || !d.sampler->id) return false;
+            if (!d.sampler || !d.sampler->id) return bad(BindFail::SamplerNull);
             out.push_back(vpgpu::samplerBinding(d.sampler->id, u.stages, uint16_t(ls.samplerSlot + e)));
           }
         }
@@ -3465,7 +3473,7 @@ OpDraw makeDraw(Recorder& r, uint32_t first, uint32_t count, uint32_t instances,
       pc.ampInstVerts.fetch_add(uint64_t(count) * d.instances, kRelaxed);
     }
   }
-  if (!resolveBindings(r, *p, r.bound.graphicsSets, d.bindings, d.views, op.zeroReads)) {
+  if (!resolveBindings(r, *p, r.bound.graphicsSets, d.bindings, d.views, op.zeroReads, passDump().on ? &op.bind : nullptr)) {
     op.ok = false, op.reason = SkipReason::Unbound;
     logSkip("unbound_descriptor", p);
     return op;

@@ -3635,6 +3635,88 @@ void testFrameOpt() {
   }
 }
 
+// gpu.pdump.* (Frame::setPassDump): passes, pipelines, resources, producer/consumer links and the GPU times, on the null backend.
+void testPassDump() {
+  NullBackend be;
+  std::vector<std::string> log;
+  Device dev(be, 0, [&](const std::string& l) { log.push_back(l); });
+  auto tex = [&](Format f) {
+    TextureDesc d;
+    d.format = f;
+    d.width = d.height = 128;
+    d.label = "scene color";
+    d.usage = usage::sampled | (formatInfo(f).depth() ? usage::depthTarget : usage::colorTarget);
+    return dev.createTexture(d);
+  };
+  const TextureId color = tex(Format::RGBA8Unorm), depth = tex(Format::D32Float), late = tex(Format::RGBA8Unorm), other = tex(Format::RGBA8Unorm);
+  PipelineState ps;
+  ps.vertexShader = 0xabc, ps.fragmentShader = 0xdef;
+  ps.colorFormats[0] = Format::RGBA8Unorm;
+  ps.label = "mat x=1\nz";  // a game's name can hold anything
+  const PipelineKey key = ps.key();
+  dev.pipelines().request(ps, key, Priority::Blocking);  // 0 workers: compiled at once on the null backend
+  auto draw = [&](std::vector<Access> b, uint32_t count, uint32_t inst) {
+    Draw d = Scene::draw(std::move(b));
+    d.pipeline = key, d.count = count, d.instances = inst;
+    d.viewport = {0, 0, 128, 128, 0, 1};
+    return d;
+  };
+  Frame f;
+  f.setPassDump(true);
+  f.dumpLine("vk.pdump.drop f=0 pass=0 from_the_client");
+  f.beginRenderPass(Scene::pass(color, depth, LoadAction::Clear));  // p0: the producer of color and depth
+  f.draw(draw({}, 30, 2));
+  f.draw(draw({}, 6, 1));
+  f.endRenderPass();
+  RenderPassDesc p1 = Scene::pass(other);                             // p1: samples color and depth (fine) and `late` (written by p2: stale)
+  p1.colors[0].load = LoadAction::Clear;
+  f.beginRenderPass(p1);
+  f.draw(draw({Scene::sample(color), Scene::sample(depth), Scene::sample(late)}, 3, 1));
+  f.endRenderPass();
+  RenderPassDesc p2 = Scene::pass(late, {}, LoadAction::Load);        // p2: writes `late`, loading the previous frame's
+  f.beginRenderPass(p2);
+  f.draw(draw({}, 3, 1));
+  f.endRenderPass();
+  dev.submit(f);
+  auto find = [&](const std::string& prefix, const std::string& must = "") {
+    for (const std::string& l : log)
+      if (l.starts_with(prefix) && l.find(must) != std::string::npos) return l;
+    return std::string();
+  };
+  CHECK(!find("gpu.pdump.frame f=0 cmds=3 render=3 dispatch=0 copy=0 encoders=").empty());
+  const std::string p0 = find("gpu.pdump.pass f=0 pass=0 ");
+  CHECK(p0.find(" draws=2 clears=0 indirect=0 idx=0 verts=36 inst=3 inst_max=2 work=66 pipes=1 ") != std::string::npos);
+  CHECK(p0.find(" att{c0=t0/RGBA8Unorm/s1/128x128x1/m0/l0/CS/uSC/scene_color,d=t1/D32Float/s1/128x128x1/m0/l0/CS/uSD/scene_color}") != std::string::npos);
+  CHECK(p0.find(" pipe_state{ready=2 pending=0 failed=0 missing=0} vp{0,0,128x128:2} sc{0,0,0x0:2}") != std::string::npos);
+  const std::string pipe = find("gpu.pdump.pipe f=0 pass=0 ", "status=ready");
+  CHECK(pipe.find(" label=mat_x_1_z ") != std::string::npos && !find("vk.pdump.drop f=0 pass=0 from_the_client").empty());
+  CHECK(pipe.find(" draws=2 count=36 inst=3 ") != std::string::npos && pipe.find(" vs=0000000000000abc fs=0000000000000def ") != std::string::npos);
+  CHECK(!find("gpu.pdump.res f=0 pass=1 dir=r n=3 tex=3 buf=0 shown=3 list=[t0:RGBA8Unorm:128x128x1:m1:s1:1,").empty());
+  CHECK(find("gpu.pdump.res f=0 pass=0 dir=w").empty());  // attachments are not draw bindings
+  const std::string lateLink = find("gpu.pdump.link f=0 tex=2 ");
+  CHECK(lateLink.find(" kind=color ") != std::string::npos);
+  CHECK(lateLink.find(" w=[p2] ") != std::string::npos && lateLink.find(" r=[p1] stale_read=[p1] stale_load=[p2] self=[]") != std::string::npos);
+  const std::string colorLink = find("gpu.pdump.link f=0 tex=0 ");
+  CHECK(colorLink.find(" w=[p0] ") != std::string::npos && colorLink.find(" r=[p1] stale_read=[] ") != std::string::npos);
+  CHECK(!find("gpu.pdump.link f=0 tex=1 ", " kind=depth ").empty());
+  CHECK(!find("gpu.enc f=0 i=0 ").empty());  // the existing per-encoder lines come with the dump
+  CHECK(!find("gpu.pdump.time f=0 gpu_ms=", " e0[p0").empty());
+  {  // one cap for the whole dump
+    std::vector<std::string> lines(300, "x");
+    capPassDump(5, lines);
+    CHECK_EQ(lines.size(), size_t{300});
+    lines.assign(305, "x");
+    capPassDump(5, lines);
+    CHECK(lines.size() == 301 && lines.back() == "gpu.pdump.cut f=5 dropped=5");
+  }
+  size_t n = log.size();
+  Frame quiet;
+  Scene::passWithDraw(quiet, Scene::pass(color));
+  dev.submit(quiet);
+  for (size_t i = n; i < log.size(); ++i) CHECK(!log[i].starts_with("gpu.pdump.pass"));  // only flagged frames are dumped
+  for (const std::string& l : log) CHECK(l.find("  ") == std::string::npos || !l.starts_with("gpu.pdump"));
+}
+
 int main(int argc, char** argv) {
   const std::vector<std::pair<const char*, std::function<void()>>> groups = {
       {"resources", testResources}, {"commands", testCommands}, {"merge", testMerge},
@@ -3645,7 +3727,8 @@ int main(int argc, char** argv) {
       {"bigframe", testBigFrameLog}, {"rectenv", testRectEnv}, {"mipchain", testMipChain},
       {"deadstore", testDeadStore}, {"rtmemory", testRtMemory}, {"scopedpool", testScopedPool},
       {"background", testBackground}, {"viewsplit", testViewSplit}, {"tilehot", testTileHot}, {"activity", testActivity}, {"harvest", testHarvest},
-      {"passfuse", testPassFuse}, {"automsaa", testAutoMsaa}, {"required_dispatch", testRequiredDispatch}, {"frameopt", testFrameOpt}};
+      {"passfuse", testPassFuse}, {"automsaa", testAutoMsaa}, {"required_dispatch", testRequiredDispatch}, {"frameopt", testFrameOpt},
+      {"passdump", testPassDump}};
   bool ran = false;
   for (const auto& [name, fn] : groups) {
     if (argc > 1 && std::strcmp(argv[1], name) != 0) continue;

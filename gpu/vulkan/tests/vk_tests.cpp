@@ -10227,6 +10227,179 @@ void testSkipReasons() {
   vkDestroyPipelineLayout(c.dev, pl, nullptr);
 }
 
+// VPVK_PASS_DUMP / VPVK_SKIP_PASS (passdump.h): the switch parsing and its caps, the per-pass census of what the translator dropped or
+// sampled, VPVK_SKIP_PASS dropping a pass's draws, and the dump through vkQueueSubmit (vk.pdump.* next to the core's gpu.pdump.*).
+void testPassDump() {
+  // Parsing: off by default; 1 = the defaults; <start>[,<frames>] with the frames capped; junk is ignored.
+  CHECK(!parsePassDump(nullptr).on && !parsePassDump("").on && !parsePassDump("0").on);
+  PassDump def = parsePassDump("1");
+  CHECK(def.on && def.start == kPassDumpStart && def.frames == kPassDumpFrames);
+  PassDump pd = parsePassDump("3000,6");
+  CHECK(pd.on && pd.start == 3000 && pd.frames == 6);
+  CHECK(parsePassDump("50,99").frames == kPassDumpMaxFrames && parsePassDump("50,0").frames == kPassDumpFrames);
+  PassDump win = parsePassDump("2,2");  // the 3rd and 4th frames with render work
+  bool seen[5];
+  for (bool& b : seen) b = passDumpNext(win);
+  CHECK(!seen[0] && !seen[1] && seen[2] && seen[3] && !seen[4] && win.seen == 5);
+  CHECK((parseSkipPasses("5,6") == std::vector<uint32_t>{5, 6}) && (parseSkipPasses("4-7") == std::vector<uint32_t>{4, 5, 6, 7}));
+  CHECK((parseSkipPasses(" 3 , x, 9-8, 2,2") == std::vector<uint32_t>{2, 3}) && parseSkipPasses(nullptr).empty() && parseSkipPasses("a").empty());
+  CHECK(parseSkipPasses("0-1000").size() == kMaxSkipPasses);
+  std::string repeated;
+  for (int i = 0; i < 40; ++i) repeated += "1,";
+  CHECK((parseSkipPasses((repeated + "2").c_str()) == std::vector<uint32_t>{1, 2}));  // duplicates do not use up the cap
+
+  Ctx c;
+  const PassDump savedDump = passDump();
+  const std::vector<uint32_t> savedSkip = skipPasses();
+  DrawRig rig(c);
+  VkShaderModule vs = module(c, "pos.vert.spv"), fs = module(c, "tex_tint.frag.spv");
+  VkDescriptorSetLayoutBinding b0{0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr};
+  VkDescriptorSetLayoutCreateInfo lci{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+  lci.bindingCount = 1, lci.pBindings = &b0;
+  VkDescriptorSetLayout dsl;
+  vkCreateDescriptorSetLayout(c.dev, &lci, nullptr, &dsl);
+  const VkPushConstantRange pcr{VK_SHADER_STAGE_FRAGMENT_BIT, 0, 16};
+  VkPipelineLayoutCreateInfo plci{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+  plci.setLayoutCount = 1, plci.pSetLayouts = &dsl, plci.pushConstantRangeCount = 1, plci.pPushConstantRanges = &pcr;
+  VkPipelineLayout pl;
+  vkCreatePipelineLayout(c.dev, &plci, nullptr, &pl);
+  PipeOpts dyn;
+  dyn.dynamic = {VK_DYNAMIC_STATE_SCISSOR};
+  VkPipeline pipe = makePosPipeline(c, rig, pl, dyn, vs, fs);
+  CHECK(from<PipelineObj>(pipe)->ok);
+  c.gpu().pipelines().waitIdle();
+  VkDeviceMemory mem = alloc(c, 1 << 20, 0);
+  VkImage tex = image(c, VK_FORMAT_R8G8B8A8_UNORM, 64, 1, VK_IMAGE_USAGE_SAMPLED_BIT, mem);  // declared 64 px, no copy into it
+  VkImageViewCreateInfo vi{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+  vi.image = tex, vi.viewType = VK_IMAGE_VIEW_TYPE_2D, vi.format = VK_FORMAT_R8G8B8A8_UNORM;
+  vi.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+  VkImageView texView;
+  vkCreateImageView(c.dev, &vi, nullptr, &texView);
+  VkSamplerCreateInfo sci{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
+  VkSampler smp;
+  vkCreateSampler(c.dev, &sci, nullptr, &smp);
+  const VkDescriptorPoolSize ps{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1};
+  VkDescriptorPoolCreateInfo dpi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+  dpi.maxSets = 1, dpi.poolSizeCount = 1, dpi.pPoolSizes = &ps;
+  VkDescriptorPool pool;
+  vkCreateDescriptorPool(c.dev, &dpi, nullptr, &pool);
+  VkDescriptorSetAllocateInfo dai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+  dai.descriptorPool = pool, dai.descriptorSetCount = 1, dai.pSetLayouts = &dsl;
+  VkDescriptorSet set;
+  vkAllocateDescriptorSets(c.dev, &dai, &set);
+  const VkDescriptorImageInfo dii{smp, texView, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+  VkWriteDescriptorSet w{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+  w.dstSet = set, w.descriptorCount = 1, w.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, w.pImageInfo = &dii;
+  vkUpdateDescriptorSets(c.dev, 1, &w, 0, nullptr);
+
+  // One pass: draw 0 has no descriptor set bound (refused), 1 and 2 sample the 64 px texture, 3 has an empty scissor.
+  const VkRect2D fine{{0, 0}, {32, 32}}, empty{{4, 4}, {0, 0}};
+  auto record = [&] {
+    rig.begin();
+    vkCmdBindPipeline(rig.cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
+    vkCmdSetScissor(rig.cb, 0, 1, &fine);
+    vkCmdDraw(rig.cb, 3, 1, 0, 0);
+    vkCmdBindDescriptorSets(rig.cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pl, 0, 1, &set, 0, nullptr);
+    vkCmdDraw(rig.cb, 3, 1, 0, 0);
+    vkCmdDraw(rig.cb, 6, 1, 0, 0);
+    vkCmdSetScissor(rig.cb, 0, 1, &empty);
+    vkCmdDraw(rig.cb, 3, 1, 0, 0);
+  };
+  passDump() = parsePassDump("1");
+  skipPasses().clear();
+  record();
+  vpgpu::Frame frame;
+  TranslateStats ts;
+  rig.finish(frame, ts);
+  CHECK(ts.draws == 2 && ts.skippedDraws == 2 && ts.passNotes.size() == 1);
+  if (ts.passNotes.size() == 1) {
+    const PassNote& n = ts.passNotes[0];
+    CHECK(n.pass == 0 && n.draws == 2 && n.skipped[size_t(SkipReason::Unbound)] == 1 && n.skipped[size_t(SkipReason::Scissor)] == 1);
+    CHECK(n.bindFail[size_t(BindFail::SetNull)] == 1 && n.bindFail[size_t(BindFail::ImageNull)] == 0);
+    CHECK(n.tex.size() == 1 && n.tex.begin()->second == (kTexLe64 | kTexDeclLe64 | kTexUnwritten));  // two draws, one distinct texture
+    const std::vector<std::string> lines = passDumpLines(7, ts.passNotes, {3});
+    CHECK(lines.size() == 2);
+    if (lines.size() == 2) {
+      CHECK(lines[0] == "vk.pdump.drop f=7 pass=0 draws=2 skipped=2 reasons{unbound=1,scissor=1} unbound{set_null=1} "
+                        "fallback{mask_plain=0,depth_tile_plain=0} gate_dropped=3");
+      CHECK(lines[1] == "vk.pdump.tex f=7 pass=0 sampled=1 full=0 le64=1,decl_le64=1,unwritten=1");
+    }
+    // The totals line: rate limited to one per 5 s, the totals since the previous one, then reset.
+    CHECK(passDumpSummary(1000).empty());  // starts the clock
+    passDumpAccumulate(ts.passNotes, 3);
+    CHECK(passDumpSummary(1000 + 4'000'000'000LL).empty());
+    const std::string sum = passDumpSummary(1000 + 5'000'000'000LL);
+    CHECK(sum.starts_with("vk.pdump.sum t=5s frames=1 render_seen=") && sum.find(" passes=1 draws=2 gate_dropped=3 skipped{unbound=1,scissor=1} unbound{set_null=1} ") != std::string::npos);
+    CHECK(sum.find("tex{sampled=1,le64=1,decl_le64=1,unwritten=1} hide_mesh=") != std::string::npos && sum.ends_with(" skip_pass=off"));
+    passDumpAccumulate(ts.passNotes, 0);
+    CHECK(passDumpSummary(1000 + 6'000'000'000LL).empty() && passDumpSummary(1000 + 10'000'000'000LL).find(" frames=1 ") != std::string::npos);
+  }
+
+  // Off (the default): nothing is collected.
+  passDump() = PassDump{};
+  record();
+  vpgpu::Frame quietFrame;
+  TranslateStats quiet;
+  rig.finish(quietFrame, quiet);
+  CHECK(quiet.draws == 2 && quiet.skippedDraws == 2 && quiet.passNotes.empty());
+  for (const Op& op : from<CommandBuffer>(rig.cb)->rec->ops)
+    if (const auto* d = std::get_if<OpDraw>(&op)) CHECK(d->bind.tex.empty() && d->bind.fail == BindFail::None);
+
+  // VPVK_SKIP_PASS: the draws of pass 0 go (the pass stays, with its attachments), another index leaves it alone.
+  passDump() = parsePassDump("1");
+  skipPasses() = {0};
+  record();
+  vpgpu::Frame skipFrame;
+  TranslateStats sk;
+  rig.finish(skipFrame, sk);
+  CHECK(sk.draws == 0 && sk.skippedBy[size_t(SkipReason::Experiment)] == 2 && skipFrame.commands().size() == 1);
+  CHECK(skipFrame.commands().size() == frame.commands().size() && sk.passes == ts.passes);  // the same passes with and without the skip
+  CHECK(sk.passNotes.size() == 1 && sk.passNotes[0].draws == 0 && sk.passNotes[0].skipped[size_t(SkipReason::Experiment)] == 2);
+  const auto* skippedPass = skipFrame.commands().empty() ? nullptr : std::get_if<vpgpu::RenderPass>(&skipFrame.commands()[0]);
+  CHECK(skippedPass && skippedPass->draws.empty() && skippedPass->desc.colors[0].texture);
+  skipPasses() = {1, 2};
+  record();
+  vpgpu::Frame otherFrame;
+  TranslateStats ot;
+  rig.finish(otherFrame, ot);
+  CHECK(ot.draws == 2 && ot.skippedBy[size_t(SkipReason::Experiment)] == 0);
+
+  // Through vkQueueSubmit: the first frame with render work is dumped (window 0..1): vk.pdump.* and the core's gpu.pdump.* name the same frame.
+  skipPasses().clear();
+  passDump() = parsePassDump("1");
+  passDump().start = 0, passDump().frames = 1, passDump().seen = 0;
+  const std::string logged = captureStderr([&] {
+    for (int i = 0; i < 2; ++i) {  // (the second submit brings the first frame's GPU times)
+      record();
+      vkCmdEndRenderPass(rig.cb);
+      vkEndCommandBuffer(rig.cb);
+      VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+      si.commandBufferCount = 1, si.pCommandBuffers = &rig.cb;
+      CHECK(vkQueueSubmit(c.queue, 1, &si, VK_NULL_HANDLE) == VK_SUCCESS);
+    }
+  });
+  CHECK(countOf(logged, "vk.pdump.drop f=") == 1 && countOf(logged, "vk.pdump.tex f=") == 1 && countOf(logged, "gpu.pdump.frame f=") == 1);
+  const size_t at = logged.find("vk.pdump.drop f=");
+  const std::string fr = at == std::string::npos ? "?" : logged.substr(at + 14, logged.find(' ', at + 14) - at - 14);  // "f=<n>"
+  CHECK(logged.find("gpu.pdump.pass " + fr + " pass=0 ") != std::string::npos && logged.find("gpu.pdump.time " + fr + " ") != std::string::npos);
+  CHECK(logged.find("gpu.pdump.pipe " + fr + " pass=0 draws=2 ") != std::string::npos && logged.find(" vs=") != std::string::npos);
+  CHECK(logged.find("gpu.pdump.link " + fr + " tex=") != std::string::npos);
+  CHECK(passDump().seen == 2);
+
+  passDump() = savedDump;
+  skipPasses() = savedSkip;
+  vkDestroyDescriptorPool(c.dev, pool, nullptr);
+  vkDestroySampler(c.dev, smp, nullptr);
+  vkDestroyImageView(c.dev, texView, nullptr);
+  vkDestroyImage(c.dev, tex, nullptr);
+  vkFreeMemory(c.dev, mem, nullptr);
+  vkDestroyPipeline(c.dev, pipe, nullptr);
+  vkDestroyPipelineLayout(c.dev, pl, nullptr);
+  vkDestroyDescriptorSetLayout(c.dev, dsl, nullptr);
+  vkDestroyShaderModule(c.dev, vs, nullptr);
+  vkDestroyShaderModule(c.dev, fs, nullptr);
+}
+
 // GPU indirect draws that need their arguments rewritten (multiview: instances x views; draw-count buffers): the patch kernel
 // (vk.indirect_patch) is dispatched before the pass begins, requested when the device is created, never silently skipped; a kernel that
 // is not there sends the draw to the CPU path (counted, logged), and a draw-count draw, which has none, is skipped with a reason.
@@ -14303,7 +14476,7 @@ int main(int argc, char** argv) {
       {"vertex_stores", testVertexStores}, {"profile", testProfile}, {"profile13", testProfile13}, {"quest_extras", testQuestExtras}, {"push_descriptor", testPushDescriptor}, {"report_geom", testReportGeomInterpolators}, {"pipeline_policy", testPipelinePolicy}, {"eds", testExtendedDynamicState},
       {"quest_gpu_name", testQuestGpuName}, {"native_identity", testNativeIdentity}, {"inline_uniform", testInlineUniformBlock}, {"bda", testBufferDeviceAddress}, {"ycbcr", testYcbcr},
       {"taa_native", testTaaNative}, {"taa_eye_depth", testTaaEyeDepth}, {"taa_uimask", testTaaUiMask}, {"msaa_force", testMsaaForce}, {"depth_tile", testDepthTile}, {"depth_tile_off", testDepthTileOff}, {"d24_emul", testD24Emul}, {"prewarm_variants", testPrewarmVariants}, {"msaa_force_marked", testMsaaForceMarkedEye}, {"aot", testAot}, {"aniso", testAniso}, {"zeroinit", testZeroInit}, {"archive_index", testArchiveIndex}, {"foveation", testFoveation},
-      {"stage_keys", testStageKeys}, {"async_pipelines", testAsyncPipelines}, {"sync_pipelines", testSyncPipelines}, {"create_default", testCreateDefault}, {"pso_census", testPsoCensus}, {"cache_state", testCacheState}, {"hide_mesh", testHideMesh}, {"pass_drop", testPassDrop}, {"skip_reasons", testSkipReasons}, {"diag_census", testDiagCensus}, {"indirect_patch", testIndirectPatch}, {"astc3d", testAstc3d},
+      {"stage_keys", testStageKeys}, {"async_pipelines", testAsyncPipelines}, {"sync_pipelines", testSyncPipelines}, {"create_default", testCreateDefault}, {"pso_census", testPsoCensus}, {"cache_state", testCacheState}, {"hide_mesh", testHideMesh}, {"pass_drop", testPassDrop}, {"skip_reasons", testSkipReasons}, {"diag_census", testDiagCensus}, {"pass_dump", testPassDump}, {"indirect_patch", testIndirectPatch}, {"astc3d", testAstc3d},
       {"perf", testPerf}, {"phase1b", testPhase1b}, {"suspend_resume", testSuspendResume}, {"translator_modes", testTranslatorModes}, {"capture", testCapture}, {"capture_images", testCaptureImages}, {"capture_hooks", testCaptureHooks}, {"capture_codec", testCaptureCodec}, {"capture_env", testCaptureEnv}, {"capture_pools", testCapturePools}, {"capture_host_frames", testCaptureHostFrames}, {"capture_corrupt", testCaptureCorrupt}, {"capture_env_host", testCaptureEnvHost}, {"capture_env_dir", testCaptureEnvDir}, {"capture_devices", testCaptureDevices}, {"capture_unhooked", testCaptureUnhooked}, {"capture_budget", testCaptureBudget}, {"capture_locks", testCaptureLocks}, {"png", testPng}, {"imgdiff", testImgDiff}, {"replay", testReplay}, {"replay_lvp", testReplayLvp}, {"refcaps", testRefCaps}};
   bool ran = false;
   for (const auto& [name, fn] : groups) {

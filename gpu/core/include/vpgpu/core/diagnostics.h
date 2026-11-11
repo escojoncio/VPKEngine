@@ -51,4 +51,23 @@ std::vector<std::string> formatResolveUse(uint64_t frame, const Frame&, const Co
 bool bigFrame(const CompiledFrame&, uint32_t threshold = 256);
 std::string formatBigFrame(uint64_t frame, const Frame&, const CompiledFrame&, const ResourceTable* res);
 
+// "gpu.pdump.*" (a client sets Frame::setPassDump; the Vulkan layer does for VPVK_PASS_DUMP): one frame explained pass by pass.
+// `pass` is the index of the command in Frame::commands() (p<i> render pass, d<i> dispatch, x<i> copy), `enc` the encoder that runs it.
+//   gpu.pdump.frame f= cmds= render= dispatch= copy= encoders=
+//   gpu.pdump.pass  f= pass= enc= [enc2=] label= layers= area= att{c0=t<id>/<fmt>/s<samples>/<w>x<h>x<layers>/m<mip>/l<layer>/<load><store>/u<usage>[->t<resolve>]/<label>,d=..}
+//                   draws= clears= indirect= idx= verts= inst= inst_max= work= pipes= pipe_state{ready= pending= failed= missing=} vp{x,y,wxh:n;..} sc{..}
+//   gpu.pdump.pipe  f= pass= draws= count= inst= status= + describePipelineState (shader hashes, blend, depth, cull); the 3 busiest of a pass
+//   gpu.pdump.res   f= pass= dir=r|w n= tex= buf= shown= list=[t<id>:<fmt>:<w>x<h>x<layers>:m<mips>:s<samples>:<draws>,b<id>:<bytes>:<draws>]
+//   gpu.pdump.link  f= tex= kind=color|depth fmt= s= size= label= w=[..] wdc=[..] r=[..] stale_read=[..] stale_load=[..] self=[..]
+//                   (w: passes that store it, wdc: render into it without storing, stale_*: read / loaded before any stored write of the
+//                   frame = the previous frame's contents, self: sampled by the pass that writes it)
+// `res` and `pipes` may be null. Not capped: Device::submit caps the whole dump (capPassDump).
+std::vector<std::string> formatPassDump(uint64_t frame, const Frame&, const CompiledFrame&, const ResourceTable* res,
+                                        const PipelineCache* pipes);
+// Keeps the first `max` lines of a frame's dump and appends "gpu.pdump.cut f= dropped=N" (N = lines dropped) when there were more.
+void capPassDump(uint64_t frame, std::vector<std::string>& lines, size_t max = 300);
+// The commands each encoder runs ("e3[p5+p6]"), kept until the frame's GPU timings arrive, then "gpu.pdump.time f= gpu_ms= stamps= e3[p5+p6]=<ms>".
+std::vector<std::string> passDumpEncoders(const Frame&, const CompiledFrame&);
+std::string formatPassDumpTime(uint64_t frame, const std::vector<std::string>& encoders, const GpuTimings&);
+
 }  // namespace vpgpu

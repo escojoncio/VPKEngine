@@ -474,6 +474,23 @@ FrameReport Device::submit(const Frame& frame) {
     }
     for (const std::string& line : fuse) log_(line);
   }
+  if (frame.passDump()) {  // VPVK_PASS_DUMP (set by the Vulkan layer for a few frames): this frame pass by pass; its GPU times follow
+    const bool detailed = detailEvery_ && index % detailEvery_ == 0;  // gpu.enc / gpu.pass.fuse / gpu.resolve.use were just logged
+    std::vector<std::string> dump;
+    {
+      std::lock_guard lock(resMutex_);
+      dump = formatPassDump(index, frame, compiled, &resources_, &pipelines_);
+      for (const std::string& l : frame.dumpLines()) dump.push_back(l);
+      if (!detailed) {
+        for (std::string& l : formatEncoders(index, frame, compiled)) dump.push_back(std::move(l));
+        for (std::string& l : formatPassFuse(index, frame, compiled, &resources_)) dump.push_back(std::move(l));
+        for (std::string& l : formatResolveUse(index, frame, compiled, &resources_)) dump.push_back(std::move(l));
+      }
+    }
+    capPassDump(index, dump);
+    for (const std::string& l : dump) log_(l);
+    if (pdumpPending_.size() < 8) pdumpPending_.emplace_back(index, passDumpEncoders(frame, compiled));
+  }
   // MSAA attachments the resolve-on-tile option could not keep on tile: the first few of the run and then
   // one frame in every detailEvery_ (the first rejects fall in the menu; the scene's matter), with
   // everything the verdict was decided on (so a log says why, not just tile_rejected=N).
@@ -539,6 +556,11 @@ FrameReport Device::submit(const Frame& frame) {
   uint64_t done;
   GpuTimings t;
   while (backend_.takeTimings(done, t)) {
+    while (!pdumpPending_.empty() && pdumpPending_.front().first < done) pdumpPending_.pop_front();
+    if (!pdumpPending_.empty() && pdumpPending_.front().first == done) {
+      log_(formatPassDumpTime(done, pdumpPending_.front().second, t));
+      pdumpPending_.pop_front();
+    }
     while (!passPending_.empty() && passPending_.front().first < done) passPending_.pop_front();
     if (!passPending_.empty() && passPending_.front().first == done) {
       const auto& desc = passPending_.front().second;

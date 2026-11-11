@@ -13,6 +13,7 @@
 #include <variant>
 #include <vector>
 
+#include "passdump.h"
 #include "vpvk.h"
 
 namespace vpvk {
@@ -143,10 +144,11 @@ struct OpBlitImage {
 // Why a draw is not drawn: set where OpDraw::ok turns false (pipelines.cpp makeDraw) or at the replay skip (commands.cpp),
 // counted per reason in TranslateStats::skippedBy and printed in vk.submit. None in the counters = a skip with no reason set.
 enum class SkipReason : uint8_t { None, TranslateTimeout, NoPipeline, PipelineFailed, Unbound, NoIndex, Fan, Scissor, Cull,
-                                  Indirect, Pass, Count };
+                                  Indirect, Pass, Experiment, Count };
 constexpr const char* kSkipReasonNames[] = {"other", "translate_timeout", "no_pipeline", "pipeline_failed", "unbound",
-                                            "no_index", "fan", "scissor", "cull", "indirect", "pass"};
+                                            "no_index", "fan", "scissor", "cull", "indirect", "pass", "skip_pass"};
 static_assert(sizeof kSkipReasonNames / sizeof *kSkipReasonNames == size_t(SkipReason::Count));
+static_assert(size_t(SkipReason::Count) <= kSkipSlots);
 struct OpDraw {
   vpgpu::Draw draw;
   // Indirect draws: arguments read from the buffer at submit (unified memory) — or, with gpuIndirect,
@@ -162,6 +164,7 @@ struct OpDraw {
   uint32_t viewCount = 1;  // instance multiplier of multiview (PipelineObj::instanceViews; 1 when amplified)
   bool ok = true;  // false: the pipeline or a binding was missing (counted as skipped)
   SkipReason reason = SkipReason::None;  // why, when !ok
+  BindCensus bind;  // VPVK_PASS_DUMP only: why a binding was refused (fail), the sampled textures
   std::vector<vpgpu::TextureId> zeroReads;  // bound images that were zero-init pending when recorded
   // VPKTAA jitter eligibility: the pipeline tests or writes depth; a vertex buffer is bound (a
   // fullscreen pass draws a few vertices generated from the vertex id, with none).
@@ -471,6 +474,7 @@ struct TranslateStats {
   };
   std::vector<QueryEvent> queries;
   std::vector<std::pair<Event*, bool>> events;  // vkCmdSetEvent (true) / vkCmdResetEvent (false)
+  std::vector<PassNote> passNotes;  // VPVK_PASS_DUMP only (passdump.h): per pass, in order
 };
 void applyQueryEvents(const std::vector<TranslateStats::QueryEvent>&, uint64_t frame);
 

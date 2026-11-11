@@ -112,6 +112,8 @@ class PipelineCache {
   // The same with the state's key already computed (key() hashes the whole state).
   Status request(const PipelineState&, PipelineKey, Priority);
   Status status(PipelineKey) const;
+  // A copy of the state a key was requested with (diagnostics: gpu.pdump); false once its entry is gone.
+  bool stateOf(PipelineKey, PipelineState& out) const;
   // Owners of a pipeline (the client's live pipeline objects). The last release of a key forgets
   // its entry and destroys the backend's native pipeline; a later request() compiles it again.
   // Keys nobody retained (blit/internal pipelines, prewarm) are never released. retain() goes
