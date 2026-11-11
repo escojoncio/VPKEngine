@@ -4437,7 +4437,9 @@ struct Lifter {
         }
         if (t == 8) {
             if (in.stage != ShaderStage::Pixel) return error("depth export outside a pixel shader");
-            if (depthOut < 0) {
+            // Only a real Z (enable bit 0) makes a depth output: without a store the output would be undefined
+            // (Metal then writes garbage depth), and a mask/stencil-only export must leave the rasterizer's depth.
+            if ((mf.enable & 1) && depthOut < 0) {
                 V::IoVar io;
                 io.name = "depth";
                 io.type = F;

@@ -40,7 +40,7 @@ int main(int argc, char** argv) {
     }
     vpgcn::LiftInput input;
     std::vector<uint32_t> code, fetch;
-    std::vector<std::string> expectMsl;
+    std::vector<std::string> expectMsl, expectNoMsl;
     vpgcn::DescriptorInfo info;  // tex_dim / tex_elem / tex_bits / tex_num: what the client would say of every T#
     bool haveInfo = false;
     std::istringstream file(readFile(argv[1]));
@@ -66,6 +66,10 @@ int main(int argc, char** argv) {
             std::string t;
             std::getline(ls >> std::ws, t);
             expectMsl.push_back(t);
+        } else if (key == "expect_no_msl") {  // text the MSL must not contain
+            std::string t;
+            std::getline(ls >> std::ws, t);
+            expectNoMsl.push_back(t);
         } else if (key == "vs_out_cntl") {
             std::string v;
             ls >> v;
@@ -167,6 +171,11 @@ int main(int argc, char** argv) {
     for (const std::string& t : expectMsl)
         if (e.shader.source.find(t) == std::string::npos) {
             std::fprintf(stderr, "MSL lacks: %s\n", t.c_str());
+            status = 1;
+        }
+    for (const std::string& t : expectNoMsl)
+        if (e.shader.source.find(t) != std::string::npos) {
+            std::fprintf(stderr, "MSL contains: %s\n", t.c_str());
             status = 1;
         }
     if (summary.str() != readFile(argv[3])) {
