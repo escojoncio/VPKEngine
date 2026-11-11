@@ -3630,6 +3630,7 @@ void frameCapture() {
     const auto put = [&](const char* name) { std::ofstream(std::string(dir) + "/" + name) << "x"; };
     const auto exists = [&](const char* name) { return std::filesystem::exists(std::string(dir) + "/" + name); };
     put("framecap-9-0-old.ppm"), put("notes.txt"), put("framecap-keep.txt"), put("other.ppm"), put("framecap-9-1-old.bin");
+    put("framecap-u3.0-0-old.ppm");  // (... and the pictures of a capture the user asked for only by this run's first such capture)
     auto find = [](Fixture& f, const std::string& what) {
         for (const std::string& l : f.log)
             if (l.find(what) != std::string::npos) return &l;
@@ -3652,6 +3653,7 @@ void frameCapture() {
         CHECK(img && img->find("read=ok zero_px=15 zero_t8=15 ") != std::string::npos && img->find(" file=framecap-1-") != std::string::npos);
         CHECK(img && img->find(" lo=") == std::string::npos && img->find(" raw_bpe=") == std::string::npos);  // (RGBA: no range of channel 0)
         CHECK(!exists("framecap-9-0-old.ppm") && exists("notes.txt") && exists("framecap-keep.txt") && exists("other.ppm") && exists("framecap-9-1-old.bin"));
+        CHECK(exists("framecap-u3.0-0-old.ppm"));
         CHECK(find(f, "kind=color addr=" + Fixture::hex(kRt)));  // the target: listed (this backend cannot read it back)
         if (img) {
             const size_t at = img->find(" file=") + 6;
@@ -3708,6 +3710,7 @@ void frameCapture() {
         ProbeOn probe;
         setenv("VPKENGINE_FRAMECAP", "0", 1);
         Fixture f;
+        put("framecap-8-0-old.ppm");
         CHECK(f.renderer.endSceneCapture() == 0);
         CHECK(f.renderer.beginSceneCapture() == 1 && f.renderer.beginSceneCapture() == 0);
         const vpps4::DrawState d = f.depthState(true);
@@ -3743,6 +3746,7 @@ void frameCapture() {
         CHECK(!find(f, "VPKENGINE_PROBE SCENEDRAW"));  // (written when the capture ends)
         CHECK(f.renderer.endSceneCapture() == 1);
         CHECK(find(f, "VPKENGINE_PROBE FRAMECAP n=u1.0 ") && find(f, "VPKENGINE_PROBE FRAMECAP n=u1.1 "));
+        CHECK(!exists("framecap-u3.0-0-old.ppm") && exists("framecap-8-0-old.ppm"));  // (the earlier run's: only the user's pictures go)
         CHECK(find(f, "VPKENGINE_PROBE CLEARPASS n=1 f=1 tex=") && find(f, " whole=1 rects=0 depth=0 stencil=0 value=colour why=in_pass"));
         unsigned lines = 0;
         for (const std::string& l : f.log) lines += l.find("VPKENGINE_PROBE SCENEDRAW cap=1 ") != std::string::npos;
