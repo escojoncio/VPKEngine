@@ -22,6 +22,7 @@ struct Range {
 struct Image {
     std::vector<uint8_t> memory; // guest address = base + offset
     uint64_t base = 0;
+    bool windows = false;          // a PE: the selectors a segment register reads are Windows x64's
     std::vector<Range> loaded;     // every mapped range
     std::vector<Range> executable; // the ranges the translator may decode
     // Every relocation target of any type (a loader writes these 8 bytes): left out of the code

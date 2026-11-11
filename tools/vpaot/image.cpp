@@ -337,6 +337,7 @@ Image load_pe(const std::vector<uint8_t>& file) {
     if (size_of_image == 0 || size_of_image > (1u << 30)) throw std::runtime_error("bad SizeOfImage");
     Image img;
     img.base = image_base;
+    img.windows = true;
     img.memory.assign(size_of_image, 0);
     img.loaded.push_back({image_base, image_base + size_of_image});
     std::memcpy(img.memory.data(), file.data(), std::min<size_t>({size_of_headers, file.size(), (size_t)size_of_image}));

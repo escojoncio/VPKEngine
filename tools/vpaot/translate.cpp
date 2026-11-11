@@ -1477,7 +1477,15 @@ struct Emitter {
         // Data movement
         case ZYDIS_MNEMONIC_MOV:
             if (ops[0].type == ZYDIS_OPERAND_TYPE_REGISTER && ZydisRegisterGetClass(ops[0].reg.value) == ZYDIS_REGCLASS_SEGMENT) { unsupported("mov-seg"); return true; }
-            if (ops[1].type == ZYDIS_OPERAND_TYPE_REGISTER && ZydisRegisterGetClass(ops[1].reg.value) == ZYDIS_REGCLASS_SEGMENT) { unsupported("mov-seg"); return true; }
+            if (ops[1].type == ZYDIS_OPERAND_TYPE_REGISTER && ZydisRegisterGetClass(ops[1].reg.value) == ZYDIS_REGCLASS_SEGMENT) {
+                // Reading a selector gives what user-mode code sees: cs 0x33 and ss 0x2b on both
+                // systems; the others are 0x2b (fs 0x53) on Windows x64 and 0 on Linux. A PS4
+                // image gets Linux's: its FreeBSD selectors are not modelled.
+                const ZydisRegister s = ops[1].reg.value;
+                const unsigned sel = s == ZYDIS_REGISTER_CS ? 0x33 : s == ZYDIS_REGISTER_SS ? 0x2b : !img.windows ? 0 : s == ZYDIS_REGISTER_FS ? 0x53 : 0x2b;
+                line(wr(ops[0], ops[0].size, fmt("%uu", sel)));
+                return true;
+            }
             line(wr(ops[0], bits, rd(ops[1], bits)));
             return true;
         case ZYDIS_MNEMONIC_MOVZX:
