@@ -3,7 +3,7 @@
 Estado: **detenida a medias. Ningún arreglo aplicado.** Hechos: pasada con herramientas y lotes 1-3.
 Sin auditar: lote 4 `gpu/shader`; lote 5 `runtime` + `tools` + `platform/visionos` + `apps`.
 Todo se ejecutó en Linux con el backend nulo; los `.mm` de Metal están razonados, no ejecutados.
-Repros y benchmarks: rama `auditoria-repros`, carpeta `audit-repros/` (rutas abajo relativas a ella).
+Repros y benchmarks: no están en el repo (sólo locales); cada hallazgo describe el escenario para reescribirlos como test.
 Gravedad: A = caída, corrupción, carrera o fuga que crece; B = desperdicio real por frame, fuga
 acotada o UB que hoy funciona; C = menor. "Linux" = comprobable con el backend nulo.
 
