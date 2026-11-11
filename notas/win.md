@@ -1,7 +1,8 @@
 # VPWin: aplicaciones Windows (Steam) con Wine 11 + CPU/GPU de VPKEngine
 
 Objetivo: instalar el cliente real de Steam, instalar juegos y jugarlos, incluidos los que arrancan
-desde un launcher que lanza el juego. Estado: diseño + medición; nada del backend escrito.
+desde un launcher que lanza el juego. Estado: aparcado el 2026-11-11 (coste: meses hasta un primer
+juego); solo diseño + medición, nada del backend escrito.
 
 ## Arquitectura elegida (pendiente de confirmar: mete Wine, LGPL-2.1+, como biblioteca aparte)
 - Capa API = Wine 11.0 sin tocar por encima de la costura. Sus DLL PE **x86-64** y las de la app se
