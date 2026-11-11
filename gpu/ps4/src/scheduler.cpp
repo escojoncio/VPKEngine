@@ -130,7 +130,7 @@ bool Scheduler::dmaOnGpu(uint64_t dst, uint64_t n, uint64_t src) {
     // it on either path. (One with an interrupt, one nobody met in order, whose value a CPU poll or another ring may wait for,
     // or one overlapping what a copy reads stays.)
     if (supersede_ && device_.labelWaitTarget(dst, uint32_t(std::min<uint64_t>(n, ~0u))))
-        if (const size_t k = device_.supersedeLabels(dst, n, src, src ? n : 0)) counters_.labelsSuperseded += k, forgetLabelValues(dst, n);
+        if (const size_t k = renderer_.supersedeLabels(dst, n, src, src ? n : 0)) counters_.labelsSuperseded += k, forgetLabelValues(dst, n);
     if (!dmaGpu_) return false;
     if (renderer_.cpuReadSeen(dst, n)) return renderer_.probeDmaCpuRead(dst, n, src), ++counters_.dmaCpuRead, false;
     const uint64_t m = src ? n : 0;
@@ -192,7 +192,7 @@ Scheduler::WaitKind Scheduler::prepareWait(uint64_t a, uint64_t n, const std::fu
             if (a < it->address || a + 4 > it->address + it->size) break;       // partial: unknown
             const unsigned shift = unsigned(a - it->address) * 8;
             if (wanted(uint32_t(it->value >> shift))) {
-                device_.markLabelOrdered(it->address, it->size);
+                renderer_.markLabelOrdered(it->address, it->size);
                 ++counters_.orderedWaits;
                 return WaitKind::Ordered;
             }

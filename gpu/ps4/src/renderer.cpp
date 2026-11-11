@@ -21,6 +21,7 @@
 #include "vpgcn/gcn.h"
 #include "vpgcn/lift.h"
 #include "vpps4/bc_decode.h"
+#include "vpps4/callcap.h"
 #include "vpps4/fetch.h"
 #include "vpps4/fixed_function.h"
 #include "vpps4/formats.h"
@@ -517,7 +518,20 @@ struct Renderer::Impl {
             log("VPKENGINE_PROBE DMA_STALE_READ n=" + std::to_string(pstat.dmaStaleReads) + " f=" + std::to_string(r.frame_) + " a=" + hex(a) +
                 " bytes=" + std::to_string(n) + " by=" + by + " busy=[" + busyRange + "]");
     }
+    // A call capture is on (callcap.h): the bytes of [a, +n) as the renderer is about to read them go to its file. Not a texture
+    // source (filled or decoded on the CPU, "texture_...", or sampled for changes, "stamp": megabytes each, and a replay does
+    // without them), a range the command processor touched ("cp_access": nothing is read here) or program code (the capture
+    // takes it from the spans of the call).
+    void callcapRead(uint64_t a, uint64_t n, const char* by) {
+        if (!n || !r.callcap_->on() || !std::strncmp(by, "texture", 7) || !std::strcmp(by, "stamp") || !std::strcmp(by, "cp_access") || !std::strcmp(by, "code") || !std::strcmp(by, "fetch")) return;
+        const void* at = r.callcap_->mirror(a, n);
+        GuestRegion g;
+        if (!at && r.hooks_.region && r.hooks_.region(a, n, g) && a >= g.base && a + n <= g.base + g.size)
+            at = static_cast<const uint8_t*>(g.host) + (a - g.base);
+        r.callcap_->mem(a, at, n);
+    }
     void noteCpuRead(uint64_t a, uint64_t n, const char* by = "?") {
+        if (r.callcap_) callcapRead(a, n, by);
         if (cpuReadAll || !n) return;
         uint64_t lo = a, hi = a + n < a ? ~uint64_t(0) : a + n;
         if (lo >= cpuReadLo && hi <= cpuReadHi) return;
@@ -3435,11 +3449,15 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         for (const std::string& p : cap.passes) log("VPKENGINE_PROBE FRAMECAP_PASS n=" + n + " " + p);
         const std::string dir = std::getenv("SHADPS4_PROBE_DIR") ? std::getenv("SHADPS4_PROBE_DIR") : "";
         static const char* const kindName[3] = {"color", "depth", "texture"};
-        if (cap.files && cap.disk == 0 && cap.userDiskAll == 0 && !dir.empty()) {  // (the pictures of an earlier run: this one's replace them)
+        // The pictures of an earlier run: this one's replace them, each kind by its own (the periodic captures' when the first
+        // of those writes pictures, the user's captures' "framecap-u..." when the first of those does: what the user asked for
+        // is not lost to the periodic capture of the next run).
+        if (cap.files && (cap.user ? cap.userDiskAll : cap.disk) == 0 && !dir.empty()) {
             std::error_code ec;
             for (const auto& e : std::filesystem::directory_iterator(dir, ec)) {
                 const std::string name = e.path().filename().string();
-                if (name.rfind("framecap-", 0) == 0 && name.size() > 4 && name.compare(name.size() - 4, 4, ".ppm") == 0)
+                if (name.rfind("framecap-", 0) == 0 && name.size() > 4 && name.compare(name.size() - 4, 4, ".ppm") == 0 &&
+                    (name.compare(9, 1, "u") == 0) == (cap.user != 0))
                     std::filesystem::remove(e.path(), ec);
             }
         }
@@ -5653,6 +5671,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
                     if (!pointer && !a.write && (snapshotSafe(address, size) || (size <= kSnapshotBytes && pointerSnapshotSafe(address, size)))) {
                         GuestRegion g;
                         if (region(address, size, g)) {
+                            if (r.callcap_) r.callcap_->mem(address, static_cast<const uint8_t*>(g.host) + (address - g.base), size);
                             const Phase cbPhase(r.cpu_.bindCbMs);
                             if (const auto at = alignedConstantCopy(address, size, static_cast<const uint8_t*>(g.host) + (address - g.base))) {
                                 ++pstat.bufferSnapshots;
@@ -5667,6 +5686,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
                         if (region(address, 1, g)) {
                             const uint64_t bytes = std::min<uint64_t>(kSnapshotBytes, g.base + g.size - address) & ~uint64_t(15);
                             if (pointerSnapshotSafe(address, bytes)) {
+                                if (r.callcap_) r.callcap_->mem(address, static_cast<const uint8_t*>(g.host) + (address - g.base), bytes);
                                 const Phase cbPhase(r.cpu_.bindCbMs);
                                 if (const auto at = alignedConstantCopy(address, bytes, static_cast<const uint8_t*>(g.host) + (address - g.base))) {
                                     ++pstat.bufferSnapshots, ++pstat.pointerSnapshots;
@@ -7566,7 +7586,150 @@ Renderer::Renderer(vpgpu::Device& device, Hooks hooks)
 }
 
 Renderer::~Renderer() {
+    if (callcap_) endCallCapture();
     if (impl_) impl_->flushReports();
+}
+
+// ---- Call capture (callcap.h) -----------------------------------------------------------------------
+
+// A call of the public interface while a call capture is on: written down when it returns, after the memory the renderer
+// read for it. Nothing without a capture.
+struct Renderer::CallNote {
+    callcap::Writer* w;
+    // (a call whose arguments are numbers: each one a u64)
+    template <class... A>
+    CallNote(const Renderer& r, callcap::Call kind, A... args) : w(r.callcap_.get()) {
+        if (!w) return;
+        enter(r);
+        const uint64_t v[] = {uint64_t(args)..., 0};
+        w->call(kind, v, sizeof...(args) * 8);
+    }
+    // (one with structs: the caller gives them to the writer, see callcapStage)
+    explicit CallNote(const Renderer& r) : w(r.callcap_.get()) {
+        if (w) enter(r);
+    }
+    void enter(const Renderer& r) { w->enter(r.device_.completedFrames(), r.hooks_.regionGeneration ? r.hooks_.regionGeneration() : 0); }
+    ~CallNote() {
+        if (w) w->leave();
+    }
+    CallNote(const CallNote&) = delete;
+};
+
+namespace {
+
+// A stage of a captured call: its program goes to the file as memory, and where it is to the call's payload.
+callcap::StageRef callcapStage(callcap::Writer& w, const Stage& s) {
+    callcap::StageRef ref;
+    if (s.code.empty()) return ref;
+    ref.code = s.address, ref.codeWords = s.code.size();
+    w.mem(ref.code, s.code.data(), s.code.size() * 4);
+    if (!s.fetch.empty()) {
+        ref.fetch = s.address + (reinterpret_cast<uintptr_t>(s.fetch.data()) - reinterpret_cast<uintptr_t>(s.code.data()));
+        ref.fetchWords = s.fetch.size();
+        w.mem(ref.fetch, s.fetch.data(), s.fetch.size() * 4);
+    }
+    return ref;
+}
+static_assert(std::is_trivially_copyable_v<DrawState> && std::is_trivially_copyable_v<DispatchState> &&
+              std::is_trivially_copyable_v<ColorTarget> && std::is_trivially_copyable_v<ImageDesc>);
+
+}  // namespace
+
+bool Renderer::beginCallCapture(const CallCapOptions& options) {
+    if (callcap_) return false;
+    auto w = std::make_unique<callcap::Writer>(options, device_.submittedFrames());
+    if (!w->on()) return false;
+    // (the switches that choose the renderer's per-draw paths, as this run has them: what a replay compares)
+    std::string meta = "translator=" + tcache::buildFingerprint() + "\n";
+    for (const char* name : {"VPKENGINE_BIND_MEMO_OFF", "VPKENGINE_PROGRAM_MEMO_OFF", "VPKENGINE_HAZARD_MEMO_OFF", "VPKENGINE_DRAW_CACHE_OFF",
+                             "VPVK_FRAME_FOLD", "VPKENGINE_NO_IMAGE_ALIAS"})
+        if (const char* value = std::getenv(name)) meta += std::string(name) + "=" + value + "\n";
+    w->meta(meta + options.meta);
+    callcap::Config c;
+    c.drawStateBytes = sizeof(DrawState), c.dispatchStateBytes = sizeof(DispatchState);
+    c.colorTargetBytes = sizeof(ColorTarget), c.imageDescBytes = sizeof(ImageDesc);
+    c.hooks = (hooks_.regionGeneration ? callcap::kHookRegionGeneration : 0) | (hooks_.watchWrites ? callcap::kHookWatchWrites : 0) |
+              (hooks_.watchOwned ? callcap::kHookWatchOwned : 0) | (hooks_.view ? callcap::kHookView : 0) |
+              (hooks_.computeBuffers ? callcap::kHookComputeBuffers : 0) |
+              (hooks_.computeBuffersWanted ? callcap::kHookComputeBuffersWanted : 0);
+    c.maxSamples = maxSamples_, c.gpuTiling = impl_->gpuTiling, c.guestReadOnly = impl_->guestReadOnly;
+    c.imageAlias = impl_->imageAlias, c.foveation = foveation_, c.bc = formatCaps().bc;
+    c.stagingLimit = impl_->stagingLimit, c.scratchLimit = impl_->scratchLimit, c.bcFrameBytes = impl_->bcFrameBytes;
+    c.idleSubmits = impl_->idleSubmits, c.byteBudget = impl_->byteBudget;
+    c.frameBase = device_.submittedFrames(), c.rendererFrame = frame_;
+    w->config(c);
+    // The regions the renderer keeps across draws were answered before the capture began: they are answers of the host too.
+    const uint64_t generation = hooks_.regionGeneration ? hooks_.regionGeneration() : 0;
+    w->generation(generation);
+    for (const Impl::CachedRegion& kept : impl_->cachedRegions)
+        if (kept.valid && kept.generation == generation) w->region(kept.g.base, kept.g.size, kept.g.host, kept.g.mirrored);
+    callcap_ = std::move(w);
+    // The host's answers go through the capture from here on (endCallCapture puts the hooks back).
+    callcapSaved_ = {};
+    if (hooks_.region) {
+        callcapSaved_.region = std::move(hooks_.region);
+        hooks_.region = [this](uint64_t address, uint64_t size, GuestRegion& g) {
+            const bool ok = callcapSaved_.region(address, size, g);
+            callcap_->generation(hooks_.regionGeneration ? hooks_.regionGeneration() : 0);
+            if (ok) callcap_->region(g.base, g.size, g.host, g.mirrored);
+            else callcap_->noRegion(address, size);
+            return ok;
+        };
+    }
+    if (hooks_.computeBuffersWanted) {
+        callcapSaved_.computeBuffersWanted = std::move(hooks_.computeBuffersWanted);
+        hooks_.computeBuffersWanted = [this] {
+            const uint64_t wanted = callcapSaved_.computeBuffersWanted();
+            callcap_->hookAnswer(callcap::Hook::ComputeBuffersWanted, &wanted, sizeof wanted);
+            return wanted != 0;
+        };
+    }
+    if (hooks_.computeBuffers) {
+        callcapSaved_.computeBuffers = std::move(hooks_.computeBuffers);
+        hooks_.computeBuffers = [this](std::span<const ComputeBuffer> buffers, bool usesXor, bool complete) {
+            const uint64_t taken = callcapSaved_.computeBuffers(buffers, usesXor, complete);
+            callcap_->hookAnswer(callcap::Hook::ComputeBuffers, &taken, sizeof taken);
+            return taken != 0;
+        };
+    }
+    if (hooks_.view) {
+        callcapSaved_.view = std::move(hooks_.view);
+        hooks_.view = [this](const ViewRequest& q) {
+            const vpgpu::TextureId id = callcapSaved_.view(q);
+            const callcap::ViewAnswer a{uint64_t(q.format), uint64_t(q.type), q.array, q.baseLayer, q.layers, q.baseMip, q.mips, bool(id)};
+            callcap_->hookAnswer(callcap::Hook::View, &a, sizeof a);
+            return id;
+        };
+    }
+    impl_->log("VPKENGINE_PROBE CALLCAP begin file=" + options.path + " pictures=" + std::to_string(options.pictures) + " max_bytes=" +
+               std::to_string(options.maxBytes) + " f=" + std::to_string(frame_));
+    return true;
+}
+
+bool Renderer::callCapturePicture() { return callcap_ && callcap_->picture(); }
+
+CallCapResult Renderer::endCallCapture() {
+    if (!callcap_) return {};
+    const CallCapResult left = callcap_->close();
+    if (callcapSaved_.region) hooks_.region = std::move(callcapSaved_.region);
+    if (callcapSaved_.computeBuffersWanted) hooks_.computeBuffersWanted = std::move(callcapSaved_.computeBuffersWanted);
+    if (callcapSaved_.computeBuffers) hooks_.computeBuffers = std::move(callcapSaved_.computeBuffers);
+    if (callcapSaved_.view) hooks_.view = std::move(callcapSaved_.view);
+    callcapSaved_ = {};
+    callcap_.reset();
+    impl_->log("VPKENGINE_PROBE CALLCAP end file=" + left.path + " bytes=" + std::to_string(left.bytes) + " pictures=" +
+               std::to_string(left.pictures) + " calls=" + std::to_string(left.calls) + " draws=" + std::to_string(left.draws) + " cut=" +
+               (left.cut.empty() ? "no" : left.cut));
+    return left;
+}
+
+size_t Renderer::markLabelOrdered(uint64_t address, uint32_t size) {
+    const CallNote note(*this, callcap::Call::MarkLabelOrdered, address, size);
+    return device_.markLabelOrdered(address, size);
+}
+size_t Renderer::supersedeLabels(uint64_t address, uint64_t size, uint64_t keepAddress, uint64_t keepSize) {
+    const CallNote note(*this, callcap::Call::SupersedeLabels, address, size, keepAddress, keepSize);
+    return device_.supersedeLabels(address, size, keepAddress, keepSize);
 }
 
 void Renderer::flushReports() { impl_->flushReports(); }
@@ -7628,6 +7791,14 @@ struct Renderer::ResolvedScope {
 };
 
 void Renderer::draw(const DrawState& d) {
+    const CallNote note(*this);
+    if (note.w) {
+        const callcap::StageRef refs[4] = {callcapStage(*note.w, d.vs), callcapStage(*note.w, d.ps), callcapStage(*note.w, d.es),
+                                           callcapStage(*note.w, d.gs)};
+        DrawState bare = d;
+        bare.vs.code = bare.vs.fetch = bare.ps.code = bare.ps.fetch = bare.es.code = bare.es.fetch = bare.gs.code = bare.gs.fetch = {};
+        note.w->call(callcap::Call::Draw, &bare, sizeof bare, refs, sizeof refs);
+    }
     const ResolvedScope scope(*this, Resolved::Kind::Draw);
     const auto t0 = Clock::now();
     const Impl::SlowMark mark = impl_->slowMark();
@@ -7639,6 +7810,13 @@ void Renderer::draw(const DrawState& d) {
     guardRunaway();
 }
 void Renderer::dispatch(const DispatchState& d) {
+    const CallNote note(*this);
+    if (note.w) {
+        const callcap::StageRef ref = callcapStage(*note.w, d.cs);
+        DispatchState bare = d;
+        bare.cs.code = bare.cs.fetch = {};
+        note.w->call(callcap::Call::Dispatch, &bare, sizeof bare, &ref, sizeof ref);
+    }
     const ResolvedScope scope(*this, Resolved::Kind::Dispatch);
     const auto t0 = Clock::now();
     impl_->dispatch(d);
@@ -7646,14 +7824,38 @@ void Renderer::dispatch(const DispatchState& d) {
     ++cpu_.calls;
     guardRunaway();
 }
-void Renderer::resolve(const ColorTarget& src, const ColorTarget& dst) { impl_->resolve(src, dst); }
-bool Renderer::writeBack(const ColorTarget& c) { return impl_->writeBack(c); }
-void Renderer::invalidate(uint64_t address, uint64_t size) { impl_->invalidate(address, size); }
-bool Renderer::syncToMemory(uint64_t address, uint64_t size) { return impl_->syncToMemory(address, size); }
-void Renderer::abandonOwners(uint64_t address, uint64_t size) { impl_->abandonOwners(address, size); }
-bool Renderer::dropGuestBuffers() { return impl_->dropGuestBuffers(); }
-void Renderer::coherencePoint(uint64_t address, uint64_t size) { impl_->coherencePoint(address, size); }
+void Renderer::resolve(const ColorTarget& src, const ColorTarget& dst) {
+    const CallNote note(*this);
+    if (note.w) note.w->call(callcap::Call::Resolve, &src, sizeof src, &dst, sizeof dst);
+    impl_->resolve(src, dst);
+}
+bool Renderer::writeBack(const ColorTarget& c) {
+    const CallNote note(*this);
+    if (note.w) note.w->call(callcap::Call::WriteBack, &c, sizeof c);
+    return impl_->writeBack(c);
+}
+void Renderer::invalidate(uint64_t address, uint64_t size) {
+    const CallNote note(*this, callcap::Call::Invalidate, address, size);
+    impl_->invalidate(address, size);
+}
+bool Renderer::syncToMemory(uint64_t address, uint64_t size) {
+    const CallNote note(*this, callcap::Call::SyncToMemory, address, size);
+    return impl_->syncToMemory(address, size);
+}
+void Renderer::abandonOwners(uint64_t address, uint64_t size) {
+    const CallNote note(*this, callcap::Call::AbandonOwners, address, size);
+    impl_->abandonOwners(address, size);
+}
+bool Renderer::dropGuestBuffers() {
+    const CallNote note(*this, callcap::Call::DropGuestBuffers);
+    return impl_->dropGuestBuffers();
+}
+void Renderer::coherencePoint(uint64_t address, uint64_t size) {
+    const CallNote note(*this, callcap::Call::CoherencePoint, address, size);
+    impl_->coherencePoint(address, size);
+}
 void Renderer::noteGpuWrite(uint64_t address, uint64_t size) {
+    const CallNote note(*this, callcap::Call::NoteGpuWrite, address, size);
     impl_->syncOwners(address, size, true);
     impl_->tracker.markGpuWrite(address, size, MemoryTracker::kGpuRaw);
 }
@@ -7671,10 +7873,17 @@ bool Renderer::gpuMayAccess(uint64_t address, uint64_t size) const { return impl
 bool Renderer::recordedMayAccess(uint64_t address, uint64_t size) const {
     return Impl::overlaps(impl_->busy, impl_->busyAll, address, size);
 }
-bool Renderer::zpassDone(uint64_t address, uint32_t pairs) { return impl_->zpassDone(address, pairs); }
-void Renderer::drainOcclusion(bool gpuIdle) { impl_->drainOcclusion(gpuIdle); }
+bool Renderer::zpassDone(uint64_t address, uint32_t pairs) {
+    const CallNote note(*this, callcap::Call::ZpassDone, address, pairs);
+    return impl_->zpassDone(address, pairs);
+}
+void Renderer::drainOcclusion(bool gpuIdle) {
+    const CallNote note(*this, callcap::Call::DrainOcclusion, gpuIdle);
+    impl_->drainOcclusion(gpuIdle);
+}
 bool Renderer::occlusionPending(uint64_t address, uint64_t size) const { return impl_->occlusionPending(address, size); }
 void Renderer::submittedIdle() {
+    const CallNote note(*this, callcap::Call::SubmittedIdle);
     impl_->inFlight.clear();
     impl_->retireOwned(true);
 }
@@ -7692,12 +7901,14 @@ uint64_t Renderer::waitTarget(uint64_t a, uint64_t n, uint64_t b, uint64_t m) co
     return target;
 }
 void Renderer::waitedBelow(uint64_t frames) {
+    const CallNote note(*this, callcap::Call::WaitedBelow, frames);
     auto& q = impl_->inFlight;
     while (!q.empty() && q.front().frame < frames) q.pop_front();
     impl_->retireOwned();
 }
 bool Renderer::cpuReadSeen(uint64_t a, uint64_t n) const { return impl_->cpuReadSeen(a, n); }
 void Renderer::cpuAccessed(uint64_t a, uint64_t n) {
+    const CallNote note(*this, callcap::Call::CpuAccessed, a, n);
     // (bounded: a title that rotates such ranges must not use up the ranges the CPU reads are followed with)
     if (impl_->cpuRead.size() < 1024) impl_->noteCpuRead(a, n, "cp_access");
     impl_->noteCpAccess(a, a + n);
@@ -7719,6 +7930,7 @@ void Renderer::noteCpuSync(const char* caller, uint64_t a, uint64_t n, uint64_t 
 }
 uint64_t Renderer::gdsAddress() const { return reinterpret_cast<uint64_t>(impl_->gds.memory); }
 void Renderer::afterGpu(uint64_t address, uint32_t size, std::function<void()> action, bool pureWrite) {
+    const CallNote note(*this, callcap::Call::AfterGpu, address, size, pureWrite);
     const uint64_t submitted = device_.submittedFrames();
     if (hasRecordedWork()) {
         device_.afterFrame(submitted, address, size, std::move(action), pureWrite);  // the frame the next submit() makes
@@ -7731,6 +7943,7 @@ void Renderer::afterGpu(uint64_t address, uint32_t size, std::function<void()> a
 bool Renderer::labelPending(uint64_t address, uint32_t size) const { return device_.labelPending(address, size); }
 uint64_t Renderer::labelWaitTarget(uint64_t address, uint32_t size) const { return device_.labelWaitTarget(address, size); }
 void Renderer::gpuIdle() {
+    const CallNote note(*this, callcap::Call::GpuIdle);
     impl_->busy.clear();
     impl_->busyWho.clear();
     impl_->busyAll = false;
@@ -8067,6 +8280,7 @@ uint64_t Renderer::takeTargetDraws(uint64_t address, uint32_t width, uint32_t he
 }
 
 vpgpu::FrameReport Renderer::submit() {
+    const CallNote note(*this, callcap::Call::Submit);
     static vpgpu::probe::Hist& submitCallHist = vpgpu::probe::hist("TIME", "submit_call_us");
     const vpgpu::probe::ScopedHist submitCallScope(submitCallHist);
     sinceSubmit_ = 0;
@@ -8099,6 +8313,11 @@ vpgpu::FrameReport Renderer::submit() {
 }
 
 vpgpu::TextureId Renderer::textureFor(const ImageDesc& d, bool integerOnly) {
+    const CallNote note(*this);
+    if (note.w) {
+        const uint64_t integer = integerOnly;
+        note.w->call(callcap::Call::TextureFor, &d, sizeof d, &integer, sizeof integer);
+    }
     impl_->probePass.clear();
     impl_->attachedWids.clear();  // (asked outside a draw)
     const auto ref = impl_->textureRef(d, false, false, integerOnly);
@@ -8107,13 +8326,20 @@ vpgpu::TextureId Renderer::textureFor(const ImageDesc& d, bool integerOnly) {
     return t;
 }
 bool Renderer::fill(uint64_t address, uint64_t bytes, uint32_t value) {
+    const CallNote note(*this, callcap::Call::Fill, address, bytes, value);
     const ResolvedScope scope(*this, Resolved::Kind::Fill);
     const bool ok = impl_->fill(address, bytes, value);
     if (!ok) impl_->resolvedStatus(Resolved::Status::Skipped, "range is not guest memory");
     return ok;
 }
-void Renderer::depthCleared(uint64_t zAddress, float value) { impl_->depthCleared(zAddress, value); }
+void Renderer::depthCleared(uint64_t zAddress, float value) {
+    uint32_t bits;
+    std::memcpy(&bits, &value, sizeof bits);
+    const CallNote note(*this, callcap::Call::DepthCleared, zAddress, bits);
+    impl_->depthCleared(zAddress, value);
+}
 bool Renderer::copy(uint64_t dst, uint64_t src, uint64_t bytes) {
+    const CallNote note(*this, callcap::Call::Copy, dst, src, bytes);
     const ResolvedScope scope(*this, Resolved::Kind::Copy);
     const bool ok = impl_->copy(dst, src, bytes);
     if (!ok) impl_->resolvedStatus(Resolved::Status::Skipped, "range is not guest memory");
@@ -8121,6 +8347,7 @@ bool Renderer::copy(uint64_t dst, uint64_t src, uint64_t bytes) {
 }
 
 uint32_t* Renderer::gds() {
+    const CallNote note(*this, callcap::Call::Gds);
     return impl_->gdsBuffer() ? static_cast<uint32_t*>(impl_->gds.memory) : nullptr;
 }
 
@@ -8171,6 +8398,7 @@ vpgpu::TextureId Renderer::backingAt(const ImageDesc& d, uint16_t& layer, std::s
 }
 
 vpgpu::TextureId Renderer::colorTargetSlice(uint64_t address, uint32_t width, uint32_t height, uint16_t& layer) const {
+    const CallNote note(*this, callcap::Call::ColorTargetSlice, address, width, height);
     layer = 0;
     const Impl::Target* t = impl_->targetSlice(address, width, height, layer);
     if (t) impl_->life.noteSticky(t->id, frame_);
@@ -8178,6 +8406,7 @@ vpgpu::TextureId Renderer::colorTargetSlice(uint64_t address, uint32_t width, ui
 }
 
 vpgpu::TextureId Renderer::colorTargetAt(uint64_t address) const {
+    const CallNote note(*this, callcap::Call::ColorTargetAt, address);
     auto it = impl_->latestColor.find(address);
     if (it == impl_->latestColor.end()) return {};
     impl_->life.noteSticky(it->second, frame_);  // what a flip presents is always stored

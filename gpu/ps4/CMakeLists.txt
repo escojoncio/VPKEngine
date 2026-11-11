@@ -8,7 +8,7 @@ file(READ ${CMAKE_CURRENT_SOURCE_DIR}/include/vpps4/bc_block.h VPT_BC_TEXT)
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/include/vpps4/bc_block.h)
 configure_file(src/bc_block_text.cpp.in ${CMAKE_CURRENT_BINARY_DIR}/bc_block_text.cpp @ONLY)
 
-add_library(vpps4 STATIC src/bc_decode.cpp src/fixed_function.cpp src/formats.cpp src/renderer.cpp src/tiling.cpp src/gpu_tiler.cpp src/fetch.cpp src/memory_tracker.cpp src/msaa.cpp src/lifetime.cpp src/foveation.cpp src/translation_cache.cpp src/scheduler.cpp src/report.cpp src/shader_stats.cpp
+add_library(vpps4 STATIC src/bc_decode.cpp src/callcap.cpp src/fixed_function.cpp src/formats.cpp src/renderer.cpp src/tiling.cpp src/gpu_tiler.cpp src/fetch.cpp src/memory_tracker.cpp src/msaa.cpp src/lifetime.cpp src/foveation.cpp src/translation_cache.cpp src/scheduler.cpp src/report.cpp src/shader_stats.cpp
             ${CMAKE_CURRENT_BINARY_DIR}/tiling_addr_text.cpp ${CMAKE_CURRENT_BINARY_DIR}/bc_block_text.cpp)
 
 # Fingerprint of the translation chain for the persistent shader cache: the GCN lifter, the IR, the
@@ -69,6 +69,21 @@ if(BUILD_TESTING OR NOT DEFINED BUILD_TESTING)
     endif()
     foreach(t equal_picture equal_buffers equal_textures equal_reuse equal_programs equal_targets equal_caches)
       add_test(NAME vpps4.perdraw_${t} COMMAND vpps4_perdraw_tests ${t})
+    endforeach()
+    # The replay of a call capture (vpps4/callcap.h: a host's calls over a few pictures, in a file): vp4replay FILE compares the
+    # renderer's paths over it; the tests record the scripts of the per-draw tests and replay them.
+    add_executable(vp4replay tools/vp4replay.cpp)
+    target_link_libraries(vp4replay PRIVATE vpps4)
+    add_executable(vpps4_replay_tests tests/replay_tests.cpp)
+    target_link_libraries(vpps4_replay_tests PRIVATE vpps4)
+    target_compile_definitions(vpps4_replay_tests PRIVATE VPPS4_LIFT_DIR="${_vpps4_shader_dir}/gcn/tests/lift"
+                                                          VPPS4_BENCH_LIFT_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/lift")
+    if(NOT MSVC)
+      target_compile_options(vp4replay PRIVATE -Wall -Wextra -Werror)
+      target_compile_options(vpps4_replay_tests PRIVATE -Wall -Wextra -Werror)
+    endif()
+    foreach(t callcap_roundtrip callcap_limits replay_equal)
+      add_test(NAME vpps4.${t} COMMAND vpps4_replay_tests ${t})
     endforeach()
   endif()
   add_executable(vpps4_tiling_tests tests/tiling_tests.cpp)

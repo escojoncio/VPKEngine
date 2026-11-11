@@ -36,6 +36,12 @@
 
 namespace vpps4 {
 
+struct CallCapOptions;  // callcap.h
+struct CallCapResult;
+namespace callcap {
+class Writer;
+}
+
 // A guest memory mapping: [base, base + size) at host pointer `host` (page aligned).
 struct GuestRegion {
     uint64_t base = 0, size = 0;
@@ -340,6 +346,18 @@ public:
     // frames ends by itself (the host's end then answers 0).
     uint64_t beginSceneCapture();
     uint64_t endSceneCapture();
+    // Call capture (callcap.h; a diagnostic for the host's diagnostic mode, nothing is spent while none is on): from now on
+    // every call of this interface that changes the renderer, and the guest memory it reads on the CPU, is written to the
+    // file of `options`, for a replay without the host. The host says where each presented picture ends
+    // (callCapturePicture); the capture closes by itself after `options.pictures` of them or at `options.maxBytes`.
+    // begin: false if one is on or the file cannot be made. picture: false once the capture has closed (or there is none):
+    // endCallCapture then says what it left (and ends one still on), with a line "VPKENGINE_PROBE CALLCAP end ..." in the log.
+    bool beginCallCapture(const CallCapOptions& options);
+    bool callCapturePicture();
+    CallCapResult endCallCapture();
+    // Device::markLabelOrdered / supersedeLabels, for a host that calls them itself: through here a call capture holds them.
+    size_t markLabelOrdered(uint64_t address, uint32_t size);
+    size_t supersedeLabels(uint64_t address, uint64_t size, uint64_t keepAddress = 0, uint64_t keepSize = 0);
     const Stats& stats() const { return stats_; }
     // The CPU time accumulated since the last call (then reset).
     CpuTimes takeCpuTimes();
@@ -389,6 +407,7 @@ public:
 
     struct Impl;
     struct ResolvedScope;
+    struct CallNote;
 
 private:
     vpgpu::Device& device_;
@@ -405,6 +424,8 @@ private:
     uint64_t sinceSubmit_ = 0;
     bool runawayTold_ = false;
     void guardRunaway();
+    std::unique_ptr<callcap::Writer> callcap_;  // the call capture that is on
+    Hooks callcapSaved_;                        // ... and the host's hooks it answers through meanwhile (those it writes down)
     std::unique_ptr<Impl> impl_;
 };
 
