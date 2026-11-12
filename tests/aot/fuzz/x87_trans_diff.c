@@ -2,7 +2,7 @@
  * host's own, argument regime by argument regime: how many results are bit-exact, the largest
  * difference in units of the last place, and status word differences.
  *   cc -O2 -std=gnu11 -frounding-math -I../../../runtime x87_trans_diff.c ../../../runtime/vp_host.c -o diff -lm -latomic -lpthread
- *   ./diff [count] [seed]
+ *   [X87_DUMP=N] ./diff [count] [seed]   (X87_DUMP: see x87_trans_ref.py, which says which of the two is rounded correctly)
  */
 #include "vp_emit.h"
 #include <stdio.h>
@@ -74,6 +74,9 @@ static long ulps(F80 x, F80 y) {
 int main(int argc, char** argv) {
     const int count = argc > 1 ? atoi(argv[1]) : 20000;
     if (argc > 2) rs = strtoull(argv[2], 0, 0) | 1;
+    const char* dm = getenv("X87_DUMP"); /* up to N differing results per instruction go to stderr */
+    const int dump_max = dm ? atoi(dm) : 0;
+    int dumped[8] = {0};
     static const char* names[] = {"fsin", "fcos", "fsincos", "fptan", "fpatan", "f2xm1", "fyl2x", "fyl2xp1"};
     struct { const char* name; int lo, hi; } reg[] = {{"|x| in 2^-30..2^-1", -30, -2}, {"|x| in 0.5..4", -1, 1}, {"|x| in 4..2^20", 2, 20}, {"|x| in 2^20..2^62", 20, 62}};
     for (int op = 0; op < 8; ++op) {
@@ -92,6 +95,11 @@ int main(int argc, char** argv) {
                 ++n;
                 const int two = op == SINCOS || op == PTAN;
                 const long u0 = ulps(h0, m0), u1 = two ? ulps(h1, m1) : 0;
+                if (dump_max && !two && (u0 != 0) && dumped[op] < dump_max) { /* for x87_trans_ref.py */
+                    ++dumped[op];
+                    fprintf(stderr, "DUMP %s %016llx %04x %016llx %04x %016llx %04x %016llx %04x\n", names[op], (unsigned long long)a.m, a.se, (unsigned long long)b.m, b.se,
+                            (unsigned long long)h0.m, h0.se, (unsigned long long)m0.m, m0.se);
+                }
                 if (u0 == 0 && u1 == 0) ++exact; else { ++bad; long u = labs(u0) > labs(u1) ? labs(u0) : labs(u1); if (u > maxu) maxu = u; }
                 if ((hs & 0x7F27) != (ms & 0x7F27)) { if (!swd) { firstsw = ms; firstsw_h = hs; } ++swd; }
             }

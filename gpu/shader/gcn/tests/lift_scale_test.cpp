@@ -27,12 +27,12 @@ void* runJob(void* p) {
     j->result = vpgcn::lift(j->in);
     return nullptr;
 }
-vpgcn::LiftResult liftOnSmallStack(const vpgcn::LiftInput& in) {
+vpgcn::LiftResult liftOnSmallStack(const vpgcn::LiftInput& in, size_t kb = 512) {
     Job job;
     job.in = in;
     pthread_attr_t attr;
     pthread_attr_init(&attr);
-    pthread_attr_setstacksize(&attr, 512 * 1024);
+    pthread_attr_setstacksize(&attr, kb * 1024);
     pthread_t th;
     if (pthread_create(&th, &attr, runJob, &job) != 0) std::abort();
     pthread_join(th, nullptr);
@@ -72,7 +72,7 @@ int fetchCallsItself() {
 int fetchManyCalls() {
     std::vector<uint32_t> program(1000, 0xBE802102);  // s_swappc_b64 s[0:1], s[2:3]
     program.push_back(0xBF810000);                   // s_endpgm
-    std::vector<uint32_t> fetch(500, 0xBE800001);    // s_mov_b32 s0, s1
+    std::vector<uint32_t> fetch(500, 0xBE800301);    // s_mov_b32 s0, s1
     fetch.push_back(0xBE802002);                     // s_setpc_b64 s[2:3]
     vpgcn::LiftInput in;
     in.stage = vpgcn::ShaderStage::Vertex;
@@ -84,7 +84,7 @@ int fetchManyCalls() {
     bool said = false;
     for (const std::string& e : r.errors) said |= e.find("is called 1000 times") != std::string::npos;
     if (!said) {
-        std::fprintf(stderr, "no error for 1000 calls of a 500-instruction fetch subroutine (%zu errors)\n", r.errors.size());
+        std::fprintf(stderr, "no error for 1000 calls of a 500-instruction fetch subroutine (%zu errors): %s\n", r.errors.size(), r.errors.empty() ? "" : r.errors[0].c_str());
         return 1;
     }
     if (ms > 5000) {
@@ -107,6 +107,8 @@ int main(int argc, char** argv) {
     if (argc > 1 && std::string(argv[1]) == "fetch_calls") return fetchManyCalls();
     const bool nested = argc > 1 && std::string(argv[1]) == "nested";
     const int n = argc > (nested ? 2 : 1) ? std::atoi(argv[nested ? 2 : 1]) : 600;
+    // `nested N KB`: the thread that lifts has KB kilobytes of stack (the walk checks the bytes left, not only its 200 levels).
+    const size_t kb = nested && argc > 3 ? size_t(std::atoi(argv[3])) : 512;
     std::vector<uint32_t> code;
     for (int i = 0; i < n && nested; ++i) {
         code.push_back(0xBF000000);  // s_cmp_eq_i32 s0, s0
@@ -123,7 +125,7 @@ int main(int argc, char** argv) {
     in.stage = vpgcn::ShaderStage::Compute;
     in.code = code;
     const auto t0 = std::chrono::steady_clock::now();
-    vpgcn::LiftResult r = liftOnSmallStack(in);
+    vpgcn::LiftResult r = liftOnSmallStack(in, kb);
     const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
     for (const std::string& e : r.errors) std::fprintf(stderr, "lift: %s\n", e.c_str());
     if (!r.errors.empty()) return 1;

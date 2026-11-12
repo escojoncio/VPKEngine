@@ -1,8 +1,16 @@
 #include "vpir/builder.h"
+#include "vpir/stack.h"
 
+#include <algorithm>
 #include <bit>
 #include <cassert>
+#include <cstdint>
 #include <stdexcept>
+
+#if defined(__linux__) || defined(__APPLE__)
+#include <pthread.h>
+#define VPIR_STACK_PROBE 1
+#endif
 
 namespace vpir {
 
@@ -188,5 +196,60 @@ void FunctionBuilder::discard() { control(NodeKind::Discard); }
 void FunctionBuilder::ret(ValueId v) { control(NodeKind::Return, v); }
 
 void FunctionBuilder::finish() { assert(open_.empty()); }
+
+// ---- StackGuard ------------------------------------------------------------------------------------
+
+namespace {
+thread_local uintptr_t g_stackFloor = 0;  // 0 = no guard / unknown
+
+#if defined(__GNUC__)
+inline uintptr_t stackPointer() { return reinterpret_cast<uintptr_t>(__builtin_frame_address(0)); }
+#else
+inline uintptr_t stackPointer() {
+    char c;
+    return reinterpret_cast<uintptr_t>(&c);
+}
+#endif
+
+#ifdef VPIR_STACK_PROBE
+// Lowest address of this thread's stack (guard page included in the loss: the reserve covers it), 0 if unknown.
+uintptr_t stackBottom(uintptr_t& size) {
+#if defined(__APPLE__)
+    const pthread_t t = pthread_self();
+    size = pthread_get_stacksize_np(t);
+    return reinterpret_cast<uintptr_t>(pthread_get_stackaddr_np(t)) - size;
+#elif defined(__linux__)
+    pthread_attr_t a;
+    if (pthread_getattr_np(pthread_self(), &a) != 0) return 0;
+    void* addr = nullptr;
+    size_t sz = 0;
+    const int rc = pthread_attr_getstack(&a, &addr, &sz);
+    pthread_attr_destroy(&a);
+    if (rc != 0) return 0;
+    size = sz;
+    return reinterpret_cast<uintptr_t>(addr);
+#endif
+}
+#endif
+}  // namespace
+
+StackGuard::StackGuard() : previous_(g_stackFloor) {
+#ifdef VPIR_STACK_PROBE
+    // (Read once per thread: on the main thread of Linux glibc this parses /proc/self/maps.)
+    thread_local uintptr_t bottom = 0, size = 0;
+    thread_local bool known = false;
+    if (!known) bottom = stackBottom(size), known = true;
+    const uintptr_t sp = stackPointer();
+    if (!bottom || sp <= bottom || sp - bottom > size) return;  // unknown, or running on another stack (alternate stack, coroutine)
+    const uintptr_t avail = sp - bottom;
+    const uintptr_t reserve = std::max<uintptr_t>(kMinReserve, avail / 4);
+    g_stackFloor = avail > reserve ? bottom + reserve : sp;  // (too little stack for the reserve: every check fails)
+#endif
+}
+StackGuard::~StackGuard() { g_stackFloor = previous_; }
+
+bool stackLow() {
+    return stackPointer() < g_stackFloor;
+}
 
 }  // namespace vpir

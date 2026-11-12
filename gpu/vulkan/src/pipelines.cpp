@@ -542,12 +542,10 @@ GateResult gateFramePipelines(Device* dev, vpgpu::Frame& frame, uint64_t submitN
   std::unordered_map<uint64_t, bool> pendingOf;  // key -> still queued / compiling (each looked up once)
   auto pending = [&](vpgpu::PipelineKey k) {
     if (!k.value) return false;
-    auto [it, fresh] = pendingOf.emplace(k.value, false);
-    if (fresh) {
-      const Status st = cache.status(k);
-      it->second = st == Status::Queued || st == Status::Compiling;
-    }
-    return it->second;
+    // (find first: emplace builds its node, a heap allocation, before it sees the key is there, and almost every draw repeats one)
+    if (const auto it = pendingOf.find(k.value); it != pendingOf.end()) return it->second;
+    const Status st = cache.status(k);
+    return pendingOf.emplace(k.value, st == Status::Queued || st == Status::Compiling).first->second;
   };
   std::vector<vpgpu::PipelineKey> hard, soft;
   std::unordered_set<uint64_t> inHard, inSoft;

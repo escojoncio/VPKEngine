@@ -8358,8 +8358,9 @@ void testFoveation() {
 // output moves it. When this test fails the translator's OUTPUT changed: bump kLowerVersion (SPIR-V -> VPIR) or
 // kEmitVersion (VPIR -> MSL) in recipes.h, then update kCorpusDigest to the printed value in the same change.
 // (0xe59a6cb9b65b9167 = the previous 0x2bf74b975e022b22 plus depth_write.frag.spv, the D24 emulation fixture: the translator's output
-// for the 68 earlier modules is unchanged, checked by taking the file out.)
-constexpr uint64_t kCorpusDigest = 0xe59a6cb9b65b9167ull;  // the "corpus digest" line the test prints
+// for the 68 earlier modules is unchanged, checked by taking the file out. 0x356364120ca33839 = that plus offset_overflow.comp.spv
+// (the shader audit's fixture): the 69 earlier modules still give 0xe59a6cb9b65b9167, checked the same way.)
+constexpr uint64_t kCorpusDigest = 0x356364120ca33839ull;  // the "corpus digest" line the test prints
 
 uint64_t corpusDigest(unsigned& modules, unsigned& failed) {
   std::vector<std::string> names;
@@ -15267,6 +15268,7 @@ void testAuditRecipeRewrite() {
     s.rewriteGate = nullptr;
     CHECK(r.rewritten && added);
     for (uint64_t n : {0, 1, 19, 100, 200, 204}) CHECK(auditHas(s, n, kText));
+    CHECK(s.stageInputs().size() == 1 + 20 + 1 + 5);  // the options of every input are read back at their new offsets (also those added meanwhile)
     auditAddStage(s, 300, kText);  // appended after the rewrite: the new file's end
     CHECK(auditHas(s, 300, kText));
     CHECK(auditFile(file).size() < before.size());  // compacted: the superseded texts are gone
@@ -15365,6 +15367,143 @@ void testAuditLinearSync() {
   vkFreeMemory(c.dev, m, nullptr);
 }
 
+// V15: a store keeps for each stage input what a lookup needs and where its options are in the file, not the options (the layout of
+// every binding): loading 2000 inputs of 128 bindings leaves little in the heap, and the options come back whole when asked for.
+#if defined(__GLIBC__) && (__GLIBC__ > 2 || __GLIBC_MINOR__ >= 33)
+#include <malloc.h>
+#define VPVK_HAVE_MALLINFO2 1
+#endif
+void testAuditInputsResident() {
+  char tmpl[] = "/tmp/vpvk_audit_inputs_XXXXXX";
+  const char* dirp = mkdtemp(tmpl);
+  CHECK(dirp != nullptr);
+  if (!dirp) return;
+  const std::string dir = dirp;
+  constexpr uint64_t kInputs = 2000;
+  constexpr uint32_t kBindings = 128;
+  std::unordered_set<uint64_t> hashes;
+  {
+    RecipeStore s(dir);
+    CHECK(s.enabled());
+    for (uint64_t n = 0; n < kInputs; ++n) {
+      StageInput in;
+      in.spirv = 0x1000 + n % 50;  // 50 modules, each used by 40 inputs (other entry)
+      in.opt.entry = "main" + std::to_string(n);
+      for (uint32_t b = 0; b < kBindings; ++b) {
+        spirv::SpirvBinding sb;
+        sb.set = 0, sb.binding = b, sb.arraySize = 1, sb.slot = uint16_t(b);
+        in.opt.layout.push_back(sb);
+      }
+      const std::vector<uint32_t> words = {0x07230203u, 0x00010000u, 0u, uint32_t(n % 50), 0u};
+      ShaderBlob blob;
+      blob.source = "// shader " + std::to_string(n);
+      s.addStage(in, in.hash(), words, 0x5000 + n, blob);
+      hashes.insert(in.hash());
+    }
+  }
+#ifdef VPVK_HAVE_MALLINFO2
+  const size_t before = mallinfo2().uordblks;
+#endif
+  RecipeStore t(dir);
+#ifdef VPVK_HAVE_MALLINFO2
+  const size_t grown = mallinfo2().uordblks - before;
+  std::printf("  heap after loading %llu inputs of %u bindings: %zu KiB\n", (unsigned long long)kInputs, kBindings, grown >> 10);
+  CHECK(grown < (3u << 20));  // with the options kept: 2000 x 128 x 24 bytes = 6 MiB more
+#endif
+  CHECK(t.enabled());
+  const std::vector<StageInput> all = t.stageInputs();
+  CHECK(all.size() == kInputs);
+  size_t whole = 0;
+  for (const StageInput& in : all) whole += in.opt.layout.size() == kBindings && hashes.count(in.hash());
+  CHECK(whole == kInputs);
+  std::filesystem::remove_all(dir);
+}
+
+// V13: the class a draw got in an eye pass is cached on the draw for that pass only: translating the same recording again, with the
+// classifier in another state, classifies it again.
+void testAuditClassCache() {
+  vpvk_taa_jitter in{1, 1920, 1824, 0, 0, 3};
+  vpvk_taa_set_jitter(&in);
+  vpvk_config_set_taa_native(1);
+  const TaaJitter j = taaJitter();
+  Recorder rec;
+  OpBeginRendering overlay;  // an overlay: it loads the depth, so it inherits what the classifier saw before
+  overlay.area = {{0, 0}, {1920, 1824}};
+  overlay.depthWidth = 1920, overlay.depthHeight = 1824;
+  overlay.desc.depth.load = vpgpu::LoadAction::Load;
+  OpDraw glass;
+  glass.draw.count = 300, glass.draw.index = vpgpu::IndexBuffer{};
+  glass.draw.viewport = {0, 0, 1920, 1824, 0, 1};
+  glass.depthTested = glass.vertexBuffers = glass.blended = true;
+  rec.ops.emplace_back(overlay), rec.ops.emplace_back(glass), rec.ops.emplace_back(OpEndPass{});
+  UiMaskState um;
+  {
+    vpgpu::Frame f;
+    TranslateStats st;
+    translate(rec, f, st, &j, &um);
+    CHECK(st.ui.scene == 1 && st.ui.ui == 0);  // blended and tested, nothing opaque before it: geometry
+  }
+  um.classifier.classify(taa::DrawFacts{true, true, false, false});  // an opaque draw of an earlier command buffer of the scene
+  {
+    vpgpu::Frame f;
+    TranslateStats st;
+    translate(rec, f, st, &j, &um);
+    CHECK(st.ui.ui == 1 && st.ui.scene == 0);  // the same draw, now after the opaque: UI (a class kept from the first run would say scene)
+  }
+  vpvk_config_set_taa_native(0);
+}
+
+// R2: a batch of pipelines that failed in part: the capture still records the ones that were created.
+VkResult halfFailedBatch(VkDevice dv, VkPipelineCache c, uint32_t n, const VkComputePipelineCreateInfo* ci, const VkAllocationCallbacks* a,
+                         VkPipeline* out) {
+  const VkResult r = vkCreateComputePipelines(dv, c, 1, ci, a, out);  // the first is made
+  for (uint32_t i = 1; i < n; ++i) out[i] = VK_NULL_HANDLE;           // the others fail
+  return r == VK_SUCCESS ? VK_ERROR_OUT_OF_HOST_MEMORY : r;
+}
+void testAuditCapturePartialBatch() {
+  const std::string path = (std::filesystem::temp_directory_path() / ("vpcap_batch_" + std::to_string(getpid()) + ".vpcap")).string();
+  std::remove(path.c_str());
+  vpvk_capture_track(0);
+  CHECK(vpvk_capture_track(1) == 0);
+  {
+    CapRig r;
+    std::vector<uint32_t> words = spirvFile("bda.comp.spv");
+    VkShaderModuleCreateInfo mci{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+    mci.codeSize = words.size() * 4, mci.pCode = words.data();
+    VkShaderModule cs = nullptr;
+    CHECK(r.v.vkCreateShaderModule(r.dev, &mci, nullptr, &cs) == VK_SUCCESS);
+    r.record(r.cb[0], true);
+    r.submit({r.cb[0]});
+    CHECK(vpvk_capture_request(1, path.c_str()) == 1);
+    r.submit({r.cb[0]});  // the boundary
+    CHECK(vpvk_capture_state() == 2);
+    VkComputePipelineCreateInfo ci[2]{{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO}, {VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO}};
+    for (auto& x : ci) {
+      x.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+      x.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT, x.stage.module = cs, x.stage.pName = "main";
+      x.layout = r.pl, x.basePipelineIndex = -1;
+    }
+    VkPipeline out[2] = {nullptr, nullptr};
+    const VkResult res = captureComputePipelinesHookFor(&halfFailedBatch, r.dev, VK_NULL_HANDLE, 2, ci, nullptr, out);
+    CHECK(res == VK_ERROR_OUT_OF_HOST_MEMORY && out[0] && !out[1]);
+    r.record(r.cb[1], true);
+    r.submit({r.cb[1]});  // its one frame: the capture ends
+    CHECK(vpvk_capture_state() == 0);
+    if (out[0]) vkDestroyPipeline(r.dev, out[0], nullptr);
+    r.v.vkDestroyShaderModule(r.dev, cs, nullptr);
+  }
+  vpvk_capture_track(0);
+  vpcap::Reader rd;
+  std::string err;
+  CHECK(rd.open(path, &err));
+  int created = 0;
+  vpcap::Call k;
+  while (rd.next(k)) created += k.id == vpcap::id::vkCreateComputePipelines;
+  CHECK(rd.error().empty());
+  CHECK(created == 1);  // the one the batch made (it was not recorded when the batch's result was an error)
+  std::remove(path.c_str());
+}
+
 int main(int argc, char** argv) {
   gLib = argc > 2 ? argv[2] : "libVPVulkan.so";
   gReplay = argc > 3 ? argv[3] : nullptr;
@@ -15381,7 +15520,7 @@ int main(int argc, char** argv) {
       {"quest_gpu_name", testQuestGpuName}, {"native_identity", testNativeIdentity}, {"inline_uniform", testInlineUniformBlock}, {"bda", testBufferDeviceAddress}, {"ycbcr", testYcbcr},
       {"taa_native", testTaaNative}, {"taa_eye_depth", testTaaEyeDepth}, {"taa_uimask", testTaaUiMask}, {"msaa_force", testMsaaForce}, {"depth_tile", testDepthTile}, {"depth_tile_off", testDepthTileOff}, {"d24_emul", testD24Emul}, {"prewarm_variants", testPrewarmVariants}, {"msaa_force_marked", testMsaaForceMarkedEye}, {"aot", testAot}, {"aniso", testAniso}, {"zeroinit", testZeroInit}, {"archive_index", testArchiveIndex}, {"foveation", testFoveation},
       {"stage_keys", testStageKeys}, {"async_pipelines", testAsyncPipelines}, {"sync_pipelines", testSyncPipelines}, {"create_default", testCreateDefault}, {"pso_census", testPsoCensus}, {"cache_state", testCacheState}, {"hide_mesh", testHideMesh}, {"pass_drop", testPassDrop}, {"skip_reasons", testSkipReasons}, {"diag_census", testDiagCensus}, {"pass_dump", testPassDump}, {"indirect_patch", testIndirectPatch}, {"astc3d", testAstc3d},
-      {"perf", testPerf}, {"phase1b", testPhase1b}, {"suspend_resume", testSuspendResume}, {"translator_modes", testTranslatorModes}, {"capture", testCapture}, {"capture_images", testCaptureImages}, {"capture_hooks", testCaptureHooks}, {"capture_codec", testCaptureCodec}, {"capture_env", testCaptureEnv}, {"capture_pools", testCapturePools}, {"capture_host_frames", testCaptureHostFrames}, {"capture_corrupt", testCaptureCorrupt}, {"capture_env_host", testCaptureEnvHost}, {"capture_env_dir", testCaptureEnvDir}, {"capture_devices", testCaptureDevices}, {"capture_unhooked", testCaptureUnhooked}, {"capture_budget", testCaptureBudget}, {"capture_locks", testCaptureLocks}, {"audit_vk_timeline", testAuditTimelinePending}, {"audit_vk_live", testAuditLiveDevice}, {"audit_vk_recipes", testAuditRecipes}, {"audit_vk_devices", testAuditTwoDevices}, {"audit_vk_arena", testAuditArena}, {"audit_vk_variant", testAuditForcedVariant}, {"audit_vk_submitlog", testAuditSubmitLog}, {"audit_vk_sources", testAuditSources}, {"audit_vk_free", testAuditFreeOrder}, {"audit_vk_sets", testAuditSetStorage}, {"audit_vk_rewrite", testAuditRecipeRewrite}, {"audit_vk_reserve", testAuditArenaReserve}, {"audit_vk_fov", testAuditFovMapCache}, {"audit_vk_linear", testAuditLinearSync}, {"audit_vk", [] { testAuditTimelinePending(); testAuditLiveDevice(); testAuditRecipes(); testAuditTwoDevices(); testAuditArena(); testAuditForcedVariant(); testAuditSubmitLog(); testAuditSources(); testAuditFreeOrder(); testAuditSetStorage(); testAuditRecipeRewrite(); testAuditArenaReserve(); testAuditFovMapCache(); testAuditLinearSync(); }}, {"png", testPng}, {"imgdiff", testImgDiff}, {"replay", testReplay}, {"replay_lvp", testReplayLvp}, {"refcaps", testRefCaps}};
+      {"perf", testPerf}, {"phase1b", testPhase1b}, {"suspend_resume", testSuspendResume}, {"translator_modes", testTranslatorModes}, {"capture", testCapture}, {"capture_images", testCaptureImages}, {"capture_hooks", testCaptureHooks}, {"capture_codec", testCaptureCodec}, {"capture_env", testCaptureEnv}, {"capture_pools", testCapturePools}, {"capture_host_frames", testCaptureHostFrames}, {"capture_corrupt", testCaptureCorrupt}, {"capture_env_host", testCaptureEnvHost}, {"capture_env_dir", testCaptureEnvDir}, {"capture_devices", testCaptureDevices}, {"capture_unhooked", testCaptureUnhooked}, {"capture_budget", testCaptureBudget}, {"capture_locks", testCaptureLocks}, {"audit_vk_timeline", testAuditTimelinePending}, {"audit_vk_live", testAuditLiveDevice}, {"audit_vk_recipes", testAuditRecipes}, {"audit_vk_devices", testAuditTwoDevices}, {"audit_vk_arena", testAuditArena}, {"audit_vk_variant", testAuditForcedVariant}, {"audit_vk_submitlog", testAuditSubmitLog}, {"audit_vk_sources", testAuditSources}, {"audit_vk_free", testAuditFreeOrder}, {"audit_vk_sets", testAuditSetStorage}, {"audit_vk_rewrite", testAuditRecipeRewrite}, {"audit_vk_reserve", testAuditArenaReserve}, {"audit_vk_fov", testAuditFovMapCache}, {"audit_vk_linear", testAuditLinearSync}, {"audit_vk_inputs", testAuditInputsResident}, {"audit_vk_classes", testAuditClassCache}, {"audit_vk_batch", testAuditCapturePartialBatch}, {"audit_vk", [] { testAuditTimelinePending(); testAuditLiveDevice(); testAuditRecipes(); testAuditTwoDevices(); testAuditArena(); testAuditForcedVariant(); testAuditSubmitLog(); testAuditSources(); testAuditFreeOrder(); testAuditSetStorage(); testAuditRecipeRewrite(); testAuditArenaReserve(); testAuditFovMapCache(); testAuditLinearSync(); testAuditInputsResident(); testAuditClassCache(); testAuditCapturePartialBatch(); }}, {"png", testPng}, {"imgdiff", testImgDiff}, {"replay", testReplay}, {"replay_lvp", testReplayLvp}, {"refcaps", testRefCaps}};
   bool ran = false;
   for (const auto& [name, fn] : groups) {
     if (argc > 1 && std::strcmp(argv[1], name) != 0) continue;

@@ -53,6 +53,23 @@ de GLES): intactos; compilan y pasan.
 - Test `gpu_spirv.malformed`: 16 módulos rotos hallados por el fuzzer (`spirv/tests/fuzz/*.spv`, < 4 KB cada uno) que antes agotaban la
   pila, leían fuera, desreferenciaban nulo o colgaban.
 
+- S15 [C] (A1) `gcn/src/lift.cpp` `buildOrder`: cada `s_swappc_b64` inlinea el fetch entero. Compartir el fetch no es seguro en el IR (sin
+  llamadas: el fetch escribe SGPR/VGPR del programa y su `s_setpc` vuelve a la dirección del `s_swappc`); se limita: llamadas × instrucciones del
+  fetch > `kMaxFetchInlined` (2^16) = error "the fetch subroutine (F instructions) is called C times". Test `gcn.lift.fetch_calls`.
+- S16 [C] (A2) `ir/src/builder.cpp:20` `current()`: guarda el `Block*` de la región abierta en `open_` → O(1) por nodo. Test `vpir.deep_nest`
+  (40000 ifs anidados, hilo de 512 KB).
+- S17 [C] (A5) `lower.cpp` `memberOffset`: sumas en `uint64_t` por struct (memo) con error "lies past 2 GiB"; antes `uint32_t` sin comprobar
+  (envolvía) y O(miembros²). Tests `gpu_spirv.offset_overflow` y `gpu_spirv.wide_struct`.
+- S18 [C] (A6) `gcn/tools/lift_batch.cpp:88`: `hashOf` ya no hace `substr` fuera de rango. Test `gcn.lift_batch.short_names` (nombres `vs.bin`, `x.bin`, …).
+- S19 [C] (A7) `gcn/src/lift.cpp` `dispatchLoop`: búsqueda binaria sobre el número de bloque (`dispatchRange`, cadena de ≤ 8) → log2(bloques)
+  comparaciones por salto, no una por bloque. Test `gcn.lift.scale` (comprueba la profundidad/cantidad de comparaciones). Misma ronda:
+  borrada la caché `thread_local` muerta de `usedWithDref` en `lower.cpp` (y el envoltorio sin uso; `drefGlobals_` se consulta directo).
+- S20 [C] (A3) Validación estructural propia en `spirv/src/parse.cpp` `validate()` (la usan `vkCreateShaderModule` y el precompile de
+  `gpu/vulkan/src/precompile.cpp`, ambos pasan por `spirv::parse`): ids bajo el `bound` y definidos una vez, destinos de salto/merge/switch =
+  etiquetas de la función, llamadas a funciones con el número de argumentos, sin recursión, punto de entrada = función sin parámetros, interfaz =
+  variables, punteros con pointee declarado. No es `spirv-val` (sin tipos de operandos ni capacidades). Test `gpu_spirv.structure`. Con
+  `spirv-val` instalado, CMake añade `gpu_spirv.val.*` (los .spv de glslang/spirv-opt de `tests/glsl`); en esta máquina no existe: sin ejecutar.
+
 ## Comprobaciones de que no cambia la salida
 - MSL de HEAD frente al actual: 28105 combinaciones (73 `.spv` × 128 variantes × 3 etapas; 7222 lowerings correctos) y 12 variantes de
   cada uno de los 17 `.lift`: hashes idénticos (`shaderId`).
@@ -62,22 +79,42 @@ de GLES): intactos; compilan y pasan.
 
 ## Medido y limpio
 `optimize`/CSE, `verify`, `print`, `emitMsl` y el lifter son lineales (50 000 `v_add` = 0,4 + 1,2 s; 100 000 sumas encadenadas = 0,5 s). Sin hilos
-ni estado global mutable en `gpu/shader` (la caché `thread_local` de `lower.cpp:~838` `usedWithDref` está muerta: se construye y no se usa;
-no se borra). `std::getenv` en `lift.cpp:3324` (`VPGCN_DEBUG`, por cada lift) y `msl.cpp:1595` (una vez): lectura concurrente con el
+ni estado global mutable en `gpu/shader` (la caché `thread_local` de `usedWithDref` estaba muerta: borrada, ver S19). `std::getenv` en `lift.cpp:3324` (`VPGCN_DEBUG`, por cada lift) y `msl.cpp:1595` (una vez): lectura concurrente con el
 `setenv` de `vkCreateDevice` ("Dudosos" del lote 2 de `notas/auditoria.md`).
 
+## Topes (A4): consumo medido y margen
+Medido con instrumentación temporal (ya retirada) sobre todos los tests de `gpu/shader` (73 `.spv` en 3 etapas, 17 `.lift`, programas del
+diferencial) en `/home/claude/build/fix_shader`. No hay shaders de juegos reales en el repo ni en la máquina (el mayor `.spv` mide 5 KB, el mayor
+`.lift` 7 KB; `notas/hallazgos.md` no da tamaños): el margen es sobre el corpus del repo, más bancos sintéticos legítimos. Unverified con
+shaders de visor.
+| Tope | Valor | Máximo medido (legítimo) | Margen | Qué lo acota |
+|---|---|---|---|---|
+| nodos por función (`kMaxNodes`) | 2^20 | 411 (SPIR-V, `mesh_multiview.vert`); 9829 (lifter, `vs_cbuf_dword`, 631 instr.); 160003 el test sintético `wide_struct` | 2550x / 107x / 6,5x | RAM: `sizeof(Node)` = 144 B; RSS medido 370 MB al llegar al tope, 510 MB con 1M nodos terminados |
+| hojas de un compuesto (`kMaxLeaves`) | 65536 | 1 | 65536x | RAM |
+| elementos desenrollados (`kMaxUnroll`) | 1024 | 4 (array de interfaz y `unrollForced`); 100 (`dyn_index_big`, descriptores, tope propio 256) | 256x | tamaño del código emitido |
+| niveles de `flow` | 320 | 5 | 64x | pila |
+| niveles de `walk` (lifter) | 200 | 5 | 40x | pila |
+| fetch inlinado (`kMaxFetchInlined`) | 2^16 instr. | 9 | 7000x | RAM (~15 nodos por instrucción) |
+| `resolve` / `unroll*` | 256 / 16 | 3 / 1 | 85x / 16x | pila |
+Pila (gcc 13 x86-64, -O2, hilo de 512 KB, como el de macOS; topes sin tope con `VP_SCALE` temporal): `flow` (flow → arm → emitBlock) ≈ 0,85 KB
+por nivel: cadena de else-if o ifs anidados aguanta ~600 niveles y cae a ~650; bucles anidados ~450 (2 niveles de flow cada uno); con ASan -O1 cae
+a ~100-150 niveles (los tests de profundidad corren en el hilo principal). `walk` aguanta 1800 y cae a ~2800-3200 (≈ 0,17 KB por nivel).
+Conclusión: ningún tope de niveles/nodos se sube: ya tienen ≥ 8x sobre lo medido en shaders legítimos y subirlos solo abre memoria (nodos: +150 MB
+por cada 2^20). El límite de `flow` ya no depende de los marcos de cada arquitectura: ver S21.
+
+## Pila (S21, cierra A8)
+- `vpir::StackGuard` (`ir/include/vpir/stack.h`, `ir/src/builder.cpp`): al entrar en `spirv::lower` y `vpgcn::lift` lee el tamaño real de la pila del hilo
+  (`pthread_getattr_np` en Linux, `pthread_get_stackaddr_np`/`_stacksize_np` en Apple; otra plataforma = sin comprobación, solo topes de niveles) y fija
+  un suelo = fondo de la pila + max(32 KB, 1/4 de lo disponible al entrar). `vpir::stackLow()` (una comparación) se consulta en `Nest` (todas las
+  recursiones de `lower.cpp`: flow, resolve, unroll → `LowerError` "nested too deep for the stack of this thread") y en `walk` del lifter (cae al bucle de despacho).
+  Los topes de niveles siguen como defensa secundaria. Sin cambio para módulos válidos: 181 tests de shader (goldens MSL/`shaderId` incluidos) en verde.
+- Cifras finales (Release -O2 x86-64, niveles de else-if que bajan con éxito antes de que el suelo o el tope 320 lo impidan): 512 KB = 319 (el tope), 256 KB = 230,
+  128 KB = 108, 64 KB = 28; bucles anidados 159 (512 KB) y 21 (64 KB). ASan -O1: 82 niveles a 512 KB; a 64 KB ni un shader trivial (error limpio, no SIGSEGV).
+  Un hilo de 512 KB llega, pues, al tope de 320 niveles; uno más pequeño recibe el error por pila en vez de caer.
+- Tests: `gpu_spirv.stack_limit` (escalera de 400 else-if en hilos de 512 KB y 64 KB: error con mensaje, sin SIGSEGV, bajo ASan; 300 niveles en 64 KB: error "stack";
+  300 niveles en el hilo principal: baja bien), `gcn.lift.scale_nested_64k` / `_128k` (150 ifs anidados en hilos de 64/128 KB).
+- No cubierto: `emitMsl`/`verify` también recursan por la profundidad del IR (≤ 320 niveles tras `lower`, ≤ 200 tras el lifter) sin guarda propia; medido
+  en Release con hilo de 512 KB sin fallo (cadena de 600 niveles con `VP_SCALE`). macOS/arm64 sin medir: la guarda mide bytes reales, no depende de ello.
+
 ## Abierto
-- A1 [C] `gcn/src/lift.cpp:249` (`buildOrder`) y `liftFetchCall`: cada `s_swappc_b64` inlinea el fetch entero (llamadas × instrucciones del
-  fetch en `order` y en el VPIR); miles de llamadas con un fetch grande piden GB. Un VS real tiene una. Propuesta: `setNodeLimit` también en
-  el lifter (recoger `std::length_error` en `lift()`) o error si `order` > 2^22.
-- A2 [C] `ir/src/builder.cpp:23` (`current()`): recorre el camino de bloques abiertos en cada emisión, O(profundidad) por nodo (77 % del tiempo
-  en 1500 ifs anidados). Con `kMaxWalkDepth` y `flow` acotados no pasa de un pico; arreglo: guardar el `Block*` en `open_`.
-- A3 [C] `lower.cpp` asume SPIR-V válido: tras el fuzz no queda UB hallado, pero los operandos mal tipados que no revientan dan un
-  resultado erróneo. Mitigación sin código: `spirv-val` en el precompile / CI.
-- A4 [C] Los topes nuevos son arbitrarios y no verificados en juegos reales: 2^20 nodos, 65536 hojas, 1024 elementos desenrollados, 320
-  niveles de `flow`, 200 de `walk`. Cualquier shader legítimo que los pase se rechaza (log `vk.err what=shader`); conviene revisar con el
-  mayor shader de los logs del visor antes de la próxima build.
-- A5 [C] `lower.cpp` `memberOffset`: suma `naturalSize` en `uint32_t` sin comprobar (miles de miembros de 2 GiB envuelven).
-- A6 [C] `gcn/tools/lift_batch.cpp:88`: `name.substr(3, 18)` lanza `std::out_of_range` con un nombre de menos de 3 caracteres (herramienta).
-- A7 [C] `gcn/src/lift.cpp` `dispatchLoop`: un `if (blk == k)` por bloque dentro del bucle → O(bloques) comparaciones por salto en la GPU; es
-  diseño, solo se usa en los saltos no estructurados.
+- A8 [C] Con shaders reales del visor (UE4/Unity, log `vk.err what=shader`) repetir la tabla de arriba; ninguno estaba disponible aquí.

@@ -507,16 +507,20 @@ void RecipeStore::load() {
       }
     } else if (tag == kTagInput) {
       InputRec in;
+      StageInput decoded;  // read to see that it is whole; only where it is stays in memory
       const uint64_t h = rec.pod<uint64_t>();
       in.translator = rec.pod<uint32_t>();
       in.msl = rec.pod<uint64_t>();
-      if (!decodeInput(rec, in.input) || !in.msl) {
+      in.off = uint64_t(rec.p - data.data());
+      in.len = uint32_t(rec.end - rec.p);
+      if (!decodeInput(rec, decoded) || !in.msl) {
         ++bad;
         continue;
       }
+      in.spirv = decoded.spirv;
       auto [it, added] = inputs_.try_emplace(h);
       if (!added) ++deadRecords_;
-      it->second = std::move(in);  // the latest record of an input wins
+      it->second = in;  // the latest record of an input wins
     } else if (tag == kTagIface) {
       const uint64_t h = rec.pod<uint64_t>();
       IfaceRec f;
@@ -691,6 +695,15 @@ bool RecipeStore::readWords(const SpirvRec& s, std::vector<uint32_t>& out) const
   return ok;
 }
 
+bool RecipeStore::readInput(const InputRec& rec, StageInput& out, FILE* f) const {
+  if (!f || !rec.len || std::fseek(f, long(rec.off), SEEK_SET) != 0) return false;
+  std::vector<uint8_t> bytes(rec.len);
+  if (std::fread(bytes.data(), 1, bytes.size(), f) != bytes.size()) return false;
+  Reader r{bytes.data(), bytes.data() + bytes.size()};
+  out = StageInput{};
+  return decodeInput(r, out) && r.ok && out.spirv == rec.spirv;
+}
+
 void RecipeStore::addStage(const StageInput& in, uint64_t h, const std::vector<uint32_t>& words, uint64_t msl,
                            const ShaderBlob& blob, const StageIface* iface) {
   if (words.empty() || !msl) return;
@@ -735,9 +748,11 @@ void RecipeStore::addStage(const StageInput& in, uint64_t h, const std::vector<u
   w.pod(h);
   w.pod(translator_);
   w.pod(msl);
+  const size_t fixed = w.b.size();  // the id, translator and MSL id come before the encoded input
   encodeInput(w, in);
-  if (!write(kTagInput, w.b)) return;
-  inputs_[h] = InputRec{in, msl, translator_};
+  uint64_t inputOff = 0;
+  if (!write(kTagInput, w.b, &inputOff)) return;
+  inputs_[h] = InputRec{in.spirv, msl, translator_, inputOff + fixed, uint32_t(w.b.size() - fixed)};
   if (iface) {
     Writer f;
     f.pod(h);
@@ -855,17 +870,24 @@ RecipeStore::RefreshResult RecipeStore::refresh(unsigned threads) {
     for (const auto& kv : shaders_) oldShaders.insert(kv.first);
     for (const auto& kv : spirv_) oldSpirv.insert(kv.first);
     std::unordered_map<uint64_t, size_t> jobOf;
+    FILE* rf = nullptr;  // the options of the inputs to retranslate are read back from the file
     for (const auto& [h, rec] : inputs_) {
       if (!drift_ && rec.translator == translator_) continue;
-      auto s = spirv_.find(rec.input.spirv);
-      if (s == spirv_.end()) {
+      auto s = spirv_.find(rec.spirv);
+      if (!rf && !(rf = std::fopen(path_.c_str(), "rb"))) {  // nothing can be read back: leave the store as it is (not every input gone)
+        logf("gpu.pso.recipe what=refresh_read_failed path=%s", path_.c_str());
+        return r;
+      }
+      StageInput si;
+      if (s == spirv_.end() || !readInput(rec, si, rf)) {
         unbuildable.push_back(h);
         continue;
       }
-      auto [j, added] = jobOf.emplace(rec.input.spirv, jobs.size());
-      if (added) jobs.push_back(Job{rec.input.spirv, s->second, {}});
-      jobs[j->second].inputs.push_back({h, rec.input.opt});
+      auto [j, added] = jobOf.emplace(rec.spirv, jobs.size());
+      if (added) jobs.push_back(Job{rec.spirv, s->second, {}});
+      jobs[j->second].inputs.push_back({h, std::move(si.opt)});
     }
+    if (rf) std::fclose(rf);
     if (jobs.empty() && unbuildable.empty() && !drift_ && !compactionDueLocked()) return r;
   }
 
@@ -944,7 +966,7 @@ RecipeStore::RefreshResult RecipeStore::refresh(unsigned threads) {
   }
   for (auto it = inputs_.begin(); it != inputs_.end();) {
     if (usedInputs.count(it->first) || !oldInputs.count(it->first)) {
-      usedSpirv.insert(it->second.input.spirv);
+      usedSpirv.insert(it->second.spirv);
       ++it;
     } else {
       ifaces_.erase(it->first);
@@ -1064,13 +1086,23 @@ bool RecipeStore::rewrite(std::unique_lock<std::mutex>& lock) {
     refs[id] = SrcRef{off + sourceOffsetInPayload(full), uint32_t(full.source.size()), vpmsl::sourceHash(full.source)};
     if (!wrote) return fail("rewrite_failed");
   }
+  std::unordered_map<uint64_t, uint64_t> inputOffs;  // input -> offset of its encoded options in the new file
+  std::vector<uint8_t> encoded;
   for (const auto& [h, rec] : inputsS) {
+    // The options are copied as they are in the old file (checked to be this input's: they start with its module's hash).
+    encoded.resize(rec.len);
+    if (rec.len < 8 || std::fseek(in, long(rec.off), SEEK_SET) != 0 || std::fread(encoded.data(), 1, encoded.size(), in) != encoded.size())
+      continue;  // unreadable: the input goes (its pipelines are orphaned on load)
+    uint64_t module = 0;
+    std::memcpy(&module, encoded.data(), 8);
+    if (module != rec.spirv) continue;
     Writer w;
     w.pod(h);
     w.pod(rec.translator);
     w.pod(rec.msl);
-    encodeInput(w, rec.input);
-    emit(kTagInput, w.b);
+    const size_t fixed = w.b.size();
+    w.raw(encoded.data(), encoded.size());
+    inputOffs[h] = emit(kTagInput, w.b) + fixed;
     if (auto f = ifacesS.find(h); f != ifacesS.end()) {
       Writer fw;
       fw.pod(h);
@@ -1091,6 +1123,8 @@ bool RecipeStore::rewrite(std::unique_lock<std::mutex>& lock) {
   in = nullptr;
 
   lock.lock();
+  // (an append that failed meanwhile may have left the store without a file: nothing to replace)
+  if (!file_) return fail("rewrite_file_closed");
   // The records other threads appended while the copy was written: the old file's bytes from snapSize on.
   const uint64_t tail = size_ - snapSize;
   if (tail) {
@@ -1127,6 +1161,11 @@ bool RecipeStore::rewrite(std::unique_lock<std::mutex>& lock) {
     if (auto n = refs.find(it->first); n != refs.end()) it->second = n->second, ++it;
     else if (it->second.off >= snapSize) it->second.off = moved(it->second.off), ++it;
     else it = srcRef_.erase(it);
+  }
+  for (auto it = inputs_.begin(); it != inputs_.end();) {
+    if (it->second.off >= snapSize) it->second.off = moved(it->second.off), ++it;  // (appended since: its record is the latest)
+    else if (auto n = inputOffs.find(it->first); n != inputOffs.end()) it->second.off = n->second, ++it;
+    else ifaces_.erase(it->first), it = inputs_.erase(it);
   }
   for (const auto& [id, ref] : refs) srcRef_.try_emplace(id, ref);  // a text that was only in memory is in the file now
   for (auto it = shaders_.begin(); it != shaders_.end();) {  // the texts leave memory again; one that could not be read back is gone
@@ -1244,7 +1283,12 @@ uint64_t RecipeStore::memoryBytes() const {
 std::vector<StageInput> RecipeStore::stageInputs() const {
   std::lock_guard lock(mutex_);
   std::vector<StageInput> v;
-  for (const auto& [h, rec] : inputs_) v.push_back(rec.input);
+  FILE* f = std::fopen(path_.c_str(), "rb");
+  for (const auto& [h, rec] : inputs_) {
+    StageInput si;
+    if (readInput(rec, si, f)) v.push_back(std::move(si));
+  }
+  if (f) std::fclose(f);
   return v;
 }
 

@@ -49,6 +49,7 @@
 
 #include "module.h"
 #include "vpir/builder.h"
+#include "vpir/stack.h"
 #include "vpvk/spirv_frontend.h"
 
 namespace spirv {
@@ -73,6 +74,8 @@ struct LowerError : std::runtime_error {
 struct Nest {
     int& depth;
     Nest(int& d, int limit, const char* what) : depth(d) {
+        // Besides the level count, the bytes of stack left: a worker thread with a small stack ends well before `limit`.
+        if (vpir::stackLow()) fail(std::string(what) + " nested too deep for the stack of this thread (" + std::to_string(depth) + " levels)");
         if (++depth > limit) {
             --depth;
             fail(std::string(what) + " nested more than " + std::to_string(limit) + " levels");
@@ -788,10 +791,7 @@ private:
             default: fail("unsupported image dimension " + std::to_string(uint32_t(img.dim)));
         }
     }
-    bool usedWithDref(uint32_t global) const {
-        // Shadow samplers declared with Depth = 0 still compare: drefGlobals_ was filled by one scan of the module.
-        return drefGlobals_.count(global) != 0;
-    }
+    // Shadow samplers declared with Depth = 0 still compare: globals sampled with a Dref, filled by one scan of the module.
     std::set<uint32_t> drefGlobals_;
 
     Handle handleFor(uint32_t global, uint32_t element) {
@@ -3100,7 +3100,8 @@ private:
     // `count` deep: a balanced tree of `idx < mid` tests nests log2(count).
     static constexpr uint32_t kChainMax = 64, kMaxDescriptorArray = 256;
     // Limits that keep a hostile module from exhausting memory: nodes of the lowered function (calls are inlined, composites
-    // are flattened), leaves of one composite value, bytes of one type in memory.
+    // are flattened), leaves of one composite value, bytes of one type in memory. Each is at least 8x what the shaders of
+    // the repo need (figures in notas/auditoria-shader.md, A4).
     static constexpr uint32_t kMaxUnroll = 1024;  // arms of a dynamic index into an interface / buffer array
     static constexpr size_t kMaxNodes = size_t(1) << 20;
     static constexpr uint64_t kMaxLeaves = 1u << 16, kMaxTypeBytes = 0x7fffffffu;
@@ -5723,6 +5724,7 @@ bool d24EmulSkipped(const SpirvModule& m, const SpirvLowerOptions& o) {
 bool lower(const SpirvModule& m, const SpirvLowerOptions& options, vpir::Module& out, SpirvInterface& iface,
            std::string& error) {
     iface = SpirvInterface{};
+    vpir::StackGuard stackGuard;  // (the recursion of the lowering stops before the stack of this thread does)
     // Every failure names where it happened (see Lowering::where), so one log line is enough to
     // find the instruction in the game's SPIR-V.
     auto l = std::make_unique<Lowering>(m, options, out, iface);

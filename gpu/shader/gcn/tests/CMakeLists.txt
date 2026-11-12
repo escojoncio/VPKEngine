@@ -24,6 +24,10 @@ if(TARGET vpmsl)
   target_compile_options(vpgcn_lift_scale_test PRIVATE -Wall -Wextra -Werror)
   add_test(NAME gcn.lift.scale COMMAND vpgcn_lift_scale_test 6000)
   add_test(NAME gcn.lift.scale_nested COMMAND vpgcn_lift_scale_test nested 1500)
+  # 150 nested ifs (under the 200-level walk limit) on a 64 KB and a 128 KB stack: the walk falls back to the dispatch loop
+  # when the bytes left run out, it does not overflow.
+  add_test(NAME gcn.lift.scale_nested_64k COMMAND vpgcn_lift_scale_test nested 150 64)
+  add_test(NAME gcn.lift.scale_nested_128k COMMAND vpgcn_lift_scale_test nested 150 128)
   add_test(NAME gcn.lift.fetch_recursion COMMAND vpgcn_lift_scale_test fetch_recursion)
   add_test(NAME gcn.lift.fetch_calls COMMAND vpgcn_lift_scale_test fetch_calls)
 endif()

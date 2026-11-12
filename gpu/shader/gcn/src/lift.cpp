@@ -15,6 +15,7 @@
 
 #include "vpgcn/gcn.h"
 #include "vpir/builder.h"
+#include "vpir/stack.h"
 
 namespace vpgcn {
 namespace {
@@ -247,9 +248,10 @@ struct Lifter {
     // Instructions in execution order: the fetch subroutine inlined at its s_swappc_b64.
     std::vector<size_t> order;
     // Each s_swappc_b64 inlines the whole fetch subroutine (the IR has no calls): a program with C calls and F fetch
-    // instructions costs C * F in `order` and in the VPIR. A real vertex shader calls it once (F is a few hundred at most);
-    // the cap leaves a margin of more than 400x and stops C * F from asking for gigabytes.
-    static constexpr size_t kMaxFetchInlined = size_t(1) << 18;
+    // instructions costs C * F in `order` and in the VPIR (about 15 nodes each, 144 bytes a node). A real vertex shader calls it
+    // once (F is a few hundred at most; the largest in the repo has 9 inlined instructions); the cap leaves a margin of more
+    // than 7000x over that and stops C * F from asking for gigabytes (2^16 instructions = about 150 MB of VPIR).
+    static constexpr size_t kMaxFetchInlined = size_t(1) << 16;
     bool buildOrder() {
         size_t calls = 0;
         for (size_t i = 0; i < mainCount; ++i) calls += prog[i].in.op == G::s_swappc_b64;
@@ -3068,7 +3070,7 @@ struct Lifter {
             explicit Level(Walk& x) : w(x) { ++w.depth; }
             ~Level() { --w.depth; }
         } level(w);
-        if (w.depth > kMaxWalkDepth) {
+        if (w.depth > kMaxWalkDepth || vpir::stackLow()) {  // (too deep, or too little stack left: the dispatch loop needs no recursion)
             w.ok = false;
             return;
         }
@@ -3409,6 +3411,7 @@ struct Lifter {
 
 LiftResult lift(const LiftInput& input) {
     LiftResult out;
+    vpir::StackGuard stackGuard;
     Lifter l(input, out);
     l.run();
     out.errors.assign(l.errorSet.begin(), l.errorSet.end());

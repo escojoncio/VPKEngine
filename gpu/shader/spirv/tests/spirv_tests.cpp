@@ -2,6 +2,8 @@
 // spirv-opt -O, which is what shipping titles carry: phis, merged blocks, folded constants).
 // Each case lowers with a driver-style layout, verifies, emits MSL and checks what the lowering
 // promises (bindings reported, multiview, the subpass-read pattern, workgroup size…).
+#include <pthread.h>
+
 #include <algorithm>
 #include <chrono>
 #include <filesystem>
@@ -2308,7 +2310,7 @@ void structure() {
     };
     auto fn = [&](Words& w, uint32_t id, std::initializer_list<uint32_t> body) {  // void id() { body; return }
         ins(w, 54, {2, id, 0, 3});
-        ins(w, 248, {id + 1});
+        ins(w, 248, {id + 7});
         for (uint32_t x : body) w.push_back(x);
         ins(w, 253, {});
         ins(w, 56, {});
@@ -2371,7 +2373,7 @@ void structure() {
                 ins(w, 22, {40, 32});      // %40 = OpTypeFloat 32, bound 16
                 fn(w, 1, {});
             }), "id bound");
-    verdict("entry point is not a function", module([&](Words& w) { ins(w, 22, {1, 32}); }), "defined twice");
+    verdict("entry point is not a function", module([&](Words& w) { ins(w, 22, {1, 32}); }), "not a function");
     verdict("pointer to nothing", module([&](Words& w) {
                 ins(w, 32, {5, 7, 9});     // %5 = OpTypePointer Private %9, never declared
                 fn(w, 1, {});
@@ -2404,6 +2406,121 @@ void offsetOverflow(const std::string& dir) {
     CHECK(!ok);
     CHECK(error.find("overflows 32 bits") != std::string::npos);
     if (error.find("overflows 32 bits") == std::string::npos) std::fprintf(stderr, "  lower: %s\n", error.c_str());
+}
+
+// A compute module whose body is an else-if chain `levels` deep (each else holds the next if): `levels` + 1 nested control-flow
+// regions, the shape of a long if / else if ladder. Hand-assembled; ids: 1 main, 2 void, 3 fn, 4 uint, 5 bool, 6 block,
+// 7 ptr block, 8 buffer, 9 ptr uint, 10 uint 0, 11 .. the constants, labels and values.
+std::vector<uint32_t> elseIfChain(uint32_t levels) {
+    std::vector<uint32_t> w = {0x07230203u, 0x00010300u, 0, 0, 0};
+    auto ins = [&](uint32_t op, std::initializer_list<uint32_t> ops) {
+        w.push_back(uint32_t(ops.size() + 1) << 16 | op);
+        w.insert(w.end(), ops.begin(), ops.end());
+    };
+    uint32_t next = 11;
+    ins(17, {1});                     // OpCapability Shader
+    ins(14, {0, 1});                  // OpMemoryModel Logical GLSL450
+    ins(15, {5, 1, 0x6e69616du, 0});  // OpEntryPoint GLCompute %1 "main"
+    ins(16, {1, 17, 1, 1, 1});        // OpExecutionMode LocalSize 1 1 1
+    ins(71, {6, 2});                  // Block
+    ins(72, {6, 0, 35, 0});           // member 0 Offset 0
+    ins(71, {8, 34, 0});              // DescriptorSet 0
+    ins(71, {8, 33, 0});              // Binding 0
+    ins(19, {2});
+    ins(33, {3, 2});
+    ins(21, {4, 32, 0});
+    ins(20, {5});
+    ins(30, {6, 4});
+    ins(32, {7, 12, 6});
+    ins(59, {7, 8, 12});
+    ins(32, {9, 12, 4});
+    ins(43, {4, 10, 0});
+    std::vector<uint32_t> k(levels), h(levels), t(levels), m(levels);
+    for (uint32_t i = 0; i < levels; ++i) k[i] = next++, ins(43, {4, k[i], i + 1});
+    for (uint32_t i = 0; i < levels; ++i) h[i] = next++, t[i] = next++, m[i] = next++;
+    const uint32_t entry = next++, p = next++, v = next++, last = next++;
+    ins(54, {2, 1, 0, 3});
+    ins(248, {entry});
+    ins(65, {9, p, 8, 10});  // OpAccessChain
+    ins(61, {4, v, p});      // OpLoad
+    ins(249, {h[0]});
+    for (uint32_t i = 0; i < levels; ++i) {
+        ins(248, {h[i]});
+        const uint32_t c = next++;
+        ins(172, {5, c, v, k[i]});  // OpUGreaterThan
+        ins(247, {m[i], 0});
+        ins(250, {c, t[i], i + 1 < levels ? h[i + 1] : last});
+        ins(248, {t[i]});
+        ins(62, {p, k[i]});
+        ins(249, {m[i]});
+    }
+    ins(248, {last});
+    ins(62, {p, k[0]});
+    ins(249, {m[levels - 1]});
+    for (int i = int(levels) - 1; i >= 0; --i) {
+        ins(248, {m[i]});
+        if (i) ins(249, {m[i - 1]});
+        else ins(253, {});
+    }
+    ins(56, {});
+    w[3] = next;
+    return w;
+}
+
+struct StackJob {
+    std::vector<uint32_t> words;
+    bool parsed = false, lowered = false;
+    std::string error;
+};
+void* stackJob(void* p) {
+    StackJob& j = *static_cast<StackJob*>(p);
+    spirv::SpirvModule* m = spirv::parse(j.words.data(), j.words.size(), j.error);
+    if (!m) return nullptr;
+    j.parsed = true;
+    spirv::SpirvLowerOptions o;
+    o.entry = "main";
+    o.stage = vpir::Stage::Compute;
+    o.layout = {bind(0, 0, vpgpu::BindKind::Buffer, 0)};
+    vpir::Module mod;
+    spirv::SpirvInterface iface;
+    j.lowered = spirv::lower(*m, o, mod, iface, j.error);
+    spirv::release(m);
+    return nullptr;
+}
+StackJob lowerOnStack(uint32_t levels, size_t kb) {
+    StackJob job;
+    job.words = elseIfChain(levels);
+    if (!kb) return stackJob(&job), job;  // this thread
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setstacksize(&attr, kb * 1024);
+    pthread_t th;
+    if (pthread_create(&th, &attr, stackJob, &job) != 0) std::abort();
+    pthread_join(th, nullptr);
+    pthread_attr_destroy(&attr);
+    return job;
+}
+
+// The lowering recurses once per nested region. The level cap (320) says nothing about the bytes that takes (about 0.85 KB a level
+// optimised, several times that under a sanitizer), so the recursion also measures the stack left in its thread and fails with a
+// message when it runs low: a worker thread of 512 KB or 64 KB gets a clean error from a 400-level ladder, never a SIGSEGV.
+void stackLimit() {
+    for (size_t kb : {size_t(512), size_t(64)}) {
+        const StackJob j = lowerOnStack(400, kb);
+        CHECK(j.parsed);
+        CHECK(!j.lowered);
+        CHECK(!j.error.empty());
+        if (j.lowered || j.error.empty()) std::fprintf(stderr, "  400 levels on %zu KB: %s\n", kb, j.lowered ? "lowered" : "no message");
+    }
+    // Under the 320-level cap: only the stack can refuse it, and it says so.
+    const StackJob small = lowerOnStack(300, 64);
+    CHECK(!small.lowered);
+    CHECK(small.error.find("stack") != std::string::npos);
+    if (small.error.find("stack") == std::string::npos) std::fprintf(stderr, "  300 levels on 64 KB: %s\n", small.error.c_str());
+    // On this thread (its full stack) the same ladder lowers as before.
+    const StackJob big = lowerOnStack(300, 0);
+    CHECK(big.lowered);
+    if (!big.lowered) std::fprintf(stderr, "  300 levels on the main thread: %s\n", big.error.c_str());
 }
 
 // A private structure of 40000 floats copied whole: each member's natural offset used to be summed from the first
@@ -2551,6 +2668,7 @@ int main(int argc, char** argv) {
     else if (c == "malformed") malformed(dir);
     else if (c == "forward_pointer") forwardPointer();
     else if (c == "offset_overflow") offsetOverflow(dir);
+    else if (c == "stack_limit") stackLimit();
     else if (c == "structure") structure();
     else if (c == "wide_struct") wideStruct();
     else if (c == "unpack_fetch") unpackFetch(dir);

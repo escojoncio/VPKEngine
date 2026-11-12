@@ -249,10 +249,14 @@ class RecipeStore {
   static std::string defaultDir();  // VP_PIPELINE_CACHE_DIR or ""
 
  private:
+  // A stage input as the store keeps it for the whole session: what a lookup needs, and where its options (the layout of every
+  // binding, the vertex formats...: the bulk of it) are in recipes.bin. A refresh or a rewrite reads them back from there.
   struct InputRec {
-    StageInput input;
+    uint64_t spirv = 0;  // spirvHash of the module
     uint64_t msl = 0;
     uint32_t translator = 0;
+    uint64_t off = 0;  // file offset of the encoded StageInput
+    uint32_t len = 0;
   };
   struct IfaceRec {
     uint32_t translator = 0;
@@ -272,6 +276,7 @@ class RecipeStore {
   bool openForAppend(bool fresh);
   bool write(uint8_t tag, const std::vector<uint8_t>& payload, uint64_t* payloadOffset = nullptr);  // false: not (fully) written
   bool readWords(const SpirvRec&, std::vector<uint32_t>& out) const;
+  bool readInput(const InputRec&, StageInput& out, FILE* f) const;  // from the open read handle `f`; mutex_ held
   bool remapLocked(PipeRec& p) const;  // shader ids from the current stage inputs
   bool rewrite(std::unique_lock<std::mutex>& lock);  // lock held on entry and on return; released while the file is written
   void insertPipelineLocked(PipeRec p);

@@ -1177,6 +1177,9 @@ PFN_vkVoidFunction lookupExt(const char* name);     // ext.cpp
 // capture.cpp: the VPCAP capture hook of the entry point `real` (found by address; `name` is only for the log of what is
 // not hooked), `real` itself when it has none.
 PFN_vkVoidFunction captureWrap(const char* name, PFN_vkVoidFunction real);
+// Tests: the compute-pipeline hook over a `real` of the test's own (a batch that fails in part).
+VkResult captureComputePipelinesHookFor(PFN_vkCreateComputePipelines real, VkDevice, VkPipelineCache, uint32_t,
+                                        const VkComputePipelineCreateInfo*, const VkAllocationCallbacks*, VkPipeline*);
 
 template <class T, class H>
 T* from(H h) { return reinterpret_cast<T*>(h); }

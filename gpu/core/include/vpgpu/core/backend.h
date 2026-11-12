@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <functional>
 #include <map>
+#include <mutex>
 #include <string>
 #include <tuple>
 #include <vector>
@@ -95,7 +96,28 @@ class NullBackend final : public Backend {
   uint64_t completedBelow = 0;  // what completedFrames reports (tests move it: nothing finishes by itself)
   uint64_t failPipeline = 0;   // compilePipeline fails for this key value (0 = never)
   double fakeEncoderMs = 0.1;  // reported per encoder by takeTimings
-  std::function<void()> onCompile;  // runs inside compilePipeline, on the compile worker (tests hold compiles)
+  // Runs inside compilePipeline, on the compile worker (tests hold compiles). Set from the test's thread while workers read it:
+  // the function is swapped and copied under a lock, and called outside it (it may block).
+  class CompileHook {
+   public:
+    CompileHook& operator=(std::function<void()> f) {
+      std::lock_guard<std::mutex> lock(m_);
+      f_ = std::move(f);
+      return *this;
+    }
+    void operator()() const {
+      std::function<void()> f;
+      {
+        std::lock_guard<std::mutex> lock(m_);
+        f = f_;
+      }
+      if (f) f();
+    }
+
+   private:
+    mutable std::mutex m_;
+    std::function<void()> f_;
+  } onCompile;
 
  private:
   struct Pending {

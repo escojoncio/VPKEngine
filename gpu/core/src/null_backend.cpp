@@ -25,7 +25,7 @@ ReadResult NullBackend::readTexture(const TextureSpan& s, std::vector<uint8_t>& 
 
 void NullBackend::destroyPipeline(PipelineKey key) { calls.push_back(std::format("destroyPipeline {:016x}", key.value)); }
 bool NullBackend::compilePipeline(const PipelineState& s, std::string& error) {
-  if (onCompile) onCompile();
+  onCompile();
   if (s.key().value == failPipeline) {
     error = "forced failure";
     return false;

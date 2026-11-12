@@ -1207,10 +1207,12 @@ template <uint16_t ID, class Info, class Fn>
 VkResult pipelinesHook(Fn real, VkDevice dv, VkPipelineCache cache, uint32_t n, const Info* infos,
                        const VkAllocationCallbacks* ac, VkPipeline* out) {
   const VkResult r = real(dv, cache, n, infos, ac, out);
-  if (!(g().mode.load(std::memory_order_relaxed) & (kTrack | kCapture)) || r < 0) return r;
+  if (!(g().mode.load(std::memory_order_relaxed) & (kTrack | kCapture))) return r;
   std::lock_guard<std::mutex> lk(g().mu);
   for (uint32_t i = 0; i < n; ++i) {
-    if (!out[i]) continue;  // a failed one of a batch (VK_PIPELINE_COMPILE_REQUIRED / early return)
+    // A batch that failed in part (an error, VK_PIPELINE_COMPILE_REQUIRED, an early return) still created the others, and the game
+    // uses them: the failed ones are VK_NULL_HANDLE.
+    if (!out[i]) continue;
     Info one = infos[i];
     one.basePipelineIndex = -1;  // an index into the batch means nothing for a single create
     VkPipeline p = out[i];
@@ -1409,6 +1411,12 @@ void initOnce() {
 }
 
 }  // namespace
+
+VkResult captureComputePipelinesHookFor(PFN_vkCreateComputePipelines real, VkDevice dv, VkPipelineCache cache, uint32_t n,
+                                        const VkComputePipelineCreateInfo* infos, const VkAllocationCallbacks* ac, VkPipeline* out) {
+  initOnce();
+  return pipelinesHook<id::vkCreateComputePipelines>(real, dv, cache, n, infos, ac, out);
+}
 
 PFN_vkVoidFunction captureWrap(const char* name, PFN_vkVoidFunction real) {
   initOnce();
