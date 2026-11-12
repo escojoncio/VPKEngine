@@ -246,11 +246,23 @@ struct Lifter {
     // SGPR pairs that hold lane masks: written by compares/carries/saveexec, or combined with one.
     // Instructions in execution order: the fetch subroutine inlined at its s_swappc_b64.
     std::vector<size_t> order;
-    void buildOrder() {
+    // Each s_swappc_b64 inlines the whole fetch subroutine (the IR has no calls): a program with C calls and F fetch
+    // instructions costs C * F in `order` and in the VPIR. A real vertex shader calls it once (F is a few hundred at most);
+    // the cap leaves a margin of more than 400x and stops C * F from asking for gigabytes.
+    static constexpr size_t kMaxFetchInlined = size_t(1) << 18;
+    bool buildOrder() {
+        size_t calls = 0;
+        for (size_t i = 0; i < mainCount; ++i) calls += prog[i].in.op == G::s_swappc_b64;
+        if (calls && fetchIndex.size() && calls > kMaxFetchInlined / fetchIndex.size()) {
+            error("the fetch subroutine (" + std::to_string(fetchIndex.size()) + " instructions) is called " + std::to_string(calls) +
+                  " times: inlining it would exceed " + std::to_string(kMaxFetchInlined) + " instructions");
+            return false;
+        }
         for (size_t i = 0; i < mainCount; ++i) {
             order.push_back(i);
             if (prog[i].in.op == G::s_swappc_b64) order.insert(order.end(), fetchIndex.begin(), fetchIndex.end());
         }
+        return true;
     }
     size_t mainCount = 0;
 
@@ -2869,9 +2881,13 @@ struct Lifter {
     std::vector<Decoded> fetchProg;
     std::vector<size_t> fetchIndex;  // fetch instructions' positions in `prog` (appended at the end)
 
+    bool inFetchCall = false;
     void liftFetchCall() {
         if (fetchIndex.empty()) return error("s_swappc_b64 without a fetch subroutine");
+        if (inFetchCall) return error("s_swappc_b64 inside the fetch subroutine");  // (it would inline itself for ever)
+        inFetchCall = true;
         for (size_t i : fetchIndex) liftOne(i);
+        inFetchCall = false;
     }
 
     // ---- Control flow ----------------------------------------------------------------------------
@@ -2940,27 +2956,41 @@ struct Lifter {
         return true;
     }
 
-    // DAG check (back edges removed).
+    // DAG check (back edges removed). Iterative: the depth of the walk is the longest chain of blocks (a recursive one
+    // overflowed a 512 KB thread stack at ~8000 blocks).
     bool dagAcyclic() {
         std::vector<int> state(blocks.size(), 0);
-        bool ok = true;
-        std::function<void(int)> dfs = [&](int k) {
-            if (k < 0 || !ok) return;
-            if (state[k] == 1) {
-                ok = false;
-                return;
-            }
-            if (state[k] == 2) return;
-            state[k] = 1;
-            for (int t : successors(k))
-                if (!backEdges.count({k, t})) dfs(t);
-            state[k] = 2;
+        struct Frame {
+            int block;
+            std::vector<int> succ;
+            size_t next;
         };
-        dfs(0);
-        return ok;
+        std::vector<Frame> stack;
+        if (blocks.empty()) return true;
+        state[0] = 1;
+        stack.push_back({0, successors(0), 0});
+        while (!stack.empty()) {
+            Frame& f = stack.back();
+            if (f.next == f.succ.size()) {
+                state[f.block] = 2;
+                stack.pop_back();
+                continue;
+            }
+            const int t = f.succ[f.next++];
+            if (t < 0 || backEdges.count({f.block, t})) continue;
+            if (state[t] == 1) return false;
+            if (state[t] == 0) {
+                state[t] = 1;
+                stack.push_back({t, successors(t), 0});
+            }
+        }
+        return true;
     }
 
-    // Immediate post-dominators (virtual exit = blocks.size()) on the graph without back edges.
+    // Immediate post-dominators (virtual exit = blocks.size()) on the graph without back edges, which is acyclic from
+    // the entry (dagAcyclic). A depth-first walk finishes a block after everything it reaches, so its immediate
+    // post-dominator (reachable from it) finishes earlier: it is the meet, in that order, of its successors' chains.
+    // (Whole post-dominator sets per block were cubic in the block count: 143 s for 2000 blocks.)
     std::vector<int> postDominators() {
         int n = int(blocks.size()), exit = n;
         std::vector<std::vector<int>> succ(n + 1);
@@ -2970,38 +3000,36 @@ struct Lifter {
                 if (!backEdges.count({k, t})) succ[k].push_back(t);
             if (succ[k].empty()) succ[k].push_back(exit);  // a latch whose only way on is back
         }
-        std::vector<std::set<int>> pdom(n + 1);
-        std::set<int> all;
-        for (int k = 0; k <= n; ++k) all.insert(k);
-        for (int k = 0; k < n; ++k) pdom[k] = all;
-        pdom[exit] = {exit};
-        bool changed = true;
-        while (changed) {
-            changed = false;
-            for (int k = n - 1; k >= 0; --k) {
-                std::set<int> acc;
-                bool first = true;
-                for (int s2 : succ[k]) {
-                    if (first) acc = pdom[s2], first = false;
-                    else {
-                        std::set<int> t;
-                        std::set_intersection(acc.begin(), acc.end(), pdom[s2].begin(), pdom[s2].end(), std::inserter(t, t.begin()));
-                        acc = t;
-                    }
+        std::vector<int> ipdom(n + 1, exit), finish(n + 1, -1), state(n + 1, 0), nextEdge(n + 1, 0), stack;
+        int clock = 0;
+        finish[exit] = clock++, state[exit] = 2;
+        auto meet = [&](int a, int b) {
+            while (a != b) {
+                if (finish[a] > finish[b]) a = ipdom[a];
+                else b = ipdom[b];
+            }
+            return a;
+        };
+        for (int root = 0; root < n; ++root) {
+            if (state[root]) continue;
+            state[root] = 1;
+            stack.push_back(root);
+            while (!stack.empty()) {
+                int k = stack.back();
+                if (size_t(nextEdge[k]) < succ[k].size()) {
+                    int t = succ[k][nextEdge[k]++];
+                    if (!state[t]) state[t] = 1, stack.push_back(t);
+                    continue;
                 }
-                acc.insert(k);
-                if (acc != pdom[k]) pdom[k] = acc, changed = true;
+                int d = -1;
+                for (int t : succ[k])
+                    if (finish[t] >= 0) d = d < 0 ? t : meet(d, t);  // (an edge to a block still open would be a cycle: none from the entry)
+                ipdom[k] = d < 0 ? exit : d;
+                finish[k] = clock++, state[k] = 2;
+                stack.pop_back();
             }
         }
-        std::vector<int> ipdom(n, exit);
-        for (int k = 0; k < n; ++k)
-            for (int c : pdom[k]) {
-                if (c == k) continue;
-                bool imm = true;
-                for (int o : pdom[k])
-                    if (o != k && o != c && !pdom[c].count(o)) imm = false;
-                if (imm) ipdom[k] = c;
-            }
+        ipdom.resize(n);
         return ipdom;
     }
 
@@ -3011,7 +3039,11 @@ struct Lifter {
         size_t count = 0, budget = 0;
         std::vector<const Loop*> loopStack;
         bool ok = true;
+        int depth = 0;  // nesting of the walk (one level per open if / loop)
     };
+    // Deeper nesting than this is lifted as the dispatch loop: `walk` recurses once per level (a 512 KB thread stack ends
+    // at a few thousand) and the MSL indents every level.
+    static constexpr int kMaxWalkDepth = 200;
 
     // Leaves the current loop iteration if `k` is its header (continue) or exit (break).
     bool loopEdge(int k, Walk& w) {
@@ -3031,6 +3063,15 @@ struct Lifter {
     }
 
     void walk(int k, int stop, const std::vector<int>& ipdom, Walk& w, bool loopEntry = false) {
+        struct Level {
+            Walk& w;
+            explicit Level(Walk& x) : w(x) { ++w.depth; }
+            ~Level() { --w.depth; }
+        } level(w);
+        if (w.depth > kMaxWalkDepth) {
+            w.ok = false;
+            return;
+        }
         int exit = int(blocks.size());
         while (w.ok && k >= 0 && k != stop && k != exit) {
             if (!loopEntry && loopEdge(k, w)) return;
@@ -3081,25 +3122,43 @@ struct Lifter {
         if (k >= 0 && k != stop && k != exit && w.ok) loopEdge(k, w);
     }
 
+    // One block of the dispatch loop: `if (blk == k) { body; set blk to the successor; continue }`.
+    void dispatchBlock(uint32_t blk, size_t k) {
+        const BasicBlock& bb = blocks[k];
+        b->beginIf(bin(V::Op::Eq, b->loadVar(blk), u(uint32_t(k)), V::kBool));
+        liftBlockBody(bb);
+        switch (bb.term) {
+            case BasicBlock::End: b->ret(); break;
+            case BasicBlock::Jump: b->storeVar(blk, u(uint32_t(bb.taken))); b->continueLoop(); break;
+            case BasicBlock::Fall: b->storeVar(blk, u(uint32_t(bb.next))); b->continueLoop(); break;
+            case BasicBlock::Cond:
+                b->storeVar(blk, sel(condition(bb), u(uint32_t(bb.taken)), u(uint32_t(bb.next)), V::kU32));
+                b->continueLoop();
+                break;
+        }
+        b->end();
+    }
+    // Blocks [lo, hi) as a binary search on the block number: a jump costs log2(blocks) comparisons on the GPU, not one
+    // per block of the program (a chain of `if (blk == k)`). Programs of up to kDispatchChain blocks keep the plain chain.
+    static constexpr size_t kDispatchChain = 8;
+    void dispatchRange(uint32_t blk, size_t lo, size_t hi) {
+        if (hi - lo <= kDispatchChain) {
+            for (size_t k = lo; k < hi; ++k) dispatchBlock(blk, k);
+            return;
+        }
+        const size_t mid = lo + (hi - lo) / 2;
+        b->beginIf(bin(V::Op::Lt, b->loadVar(blk), u(uint32_t(mid)), V::kBool));
+        dispatchRange(blk, lo, mid);
+        b->beginElse();
+        dispatchRange(blk, mid, hi);
+        b->end();
+    }
+
     void dispatchLoop() {
         uint32_t blk = b->variable(V::kU32);
         b->storeVar(blk, u(0));
         b->beginLoop();
-        for (size_t k = 0; k < blocks.size(); ++k) {
-            const BasicBlock& bb = blocks[k];
-            b->beginIf(bin(V::Op::Eq, b->loadVar(blk), u(uint32_t(k)), V::kBool));
-            liftBlockBody(bb);
-            switch (bb.term) {
-                case BasicBlock::End: b->ret(); break;
-                case BasicBlock::Jump: b->storeVar(blk, u(uint32_t(bb.taken))); b->continueLoop(); break;
-                case BasicBlock::Fall: b->storeVar(blk, u(uint32_t(bb.next))); b->continueLoop(); break;
-                case BasicBlock::Cond:
-                    b->storeVar(blk, sel(condition(bb), u(uint32_t(bb.taken)), u(uint32_t(bb.next)), V::kU32));
-                    b->continueLoop();
-                    break;
-            }
-            b->end();
-        }
+        dispatchRange(blk, 0, blocks.size());
         b->breakLoop();
         b->end();
     }
@@ -3287,7 +3346,7 @@ struct Lifter {
             fetchIndex.push_back(prog.size());
             prog.push_back(d);
         }
-        buildOrder();
+        if (!buildOrder()) return;
         for (const Decoded& d : prog) {
             auto see = [&](const Operand& o) {
                 if (o.kind == OperandKind::Vgpr) highestVgpr = std::max(highestVgpr, unsigned(o.index + o.count - 1));

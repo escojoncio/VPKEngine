@@ -681,6 +681,9 @@ uint32_t mipsOf(const Image* im, const VkImageSubresourceRange& r) {
 uint32_t layersOf(const Image* im, const VkImageSubresourceRange& r) {
   return r.layerCount == VK_REMAINING_ARRAY_LAYERS ? im->desc.layers - r.baseArrayLayer : r.layerCount;
 }
+VkImageSubresourceRange rangeOf(const VkImageSubresourceLayers& l) {  // the one mip of a copy region and its layers
+  return {l.aspectMask, l.mipLevel, 1, l.baseArrayLayer, l.layerCount};
+}
 
 // VPKTAA jitter: does the pass draw the eye's geometry? It must have a depth attachment and either
 // be multiview (both eyes in one layered pass) or match the eye size the caller gave, by its render
@@ -728,6 +731,12 @@ bool taaEyePass(const TaaJitter& jit, bool hasDepth, uint32_t viewMask, const Vk
 constexpr uint32_t kMaxIndirectCount = 1u << 25;      // indices / vertices of one draw
 constexpr uint32_t kMaxIndirectInstances = 1u << 20;  // instances of one draw
 
+// Epoch of the eye pass whose draw classes are cached in OpDraw::classEpoch: process-wide, so no pass of any submit shares one.
+static uint64_t nextClassEpoch() {
+  static std::atomic<uint64_t> n{0};
+  return ++n;
+}
+
 struct Translator {
   vpgpu::Frame& frame;
   TranslateStats& st;
@@ -757,7 +766,7 @@ struct Translator {
   // fovArea: the pass about to open has area-clear quads (they carry no viewport index): never foveated.
   FoveationState* fovs = nullptr;
   bool fovPass = false, fovSuppressed = false, fovArea = false;
-  std::unordered_map<const OpDraw*, taa::DrawClass> classes;  // of the open eye pass, by draw
+  uint64_t classEpoch = nextClassEpoch();  // the open eye pass: a draw's class is valid while its OpDraw::classEpoch is this
   taa::DrawClassifier& classifier() { return um ? um->classifier : ownClassifier; }
   bool passOpen = false;
   uint32_t secondaryDepth = 0;  // > 0 while replaying a secondary command buffer (OpExecute)
@@ -853,16 +862,23 @@ struct Translator {
   // Before a transfer touches one, the texture is refreshed from memory (the host may have written
   // it); after a transfer writes it, memory gets the texture back (the host reads it after the
   // fence). Copies through the image's host-aliasing buffer, ordered by the frame compiler.
-  void linearSync(const Image* im, bool toTexture) {
+  // `sub`: only the mips and layers the op touches (null: every one, for ops whose levels the budget or a mip chain remap).
+  void linearSync(const Image* im, bool toTexture, const VkImageSubresourceRange* sub = nullptr) {
     if (!im || !im->linear || !im->id || !im->hostAlias || !im->memory) return;
     const vpgpu::TextureDesc& d = im->desc;
     const LinearLayout last = linearLayout(d, d.mips - 1u, d.layers - 1u);
     if (last.offset + last.size > im->memory->size - std::min(im->memory->size, im->offset)) return;  // memory too small
     // 3D: one layer holding the mip's depth slices, depthPitch (= rowsPerImage rows) apart.
     const bool is3d = d.type == vpgpu::TextureType::Tex3D;
-    const uint16_t layers = is3d ? uint16_t(1) : uint16_t(d.layers);
-    for (uint32_t m = 0; m < d.mips; ++m) {
-      const LinearLayout l = linearLayout(d, m, 0);
+    uint32_t m0 = 0, m1 = d.mips, l0 = 0, l1 = is3d ? 1u : d.layers;
+    if (sub) {
+      m0 = sub->baseMipLevel, m1 = std::min<uint32_t>(d.mips, m0 + mipsOf(im, *sub));
+      if (!is3d) l0 = sub->baseArrayLayer, l1 = std::min<uint32_t>(d.layers, l0 + layersOf(im, *sub));
+      if (m0 >= m1 || l0 >= l1) return;
+    }
+    const uint16_t layers = uint16_t(l1 - l0);
+    for (uint32_t m = m0; m < m1; ++m) {
+      const LinearLayout l = linearLayout(d, m, l0);
       vpgpu::Copy c;
       c.kind = toTexture ? vpgpu::CopyKind::BufferToTexture : vpgpu::CopyKind::TextureToBuffer;
       vpgpu::BufferSpan& b = toTexture ? c.srcBuffer : c.dstBuffer;
@@ -874,7 +890,7 @@ struct Translator {
       b.rowsPerImage = l.rows;
       t.texture = im->id;
       t.mip = uint16_t(m);
-      t.layer = 0;
+      t.layer = uint16_t(l0);
       t.layerCount = layers;
       t.width = std::max(1u, d.width >> m);
       t.height = std::max(1u, d.height >> m);
@@ -1111,7 +1127,7 @@ struct Translator {
         ++st.copies;
       } else if (const auto* cc = std::get_if<OpClearColor>(&op)) {
         if (!cc->image->id) { ++st.dropped; continue; }
-        linearSync(cc->image, true);
+        linearSync(cc->image, true, &cc->range);
         const bool is3d = cc->image->desc.type == vpgpu::TextureType::Tex3D;
         for (uint32_t m = 0; m < mipsOf(cc->image, cc->range); ++m) {
           // A 3D image is cleared slice by slice (the attachment layer is the depth plane there).
@@ -1132,7 +1148,7 @@ struct Translator {
             ++st.clears;
           }
         }
-        linearSync(cc->image, false);
+        linearSync(cc->image, false, &cc->range);
       } else if (const auto* cd = std::get_if<OpClearDepth>(&op)) {
         if (!cd->image->id) { ++st.dropped; continue; }
         for (uint32_t m = 0; m < mipsOf(cd->image, cd->range); ++m)
@@ -1192,30 +1208,39 @@ struct Translator {
         if (eyeRec && cr->depth) eyeRec->cleared = true, eyeRec->clearValue = cr->depthValue;
         if (cr->colorMask || cr->depth || cr->stencil) clearQuads(std::move(cr));
       } else if (const auto* bi = std::get_if<OpCopyBufferToImage>(&op)) {
-        linearSync(bi->dst, true);
+        // (a shrunk or decoded upload lands in other levels than its region names: all of them)
+        const VkImageSubresourceRange bsub = rangeOf(bi->region.imageSubresource);
+        const VkImageSubresourceRange* bs = bi->shrink || bi->decodedHost ? nullptr : &bsub;
+        linearSync(bi->dst, true, bs);
         if (bi->shrink) shrunkCopy(*bi);
         else if (bi->decodedHost) decodedVolumeCopy(*bi);
         else bufferImage(bi->src, bi->dst, bi->region, true);
-        linearSync(bi->dst, false);
+        linearSync(bi->dst, false, bs);
       } else if (const auto* ib = std::get_if<OpCopyImageToBuffer>(&op)) {
-        linearSync(ib->src, true);
+        const VkImageSubresourceRange isub = rangeOf(ib->region.imageSubresource);
+        linearSync(ib->src, true, &isub);
         bufferImage(ib->dst, ib->src, ib->region, false);
       } else if (const auto* ci = std::get_if<OpCopyImage>(&op)) {
         if (!ci->src->id || !ci->dst->id) { ++st.dropped; continue; }
-        linearSync(ci->src, true);
-        if (ci->dst != ci->src) linearSync(ci->dst, true);
+        // (a mip-chain build reads and writes every level)
+        const VkImageSubresourceRange csrc = rangeOf(ci->region.srcSubresource), cdst = rangeOf(ci->region.dstSubresource);
+        const VkImageSubresourceRange *ps = ci->genMips ? nullptr : &csrc, *pd = ci->genMips ? nullptr : &cdst;
+        linearSync(ci->src, true, ps);
+        if (ci->dst != ci->src) linearSync(ci->dst, true, pd);
         copyImage(*ci);
-        linearSync(ci->dst, false);
+        linearSync(ci->dst, false, pd);
       } else if (const auto* bl = std::get_if<OpBlitImage>(&op)) {
         if (!bl->src->id || !bl->dst->id) { ++st.dropped; continue; }
-        linearSync(bl->src, true);
-        if (bl->dst != bl->src) linearSync(bl->dst, true);
+        const VkImageSubresourceRange bsrc = rangeOf(bl->region.srcSubresource), bdst = rangeOf(bl->region.dstSubresource);
+        linearSync(bl->src, true, &bsrc);
+        if (bl->dst != bl->src) linearSync(bl->dst, true, &bdst);
         blitImage(*bl);
-        linearSync(bl->dst, false);
+        linearSync(bl->dst, false, &bdst);
       } else if (const auto* rs = std::get_if<OpResolveImage>(&op)) {
-        linearSync(rs->dst, true);
+        const VkImageSubresourceRange rdst = rangeOf(rs->region.dstSubresource);
+        linearSync(rs->dst, true, &rdst);
         resolveImage(*rs);
-        linearSync(rs->dst, false);
+        linearSync(rs->dst, false, &rdst);
       } else if (const auto* d = std::get_if<OpDraw>(&op)) {
         draw(*d, opIx);
       } else if (const auto* x = std::get_if<OpDispatch>(&op)) {
@@ -1684,9 +1709,10 @@ struct Translator {
   }
   // The class of a draw of the open eye pass: classified in order by the pre-scan (uiPass), or now.
   taa::DrawClass classOf(const OpDraw& d) {
-    auto it = classes.find(&d);
-    if (it != classes.end()) return it->second;
-    return classes.emplace(&d, classifier().classify(factsOf(d))).first->second;
+    if (d.classEpoch == classEpoch) return taa::DrawClass(d.drawClass);
+    const taa::DrawClass c = classifier().classify(factsOf(d));
+    d.classEpoch = classEpoch, d.drawClass = uint8_t(c);
+    return c;
   }
 
   // Everything an eye-pass geometry draw needs: its class (counted), the mask variant of its
@@ -1746,7 +1772,7 @@ struct Translator {
         if (!d->ok) continue;
         ++scanDraws;
         const taa::DrawClass c = classifier().classify(factsOf(*d));
-        classes[d] = c;
+        d->classEpoch = classEpoch, d->drawClass = uint8_t(c);
         hasUi = hasUi || c == taa::DrawClass::Ui;
         samples = std::max(samples, d->passSamples);
         dualSource = dualSource || (d->pipe && d->pipe->dualSource);
@@ -1773,7 +1799,7 @@ struct Translator {
   // and stored for the TAA pass (MSAA pass: a multisample twin resolved into the 1x mask).
   void uiPass(const std::vector<Op>& ops, size_t at, vpgpu::RenderPassDesc& desc) {
     maskPass = false;
-    classes.clear();
+    classEpoch = nextClassEpoch();
     if (!taaPass || !uiOn) return;
     classifier().beginPass(desc.depth.load == vpgpu::LoadAction::Load);
     bool hasUi = false, dualSource = false;
@@ -2219,7 +2245,7 @@ struct Translator {
       if (const auto* d = std::get_if<OpDraw>(&op)) {
         if (!d->ok) return false;
         ++draws[sub ? 1 : 0];
-        if (!d->pipe || !d->pipe->ok || !d->pipe->depthTileSrc || d->pipe->sources.empty()) return refuse("pipeline");
+        if (!d->pipe || !d->pipe->ok || !d->pipe->depthTileSrc) return refuse("pipeline");
         if (d->edsVariant) return refuse("pipeline_variant");  // (a texel / stride variant has its own depth variant: depthPipelineKey)
         const PipelineObj& p = *d->pipe;
         const bool writes = p.state.depthTest && p.state.depthWrite;
@@ -2403,7 +2429,9 @@ struct Translator {
     vpgpu::Draw forced;
     if (forceN && d.pipe && !d.edsVariant && base == &d.draw) {
       forced = d.draw;
-      forced.pipeline = pipelineFor(devForce(), *d.pipe, forceN, d.texelVariant);
+      Device* fd = devForce();
+      // Synchronous pipelines: the variants this submission asks for are awaited together once it is translated (awaitFreshVariants).
+      forced.pipeline = pipelineFor(fd, *d.pipe, forceN, d.texelVariant, nullptr, fd && !fd->translator ? &fd->uiMask.freshVariants : nullptr);
       base = &forced;
     }
     if (!d.indirect) {
@@ -2415,6 +2443,7 @@ struct Translator {
       } else {
         if (eyeScene) noteDepthDraw(dd, *base, d);
         if (base == &tiled) emit(d, std::move(tiled));  // (the variant copy is the draw: no second copy)
+        else if (base == &forced) emit(d, std::move(forced));
         else emit(d, vpgpu::Draw(*base));
       }
       return;

@@ -11,7 +11,8 @@ permissions:
   contents: read
 
 concurrency:
-  group: metal-gpu-${{ github.ref }}
+  # (a push without [build] skips the job: its run must not replace the pending build run of the group)
+  group: metal-gpu-${{ github.ref }}-${{ (github.event_name == 'workflow_dispatch' || contains(github.event.head_commit.message, '[build]')) && 'build' || github.run_id }}
   cancel-in-progress: false
 
 jobs:

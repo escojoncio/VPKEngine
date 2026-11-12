@@ -47,6 +47,7 @@
 #include "vpgpu/core/activity_gauge.h"
 #include "vpgpu/core/archive_harvest.h"
 #include "vpgpu/core/background.h"
+#include "vpgpu/core/once_map.h"
 #include "vpgpu/core/perf.h"
 #include "vpgpu/core/pipeline_cache.h"
 #include "vpgpu/core/scoped_pool.h"
@@ -840,13 +841,17 @@ struct MetalBackend::Impl {
     uint64_t lastFrame = 0;
   };
   std::unordered_map<uint64_t, MemorylessPool> memoryless;
-  // Sampled blits (CopyKind::TextureBlit): one fullscreen-triangle pipeline per destination pixel
-  // format, built on first use. Submit thread only, so no lock.
+  // Sampled blits (CopyKind::TextureBlit): one fullscreen-triangle pipeline per destination pixel format and variant. The
+  // common ones are built by warmInternal() on warmQueue at start; one asked for before it is ready (or not in the warm set) is
+  // built by the asking thread, which waits for a build of the same key already running (OnceMap) and never builds it twice.
+  // blitLibMutex guards the library and its samplers, built once by whichever thread gets there first.
+  std::mutex blitLibMutex;
   id<MTLLibrary> blitLibrary;
   bool blitLibraryFailed = false;      // a real compile error: never retried
   double blitLibraryRetryAt = 0;      // compiler unreachable: retried after this (steady seconds)
-  std::unordered_map<NSUInteger, id<MTLRenderPipelineState>> blitPipelines;  // nil value = failed
-  id<MTLSamplerState> blitSamplers[2];  // nearest, linear
+  vpgpu::OnceMap<NSUInteger, id<MTLRenderPipelineState>> blitPipelines;  // nil value = failed
+  id<MTLSamplerState> blitSamplers[2];  // nearest, linear (written under blitLibMutex before any blit pipeline exists)
+  id<MTLLibrary> blitLibraryReady(std::string& error);  // locks blitLibMutex; nil sets `error`
   std::unordered_set<std::string> blitWarned;  // reasons already logged
   // variant: bit 0-1 = 0 float, 1 int, 2 uint; bit 2 = 3D source.
   id<MTLRenderPipelineState> blitPipeline(MTLPixelFormat format, int variant, std::string& error);
@@ -875,13 +880,31 @@ struct MetalBackend::Impl {
   std::unordered_map<uint64_t, FovShadowPool> fovShadows;  // by (format, physical size, layers)
   id<MTLTexture> fovShadow(MTLPixelFormat pf, NSUInteger w, NSUInteger h, NSUInteger layers, bool depth,
                            std::unordered_map<uint64_t, size_t>& taken, uint64_t frame);
+  // Gives back the pooled shadows (except the pool `keep`, 0 = none) that no frame used in the last `idleFrames` frames before
+  // `frame`: the sizes a resolution change leaves behind, and with idleFrames == 0 everything but what `frame` used (a trim).
+  void releaseFovShadows(uint64_t frame, uint64_t idleFrames, uint64_t keep);
+  // The fold / expand pipelines are compiled on seedQueue, never on the submit thread: until one is ready the lookup answers error
+  // "pending" and the pass is not foveated (the caller declines, as for any other reason; each foveated pass folds and expands on
+  // its own, so passes may switch between the two). fovLibrary* belong to seedQueue's jobs; fovPipelines / fovPending are guarded
+  // by fovMutex.
   id<MTLLibrary> fovLibrary;
   bool fovLibraryFailed = false;
   double fovLibraryRetryAt = 0;
+  std::mutex fovMutex;
   std::unordered_map<uint64_t, id<MTLRenderPipelineState>> fovPipelines;  // by kind << 32 | pixel format; nil = failed
+  std::unordered_set<uint64_t> fovPending;                                // compiles queued or running
   id<MTLDepthStencilState> fovDepthState;
   // kind: 0 expand colour, 1 fold colour, 2 expand depth, 3 fold depth.
   id<MTLRenderPipelineState> fovPipeline(int kind, MTLPixelFormat pf, std::string& error);
+  void buildFovPipeline(int kind, MTLPixelFormat pf, uint64_t key);
+  // Internal pipelines (clear, blit, foveation, D24, seed) are built from MSL of the backend itself and take part in the binary
+  // archives like any other: looked up there first (a hit compiles nothing), compiled on a miss and queued for the archive so
+  // the next run finds them. The archive key of a descriptor identifies a function by its label, so internalFunction gives each
+  // one a label that names its entry point and the hash of its text (a changed text is a new key).
+  id<MTLFunction> internalFunction(id<MTLLibrary> lib, NSString* entry, uint64_t textKey);
+  id<MTLRenderPipelineState> internalRenderPipeline(MTLRenderPipelineDescriptor* d, NSError* __autoreleasing* e);
+  id<MTLComputePipelineState> internalComputePipeline(MTLComputePipelineDescriptor* d, NSError* __autoreleasing* e);
+  dispatch_queue_t compileQueue();  // seedQueue, made on first use by the submit thread
   // Forced-MSAA seed (Attachment::needsSeed): the start of an encoder whose autoMsaa slots continue a picture an earlier encoder
   // resolved draws one fullscreen triangle per layer that fills every sample from the 1x partner (colour: the texel read as is;
   // depth: depth(any)). One pipeline (and library) per signature of the encoder's attachments; nil = failed (logged once).
@@ -907,20 +930,36 @@ struct MetalBackend::Impl {
 
   // In-pass clear quads (Draw::clear): pipelines by the encoder's attachment formats, sample
   // count, which attachments are cleared and layering; depth/stencil states by (depth, stencil).
-  // Built on first use on the submit thread (no lock), failures cached as nil.
-  std::unordered_map<std::string, id<MTLRenderPipelineState>> clearPipelines;
-  id<MTLDepthStencilState> clearDepthStates[4];
+  // The common signatures are built by warmInternal() on warmQueue at start, the others on first use (the asking thread builds
+  // it, or waits for the build of the same key in progress: OnceMap); failures cached as nil.
+  struct ClearSig {
+    MTLPixelFormat colors[kMaxColorAttachments] = {};  // Invalid = no attachment
+    MTLPixelFormat depthPf = MTLPixelFormatInvalid, stencilPf = MTLPixelFormatInvalid;
+    NSUInteger samples = 1;
+    uint8_t colorMask = 0;
+    bool layered = false;
+    std::array<int, kMaxColorAttachments> kinds{};
+  };
+  vpgpu::OnceMap<std::string, id<MTLRenderPipelineState>> clearPipelines;
+  id<MTLDepthStencilState> clearDepthStates[4];  // submit thread only
   id<MTLRenderPipelineState> clearPipeline(MTLRenderPassDescriptor* rp, const ClearRects& c, bool layered,
                                            const std::array<int, kMaxColorAttachments>& kinds, std::string& error);
+  id<MTLRenderPipelineState> clearPipelineFor(const ClearSig& sig, std::string& error);
   id<MTLDepthStencilState> clearDepthState(bool depth, bool stencil);
 
   // D24 depth in buffer<->texture copies: Apple GPUs keep D24UnormS8 as Depth32Float_Stencil8, but
   // the client's buffer holds 24-bit unorm in a uint32 per texel. A compute kernel converts between
   // the client buffer and a float staging buffer that the blit moves. [0] = unorm24 → float
-  // (upload), [1] = float → unorm24 (readback). Submit thread only; failure cached.
+  // (upload), [1] = float → unorm24 (readback). Built by warmInternal() or on first use, under d24Mutex; failure cached.
+  std::mutex d24Mutex;
   id<MTLComputePipelineState> d24Pipelines[2];
   bool d24Failed = false;
   id<MTLComputePipelineState> d24Pipeline(bool toUnorm, std::string& error);
+  // Builds the internal pipelines a frame is likely to ask for (D24, common blits, common clears) off the submit thread, through
+  // the binary archives (internalRenderPipeline): a serial utility queue, started by the constructor, drained by the destructor.
+  dispatch_queue_t warmQueue = nil;
+  void startWarmInternal();
+  void warmInternal();
 
   // pipelineMutex guards only the maps (the submit thread takes it every frame, so it is never
   // held across a Metal compile). archiveMutex guards the session's binary archive: adding to it
@@ -978,8 +1017,9 @@ struct MetalBackend::Impl {
   std::unordered_set<uint32_t> backedMsaa;
   uint32_t msaaReleaseFrames = 120;  // VPVK_MSAA_RELEASE_FRAMES; 0 = sticky (old behaviour)
   // bookkeeping=false: only the release loop (trimSerialized, outside a frame: no gpu.tex line, no ledger refresh).
-  // trimNow: release as in a trim request even if trimLevel is not set. In trim mode every backing that is not pinned and
-  // was not used by `frameIndex` goes (no tile-streak needed: it includes those that never passed through `target`);
+  // trimNow: release as in a trim request even if trimLevel is not set. In trim mode every backing that is not pinned, was not
+  // used by `frameIndex` and has been tile-local for at least one frame goes (a streak of 0 is a target whose memory still
+  // holds what a frame stored and a later one may read: a render-to-texture, a shadow map);
   // frameIndex == ~0ull means "no frame" and protects nothing (a texture never used has usedFrame == ~0ull too).
   void releaseMsaaBackings(uint64_t frameIndex, bool bookkeeping = true, bool trimNow = false);
   std::atomic<uint64_t> lastSubmitFrame{~0ull};  // newest frame handed to submit (~0ull = none yet); trimSerialized protects its backings
@@ -1462,6 +1502,40 @@ struct MetalBackend::Impl {
     }
   };
   std::unordered_map<FormatViewKey, id<MTLTexture>, FormatViewHash> formatViews;
+  // Views of a slice range that the encoders ask for again every frame (the 1x source of a forced-MSAA seed, a layer of a sampled
+  // blit): kept for a few frames after their last use instead of made new each time. A view holds its base alive, so an entry
+  // unused for kViewKeepFrames (about the frames in flight; none on a memory warning) is dropped, and that bounds how long a
+  // destroyed texture stays resident because of it. The base's address cannot be reused while an entry holds it. Submit thread only.
+  struct SliceViewKey {
+    __unsafe_unretained id<MTLTexture> base;
+    uint32_t format, type, mip, mips, slice, slices;
+    bool swapRB;
+    bool operator==(const SliceViewKey& o) const {
+      return base == o.base && format == o.format && type == o.type && mip == o.mip && mips == o.mips && slice == o.slice &&
+             slices == o.slices && swapRB == o.swapRB;
+    }
+  };
+  struct SliceViewHash {
+    size_t operator()(const SliceViewKey& k) const {
+      uint64_t h = std::hash<const void*>()((__bridge const void*)k.base);
+      for (uint64_t v : {uint64_t(k.format) << 32 | k.type, uint64_t(k.mip) << 32 | k.mips, uint64_t(k.slice) << 32 | k.slices,
+                         uint64_t(k.swapRB)})
+        h = (h ^ v) * 1099511628211ull;
+      return size_t(h);
+    }
+  };
+  struct SliceView {
+    id<MTLTexture> view;
+    uint64_t lastFrame = 0;
+  };
+  static constexpr uint64_t kViewKeepFrames = 4;
+  static constexpr size_t kMaxSliceViews = 4096;  // a frame that asks for more distinct views than this starts the cache over
+  std::unordered_map<SliceViewKey, SliceView, SliceViewHash> sliceViews;
+  // `base` as `format` / `type` over mips [mip, mip + mips) and slices [slice, slice + slices), with red and blue swapped when
+  // `swapRB`; nil when Metal refuses.
+  id<MTLTexture> sliceView(id<MTLTexture> base, MTLPixelFormat format, MTLTextureType type, NSUInteger mip, NSUInteger mips,
+                           NSUInteger slice, NSUInteger slices, bool swapRB, uint64_t frame);
+  void releaseSliceViews(uint64_t frame, uint64_t keepFrames);
   // prewarm (the speculative compile of prewarmShader, queuedAt = when it was queued): returns nil with an EMPTY error when the
   // library is ready or being compiled by another thread (nothing to do), and waits for compileGauge to be quiet before it
   // compiles. Otherwise a nil result always sets `error`.
@@ -2020,11 +2094,12 @@ void MetalBackend::Impl::releaseMsaaBackings(uint64_t frameIndex, bool bookkeepi
     // 50-100 MiB backing stalls the frame it comes back in, and a target that alternates (Gundam: the same eye targets
     // 16 times in 77 s, 45-58 ms each) gains nothing from being released. A memory warning still takes it at once.
     const uint32_t need = msaaReleaseFrames << std::min<uint32_t>(tex.releases, 6);
-    if (tex.pinned || (!trim && tex.streak < need) || (frameIndex != ~0ull && tex.usedFrame == frameIndex)) {
+    if (tex.pinned || tex.streak < (trim ? 1u : need) || (frameIndex != ~0ull && tex.usedFrame == frameIndex)) {
       ++bi;
       continue;
     }
     id<MTLTexture> t = tex.texture;
+    const uint32_t tileFrames = tex.streak;  // for the log line: the streak is reset below
     for (auto f = formatViews.begin(); f != formatViews.end();) {
       if (f->first.base == t) {
         if (f->second != t) retire(f->second);
@@ -2052,7 +2127,7 @@ void MetalBackend::Impl::releaseMsaaBackings(uint64_t frameIndex, bool bookkeepi
     char line[320];
     std::snprintf(line, sizeof line, "gpu.metal.info what=msaa_released index=%u %ux%ux%u samples=%u mb=%.1f after_tile_frames=%u label=%s",
                   *bi, tex.desc.width, tex.desc.height, unsigned(tex.desc.layers), unsigned(tex.desc.samples), mb,
-                  trim ? tex.streak : need, token(tex.desc.label).c_str());
+                  trim ? tileFrames : need, token(tex.desc.label).c_str());
     info(line);
     if (!trim && tex.releases < 255) ++tex.releases;
     trimmedMsaaBytes += uint64_t(mb * 1048576.0);
@@ -2086,6 +2161,39 @@ double MetalBackend::Impl::encoderCost(const Encoder& enc, const std::vector<Com
   visit(enc.pass.depth, kDepthSlot);
   constexpr double kRefPx = 3840.0 * 2485.0 * 2.0;
   return double(draws) * std::clamp(px / kRefPx, 1.0, 8.0) + 2.0 * mb;
+}
+
+id<MTLTexture> MetalBackend::Impl::sliceView(id<MTLTexture> base, MTLPixelFormat format, MTLTextureType type, NSUInteger mip,
+                                             NSUInteger mips, NSUInteger slice, NSUInteger slices, bool swapRB, uint64_t frame) {
+  const SliceViewKey key{base, uint32_t(format), uint32_t(type), uint32_t(mip), uint32_t(mips), uint32_t(slice), uint32_t(slices), swapRB};
+  if (auto it = sliceViews.find(key); it != sliceViews.end()) {
+    it->second.lastFrame = frame;
+    return it->second.view;
+  }
+  id<MTLTexture> v = [base newTextureViewWithPixelFormat:format
+                                             textureType:type
+                                                  levels:NSMakeRange(mip, mips)
+                                                  slices:NSMakeRange(slice, slices)];
+  // Copy::blitSwapRB: the source read with red and blue swapped (a swizzled view of the view).
+  if (v && swapRB)
+    v = [v newTextureViewWithPixelFormat:v.pixelFormat
+                             textureType:v.textureType
+                                  levels:NSMakeRange(0, 1)
+                                  slices:NSMakeRange(0, 1)
+                                 swizzle:MTLTextureSwizzleChannelsMake(MTLTextureSwizzleBlue, MTLTextureSwizzleGreen,
+                                                                       MTLTextureSwizzleRed, MTLTextureSwizzleAlpha)];
+  if (v) {
+    if (sliceViews.size() >= kMaxSliceViews) sliceViews.clear();
+    sliceViews[key] = SliceView{v, frame};
+  }
+  return v;
+}
+
+void MetalBackend::Impl::releaseSliceViews(uint64_t frame, uint64_t keepFrames) {
+  for (auto it = sliceViews.begin(); it != sliceViews.end();) {
+    if (frame > it->second.lastFrame + keepFrames) it = sliceViews.erase(it);
+    else ++it;
+  }
 }
 
 id<MTLTexture> MetalBackend::Impl::formatViewOfPixel(id<MTLTexture> t, MTLPixelFormat pf) {
@@ -2194,7 +2302,7 @@ id<MTLFunction> MetalBackend::Impl::function(uint64_t shaderId, const FetchInput
     }
     const auto yieldUntil = std::chrono::steady_clock::now() + std::chrono::milliseconds(kPrewarmYieldMs);
     while (compileGauge.active() && !closing && std::chrono::steady_clock::now() < yieldUntil)
-      std::this_thread::sleep_for(std::chrono::milliseconds(2));
+      compileGauge.waitInactive(std::chrono::milliseconds(2));  // woken when the last compile ends; the tick re-reads `closing`
     if (closing) {  // teardown: do not start a speculative compile
       error.clear();
       return nil;
@@ -2355,16 +2463,18 @@ void MetalBackend::prewarmShader(uint64_t shaderId) {
   dispatch_queue_t q = m->prewarmQueues[m->prewarmNext++ & 1];
   const auto queuedAt = std::chrono::steady_clock::now();
   dispatch_async(q, ^{
-    if (m->closing) return;
-    MslShader shader;
-    std::string error;
-    // Most likely variant: no fetch inputs; vertex shaders without a PointSize write (non-point topology).
-    // function() returns nil with no error when a worker got there first (ready or compiling): nothing to do.
-    if (m->function(shaderId, {}, shader, error, true, false, nullptr, true, queuedAt)) {
-      std::lock_guard sl(m->libStatsMutex);
-      ++m->libPrewarmed;
-    } else if (!error.empty()) {
-      m->info("gpu.shader.lib prewarm_fail id=" + std::to_string(shaderId) + " error=" + token(error));
+    @autoreleasepool {  // the compile's temporaries go at the end of each job, not when the queue's thread decides
+      if (m->closing) return;
+      MslShader shader;
+      std::string error;
+      // Most likely variant: no fetch inputs; vertex shaders without a PointSize write (non-point topology).
+      // function() returns nil with no error when a worker got there first (ready or compiling): nothing to do.
+      if (m->function(shaderId, {}, shader, error, true, false, nullptr, true, queuedAt)) {
+        std::lock_guard sl(m->libStatsMutex);
+        ++m->libPrewarmed;
+      } else if (!error.empty()) {
+        m->info("gpu.shader.lib prewarm_fail id=" + std::to_string(shaderId) + " error=" + token(error));
+      }
     }
   });
 }
@@ -2465,84 +2575,95 @@ id<MTLRenderPipelineState> MetalBackend::Impl::clearPipeline(MTLRenderPassDescri
                                                              bool layered,
                                                              const std::array<int, kMaxColorAttachments>& kinds,
                                                              std::string& error) {
+  ClearSig sig;
+  sig.layered = layered, sig.colorMask = c.colorMask, sig.kinds = kinds;
   NSUInteger samples = 1;
-  std::string key = "L" + std::to_string(layered) + "M" + std::to_string(c.colorMask);
   for (int i = 0; i < kMaxColorAttachments; ++i) {
     id<MTLTexture> t = rp.colorAttachments[i].texture;
-    key += "," + std::to_string(t ? NSUInteger(t.pixelFormat) : 0) + ":" + std::to_string(kinds[i]);
+    sig.colors[i] = t ? t.pixelFormat : MTLPixelFormatInvalid;
     if (t) samples = t.sampleCount;
   }
   id<MTLTexture> dt = rp.depthAttachment.texture, stt = rp.stencilAttachment.texture;
   if (dt) samples = dt.sampleCount;
   else if (stt) samples = stt.sampleCount;
-  key += "D" + std::to_string(dt ? NSUInteger(dt.pixelFormat) : 0) + "S" +
-         std::to_string(stt ? NSUInteger(stt.pixelFormat) : 0) + "x" + std::to_string(samples);
-  if (auto it = clearPipelines.find(key); it != clearPipelines.end()) {
-    if (!it->second) error = "pipeline_failed";
-    return it->second;
-  }
-  // Instances: one rect (NDC x0 y0 x1 y1), its depth and layer; triangle strip of 4 vertices.
-  std::string src = "#include <metal_stdlib>\nusing namespace metal;\n"
-                    "struct VpClearRect { float4 ndc; float depth; uint layer; uint pad0; uint pad1; };\n"
-                    "struct VpClearV { float4 pos [[position]];";
-  if (layered) src += " uint layer [[render_target_array_index]];";
-  src += " };\n"
-         "vertex VpClearV vp_clear_vs(uint vid [[vertex_id]], uint iid [[instance_id]],\n"
-         "                            constant VpClearRect* rects [[buffer(0)]]) {\n"
-         "    const VpClearRect r = rects[iid];\n"
-         "    VpClearV o;\n"
-         "    o.pos = float4((vid & 1u) ? r.ndc.z : r.ndc.x, (vid & 2u) ? r.ndc.w : r.ndc.y, r.depth, 1.0f);\n";
-  if (layered) src += "    o.layer = r.layer;\n";
-  src += "    return o;\n}\n";
-  if (c.colorMask) {
-    static const char* type[] = {"float4", "int4", "uint4"};
-    src += "struct VpClearF {";
-    for (int i = 0; i < kMaxColorAttachments; ++i)
-      if ((c.colorMask >> i & 1) && rp.colorAttachments[i].texture)
-        src += std::string(" ") + type[kinds[i]] + " c" + std::to_string(i) + " [[color(" + std::to_string(i) + ")]];";
-    src += " };\nfragment VpClearF vp_clear_fs(constant uint4* colors [[buffer(0)]]) {\n    VpClearF o;\n";
-    for (int i = 0; i < kMaxColorAttachments; ++i)
-      if ((c.colorMask >> i & 1) && rp.colorAttachments[i].texture)
-        src += std::string("    o.c") + std::to_string(i) + " = as_type<" + type[kinds[i]] + ">(colors[" +
-               std::to_string(i) + "]);\n";
+  sig.depthPf = dt ? dt.pixelFormat : MTLPixelFormatInvalid;
+  sig.stencilPf = stt ? stt.pixelFormat : MTLPixelFormatInvalid;
+  sig.samples = samples;
+  return clearPipelineFor(sig, error);
+}
+
+id<MTLRenderPipelineState> MetalBackend::Impl::clearPipelineFor(const ClearSig& sig, std::string& error) {
+  std::string key = "L" + std::to_string(sig.layered) + "M" + std::to_string(sig.colorMask);
+  for (int i = 0; i < kMaxColorAttachments; ++i)
+    key += "," + std::to_string(NSUInteger(sig.colors[i])) + ":" + std::to_string(sig.kinds[i]);
+  key += "D" + std::to_string(NSUInteger(sig.depthPf)) + "S" + std::to_string(NSUInteger(sig.stencilPf)) + "x" +
+         std::to_string(sig.samples);
+  bool built = false;  // this thread ran the build below (so `error` is set if it failed)
+  using Map = vpgpu::OnceMap<std::string, id<MTLRenderPipelineState>>;
+  id<MTLRenderPipelineState> result = clearPipelines.get(key, [&]() -> Map::Built {
+    built = true;
+    // Instances: one rect (NDC x0 y0 x1 y1), its depth and layer; triangle strip of 4 vertices.
+    std::string src = "#include <metal_stdlib>\nusing namespace metal;\n"
+                      "struct VpClearRect { float4 ndc; float depth; uint layer; uint pad0; uint pad1; };\n"
+                      "struct VpClearV { float4 pos [[position]];";
+    if (sig.layered) src += " uint layer [[render_target_array_index]];";
+    src += " };\n"
+           "vertex VpClearV vp_clear_vs(uint vid [[vertex_id]], uint iid [[instance_id]],\n"
+           "                            constant VpClearRect* rects [[buffer(0)]]) {\n"
+           "    const VpClearRect r = rects[iid];\n"
+           "    VpClearV o;\n"
+           "    o.pos = float4((vid & 1u) ? r.ndc.z : r.ndc.x, (vid & 2u) ? r.ndc.w : r.ndc.y, r.depth, 1.0f);\n";
+    if (sig.layered) src += "    o.layer = r.layer;\n";
     src += "    return o;\n}\n";
-  }
-  MTLCompileOptions* o = [MTLCompileOptions new];
-  o.languageVersion = MTLLanguageVersion3_2;
-  NSError* e = nil;
-  const attr::Probe probe(device);  // covers the library and the pipeline (the delta goes to the pipeline's tag)
-  id<MTLLibrary> lib = compileRetrying(&e, [&](NSError* __autoreleasing* pe) {
-    vpgpu::HitchSpan hitch(vpgpu::hitchPerf().libCompileUs, false);  // vk.hitch lib_compile_ms
-    return [device newLibraryWithSource:@(src.c_str()) options:o error:pe];
-  });
-  attr::trackCount("m2.lib.clear", lib);
-  id<MTLFunction> vs = lib ? [lib newFunctionWithName:@"vp_clear_vs"] : nil;
-  id<MTLFunction> fs = lib && c.colorMask ? [lib newFunctionWithName:@"vp_clear_fs"] : nil;
-  id<MTLRenderPipelineState> p = nil;
-  if (vs && (fs || !c.colorMask)) {
-    MTLRenderPipelineDescriptor* d = [MTLRenderPipelineDescriptor new];
-    d.label = @"vpgpu.clear";
-    d.vertexFunction = vs;
-    if (fs) d.fragmentFunction = fs;
-    for (int i = 0; i < kMaxColorAttachments; ++i) {
-      id<MTLTexture> t = rp.colorAttachments[i].texture;
-      if (!t) continue;
-      d.colorAttachments[i].pixelFormat = t.pixelFormat;
-      d.colorAttachments[i].writeMask = (c.colorMask >> i & 1) && fs ? MTLColorWriteMaskAll : MTLColorWriteMaskNone;
+    if (sig.colorMask) {
+      static const char* type[] = {"float4", "int4", "uint4"};
+      src += "struct VpClearF {";
+      for (int i = 0; i < kMaxColorAttachments; ++i)
+        if ((sig.colorMask >> i & 1) && sig.colors[i] != MTLPixelFormatInvalid)
+          src += std::string(" ") + type[sig.kinds[i]] + " c" + std::to_string(i) + " [[color(" + std::to_string(i) + ")]];";
+      src += " };\nfragment VpClearF vp_clear_fs(constant uint4* colors [[buffer(0)]]) {\n    VpClearF o;\n";
+      for (int i = 0; i < kMaxColorAttachments; ++i)
+        if ((sig.colorMask >> i & 1) && sig.colors[i] != MTLPixelFormatInvalid)
+          src += std::string("    o.c") + std::to_string(i) + " = as_type<" + type[sig.kinds[i]] + ">(colors[" +
+                 std::to_string(i) + "]);\n";
+      src += "    return o;\n}\n";
     }
-    if (dt) d.depthAttachmentPixelFormat = dt.pixelFormat;
-    if (stt) d.stencilAttachmentPixelFormat = stt.pixelFormat;
-    d.rasterSampleCount = samples;
-    if (layered) d.inputPrimitiveTopology = MTLPrimitiveTopologyClassTriangle;
-    p = compileRetrying(&e, [&](NSError* __autoreleasing* pe) {
-      return [device newRenderPipelineStateWithDescriptor:d error:pe];
+    MTLCompileOptions* o = [MTLCompileOptions new];
+    o.languageVersion = MTLLanguageVersion3_2;
+    NSError* e = nil;
+    const attr::Probe probe(device);  // covers the library and the pipeline (the delta goes to the pipeline's tag)
+    id<MTLLibrary> lib = compileRetrying(&e, [&](NSError* __autoreleasing* pe) {
+      vpgpu::HitchSpan hitch(vpgpu::hitchPerf().libCompileUs, false);  // vk.hitch lib_compile_ms
+      return [device newLibraryWithSource:@(src.c_str()) options:o error:pe];
     });
-    attr::trackObject("m2.pso.clear", p, probe);
-  }
-  if (!p) error = "clear pipeline: " + str(e);
-  // A compiler that could not be reached is retried on the next clear, not cached as broken.
-  if (p || !compilerUnreachable(e)) clearPipelines[key] = p;
-  return p;
+    attr::trackCount("m2.lib.clear", lib);
+    const uint64_t textKey = sourceKey(src);
+    id<MTLFunction> vs = internalFunction(lib, @"vp_clear_vs", textKey);
+    id<MTLFunction> fs = sig.colorMask ? internalFunction(lib, @"vp_clear_fs", textKey) : nil;
+    id<MTLRenderPipelineState> p = nil;
+    if (vs && (fs || !sig.colorMask)) {
+      MTLRenderPipelineDescriptor* d = [MTLRenderPipelineDescriptor new];
+      d.label = @"vpgpu.clear";
+      d.vertexFunction = vs;
+      if (fs) d.fragmentFunction = fs;
+      for (int i = 0; i < kMaxColorAttachments; ++i) {
+        if (sig.colors[i] == MTLPixelFormatInvalid) continue;
+        d.colorAttachments[i].pixelFormat = sig.colors[i];
+        d.colorAttachments[i].writeMask = (sig.colorMask >> i & 1) && fs ? MTLColorWriteMaskAll : MTLColorWriteMaskNone;
+      }
+      if (sig.depthPf != MTLPixelFormatInvalid) d.depthAttachmentPixelFormat = sig.depthPf;
+      if (sig.stencilPf != MTLPixelFormatInvalid) d.stencilAttachmentPixelFormat = sig.stencilPf;
+      d.rasterSampleCount = sig.samples;
+      if (sig.layered) d.inputPrimitiveTopology = MTLPrimitiveTopologyClassTriangle;
+      p = internalRenderPipeline(d, &e);
+      attr::trackObject("m2.pso.clear", p, probe);
+    }
+    if (!p) error = "clear pipeline: " + str(e);
+    // A compiler that could not be reached is retried on the next clear, not cached as broken.
+    return Map::Built{p, p || !compilerUnreachable(e)};
+  });
+  if (!result && !built) error = "pipeline_failed";  // a failure another thread cached
+  return result;
 }
 
 id<MTLDepthStencilState> MetalBackend::Impl::clearDepthState(bool depth, bool stencil) {
@@ -2567,67 +2688,75 @@ id<MTLDepthStencilState> MetalBackend::Impl::clearDepthState(bool depth, bool st
   return s;
 }
 
-id<MTLRenderPipelineState> MetalBackend::Impl::blitPipeline(MTLPixelFormat format, int variant, std::string& error) {
-  const NSUInteger key = NSUInteger(format) * 16 + NSUInteger(variant & 15);
-  if (auto it = blitPipelines.find(key); it != blitPipelines.end()) {
-    if (!it->second) error = "pipeline_failed";
-    return it->second;
+// The library and its two samplers, built once (blitLibMutex): by the warm job or by the first blit that needs it.
+id<MTLLibrary> MetalBackend::Impl::blitLibraryReady(std::string& error) {
+  std::lock_guard<std::mutex> lock(blitLibMutex);
+  if (blitLibrary) return blitLibrary;
+  const double now = steadySeconds();
+  if (blitLibraryFailed || now < blitLibraryRetryAt) {
+    error = "library_failed";
+    return nil;
   }
-  if (!blitLibrary) {
-    const double now = steadySeconds();
-    if (blitLibraryFailed || now < blitLibraryRetryAt) {
-      error = "library_failed";
-      return nil;
-    }
-    MTLCompileOptions* o = [MTLCompileOptions new];
-    o.languageVersion = MTLLanguageVersion3_2;
-    NSError* e = nil;
-    const attr::Probe probe(device);
-    blitLibrary = compileRetrying(&e, [&](NSError* __autoreleasing* pe) {
-      return [device newLibraryWithSource:@(kBlitMsl) options:o error:pe];
-    });
-    attr::trackObject("m2.lib.blit", blitLibrary, probe);
-    for (int i = 0; i < 2 && blitLibrary; ++i) {
-      MTLSamplerDescriptor* sd = [MTLSamplerDescriptor new];
-      sd.minFilter = sd.magFilter = i ? MTLSamplerMinMagFilterLinear : MTLSamplerMinMagFilterNearest;
-      sd.mipFilter = MTLSamplerMipFilterNotMipmapped;
-      sd.sAddressMode = sd.tAddressMode = MTLSamplerAddressModeClampToEdge;
-      blitSamplers[i] = [device newSamplerStateWithDescriptor:sd];
-      if (!blitSamplers[i]) blitLibrary = nil;
-    }
-    if (!blitLibrary) {
-      if (compilerUnreachable(e))
-        blitLibraryRetryAt = now + 2.0;  // the service comes back: try again in 2 s
-      else
-        blitLibraryFailed = true;
-      error = "library: " + str(e);
-      return nil;
-    }
-  }
-  MTLRenderPipelineDescriptor* d = [MTLRenderPipelineDescriptor new];
-  d.label = @"vpgpu.blit";
-  d.vertexFunction = [blitLibrary newFunctionWithName:@"vp_blit_vs"];
-  // variant: bits 0-1 float (linear) / int / uint / float nearest, bit 2 a 3D source, bit 3 a
-  // multisampled source (sample 0; never 3D).
-  static NSString* const fs[16] = {@"vp_blit_fs",   @"vp_blit_fs_i",  @"vp_blit_fs_u",  @"vp_blit_fs_n",
-                                   @"vp_blit_fs3",  @"vp_blit_fs3_i", @"vp_blit_fs3_u", @"vp_blit_fs3",
-                                   @"vp_blit_ms_f", @"vp_blit_ms_i",  @"vp_blit_ms_u",  @"vp_blit_ms_f",
-                                   @"vp_blit_ms_f", @"vp_blit_ms_i",  @"vp_blit_ms_u",  @"vp_blit_ms_f"};
-  d.fragmentFunction = [blitLibrary newFunctionWithName:fs[variant & 15]];
-  d.colorAttachments[0].pixelFormat = format;
-  d.inputPrimitiveTopology = MTLPrimitiveTopologyClassTriangle;
+  MTLCompileOptions* o = [MTLCompileOptions new];
+  o.languageVersion = MTLLanguageVersion3_2;
   NSError* e = nil;
   const attr::Probe probe(device);
-  id<MTLRenderPipelineState> p =
-      d.vertexFunction && d.fragmentFunction
-          ? compileRetrying(&e, [&](NSError* __autoreleasing* pe) { return [device newRenderPipelineStateWithDescriptor:d error:pe]; })
-          : nil;
-  attr::trackObject("m2.pso.blit", p, probe);
-  if (!p) error = "pipeline: " + str(e);
-  // A failure is cached too (logged once, not retried every frame) — unless the compiler was
-  // only unreachable.
-  if (p || !compilerUnreachable(e)) blitPipelines[key] = p;
-  return p;
+  id<MTLLibrary> lib = compileRetrying(&e, [&](NSError* __autoreleasing* pe) {
+    return [device newLibraryWithSource:@(kBlitMsl) options:o error:pe];
+  });
+  attr::trackObject("m2.lib.blit", lib, probe);
+  for (int i = 0; i < 2 && lib; ++i) {
+    MTLSamplerDescriptor* sd = [MTLSamplerDescriptor new];
+    sd.minFilter = sd.magFilter = i ? MTLSamplerMinMagFilterLinear : MTLSamplerMinMagFilterNearest;
+    sd.mipFilter = MTLSamplerMipFilterNotMipmapped;
+    sd.sAddressMode = sd.tAddressMode = MTLSamplerAddressModeClampToEdge;
+    blitSamplers[i] = [device newSamplerStateWithDescriptor:sd];
+    if (!blitSamplers[i]) lib = nil;
+  }
+  if (!lib) {
+    if (compilerUnreachable(e))
+      blitLibraryRetryAt = now + 2.0;  // the service comes back: try again in 2 s
+    else
+      blitLibraryFailed = true;
+    error = "library: " + str(e);
+    return nil;
+  }
+  blitLibrary = lib;
+  return lib;
+}
+
+id<MTLRenderPipelineState> MetalBackend::Impl::blitPipeline(MTLPixelFormat format, int variant, std::string& error) {
+  const NSUInteger key = NSUInteger(format) * 16 + NSUInteger(variant & 15);
+  bool built = false;  // this thread ran the build below (so `error` is set if it failed)
+  using Map = vpgpu::OnceMap<NSUInteger, id<MTLRenderPipelineState>>;
+  id<MTLRenderPipelineState> result = blitPipelines.get(key, [&]() -> Map::Built {
+    built = true;
+    id<MTLLibrary> lib = blitLibraryReady(error);
+    if (!lib) return Map::Built{nil, false};  // (a library that cannot be built is not cached per pipeline)
+    MTLRenderPipelineDescriptor* d = [MTLRenderPipelineDescriptor new];
+    d.label = @"vpgpu.blit";
+    static const uint64_t blitText = sourceKey(kBlitMsl);
+    d.vertexFunction = internalFunction(lib, @"vp_blit_vs", blitText);
+    // variant: bits 0-1 float (linear) / int / uint / float nearest, bit 2 a 3D source, bit 3 a
+    // multisampled source (sample 0; never 3D).
+    static NSString* const fs[16] = {@"vp_blit_fs",   @"vp_blit_fs_i",  @"vp_blit_fs_u",  @"vp_blit_fs_n",
+                                     @"vp_blit_fs3",  @"vp_blit_fs3_i", @"vp_blit_fs3_u", @"vp_blit_fs3",
+                                     @"vp_blit_ms_f", @"vp_blit_ms_i",  @"vp_blit_ms_u",  @"vp_blit_ms_f",
+                                     @"vp_blit_ms_f", @"vp_blit_ms_i",  @"vp_blit_ms_u",  @"vp_blit_ms_f"};
+    d.fragmentFunction = internalFunction(lib, fs[variant & 15], blitText);
+    d.colorAttachments[0].pixelFormat = format;
+    d.inputPrimitiveTopology = MTLPrimitiveTopologyClassTriangle;
+    NSError* e = nil;
+    const attr::Probe probe(device);
+    id<MTLRenderPipelineState> p = d.vertexFunction && d.fragmentFunction ? internalRenderPipeline(d, &e) : nil;
+    attr::trackObject("m2.pso.blit", p, probe);
+    if (!p) error = "pipeline: " + str(e);
+    // A failure is cached too (logged once, not retried every frame) — unless the compiler was
+    // only unreachable.
+    return Map::Built{p, p || !compilerUnreachable(e)};
+  });
+  if (!result && !built) error = "pipeline_failed";  // a failure another thread cached
+  return result;
 }
 
 // ---- Foveation: fold / expand between the logical attachments and the physical shadows ----
@@ -2694,49 +2823,129 @@ fragment VpFovD vp_fov_fold_d(VpFovF in [[stage_in]], uint layer [[render_target
 
 id<MTLRenderPipelineState> MetalBackend::Impl::fovPipeline(int kind, MTLPixelFormat pf, std::string& error) {
   const uint64_t key = uint64_t(kind) << 32 | uint64_t(pf);
-  if (auto it = fovPipelines.find(key); it != fovPipelines.end()) {
-    if (!it->second) error = "pipeline_failed";
-    return it->second;
-  }
-  if (!fovLibrary) {
-    const double now = steadySeconds();
-    if (fovLibraryFailed || now < fovLibraryRetryAt) {
-      error = "library_failed";
+  {
+    std::lock_guard<std::mutex> lock(fovMutex);
+    if (auto it = fovPipelines.find(key); it != fovPipelines.end()) {
+      if (!it->second) error = "pipeline_failed";
+      return it->second;
+    }
+    if (!fovPending.insert(key).second) {
+      error = "pending";
       return nil;
     }
-    MTLCompileOptions* o = [MTLCompileOptions new];
-    o.languageVersion = MTLLanguageVersion3_2;
+  }
+  if (closing) {
+    std::lock_guard<std::mutex> lock(fovMutex);
+    fovPending.erase(key);
+    error = "closing";
+    return nil;
+  }
+  dispatch_async(compileQueue(), ^{
+    if (!closing) buildFovPipeline(kind, pf, key);
+    std::lock_guard<std::mutex> lock(fovMutex);
+    fovPending.erase(key);
+  });
+  error = "pending";
+  return nil;
+}
+
+// On seedQueue (serial, so fovLibrary* need no lock). A failure is cached (nil) unless the compiler was only unreachable: then
+// nothing is stored and the next lookup asks again.
+void MetalBackend::Impl::buildFovPipeline(int kind, MTLPixelFormat pf, uint64_t key) {
+  @autoreleasepool {
+    auto publish = [&](id<MTLRenderPipelineState> p) {
+      std::lock_guard<std::mutex> lock(fovMutex);
+      fovPipelines[key] = p;
+    };
+    if (!fovLibrary) {
+      const double now = steadySeconds();
+      if (fovLibraryFailed) {
+        publish(nil);
+        return;
+      }
+      if (now < fovLibraryRetryAt) return;
+      MTLCompileOptions* o = [MTLCompileOptions new];
+      o.languageVersion = MTLLanguageVersion3_2;
+      NSError* e = nil;
+      const attr::Probe probe(device);
+      fovLibrary = compileRetrying(&e, [&](NSError* __autoreleasing* pe) {
+        return [device newLibraryWithSource:@(kFovMsl) options:o error:pe];
+      });
+      attr::trackObject("m2.lib.fov", fovLibrary, probe);
+      if (!fovLibrary) {
+        err("what=fov_library error=%s", str(e).c_str());
+        if (compilerUnreachable(e)) {
+          fovLibraryRetryAt = now + 2.0;
+        } else {
+          fovLibraryFailed = true;
+          publish(nil);
+        }
+        return;
+      }
+    }
+    static NSString* const fs[4] = {@"vp_fov_expand_c", @"vp_fov_fold_c", @"vp_fov_expand_d", @"vp_fov_fold_d"};
+    static const uint64_t fovText = sourceKey(kFovMsl);
+    MTLRenderPipelineDescriptor* d = [MTLRenderPipelineDescriptor new];
+    d.label = @"vpgpu.fov";
+    d.vertexFunction = internalFunction(fovLibrary, @"vp_fov_vs", fovText);
+    d.fragmentFunction = internalFunction(fovLibrary, fs[kind & 3], fovText);
+    if (kind >= 2) d.depthAttachmentPixelFormat = pf;
+    else d.colorAttachments[0].pixelFormat = pf;
+    d.inputPrimitiveTopology = MTLPrimitiveTopologyClassTriangle;
     NSError* e = nil;
     const attr::Probe probe(device);
-    fovLibrary = compileRetrying(&e, [&](NSError* __autoreleasing* pe) {
-      return [device newLibraryWithSource:@(kFovMsl) options:o error:pe];
-    });
-    attr::trackObject("m2.lib.fov", fovLibrary, probe);
-    if (!fovLibrary) {
-      if (compilerUnreachable(e)) fovLibraryRetryAt = now + 2.0;
-      else fovLibraryFailed = true;
-      error = "library: " + str(e);
-      return nil;
-    }
+    id<MTLRenderPipelineState> p = d.vertexFunction && d.fragmentFunction ? internalRenderPipeline(d, &e) : nil;
+    attr::trackObject("m2.pso.fov", p, probe);
+    if (!p) err("what=fov_pipeline_build kind=%d pf=%lu error=%s", kind, (unsigned long)pf, str(e).c_str());
+    if (p || !compilerUnreachable(e)) publish(p);
   }
-  static NSString* const fs[4] = {@"vp_fov_expand_c", @"vp_fov_fold_c", @"vp_fov_expand_d", @"vp_fov_fold_d"};
-  MTLRenderPipelineDescriptor* d = [MTLRenderPipelineDescriptor new];
-  d.label = @"vpgpu.fov";
-  d.vertexFunction = [fovLibrary newFunctionWithName:@"vp_fov_vs"];
-  d.fragmentFunction = [fovLibrary newFunctionWithName:fs[kind & 3]];
-  if (kind >= 2) d.depthAttachmentPixelFormat = pf;
-  else d.colorAttachments[0].pixelFormat = pf;
-  d.inputPrimitiveTopology = MTLPrimitiveTopologyClassTriangle;
-  NSError* e = nil;
-  const attr::Probe probe(device);
-  id<MTLRenderPipelineState> p =
-      d.vertexFunction && d.fragmentFunction
-          ? compileRetrying(&e, [&](NSError* __autoreleasing* pe) { return [device newRenderPipelineStateWithDescriptor:d error:pe]; })
-          : nil;
-  attr::trackObject("m2.pso.fov", p, probe);
-  if (!p) error = "pipeline: " + str(e);
-  if (p || !compilerUnreachable(e)) fovPipelines[key] = p;
-  return p;
+}
+
+// ---- Warm-up of the internal pipelines ----
+// The pipelines the backend itself needs for clears, blits and D24 copies are built on warmQueue right after the device is up, so
+// the first frame that needs one finds it ready (a binary archive hit when an earlier run archived it) and does not compile it
+// on the submit thread. A request that comes first builds it synchronously (same OnceMap / mutexes as the warm job), so nothing
+// is ever skipped; anything outside the warm set is built on first use as before.
+void MetalBackend::Impl::startWarmInternal() {
+  if (warmQueue) return;
+  warmQueue = dispatch_queue_create("vpgpu.internal.warm", dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_UTILITY, 0));
+  dispatch_async(warmQueue, ^{
+    warmInternal();
+  });
+}
+
+void MetalBackend::Impl::warmInternal() {
+  const auto t0 = std::chrono::steady_clock::now();
+  uint32_t built = 0, failed = 0;
+  auto one = [&](auto&& fn) {  // one item per autorelease pool; stops at teardown
+    if (closing) return;
+    @autoreleasepool {
+      (fn() ? built : failed) += 1;
+    }
+  };
+  std::string error;
+  one([&] { return d24Pipeline(false, error) != nil; });
+  one([&] { return d24Pipeline(true, error) != nil; });
+  // Blits: linear and nearest float, into the colour formats games render and copy to.
+  static const MTLPixelFormat blitFormats[] = {MTLPixelFormatRGBA8Unorm, MTLPixelFormatBGRA8Unorm, MTLPixelFormatRGBA8Unorm_sRGB,
+                                               MTLPixelFormatBGRA8Unorm_sRGB, MTLPixelFormatRGBA16Float};
+  for (MTLPixelFormat pf : blitFormats)
+    for (int variant : {0, 3}) one([&] { return blitPipeline(pf, variant, error) != nil; });
+  // Clears: colour 0 (float) with a 32-bit depth, and depth only; 1x and 4x, one layer and the two eye layers.
+  for (NSUInteger samples : {NSUInteger(1), NSUInteger(4)})
+    for (bool layered : {true, false}) {
+      for (MTLPixelFormat pf : {MTLPixelFormatRGBA16Float, MTLPixelFormatRGBA8Unorm}) {
+        ClearSig sig;
+        sig.colors[0] = pf, sig.depthPf = MTLPixelFormatDepth32Float, sig.samples = samples, sig.colorMask = 1,
+        sig.layered = layered;
+        one([&] { return clearPipelineFor(sig, error) != nil; });
+      }
+      ClearSig depthOnly;
+      depthOnly.depthPf = MTLPixelFormatDepth32Float, depthOnly.samples = samples, depthOnly.layered = layered;
+      one([&] { return clearPipelineFor(depthOnly, error) != nil; });
+    }
+  info("gpu.internal.warm built=" + std::to_string(built) + " failed=" + std::to_string(failed) + " ms=" +
+       std::to_string(int(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count())));
 }
 
 // ---- Forced MSAA: seed the samples of an autoMsaa attachment from its 1x partner ----
@@ -2783,15 +2992,20 @@ id<MTLRenderPipelineState> MetalBackend::Impl::seedPipeline(MTLRenderPassDescrip
     error = "closing";
     return nil;
   }
-  if (!seedQueue)
-    seedQueue = dispatch_queue_create("vpgpu.seed.compile", dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INITIATED, 0));
-  dispatch_async(seedQueue, ^{
+  dispatch_async(compileQueue(), ^{
     if (!closing) buildSeedPipeline(sig);
     std::lock_guard<std::mutex> lock(seedMutex);
     seedPending.erase(sig.key);
   });
   error = "pending";
   return nil;
+}
+
+// The queue that compiles the seed and foveation pipelines (serial; made by the submit thread, drained in ~MetalBackend).
+dispatch_queue_t MetalBackend::Impl::compileQueue() {
+  if (!seedQueue)
+    seedQueue = dispatch_queue_create("vpgpu.seed.compile", dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INITIATED, 0));
+  return seedQueue;
 }
 
 void MetalBackend::Impl::buildSeedPipeline(const SeedSig& sig) {
@@ -2842,8 +3056,9 @@ void MetalBackend::Impl::buildSeedPipeline(const SeedSig& sig) {
     }
     MTLRenderPipelineDescriptor* d = [MTLRenderPipelineDescriptor new];
     d.label = @"vpgpu.seed";
-    d.vertexFunction = [lib newFunctionWithName:@"vp_seed_vs"];
-    d.fragmentFunction = [lib newFunctionWithName:@"vp_seed_fs"];
+    const uint64_t textKey = sourceKey(src);
+    d.vertexFunction = internalFunction(lib, @"vp_seed_vs", textKey);
+    d.fragmentFunction = internalFunction(lib, @"vp_seed_fs", textKey);
     for (int i = 0; i < kMaxColorAttachments; ++i)
       if (sig.colors[i] != MTLPixelFormatInvalid) {
         d.colorAttachments[i].pixelFormat = sig.colors[i];
@@ -2854,10 +3069,7 @@ void MetalBackend::Impl::buildSeedPipeline(const SeedSig& sig) {
     d.rasterSampleCount = sig.samples;
     d.inputPrimitiveTopology = MTLPrimitiveTopologyClassTriangle;
     const attr::Probe probe2(device);
-    id<MTLRenderPipelineState> p =
-        d.vertexFunction && d.fragmentFunction
-            ? compileRetrying(&e, [&](NSError* __autoreleasing* pe) { return [device newRenderPipelineStateWithDescriptor:d error:pe]; })
-            : nil;
+    id<MTLRenderPipelineState> p = d.vertexFunction && d.fragmentFunction ? internalRenderPipeline(d, &e) : nil;
     attr::trackObject("m2.pso.seed", p, probe2);
     if (!p) err("what=seed_pipeline_build error=%s", str(e).c_str());
     if (p || !compilerUnreachable(e)) {
@@ -3003,20 +3215,22 @@ id<MTLTexture> MetalBackend::Impl::fovShadow(MTLPixelFormat pf, NSUInteger w, NS
       residencyDirty = true;
     }
     pool.textures.push_back(t);
-    // Sizes of earlier configurations (a resolution change) are given back once unused for a while.
-    if (fovShadows.size() > 8)
-      for (auto it = fovShadows.begin(); it != fovShadows.end();) {
-        if (it->first != key && frame > it->second.lastFrame + 600) {
-          for (id<MTLTexture> old : it->second.textures) texLive(old, false), retire(old);
-          texBytes[it->second.cat] -= std::min<uint64_t>(texBytes[it->second.cat].load(), it->second.bytes);
-          fovShadowBytes -= std::min<uint64_t>(fovShadowBytes.load(), it->second.bytes);
-          it = fovShadows.erase(it);
-        } else {
-          ++it;
-        }
-      }
+    releaseFovShadows(frame, 600, key);  // sizes of earlier configurations (a resolution change) once unused for a while
   }
   return pool.textures[n++];
+}
+
+void MetalBackend::Impl::releaseFovShadows(uint64_t frame, uint64_t idleFrames, uint64_t keep) {
+  for (auto it = fovShadows.begin(); it != fovShadows.end();) {
+    if (it->first != keep && frame > it->second.lastFrame + idleFrames) {
+      for (id<MTLTexture> old : it->second.textures) texLive(old, false), retire(old);  // in-flight frames may still read them
+      texBytes[it->second.cat] -= std::min<uint64_t>(texBytes[it->second.cat].load(), it->second.bytes);
+      fovShadowBytes -= std::min<uint64_t>(fovShadowBytes.load(), it->second.bytes);
+      it = fovShadows.erase(it);
+    } else {
+      ++it;
+    }
+  }
 }
 
 constexpr const char* kD24Msl = R"(#include <metal_stdlib>
@@ -3037,6 +3251,7 @@ kernel void vp_float_to_d24(device const float* src [[buffer(0)]], device uint* 
 )";
 
 id<MTLComputePipelineState> MetalBackend::Impl::d24Pipeline(bool toUnorm, std::string& error) {
+  std::lock_guard<std::mutex> lock(d24Mutex);  // the warm job may be building them: wait for it rather than compile twice
   if (d24Pipelines[toUnorm ? 1 : 0]) return d24Pipelines[toUnorm ? 1 : 0];
   if (d24Failed) {
     error = "d24_failed";
@@ -3051,8 +3266,14 @@ id<MTLComputePipelineState> MetalBackend::Impl::d24Pipeline(bool toUnorm, std::s
   });
   attr::trackObject("m2.lib.d24", lib, probe);
   for (int i = 0; i < 2 && lib; ++i) {
-    id<MTLFunction> f = [lib newFunctionWithName:i ? @"vp_float_to_d24" : @"vp_d24_to_float"];
-    d24Pipelines[i] = f ? [device newComputePipelineStateWithFunction:f error:&e] : nil;
+    id<MTLFunction> f = internalFunction(lib, i ? @"vp_float_to_d24" : @"vp_d24_to_float", sourceKey(kD24Msl));
+    MTLComputePipelineDescriptor* cd = nil;
+    if (f) {  // (setComputeFunction: asserts on nil)
+      cd = [MTLComputePipelineDescriptor new];
+      cd.label = @"vpgpu.d24";
+      cd.computeFunction = f;
+    }
+    d24Pipelines[i] = cd ? internalComputePipeline(cd, &e) : nil;
     attr::trackObject("m2.pso.d24", d24Pipelines[i], probe);
     if (!d24Pipelines[i]) lib = nil;
   }
@@ -3336,6 +3557,49 @@ void MetalBackend::Impl::hangEncoders(uint64_t frame, NSError* error,
 
 namespace {
 uint64_t descriptorKey(id desc, bool compute);  // defined with the archive code below
+}
+
+id<MTLFunction> MetalBackend::Impl::internalFunction(id<MTLLibrary> lib, NSString* entry, uint64_t textKey) {
+  id<MTLFunction> fn = lib ? [lib newFunctionWithName:entry] : nil;
+  if (fn) fn.label = [NSString stringWithFormat:@"vpgpu.int.%@.%016llx", entry, (unsigned long long)textKey];
+  return fn;
+}
+
+id<MTLRenderPipelineState> MetalBackend::Impl::internalRenderPipeline(MTLRenderPipelineDescriptor* d, NSError* __autoreleasing* e) {
+  id<MTLRenderPipelineState> p = nil;
+  bool hit = false;
+  if (NSArray<id<MTLBinaryArchive>>* ars = archivesFor(descriptorKey(d, false)); ars.count) {  // immutable: no lock
+    Inflight guard(this, "lookup");
+    d.binaryArchives = ars;
+    p = [device newRenderPipelineStateWithDescriptor:d options:MTLPipelineOptionFailOnBinaryArchiveMiss reflection:nil error:e];
+    hit = p != nil;
+    *e = nil;
+    d.binaryArchives = nil;  // the full compile below and the archived copy never reference them
+  }
+  if (!p)
+    p = compileRetrying(e, [&](NSError* __autoreleasing* pe) { return [device newRenderPipelineStateWithDescriptor:d error:pe]; });
+  if (p && !hit && archiveOn) queueArchive([d copy], false, d.label ? d.label.UTF8String : "internal");
+  return p;
+}
+
+id<MTLComputePipelineState> MetalBackend::Impl::internalComputePipeline(MTLComputePipelineDescriptor* d, NSError* __autoreleasing* e) {
+  id<MTLComputePipelineState> p = nil;
+  bool hit = false;
+  if (NSArray<id<MTLBinaryArchive>>* ars = archivesFor(descriptorKey(d, true)); ars.count) {
+    Inflight guard(this, "lookup");
+    d.binaryArchives = ars;
+    p = [device newComputePipelineStateWithDescriptor:d options:MTLPipelineOptionFailOnBinaryArchiveMiss reflection:nil error:e];
+    hit = p != nil;
+    *e = nil;
+    d.binaryArchives = nil;
+  }
+  if (!p) {
+    p = compileRetrying(e, [&](NSError* __autoreleasing* pe) {
+      return [device newComputePipelineStateWithDescriptor:d options:MTLPipelineOptionNone reflection:nil error:pe];
+    });
+  }
+  if (p && !hit && archiveOn) queueArchive([d copy], true, d.label ? d.label.UTF8String : "internal");
+  return p;
 }
 
 void MetalBackend::Impl::notePso(bool archived, double ms, const PipelineState& s, const char* kind) {
@@ -3854,8 +4118,8 @@ void MetalBackend::Impl::frameFinished(uint64_t frameIndex) {
     } else if (frameIndex > finishedBelow) {
       finishedAhead.insert(frameIndex);
     }
+    completions.fetch_add(1);  // under the lock: acquireSlot's wait tests it there
   }
-  completions.fetch_add(1);
   doneCv.notify_all();
 }
 
@@ -4076,6 +4340,19 @@ MetalBackend::WaitResult MetalBackend::Impl::drain(uint64_t timeoutNs, bool& dra
 
 MetalBackend::Impl::Slot* MetalBackend::Impl::acquireSlot(uint64_t frame) {
   if (!takeSlotSemaphore()) return nullptr;
+  // What the slot held until its previous frame finished goes back to the system after tableMutex is released (it is declared
+  // before the lock, so it is destroyed after it) and on a utility queue: giving GPU memory back is neither work for the submit
+  // thread nor for a holder of the tables.
+  struct Dying {
+    std::vector<id> objects;
+    ~Dying() {
+      if (objects.empty()) return;
+      __block std::vector<id> held = std::move(objects);
+      dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        held.clear();
+      });
+    }
+  } dying;
   {
     // The semaphore counts frames in flight, not which ones: a frame that completes before an earlier one (a short
     // compute-only frame next to a long render one) frees a count while the slot about to be taken may still be read by its
@@ -4086,13 +4363,18 @@ MetalBackend::Impl::Slot* MetalBackend::Impl::acquireSlot(uint64_t frame) {
     bool busy = false;
     uint64_t seen = completions.load();
     int64_t quietSince = steadyNs(), lastPass = quietSince;
-    while (!slotSettled(ix)) {
+    for (;;) {
+      const uint64_t before = completions.load();  // read before the check: a completion after it ends the wait below at once
+      if (slotSettled(ix)) break;
       if (lostFlag.load()) {
         dispatch_semaphore_signal(inFlight);
         return nullptr;
       }
       busy = true;
-      std::this_thread::sleep_for(std::chrono::microseconds(50));
+      {  // woken by frameFinished / the native tail / markLost (they notify after taking doneMutex); the 2 ms is the watchdog's tick
+        std::unique_lock<std::mutex> dl(doneMutex);
+        doneCv.wait_for(dl, std::chrono::milliseconds(2), [&] { return completions.load() != before || lostFlag.load(); });
+      }
       const uint64_t c = completions.load();
       const int64_t now = steadyNs();
       if (c != seen || vpgpu::backgroundGate().active() || now - lastPass > kPauseNs) seen = c, quietSince = now;
@@ -4127,6 +4409,7 @@ MetalBackend::Impl::Slot* MetalBackend::Impl::acquireSlot(uint64_t frame) {
     cnt.heldObjs.fetch_sub(std::min<uint64_t>(cnt.heldObjs.load(), slot.retired.size()), std::memory_order_relaxed);
     cnt.heldBytes.fetch_sub(std::min<uint64_t>(cnt.heldBytes.load(), slot.retiredBytes), std::memory_order_relaxed);
   }
+  dying.objects = std::move(slot.retired);
   slot.retired = std::move(graveyard);
   slot.retiredBytes = graveyardBytes;
   graveyard.clear();
@@ -4248,7 +4531,10 @@ bool MetalBackend::Impl::encodeNative(NativeEncodeFn fn, void* user) {
       watch->done = true;
     }
     impl->slotDone[slotIx].store(true, std::memory_order_release);  // the tail completed: nothing of this slot runs
-    impl->completions.fetch_add(1);
+    {
+      std::lock_guard lk(impl->doneMutex);  // under the lock: acquireSlot's wait tests the count there
+      impl->completions.fetch_add(1);
+    }
     impl->doneCv.notify_all();
     dispatch_semaphore_signal(sem);  // last: once every slot is back the backend may be destroyed
   }];
@@ -4999,22 +5285,10 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
       }
       // Same pixel format, one mip and slice: allowed without MTLTextureUsagePixelFormatView. The
       // command buffer retains it until the GPU is done.
-      id<MTLTexture> sv = s3 ? [st newTextureViewWithPixelFormat:st.pixelFormat
-                                                    textureType:MTLTextureType3D
-                                                         levels:NSMakeRange(s.mip, 1)
-                                                         slices:NSMakeRange(0, 1)]
-                             : [st newTextureViewWithPixelFormat:spf
-                                                    textureType:ms ? MTLTextureType2DMultisample : MTLTextureType2D
-                                                         levels:NSMakeRange(s.mip, 1)
-                                                         slices:NSMakeRange(s.layer + sl, 1)];
-      // Copy::blitSwapRB: the source read with red and blue swapped (a swizzled view of the view).
-      if (sv && c.blitSwapRB)
-        sv = [sv newTextureViewWithPixelFormat:sv.pixelFormat
-                                   textureType:sv.textureType
-                                        levels:NSMakeRange(0, 1)
-                                        slices:NSMakeRange(0, 1)
-                                       swizzle:MTLTextureSwizzleChannelsMake(MTLTextureSwizzleBlue, MTLTextureSwizzleGreen,
-                                                                             MTLTextureSwizzleRed, MTLTextureSwizzleAlpha)];
+      // (Cached across frames: sliceView; with Copy::blitSwapRB the source is read with red and blue swapped.)
+      id<MTLTexture> sv = s3 ? sliceView(st, st.pixelFormat, MTLTextureType3D, s.mip, 1, 0, 1, c.blitSwapRB, frameIndex)
+                             : sliceView(st, spf, ms ? MTLTextureType2DMultisample : MTLTextureType2D, s.mip, 1, s.layer + sl, 1,
+                                         c.blitSwapRB, frameIndex);
       if (!sv) {
         blitUnsupported(c, "src_view");
         break;
@@ -5690,7 +5964,10 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
           blitWarned.insert(std::string(dumping ? "hang_split_dump" : autoMsaaEnc ? "hang_split_auto_msaa" : "hang_split_memoryless")).second)
         info("gpu.hang split=off enc_draws=" + std::to_string(encDraws) + " reason=" + (dumping ? "dump" : autoMsaaEnc ? "auto_msaa" : "memoryless") +
              " (the split needs stored attachments)");
-      track.recs.reserve(std::min<size_t>(kMaxDrawRecs, track.recs.size() + encDraws));
+      {  // grows geometrically: an exact reserve per encoder would copy every earlier record again each time
+        const size_t want = std::min<size_t>(kMaxDrawRecs, track.recs.size() + encDraws);
+        if (want > track.recs.capacity()) track.recs.reserve(std::min<size_t>(kMaxDrawRecs, std::max(want, track.recs.capacity() * 2)));
+      }
       MTLStoreAction origColor[8] = {}, origDepth = MTLStoreActionDontCare, origStencil = MTLStoreActionDontCare;
       MTLRenderPassDescriptor* cont = nil;  // descriptor of the continuation chunks
       if (canSplit) {
@@ -5954,10 +6231,7 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
             const NSUInteger first = NSUInteger(a.seedLayer) + viewOff;
             const NSUInteger have = t.textureType == MTLTextureType2DArray ? t.arrayLength : 1;
             if (first + passLayers > have) return nil;
-            return [t newTextureViewWithPixelFormat:pf
-                                        textureType:MTLTextureType2DArray
-                                             levels:NSMakeRange(a.seedMip, 1)
-                                             slices:NSMakeRange(first, passLayers)];
+            return sliceView(t, pf, MTLTextureType2DArray, a.seedMip, 1, first, passLayers, false, frameIndex);
           };
           // The stencil plane of a depth/stencil format as a readable format (Stencil8 as is).
           auto stencilPlane = [](MTLPixelFormat pf) {
@@ -6752,6 +7026,9 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
                          uint64_t(g.layers) << 8 | g.samples})
         exclType = (exclType ^ v) * 1099511628211ull;
   releaseMsaaBackings(frameIndex);
+  releaseSliceViews(frameIndex, trimLevel.load(std::memory_order_relaxed) ? 0 : kViewKeepFrames);
+  if (trimLevel.load(std::memory_order_relaxed)) releaseFovShadows(frameIndex, 0, 0);  // memory warning: whatever this frame did not use
+  else if (frameIndex % kLedgerFrames == 0) releaseFovShadows(frameIndex, 600, 0);     // a configuration the game left
   if (residencyDirty) {  // render targets allocated lazily while encoding
     [residency commit];
     bump(cnt.resCommit);
@@ -7501,6 +7778,7 @@ MetalBackend::MetalBackend(const ShaderProvider& shaders, LogSink log, MetalOpti
   // The app went to the background: the save job flushes the whole archive queue at once (maybeSaveArchive). Never blocks.
   if (impl_->archiveOn)
     impl_->pauseHook = vpgpu::backgroundGate().addPauseHook([m = impl_.get()] { m->requestArchiveSave(); });
+  if (impl_->device && impl_->queue) impl_->startWarmInternal();  // after init: the archives are open and read-only from here
 }
 
 MetalBackend::~MetalBackend() {
@@ -7511,6 +7789,7 @@ MetalBackend::~MetalBackend() {
   for (dispatch_queue_t q : impl_->prewarmQueues)
     if (q) dispatch_sync(q, ^{});  // queued prewarms see `closing`; the running one finishes
   if (impl_->knockFsrQueue) dispatch_sync(impl_->knockFsrQueue, ^{});  // same for the knock's substitutes
+  if (impl_->warmQueue) dispatch_sync(impl_->warmQueue, ^{});  // the internal warm-up stops at its next item
   if (impl_->seedQueue) dispatch_sync(impl_->seedQueue, ^{});  // and the seed pipelines
   if (ok()) {
     vpgpu::backgroundGate().release();  // a commit parked for the background holds a slot drain() waits for
@@ -7957,7 +8236,11 @@ size_t MetalBackend::trimSerialized(std::string& report) {
       return 0;
     }
     const uint64_t msaa0 = m.trimmedMsaaBytes.load();
-    if (level) m.releaseMsaaBackings(m.lastSubmitFrame.load(std::memory_order_relaxed), false, true);
+    if (level) {
+      m.releaseMsaaBackings(m.lastSubmitFrame.load(std::memory_order_relaxed), false, true);
+      m.releaseFovShadows(m.lastSubmitFrame.load(std::memory_order_relaxed), 0, 0);
+      m.releaseSliceViews(m.lastSubmitFrame.load(std::memory_order_relaxed), 0);
+    }
     uint64_t argsFreed = 0;
     size_t unsettled = 0;
     for (size_t i = 0; i < m.slots.size(); ++i) {

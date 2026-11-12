@@ -11,6 +11,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
+#include <set>
 
 #include "egl_internal.h"
 #include "vpgles/vpgles.h"
@@ -97,6 +98,11 @@ bool err(EGLint e) {
 }
 
 std::mutex gEglLock;
+
+// What the display owns (Device::lock): eglTerminate releases it, and a handle that is not in these is refused instead of followed.
+std::set<Context*> gContexts;
+std::set<Surface*> gSurfaces;
+std::set<void*> gSyncs, gImages;  // EglSync / EglImage (defined below)
 
 }  // namespace
 
@@ -197,6 +203,7 @@ static EGLBoolean Initialize(EGLDisplay d, EGLint* major, EGLint* minor) {
     tError = SUCCESS;
     return TRUE_;
 }
+static void releaseDisplay();
 static EGLBoolean Terminate(EGLDisplay d) {
     if (d != kDisplay) return err(BAD_DISPLAY);
     if (Device* dv = device()) {
@@ -204,7 +211,9 @@ static EGLBoolean Terminate(EGLDisplay d) {
         texStatsTick(true);
         recipeStatsTick(true);
         mapStatsTick(true);
+        releaseDisplay();
     }
+    gDisplay.initialized = false;
     return TRUE_;
 }
 static const char* QueryString(EGLDisplay d, EGLint name) {
@@ -326,6 +335,7 @@ static EGLSurface CreateSurface(EGLConfig c, Surface::Kind kind, void* window, c
         zeroSurfaceImage(tmp, *s->depthStencil);
     }
     tmp.flush(true);
+    gSurfaces.insert(s);
     return s;
 }
 static EGLSurface CreateWindowSurface(EGLDisplay d, EGLConfig c, void* window, const EGLint* attribs) {
@@ -348,6 +358,7 @@ static void freeSurface(Surface* s) {
     Context* c = current();
     if (c) c->flush(true);
     else device()->waitSerial(device()->submitted);
+    gSurfaces.erase(s);
     delete s;
 }
 // Un hilo deja de tener `s` como draw/read; si estaba pendiente de destruir y ya nadie la usa, se borra.
@@ -359,6 +370,7 @@ static EGLBoolean DestroySurface(EGLDisplay d, EGLSurface s) {
     if (!s) return err(BAD_SURFACE);
     std::lock_guard<std::recursive_mutex> l(device()->lock);
     auto* surf = static_cast<Surface*>(s);
+    if (!gSurfaces.count(surf)) return err(BAD_SURFACE);  // released (eglTerminate) or never made
     // EGL 1.5: una superficie actual en algún hilo se destruye cuando deja de serlo (unbindSurface).
     if (surf->bound > 0) {
         surf->dead = true;
@@ -371,6 +383,10 @@ static EGLBoolean QuerySurface(EGLDisplay d, EGLSurface sv, EGLint attr, EGLint*
     if (d != kDisplay) return err(BAD_DISPLAY);
     auto* s = static_cast<Surface*>(sv);
     if (!s) return err(BAD_SURFACE);
+    {
+        std::lock_guard<std::recursive_mutex> l(device()->lock);
+        if (!gSurfaces.count(s)) return err(BAD_SURFACE);  // released (eglTerminate) or never made
+    }
     switch (attr) {
         case WIDTH: *value = EGLint(s->width); return TRUE_;
         case HEIGHT: *value = EGLint(s->height); return TRUE_;
@@ -413,21 +429,26 @@ static EGLContext CreateContext(EGLDisplay d, EGLConfig, EGLContext shareCtx, co
     // Strict (conformance) mode: only what is advertised; a 3.2 request fails so the caller falls back to 3.1.
     if (major == 3 && minor > gl::kAdvertisedMinor && vpglsl::strictMode()) return err(BAD_MATCH), nullptr;
     std::lock_guard<std::recursive_mutex> l(device()->lock);
-    if (shareCtx && static_cast<Context*>(shareCtx)->dead) return err(BAD_CONTEXT), nullptr;
+    if (shareCtx && (!gContexts.count(static_cast<Context*>(shareCtx)) || static_cast<Context*>(shareCtx)->dead))
+        return err(BAD_CONTEXT), nullptr;
     ShareGroup* sg = shareCtx ? static_cast<Context*>(shareCtx)->share : new ShareGroup;
-    return new Context(device(), sg, 3, 2);
+    auto* ctx = new Context(device(), sg, 3, 2);
+    gContexts.insert(ctx);
+    return ctx;
 }
 static EGLBoolean DestroyContext(EGLDisplay d, EGLContext c) {
     if (d != kDisplay) return err(BAD_DISPLAY);
     if (!c) return err(BAD_CONTEXT);
     std::lock_guard<std::recursive_mutex> l(device()->lock);
     auto* ctx = static_cast<Context*>(c);
+    if (!gContexts.count(ctx)) return err(BAD_CONTEXT);  // released (eglTerminate) or never made
     forgetContext(ctx);
     // EGL 1.5: un contexto actual en algún hilo (también en este) se borra cuando deja de serlo.
     if (ctx->owned) {
         ctx->dead = true;
         return TRUE_;
     }
+    gContexts.erase(ctx);
     delete ctx;
     return TRUE_;
 }
@@ -449,9 +470,9 @@ static EGLBoolean MakeCurrent(EGLDisplay d, EGLSurface draw, EGLSurface read, EG
     auto* ctx = static_cast<Context*>(c);
     auto* nd = static_cast<Surface*>(draw);
     auto* nr = static_cast<Surface*>(read);
-    if (ctx && ctx->dead) return err(BAD_CONTEXT);
+    if (ctx && (!gContexts.count(ctx) || ctx->dead)) return err(BAD_CONTEXT);
     if (ctx && ctx->owned && ctx->owner != std::this_thread::get_id()) return err(BAD_ACCESS);  // actual en otro hilo
-    if ((nd && nd->dead) || (nr && nr->dead)) return err(BAD_SURFACE);
+    if ((nd && (!gSurfaces.count(nd) || nd->dead)) || (nr && (!gSurfaces.count(nr) || nr->dead))) return err(BAD_SURFACE);
     Context* old = current();
     Surface* oldDraw = tDraw;
     Surface* oldRead = tRead;
@@ -464,7 +485,7 @@ static EGLBoolean MakeCurrent(EGLDisplay d, EGLSurface draw, EGLSurface read, EG
     tRead = nr;
     unbindSurface(oldDraw);
     unbindSurface(oldRead);
-    if (old && old != ctx && old->dead) delete old;  // destruido mientras era actual (forgetContext ya hecho)
+    if (old && old != ctx && old->dead) gContexts.erase(old), delete old;  // destruido mientras era actual (forgetContext ya hecho)
     if (ctx) {
         const bool first = !ctx->draw && !ctx->viewport[2];
         ctx->draw = tDraw;
@@ -485,6 +506,7 @@ static EGLBoolean SwapBuffers(EGLDisplay d, EGLSurface sv) {
     auto* s = static_cast<Surface*>(sv);
     if (!s) return err(BAD_SURFACE);
     std::lock_guard<std::recursive_mutex> l(device()->lock);
+    if (!gSurfaces.count(s)) return err(BAD_SURFACE);
     Context* c = current();
     if (c) c->flush(true);
     ++s->presented;
@@ -505,7 +527,10 @@ static EGLint GetError() {
     return e;
 }
 static EGLBoolean WaitGL() {
-    if (Context* c = current()) c->flush(true);
+    if (Context* c = current()) {
+        std::lock_guard<std::recursive_mutex> l(device()->lock);
+        c->flush(true);
+    }
     return TRUE_;
 }
 static EGLBoolean WaitNative(EGLint) { return TRUE_; }
@@ -525,26 +550,32 @@ static EGLSync CreateSyncKHR(EGLDisplay d, EGLenum type, const EGLint*) {
     Context* c = current();
     uint64_t serial = c ? c->flush(false) : 0;
     if (!serial) serial = device()->submitted;
-    return new EglSync{serial};
+    auto* y = new EglSync{serial};
+    gSyncs.insert(y);
+    return y;
 }
 static EGLBoolean DestroySyncKHR(EGLDisplay, EGLSync s) {
+    std::lock_guard<std::recursive_mutex> l(device()->lock);
+    if (!gSyncs.erase(s)) return err(BAD_PARAMETER);  // released (eglTerminate) or never made
     delete static_cast<EglSync*>(s);
     return TRUE_;
 }
 static EGLint ClientWaitSyncKHR(EGLDisplay, EGLSync s, EGLint, uint64_t timeout) {
     if (!s) return err(BAD_PARAMETER), FALSE_;
     std::lock_guard<std::recursive_mutex> l(device()->lock);
+    if (!gSyncs.count(s)) return err(BAD_PARAMETER), FALSE_;
     auto* y = static_cast<EglSync*>(s);
     device()->retire(false);
     if (device()->completed >= y->serial) return CONDITION_SATISFIED_KHR;
     if (timeout == 0) return TIMEOUT_EXPIRED_KHR;
-    device()->waitSerial(y->serial);
+    if (!device()->waitSerial(y->serial, timeout)) return TIMEOUT_EXPIRED_KHR;
     return CONDITION_SATISFIED_KHR;
 }
 static EGLint WaitSyncKHR(EGLDisplay, EGLSync, EGLint) { return TRUE_; }  // one queue: already ordered
 static EGLBoolean GetSyncAttribKHR(EGLDisplay, EGLSync s, EGLint attr, EGLint* value) {
     if (!s) return err(BAD_PARAMETER);
     std::lock_guard<std::recursive_mutex> l(device()->lock);
+    if (!gSyncs.count(s)) return err(BAD_PARAMETER);
     device()->retire(false);
     auto* y = static_cast<EglSync*>(s);
     switch (attr) {
@@ -566,18 +597,49 @@ static EGLImage CreateImageKHR(EGLDisplay d, EGLContext c, EGLenum target, void*
     std::lock_guard<std::recursive_mutex> l(device()->lock);
     if (target == 0x30B1 /* EGL_GL_TEXTURE_2D_KHR */) {
         auto* ctx = static_cast<Context*>(c);
-        if (!ctx) return err(BAD_CONTEXT), nullptr;
+        if (!ctx || !gContexts.count(ctx)) return err(BAD_CONTEXT), nullptr;
         Texture* t = ctx->texture(GLuint(reinterpret_cast<uintptr_t>(buffer)));
         if (!t || !t->image) return err(BAD_PARAMETER), nullptr;
-        return new EglImage{t->image, gl::TEXTURE_2D};
+        auto* i = new EglImage{t->image, gl::TEXTURE_2D};
+        gImages.insert(i);
+        return i;
     }
     // EGL_NATIVE_BUFFER_ANDROID (AHardwareBuffer from the host's video path) is the host's (Klepton's
     // kl_egl.c) business: it keeps answering it.
     return err(BAD_PARAMETER), nullptr;
 }
 static EGLBoolean DestroyImageKHR(EGLDisplay, EGLImage i) {
+    std::lock_guard<std::recursive_mutex> l(device()->lock);
+    if (!gImages.erase(i)) return err(BAD_PARAMETER);  // released (eglTerminate) or never made (the host's own: it answers those)
     delete static_cast<EglImage*>(i);
     return TRUE_;
+}
+
+// eglTerminate: what the display owns is released, except what a thread still has current (contexts and surfaces go when they
+// stop being current: MakeCurrent / unbindSurface); what the device cached for reuse goes back; all of it is made again on demand
+// when the display is initialized again (Device::lock held).
+static void releaseDisplay() {
+    for (Context* c : std::vector<Context*>(gContexts.begin(), gContexts.end())) {
+        if (c->owned) {
+            c->dead = true;
+            continue;
+        }
+        forgetContext(c);
+        gContexts.erase(c);
+        delete c;
+    }
+    for (Surface* s : std::vector<Surface*>(gSurfaces.begin(), gSurfaces.end())) {
+        if (s->bound > 0) {
+            s->dead = true;
+            continue;
+        }
+        freeSurface(s);
+    }
+    for (void* y : gSyncs) delete static_cast<EglSync*>(y);
+    for (void* i : gImages) delete static_cast<EglImage*>(i);
+    gSyncs.clear(), gImages.clear();
+    device()->waitSerial(device()->submitted);
+    device()->trim();
 }
 
 }  // namespace vpgles
@@ -586,7 +648,7 @@ static EGLBoolean DestroyImageKHR(EGLDisplay, EGLImage i) {
 namespace vpgles {
 bool eglImageToTexture(void* image, Texture& t) {
     auto* i = static_cast<EglImage*>(image);
-    if (!i || !i->image) return false;
+    if (!i || !gImages.count(i) || !i->image) return false;  // (the caller holds Device::lock)
     t.image = i->image;
     t.levels = {{i->image->width, i->image->height, 1, i->image->format}};
     t.immutable = true, t.immutableLevels = 1;

@@ -18,26 +18,34 @@ final class SenseTracking: @unchecked Sendable {
     private var task: Task<Void, Never>?
     private var tracked: Set<ObjectIdentifier> = []
     private var starting = false
+    private var startingSet: Set<ObjectIdentifier> = [] // what the start under way is for
+    private var pending: [GCController]? // the newest set asked for while a start was under way
+    private var epoch = 0 // raised by every stop(): a start that was under way when it came must not keep its session
 
     private init() {}
 
     /// Tracks these controllers (and no others). Returns at once; loading the accessories and
     /// asking for the permission go on in the background. Calling it again with the same
-    /// controllers does nothing.
+    /// controllers does nothing. Asked while a start is under way, it is done when that one ends
+    /// (the newest set asked for wins).
     func track(_ controllers: [GCController]) {
         let wanted = Set(controllers.map(ObjectIdentifier.init))
         lock.lock()
-        if wanted == tracked || starting {
+        if starting {
+            pending = wanted == startingSet ? nil : controllers
+            lock.unlock()
+            return
+        }
+        if wanted == tracked {
             lock.unlock()
             return
         }
         starting = true
+        startingSet = wanted
         lock.unlock()
-        stop()
+        halt()
         guard !controllers.isEmpty else {
-            lock.lock()
-            starting = false
-            lock.unlock()
+            endStart()
             return
         }
         Task.detached(priority: .userInitiated) { [weak self] in
@@ -45,10 +53,21 @@ final class SenseTracking: @unchecked Sendable {
         }
     }
 
-    private func start(_ controllers: [GCController], wanted: Set<ObjectIdentifier>) async {
-        defer {
-            lock.withLock { starting = false }
+    /// Ends the start under way, and begins the set asked for meanwhile, if there is one.
+    private func endStart() {
+        let next = lock.withLock { () -> [GCController]? in
+            starting = false
+            startingSet = []
+            let next = pending
+            pending = nil
+            return next
         }
+        if let next { track(next) }
+    }
+
+    private func start(_ controllers: [GCController], wanted: Set<ObjectIdentifier>) async {
+        let startedAt = lock.withLock { epoch }
+        defer { endStart() }
         guard AccessoryTrackingProvider.isSupported else {
             LogFiles.log("Sense tracking: not supported here")
             return
@@ -71,9 +90,15 @@ final class SenseTracking: @unchecked Sendable {
             LogFiles.log("Sense tracking: could not start (\(error.localizedDescription))")
             return
         }
-        lock.withLock {
+        let stale = lock.withLock { () -> Bool in
+            if epoch != startedAt { return true }
             self.session = session
             tracked = wanted
+            return false
+        }
+        if stale {
+            session.stop()
+            return
         }
         LogFiles.log("Sense tracking: on for \(accessories.count) controller(s)")
         let updates = Task.detached(priority: .userInitiated) {
@@ -86,12 +111,19 @@ final class SenseTracking: @unchecked Sendable {
     }
 
     func stop() {
+        lock.withLock { pending = nil } // nothing asked for before the stop is wanted after it
+        halt()
+    }
+
+    /// Stops the session and the updates; what was asked for during a start (pending) stays.
+    private func halt() {
         lock.lock()
         let session = self.session
         let task = self.task
         self.session = nil
         self.task = nil
         tracked = []
+        epoch += 1
         lock.unlock()
         task?.cancel()
         session?.stop()

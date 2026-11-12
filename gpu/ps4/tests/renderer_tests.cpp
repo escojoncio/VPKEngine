@@ -6,12 +6,14 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <memory>
 #include <sstream>
 #include <string>
 #include <vector>
 
 #include "vpgpu/core/device.h"
 #include "vpps4/fetch.h"
+#include "vpps4/formats.h"
 #include "vpps4/renderer.h"
 #include "vpps4/tiling.h"
 
@@ -58,7 +60,8 @@ struct Fixture {
     std::vector<std::string> log;
     vpgpu::Device device{backend, 0, [this](const std::string& s) { log.push_back(s); }};
     std::vector<std::pair<uint64_t, vpir::Stage>> shaders;
-    vpps4::Renderer renderer{device, hooks()};
+    std::unique_ptr<vpps4::Renderer> rendererOwner{new vpps4::Renderer(device, hooks())};  // (a test may drop it to see its teardown)
+    vpps4::Renderer& renderer = *rendererOwner;
     Program vs = load("vs_fetch"), ps = load("ps_textured");
 
     Fixture() { std::memset(host, 0, kSize); }
@@ -418,6 +421,51 @@ void busyRanges() {
     CHECK(!f.renderer.gpuMayAccess(kBase + 0x5000, 4));
 }
 
+// What the renderer caches on the device does not grow without end: targets nothing used for a long time are released (one a
+// draw samples every submit is not), and the renderer's teardown releases everything it made.
+void evictIdle() {
+    Fixture f;
+    vpps4::DrawState keep = f.state();  // renders to kBase + 0x40000 and samples the texture at +0x10000
+    f.renderer.draw(keep);
+    f.renderer.submit();
+    constexpr int kSubmits = 3000;
+    for (int i = 0; i < kSubmits; ++i) {
+        vpps4::DrawState d = f.state();
+        d.color[0].address = kBase + 0x200000 + uint64_t(i) * 0x1000;  // a new surface each time (a level load, a resolution change)
+        f.renderer.draw(d);
+        if (i % 50 == 0) f.renderer.draw(keep);  // the first one stays in use
+        f.renderer.submit();
+    }
+    const vpps4::Stats& s = f.renderer.stats();
+    CHECK(s.targets == 1 + kSubmits);  // the kept target and the texture were made once: never released and made again
+    CHECK(s.textures == 1);
+    const size_t made = f.count("createTexture"), gone = f.count("destroyTexture");
+    CHECK(gone > 500);
+    CHECK(made - gone < 2500);  // bounded by what was used in the last ~2000 submits (it was 3002 live before)
+    // Teardown: every object the renderer made on the device is released.
+    f.rendererOwner.reset();
+    CHECK(f.count("createTexture") == f.count("destroyTexture"));
+    CHECK(f.count("createBuffer") == f.count("destroyBuffer"));
+    CHECK(f.count("createSampler") == f.count("destroySampler"));
+    CHECK(f.count("createSampler") > 0);
+}
+
+// A big texture source (a 1080p texture is 8 MiB) is staged in a buffer of its own, not in the draws' upload ring.
+void bigStaging() {
+    Fixture f;
+    const uint64_t bytes = 700000;
+    CHECK(f.renderer.fill(kBase + 0x1000, bytes, 0x12345678u));  // a pattern that is not one byte: staged
+    const uint64_t size = (bytes + 16383) / 16384 * 16384;
+    bool own = false, ring = false;
+    for (const std::string& c : f.backend.calls) {
+        if (c.rfind("createBuffer", 0) != 0) continue;
+        own = own || c.find("size=" + std::to_string(size) + " ") != std::string::npos;
+        ring = ring || c.find("size=16777216 ") != std::string::npos;
+    }
+    CHECK(own);
+    CHECK(!ring);
+}
+
 // Microbenchmark: 16 frames of 1600 textured draws, a submit every 100 draws (the shape of the
 // world scene). Prints the CPU cost per draw of the renderer + frame compiler on the NullBackend.
 void drawBench() {
@@ -442,6 +490,22 @@ void drawBench() {
     CHECK(f.renderer.stats().drawn >= uint64_t(kFrames * kDraws));
 }
 
+// CB_BLEND factors with a gpu/core equivalent are exact (constant alpha and source-alpha saturate used to be approximated
+// with other factors and reported as exact); only dual-source and reserved codes are approximations.
+void blendFactors() {
+    using F = vpgpu::BlendFactor;
+    struct Case { uint8_t gcn; F want; bool exact; };
+    const Case cases[] = {{0, F::Zero, true}, {1, F::One, true}, {10, F::SrcAlphaSaturate, true}, {13, F::Constant, true},
+                          {14, F::OneMinusConstant, true}, {19, F::ConstantAlpha, true}, {20, F::OneMinusConstantAlpha, true},
+                          {15, F::Zero, false}, {18, F::Zero, false}, {11, F::Zero, false}};
+    for (const Case& c : cases) {
+        bool exact = true;
+        const F got = vpps4::blendFactor(c.gcn, exact);
+        if (got != c.want || exact != c.exact) std::fprintf(stderr, "blendFactor(%u): got %d exact=%d\n", c.gcn, int(got), int(exact));
+        CHECK(got == c.want && exact == c.exact);
+    }
+}
+
 int main(int argc, char** argv) {
     const std::string t = argc > 1 ? argv[1] : "";
     if (t == "clear_and_draw") clearAndDraw();
@@ -461,6 +525,9 @@ int main(int argc, char** argv) {
     else if (t == "storage_alias") storageAlias();
     else if (t == "busy_ranges") busyRanges();
     else if (t == "draw_bench") drawBench();
+    else if (t == "evict_idle") evictIdle();
+    else if (t == "big_staging") bigStaging();
+    else if (t == "blend_factors") blendFactors();
     else return std::fprintf(stderr, "unknown test %s\n", t.c_str()), 2;
     return failures ? 1 : 0;
 }

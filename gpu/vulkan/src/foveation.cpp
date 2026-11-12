@@ -1,4 +1,5 @@
 #include "foveation.h"
+#include <atomic>
 
 #include <algorithm>
 #include <cmath>
@@ -6,8 +7,10 @@
 
 namespace vpvk::fov {
 namespace {
+// std::clamp lets a NaN through (a host's 0/0 tangent, an unset float): it becomes `def`.
+float clampOr(float v, float lo, float hi, float def) { return v != v ? def : std::clamp(v, lo, hi); }
 float smootherstep(float t) {
-  t = std::clamp(t, 0.0f, 1.0f);
+  t = clampOr(t, 0.0f, 1.0f, 0.0f);
   return t * t * t * (t * (t * 6.0f - 15.0f) + 10.0f);
 }
 uint64_t mix(uint64_t h, uint64_t v) { return (h ^ v) * 0x100000001b3ull; }
@@ -33,12 +36,12 @@ Shape shapeOf(int mode, float sharp, float periphery, float height) {
     case 2: s = presetM5(); break;
     case 3:
       s.off = false;
-      s.sharp = std::clamp(sharp, 0.05f, 1.0f);
-      s.periphery = std::clamp(periphery, 0.1f, 1.0f);
+      s.sharp = clampOr(sharp, 0.05f, 1.0f, s.sharp);
+      s.periphery = clampOr(periphery, 0.1f, 1.0f, s.periphery);
       break;
     default: return s;  // apagado
   }
-  s.height = std::clamp(s.height + height, -0.5f, 0.5f);  // en los presets, `height` es un ajuste sobre el suyo
+  s.height = clampOr(s.height + clampOr(height, -0.5f, 0.5f, 0.0f), -0.5f, 0.5f, 0.0f);  // en los presets, `height` es un ajuste sobre el suyo
   return s;
 }
 
@@ -54,15 +57,16 @@ const char* modeName(int mode) {
 Center opticalCenter(const std::array<float, 4>& t) {
   Center c;
   const float h = t[0] + t[1], v = t[2] + t[3];
-  if (h > 1e-6f && t[0] >= 0 && t[1] >= 0) c.x = std::clamp(t[0] / h, 0.05f, 0.95f);
-  if (v > 1e-6f && t[2] >= 0 && t[3] >= 0) c.y = std::clamp(t[2] / v, 0.05f, 0.95f);
+  if (h > 1e-6f && t[0] >= 0 && t[1] >= 0) c.x = clampOr(t[0] / h, 0.05f, 0.95f, c.x);
+  if (v > 1e-6f && t[2] >= 0 && t[3] >= 0) c.y = clampOr(t[2] / v, 0.05f, 0.95f, c.y);
   return c;
 }
 
 void axisQuality(float* q, uint32_t zones, float center, float sharp, float periphery, float fade) {
-  center = std::clamp(center, 0.0f, 1.0f);
-  sharp = std::clamp(sharp, 0.0f, 0.99f);
-  periphery = std::clamp(periphery, 0.1f, 1.0f);
+  center = clampOr(center, 0.0f, 1.0f, 0.5f);
+  sharp = clampOr(sharp, 0.0f, 0.99f, 0.35f);
+  periphery = clampOr(periphery, 0.1f, 1.0f, 1.0f);
+  if (fade != fade) fade = -1.0f;
   for (uint32_t i = 0; i < zones; ++i) {
     const float p = (float(i) + 0.5f) / float(zones);
     // Distancia al centro normalizada con el borde de SU lado: 1 en el borde de la imagen a cada lado.
@@ -85,9 +89,13 @@ float keptFraction(const vpgpu::RateMap& m) {
   return float(sum / m.layers);
 }
 
+static std::atomic<uint64_t> gBuilds{0};
+uint64_t rateMapBuilds() { return gBuilds.load(std::memory_order_relaxed); }
+
 std::shared_ptr<vpgpu::RateMap> buildRateMap(uint32_t w, uint32_t h, uint16_t layers, const Shape& shape, const Eyes& eyes,
                                              uint32_t zones) {
   if (shape.off || !w || !h || !layers) return nullptr;
+  gBuilds.fetch_add(1, std::memory_order_relaxed);
   zones = std::clamp<uint32_t>(zones, 1, kMaxZones);
   auto m = std::make_shared<vpgpu::RateMap>();
   m->width = w, m->height = h, m->layers = layers;
@@ -98,7 +106,7 @@ std::shared_ptr<vpgpu::RateMap> buildRateMap(uint32_t w, uint32_t h, uint16_t la
     Center c;
     if (eyes.known) c = opticalCenter(eyes.tangents[std::min<size_t>(l, 1)]);
     // `height` + = el centro de la zona nítida sube (y desde arriba baja).
-    const float cy = std::clamp(c.y - shape.height, 0.0f, 1.0f);
+    const float cy = clampOr(c.y - shape.height, 0.0f, 1.0f, 0.5f);
     axisQuality(&m->qx[size_t(l) * zones], zones, c.x, shape.sharp, shape.periphery, shape.fade);
     axisQuality(&m->qy[size_t(l) * zones], zones, cy, shape.sharp, shape.periphery, shape.fade);
   }

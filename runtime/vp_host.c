@@ -192,33 +192,60 @@ __attribute__((weak)) int vp_dispatch_miss_possible(uint64_t target) {
     return vp_hooks.dispatch_miss_possible ? vp_hooks.dispatch_miss_possible(target) : 0;
 }
 
-#define VP_MAX_NATIVES 4096
+#define VP_MAX_NATIVES 16384
 static struct { uint64_t guest; VpNative fn; } vp_natives[VP_MAX_NATIVES];
 static size_t vp_native_count;
+/* Natives are registered while other threads dispatch (a runtime that loads a module while the
+ * game runs). Writers take the lock and bracket the rewrite with an odd sequence number; the
+ * lookups read the table with relaxed atomic loads and run again if a rewrite overlapped. */
+static pthread_mutex_t vp_natives_lock = PTHREAD_MUTEX_INITIALIZER;
+static unsigned vp_native_seq;
 
-/* Registration happens before the threads start; the table is kept sorted for the lookups. */
+#define NAT_GUEST(i) __atomic_load_n(&vp_natives[i].guest, __ATOMIC_RELAXED)
+#define NAT_FN(i) __atomic_load_n(&vp_natives[i].fn, __ATOMIC_RELAXED)
+#define NAT_SET(i, g, f) (__atomic_store_n(&vp_natives[i].guest, (g), __ATOMIC_RELAXED), __atomic_store_n(&vp_natives[i].fn, (f), __ATOMIC_RELAXED))
+
 void vp_register_native(uint64_t guest, VpNative fn) {
-    size_t i;
-    for (i = 0; i < vp_native_count; ++i) {
-        if (vp_natives[i].guest == guest) { vp_natives[i].fn = fn; vp_dispatch_changed(); return; }
-        if (vp_natives[i].guest > guest) break;
+    pthread_mutex_lock(&vp_natives_lock);
+    size_t lo = 0, hi = vp_native_count;
+    while (lo < hi) {
+        const size_t mid = (lo + hi) / 2;
+        if (NAT_GUEST(mid) < guest) lo = mid + 1; else hi = mid;
     }
-    if (vp_native_count >= VP_MAX_NATIVES) return;
-    for (size_t k = vp_native_count; k > i; --k) vp_natives[k] = vp_natives[k - 1];
-    vp_natives[i].guest = guest;
-    vp_natives[i].fn = fn;
-    vp_native_count++;
+    const size_t i = lo;
+    if (i < vp_native_count && NAT_GUEST(i) == guest) {
+        __atomic_store_n(&vp_natives[i].fn, fn, __ATOMIC_RELAXED);
+    } else if (vp_native_count >= VP_MAX_NATIVES) {
+        pthread_mutex_unlock(&vp_natives_lock);
+        fprintf(stderr, "vp: the table of %d natives is full: %#llx is not registered\n", VP_MAX_NATIVES, (unsigned long long)guest);
+        return;
+    } else {
+        __atomic_store_n(&vp_native_seq, vp_native_seq + 1, __ATOMIC_RELAXED);
+        __atomic_thread_fence(__ATOMIC_RELEASE);
+        for (size_t k = vp_native_count; k > i; --k) NAT_SET(k, NAT_GUEST(k - 1), NAT_FN(k - 1));
+        NAT_SET(i, guest, fn);
+        __atomic_store_n(&vp_native_count, vp_native_count + 1, __ATOMIC_RELAXED);
+        __atomic_store_n(&vp_native_seq, vp_native_seq + 1, __ATOMIC_RELEASE);
+    }
+    pthread_mutex_unlock(&vp_natives_lock);
     vp_dispatch_changed(); /* cached embedder targets must not shadow a new native */
 }
 
 static VpNative vp_find_native(uint64_t guest) {
-    size_t lo = 0, hi = vp_native_count;
-    while (lo < hi) {
-        const size_t mid = (lo + hi) / 2;
-        if (vp_natives[mid].guest == guest) return vp_natives[mid].fn;
-        if (vp_natives[mid].guest < guest) lo = mid + 1; else hi = mid;
+    for (;;) {
+        const unsigned before = __atomic_load_n(&vp_native_seq, __ATOMIC_ACQUIRE);
+        if (before & 1) continue; /* a registration is rewriting the table */
+        VpNative found = NULL;
+        size_t lo = 0, hi = __atomic_load_n(&vp_native_count, __ATOMIC_RELAXED);
+        while (lo < hi) {
+            const size_t mid = (lo + hi) / 2;
+            const uint64_t g = NAT_GUEST(mid);
+            if (g == guest) { found = NAT_FN(mid); break; }
+            if (g < guest) lo = mid + 1; else hi = mid;
+        }
+        __atomic_thread_fence(__ATOMIC_ACQUIRE);
+        if (__atomic_load_n(&vp_native_seq, __ATOMIC_RELAXED) == before) return found;
     }
-    return NULL;
 }
 
 void vp_call_native(VpCpu* c, uint64_t guest) {
@@ -254,10 +281,28 @@ static void vp_note_missing(uint64_t target) {
     for (size_t i = 0; i < vp_missing_count; ++i) {
         if (vp_missing_seen[i] == target) { pthread_mutex_unlock(&vp_missing_lock); return; }
     }
-    if (vp_missing_count < sizeof vp_missing_seen / sizeof vp_missing_seen[0]) vp_missing_seen[vp_missing_count++] = target;
+    if (vp_missing_count >= sizeof vp_missing_seen / sizeof vp_missing_seen[0]) { /* full: no more lines, or the file grows without limit */
+        pthread_mutex_unlock(&vp_missing_lock);
+        return;
+    }
+    vp_missing_seen[vp_missing_count++] = target;
     const char* path = vp_missing_path[0] ? vp_missing_path : getenv("VPKENGINE_MISSING_LOG");
-    FILE* f = path && *path ? fopen(path, "a") : NULL;
-    fprintf(f ? f : stderr, "%s%s+%#llx\n", f ? "" : "VPKENGINE: missing entry ", m->name, (unsigned long long)off);
+    FILE* f = path && *path ? fopen(path, "a+") : NULL;
+    char entry[256];
+    snprintf(entry, sizeof entry, "%s+%#llx\n", m->name, (unsigned long long)off);
+    /* The file outlives the process: an earlier session (or the app, after translating the entry
+     * on demand) may have written it already. */
+    int known = 0;
+    if (f) {
+        char line[512];
+        rewind(f);
+        while (!known && fgets(line, sizeof line, f)) known = !strcmp(line, entry);
+        fseek(f, 0, SEEK_END); /* between reading and writing */
+    }
+    if (!known) {
+        if (f) fputs(entry, f);
+        else fprintf(stderr, "VPKENGINE: missing entry %s", entry);
+    }
     if (f) fclose(f);
     pthread_mutex_unlock(&vp_missing_lock);
 }
@@ -389,7 +434,7 @@ __attribute__((weak)) void vp_syscall(VpCpu* c) {
 uint64_t vp_rdtsc(VpCpu* c) {
     (void)c;
     static uint64_t t;
-    return t += 1000;
+    return __atomic_add_fetch(&t, 1000, __ATOMIC_RELAXED);
 }
 
 void vp_apply_mxcsr(VpCpu* c) {
@@ -399,6 +444,17 @@ void vp_apply_mxcsr(VpCpu* c) {
     case 2: fesetround(FE_UPWARD); break;
     default: fesetround(FE_TOWARDZERO); break;
     }
+    /* DAZ (bit 6) and FTZ (bit 15) are applied to the host's own state, so the translated float code
+     * (which compiles to the hardware instructions) flushes denormals as the guest asked. */
+#if defined(__x86_64__)
+    __builtin_ia32_ldmxcsr((__builtin_ia32_stmxcsr() & ~0x8040u) | (c->mxcsr & 0x8040u));
+#elif defined(__aarch64__)
+    /* FPCR.FZ flushes inputs and results together: there is no separate DAZ / FTZ, so either bit sets it. */
+    uint64_t fpcr;
+    __asm__ volatile("mrs %0, fpcr" : "=r"(fpcr));
+    fpcr = (fpcr & ~(UINT64_C(1) << 24)) | ((c->mxcsr & 0x8040u) ? UINT64_C(1) << 24 : 0);
+    __asm__ volatile("msr fpcr, %0" : : "r"(fpcr));
+#endif
 }
 
 __attribute__((weak)) void vp_trace(VpCpu* cpu, uint64_t rip) { (void)cpu; (void)rip; }

@@ -51,7 +51,7 @@ def main():
             stale.append(n)
         o = old.get(n) if old is not None else None
         if bad:
-            if o is None:
+            if o is None or o == "NotRun":  # not seen before (a shard whose budget ended before it counts as not seen)
                 if old is not None:
                     newcases_bad.append((n, st))
             elif o in OK:

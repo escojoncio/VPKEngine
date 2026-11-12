@@ -2,6 +2,7 @@
 // `golden IN.vpir --reject SUBSTRING` expects emission to fail with that error.
 // `golden IN.vpir EXPECTED.metal --color-outputs MASK` also checks MslShader::colorOutputs.
 // `golden IN.vpir EXPECTED.metal --sampler-bias` emits with EmitOptions::samplerBias.
+// `golden IN.vpir --max-source BYTES` expects emission to succeed with at most that much MSL.
 // `golden IN.vpir EXPECTED.metal --rate-map` emits with Module::rateMapPosition set (foveation).
 #include <cstdio>
 #include <cstdlib>
@@ -24,9 +25,10 @@ std::string readFile(const char* path) {
 int main(int argc, char** argv) {
     const bool reject = argc == 4 && std::string(argv[2]) == "--reject";
     const bool mask = argc == 5 && std::string(argv[3]) == "--color-outputs";
+    const bool maxSource = argc == 4 && std::string(argv[2]) == "--max-source";
     const bool rateMap = argc == 4 && std::string(argv[3]) == "--rate-map";
     const bool samplerBias = argc == 4 && std::string(argv[3]) == "--sampler-bias";
-    if (argc != 3 && !reject && !mask && !rateMap && !samplerBias) {
+    if (argc != 3 && !reject && !maxSource && !mask && !rateMap && !samplerBias) {
         std::fprintf(stderr, "usage: vpmsl_golden IN.vpir (EXPECTED.metal [--color-outputs MASK] | --reject SUBSTRING)\n");
         return 2;
     }
@@ -47,6 +49,11 @@ int main(int argc, char** argv) {
     }
     for (const std::string& e : r.errors) std::fprintf(stderr, "verify: %s\n", e.c_str());
     if (!r.errors.empty()) return 1;
+    if (maxSource) {
+        if (r.shader.source.size() <= std::strtoul(argv[3], nullptr, 0)) return 0;
+        std::fprintf(stderr, "%zu bytes of MSL, expected at most %s\n", r.shader.source.size(), argv[3]);
+        return 1;
+    }
     if (mask && r.shader.colorOutputs != std::strtoul(argv[4], nullptr, 0)) {
         std::fprintf(stderr, "colorOutputs = 0x%02x, expected %s\n", r.shader.colorOutputs, argv[4]);
         return 1;

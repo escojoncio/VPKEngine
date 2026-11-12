@@ -2,10 +2,12 @@
 // or `builder` (API smoke test).
 #include <algorithm>
 #include <bit>
+#include <chrono>
 #include <cstdio>
 #include <fstream>
 #include <limits>
 #include <map>
+#include <pthread.h>
 #include <set>
 #include <sstream>
 #include <string>
@@ -192,11 +194,94 @@ int builder() {
     return 0;
 }
 
+// optimize() on a straight chain of 20000 values nobody reads: the dead-value sweep removes the whole chain in
+// one walk (it recounted the uses once per link: about 10 s of CPU for 20000).
+int deadChain() {
+    Module m;
+    m.stage = Stage::Fragment;
+    IoVar in;
+    in.name = "x";
+    in.type = kU32;
+    in.interp = Interp::Flat;
+    m.inputs.push_back(in);
+    FunctionBuilder b(m, "main");
+    ValueId x = b.loadInput(0, kU32);
+    for (int i = 0; i < 20000; ++i) x = b.binary(Op::Add, x, b.loadInput(0, kU32), kU32);
+    b.finish();
+    if (auto errors = verify(m); !errors.empty()) return fail("verify:\n" + joined(errors));
+    auto t0 = std::chrono::steady_clock::now();
+    optimize(m);
+    double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    if (!m.functions[0].body.empty()) return fail("dead chain not removed: " + std::to_string(m.functions[0].body.size()) + " nodes left");
+    if (ms > 5000) return fail("optimize took " + std::to_string(ms) + " ms on a dead chain");
+    return 0;
+}
+
+// 40000 nested ifs, each with a then and an else node: the builder finds the open block in O(1)
+// (it walked the whole path of open regions on every node: ~1e9 steps here). Run in a big stack:
+// destroying a nest that deep recurses.
+int deepNestBody() {
+    constexpr int kDepth = 40000;
+    Module m;
+    m.stage = Stage::Fragment;
+    IoVar in;
+    in.name = "x";
+    in.type = kU32;
+    in.interp = Interp::Flat;
+    m.inputs.push_back(in);
+    auto t0 = std::chrono::steady_clock::now();
+    {
+        FunctionBuilder b(m, "main");
+        ValueId x = b.loadInput(0, kU32);
+        ValueId c = b.binary(Op::Eq, x, x, kBool);
+        for (int i = 0; i < kDepth; ++i) {
+            b.beginIf(c);
+            b.loadInput(0, kU32);  // then-branch node
+            b.beginElse();
+            b.loadInput(0, kU32);  // else-branch node, then the next level
+        }
+        for (int i = 0; i < kDepth; ++i) b.end();
+        b.finish();
+    }
+    double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    // Every level: [If] with one node in then, and else = {node, If...}.
+    const Block* blk = &m.functions[0].body;
+    if (blk->size() != 3) return fail("body has " + std::to_string(blk->size()) + " nodes, expected 3");
+    int levels = 0;
+    for (const Node* n = &(*blk)[2]; n->kind == NodeKind::If;) {
+        ++levels;
+        if (n->body.size() != 1) return fail("then branch of level " + std::to_string(levels) + " has the wrong size");
+        if (n->elseBody.empty() || n->elseBody.size() > 2) return fail("else branch of level " + std::to_string(levels) + " has the wrong size");
+        if (n->elseBody.size() == 1) break;
+        n = &n->elseBody[1];
+    }
+    if (levels != kDepth) return fail("nesting is " + std::to_string(levels) + " levels deep, expected " + std::to_string(kDepth));
+    if (ms > 3000) return fail("building took " + std::to_string(ms) + " ms");
+    return 0;
+}
+void* deepNestThread(void* r) {
+    *static_cast<int*>(r) = deepNestBody();
+    return nullptr;
+}
+int deepNest() {
+    int result = 1;
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setstacksize(&attr, size_t(512) << 20);
+    pthread_t th;
+    if (pthread_create(&th, &attr, deepNestThread, &result) != 0) return fail("pthread_create");
+    pthread_join(th, nullptr);
+    pthread_attr_destroy(&attr);
+    return result;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
     std::string mode = argc > 1 ? argv[1] : "";
     if (mode == "builder") return builder();
+    if (mode == "dead_chain") return deadChain();
+    if (mode == "deep_nest") return deepNest();
     if (argc == 3 && mode == "roundtrip") return roundtrip(argv[2]);
     if (argc == 3 && mode == "reject") return reject(argv[2]);
     if ((argc == 3 || argc == 4) && mode == "fbfetch") return fbfetch(argv[2], argc == 4 ? argv[3] : nullptr);

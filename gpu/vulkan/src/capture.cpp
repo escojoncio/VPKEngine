@@ -495,7 +495,7 @@ void emitSetState(Writer& w, Rec& setRec, bool state) {
   std::deque<VkWriteDescriptorSetInlineUniformBlock> inl;
   const VkDescriptorSet hs = reinterpret_cast<VkDescriptorSet>(const_cast<void*>(setRec.handle));
   const auto& bindings = set->layout->bindings;
-  for (size_t b = 0; b < bindings.size() && b < set->slots.size(); ++b) {
+  for (size_t b = 0; b < bindings.size(); ++b) {
     const SetLayoutBinding& lb = bindings[b];
     if (lb.type == VK_DESCRIPTOR_TYPE_INLINE_UNIFORM_BLOCK) {
       if (b >= set->inlineData.size() || set->inlineData[b].empty()) continue;
@@ -508,8 +508,8 @@ void emitSetState(Writer& w, Rec& setRec, bool state) {
       writes.push_back(wr);
       continue;
     }
-    for (uint32_t e = 0; e < set->slots[b].size(); ++e) {
-      const Descriptor& d = set->slots[b][e];
+    for (uint32_t e = 0; e < set->slots(b).size(); ++e) {
+      const Descriptor& d = set->slots(b)[e];
       if (d.type == VK_DESCRIPTOR_TYPE_MAX_ENUM) continue;  // never written
       VkWriteDescriptorSet wr{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
       wr.dstSet = hs, wr.dstBinding = lb.binding, wr.dstArrayElement = e, wr.descriptorCount = 1, wr.descriptorType = d.type;
@@ -637,7 +637,10 @@ void bufferRange(const Buffer* b, uint64_t lo, uint64_t hi, RangeSet& done) {
 }
 
 // `reads` collects the ids of the images the submit reads (captureImage).
-void resolveRef(uint64_t refId, RangeSet& done, std::unordered_set<uint64_t>& visitedCbs, std::vector<uint64_t>& reads) {
+// `visited` holds every id already resolved in this submit (command buffers, sets, views...): a command buffer refers to the same
+// set once per bind, and each resolution of a set copies its descriptors under the tables' lock.
+void resolveRef(uint64_t refId, RangeSet& done, std::unordered_set<uint64_t>& visited, std::vector<uint64_t>& reads) {
+  if (!visited.insert(refId).second) return;
   Rec* r = find(refId);
   if (!r || r->destroyed) return;
   switch (r->kind) {
@@ -654,10 +657,8 @@ void resolveRef(uint64_t refId, RangeSet& done, std::unordered_set<uint64_t>& vi
       break;
     }
     case Kind::CmdBuf:
-      if (visitedCbs.insert(r->id).second) {
-        reads.insert(reads.end(), r->cbImgReads.begin(), r->cbImgReads.end());
-        for (uint64_t t : std::vector<uint64_t>(r->cbRefs)) resolveRef(t, done, visitedCbs, reads);
-      }
+      reads.insert(reads.end(), r->cbImgReads.begin(), r->cbImgReads.end());
+      for (uint64_t t : std::vector<uint64_t>(r->cbRefs)) resolveRef(t, done, visited, reads);
       break;
     case Kind::DescSet: {
       // What the set holds is copied under the tables' lock (an update may be writing them on another thread); the buffers
@@ -672,18 +673,17 @@ void resolveRef(uint64_t refId, RangeSet& done, std::unordered_set<uint64_t>& vi
         std::unique_lock<std::shared_mutex> tables(g().setLock);
         const auto* set = from<DescriptorSetObj>(reinterpret_cast<VkDescriptorSet>(const_cast<void*>(r->handle)));
         if (!set || !set->layout) break;
-        for (const auto& slot : set->slots)
-          for (const Descriptor& d : slot) {
-            if (d.type == VK_DESCRIPTOR_TYPE_MAX_ENUM) continue;
-            if (d.buffer && live(d.buffer, Kind::Buffer)) {
-              const bool dyn = d.type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC || d.type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC;
-              bufs.push_back({d.buffer, d.offset, (dyn || d.range == VK_WHOLE_SIZE) ? UINT64_MAX : d.offset + d.range});
-            }
-            if (d.texel && live(d.texel, Kind::BufferView) && live(d.texel->buffer, Kind::Buffer))
-              bufs.push_back({d.texel->buffer, 0, UINT64_MAX});
-            if (d.view && live(d.view, Kind::ImageView) && live(d.view->image, Kind::Image))
-              images.push_back(g().recs.find(d.view->image)->second.id);
+        for (const Descriptor& d : set->flat) {
+          if (d.type == VK_DESCRIPTOR_TYPE_MAX_ENUM) continue;
+          if (d.buffer && live(d.buffer, Kind::Buffer)) {
+            const bool dyn = d.type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC || d.type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC;
+            bufs.push_back({d.buffer, d.offset, (dyn || d.range == VK_WHOLE_SIZE) ? UINT64_MAX : d.offset + d.range});
           }
+          if (d.texel && live(d.texel, Kind::BufferView) && live(d.texel->buffer, Kind::Buffer))
+            bufs.push_back({d.texel->buffer, 0, UINT64_MAX});
+          if (d.view && live(d.view, Kind::ImageView) && live(d.view->image, Kind::Image))
+            images.push_back(g().recs.find(d.view->image)->second.id);
+        }
       }
       for (const BufRef& b : bufs) bufferRange(b.buf, b.lo, b.hi, done);
       for (uint64_t i : images) {
@@ -857,9 +857,13 @@ std::string makePath(const std::string& req, const std::string& dir) {
   const bool isDir = p.back() == '/' || (::stat(p.c_str(), &st) == 0 && S_ISDIR(st.st_mode));
   if (!isDir) return p;
   if (p.back() != '/') p += '/';
-  return p + "vpcap_" + std::to_string(std::chrono::duration_cast<std::chrono::seconds>(
-                                           std::chrono::system_clock::now().time_since_epoch()).count()) +
-         "_" + std::to_string(::getpid()) + ".vpcap";
+  const std::string base = p + "vpcap_" + std::to_string(std::chrono::duration_cast<std::chrono::seconds>(
+                                               std::chrono::system_clock::now().time_since_epoch()).count()) +
+                           "_" + std::to_string(::getpid());
+  // Two captures of one process in the same second must not overwrite each other.
+  std::string path = base + ".vpcap";
+  for (int n = 2; ::stat(path.c_str(), &st) == 0 && n < 10000; ++n) path = base + "_" + std::to_string(n) + ".vpcap";
+  return path;
 }
 
 void finishCapture(const char* why) {  // g().mu held
@@ -871,8 +875,9 @@ void finishCapture(const char* why) {  // g().mu held
   uint32_t usedCalls = 0;
   for (const std::string& r : c.invalid) reasons += (reasons.empty() ? "" : ",") + r;
   for (const auto& [name, n] : c.unhookedUsed) used += (used.empty() ? "" : ",") + name + ":" + std::to_string(n), usedCalls += n;
-  char b[1024];
-  std::snprintf(b, sizeof b,
+  // The numbers and labels need under 1 KiB; the two lists and `why` are as long as they are (a truncated text lost "end=").
+  std::string b(1024 + used.size() + reasons.size() + std::strlen(why), '\0');
+  std::snprintf(b.data(), b.size(),
                 "frames=%u\nframe_unit=%s\nsubmits=%llu\ncalls=%llu\nimages_seen=%u\nimage_subresources=%u\nimage_bytes=%llu\nimage_zero=%u\n"
                 "image_memoryless=%u\nimage_unsupported=%u\nimage_failed=%u\nimg_deferred=%u\nimg_deferred_pending=%zu\n"
                 "other_device_calls=%llu\nother_device_submits=%llu\npnext_dropped=%llu\nunhooked_used=%u\nunhooked_used_calls=%s\n"
@@ -882,7 +887,7 @@ void finishCapture(const char* why) {  // g().mu held
                 c.imgFailed, c.imgDeferred, c.deferredImages.size(), static_cast<unsigned long long>(c.foreignCalls),
                 static_cast<unsigned long long>(c.foreignSubmits), static_cast<unsigned long long>(s.droppedNext - c.droppedNextAtStart),
                 usedCalls, used.c_str(), c.invalid.empty() ? 0 : 1, reasons.c_str(), why);
-  const bool ok = c.w->close(b);
+  const bool ok = c.w->close(b.c_str());
   logf("vk.capture done frames=%u calls=%llu bytes=%llu file_bytes=%llu mem_pages=%llu mem_bytes=%llu cbs_dropped=%u "
        "pnext_dropped=%llu images_touched=%zu images_seen=%u img_subres=%u img_bytes=%llu img_zero=%u img_memoryless=%u "
        "img_unsupported=%u img_failed=%u img_deferred=%u other_device_calls=%llu other_device_submits=%llu unhooked_used=%u "

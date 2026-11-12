@@ -50,7 +50,8 @@ enum LogFiles {
         lock.lock()
         defer { lock.unlock() }
         if let data = line.data(using: .utf8) {
-            appLogHandle?.write(data)
+            // write(contentsOf:) throws; write(_:) raises an Objective-C exception (disk full) that ends the app.
+            try? appLogHandle?.write(contentsOf: data)
         }
     }
 
@@ -64,9 +65,11 @@ enum LogFiles {
         let window: UInt64 = 256 * 1024
         let start = size > window ? size - window : 0
         try? handle.seek(toOffset: start)
-        guard let data = try? handle.readToEnd(), let text = String(data: data, encoding: .utf8) else {
+        guard let data = try? handle.readToEnd() else {
             return ""
         }
+        // The window can start inside a character: decoding with String(data:encoding:) would fail for the whole text.
+        let text = String(decoding: data, as: UTF8.self)
         var lines = text.components(separatedBy: "\n")
         if start > 0, !lines.isEmpty {
             // The first line is probably cut.
@@ -98,10 +101,15 @@ enum LogFiles {
         return files
     }
 
-    private static func stamp(_ date: Date) -> String {
+    // One formatter: building one per line costs more than the line.
+    private static let stampFormatter: DateFormatter = {
         let formatter = DateFormatter()
         formatter.locale = Locale(identifier: "en_US_POSIX")
         formatter.dateFormat = "HH:mm:ss.SSS"
-        return formatter.string(from: date)
+        return formatter
+    }()
+
+    private static func stamp(_ date: Date) -> String {
+        stampFormatter.string(from: date)
     }
 }

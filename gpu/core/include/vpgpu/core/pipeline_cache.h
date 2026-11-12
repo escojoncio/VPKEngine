@@ -174,6 +174,8 @@ class PipelineCache {
     bool orphan = false;
     // boost() already queued the Urgent job (cleared when a worker claims the entry): repeated boosts add nothing.
     bool boosted = false;
+    // Priority of the most urgent job queued for it while Queued: a request at that priority or a lower one adds nothing.
+    Priority queuedPriority = Priority::Prefetch;
     std::chrono::steady_clock::time_point queuedAt;  // request() queued it (pending())
   };
 

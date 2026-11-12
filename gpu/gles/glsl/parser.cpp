@@ -75,6 +75,20 @@ public:
     }
 
 private:
+    // Nesting of statements / expressions: "((((...", "- - - -x", "{{{{..." recurse once per level, so a hostile shader would overflow
+    // the stack. Real shaders nest a few dozen levels at most.
+    int nest_ = 0;
+    static constexpr int kMaxNest = 200;
+    struct NestGuard {
+        Parser& p;
+        explicit NestGuard(Parser& parser) : p(parser) {
+            if (++p.nest_ > kMaxNest) {
+                --p.nest_;
+                p.err("shader nests statements or expressions too deeply");
+            }
+        }
+        ~NestGuard() { --p.nest_; }
+    };
     // Recursion (static, not even through a chain of calls) cannot be compiled: SPIR-V forbids it and the hardware has
     // no stack. Always an error, in lenient mode too.
     void checkRecursion() {
@@ -893,6 +907,9 @@ private:
                 if (s->storage == Storage::Const) {
                     if (init->hasConst) {
                         s->hasConst = true, s->constF = init->constF, s->constI = init->constI;
+                    } else {
+                        std::vector<double> c;
+                        if (constComps(*init, c)) constVec_[s] = c;
                     }
                     s->constant = isConstExpr(*init);
                     if (!s->constant) strictAt("const_initializer", line, "'" + name + "' : the initializer of a const must be a constant expression");
@@ -1071,6 +1088,7 @@ private:
     }
 
     StmtP statement() {
+        NestGuard nestGuard(*this);
         int line = peek().line;
         if (isP("{")) return compound();
         if (acceptP(";")) return mk(SK::Empty, line);
@@ -1266,6 +1284,10 @@ private:
                     if (init->type != v->type)
                         errAt(line, "'=' : cannot convert from '" + init->type.str() + "' to '" + v->type.str() + "'");
                     if (q.isConst && init->hasConst) v->hasConst = true, v->constF = init->constF, v->constI = init->constI;
+                    else if (q.isConst) {
+                        std::vector<double> c;
+                        if (constComps(*init, c)) constVec_[v] = c;
+                    }
                     if (q.isConst) {
                         v->constant = isConstExpr(*init);
                         if (!v->constant) strictAt("const_initializer", line, "'" + v->name + "' : the initializer of a const must be a constant expression");
@@ -1338,6 +1360,111 @@ private:
         return true;
     }
 
+    // Components of a constant vector (or scalar) expression: constructors, swizzles, `const` variables and + - * / of constants.
+    // hasConst only carries scalars; a swizzle or index of a constant vector is a scalar constant (array sizes, case labels).
+    std::map<const Symbol*, std::vector<double>> constVec_;
+    static double convertConst(double v, Base from, Base to) {
+        switch (to) {
+            case Base::Float: return double(float(v));
+            case Base::Int: return from == Base::Float ? double(int32_t(v)) : double(int32_t(uint32_t(int64_t(v))));
+            case Base::Uint: return from == Base::Float ? double(uint32_t(int64_t(v))) : double(uint32_t(int64_t(v)));
+            default: return v != 0;
+        }
+    }
+    bool constComps(const Expr& e, std::vector<double>& out) const {
+        out.clear();
+        if (e.hasConst && e.type.isScalar() && !e.type.isArray()) {
+            out.push_back(e.type.base == Base::Float ? e.constF : double(e.constI));
+            return true;
+        }
+        if (e.type.isArray()) {
+            // const float W[3] = float[3](1.0, 2.0, 3.0): a one-dimensional array of scalars.
+            if (e.type.dims.size() != 1 || e.type.element().cols || e.type.element().vec != 1 || !e.type.element().numericOrBool()) return false;
+            if (e.k == EK::Var) {
+                auto it = constVec_.find(e.sym);
+                if (it == constVec_.end()) return false;
+                out = it->second;
+                return true;
+            }
+            if (e.k != EK::Ctor || e.a.size() != size_t(e.type.dims[0])) return false;
+            for (const ExprP& a : e.a) {
+                std::vector<double> c;
+                if (!constComps(*a, c) || c.size() != 1) return false;
+                out.push_back(c[0]);
+            }
+            return true;
+        }
+        if (e.type.cols || !e.type.numericOrBool()) return false;
+        switch (e.k) {
+            case EK::Var: {
+                auto it = constVec_.find(e.sym);
+                if (it == constVec_.end()) return false;
+                out = it->second;
+                return true;
+            }
+            case EK::Swizzle: {
+                std::vector<double> b;
+                if (!constComps(*e.a[0], b)) return false;
+                for (int i = 0; i < e.nswz; ++i) out.push_back(b[e.swz[i]]);
+                return true;
+            }
+            case EK::Unary: {
+                if (e.op != "-" && e.op != "!" && e.op != "~") return false;
+                if (!constComps(*e.a[0], out)) return false;
+                for (double& v : out) {
+                    if (e.op == "-") v = e.type.base == Base::Float ? -v : e.type.base == Base::Uint ? double(uint32_t(-int64_t(v))) : double(int32_t(-int64_t(v)));
+                    else if (e.op == "!") v = v == 0;
+                    else v = e.type.base == Base::Uint ? double(uint32_t(~int64_t(v))) : double(int32_t(~int64_t(v)));
+                }
+                return true;
+            }
+            case EK::Binary: {
+                if (e.op != "+" && e.op != "-" && e.op != "*" && e.op != "/") return false;
+                std::vector<double> a, b;
+                if (!constComps(*e.a[0], a) || !constComps(*e.a[1], b) || e.a[0]->type.base != e.type.base) return false;
+                for (int i = 0; i < e.type.vec; ++i) {
+                    const double x = a[a.size() == 1 ? 0 : size_t(i)], y = b[b.size() == 1 ? 0 : size_t(i)];
+                    double r;
+                    if (e.type.base == Base::Float) {
+                        r = e.op == "+" ? x + y : e.op == "-" ? x - y : e.op == "*" ? x * y : x / y;
+                        r = double(float(r));
+                    } else {
+                        const int64_t p = int64_t(x), q = int64_t(y);
+                        if (e.op == "/" && q == 0) return false;
+                        const int64_t v = e.op == "+" ? p + q : e.op == "-" ? p - q : e.op == "*" ? p * q : e.type.base == Base::Uint ? int64_t(uint32_t(p) / uint32_t(q)) : p / q;
+                        r = e.type.base == Base::Uint ? double(uint32_t(v)) : double(int32_t(v));
+                    }
+                    out.push_back(r);
+                }
+                return true;
+            }
+            case EK::Ctor: {
+                if (e.type.vec < 2) return false;
+                std::vector<double> flat;
+                for (const ExprP& a : e.a) {
+                    std::vector<double> c;
+                    if (!constComps(*a, c)) return false;
+                    for (double v : c) flat.push_back(convertConst(v, a->type.base, e.type.base));
+                }
+                if (e.a.size() == 1 && flat.size() == 1) {
+                    out.assign(size_t(e.type.vec), flat[0]);
+                    return true;
+                }
+                if (flat.size() < size_t(e.type.vec)) return false;
+                out.assign(flat.begin(), flat.begin() + e.type.vec);
+                return true;
+            }
+            default: return false;
+        }
+    }
+    // A constant component of a constant vector: x->hasConst for `K.y` / `K[1]`.
+    void foldComponent(Expr& x, const Expr& vec, int index) const {
+        std::vector<double> c;
+        if (x.hasConst || !constComps(vec, c) || index < 0 || size_t(index) >= c.size()) return;
+        x.hasConst = true, x.constF = c[size_t(index)], x.constI = x.type.base == Base::Float ? int64_t(c[size_t(index)]) : int64_t(c[size_t(index)]);
+        if (x.type.base == Base::Bool) x.constI = c[size_t(index)] != 0;
+    }
+
     bool isLValue(const Expr& e, std::string& why) {
         switch (e.k) {
             case EK::Var: {
@@ -1389,6 +1516,7 @@ private:
     }
 
     ExprP assignment() {
+        NestGuard nestGuard(*this);
         ExprP lhs = conditional();
         static const char* const ops[] = {"=", "+=", "-=", "*=", "/=", "%=", "<<=", ">>=", "&=", "^=", "|="};
         for (const char* op : ops) {
@@ -1420,7 +1548,7 @@ private:
         if (!isP("?")) return c;
         int line = next().line;
         if (c->type != Type::make(Base::Bool)) errAt(line, "'?:' : condition must be a scalar bool");
-        ExprP a = assignment();
+        ExprP a = expression();  // the grammar's middle operand is a full expression (comma allowed)
         expectP(":");
         ExprP b = assignment();
         if (a->type != b->type) errAt(line, "'?:' : operand types differ");
@@ -1577,6 +1705,7 @@ private:
     }
 
     ExprP unary() {
+        NestGuard nestGuard(*this);
         int line = peek().line;
         for (const char* op : {"++", "--"}) {
             if (!isP(op)) continue;
@@ -1651,6 +1780,7 @@ private:
                 if (bt.isArray() && bt.containsSampler() && !idx->hasConst && !es3())
                     errAt(line, "sampler arrays need constant indices in GLSL ES 1.00");
                 ExprP x = mkE(EK::Index, t, line);
+                if (idx->hasConst && !bt.cols) foldComponent(*x, *e, int(idx->constI));
                 x->a.push_back(std::move(e));
                 x->a.push_back(std::move(idx));
                 e = collapseSplit(std::move(x), line);
@@ -1705,6 +1835,7 @@ private:
                     }
                     x->nswz = uint8_t(f.size());
                     if (e->hasConst && f.size() == 1) x->hasConst = true, x->constF = e->constF, x->constI = e->constI;
+                    else if (f.size() == 1) foldComponent(*x, *e, x->swz[0]);
                     // gl_WorkGroupSize.x is a constant expression once layout(local_size_*) is declared (ES 3.10).
                     if (e->k == EK::Var && e->sym->builtin == BuiltinVar::WorkGroupSize && f.size() == 1 && sh_->hasLocalSize)
                         x->hasConst = true, x->constI = sh_->localSize[x->swz[0]], x->constF = double(x->constI);
@@ -1893,7 +2024,7 @@ private:
             e->hasConst = true;
             const Expr& s = *args[0];
             switch (t.base) {
-                case Base::Float: e->constF = s.type.base == Base::Float ? s.constF : s.type.base == Base::Uint ? double(uint32_t(s.constI)) : double(s.constI); e->constI = int64_t(e->constF); break;
+                case Base::Float: e->constF = double(float(s.type.base == Base::Float ? s.constF : s.type.base == Base::Uint ? double(uint32_t(s.constI)) : double(s.constI))); e->constI = int64_t(e->constF); break;
                 case Base::Int: e->constI = s.type.base == Base::Float ? int64_t(int32_t(s.constF)) : int64_t(int32_t(s.constI)); e->constF = double(e->constI); break;
                 case Base::Uint: e->constI = s.type.base == Base::Float ? int64_t(uint32_t(int64_t(s.constF))) : int64_t(uint32_t(s.constI)); e->constF = double(e->constI); break;
                 case Base::Bool: e->constI = s.type.base == Base::Float ? s.constF != 0 : s.constI != 0; e->constF = double(e->constI); break;

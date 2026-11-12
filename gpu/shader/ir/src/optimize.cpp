@@ -256,32 +256,47 @@ private:
 }  // namespace
 
 void removeDeadValues(Function& f) {
-    for (bool again = true; again;) {
-        std::unordered_map<ValueId, unsigned> uses;
-        auto count = [&](const Block& b, auto& self) -> void {
-            for (const Node& n : b) {
-                if (n.value != kNoValue) ++uses[n.value];
-                for (ValueId a : n.inst.args) ++uses[a];
-                self(n.body, self);
-                self(n.elseBody, self);
-            }
-        };
-        count(f.body, count);
-        again = false;
-        auto sweep = [&](Block& b, auto& self) -> void {
-            std::erase_if(b, [&](const Node& n) {
-                bool dead = n.kind == NodeKind::Inst && n.inst.result != kNoValue && !hasEffect(n.inst.op) &&
-                            !uses.contains(n.inst.result);
-                again |= dead;
-                return dead;
-            });
-            for (Node& n : b) {
-                self(n.body, self);
-                self(n.elseBody, self);
-            }
-        };
-        sweep(f.body, sweep);
-    }
+    // Use counts once, then one walk from the end of each block: every user of a value comes after its definition (in the
+    // block or in a nested block of a later node), so when an instruction is reached the dead users of its result are
+    // already gone and uncounted. A chain of dead values dies in one walk (a recount per link was quadratic).
+    std::vector<unsigned> uses(f.valueTypes.size());
+    auto slot = [&](ValueId v) -> unsigned& {
+        if (v >= uses.size()) uses.resize(size_t(v) + 1);
+        return uses[v];
+    };
+    auto count = [&](const Block& b, auto& self) -> void {
+        for (const Node& n : b) {
+            if (n.value != kNoValue) ++slot(n.value);
+            for (ValueId a : n.inst.args) ++slot(a);
+            self(n.body, self);
+            self(n.elseBody, self);
+        }
+    };
+    count(f.body, count);
+    std::vector<char> dead(uses.size());
+    bool any = false;
+    auto walk = [&](const Block& b, auto& self) -> void {
+        for (size_t i = b.size(); i-- > 0;) {
+            const Node& n = b[i];
+            self(n.elseBody, self);
+            self(n.body, self);
+            if (n.kind != NodeKind::Inst || n.inst.result == kNoValue || hasEffect(n.inst.op) || slot(n.inst.result)) continue;
+            dead.resize(uses.size());
+            dead[n.inst.result] = 1;
+            any = true;
+            for (ValueId a : n.inst.args) --slot(a);
+        }
+    };
+    walk(f.body, walk);
+    if (!any) return;
+    auto sweep = [&](Block& b, auto& self) -> void {
+        std::erase_if(b, [&](const Node& n) { return n.kind == NodeKind::Inst && n.inst.result != kNoValue && dead[n.inst.result]; });
+        for (Node& n : b) {
+            self(n.body, self);
+            self(n.elseBody, self);
+        }
+    };
+    sweep(f.body, sweep);
 }
 
 void optimize(Module& module) { Optimizer(module).run(); }

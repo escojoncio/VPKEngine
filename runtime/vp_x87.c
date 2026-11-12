@@ -3,9 +3,9 @@
  * The x87 FPU for translated code: 80-bit extended precision computed exactly with Berkeley
  * SoftFloat 3e (runtime/softfloat), including the control word's precision and rounding
  * control, the status word's exception flags, condition codes and stack faults, and the tag
- * word. The transcendental instructions (fsin, fcos, fsincos, fptan, fpatan, f2xm1, fyl2x,
- * fyl2xp1) go through the host's double-precision libm: x87 code on the PS4 is rare (long double
- * in the system libc) and those few results are correct to double precision, not to 64 bits.
+ * word. The transcendental instructions (fsin, fcos, fsincos, fptan, fpatan, f2xm1, fyl2x, fyl2xp1)
+ * are computed in binary128 (SoftFloat's f128) and rounded once: within one unit of the last place of
+ * the Intel hardware, bit-exact for 92-99.9% of the arguments (tests/aot/fuzz/x87_trans_diff.c).
  *
  * Included by runtime/vp_host.c (one translation unit, no extra build flags).
  */
@@ -95,15 +95,18 @@ static void st_set(VpCpu* c, int i, extFloat80_t v) {
     c->ftag |= (uint8_t)(1u << phys(c, i));
 }
 /* Push: overflow (the new top is in use) gives IE, SF, C1 = 1 and the indefinite. */
-static void st_push(VpCpu* c, extFloat80_t v) {
+static int st_push(VpCpu* c, extFloat80_t v) {
+    int overflow = 0;
     c->ftop = (c->ftop - 1) & 7;
     if ((c->ftag >> c->ftop) & 1) {
         c->fsw |= FSW_IE | FSW_SF | FSW_C1;
         v = vp_f80_indefinite;
+        overflow = 1;
     } else {
         c->fsw &= ~FSW_C1;
     }
     st_set(c, 0, v);
+    return overflow;
 }
 /* fxtract, fsincos, fptan: replace ST(0) and push. On a stack overflow the hardware leaves the
  * indefinite in both (the old ST(0) included). */
@@ -128,13 +131,19 @@ static extFloat80_t load_kind(VpCpu* c, uint64_t a, int kind, uint16_t* extra) {
     case VP_X87_F32: {
         float32_t f; f.v = vp_ld32(a);
         if ((f.v & 0x7F800000u) == 0 && (f.v & 0x7FFFFFu)) *extra |= FSW_DE;
-        v = f32_to_extF80(f);
+        if ((f.v & 0x7F800000u) == 0x7F800000u && (f.v & 0x7FFFFFu)) { /* NaN: kept as is, a signaling one is quieted by the user */
+            v.signExp = (uint16_t)(((f.v >> 16) & 0x8000u) | 0x7FFFu);
+            v.signif = UINT64_C(0x8000000000000000) | ((uint64_t)(f.v & 0x7FFFFFu) << 40);
+        } else v = f32_to_extF80(f);
         break;
     }
     case VP_X87_F64: {
         float64_t f; f.v = vp_ld64(a);
         if ((f.v & UINT64_C(0x7FF0000000000000)) == 0 && (f.v & UINT64_C(0xFFFFFFFFFFFFF))) *extra |= FSW_DE;
-        v = f64_to_extF80(f);
+        if ((f.v & UINT64_C(0x7FF0000000000000)) == UINT64_C(0x7FF0000000000000) && (f.v & UINT64_C(0xFFFFFFFFFFFFF))) {
+            v.signExp = (uint16_t)(((f.v >> 48) & 0x8000u) | 0x7FFFu);
+            v.signif = UINT64_C(0x8000000000000000) | ((f.v & UINT64_C(0xFFFFFFFFFFFFF)) << 11);
+        } else v = f64_to_extF80(f);
         break;
     }
     case VP_X87_F80: v.signif = vp_ld64(a); v.signExp = vp_ld16(a + 8); break;
@@ -151,8 +160,9 @@ static extFloat80_t load_kind(VpCpu* c, uint64_t a, int kind, uint16_t* extra) {
 void vp_x87_fld_mem(VpCpu* c, uint64_t a, int kind) {
     vp_x87_begin(c);
     uint16_t extra = 0;
-    const extFloat80_t v = load_kind(c, a, kind, &extra);
-    st_push(c, v);
+    extFloat80_t v = load_kind(c, a, kind, &extra);
+    if (kind <= VP_X87_F64 && extF80_isSignalingNaN(v)) { softfloat_exceptionFlags |= softfloat_flag_invalid; v.signif |= UINT64_C(0x4000000000000000); }
+    if (st_push(c, v)) extra &= (uint16_t)~FSW_DE; /* a stack overflow is an invalid operation: no DE */
     vp_x87_end(c, extra);
 }
 
@@ -188,6 +198,11 @@ void vp_x87_fld_const(VpCpu* c, int which) {
     vp_x87_flags_es(c);
 }
 
+/* The undocumented D9 D8+i (FSTPNCE): FSTP, but an empty ST(0) is only popped, with no exception. */
+void vp_x87_fstpnce(VpCpu* c, int i) {
+    if (!valid(c, 0)) { st_pop(c); c->fsw &= ~FSW_C1; return; }
+    vp_x87_fst_reg(c, i, 1);
+}
 void vp_x87_fst_reg(VpCpu* c, int i, int pop) {
     vp_x87_begin(c);
     c->fsw &= ~FSW_C1;
@@ -488,7 +503,7 @@ void vp_x87_fcmov(VpCpu* c, int i, int cond) {
     }
     vp_x87_end(c, 0);
 }
-void vp_x87_ffree(VpCpu* c, int i) { c->ftag &= (uint8_t)~(1u << phys(c, i)); }
+void vp_x87_ffree(VpCpu* c, int i) { c->ftag &= (uint8_t)~(1u << phys(c, i)); c->fsw &= ~FSW_C1; } /* C1 is cleared (Intel) */
 void vp_x87_fincstp(VpCpu* c) { c->ftop = (c->ftop + 1) & 7; c->fsw &= ~FSW_C1; }
 void vp_x87_fdecstp(VpCpu* c) { c->ftop = (c->ftop - 1) & 7; c->fsw &= ~FSW_C1; }
 void vp_x87_fstp_discard(VpCpu* c) { st_pop(c); } /* ffreep */
@@ -507,8 +522,10 @@ static void vp_x87_check_masks(const VpCpu* c) {
         fprintf(stderr, "VPKENGINE: x87 control word %#x unmasks exceptions; results stay the masked ones\n", c->fcw);
 }
 
+/* The control word bits that exist: IC (12), RC, PC, the masks (0-5); bit 6 reads as 1, 7 and 13-15 as 0 (Intel). */
+#define VP_FCW_MASK 0x1F3F
 void vp_x87_fldcw(VpCpu* c, uint16_t cw) {
-    c->fcw = (uint16_t)(cw | 0x0040); /* bit 6 reads as 1 */
+    c->fcw = (uint16_t)((cw & VP_FCW_MASK) | 0x0040); /* bit 6 reads as 1 */
     c->fsw &= ~(FSW_ES | FSW_B);
     vp_x87_flags_es(c);
     vp_x87_check_masks(c);
@@ -532,26 +549,36 @@ static uint16_t full_tag(const VpCpu* c) {
     return t;
 }
 
-/* fnstenv / fldenv, 28-byte protected-mode layout (instruction and data pointers are 0). */
-void vp_x87_fnstenv(VpCpu* c, uint64_t a) {
+/* fnstenv / fldenv, 28-byte protected-mode layout (instruction and data pointers are 0); with the
+ * operand-size prefix (the _16 forms) the 14-byte one: three words, then the four pointer words. */
+static void env_store(VpCpu* c, uint64_t a, int size16) {
     vp_x87_fix_cw(c);
     uint8_t env[28];
     memset(env, 0, sizeof env);
     const uint16_t cw = c->fcw, sw = vp_x87_fnstsw(c), tw = full_tag(c);
-    memcpy(env + 0, &cw, 2);
-    memcpy(env + 4, &sw, 2);
-    memcpy(env + 8, &tw, 2);
-    env[2] = env[3] = env[6] = env[7] = env[10] = env[11] = env[26] = env[27] = 0xFF; /* reserved halves read as ones */
-    memcpy((void*)(uintptr_t)a, env, sizeof env);
+    if (size16) {
+        memcpy(env + 0, &cw, 2);
+        memcpy(env + 2, &sw, 2);
+        memcpy(env + 4, &tw, 2);
+        memcpy((void*)(uintptr_t)a, env, 14);
+    } else {
+        memcpy(env + 0, &cw, 2);
+        memcpy(env + 4, &sw, 2);
+        memcpy(env + 8, &tw, 2);
+        env[2] = env[3] = env[6] = env[7] = env[10] = env[11] = env[26] = env[27] = 0xFF; /* reserved halves read as ones */
+        memcpy((void*)(uintptr_t)a, env, sizeof env);
+    }
     c->fcw |= 0x3F; /* fnstenv masks every exception afterwards, which clears ES and B */
     c->fsw &= ~(FSW_ES | FSW_B);
 }
-void vp_x87_fldenv(VpCpu* c, uint64_t a) {
+void vp_x87_fnstenv(VpCpu* c, uint64_t a) { env_store(c, a, 0); }
+void vp_x87_fnstenv_16(VpCpu* c, uint64_t a) { env_store(c, a, 1); }
+static void env_load(VpCpu* c, uint64_t a, int size16) {
     uint16_t cw, sw, tw;
     memcpy(&cw, (const void*)(uintptr_t)a, 2);
-    memcpy(&sw, (const void*)(uintptr_t)(a + 4), 2);
-    memcpy(&tw, (const void*)(uintptr_t)(a + 8), 2);
-    c->fcw = (uint16_t)(cw | 0x0040);
+    memcpy(&sw, (const void*)(uintptr_t)(a + (size16 ? 2 : 4)), 2);
+    memcpy(&tw, (const void*)(uintptr_t)(a + (size16 ? 4 : 8)), 2);
+    c->fcw = (uint16_t)((cw & VP_FCW_MASK) | 0x0040);
     c->ftop = (sw >> 11) & 7;
     c->fsw = sw & ~0x3800;
     c->ftag = 0;
@@ -560,24 +587,32 @@ void vp_x87_fldenv(VpCpu* c, uint64_t a) {
     vp_x87_flags_es(c);
     vp_x87_check_masks(c);
 }
+void vp_x87_fldenv(VpCpu* c, uint64_t a) { env_load(c, a, 0); }
+void vp_x87_fldenv_16(VpCpu* c, uint64_t a) { env_load(c, a, 1); }
 /* fnsave / frstor: the environment, then the registers in stack order (ST0 first), 10 bytes each. */
-void vp_x87_fnsave(VpCpu* c, uint64_t a) {
-    vp_x87_fnstenv(c, a);
+static void save_regs(VpCpu* c, uint64_t a, int size16) {
+    env_store(c, a, size16);
+    const uint64_t r0 = a + (size16 ? 14 : 28);
     for (int i = 0; i < 8; ++i) {
         const VpF80* r = &c->st[phys(c, i)];
-        memcpy((void*)(uintptr_t)(a + 28 + 10 * i), &r->m, 8);
-        memcpy((void*)(uintptr_t)(a + 36 + 10 * i), &r->se, 2);
+        memcpy((void*)(uintptr_t)(r0 + 10 * i), &r->m, 8);
+        memcpy((void*)(uintptr_t)(r0 + 8 + 10 * i), &r->se, 2);
     }
     vp_x87_fninit(c);
 }
-void vp_x87_frstor(VpCpu* c, uint64_t a) {
-    vp_x87_fldenv(c, a);
+static void restore_regs(VpCpu* c, uint64_t a, int size16) {
+    env_load(c, a, size16);
+    const uint64_t r0 = a + (size16 ? 14 : 28);
     for (int i = 0; i < 8; ++i) {
         VpF80* r = &c->st[phys(c, i)];
-        memcpy(&r->m, (const void*)(uintptr_t)(a + 28 + 10 * i), 8);
-        memcpy(&r->se, (const void*)(uintptr_t)(a + 36 + 10 * i), 2);
+        memcpy(&r->m, (const void*)(uintptr_t)(r0 + 10 * i), 8);
+        memcpy(&r->se, (const void*)(uintptr_t)(r0 + 8 + 10 * i), 2);
     }
 }
+void vp_x87_fnsave(VpCpu* c, uint64_t a) { save_regs(c, a, 0); }
+void vp_x87_fnsave_16(VpCpu* c, uint64_t a) { save_regs(c, a, 1); }
+void vp_x87_frstor(VpCpu* c, uint64_t a) { restore_regs(c, a, 0); }
+void vp_x87_frstor_16(VpCpu* c, uint64_t a) { restore_regs(c, a, 1); }
 
 /* fxsave / fxrstor (512 bytes): x87 + MXCSR + XMM0-15. */
 void vp_x87_fxsave(VpCpu* c, uint64_t a) {
@@ -588,7 +623,9 @@ void vp_x87_fxsave(VpCpu* c, uint64_t a) {
     memcpy(p + 0, &cw, 2);
     memcpy(p + 2, &sw, 2);
     p[4] = c->ftag; /* abridged, by physical register */
-    const uint32_t mxcsr = c->mxcsr, mask = 0x2FFFF; /* AMD (Jaguar): MM, misaligned SSE, included */
+    /* MXCSR_MASK: 0x2FFFF is a decision (tests/rt/x86_float.c fixes it): the target is the PS4's Jaguar, which reports it
+     * (MM, the misaligned-SSE bit, included). Intel CPUs report 0xFFFF, so a native comparison on one differs in this byte. */
+    const uint32_t mxcsr = c->mxcsr, mask = 0x2FFFF;
     memcpy(p + 24, &mxcsr, 4);
     memcpy(p + 28, &mask, 4);
     for (int i = 0; i < 8; ++i) {
@@ -603,7 +640,7 @@ void vp_x87_fxrstor(VpCpu* c, uint64_t a) {
     uint16_t cw, sw;
     memcpy(&cw, p + 0, 2);
     memcpy(&sw, p + 2, 2);
-    c->fcw = (uint16_t)(cw | 0x0040);
+    c->fcw = (uint16_t)((cw & VP_FCW_MASK) | 0x0040);
     c->ftop = (sw >> 11) & 7;
     c->fsw = sw & ~0x3800;
     c->fsw &= ~(FSW_ES | FSW_B); /* recomputed from the flags and the masks, as fldenv does */
@@ -792,39 +829,211 @@ void vp_x87_fxtract(VpCpu* c) {
     vp_x87_end(c, extra);
 }
 
-/* ---- transcendental (double precision) ------------------------------------------------------------ */
-
-/* Conversions to and from double that leave the status flags alone. */
-static double to_d(extFloat80_t v) {
-    const uint_fast8_t f = softfloat_exceptionFlags;
-    float64_t r = extF80_to_f64(v);
-    softfloat_exceptionFlags = f;
-    double d;
-    memcpy(&d, &r.v, 8);
-    return d;
-}
-static extFloat80_t from_d(double d) { float64_t f; memcpy(&f.v, &d, 8); return f64_to_extF80(f); }
-/* A finite non-zero value as m * 2^e with m in [1, 2) (as a double, 53 bits of it). */
-static double split(extFloat80_t v, int* e) {
-    int x = v.signExp & 0x7FFF;
-    uint64_t m = v.signif;
-    if (!x) { x = 1; while (!(m >> 63)) { m <<= 1; --x; } }
-    *e = x - 0x3FFF;
-    const double d = ldexp((double)(m >> 11), -52);
-    return (v.signExp & 0x8000) ? -d : d;
-}
-static const extFloat80_t vp_f80_ln2 = {UINT64_C(0xB17217F7D1CF79AC), 0x3FFE};
 static const extFloat80_t vp_f80_one = {UINT64_C(0x8000000000000000), 0x3FFF};
 
-/* The transcendental instructions. The result is computed in double precision (53 bits, not 64)
- * from a range-reduced argument: exponents are kept apart from the double, so tiny and huge
- * operands give the right magnitude and flags (no spurious overflow or underflow). */
+/* ---- transcendental functions ------------------------------------------------------------------- */
+
+/* Computed in binary128 (SoftFloat's f128, 113 bits) and rounded once to the 64 bits of the result:
+ * correctly rounded but for the rare cases where the 113-bit value is within 2^-50 ulp of a tie.
+ * Intel's own results are within an ulp of these (measured with tests/aot/fuzz/x87_trans_diff.c). */
+#include "vp_x87_trans.h"
+
+typedef float128_t F128;
+static const F128 TF_PI = {VP_F128_PI}, TF_PI_2 = {VP_F128_PI_2}, TF_PI_4 = {VP_F128_PI_4}, TF_3PI_4 = {VP_F128_3PI_4},
+                  TF_LN2 = {VP_F128_LN2}, TF_LOG2E = {VP_F128_LOG2E};
+
+static F128 tf_i(int64_t v) { return i64_to_f128(v); }
+static F128 tf_f80(extFloat80_t v) { return extF80_to_f128(v); }
+static F128 tf_add(F128 a, F128 b) { return f128_add(a, b); }
+static F128 tf_sub(F128 a, F128 b) { return f128_sub(a, b); }
+static F128 tf_mul(F128 a, F128 b) { return f128_mul(a, b); }
+static F128 tf_div(F128 a, F128 b) { return f128_div(a, b); }
+static F128 tf_neg(F128 a) { a.v[1] ^= UINT64_C(0x8000000000000000); return a; }
+static F128 tf_abs(F128 a) { a.v[1] &= ~UINT64_C(0x8000000000000000); return a; }
+/* a * 2^n for a finite value far from the exponent limits (zero stays zero). */
+static F128 tf_scale(F128 a, int n) {
+    if (!(a.v[1] & UINT64_C(0x7FFF000000000000))) return a;
+    a.v[1] += (uint64_t)(int64_t)n << 48;
+    return a;
+}
+
+/* The rounding mode and flags of the caller are kept apart from the binary128 arithmetic, which runs
+ * to nearest and whose inexact flags mean nothing. */
+typedef struct { uint_fast8_t flags, mode; } TfSave;
+static TfSave tf_enter(void) {
+    const TfSave s = {softfloat_exceptionFlags, softfloat_roundingMode};
+    softfloat_roundingMode = softfloat_round_near_even;
+    return s;
+}
+static void tf_leave(TfSave s) { softfloat_exceptionFlags = s.flags; softfloat_roundingMode = s.mode; }
+
+/* Rounds v to extended precision with the current mode (flags: inexact, underflow, overflow); C1 in
+ * *extra when the magnitude was rounded up. */
+static extFloat80_t tf_round(F128 v, uint16_t* extra) {
+    const extFloat80_t r = f128_to_extF80(v);
+    /* The hardware flags every finite non-zero result inexact, an exact one (fyl2x of 2, 1) included,
+     * and a denormal one also underflows. */
+    if (!is_zero(r) && !is_inf(r) && !is_nan(r)) {
+        softfloat_exceptionFlags |= softfloat_flag_inexact;
+        if (!(r.signExp & 0x7FFF)) softfloat_exceptionFlags |= softfloat_flag_underflow;
+    }
+    if (extra) {
+        const F128 back = extF80_to_f128(r);
+        if (!f128_eq(back, v) && f128_lt(tf_abs(v), tf_abs(back))) *extra |= FSW_C1;
+    }
+    return r;
+}
+
+/* sin and cos of r, |r| <= pi/4 (a little more is fine): Taylor series. */
+static void tf_sincos_kernel(F128 r, F128* s, F128* c) {
+    const F128 r2 = tf_mul(r, r);
+    F128 ts = r, tc = tf_i(1), ss = r, sc = tf_i(1);
+    for (int k = 1; k <= 18; ++k) {
+        tc = tf_div(tf_mul(tc, r2), tf_i((int64_t)(2 * k - 1) * (2 * k)));
+        ts = tf_div(tf_mul(ts, r2), tf_i((int64_t)(2 * k) * (2 * k + 1)));
+        if (k & 1) { sc = tf_sub(sc, tc); ss = tf_sub(ss, ts); }
+        else { sc = tf_add(sc, tc); ss = tf_add(ss, ts); }
+    }
+    *s = ss;
+    *c = sc;
+}
+
+/* x = n * pi/2 + r with |r| <= pi/4, for a finite |x| < 2^63 (the sign is the caller's): returns n mod 4
+ * and r in binary128. Like the hardware, the reduction uses pi/2 to 66 bits (0xC90FDAA22168C234C / 2^67),
+ * not the exact value: that is what makes the results near multiples of pi/2 differ from the true ones,
+ * and so from a correctly rounded library, in the same way. The product n * pi/2 and the subtractions are
+ * exact in binary128. */
+static int tf_reduce(extFloat80_t a, F128* r) {
+    static const F128 pi_2_66 = {VP_F128_PI_2_66};
+    const F128 x = tf_abs(tf_f80(a));
+    if (f128_lt(x, TF_PI_4)) { *r = x; return 0; }
+    const int64_t n = f128_to_i64(tf_div(x, TF_PI_2), softfloat_round_near_even, false);
+    F128 v = x;
+    if (n >> 32) v = tf_sub(v, tf_scale(tf_mul(tf_i(n >> 32), pi_2_66), 32));
+    *r = tf_sub(v, tf_mul(tf_i(n & INT64_C(0xFFFFFFFF)), pi_2_66));
+    return (int)(n & 3);
+}
+
+/* sin, cos of a finite extended-precision value with |a| < 2^63. */
+static void tf_sincos(extFloat80_t a, F128* sin_out, F128* cos_out) {
+    const TfSave sv = tf_enter();
+    F128 r, s, c;
+    const int n = tf_reduce(a, &r);
+    tf_sincos_kernel(r, &s, &c);
+    F128 sn, cs;
+    switch (n) {
+    case 0: sn = s; cs = c; break;
+    case 1: sn = c; cs = tf_neg(s); break;
+    case 2: sn = tf_neg(s); cs = tf_neg(c); break;
+    default: sn = tf_neg(c); cs = s; break;
+    }
+    if (a.signExp & 0x8000) sn = tf_neg(sn);
+    *sin_out = sn;
+    *cos_out = cs;
+    tf_leave(sv);
+}
+
+/* 2 * (z + z^3/3 + z^5/5 + ...) = ln((1 + z) / (1 - z)), |z| <= 0.172. */
+static F128 tf_ln_series(F128 z) {
+    const F128 z2 = tf_mul(z, z);
+    F128 sum = z, pw = z;
+    for (int k = 1; k <= 26; ++k) {
+        pw = tf_mul(pw, z2);
+        sum = tf_add(sum, tf_div(pw, tf_i(2 * k + 1)));
+    }
+    return tf_scale(sum, 1);
+}
+/* log2 of a positive finite value. */
+static F128 tf_log2(F128 v) {
+    int e = 0;
+    if (!(v.v[1] & UINT64_C(0x7FFF000000000000))) { /* an extended denormal is subnormal in binary128 too */
+        v = tf_mul(v, tf_scale(tf_i(1), 120));
+        e = -120;
+    }
+    e += (int)((v.v[1] >> 48) & 0x7FFF) - 16383;
+    v.v[1] = (v.v[1] & ~UINT64_C(0x7FFF000000000000)) | (UINT64_C(16383) << 48); /* m in [1, 2) */
+    if (((v.v[1] >> 40) & 0xFF) >= 0x6A) { v = tf_scale(v, -1); ++e; } /* m in [0.707, 1.414) */
+    const F128 one = tf_i(1);
+    const F128 z = tf_div(tf_sub(v, one), tf_add(v, one));
+    return tf_add(tf_i(e), tf_mul(tf_ln_series(z), TF_LOG2E));
+}
+/* y * log2(x) and y * log2(1 + x) for x > 0 / x > -1 (finite, y finite or infinite). */
+static F128 tf_yl2x(extFloat80_t y, extFloat80_t x) {
+    const TfSave sv = tf_enter();
+    const F128 v = tf_mul(tf_f80(y), tf_log2(tf_f80(x)));
+    tf_leave(sv);
+    return v;
+}
+static F128 tf_yl2xp1(extFloat80_t y, extFloat80_t x) {
+    const TfSave sv = tf_enter();
+    const F128 xx = tf_f80(x), one = tf_i(1);
+    /* |x| < 1/4: ln(1 + x) = 2 atanh(x / (2 + x)) keeps the relative precision of a small x */
+    const F128 l = f128_lt(tf_abs(xx), tf_scale(one, -2)) ? tf_mul(tf_ln_series(tf_div(xx, tf_add(tf_i(2), xx))), TF_LOG2E) : tf_log2(tf_add(one, xx));
+    const F128 v = tf_mul(tf_f80(y), l);
+    tf_leave(sv);
+    return v;
+}
+
+/* 2^x - 1 */
+static F128 tf_exp2m1(extFloat80_t a) {
+    const TfSave sv = tf_enter();
+    const F128 x = tf_f80(a);
+    const int n = (int)f128_to_i32(x, softfloat_round_near_even, false);
+    const F128 y = tf_mul(tf_sub(x, tf_i(n)), TF_LN2);
+    F128 sum = y, term = y;
+    for (int k = 2; k <= 28; ++k) {
+        term = tf_div(tf_mul(term, y), tf_i(k));
+        sum = tf_add(sum, term);
+    }
+    const F128 v = n == 0 ? sum : tf_add(tf_scale(sum, n), tf_sub(tf_scale(tf_i(1), n), tf_i(1)));
+    tf_leave(sv);
+    return v;
+}
+
+/* atan of t >= 0: t -> t / (1 + sqrt(1 + t^2)) three times (atan doubles each time back), series. */
+static F128 tf_atan_pos(F128 t) {
+    const F128 one = tf_i(1);
+    int inv = 0;
+    if (f128_lt(one, t)) { t = tf_div(one, t); inv = 1; }
+    for (int i = 0; i < 3; ++i) t = tf_div(t, tf_add(one, f128_sqrt(tf_add(one, tf_mul(t, t)))));
+    const F128 t2 = tf_mul(t, t);
+    F128 sum = t, pw = t;
+    for (int k = 1; k <= 22; ++k) {
+        pw = tf_mul(pw, t2);
+        const F128 term = tf_div(pw, tf_i(2 * k + 1));
+        sum = (k & 1) ? tf_sub(sum, term) : tf_add(sum, term);
+    }
+    sum = tf_scale(sum, 3);
+    return inv ? tf_sub(TF_PI_2, sum) : sum;
+}
+/* atan2(y, x) for finite non-zero y and x. */
+static F128 tf_atan2(extFloat80_t y, extFloat80_t x) {
+    const TfSave sv = tf_enter();
+    F128 t = tf_atan_pos(tf_div(tf_abs(tf_f80(y)), tf_abs(tf_f80(x))));
+    if (x.signExp & 0x8000) t = tf_sub(TF_PI, t);
+    if (y.signExp & 0x8000) t = tf_neg(t);
+    tf_leave(sv);
+    return t;
+}
+/* atan2 with a zero or an infinity among the operands (not NaN). */
+static F128 tf_atan2_special(extFloat80_t y, extFloat80_t x) {
+    const int ys = (y.signExp & 0x8000) != 0, xs = (x.signExp & 0x8000) != 0;
+    F128 t;
+    if (is_zero(y)) t = xs ? TF_PI : tf_i(0);
+    else if (is_zero(x)) t = TF_PI_2;
+    else if (is_inf(y)) t = is_inf(x) ? (xs ? TF_3PI_4 : TF_PI_4) : TF_PI_2;
+    else t = xs ? TF_PI : tf_i(0); /* x infinite, y finite */
+    return ys ? tf_neg(t) : t;
+}
+
+/* The transcendental instructions. Special values are settled here; the rest goes to the functions above. */
 enum { VP_X87_SIN, VP_X87_COS, VP_X87_SINCOS, VP_X87_PTAN, VP_X87_PATAN, VP_X87_F2XM1, VP_X87_YL2X, VP_X87_YL2XP1 };
 void vp_x87_transcendental(VpCpu* c, int op) {
     vp_x87_begin(c);
     extFloat80_t a;
     int ok = st_get(c, 0, &a);
-    c->fsw &= ~(FSW_C1 | FSW_C2);
+    c->fsw &= ~FSW_C1;
+    if (op <= VP_X87_PTAN) c->fsw &= ~FSW_C2; /* the others leave C2 alone */
     uint16_t extra = 0;
     if (ok && is_unsupported(a)) { softfloat_exceptionFlags |= softfloat_flag_invalid; a = vp_f80_indefinite; ok = 0; }
     switch (op) {
@@ -838,20 +1047,22 @@ void vp_x87_transcendental(VpCpu* c, int op) {
         else if (ok && is_inf(a)) { softfloat_exceptionFlags |= softfloat_flag_invalid; r1 = r2 = vp_f80_indefinite; }
         else if (ok && (a.signExp & 0x7FFF) >= 0x3FFF + 63) { c->fsw |= FSW_C2; break; } /* out of range: unchanged */
         else if (ok) {
-            int e = 0;
             if (is_denormal(a)) extra |= FSW_DE;
-            if (is_zero(a) || (e = (a.signExp & 0x7FFF) - 0x3FFF, (a.signExp & 0x7FFF) < 0x3FFF - 33)) {
+            if (is_zero(a) || (a.signExp & 0x7FFF) < 0x3FFF - 33) {
                 /* |x| < 2^-33: sin x = tan x = x and cos x = 1 to 64 bits */
                 r1 = a;
                 r2 = vp_f80_one;
                 if (!is_zero(a)) softfloat_exceptionFlags |= softfloat_flag_inexact;
                 if (op == VP_X87_COS) r1 = vp_f80_one;
-                (void)e;
             } else {
-                const double x = to_d(a);
-                r1 = from_d(op == VP_X87_COS ? cos(x) : op == VP_X87_PTAN ? tan(x) : sin(x));
-                r2 = op == VP_X87_PTAN ? vp_f80_one : from_d(cos(x));
-                softfloat_exceptionFlags |= softfloat_flag_inexact;
+                F128 s, co;
+                tf_sincos(a, &s, &co);
+                const TfSave sv = tf_enter();
+                const F128 tn = op == VP_X87_PTAN ? tf_div(s, co) : s; /* the quotient is correctly rounded in binary128 */
+                tf_leave(sv);
+/* C1 is the "rounded up" of the result the hardware reports it for: fsin, fcos, fptan the first, fsincos the cosine */
+                r1 = tf_round(op == VP_X87_COS ? co : tn, op == VP_X87_SINCOS ? NULL : &extra);
+                r2 = op == VP_X87_PTAN ? vp_f80_one : tf_round(co, op == VP_X87_SINCOS ? &extra : NULL);
             }
         }
         if (op == VP_X87_SIN || op == VP_X87_COS) st_set(c, 0, r1);
@@ -864,8 +1075,10 @@ void vp_x87_transcendental(VpCpu* c, int op) {
         else if (ok && is_inf(a)) { if (a.signExp & 0x8000) { r.signif = UINT64_C(0x8000000000000000); r.signExp = 0xBFFF; } } /* -inf: -1 */
         else if (ok && !is_zero(a)) {
             if (is_denormal(a)) extra |= FSW_DE;
-            if ((a.signExp & 0x7FFF) < 0x3FFF - 60) r = extF80_mul(a, vp_f80_ln2); /* 2^x - 1 = x ln2 to 64 bits */
-            else { r = from_d(exp2(to_d(a)) - 1.0); softfloat_exceptionFlags |= softfloat_flag_inexact; }
+            if ((a.signExp & 0x7FFF) >= 0x3FFF + 14) { /* |x| >= 16384: 2^x is out of the format (the instruction is defined for |x| <= 1) */
+                if (a.signExp & 0x8000) { r.signif = UINT64_C(0x8000000000000000); r.signExp = 0xBFFF; softfloat_exceptionFlags |= softfloat_flag_inexact; }
+                else r = extF80_add((extFloat80_t){UINT64_C(0xFFFFFFFFFFFFFFFF), 0x7FFE}, (extFloat80_t){UINT64_C(0xFFFFFFFFFFFFFFFF), 0x7FFE});
+            } else r = tf_round(tf_exp2m1(a), &extra);
         }
         st_set(c, 0, r);
         break;
@@ -880,19 +1093,17 @@ void vp_x87_transcendental(VpCpu* c, int op) {
             if (is_denormal(a) || is_denormal(b)) extra |= FSW_DE;
             const int ysign = (b.signExp & 0x8000) != 0;
             if (op == VP_X87_PATAN) {
-                int ex = 0, ey = 0;
-                if (is_zero(a) || is_zero(b) || is_inf(a) || is_inf(b)) r = from_d(atan2(to_d(b), to_d(a)));
+                int ex = (int)(a.signExp & 0x7FFF), ey = (int)(b.signExp & 0x7FFF);
+                if (is_zero(a) || is_zero(b) || is_inf(a) || is_inf(b)) r = tf_round(tf_atan2_special(b, a), &extra);
                 else {
-                    const double mx = split(a, &ex), my = split(b, &ey);
+                    if (ex == 0) ex = 1; /* denormals */
+                    if (ey == 0) ey = 1;
                     if (ex - ey > 60 && !(a.signExp & 0x8000)) r = extF80_div(b, a); /* atan(y/x) = y/x to 64 bits */
                     else if (ey - ex > 66) { /* +-pi/2 to 64 bits (the rounded constant: up, so C1) */
                         r.signif = UINT64_C(0xC90FDAA22168C235); r.signExp = (uint16_t)(0x3FFF | (ysign << 15));
                         extra |= FSW_C1;
                     }
-                    else {
-                        const int k = ex > ey ? ex : ey;
-                        r = from_d(atan2(ldexp(my, ey - k), ldexp(mx, ex - k)));
-                    }
+                    else r = tf_round(tf_atan2(b, a), &extra);
                 }
                 if (!is_zero(b) || (a.signExp & 0x8000)) softfloat_exceptionFlags |= softfloat_flag_inexact;
             } else if (op == VP_X87_YL2X) {
@@ -905,17 +1116,16 @@ void vp_x87_transcendental(VpCpu* c, int op) {
                     r.signif = UINT64_C(0x8000000000000000); r.signExp = (uint16_t)(ysign ? 0x7FFF : 0xFFFF);
                 } else if (is_inf(a)) {
                     r.signif = UINT64_C(0x8000000000000000); r.signExp = (uint16_t)(ysign ? 0xFFFF : 0x7FFF);
-                } else {
-                    int e;
-                    const double m = split(a, &e);
-                    const double l = (double)e + log2(m); /* the exponent outside the double */
-                    r = extF80_mul(b, from_d(l));
-                    if (!(e == 0 && m == 1.0)) softfloat_exceptionFlags |= softfloat_flag_inexact;
-                }
+                } else r = tf_round(tf_yl2x(b, a), &extra);
             } else { /* fyl2xp1: y log2(1 + x) */
                 if (is_zero(a)) { r.signif = 0; r.signExp = (uint16_t)((a.signExp ^ b.signExp) & 0x8000); }
-                else if ((a.signExp & 0x7FFF) < 0x3FFF - 60) { r = extF80_mul(b, extF80_div(a, vp_f80_ln2)); }
-                else { r = extF80_mul(b, from_d(log1p(to_d(a)) / log(2.0))); softfloat_exceptionFlags |= softfloat_flag_inexact; }
+                else if ((a.signExp & 0x8000) && (a.signExp & 0x7FFF) >= 0x3FFF) { /* x <= -1: outside the domain; the hardware gives x, inexact */
+                    r = a;
+                    softfloat_exceptionFlags |= softfloat_flag_inexact;
+                } else if (is_inf(a)) {
+                    if (is_zero(b)) { softfloat_exceptionFlags |= softfloat_flag_invalid; r = vp_f80_indefinite; }
+                    else { r.signif = UINT64_C(0x8000000000000000); r.signExp = (uint16_t)(ysign ? 0xFFFF : 0x7FFF); }
+                } else r = tf_round(tf_yl2xp1(b, a), &extra);
             }
         }
         st_set(c, 1, r);
@@ -942,11 +1152,15 @@ void vp_x87_fbld(VpCpu* c, uint64_t a) {
 void vp_x87_fbstp(VpCpu* c, uint64_t a) {
     vp_x87_begin(c);
     extFloat80_t v;
-    st_get(c, 0, &v);
-    int_fast64_t n = extF80_to_i64(v, softfloat_roundingMode, true);
+    const int ok = st_get(c, 0, &v);
+    c->fsw &= ~FSW_C1;
+    int_fast64_t n = ok ? extF80_to_i64(v, softfloat_roundingMode, true) : 0;
+    uint16_t extra = 0;
+    if (ok && !(softfloat_exceptionFlags & softfloat_flag_invalid) && n != extF80_to_i64(v, softfloat_round_minMag, false)) extra |= FSW_C1; /* rounded up */
     uint8_t out[10];
-    if ((softfloat_exceptionFlags & softfloat_flag_invalid) || n > INT64_C(999999999999999999) || n < -INT64_C(999999999999999999)) {
+    if (!ok || is_unsupported(v) || (softfloat_exceptionFlags & softfloat_flag_invalid) || n > INT64_C(999999999999999999) || n < -INT64_C(999999999999999999)) {
         softfloat_exceptionFlags = softfloat_flag_invalid;
+        extra = 0;
         memset(out, 0, 7); out[7] = 0xC0; out[8] = 0xFF; out[9] = 0xFF; /* the BCD indefinite */
     } else {
         const int neg = n < 0 || (n == 0 && (v.signExp & 0x8000));
@@ -956,5 +1170,5 @@ void vp_x87_fbstp(VpCpu* c, uint64_t a) {
     }
     for (int i = 0; i < 10; ++i) vp_st8(a + (uint64_t)i, out[i]);
     st_pop(c);
-    vp_x87_end(c, 0);
+    vp_x87_end(c, extra);
 }

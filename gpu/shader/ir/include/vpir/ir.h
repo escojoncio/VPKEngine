@@ -81,6 +81,7 @@ enum class Builtin : uint8_t {
     AmplificationId,      // vertex in: u32 ([[amplification_id]]: the view under Metal vertex amplification)
     DepthBias,            // fragment in: vec3<f32> {constant factor, slope factor, clamp} of the draw's depth bias (D24 emulation;
                           // MSL: vp_dbias, vpmsl kDepthBiasDecl). Never a stage attribute: the backend writes it per draw
+    PointCoord,           // fragment in: vec2<f32> (MSL [[point_coord]]; origin upper left, (0,0)..(1,1) across the point sprite)
 };
 
 enum class Interp : uint8_t { Perspective, Linear, Flat };

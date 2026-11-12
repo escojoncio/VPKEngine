@@ -3735,6 +3735,172 @@ void testPassDump() {
   for (const std::string& l : log) CHECK(l.find("  ") == std::string::npos || !l.starts_with("gpu.pdump"));
 }
 
+// Device::destroy reaches the backend before the table slot can be reused: a create of the recycled index on another thread
+// must not get to the backend ahead of the destroy of the old generation (it would be overwritten, then the destroy
+// would remove the live entry).
+struct OrderBackend final : Backend {
+  std::mutex m;
+  std::condition_variable cv;
+  bool inDestroy = false, release = false, blockDestroy = true;
+  std::vector<std::string> events;
+  void note(const char* e) {
+    std::lock_guard<std::mutex> l(m);
+    events.push_back(e);
+  }
+  void createBuffer(BufferId, const BufferDesc&) override {}
+  void createTexture(TextureId, const TextureDesc&) override { note("create"); }
+  void createSampler(SamplerId, const SamplerDesc&) override { note("create"); }
+  void destroyBuffer(BufferId) override {}
+  void destroyTexture(TextureId) override { destroyBlocked(); }
+  void destroySampler(SamplerId) override { destroyBlocked(); }
+  void destroyBlocked() {
+    std::unique_lock<std::mutex> l(m);
+    events.push_back("destroy_begin");
+    inDestroy = true;
+    cv.notify_all();
+    if (blockDestroy) cv.wait(l, [&] { return release; });
+    events.push_back("destroy_end");
+  }
+  bool compilePipeline(const PipelineState&, std::string&) override { return true; }
+  void submit(uint64_t, const Frame&, const CompiledFrame&) override {}
+  bool takeTimings(uint64_t&, GpuTimings&) override { return false; }
+};
+
+void testDestroyOrder() {
+  for (int kind = 0; kind < 2; ++kind) {  // textures, samplers
+    OrderBackend be;
+    Device dev(be, 0, [](const std::string&) {});
+    TextureDesc td;
+    td.format = Format::RGBA8Unorm;
+    td.usage = usage::colorTarget;
+    be.blockDestroy = false;
+    const TextureId t = kind == 0 ? dev.createTexture(td) : TextureId{};
+    const SamplerId sm = kind == 1 ? dev.createSampler(SamplerDesc{}) : SamplerId{};
+    be.events.clear();
+    be.blockDestroy = true;
+    std::thread destroyer([&] { kind == 0 ? dev.destroy(t) : dev.destroy(sm); });
+    {
+      std::unique_lock<std::mutex> l(be.m);
+      be.cv.wait(l, [&] { return be.inDestroy; });
+    }
+    std::thread creator([&] { kind == 0 ? (void)dev.createTexture(td) : (void)dev.createSampler(SamplerDesc{}); });
+    std::this_thread::sleep_for(std::chrono::milliseconds(150));
+    {
+      std::lock_guard<std::mutex> l(be.m);
+      be.release = true;
+    }
+    be.cv.notify_all();
+    destroyer.join();
+    creator.join();
+    CHECK(be.events.size() == 3 && be.events[0] == "destroy_begin" && be.events[1] == "destroy_end" && be.events[2] == "create");
+  }
+}
+
+// The slow-frame log counters belong to the Device: the first slow frame of each Device carries its encoder times.
+void testSlowLogPerDevice() {
+  std::string lines[2];
+  for (int i = 0; i < 2; ++i) {
+    NullBackend be;
+    be.fakeEncoderMs = 20;
+    Device dev(be, 0, [&](const std::string& l) {
+      if (l.starts_with("gpu.time ")) lines[i] += l + "\n";
+    });
+    TextureDesc td;
+    td.format = Format::RGBA8Unorm;
+    td.usage = usage::colorTarget;
+    const TextureId t = dev.createTexture(td);
+    Frame f;
+    Scene::passWithDraw(f, Scene::pass(t), {});
+    dev.submit(f);
+    dev.submit(Frame{});  // timings of the first frame are taken on the next submit
+  }
+  for (const std::string& l : lines) CHECK(l.find(" enc_ms=") != std::string::npos);
+}
+
+// Scaling check without an absolute time limit (a loaded machine runs everything slower, a fixed limit then fails with no
+// regression): compileFrame of the same frame shape at n and at 4n, interleaved so a load spike hits both, the minimum of
+// several runs of each. Linear work gives a ratio near 4, quadratic work near 16; the limit sits between.
+constexpr double kMaxScaleRatio = 10.0;
+double compileMs(const std::function<void(Scene&, Frame&, int)>& build, int n, const std::function<void(const CompiledFrame&, int)>& check) {
+  Scene s;
+  Frame f;
+  build(s, f, n);
+  const auto t0 = std::chrono::steady_clock::now();
+  const CompiledFrame cf = compileFrame(f, &s.res);
+  const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+  check(cf, n);
+  return ms;
+}
+void checkScaling(const char* what, int n, const std::function<void(Scene&, Frame&, int)>& build,
+                  const std::function<void(const CompiledFrame&, int)>& check) {
+  double small = 1e30, large = 1e30;
+  for (int rep = 0; rep < 5; ++rep) {
+    small = std::min(small, compileMs(build, n, check));
+    large = std::min(large, compileMs(build, 4 * n, check));
+  }
+  const double ratio = large / std::max(small, 0.5);  // (0.5 ms: below that the clock is noise)
+  CHECK(ratio < kMaxScaleRatio);
+  if (ratio >= kMaxScaleRatio) std::printf("  %s: %.1f ms at n=%d, %.1f ms at n=%d (x%.1f, linear is x4, quadratic x16)\n", what, small, n, large, 4 * n, ratio);
+}
+
+// Barrier placement scales with the writes of a resource, not with its readers: thousands of encoders reading the same
+// buffers (written once up front) used to compare every read with every earlier read.
+void testBarrierScaling() {
+  checkScaling(
+      "barrier placement", 1500,
+      [](Scene& s, Frame& f, int passes) {
+        std::vector<BufferId> bufs;
+        for (int i = 0; i < 10; ++i) bufs.push_back(s.buf(4096));
+        f.dispatch(Scene::compute({write(ResourceRange::bytes(bufs[0], 0, 4096), stage::compute)}));
+        for (int p = 0; p < passes; ++p) {
+          std::vector<Access> reads;
+          for (BufferId b : bufs) reads.push_back(Scene::vsRead(b, 0, 4096));
+          Scene::passWithDraw(f, Scene::pass(s.rt(64)), reads);
+        }
+      },
+      [](const CompiledFrame& cf, int passes) {
+        CHECK_EQ(cf.encoders.size(), size_t(passes) + 1);
+        CHECK(!cf.barriers.empty() && cf.barriers.front().encoder == 1);  // the first reader waits for the write; the rest are covered
+        CHECK_EQ(cf.barriers.size(), size_t(1));
+      });
+}
+
+// A copy hoists to the lowest compute encoder no earlier encoder conflicts with: that search used to walk every earlier
+// encoder for every copy (quadratic in the passes of a frame, a copy after each of them).
+void testCopyHoistScaling() {
+  checkScaling(
+      "copy hoist", 1500,
+      [](Scene& s, Frame& f, int passes) {
+        const BufferId staging = s.buf();
+        for (int p = 0; p < passes; ++p) {
+          Scene::passWithDraw(f, Scene::pass(s.rt(64)), {});
+          f.copyBuffer(Scene::span(staging), Scene::span(s.buf(), 0));
+        }
+      },
+      [](const CompiledFrame& cf, int passes) {
+        CHECK_EQ(cf.stats.copiesHoisted, uint32_t(passes));
+        CHECK_EQ(cf.encoders.size(), size_t(passes) + 1);  // every copy gathers in the one compute encoder in front
+        CHECK(cf.encoders[0].kind == Encoder::Kind::Compute && cf.encoders[0].commands.size() == size_t(passes));
+      });
+}
+
+// submittedFrames() is read by other threads (the Vulkan layer's cache watch) while submit() advances it: ThreadSanitizer
+// reports a plain counter here.
+void testSubmittedFramesRace() {
+  NullBackend be;
+  Device dev(be, 0, [](const std::string&) {});
+  std::atomic<bool> stop{false};
+  std::atomic<uint64_t> seen{0};
+  std::thread reader([&] {
+    while (!stop.load()) seen.store(dev.submittedFrames());
+  });
+  for (int i = 0; i < 300; ++i) dev.submit(Frame{});
+  stop = true;
+  reader.join();
+  CHECK_EQ(dev.submittedFrames(), uint64_t(300));
+  CHECK(seen.load() <= 300);
+}
+
 int main(int argc, char** argv) {
   const std::vector<std::pair<const char*, std::function<void()>>> groups = {
       {"resources", testResources}, {"commands", testCommands}, {"merge", testMerge},
@@ -3746,7 +3912,7 @@ int main(int argc, char** argv) {
       {"deadstore", testDeadStore}, {"rtmemory", testRtMemory}, {"scopedpool", testScopedPool},
       {"background", testBackground}, {"viewsplit", testViewSplit}, {"tilehot", testTileHot}, {"activity", testActivity}, {"harvest", testHarvest},
       {"passfuse", testPassFuse}, {"automsaa", testAutoMsaa}, {"required_dispatch", testRequiredDispatch}, {"frameopt", testFrameOpt},
-      {"passdump", testPassDump}};
+      {"passdump", testPassDump}, {"destroyorder", testDestroyOrder}, {"slowlog", testSlowLogPerDevice}, {"barrierscale", testBarrierScaling}, {"submittedframes", testSubmittedFramesRace}, {"copyhoistscale", testCopyHoistScaling}};
   bool ran = false;
   for (const auto& [name, fn] : groups) {
     if (argc > 1 && std::strcmp(argv[1], name) != 0) continue;

@@ -10,7 +10,8 @@ permissions:
   contents: write # only to publish failure logs to the ci-logs branch (job logs are not readable from the dev sandbox)
 
 concurrency:
-  group: aot-${{ github.ref }}
+  # (a push without [build] skips every job: its run must not take the group of a running build)
+  group: aot-${{ github.ref }}-${{ (github.event_name == 'workflow_dispatch' || contains(github.event.head_commit.message, '[build]')) && 'build' || github.run_id }}
   cancel-in-progress: true
 
 jobs:
@@ -55,6 +56,8 @@ jobs:
         run: tests/aot/realbin/run.sh
       - name: Loader and imports
         run: tests/aot/loader/run.sh
+      - name: Malformed SELF containers are refused, never crash
+        run: tests/aot/self_malformed/run.sh
       - name: Two modules, attach by fingerprint
         run: tests/aot/modules/run.sh
       - name: Read-only data in the executable segment (PS4 layout) is not translated as code
@@ -71,7 +74,10 @@ jobs:
           sudo apt-get install -y --no-install-recommends lld clang libssl-dev
           # The newest: the tbd stubs name xros, which lld before 18 does not know.
           LD64=$(ls /usr/bin/ld64.lld-* 2>/dev/null | sort -V | tail -n 1)
-          curl -sSL https://github.com/indygreg/apple-platform-rs/releases/download/apple-codesign%2F0.29.0/apple-codesign-0.29.0-x86_64-unknown-linux-musl.tar.gz | tar -xz -C /tmp
+          # Pinned: version 0.29.0 and the SHA-256 of its tarball (computed from the release asset; checked before it is unpacked).
+          curl -sSLf -o /tmp/apple-codesign.tar.gz https://github.com/indygreg/apple-platform-rs/releases/download/apple-codesign%2F0.29.0/apple-codesign-0.29.0-x86_64-unknown-linux-musl.tar.gz
+          echo "dbe85cedd8ee4217b64e9a0e4c2aef92ab8bcaaa41f20bde99781ff02e600002  /tmp/apple-codesign.tar.gz" | sha256sum -c -
+          tar -xz -C /tmp -f /tmp/apple-codesign.tar.gz
           set -o pipefail
           mkdir -p build/logs
           { echo "LD64=$LD64"; ls /tmp/apple-codesign-*/ ; } 2>&1 | tee build/logs/codesign.txt
@@ -85,7 +91,7 @@ jobs:
           cd /tmp/ci-logs
           git init -q && git checkout -q -b ci-logs
           git -c user.name=Claude -c user.email=noreply@anthropic.com add -A
-          git -c user.name=Claude -c user.email=noreply@anthropic.com commit -qm "logs ${GITHUB_SHA::7} ${GITHUB_JOB}"
+          git -c user.name=Claude -c user.email=noreply@anthropic.com commit -qm "logs ${GITHUB_SHA::7} ${GITHUB_JOB}" --allow-empty
           git push -qf "https://x-access-token:${{ github.token }}@github.com/${GITHUB_REPOSITORY}.git" ci-logs:ci-logs-${GITHUB_JOB}
       - name: Golden files
         uses: actions/upload-artifact@v4

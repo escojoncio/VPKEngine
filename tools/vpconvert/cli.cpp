@@ -34,6 +34,7 @@ int main(int argc, char** argv) {
     c.game_dir = argv[1];
     c.work_dir = argv[2];
     g_stop_file = std::string(argv[2]) + "/STOP";
+    std::remove(g_stop_file.c_str());  // the STOP that ended the previous run must not end this one at once (it resumes)
     c.output = argv[3];
     c.sdk_dir = argv[4];
     c.jobs = argc > 5 ? std::atoi(argv[5]) : 0;

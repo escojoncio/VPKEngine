@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
@@ -414,6 +415,18 @@ RecipeStore::RecipeStore(std::string dir, uint32_t translatorVersion, uint64_t t
        translator_, (unsigned long long)size_);
 }
 
+std::shared_ptr<RecipeStore> RecipeStore::forDir(const std::string& dir) {
+  if (dir.empty()) return std::make_shared<RecipeStore>(dir);
+  static auto* mutex = new std::mutex;  // leaked on purpose: devices may be destroyed from threads that outlive static destructors
+  static auto* open = new std::map<std::string, std::weak_ptr<RecipeStore>>;
+  std::lock_guard<std::mutex> lock(*mutex);
+  std::weak_ptr<RecipeStore>& slot = (*open)[dir];
+  if (std::shared_ptr<RecipeStore> live = slot.lock()) return live;
+  std::shared_ptr<RecipeStore> made = std::make_shared<RecipeStore>(dir);
+  slot = made;
+  return made;
+}
+
 RecipeStore::~RecipeStore() {
   if (!file_) return;
   logf("gpu.pso.recipe stored=%zu total=%zu", storedThisRun_, pipelines_.size());
@@ -441,6 +454,9 @@ void RecipeStore::load() {
   FILE* f = std::fopen(path_.c_str(), "rb");
   if (!f) return;
   std::vector<uint8_t> data;
+  std::error_code sizeEc;
+  const uintmax_t onDisk = std::filesystem::file_size(path_, sizeEc);
+  if (!sizeEc) data.reserve(size_t(onDisk));  // one allocation instead of a vector that doubles (and peaks at ~2x the file)
   uint8_t buf[65536];
   for (size_t n; (n = std::fread(buf, 1, sizeof buf, f)) > 0;) data.insert(data.end(), buf, buf + n);
   std::fclose(f);
@@ -638,15 +654,27 @@ void RecipeStore::insertPipelineLocked(PipeRec p) {
   else byId_[id] = key;
 }
 
-void RecipeStore::write(uint8_t tag, const std::vector<uint8_t>& payload, uint64_t* payloadOffset) {
+bool RecipeStore::write(uint8_t tag, const std::vector<uint8_t>& payload, uint64_t* payloadOffset) {
   const uint32_t len = uint32_t(payload.size());
   if (payloadOffset) *payloadOffset = size_ + kRecordHeader;
-  std::fwrite(&tag, 1, 1, file_);
-  std::fwrite(&len, sizeof len, 1, file_);
-  if (len) std::fwrite(payload.data(), 1, payload.size(), file_);
-  std::fflush(file_);
+  bool ok = std::fwrite(&tag, 1, 1, file_) == 1 && std::fwrite(&len, sizeof len, 1, file_) == 1;
+  if (ok && len) ok = std::fwrite(payload.data(), 1, payload.size(), file_) == payload.size();
+  ok = std::fflush(file_) == 0 && ok;
+  if (!ok) {
+    // A torn record would make every offset after it wrong: cut the file back to the last whole record and keep going from there.
+    static std::atomic<uint32_t> lines{0};
+    if (lines++ < 8) logf("gpu.pso.recipe what=write_failed tag=%u bytes=%u (record not stored)", unsigned(tag), len);
+    // The stream is closed and reopened: a failed flush leaves its bytes in the buffer, and the next flush would write them after the cut.
+    std::fclose(file_);
+    file_ = nullptr;
+    std::error_code ec;
+    std::filesystem::resize_file(path_, size_, ec);
+    openForAppend(false);
+    return false;
+  }
   size_ += kRecordHeader + len;
   ++records_;
+  return true;
 }
 
 bool RecipeStore::readWords(const SpirvRec& s, std::vector<uint32_t>& out) const {
@@ -681,14 +709,14 @@ void RecipeStore::addStage(const StageInput& in, uint64_t h, const std::vector<u
     w.pod(uint32_t(words.size()));
     w.raw(words.data(), words.size() * 4);
     uint64_t off = 0;
-    write(kTagSpirv, w.b, &off);
+    if (!write(kTagSpirv, w.b, &off)) return;
     spirv_[in.spirv] = {off + 12, uint32_t(words.size())};
   }
   if (!shaders_.count(msl)) {
     Writer w;
     encodeShader(w, msl, blob);
     uint64_t off = 0;
-    write(kTagShader, w.b, &off);  // flushed: readable back at once
+    if (!write(kTagShader, w.b, &off)) return;  // flushed: readable back at once
     ShaderBlob& kept = shaders_[msl] = blob;
     srcRef_[msl] = SrcRef{off + sourceOffsetInPayload(blob), uint32_t(blob.source.size()), vpmsl::sourceHash(blob.source)};
     std::string().swap(kept.source);
@@ -708,7 +736,7 @@ void RecipeStore::addStage(const StageInput& in, uint64_t h, const std::vector<u
   w.pod(translator_);
   w.pod(msl);
   encodeInput(w, in);
-  write(kTagInput, w.b);
+  if (!write(kTagInput, w.b)) return;
   inputs_[h] = InputRec{in, msl, translator_};
   if (iface) {
     Writer f;
@@ -716,9 +744,10 @@ void RecipeStore::addStage(const StageInput& in, uint64_t h, const std::vector<u
     f.pod(translator_);
     f.pod(code_);
     encodeIface(f, *iface);
-    write(kTagIface, f.b);
-    if (fi != ifaces_.end()) ++deadRecords_;
-    ifaces_[h] = IfaceRec{translator_, code_, *iface};
+    if (write(kTagIface, f.b)) {
+      if (fi != ifaces_.end()) ++deadRecords_;
+      ifaces_[h] = IfaceRec{translator_, code_, *iface};
+    }
   }
 }
 
@@ -770,6 +799,7 @@ bool RecipeStore::fillSource(uint64_t id, ShaderBlob& b, FILE* f) const {
   if (ok) {
     b.source.resize(r->second.len);
     ok = std::fread(b.source.data(), 1, b.source.size(), f) == b.source.size();
+    ok = ok && vpmsl::sourceHash(b.source) == r->second.hash;  // the bytes at that offset are the text that was stored
   }
   if (own) std::fclose(own);
   if (!ok) b.source.clear();
@@ -784,7 +814,7 @@ void RecipeStore::addPipeline(const vpgpu::PipelineState& s, const std::array<ui
     if ((k == 0 ? s.vertexShader : k == 1 ? s.fragmentShader : s.computeShader) && !inputs[k]) return;
   Writer w;
   encodePipeline(w, s, inputs);
-  write(kTagPipeline, w.b);
+  if (!write(kTagPipeline, w.b)) return;
   pipelines_[key] = PipeRec{s, inputs};
   byId_[recipeId(s, inputs)] = key;
   ++storedThisRun_;
@@ -874,7 +904,7 @@ RecipeStore::RefreshResult RecipeStore::refresh(unsigned threads) {
     for (auto& t : pool) t.join();
   }
 
-  std::lock_guard lock(mutex_);
+  std::unique_lock lock(mutex_);
   if (!file_) return r;
   for (uint64_t h : unbuildable) inputs_.erase(h), ifaces_.erase(h), ++r.failed;
   for (auto& job : outs)
@@ -932,7 +962,7 @@ RecipeStore::RefreshResult RecipeStore::refresh(unsigned threads) {
   for (auto it = spirv_.begin(); it != spirv_.end();)
     it = usedSpirv.count(it->first) || !oldSpirv.count(it->first) ? std::next(it) : spirv_.erase(it);
   drift_ = false;
-  r.rewritten = rewriteLocked();
+  r.rewritten = rewrite(lock);
   r.ms = std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
   logf("gpu.pso.recipe refresh retranslated=%u same_msl=%u failed=%u dropped_pipelines=%u pipelines=%zu shaders=%zu "
        "spirv=%zu rewritten=%d translator=%u (%s) workers=%u ms=%.0f",
@@ -941,58 +971,107 @@ RecipeStore::RefreshResult RecipeStore::refresh(unsigned threads) {
   return r;
 }
 
-// Writes every live record to recipes.bin.tmp and renames it over the file (a crash mid-way leaves
-// the old file intact). SPIR-V words are copied from the old file.
-bool RecipeStore::rewriteLocked() {
+// Rewrites recipes.bin compacted: every live record goes to recipes.bin.tmp, which is renamed over the file (a crash or a failed write
+// at any point leaves the old file intact). The I/O (the whole file, 100-250 MB with its SPIR-V and MSL) runs with `lock` released,
+// from a copy of the index taken under it: other threads keep appending to the old file meanwhile, and the records they add after the
+// copy (the file's bytes from `snapSize` on, whole records: write() appends and flushes one at a time) are carried over verbatim at the end,
+// under the lock again, with their file offsets moved by the difference. One rewrite at a time (rewriting_). false: file unchanged.
+bool RecipeStore::rewrite(std::unique_lock<std::mutex>& lock) {
+  rewriteDone_.wait(lock, [&] { return !rewriting_; });
+  if (!file_) return false;
+  rewriting_ = true;
+  struct Done {  // the lock is held again and the next rewrite may start, whichever way this returns
+    RecipeStore& s;
+    std::unique_lock<std::mutex>& l;
+    ~Done() {
+      if (!l.owns_lock()) l.lock();
+      s.rewriting_ = false;
+      s.rewriteDone_.notify_all();
+    }
+  } done{*this, lock};
+
+  const uint64_t snapSize = size_;
+  const size_t snapRecords = records_, snapDead = deadRecords_;
+  const auto spirvS = spirv_;
+  const auto shadersS = shaders_;
+  const auto refsS = srcRef_;
+  const auto inputsS = inputs_;
+  const auto ifacesS = ifaces_;
+  const auto pipelinesS = pipelines_;
+  lock.unlock();
+  if (rewriteGate) rewriteGate();
+
   const std::string tmp = path_ + ".tmp";
   FILE* out = std::fopen(tmp.c_str(), "wb");
   if (!out) {
     logf("gpu.pso.recipe what=rewrite_open_failed path=%s", tmp.c_str());
     return false;
   }
+  FILE* in = std::fopen(path_.c_str(), "rb");
+  auto fail = [&](const char* what) {
+    if (out) std::fclose(out);
+    if (in) std::fclose(in);
+    std::error_code ec;
+    std::filesystem::remove(tmp, ec);
+    logf("gpu.pso.recipe what=%s", what);
+    return false;
+  };
+  if (!in) return fail("rewrite_read_failed");
+  bool wrote = true;
   uint64_t size = 0;
   size_t records = 0;
+  auto put = [&](const void* p, size_t n, size_t count) { wrote = wrote && std::fwrite(p, n, count, out) == count; };
   auto emit = [&](uint8_t tag, const std::vector<uint8_t>& payload) {
     const uint32_t len = uint32_t(payload.size());
     const uint64_t off = size + kRecordHeader;
-    std::fwrite(&tag, 1, 1, out);
-    std::fwrite(&len, sizeof len, 1, out);
-    if (len) std::fwrite(payload.data(), 1, len, out);
+    put(&tag, 1, 1);
+    put(&len, sizeof len, 1);
+    if (len) put(payload.data(), 1, len);
     size += kRecordHeader + len;
     ++records;
     return off;
   };
-  std::fwrite(kMagic, 1, 4, out);
+  put(kMagic, 1, 4);
   const uint32_t hdr[2] = {kRecipeVersion, headerFields()};
-  std::fwrite(hdr, sizeof hdr, 1, out);
+  put(hdr, sizeof hdr, 1);
   size = kHeaderBytes;
   std::unordered_map<uint64_t, SpirvRec> spirv;
   std::vector<uint32_t> words;
-  for (const auto& [h, s] : spirv_) {
-    if (!readWords(s, words)) continue;  // unreadable: its inputs stay usable while the version matches
+  for (const auto& [h, s] : spirvS) {
+    words.resize(s.count);
+    if (std::fseek(in, long(s.offset), SEEK_SET) != 0 || std::fread(words.data(), 4, words.size(), in) != words.size())
+      continue;  // unreadable: its inputs stay usable while the version matches
     Writer w;
     w.pod(h);
     w.pod(uint32_t(words.size()));
     w.raw(words.data(), words.size() * 4);
     spirv[h] = {emit(kTagSpirv, w.b) + 12, uint32_t(words.size())};
+    if (!wrote) return fail("rewrite_failed");
   }
   std::unordered_map<uint64_t, SrcRef> refs;
-  for (const auto& [id, b] : shaders_) {
+  for (const auto& [id, b] : shadersS) {
     ShaderBlob full = b;
-    if (!fillSource(id, full)) continue;  // unreadable text: the recipe goes (its pipelines are orphaned on load)
+    if (const auto r = refsS.find(id); r != refsS.end()) {  // the text is in the file: read it back, checked against its hash
+      full.source.resize(r->second.len);
+      if (std::fseek(in, long(r->second.off), SEEK_SET) != 0 ||
+          std::fread(full.source.data(), 1, full.source.size(), in) != full.source.size() ||
+          vpmsl::sourceHash(full.source) != r->second.hash)
+        continue;  // unreadable text: the recipe goes (its pipelines are orphaned on load)
+    }
     Writer w;
     encodeShader(w, id, full);
     const uint64_t off = emit(kTagShader, w.b);
     refs[id] = SrcRef{off + sourceOffsetInPayload(full), uint32_t(full.source.size()), vpmsl::sourceHash(full.source)};
+    if (!wrote) return fail("rewrite_failed");
   }
-  for (const auto& [h, rec] : inputs_) {
+  for (const auto& [h, rec] : inputsS) {
     Writer w;
     w.pod(h);
     w.pod(rec.translator);
     w.pod(rec.msl);
     encodeInput(w, rec.input);
     emit(kTagInput, w.b);
-    if (auto f = ifaces_.find(h); f != ifaces_.end()) {
+    if (auto f = ifacesS.find(h); f != ifacesS.end()) {
       Writer fw;
       fw.pod(h);
       fw.pod(f->second.translator);
@@ -1000,20 +1079,34 @@ bool RecipeStore::rewriteLocked() {
       encodeIface(fw, f->second.iface);
       emit(kTagIface, fw.b);
     }
+    if (!wrote) return fail("rewrite_failed");
   }
-  for (const auto& [key, p] : pipelines_) {
+  for (const auto& [key, p] : pipelinesS) {
     Writer w;
     encodePipeline(w, p.state, p.inputs);
     emit(kTagPipeline, w.b);
+    if (!wrote) return fail("rewrite_failed");
   }
-  const bool ok = std::fflush(out) == 0 && !std::ferror(out);
-  std::fclose(out);
+  std::fclose(in);
+  in = nullptr;
+
+  lock.lock();
+  // The records other threads appended while the copy was written: the old file's bytes from snapSize on.
+  const uint64_t tail = size_ - snapSize;
+  if (tail) {
+    std::vector<uint8_t> bytes{};
+    bytes.resize(size_t(tail));
+    FILE* old = std::fopen(path_.c_str(), "rb");
+    const bool read = old && std::fseek(old, long(snapSize), SEEK_SET) == 0 && std::fread(bytes.data(), 1, bytes.size(), old) == bytes.size();
+    if (old) std::fclose(old);
+    if (!read) return fail("rewrite_tail_failed");
+    put(bytes.data(), 1, bytes.size());
+  }
+  const bool ok = std::fflush(out) == 0 && !std::ferror(out) && wrote;
+  const int closed = std::fclose(out);
+  out = nullptr;
   std::error_code ec;
-  if (!ok) {
-    std::filesystem::remove(tmp, ec);
-    logf("gpu.pso.recipe what=rewrite_failed");
-    return false;
-  }
+  if (!ok || closed != 0) return fail("rewrite_failed");
   std::fclose(file_);
   file_ = nullptr;
   std::filesystem::rename(tmp, path_, ec);
@@ -1023,9 +1116,20 @@ bool RecipeStore::rewriteLocked() {
     openForAppend(false);  // the old file (and the old offsets) stay valid
     return false;
   }
-  spirv_ = std::move(spirv);
-  srcRef_ = std::move(refs);  // new file offsets; the texts leave memory again
-  for (auto it = shaders_.begin(); it != shaders_.end();) {  // a text that could not be read back is not in the new file
+  // New file offsets: what the copy held has them from the rewrite, what was appended since moved by the same distance.
+  const auto moved = [&](uint64_t off) { return off - snapSize + size; };
+  for (auto it = spirv_.begin(); it != spirv_.end();) {
+    if (auto n = spirv.find(it->first); n != spirv.end()) it->second = n->second, ++it;
+    else if (it->second.offset >= snapSize) it->second.offset = moved(it->second.offset), ++it;
+    else it = spirv_.erase(it);
+  }
+  for (auto it = srcRef_.begin(); it != srcRef_.end();) {
+    if (auto n = refs.find(it->first); n != refs.end()) it->second = n->second, ++it;
+    else if (it->second.off >= snapSize) it->second.off = moved(it->second.off), ++it;
+    else it = srcRef_.erase(it);
+  }
+  for (const auto& [id, ref] : refs) srcRef_.try_emplace(id, ref);  // a text that was only in memory is in the file now
+  for (auto it = shaders_.begin(); it != shaders_.end();) {  // the texts leave memory again; one that could not be read back is gone
     if (srcRef_.count(it->first)) {
       std::string().swap(it->second.source);
       ++it;
@@ -1033,9 +1137,9 @@ bool RecipeStore::rewriteLocked() {
       it = shaders_.erase(it);
     }
   }
-  size_ = size;
-  records_ = records;
-  deadRecords_ = 0;
+  size_ = size + tail;
+  records_ = records + (records_ - snapRecords);
+  deadRecords_ = deadRecords_ > snapDead ? deadRecords_ - snapDead : 0;
   driftWritten_ = false;
   openForAppend(false);
   return file_ != nullptr;
@@ -1201,17 +1305,23 @@ PrewarmResult prewarm(Platform& platform, vpgpu::PipelineCache& cache, RecipeSto
     if (total > cap) logf("gpu.prewarm variants_capped=%u of %zu", r.variants, total);
     logf("gpu.prewarm variants=%u msaa=%d masks=%d hits=%u", r.variants, force, masks ? 1 : 0, variantHits);
   }
+  // A key that has finished (ready, failed, or released by the game) stays finished: only the open ones are polled again.
+  std::vector<size_t> open(keys.size());
+  for (size_t i = 0; i < open.size(); ++i) open[i] = i;
+  uint32_t done = 0, failed = 0, doneV = 0, failedV = 0;
   for (;;) {
-    uint32_t done = 0, failed = 0, doneV = 0, failedV = 0;
-    for (size_t i = 0; i < keys.size(); ++i) {
-      const bool variant = i >= r.recipes;
+    size_t kept = 0;
+    for (size_t at : open) {
+      const bool variant = at >= r.recipes;
       uint32_t& d = variant ? doneV : done;
       uint32_t& f = variant ? failedV : failed;
-      const auto st = cache.status({keys[i]});
+      const auto st = cache.status({keys[at]});
       if (st == vpgpu::PipelineCache::Status::Ready) ++d;
       else if (st == vpgpu::PipelineCache::Status::Failed) ++d, ++f;
       else if (st == vpgpu::PipelineCache::Status::Missing) ++d;  // compiled, then released by the game: no longer ours to wait for
+      else open[kept++] = at;
     }
+    open.resize(kept);
     if (progress) progress(done, r.recipes);
     r.ready = done - failed;
     r.variantsFailed = failedV;
@@ -1250,8 +1360,8 @@ __attribute__((visibility("default"))) uint32_t vpvk_prewarm_count(void) {
   if (dir.empty()) return 0;
   vpvk::refreshTranslatorMode();
   vpvk::refreshRobustMode();
-  vpvk::RecipeStore store(dir);
-  return uint32_t(store.snapshot().pipelines.size());
+  const std::shared_ptr<vpvk::RecipeStore> store = vpvk::RecipeStore::forDir(dir);
+  return uint32_t(store->snapshot().pipelines.size());
 }
 
 // Standalone platform + device with every core as a pipeline worker (the game is not running).
@@ -1277,7 +1387,8 @@ __attribute__((visibility("default"))) uint32_t vpvk_prewarm(vpvk_prewarm_progre
   }
   vpvk::refreshTranslatorMode();  // the environment the host set for this run (it may change between runs)
   vpvk::refreshRobustMode();
-  vpvk::RecipeStore store(dir);
+  const std::shared_ptr<vpvk::RecipeStore> storePtr = vpvk::RecipeStore::forDir(dir);
+  vpvk::RecipeStore& store = *storePtr;
   if (!store.pipelineCount()) {
     vpvk::log("gpu.prewarm skipped=no_recipes");
     return 0;

@@ -6,6 +6,7 @@ namespace vpgpu {
 
 namespace {
 uint64_t saturatingEnd(uint64_t begin, uint64_t size) { return size > UINT64_MAX - begin ? UINT64_MAX : begin + size; }
+uint32_t saturatingEnd(uint32_t begin, uint32_t size) { return size > UINT32_MAX - begin ? UINT32_MAX : begin + size; }
 uint16_t saturatingEnd(uint16_t begin, uint16_t count) {
   return static_cast<uint16_t>(std::min<uint32_t>(uint32_t{begin} + count, UINT16_MAX));
 }
@@ -106,8 +107,8 @@ std::vector<Access> drawAccesses(const Draw& d) {
   std::vector<Access> out = d.bindings;
   if (d.index) {
     const uint64_t stride = d.index->wide ? 4 : 2;
-    out.push_back(read(ResourceRange::bytes(d.index->buffer, d.index->offset + uint64_t{d.first} * stride,
-                                            uint64_t{d.count} * stride),
+    const uint64_t skip = uint64_t{d.first} * stride;
+    out.push_back(read(ResourceRange::bytes(d.index->buffer, saturatingEnd(d.index->offset, skip), uint64_t{d.count} * stride),
                        stage::vertex));
   }
   if (d.indirect) out.push_back(read(ResourceRange::bytes(d.indirect->buffer, d.indirect->offset, d.index ? 20 : 16), stage::vertex));
@@ -129,7 +130,7 @@ std::vector<Access> copyAccesses(const Copy& c, bool rects) {
     if (rects && !sameTexture && s.width && s.height) {
       r.rect = true;
       r.x0 = s.x, r.y0 = s.y;
-      r.x1 = s.x + s.width, r.y1 = s.y + s.height;
+      r.x1 = saturatingEnd(s.x, s.width), r.y1 = saturatingEnd(s.y, s.height);
     }
     return r;
   };

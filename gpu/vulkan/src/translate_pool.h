@@ -27,9 +27,10 @@ class TranslatePool {
  public:
   struct Job {
     std::function<void()> fn;
-    std::atomic<int> state{0};  // 0 queued, 1 running, 2 done
+    std::atomic<int> state{0};  // 0 queued, 1 running, 2 done, 3 dropped (the pool went away before it started; fn never ran)
     std::mutex m;
     std::condition_variable cv;
+    bool finished() const { return state.load(std::memory_order_acquire) >= 2; }  // done or dropped: nothing will change
     bool done() const { return state.load(std::memory_order_acquire) == 2; }
   };
   using JobPtr = std::shared_ptr<Job>;
@@ -45,6 +46,20 @@ class TranslatePool {
     }
     wake_.notify_all();
     for (std::thread& t : workers_) t.join();
+    // A thread blocked in wait(job, UINT32_MAX) on a job that never started would wait for ever: release them (state "dropped",
+    // wait() returns false; the function never ran and is dropped with what it captured).
+    while (!queue_.empty()) {
+      const JobPtr job = queue_.top().job;
+      queue_.pop();
+      int expect = 0;
+      if (!job->state.compare_exchange_strong(expect, 1)) continue;  // claimed through its other entry
+      job->fn = nullptr;
+      {
+        std::lock_guard<std::mutex> jl(job->m);
+        job->state.store(3, std::memory_order_release);
+      }
+      job->cv.notify_all();
+    }
   }
   TranslatePool(const TranslatePool&) = delete;
   TranslatePool& operator=(const TranslatePool&) = delete;
@@ -59,15 +74,16 @@ class TranslatePool {
   void boost(const JobPtr& job) {
     if (job && job->state.load(std::memory_order_acquire) == 0) push(job, 0);
   }
-  // True when the job is done. `ms` UINT32_MAX = no limit.
+  // True when the job is done (it ran); false on timeout or when it was dropped at the pool's destruction. `ms` UINT32_MAX = no limit.
   bool wait(const JobPtr& job, uint32_t ms) {
-    if (!job || job->done()) return true;
+    if (!job) return true;
+    if (job->finished()) return job->done();
     std::unique_lock<std::mutex> l(job->m);
-    if (ms == UINT32_MAX) {
-      job->cv.wait(l, [&] { return job->done(); });
-      return true;
-    }
-    return job->cv.wait_for(l, std::chrono::milliseconds(ms), [&] { return job->done(); });
+    if (ms == UINT32_MAX)
+      job->cv.wait(l, [&] { return job->finished(); });
+    else if (!job->cv.wait_for(l, std::chrono::milliseconds(ms), [&] { return job->finished(); }))
+      return false;
+    return job->done();
   }
   // Jobs queued or running (diagnostics).
   size_t pending() const {

@@ -5,6 +5,7 @@
 // are libraries here, called the way their own command-line tools call themselves.
 
 #include "vpconvert.h"
+#include "vpconvert_cache.h"
 #include "../vpaot/image.h"
 
 #include <algorithm>
@@ -20,6 +21,7 @@
 #include <memory>
 #include <mutex>
 #include <regex>
+#include <set>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -162,16 +164,16 @@ std::string module_roots(const VpConvertConfig& c, const std::string& name) {
     if (!c.missing_log || !fs::exists(c.missing_log)) return "";
     std::istringstream in(read_file(c.missing_log));
     std::string out;
+    std::set<std::string> seen; // the log may hold an entry more than once: the roots are the same
     for (std::string l; std::getline(in, l);) {
-        if (l.rfind(name + "+", 0) == 0) out += l + "\n";
+        if (l.rfind(name + "+", 0) == 0 && seen.insert(l).second) out += l + "\n";
     }
     return out;
 }
 
 // The embedder's changes to a module's image (VpConvertCallbacks.patch_image) as vpaot --patch
 // lines ("OFFSET HEXBYTES", runs of changed bytes); empty when it changes nothing.
-std::string module_patch(const fs::path& file, const std::string& name, const VpConvertCallbacks* cb) {
-    if (!cb || !cb->patch_image) return {};
+std::string read_patch(const fs::path& file, const std::string& name, const VpConvertCallbacks* cb) {
     vpaot::Image img = vpaot::load_elf_or_self(file.string());
     std::vector<uint8_t> changed = img.memory;
     cb->patch_image(cb->user, name.c_str(), changed.data(), (unsigned long)changed.size());
@@ -188,6 +190,15 @@ std::string module_patch(const fs::path& file, const std::string& name, const Vp
         i = j;
     }
     return out;
+}
+
+// The same, kept for the run of the app (see vpcache::Patches): `recompute` for a conversion and for
+// the check whether the pack is current, which must see the embedder's settings as they are now.
+vpcache::Patches g_patches;
+std::string module_patch(const fs::path& file, const std::string& name, const VpConvertCallbacks* cb, bool recompute = true) {
+    if (!cb || !cb->patch_image) return {};
+    return g_patches.get(file.string(), name, (const void*)cb->patch_image, cb->user, recompute,
+                         [&] { return read_patch(file, name, cb); });
 }
 
 // What a module's translation depends on: if this is the same, its C (and objects) are current.
@@ -220,6 +231,8 @@ std::string content_hash(const fs::path& p) {
 // The compiler flags of every piece (besides target, level, include paths).
 const char* const kPieceFlags[] = {"-ffreestanding", "-fno-stack-protector", "-fno-math-errno", "-frounding-math", "-w"};
 
+vpcache::FileValues g_header_hashes; // a header is read again only if its file changed
+
 // What every object depends on besides its C: the runtime's binary interface and its headers in
 // the SDK (an app update may change them), clang (version, headers) and the compiler options. Not
 // the translator: a new translator that writes the same C for a piece keeps its object (its C's
@@ -235,7 +248,9 @@ std::string compile_key(const fs::path& sdk, const std::string& triple, const st
     }
     std::sort(headers.begin(), headers.end());
     std::string all;
-    for (const auto& h : headers) all += fs::relative(h, sdk, ec).generic_string() + " " + content_hash(h) + "\n";
+    for (const auto& h : headers) {
+        all += fs::relative(h, sdk, ec).generic_string() + " " + g_header_hashes.get(h.string(), [&] { return content_hash(h); }) + "\n";
+    }
     char buf[256];
     std::string flags;
     for (const char* f : kPieceFlags) flags += std::string(f) + " ";
@@ -480,12 +495,10 @@ std::string module_want(const fs::path& file, const VpConvertConfig& c, const st
 }
 
 // The translator and compiler a module's stamp names (see module_stamp).
-std::string build_key(const VpConvertConfig& c) {
-    const std::string triple = c.triple ? c.triple : "arm64-apple-xros2.0";
-    const std::string opt = c.opt_level ? c.opt_level : "-O2";
+std::string build_key(const VpConvertConfig& c, const std::string& compiled_with) {
     char translator[96];
     snprintf(translator, sizeof translator, "vpaot %s\nzydis %llx\n", VPAOT_SOURCE_ID, (unsigned long long)ZYDIS_VERSION);
-    return translator + compile_key(fs::path(c.sdk_dir), triple, opt);
+    return translator + compiled_with;
 }
 
 int convert(const VpConvertConfig& c, Logger& log) {
@@ -498,7 +511,7 @@ int convert(const VpConvertConfig& c, Logger& log) {
     const fs::path game(c.game_dir), work(c.work_dir), sdk(c.sdk_dir);
     const std::string compiled_with = compile_key(sdk, triple, opt);
     // A module's translation is current when its file, roots, split, translator and compiler are.
-    const std::string build = build_key(c);
+    const std::string build = build_key(c, compiled_with);
     // What a piece's ".o.ok" holds: its object is current when its C and the build are the same.
     auto object_key = [&](const fs::path& c_file) { return content_hash(c_file) + "\n" + compiled_with; };
     std::error_code ec;
@@ -873,7 +886,7 @@ int is_current(const VpConvertConfig& c, Logger& log) {
     std::error_code ec;
     if (!fs::exists(c.output, ec)) return 1;
     const int split = c.split > 0 ? c.split : 300;
-    const std::string build = build_key(c);
+    const std::string build = build_key(c, compile_key(fs::path(c.sdk_dir), c.triple ? c.triple : "arm64-apple-xros2.0", c.opt_level ? c.opt_level : "-O2"));
     const std::vector<fs::path> files = game_modules(game);
     if (files.empty()) return -1;
     const auto pack_time = fs::last_write_time(c.output, ec);
@@ -904,6 +917,16 @@ namespace {
 
 std::mutex g_fragment_mutex;
 
+// What a fragment's translation leaves in its folder besides the library, whichever way it ends:
+// the known list grows with the module, and a failed attempt is made again at the next miss.
+struct Scratch {
+    std::vector<fs::path> files;
+    ~Scratch() {
+        std::error_code ec;
+        for (const auto& f : files) fs::remove(f, ec);
+    }
+};
+
 int convert_fragment(const VpConvertConfig& c, Logger& log, const std::string& module, uint64_t offset,
                      const unsigned long long* known, unsigned long known_count, std::string& result) {
     init_llvm_once();
@@ -929,6 +952,9 @@ int convert_fragment(const VpConvertConfig& c, Logger& log, const std::string& m
     // ---- translation: the entry and what it calls that the loaded translation lacks
     const fs::path roots = dir / (name + ".roots"), known_file = dir / (name + ".known"), patch_file = dir / (name + ".patch");
     const fs::path c_file = dir / (name + ".c"), reg_c = dir / (name + "_registry.c");
+    Scratch scratch;
+    scratch.files = {roots, known_file, patch_file, c_file, reg_c, fs::path(c_file).replace_extension(".o"),
+                     fs::path(reg_c).replace_extension(".o"), fs::path(dylib.string() + ".tmp")};
     if (!write_file(roots, std::string("0x") + hex + "\n")) { log.line("on demand: ERROR: cannot write %s", roots.string().c_str()); return -1; }
     {
         std::string text;
@@ -939,7 +965,7 @@ int convert_fragment(const VpConvertConfig& c, Logger& log, const std::string& m
     }
     std::string patch;
     try {
-        patch = module_patch(file, module, log.cb);
+        patch = module_patch(file, module, log.cb, false); // the game runs: its patches stay as they were
     } catch (const std::exception& e) {
         log.line("on demand: ERROR: reading %s for its patches: %s", file.filename().string().c_str(), e.what());
         return -1;
@@ -1014,9 +1040,6 @@ int convert_fragment(const VpConvertConfig& c, Logger& log, const std::string& m
     if (!link(args, link_output)) { log.line("on demand: ERROR: linking failed:\n%s", link_output.substr(0, 4000).c_str()); return -1; }
     fs::rename(out_tmp, dylib, ec);
     if (ec) { log.line("on demand: ERROR: cannot move %s: %s", out_tmp.c_str(), ec.message().c_str()); return -1; }
-    for (const auto& o : objects) fs::remove(o, ec);
-    fs::remove(c_file, ec);
-    fs::remove(reg_c, ec);
     log.line("on demand: %s+0x%s translated in %.2f s, compiled and linked in %.2f s (%ju bytes)", module.c_str(), hex, translate_s,
              seconds_since(started) - translate_s, fs::file_size(dylib, ec));
     result = dylib.string();

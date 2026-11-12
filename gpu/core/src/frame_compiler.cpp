@@ -116,7 +116,7 @@ struct AccessIndex {
   std::unordered_map<uint64_t, std::vector<uint32_t>> byResource, writesByResource;
 
   void append(const AccessList& from) {
-    list.reserve(list.size() + from.size());
+    if (list.empty()) list.reserve(from.size());  // (an exact reserve on every append would copy the whole list each time)
     for (const Tagged& t : from) {
       const uint64_t k = resourceKey(t.access.range);
       const uint32_t i = static_cast<uint32_t>(list.size());
@@ -132,17 +132,21 @@ struct AccessIndex {
   }
 };
 
-bool conflicts(const AccessList& a, const AccessIndex& b) {
-  for (const Tagged& x : a) {
-    const auto& map = x.access.write ? b.byResource : b.writesByResource;
-    auto it = map.find(resourceKey(x.access.range));
-    if (it == map.end()) continue;
-    for (uint32_t i : it->second) {
-      const Tagged& y = b.list[i];
-      if (x.attachment && y.attachment) continue;
-      if (x.access.range.overlaps(y.access.range)) return true;
-    }
+bool conflicts(const Tagged& x, const AccessIndex& b) {
+  const auto& map = x.access.write ? b.byResource : b.writesByResource;
+  auto it = map.find(resourceKey(x.access.range));
+  if (it == map.end()) return false;
+  for (uint32_t i : it->second) {
+    const Tagged& y = b.list[i];
+    if (x.attachment && y.attachment) continue;
+    if (x.access.range.overlaps(y.access.range)) return true;
   }
+  return false;
+}
+
+bool conflicts(const AccessList& a, const AccessIndex& b) {
+  for (const Tagged& x : a)
+    if (conflicts(x, b)) return true;
   return false;
 }
 
@@ -238,7 +242,7 @@ struct Extent {
 Extent extent(const Attachment& a, const ResourceTable& t) {
   const TextureDesc* d = t.get(a.texture);
   if (!d) return {};
-  return {std::max(1u, d->width >> a.mip), std::max(1u, d->height >> a.mip), d->samples};
+  return {std::max(1u, mipShift(d->width, a.mip)), std::max(1u, mipShift(d->height, a.mip)), d->samples};
 }
 
 template <class F>
@@ -411,14 +415,23 @@ class Scheduler {
     }
     // Hoist as far up as no earlier encoder conflicts: copies of a whole frame then gather in
     // a few compute encoders instead of one in front of every render encoder.
-    int target = -1;
-    for (int e = open_ - 1; e >= 0; --e) {
-      if (out_.encoders[e].kind == Encoder::Kind::Compute) target = e;
-      if (conflicts(acc, acc_[e])) break;
+    // The last conflicting encoder is found through the encoders that touched each resource (noteTouch), not by walking all.
+    int last = -1;
+    for (const Tagged& x : acc) {
+      auto it = touch_.find(resourceKey(x.access.range));
+      if (it == touch_.end()) continue;
+      const std::vector<int>& list = x.access.write ? it->second.any : it->second.writes;
+      for (size_t k = list.size(); k-- > 0 && list[k] > last;)
+        if (conflicts(x, acc_[list[k]])) {
+          last = list[k];
+          break;
+        }
     }
-    if (target < 0) target = insertComputeBeforeOpen();
+    const auto lowest = std::lower_bound(computes_.begin(), computes_.end(), std::max(last, 0));
+    const int target = lowest != computes_.end() && *lowest < open_ ? *lowest : insertComputeBeforeOpen();
     out_.encoders[target].commands.push_back(i);
     acc_[target].append(acc);
+    noteTouch(target, acc);
     ++out_.stats.copiesHoisted;
   }
 
@@ -519,7 +532,9 @@ class Scheduler {
     e.commands = {i};
     out_.encoders.push_back(std::move(e));
     acc_.emplace_back().append(acc);
-    return static_cast<int>(out_.encoders.size()) - 1;
+    const int index = static_cast<int>(out_.encoders.size()) - 1;
+    if (kind == Encoder::Kind::Compute) computes_.push_back(index), noteTouch(index, acc);  // a render encoder is noted when it closes
+    return index;
   }
   int push(Encoder::Kind kind, CutReason reason, uint32_t i, AccessIndex acc) {
     Encoder e;
@@ -528,7 +543,9 @@ class Scheduler {
     e.commands = {i};
     out_.encoders.push_back(std::move(e));
     acc_.push_back(std::move(acc));
-    return static_cast<int>(out_.encoders.size()) - 1;
+    const int index = static_cast<int>(out_.encoders.size()) - 1;
+    if (kind == Encoder::Kind::Compute) computes_.push_back(index), noteTouch(index, acc_.back().list);
+    return index;
   }
 
   int insertComputeBeforeOpen() {
@@ -537,6 +554,7 @@ class Scheduler {
     e.reason = CutReason::CopyWork;
     out_.encoders.insert(out_.encoders.begin() + open_, std::move(e));
     acc_.insert(acc_.begin() + open_, AccessIndex{});
+    computes_.push_back(open_);  // the open render encoder is the last one: nothing sits above it
     return open_++;
   }
 
@@ -544,6 +562,7 @@ class Scheduler {
     if (!out_.encoders.empty() && out_.encoders.back().kind == Encoder::Kind::Compute) {
       out_.encoders.back().commands.push_back(i);
       acc_.back().append(acc);
+      noteTouch(static_cast<int>(out_.encoders.size()) - 1, acc);
     } else {
       push(Encoder::Kind::Compute, reason, i, std::move(acc));
     }
@@ -551,6 +570,7 @@ class Scheduler {
 
   void closeRender() {
     if (open_ < 0) return;
+    noteTouch(open_, acc_[open_].list);
     lastRender_ = out_.encoders[open_].pass;
     haveLastRender_ = true;
     open_ = -1;
@@ -561,10 +581,29 @@ class Scheduler {
     sunkAcc_.clear();
   }
 
+  // Encoder indices (ascending) that touched a resource: every access, and the writes alone (as AccessIndex). Only encoders
+  // below open_ are in it: the open one is noted when it closes, so the index shift of insertComputeBeforeOpen never matters.
+  struct Touch {
+    std::vector<int> any, writes;
+  };
+  static void insertSorted(std::vector<int>& v, int e) {
+    if (v.empty() || v.back() < e) v.push_back(e);
+    else if (const auto it = std::lower_bound(v.begin(), v.end(), e); *it != e) v.insert(it, e);
+  }
+  void noteTouch(int e, const AccessList& acc) {
+    for (const Tagged& t : acc) {
+      Touch& n = touch_[resourceKey(t.access.range)];
+      insertSorted(n.any, e);
+      if (t.access.write) insertSorted(n.writes, e);
+    }
+  }
+
   CompiledFrame& out_;
   const ResourceTable* res_;
   const CompileOptions& options_;
   std::vector<AccessIndex> acc_;  // parallel to out_.encoders
+  std::unordered_map<uint64_t, Touch> touch_;
+  std::vector<int> computes_;     // indices of the compute encoders, ascending
   int open_ = -1;                 // open render encoder
   std::vector<uint32_t> sunk_;    // copies deferred to right after the open render encoder
   AccessIndex sunkAcc_;
@@ -580,22 +619,35 @@ class BarrierPlacer {
   void access(const Access& a, uint32_t encoder, uint32_t item) {
     if (a.range.kind == ResourceRange::Kind::Sampler) return;  // immutable: never a hazard
     const Pos p{encoder, item};
-    auto& records = records_[key(a.range)];
+    Bucket& bucket = records_[key(a.range)];
+    auto& records = bucket.records;
     uint8_t kinds = 0;
     StageMask after = 0;
-    for (const Record& r : records) {
-      if (r.pos == p || !r.access.range.overlaps(a.range)) continue;
-      if (!r.access.write && !a.write) continue;
-      if (covered(r.pos, r.access.stages, a.stages)) continue;
+    auto meet = [&](const Record& r) {
+      if (r.pos == p || !r.access.range.overlaps(a.range)) return;
+      if (!r.access.write && !a.write) return;
+      if (covered(r.pos, r.access.stages, a.stages)) return;
       const HazardKind k = !r.access.write ? HazardKind::WAR : a.write ? HazardKind::WAW : HazardKind::RAW;
       kinds |= 1 << static_cast<int>(k);
       after |= r.access.stages;
-    }
+    };
+    // A read only meets writes (thousands of encoders can read one buffer): a write meets everything.
+    if (a.write)
+      for (const Record& r : records) meet(r);
+    else
+      for (uint32_t i : bucket.writes) meet(records[i]);
     if (kinds) addBarrier(p, after, a.stages, kinds);
     // A write orders everything it fully covers (through the barrier just placed), so those
     // records can no longer cause a hazard on their own.
-    if (a.write)
+    if (a.write) {
+      const size_t before = records.size();
       std::erase_if(records, [&](const Record& r) { return r.pos < p && a.range.contains(r.access.range); });
+      if (records.size() != before) {
+        bucket.writes.clear();
+        for (size_t i = 0; i < records.size(); ++i)
+          if (records[i].access.write) bucket.writes.push_back(static_cast<uint32_t>(i));
+      }
+    }
     // Many draws of one render encoder (one position) touch the same resource: their records are
     // folded so the scan above stays short. Reads widen into one read record of the position (a
     // wider read only adds hazards, and nothing is erased because of a read); a write folds only
@@ -625,6 +677,7 @@ class BarrierPlacer {
       r.stages |= a.stages;
       return;
     }
+    if (a.write) bucket.writes.push_back(static_cast<uint32_t>(records.size()));
     records.push_back({a, p});
   }
 
@@ -661,8 +714,13 @@ class BarrierPlacer {
     b.hazards |= kinds;
   }
 
+  struct Bucket {
+    std::vector<Record> records;
+    std::vector<uint32_t> writes;  // indices in `records` of the write records (rebuilt when a write erases records)
+  };
+
   CompiledFrame& out_;
-  std::unordered_map<uint64_t, std::vector<Record>> records_;
+  std::unordered_map<uint64_t, Bucket> records_;
 };
 
 // Consecutive dead stores of an MSAA texture before its store is elided (CompileOptions::msaaDeadStore).
@@ -724,7 +782,7 @@ uint64_t splitSignature(const Encoder& enc, const ResourceTable& res) {
     const TextureDesc* d = a.texture ? res.get(a.texture) : nullptr;
     if (!d) return;
     mix(uint64_t(slot) << 32 | uint64_t(a.format != Format::Undefined ? a.format : d->format));
-    mix(uint64_t(std::max(1u, d->width >> a.mip)) << 32 | std::max(1u, d->height >> a.mip));
+    mix(uint64_t(std::max(1u, mipShift(d->width, a.mip))) << 32 | std::max(1u, mipShift(d->height, a.mip)));
     mix(uint64_t(d->samples) << 16 | enc.pass.layerCount);
   });
   return h;
@@ -1241,7 +1299,7 @@ static void msaaTraffic(CompiledFrame& out, const ResourceTable& res) {
     forEachSlot(enc.pass, [&](const Attachment& a, int) {
       const TextureDesc* d = a.texture ? res.get(a.texture) : nullptr;
       if (!d || d->samples < 2) return;
-      const uint64_t bytes = uint64_t{std::max(1u, d->width >> a.mip)} * std::max(1u, d->height >> a.mip) * layers * d->samples *
+      const uint64_t bytes = uint64_t{std::max(1u, mipShift(d->width, a.mip))} * std::max(1u, mipShift(d->height, a.mip)) * layers * d->samples *
                              formatInfo(a.format != Format::Undefined ? a.format : d->format).bytesPerBlock;
       if (a.load == LoadAction::Load) out.stats.msaaLoadBytes += bytes;
       if (a.store == StoreAction::Store || a.store == StoreAction::StoreAndResolve) out.stats.msaaStoreBytes += bytes;

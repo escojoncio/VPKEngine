@@ -90,6 +90,9 @@ inline bool pngDecode(const std::vector<uint8_t>& f, Image& im, std::string* err
   if (!w || !h || (depth != 8 && depth != 16)) return fail("unsupported PNG bit depth");
   const uint32_t ch = type == 0 ? 1 : type == 2 ? 3 : type == 4 ? 2 : type == 6 ? 4 : 0;
   if (!ch) return fail("unsupported PNG color type");
+  // The header decides what is allocated below (h * (row + 1) bytes of rows, w * h * 4 samples): a damaged or hostile one must not
+  // ask for terabytes. 2^26 pixels is an 8192 x 8192 image, more than any dump of vpreplay.
+  if (uint64_t(w) * h > (uint64_t(1) << 26)) return fail("PNG too large");
   const size_t bps = depth / 8, bpp = ch * bps, row = size_t(w) * bpp;
   std::vector<uint8_t> raw(size_t(h) * (row + 1));
   uLongf rn = uLongf(raw.size());

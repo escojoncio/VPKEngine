@@ -14,6 +14,7 @@
 #include "taa_native.h"
 
 namespace {
+float clampOr(float v, float lo, float hi, float def) { return v != v ? def : std::clamp(v, lo, hi); }  // std::clamp lets a NaN through
 std::mutex gMutex;
 vpvk_config gCfg = {{VPVK_FOVEATION_OFF, 0.35f, 0.5f, 0.0f}, {0, 50.0f, 0.5f}, 1.0f, 1, 1};
 std::atomic<uint32_t> gGen{0};
@@ -267,8 +268,13 @@ FoveationState::FoveationState() {
 std::shared_ptr<const vpgpu::RateMap> FoveationState::mapFor(uint32_t w, uint32_t h, uint16_t layers) {
   if (layers != fov::kViews || !w || !h || !foveationActive()) return nullptr;
   const FovConfig c = foveationConfig();
+  if (cur_ && w == curW_ && h == curH_ && layers == curLayers_ && c.shape.sharp == curCfg_.shape.sharp &&
+      c.shape.periphery == curCfg_.shape.periphery && c.shape.height == curCfg_.shape.height && c.shape.fade == curCfg_.shape.fade &&
+      c.shape.off == curCfg_.shape.off && c.eyes.known == curCfg_.eyes.known && c.eyes.tangents == curCfg_.eyes.tangents)
+    return cur_;
   std::shared_ptr<vpgpu::RateMap> m = fov::buildRateMap(w, h, layers, c.shape, c.eyes);
   if (!m) return nullptr;
+  curW_ = w, curH_ = h, curLayers_ = layers, curCfg_ = c;
   if (cur_ && cur_->key == m->key) return cur_;
   const fov::Center c0 = c.eyes.known ? fov::opticalCenter(c.eyes.tangents[0]) : fov::Center{};
   const fov::Center c1 = c.eyes.known ? fov::opticalCenter(c.eyes.tangents[1]) : fov::Center{};
@@ -595,9 +601,9 @@ __attribute__((visibility("default"))) void vpvk_config_set_foveation(const vpvk
   if (!f) return;
   vpvk_foveation v = *f;
   if (v.mode < VPVK_FOVEATION_OFF || v.mode > VPVK_FOVEATION_CUSTOM) v.mode = VPVK_FOVEATION_OFF;
-  v.sharp_zone = std::clamp(v.sharp_zone, 0.05f, 1.0f);
-  v.periphery = std::clamp(v.periphery, 0.1f, 1.0f);
-  v.height = std::clamp(v.height, -0.5f, 0.5f);
+  v.sharp_zone = clampOr(v.sharp_zone, 0.05f, 1.0f, 0.35f);  // a NaN would pass std::clamp and poison the rate map
+  v.periphery = clampOr(v.periphery, 0.1f, 1.0f, 0.5f);
+  v.height = clampOr(v.height, -0.5f, 0.5f, 0.0f);
   {
     std::lock_guard<std::mutex> l(gMutex);
     gCfg.foveation = v;
@@ -644,8 +650,8 @@ __attribute__((visibility("default"))) void vpvk_config_set_vpktaa(const vpvk_vp
   std::lock_guard<std::mutex> l(gMutex);
   vpvk_vpktaa v = *t;
   v.enabled = v.enabled ? 1 : 0;
-  v.percent = std::clamp(v.percent, 0.0f, 100.0f);
-  v.sharpness = std::clamp(v.sharpness, 0.0f, 1.0f);
+  v.percent = clampOr(v.percent, 0.0f, 100.0f, 50.0f);
+  v.sharpness = clampOr(v.sharpness, 0.0f, 1.0f, 0.5f);
   gCfg.vpktaa = v;
   gGen.fetch_add(1);
   vpvk::logf("vk.cfg vpktaa enabled=%d percent=%.0f sharpness=%.2f applied=%s", v.enabled,
@@ -671,7 +677,7 @@ __attribute__((visibility("default"))) int vpvk_taa_ui_mask_enabled(void) { retu
 
 __attribute__((visibility("default"))) void vpvk_config_set_render_scale(float s) {
   std::lock_guard<std::mutex> l(gMutex);
-  gCfg.render_scale = std::clamp(s, 0.5f, 1.5f);
+  gCfg.render_scale = clampOr(s, 0.5f, 1.5f, 1.0f);
   gGen.fetch_add(1);
   vpvk::logf("vk.cfg render_scale=%.2f", gCfg.render_scale);
 }

@@ -67,6 +67,12 @@ void BackgroundGate::waitForeground() {
   cv_.wait(lock, [&] { return !background_ || shutdown_ || epoch_ != epoch; });
 }
 
+bool BackgroundGate::wouldPark() const {
+  if (!active()) return false;
+  std::lock_guard lock(mutex_);
+  return background_ && !shutdown_ && std::this_thread::get_id() != main_;
+}
+
 void BackgroundGate::release() {
   {
     std::lock_guard lock(mutex_);

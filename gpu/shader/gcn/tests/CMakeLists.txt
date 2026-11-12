@@ -17,6 +17,15 @@ if(TARGET vpmsl)
     add_test(NAME gcn.lift.${n} COMMAND vpgcn_lift_test ${f} ${CMAKE_CURRENT_SOURCE_DIR}/lift/${n}.metal
              ${CMAKE_CURRENT_SOURCE_DIR}/lift/${n}.txt)
   endforeach()
+
+  # Scaling: forward diamonds (post-dominators) and nested ifs (size of the MSL).
+  add_executable(vpgcn_lift_scale_test lift_scale_test.cpp)
+  target_link_libraries(vpgcn_lift_scale_test PRIVATE vpgcn_lift vpmsl)
+  target_compile_options(vpgcn_lift_scale_test PRIVATE -Wall -Wextra -Werror)
+  add_test(NAME gcn.lift.scale COMMAND vpgcn_lift_scale_test 6000)
+  add_test(NAME gcn.lift.scale_nested COMMAND vpgcn_lift_scale_test nested 1500)
+  add_test(NAME gcn.lift.fetch_recursion COMMAND vpgcn_lift_scale_test fetch_recursion)
+  add_test(NAME gcn.lift.fetch_calls COMMAND vpgcn_lift_scale_test fetch_calls)
 endif()
 
 # Independent reference interpreter for SALU/VALU ops (differential testing of the translator).

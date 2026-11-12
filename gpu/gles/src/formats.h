@@ -42,6 +42,10 @@ uint32_t clientPixelBytes(GLenum format, GLenum type);
 // `dst` (tightly packed). Returns false when no conversion is known.
 bool convertUpload(const FormatInfo& dst, GLenum format, GLenum type, const uint8_t* src, uint32_t pixels,
                    std::vector<uint8_t>& out);
+// The same into `out`, which holds pixels * dst.texelBytes bytes (every one is written when this returns true).
+bool convertUploadTo(const FormatInfo& dst, GLenum format, GLenum type, const uint8_t* src, uint32_t pixels, uint8_t* out);
+// Whether convertReadback(src, format, type) leaves the texels as they are (the pixels are the bytes the image holds).
+bool readbackIsCopy(const FormatInfo& src, GLenum format, GLenum type);
 // Converts tightly packed texels of `src` into client (format, type) pixels (glReadPixels).
 bool convertReadback(const FormatInfo& src, GLenum format, GLenum type, const uint8_t* in, uint32_t pixels,
                      uint8_t* out);

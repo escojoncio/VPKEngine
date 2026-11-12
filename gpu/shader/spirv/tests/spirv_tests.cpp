@@ -3,6 +3,8 @@
 // Each case lowers with a driver-style layout, verifies, emits MSL and checks what the lowering
 // promises (bindings reported, multiview, the subpass-read pattern, workgroup size…).
 #include <algorithm>
+#include <chrono>
+#include <filesystem>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -2281,6 +2283,263 @@ static void ycbcr(const std::string& dir) {
   }
 }
 
+// Structural checks of the reader: modules a compiler never writes are refused with a message, and a minimal valid one
+// passes. Each case is the header of a compute module (ids: 1 main, 2 void, 3 void(), bound 16) plus what the lambda adds.
+void structure() {
+    using Words = std::vector<uint32_t>;
+    auto module = [](const std::function<void(Words&)>& rest) {
+        Words w = {0x07230203u, 0x00010300u, 0, 16, 0};
+        auto ins = [&](uint32_t op, std::initializer_list<uint32_t> ops) {
+            w.push_back(uint32_t(ops.size() + 1) << 16 | op);
+            w.insert(w.end(), ops.begin(), ops.end());
+        };
+        ins(17, {1});                    // OpCapability Shader
+        ins(14, {0, 1});                 // OpMemoryModel Logical GLSL450
+        ins(15, {5, 1, 0x6e69616du, 0}); // OpEntryPoint GLCompute %1 "main"
+        ins(16, {1, 17, 1, 1, 1});       // OpExecutionMode %1 LocalSize 1 1 1
+        ins(19, {2});                    // OpTypeVoid %2
+        ins(33, {3, 2});                 // OpTypeFunction %3 %2
+        rest(w);
+        return w;
+    };
+    auto ins = [](Words& w, uint32_t op, std::initializer_list<uint32_t> ops) {
+        w.push_back(uint32_t(ops.size() + 1) << 16 | op);
+        w.insert(w.end(), ops.begin(), ops.end());
+    };
+    auto fn = [&](Words& w, uint32_t id, std::initializer_list<uint32_t> body) {  // void id() { body; return }
+        ins(w, 54, {2, id, 0, 3});
+        ins(w, 248, {id + 1});
+        for (uint32_t x : body) w.push_back(x);
+        ins(w, 253, {});
+        ins(w, 56, {});
+    };
+    auto verdict = [&](const char* name, const Words& w, const char* expect) {
+        std::string error;
+        spirv::SpirvModule* m = spirv::parse(w.data(), w.size(), error);
+        if (m) spirv::release(m);
+        const bool ok = expect[0] == 0 ? m != nullptr : (!m && error.find(expect) != std::string::npos);
+        if (!ok) std::fprintf(stderr, "  %s: expected \"%s\", got %s \"%s\"\n", name, expect, m ? "a module" : "an error", error.c_str());
+        CHECK(ok);
+    };
+    verdict("valid", module([&](Words& w) { fn(w, 1, {}); }), "");
+    verdict("branch to nothing", module([&](Words& w) {
+                ins(w, 54, {2, 1, 0, 3});
+                ins(w, 248, {4});
+                ins(w, 249, {9});  // OpBranch %9
+                ins(w, 56, {});
+            }), "not one of its labels");
+    verdict("recursion", module([&](Words& w) {
+                ins(w, 54, {2, 1, 0, 3});
+                ins(w, 248, {4});
+                ins(w, 57, {2, 5, 1});  // %5 = OpFunctionCall %2 %1
+                ins(w, 253, {});
+                ins(w, 56, {});
+            }), "recursion");
+    verdict("mutual recursion", module([&](Words& w) {
+                ins(w, 54, {2, 1, 0, 3});
+                ins(w, 248, {4});
+                ins(w, 57, {2, 5, 6});
+                ins(w, 253, {});
+                ins(w, 56, {});
+                ins(w, 54, {2, 6, 0, 3});
+                ins(w, 248, {7});
+                ins(w, 57, {2, 8, 1});
+                ins(w, 253, {});
+                ins(w, 56, {});
+            }), "recursion");
+    verdict("call with an argument too many", module([&](Words& w) {
+                fn(w, 6, {});
+                ins(w, 54, {2, 1, 0, 3});
+                ins(w, 248, {4});
+                ins(w, 57, {2, 5, 6, 4});
+                ins(w, 253, {});
+                ins(w, 56, {});
+            }), "arguments");
+    verdict("call of a type", module([&](Words& w) {
+                ins(w, 54, {2, 1, 0, 3});
+                ins(w, 248, {4});
+                ins(w, 57, {2, 5, 3});
+                ins(w, 253, {});
+                ins(w, 56, {});
+            }), "not a function");
+    verdict("id defined twice", module([&](Words& w) {
+                ins(w, 22, {4, 32});       // %4 = OpTypeFloat 32
+                ins(w, 43, {4, 4, 0});     // %4 = OpConstant %4 0
+                fn(w, 1, {});
+            }), "defined twice");
+    verdict("id past the bound", module([&](Words& w) {
+                ins(w, 22, {40, 32});      // %40 = OpTypeFloat 32, bound 16
+                fn(w, 1, {});
+            }), "id bound");
+    verdict("entry point is not a function", module([&](Words& w) { ins(w, 22, {1, 32}); }), "defined twice");
+    verdict("pointer to nothing", module([&](Words& w) {
+                ins(w, 32, {5, 7, 9});     // %5 = OpTypePointer Private %9, never declared
+                fn(w, 1, {});
+            }), "no declared pointee");
+    verdict("merge block that is not a label", module([&](Words& w) {
+                ins(w, 54, {2, 1, 0, 3});
+                ins(w, 248, {4});
+                ins(w, 247, {9, 0});       // OpSelectionMerge %9
+                ins(w, 249, {4});
+                ins(w, 56, {});
+            }), "merge block");
+}
+
+// A vec4 member at byte 0xFFFFFFF4: its last component sits at byte 2^32. The offsets used to be summed in 32 bits and
+// wrapped (a store to byte 0); the lowering now refuses the module.
+void offsetOverflow(const std::string& dir) {
+    const std::vector<uint32_t> words = readWords(dir + "/offset_overflow.comp.spv");
+    std::string error;
+    spirv::SpirvModule* m = spirv::parse(words.data(), words.size(), error);
+    CHECK(m != nullptr);
+    if (!m) return;
+    spirv::SpirvLowerOptions o;
+    o.entry = "main";
+    o.stage = vpir::Stage::Compute;
+    o.layout = {bind(0, 0, vpgpu::BindKind::Buffer, 0)};
+    vpir::Module mod;
+    spirv::SpirvInterface iface;
+    const bool ok = spirv::lower(*m, o, mod, iface, error);
+    spirv::release(m);
+    CHECK(!ok);
+    CHECK(error.find("overflows 32 bits") != std::string::npos);
+    if (error.find("overflows 32 bits") == std::string::npos) std::fprintf(stderr, "  lower: %s\n", error.c_str());
+}
+
+// A private structure of 40000 floats copied whole: each member's natural offset used to be summed from the first
+// member (40000^2 / 2 lookups, about 10 s); the prefix sums are now built once per structure.
+void wideStruct() {
+    constexpr uint32_t kMembers = 40000;
+    std::vector<uint32_t> w = {0x07230203u, 0x00010300u, 0, 0, 0};
+    auto ins = [&](uint32_t op, std::initializer_list<uint32_t> ops) {
+        w.push_back(uint32_t(ops.size() + 1) << 16 | op);
+        w.insert(w.end(), ops.begin(), ops.end());
+    };
+    // ids: 1 main, 2 void, 3 fn, 4 f32, 5 struct, 6 ptr, 7 var, 8 value
+    ins(17, {1});                             // OpCapability Shader
+    ins(14, {0, 1});                          // OpMemoryModel Logical GLSL450
+    ins(15, {5, 1, 0x6e69616du, 0});          // OpEntryPoint GLCompute %1 "main"
+    ins(16, {1, 17, 1, 1, 1});                // OpExecutionMode LocalSize 1 1 1
+    ins(19, {2});                             // OpTypeVoid
+    ins(33, {3, 2});                          // OpTypeFunction
+    ins(22, {4, 32});                         // OpTypeFloat 32
+    w.push_back(uint32_t(kMembers + 2) << 16 | 30), w.push_back(5);  // OpTypeStruct %5 {%4 x kMembers}
+    w.insert(w.end(), kMembers, 4);
+    ins(32, {6, 6, 5});                       // OpTypePointer Private
+    ins(59, {6, 7, 6});                       // OpVariable Private
+    ins(54, {2, 1, 0, 3});                    // OpFunction
+    ins(248, {9});                            // OpLabel
+    ins(61, {5, 8, 7});                       // OpLoad %5 %8 %7
+    ins(62, {7, 8});                          // OpStore
+    ins(253, {});                             // OpReturn
+    ins(56, {});                              // OpFunctionEnd
+    w[3] = 10;
+    spirv::SpirvLowerOptions o;
+    o.entry = "main";
+    o.stage = vpir::Stage::Compute;
+    std::string error;
+    spirv::SpirvModule* m = spirv::parse(w.data(), w.size(), error);
+    CHECK(m != nullptr);
+    if (!m) return std::fprintf(stderr, "  parse: %s\n", error.c_str()), void();
+    const auto t0 = std::chrono::steady_clock::now();
+    vpir::Module mod;
+    spirv::SpirvInterface iface;
+    const bool ok = spirv::lower(*m, o, mod, iface, error);
+    spirv::release(m);
+    const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    if (!ok) std::fprintf(stderr, "  lower: %s\n", error.c_str());
+    CHECK(ok);
+    if (ms > 4000) std::fprintf(stderr, "  lowering took %.0f ms\n", ms);
+    CHECK(ms < 4000);
+}
+
+// tests/fuzz/*.spv: modules a mutation fuzzer (ASan/UBSan) broke the reader with - types and constants that contain
+// themselves, instructions cut short at the end of the words, a function without blocks, access chains that loop,
+// arrays of 2^32 elements, structures nested as a DAG, control flow that leads back into itself. Each is parsed and
+// lowered for every stage under a few option sets: whatever the verdict (parse error, lowering error, a module), it
+// must come back without crashing, without a sanitizer report, and within a few seconds.
+void malformed(const std::string& dir) {
+    namespace fs = std::filesystem;
+    size_t files = 0;
+    for (const auto& e : fs::directory_iterator(dir + "/fuzz")) {
+        if (e.path().extension() != ".spv") continue;
+        ++files;
+        const auto t0 = std::chrono::steady_clock::now();
+        const std::vector<uint32_t> words = readWords(e.path().string());
+        std::string error;
+        spirv::SpirvModule* m = spirv::parse(words.data(), words.size(), error);
+        if (!m) continue;
+        for (uint32_t variant : {0u, 2u | 4u, 16u | 32u | 64u}) {
+            for (vpir::Stage st : {vpir::Stage::Vertex, vpir::Stage::Fragment, vpir::Stage::Compute}) {
+                spirv::SpirvLowerOptions o;
+                o.entry = "main", o.stage = st, o.viewCount = (variant & 2) ? 2 : 1, o.amplify = variant & 4;
+                if (variant & 16) o.uiMaskSlot = 3, o.alphaTest = true;
+                o.d24Emul = variant & 32;
+                o.viewportIndex = o.rateMapPosition = variant & 64;
+                uint16_t slot = 0;
+                for (uint32_t set = 0; set < 3; ++set)
+                    for (uint32_t b = 0; b < 6; ++b, slot += 4) {
+                        static const vpgpu::BindKind kinds[] = {vpgpu::BindKind::Buffer, vpgpu::BindKind::ConstantBuffer, vpgpu::BindKind::Texture,
+                                                                 vpgpu::BindKind::StorageTexture, vpgpu::BindKind::Sampler};
+                        const vpgpu::BindKind k = kinds[(set + b) % 5];
+                        o.layout.push_back(bind(set, b, k, slot, k == vpgpu::BindKind::Texture ? uint16_t(slot + 1) : uint16_t(0xFFFF)));
+                        o.layout.back().arraySize = 1 + b % 3;
+                    }
+                if (st == vpir::Stage::Vertex) {
+                    spirv::VertexBufferBinding vb;
+                    vb.binding = 0, vb.stride = 32, vb.slot = 40;
+                    o.vertexBuffers.push_back(vb);
+                    for (uint32_t l = 0; l < 4; ++l) {
+                        spirv::VertexAttribute a;
+                        a.location = l, a.offset = l * 4, a.format = vpgpu::Format::RGBA32Float;
+                        o.vertexAttributes.push_back(a);
+                    }
+                }
+                o.specConstants = {{0, 7}, {1, 0xFFFFFFFFu}};
+                vpir::Module mod;
+                spirv::SpirvInterface iface;
+                if (spirv::lower(*m, o, mod, iface, error)) vpmsl::emitMsl(mod);
+            }
+        }
+        spirv::release(m);
+        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        if (ms > 10000) {
+            std::fprintf(stderr, "  %s took %.0f ms\n", e.path().filename().string().c_str(), ms);
+            ++failures;
+        }
+    }
+    CHECK(files >= 10);
+}
+
+// A struct that holds a pointer to itself (buffer_reference lists): OpTypeForwardPointer names the pointer before the
+// struct that contains it. The reader requires types to be declared before they are used, except the pointee of a pointer.
+void forwardPointer() {
+    auto op = [](std::vector<uint32_t>& w, uint32_t code, std::vector<uint32_t> operands) {
+        w.push_back(uint32_t(operands.size() + 1) << 16 | code);
+        w.insert(w.end(), operands.begin(), operands.end());
+    };
+    std::vector<uint32_t> w = {0x07230203, 0x00010500, 0, 16, 0};
+    const uint32_t kPhysical = 5349;
+    op(w, 17, {1});                                           // OpCapability Shader
+    op(w, 14, {0, 1});                                        // OpMemoryModel Logical GLSL450
+    op(w, 15, {5, 2, 0x6e69616d, 0});                         // OpEntryPoint GLCompute %2 "main"
+    op(w, 19, {3});                                           // OpTypeVoid %3
+    op(w, 33, {4, 3});                                        // OpTypeFunction %4 %3
+    op(w, 21, {6, 32, 0});                                    // OpTypeInt %6 32 0
+    op(w, 39, {7, kPhysical});                                // OpTypeForwardPointer %7
+    op(w, 30, {8, 7, 6});                                     // OpTypeStruct %8 %7 %6
+    op(w, 32, {7, kPhysical, 8});                             // OpTypePointer %7 PhysicalStorageBuffer %8
+    op(w, 54, {3, 2, 0, 4});                                  // OpFunction %3 %2 None %4
+    op(w, 248, {9});                                          // OpLabel %9
+    op(w, 253, {});                                           // OpReturn
+    op(w, 56, {});                                            // OpFunctionEnd
+    std::string error;
+    spirv::SpirvModule* m = spirv::parse(w.data(), w.size(), error);
+    if (!m) std::fprintf(stderr, "  parse: %s\n", error.c_str());
+    CHECK(m != nullptr);
+    if (m) spirv::release(m);
+}
+
 int main(int argc, char** argv) {
     if (argc < 4) {
         std::fprintf(stderr, "usage: vpspirv_tests <case> <plain|opt> <tests dir>\n");
@@ -2289,6 +2548,11 @@ int main(int argc, char** argv) {
     std::string c = argv[1], v = std::string(argv[2]) == "opt" ? "opt" : "", dir = argv[3];
     if (c == "mesh_multiview") meshMultiview(dir, v);
     else if (c == "amplify") amplify(dir, v);
+    else if (c == "malformed") malformed(dir);
+    else if (c == "forward_pointer") forwardPointer();
+    else if (c == "offset_overflow") offsetOverflow(dir);
+    else if (c == "structure") structure();
+    else if (c == "wide_struct") wideStruct();
     else if (c == "unpack_fetch") unpackFetch(dir);
     else if (c == "lit") lit(dir, v);
     else if (c == "cull") cull(dir, v);

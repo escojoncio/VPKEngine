@@ -2,6 +2,7 @@
 // submits frames, and produces the per-frame log lines.
 #pragma once
 
+#include <atomic>
 #include <chrono>
 #include <deque>
 #include <functional>
@@ -68,7 +69,7 @@ class Device {
   // Frames with an index below this one have finished on the GPU (see Backend::completedFrames).
   uint64_t completedFrames() const { return backend_.completedFrames(); }
   // How many frames submit() has handed to the backend (the next frame's index).
-  uint64_t submittedFrames() const { return frame_; }
+  uint64_t submittedFrames() const { return frame_.load(std::memory_order_relaxed); }
   // gpu.mem.rt (render-target memory by the frame compiler's verdicts): every `ms` (default 10000, 0 = every frame), logged
   // only when its numbers changed; the first line comes one period after the Device was made, or at once after this call.
   void setRtMemLogMs(uint32_t ms) { rtMemMs_ = ms, rtMemNext_ = {}; }
@@ -82,7 +83,9 @@ class Device {
   ResourceTable resources_;
   PipelineCache pipelines_;
   LogSink log_;
-  uint64_t frame_ = 0, detailEvery_ = 0;
+  std::atomic<uint64_t> frame_{0};  // written by submit, read by submittedFrames() on other threads
+  uint64_t detailEvery_ = 0;
+  uint64_t slowLogged_ = 0, slowSeen_ = 0;  // gpu.time lines: slow frames logged so far, and slow frames with encoder times seen
   uint32_t nonMemorylessSeen_ = 0;  // bit per TileVerdict already reported by gpu.msaa.nonmemoryless
   uint32_t deadStoreMisses_ = 0;    // elided MSAA stores a later frame needed (CompileOptions::msaaDeadStore is switched off at a limit)
   // times each texture kept its MSAA store per (slot, origin, verdict) key (gpu.msaa.kept_store); a texture's entry goes with it

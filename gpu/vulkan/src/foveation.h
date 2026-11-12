@@ -68,4 +68,7 @@ float keptFraction(const vpgpu::RateMap& m);
 std::shared_ptr<vpgpu::RateMap> buildRateMap(uint32_t w, uint32_t h, uint16_t layers, const Shape& shape, const Eyes& eyes,
                                              uint32_t zones = kZones);
 
+// How many maps buildRateMap has built (tests: a map is not rebuilt for the same size and settings).
+uint64_t rateMapBuilds();
+
 }  // namespace vpvk::fov

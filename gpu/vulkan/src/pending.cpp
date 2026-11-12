@@ -161,7 +161,7 @@ std::vector<std::string> pendingReport(Device& d) {
     }
     if (d.deferred.size() > kMaxDeferred) out.push_back(fmt("vk.pending deferred_more=%zu", d.deferred.size() - kMaxDeferred));
   }
-  submit.unlock();
+  if (submit.owns_lock()) submit.unlock();  // (try_to_lock: unlocking one that failed throws)
 
   std::vector<Row> rows;
   {

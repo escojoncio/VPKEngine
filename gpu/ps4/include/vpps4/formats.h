@@ -19,8 +19,8 @@ vpgpu::Format depthFormat(uint8_t zFormat, uint8_t stencilFormat);
 // Image descriptor IMG_DATA_FORMAT / IMG_NUM_FORMAT -> sampled texture format.
 vpgpu::Format textureFormat(uint8_t dataFormat, uint8_t numFormat);
 
-// CB_BLENDn_CONTROL encodings; `exact` is cleared when the factor has no gpu/core equivalent
-// (source-alpha saturate, dual-source) and an approximation is used.
+// CB_BLENDn_CONTROL encodings; `exact` is cleared when the factor has no usable gpu/core equivalent
+// (dual-source SRC1_*: the translated pixel shader has one colour output) and an approximation is used.
 vpgpu::BlendFactor blendFactor(uint8_t gcn, bool& exact);
 vpgpu::BlendOp blendOp(uint8_t gcn);
 // FRAG_* (depth) and REF_* (stencil) functions share the gpu/core order.

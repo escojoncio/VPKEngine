@@ -21,8 +21,11 @@
 #include <array>
 #include <atomic>
 #include <cstdint>
+#include <condition_variable>
 #include <cstdio>
 #include <functional>
+#include <map>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <unordered_map>
@@ -169,6 +172,13 @@ class RecipeStore {
   explicit RecipeStore(std::string dir, uint32_t translatorVersion = translatorId(),
                        uint64_t translatorCode = kTranslatorCode);
   ~RecipeStore();
+  // The store of `dir` for this process: every device of the process appends to the same recipes.bin, so they share one store
+  // (its offsets, its lock) instead of each keeping a private view of a file that all of them grow. Held weakly: the file is
+  // closed when the last device lets go. An empty dir gives a disabled store of its own.
+  static std::shared_ptr<RecipeStore> forDir(const std::string& dir);
+
+  // Tests: called by a rewrite (refresh / compaction) with the store unlocked, after it copied the index and before it writes the new file.
+  std::function<void()> rewriteGate;
 
   bool enabled() const { return file_ != nullptr; }
   // One translated stage: the input (hash = input.hash()), its module words (stored once per
@@ -260,10 +270,10 @@ class RecipeStore {
 
   void load();
   bool openForAppend(bool fresh);
-  void write(uint8_t tag, const std::vector<uint8_t>& payload, uint64_t* payloadOffset = nullptr);
+  bool write(uint8_t tag, const std::vector<uint8_t>& payload, uint64_t* payloadOffset = nullptr);  // false: not (fully) written
   bool readWords(const SpirvRec&, std::vector<uint32_t>& out) const;
   bool remapLocked(PipeRec& p) const;  // shader ids from the current stage inputs
-  bool rewriteLocked();
+  bool rewrite(std::unique_lock<std::mutex>& lock);  // lock held on entry and on return; released while the file is written
   void insertPipelineLocked(PipeRec p);
 
   bool compactionDueLocked() const { return deadRecords_ > 256 && deadRecords_ * 4 > records_; }
@@ -273,6 +283,8 @@ class RecipeStore {
   uint32_t translator_ = kTranslatorVersion;
   uint64_t code_ = kTranslatorCode;
   mutable std::mutex mutex_;
+  std::condition_variable rewriteDone_;
+  bool rewriting_ = false;  // a rewrite is writing the temporary file (mutex_ released)
   FILE* file_ = nullptr;
   std::unordered_map<uint64_t, ShaderBlob> shaders_;
   // Shaders whose MSL text is not in shaders_[id].source but only in recipes.bin (file offset, length, source hash):

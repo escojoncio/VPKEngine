@@ -10,6 +10,11 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  # (one release tag: two runs would race to replace its file; a push without [build] must not replace a pending build run)
+  group: vpaot-windows-${{ (github.event_name == 'workflow_dispatch' || contains(github.event.head_commit.message, '[build]')) && 'build' || github.run_id }}
+  cancel-in-progress: false
+
 jobs:
   build:
     if: github.event_name == 'workflow_dispatch' || contains(github.event.head_commit.message, '[build]')

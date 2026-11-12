@@ -3,6 +3,7 @@
 // display micro tile order of 32-bit elements.
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <string>
 #include <vector>
 
@@ -52,6 +53,18 @@ static void bijective(const TiledSurface& s) {
     CHECK(tile(s, a.data(), t.data(), why));
     CHECK(detile(s, t.data(), b.data(), why));
     CHECK(a == b);
+    // The surface copies (micro tile by micro tile) put every element where tiledOffset says.
+    bool placed = true;
+    for (uint32_t z = 0; z < s.slices && placed; ++z)
+        for (uint32_t y = 0; y < s.height && placed; ++y)
+            for (uint32_t x = 0; x < s.width && placed; ++x) {
+                const uint64_t o = tiledOffset(s, x, y, z), l = ((uint64_t(z) * s.height + y) * s.width + x) * s.bytesPerElement;
+                if (std::memcmp(&t[o], &a[l], s.bytesPerElement) != 0) {
+                    std::printf("  index %u bpe %u: (%u,%u,%u) is not at its tiledOffset\n", s.tileIndex, s.bytesPerElement, x, y, z);
+                    placed = false;
+                }
+            }
+    CHECK(placed);
 }
 
 int main() {

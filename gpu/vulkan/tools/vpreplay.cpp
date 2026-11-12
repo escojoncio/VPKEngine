@@ -102,7 +102,7 @@ uint64_t expectedImageBytes(VkFormat f, uint32_t aspect, uint32_t w, uint32_t h,
       default: bytes = vpimg::texelBytes(f);
     }
   }
-  if (!bytes) return 0;
+  if (!bytes || w > 65536 || h > 65536 || d > 65536) return 0;  // no Vulkan image is larger; keeps the product below 2^64
   return uint64_t((w + bw - 1) / bw) * ((h + bh - 1) / bh) * d * bytes;
 }
 
@@ -644,6 +644,23 @@ struct R {
   void onImageData(const Call& c) {
     ImageData d;
     if (!decodeImageData(c, d)) return void(++errors);
+    // The chunks are gathered in a buffer of `total` bytes: it has to be what the image's format and extent need (upload() asks the
+    // same), and a chunk has to lie inside it (offset + size must not wrap), or a damaged file allocates what it likes / writes out.
+    const auto hi = h.find(d.image);
+    if (hi == h.end()) return void(++imgUploadFail);
+    const VkImageCreateInfo& ici = imgs[reinterpret_cast<VkImage>(hi->second)].ci;
+    // The subresource has to exist and the region cannot be larger than its mip level (planes of a multi-planar image are smaller).
+    if (d.mip >= ici.mipLevels || d.mip >= 32 || d.layer >= ici.arrayLayers || d.width > std::max(1u, ici.extent.width >> d.mip) ||
+        d.height > std::max(1u, ici.extent.height >> d.mip) || d.depth > std::max(1u, ici.extent.depth >> d.mip)) {
+      ++imgUploadSkipped;
+      char why[160];
+      std::snprintf(why, sizeof why, "image upload skipped: mip %u layer %u %ux%ux%u is outside the %ux%ux%u image of %u mips, %u layers; more are counted",
+                    d.mip, d.layer, d.width, d.height, d.depth, ici.extent.width, ici.extent.height, ici.extent.depth, ici.mipLevels, ici.arrayLayers);
+      return warnOnce("imgrange", why);
+    }
+    const uint64_t want = expectedImageBytes(ici.format, d.aspect, d.width, d.height, d.depth);
+    if (!want || want != d.total) return upload(d, nullptr, d.total);  // counts it and says why before touching the bytes
+    if (d.offset > d.total || d.size > d.total - d.offset) return void(++imgUploadSkipped);
     auto key = std::make_tuple(d.image, d.mip, d.layer, d.aspect);
     auto& pend = pendingImage[key];
     if (d.offset == 0 && d.size == d.total) {
@@ -652,7 +669,7 @@ struct R {
       return;
     }
     if (pend.first.size() != d.total) pend.first.assign(d.total, 0), pend.second = 0;
-    if (d.offset + d.size <= d.total) std::memcpy(pend.first.data() + d.offset, d.data, d.size);
+    std::memcpy(pend.first.data() + d.offset, d.data, d.size);
     pend.second += d.size;
     if (pend.second >= d.total) {
       upload(d, pend.first.data(), d.total);

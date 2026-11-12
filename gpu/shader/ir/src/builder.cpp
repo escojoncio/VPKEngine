@@ -2,6 +2,7 @@
 
 #include <bit>
 #include <cassert>
+#include <stdexcept>
 
 namespace vpir {
 
@@ -16,21 +17,17 @@ FunctionBuilder::FunctionBuilder(Module& module, std::string name, Type returnTy
 // Resolved on every access: holding references would dangle as blocks grow.
 Function& FunctionBuilder::fn() { return module_.functions[index_]; }
 
-Block& FunctionBuilder::current() {
-    Block* b = &fn().body;
-    for (const Open& o : open_) {
-        Node& n = (*b)[o.node];
-        b = o.inElse ? &n.elseBody : &n.body;
-    }
-    return *b;
-}
+Block& FunctionBuilder::current() { return open_.empty() ? fn().body : *open_.back().inner; }
 
 ValueId FunctionBuilder::newValue(Type t) {
     fn().valueTypes.push_back(t);
     return ValueId(fn().valueTypes.size() - 1);
 }
 
-void FunctionBuilder::push(Node n) { current().push_back(std::move(n)); }
+void FunctionBuilder::push(Node n) {
+    if (limit_ && ++nodes_ > limit_) throw std::length_error("function exceeds " + std::to_string(limit_) + " nodes");
+    current().push_back(std::move(n));
+}
 
 ValueId FunctionBuilder::param(Type t) {
     ValueId id = newValue(t);
@@ -158,17 +155,20 @@ void FunctionBuilder::barrier() { emit(make(Op::Barrier, kVoid)); }
 
 void FunctionBuilder::beginIf(ValueId cond) {
     control(NodeKind::If, cond);
-    open_.push_back({current().size() - 1, false});
+    open_.push_back({current().size() - 1, false, &current().back().body});
 }
 
 void FunctionBuilder::beginElse() {
     assert(!open_.empty() && !open_.back().inElse);
-    open_.back().inElse = true;
+    Open& o = open_.back();
+    o.inElse = true;
+    Block& parent = open_.size() > 1 ? *open_[open_.size() - 2].inner : fn().body;
+    o.inner = &parent[o.node].elseBody;
 }
 
 void FunctionBuilder::beginLoop() {
     control(NodeKind::Loop);
-    open_.push_back({current().size() - 1, false});
+    open_.push_back({current().size() - 1, false, &current().back().body});
 }
 
 void FunctionBuilder::end() {

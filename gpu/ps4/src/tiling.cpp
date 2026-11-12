@@ -188,14 +188,19 @@ Layout layoutOf(const TiledSurface& s) {
     return l;
 }
 
-uint64_t offsetIn(const Layout& l, uint32_t x, uint32_t y, uint32_t slice) {
-    const uint32_t bpe = l.bpe;
-    if (l.array == Array::Linear) return slice * l.sliceBytes + (uint64_t(y) * l.pitch + x) * bpe;
-    const uint64_t tileBytes = kMicro * kMicro * bpe;
-    const uint64_t element = uint64_t(microIndex(l.micro, bpe, x % kMicro, y % kMicro)) * bpe;
+// What the address of an element of a tiled (not linear) surface owes to its micro tile alone: every element of one micro tile
+// shares it, so a surface copy computes it once per tile and adds the element.
+struct Tile {
+    uint64_t base = 0;  // 1D thin: the tile's byte offset; 2D thin: the offset the element is added to (before pipe and bank)
+    uint32_t pipe = 0, bank = 0;
+};
+
+Tile tileAt(const Layout& l, uint32_t x, uint32_t y, uint32_t slice) {
+    Tile t;
+    const uint64_t tileBytes = kMicro * kMicro * l.bpe;
     if (l.array == Array::Tiled1D) {
-        const uint64_t tile = uint64_t(y / kMicro) * (l.pitch / kMicro) + x / kMicro;
-        return slice * l.sliceBytes + tile * tileBytes + element;
+        t.base = slice * l.sliceBytes + (uint64_t(y / kMicro) * (l.pitch / kMicro) + x / kMicro) * tileBytes;
+        return t;
     }
     // 2D thin. Offsets that cover all pipes and banks are divided among them; the micro tile's
     // place among those of its bank (bank width 1: a column of `bank height` tiles) and the
@@ -203,15 +208,28 @@ uint64_t offsetIn(const Layout& l, uint32_t x, uint32_t y, uint32_t slice) {
     const uint64_t macro = uint64_t(y / l.macroHeight) * l.macroPerRow + x / l.macroPitch;
     const uint64_t spread = slice * l.sliceBytes + macro * l.macroBytes;
     const uint32_t tileRow = (y / kMicro) % l.banks.height;
-    const uint64_t local = (spread >> (kPipeBits + std::countr_zero(uint32_t(l.banks.count)))) + tileRow * tileBytes + element;
-    uint32_t bank = bankOf(l.banks.count, l.banks.height, x, y);
+    t.base = (spread >> (kPipeBits + std::countr_zero(uint32_t(l.banks.count)))) + tileRow * tileBytes;
+    t.bank = bankOf(l.banks.count, l.banks.height, x, y);
     // Slices of an array rotate their banks.
-    if (slice) bank ^= (slice * (std::max(1u, uint32_t(l.banks.count) / 2u - 1u))) % l.banks.count;
-    const uint32_t pipe = pipeOf(l.pipes, x, y);
+    if (slice) t.bank ^= (slice * (std::max(1u, uint32_t(l.banks.count) / 2u - 1u))) % l.banks.count;
+    t.pipe = pipeOf(l.pipes, x, y);
+    return t;
+}
+
+// `element`: the byte offset of the element inside its micro tile.
+inline uint64_t addressIn(const Layout& l, const Tile& t, uint64_t element) {
+    if (l.array == Array::Tiled1D) return t.base + element;
+    const uint64_t local = t.base + element;
     const unsigned bankBits = unsigned(std::countr_zero(uint32_t(l.banks.count)));
-    return (local & (kPipeInterleave - 1)) | uint64_t(pipe) << kPipeInterleaveBits |
-           uint64_t(bank) << (kPipeInterleaveBits + kPipeBits) |
+    return (local & (kPipeInterleave - 1)) | uint64_t(t.pipe) << kPipeInterleaveBits |
+           uint64_t(t.bank) << (kPipeInterleaveBits + kPipeBits) |
            (local >> kPipeInterleaveBits) << (kPipeInterleaveBits + kPipeBits + bankBits);
+}
+
+uint64_t offsetIn(const Layout& l, uint32_t x, uint32_t y, uint32_t slice) {
+    const uint32_t bpe = l.bpe;
+    if (l.array == Array::Linear) return slice * l.sliceBytes + (uint64_t(y) * l.pitch + x) * bpe;
+    return addressIn(l, tileAt(l, x, y, slice), uint64_t(microIndex(l.micro, bpe, x % kMicro, y % kMicro)) * bpe);
 }
 
 template <bool kToLinear>
@@ -223,21 +241,36 @@ bool copy(const TiledSurface& s, const uint8_t* src, uint8_t* dst, std::string& 
     }
     const uint32_t bpe = l.bpe;
     const uint64_t rowBytes = uint64_t(s.width) * bpe;
-    for (uint32_t z = 0; z < s.slices; ++z)
-        for (uint32_t y = 0; y < s.height; ++y) {
-            uint8_t* linear = (kToLinear ? dst : const_cast<uint8_t*>(src)) + (uint64_t(z) * s.height + y) * rowBytes;
-            if (l.array == Array::Linear) {
+    auto linearRow = [&](uint32_t z, uint32_t y) {
+        return (kToLinear ? dst : const_cast<uint8_t*>(src)) + (uint64_t(z) * s.height + y) * rowBytes;
+    };
+    auto element = [&](uint8_t* linear, uint64_t o) {
+        if constexpr (kToLinear) std::memcpy(linear, src + o, bpe);
+        else std::memcpy(dst + o, linear, bpe);
+    };
+    if (l.array == Array::Linear) {
+        for (uint32_t z = 0; z < s.slices; ++z)
+            for (uint32_t y = 0; y < s.height; ++y) {
                 const uint64_t o = offsetIn(l, 0, y, z);
-                if constexpr (kToLinear) std::memcpy(linear, src + o, rowBytes);
-                else std::memcpy(dst + o, linear, rowBytes);
-                continue;
+                if constexpr (kToLinear) std::memcpy(linearRow(z, y), src + o, rowBytes);
+                else std::memcpy(dst + o, linearRow(z, y), rowBytes);
             }
-            for (uint32_t x = 0; x < s.width; ++x) {
-                const uint64_t o = offsetIn(l, x, y, z);
-                if constexpr (kToLinear) std::memcpy(linear + uint64_t(x) * bpe, src + o, bpe);
-                else std::memcpy(dst + o, linear + uint64_t(x) * bpe, bpe);
+        return true;
+    }
+    // Micro tile by micro tile: the tile's pipe, bank and base once, then its elements through the micro order table.
+    uint32_t order[kMicro * kMicro];
+    for (uint32_t y = 0; y < kMicro; ++y)
+        for (uint32_t x = 0; x < kMicro; ++x) order[y * kMicro + x] = microIndex(l.micro, bpe, x, y) * bpe;
+    for (uint32_t z = 0; z < s.slices; ++z)
+        for (uint32_t ty = 0; ty < s.height; ty += kMicro)
+            for (uint32_t tx = 0; tx < s.width; tx += kMicro) {
+                const Tile t = tileAt(l, tx, ty, z);
+                const uint32_t ye = std::min(kMicro, s.height - ty), xe = std::min(kMicro, s.width - tx);
+                for (uint32_t y = 0; y < ye; ++y) {
+                    uint8_t* row = linearRow(z, ty + y) + uint64_t(tx) * bpe;
+                    for (uint32_t x = 0; x < xe; ++x) element(row + uint64_t(x) * bpe, addressIn(l, t, order[y * kMicro + x]));
+                }
             }
-        }
     return true;
 }
 

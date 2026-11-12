@@ -69,10 +69,36 @@ struct LowerError : std::runtime_error {
 };
 [[noreturn]] void fail(const std::string& why) { throw LowerError(why); }
 
+// Recursion counter: fails past `limit` levels (a malformed module can make the lowering recurse for ever).
+struct Nest {
+    int& depth;
+    Nest(int& d, int limit, const char* what) : depth(d) {
+        if (++depth > limit) {
+            --depth;
+            fail(std::string(what) + " nested more than " + std::to_string(limit) + " levels");
+        }
+    }
+    ~Nest() { --depth; }
+};
+
 // A SPIR-V value flattened to VPIR values: one per scalar or vector leaf, in declaration order
 // (matrices by column, arrays by element, structs by member).
+// (The index is checked: a malformed module can ask for a component or an element a value does not have.)
+struct ValVec : std::vector<ValueId> {
+    using std::vector<ValueId>::vector;
+    using std::vector<ValueId>::operator=;
+    ValVec(const std::vector<ValueId>& o) : std::vector<ValueId>(o) {}
+    ValueId& operator[](size_t i) {
+        if (i >= size()) fail("value has no component " + std::to_string(i));
+        return std::vector<ValueId>::operator[](i);
+    }
+    const ValueId& operator[](size_t i) const {
+        if (i >= size()) fail("value has no component " + std::to_string(i));
+        return std::vector<ValueId>::operator[](i);
+    }
+};
 struct Val {
-    std::vector<ValueId> v;
+    ValVec v;
 };
 
 // Image/sampler handles are not values in VPIR: they name resources.
@@ -298,6 +324,10 @@ private:
     static constexpr uint32_t kViewVaryingLocation = 63;  // past every Vulkan location; clip varyings start at 64
     std::unordered_map<uint32_t, uint64_t> specValue_;
 
+    int resolveDepth_ = 0, unrollDepth_ = 0, flowDepth_ = 0;
+    mutable std::unordered_map<uint32_t, uint64_t> leafMemo_;  // type -> leaves (types are immutable once parsed)
+    mutable std::unordered_map<uint32_t, uint32_t> sizeMemo_;  // type -> naturalSize
+
     // ---- types ---------------------------------------------------------------------------------
     const TypeInfo& T(uint32_t id) const {
         auto t = m_.type(id);
@@ -348,6 +378,10 @@ private:
     }
     // Leaf types of a composite, in order.
     void leaves(uint32_t typeId, std::vector<uint32_t>& out) const {
+        leafTotal(typeId);  // fails when the composite is too large to flatten
+        leavesRec(typeId, out);
+    }
+    void leavesRec(uint32_t typeId, std::vector<uint32_t>& out) const {
         const TypeInfo& t = T(typeId);
         switch (t.kind) {
             case TypeKind::Matrix:
@@ -355,20 +389,37 @@ private:
                 break;
             case TypeKind::Array: {
                 uint32_t n = arrayLength(t);
-                for (uint32_t i = 0; i < n; ++i) leaves(t.elem, out);
+                if (!leafTotal(t.elem)) break;  // (an array of empty structs has no leaves, whatever its length)
+                for (uint32_t i = 0; i < n; ++i) leavesRec(t.elem, out);
                 break;
             }
             case TypeKind::Struct:
-                for (uint32_t mt : t.members) leaves(mt, out);
+                for (uint32_t mt : t.members)
+                    if (leafTotal(mt)) leavesRec(mt, out);
                 break;
             case TypeKind::RuntimeArray: fail("runtime arrays cannot be values");
             default: out.push_back(typeId);
         }
     }
-    uint32_t leafCount(uint32_t typeId) const {
-        std::vector<uint32_t> l;
-        leaves(typeId, l);
-        return uint32_t(l.size());
+    // Number of leaves of a composite (no list is built); fails past kMaxLeaves.
+    uint32_t leafCount(uint32_t typeId) const { return uint32_t(leafTotal(typeId)); }
+    uint64_t leafTotal(uint32_t typeId) const {
+        if (auto it = leafMemo_.find(typeId); it != leafMemo_.end()) return it->second;  // (types share members: no re-walk)
+        const TypeInfo& t = T(typeId);
+        uint64_t n = 1;
+        switch (t.kind) {
+            case TypeKind::Matrix: n = t.count; break;
+            case TypeKind::Array: n = uint64_t(arrayLength(t)) * leafTotal(t.elem); break;
+            case TypeKind::Struct:
+                n = 0;
+                for (uint32_t mt : t.members) n += leafTotal(mt);
+                break;
+            case TypeKind::RuntimeArray: fail("runtime arrays cannot be values");
+            default: break;
+        }
+        if (n > kMaxLeaves) fail("composite value of more than " + std::to_string(kMaxLeaves) + " leaves");
+        leafMemo_[typeId] = n;
+        return n;
     }
 
     // ---- constants -----------------------------------------------------------------------------
@@ -646,11 +697,12 @@ private:
                 if ((in.op == OpAccessChain || in.op == OpInBoundsAccessChain || in.op == OpPtrAccessChain ||
                      in.op == OpInBoundsPtrAccessChain || in.op == OpImageTexelPointer) && in.count >= 4)
                     derived[m_.w(in, 2)] = &in;
+        std::unordered_set<uint64_t> expanded;  // (id, block) pairs whose operands were already followed
         std::function<void(uint32_t, uint32_t, int)> use = [&](uint32_t id, uint32_t block, int depth) {
             auto d = defBlock.find(id);
             if (d != defBlock.end() && d->second != block) s.spilled.insert(id);
             auto c = derived.find(id);
-            if (c != derived.end() && depth < 32)
+            if (c != derived.end() && depth < 32 && expanded.insert(uint64_t(id) << 32 | block).second)
                 for (uint32_t i = 3; i < c->second->count; ++i) use(m_.w(*c->second, i), block, depth + 1);
         };
         for (const Block& bl : f.blocks) {
@@ -737,9 +789,7 @@ private:
         }
     }
     bool usedWithDref(uint32_t global) const {
-        // Shadow samplers declared with Depth = 0 still compare: scan the whole module once.
-        static thread_local std::unordered_map<const SpirvModule*, std::set<uint32_t>> cache;
-        (void)cache;
+        // Shadow samplers declared with Depth = 0 still compare: drefGlobals_ was filled by one scan of the module.
         return drefGlobals_.count(global) != 0;
     }
     std::set<uint32_t> drefGlobals_;
@@ -897,22 +947,29 @@ private:
     }
 
     uint32_t naturalSize(uint32_t typeId) const {
+        if (auto it = sizeMemo_.find(typeId); it != sizeMemo_.end()) return it->second;
+        const uint32_t n = naturalSizeOf(typeId);
+        sizeMemo_[typeId] = n;
+        return n;
+    }
+    uint32_t naturalSizeOf(uint32_t typeId) const {
         const TypeInfo& t = T(typeId);
+        uint64_t n = 0;
         switch (t.kind) {
             case TypeKind::Bool: case TypeKind::Int: case TypeKind::Float: return 4;
             case TypeKind::Pointer:
                 if (isDevicePtr(typeId)) return 8;
                 fail("type has no memory layout");
             case TypeKind::Vector: return 4 * t.count;
-            case TypeKind::Matrix: return t.count * naturalSize(t.elem);
-            case TypeKind::Array: return arrayLength(t) * naturalSize(t.elem);
-            case TypeKind::Struct: {
-                uint32_t s = 0;
-                for (uint32_t mt : t.members) s += naturalSize(mt);
-                return s;
-            }
+            case TypeKind::Matrix: n = uint64_t(t.count) * naturalSize(t.elem); break;
+            case TypeKind::Array: n = uint64_t(arrayLength(t)) * naturalSize(t.elem); break;
+            case TypeKind::Struct:
+                for (uint32_t mt : t.members) n += naturalSize(mt);
+                break;
             default: fail("type has no memory layout");
         }
+        if (n > kMaxTypeBytes) fail("type of " + std::to_string(n) + " bytes");
+        return uint32_t(n);
     }
     uint32_t memberOffset(uint32_t structId, uint32_t member, bool explicitLayout) const {
         const TypeInfo& t = T(structId);
@@ -921,9 +978,23 @@ private:
             if (!d || !d->has(Deco::Offset)) fail("member " + std::to_string(member) + " of " + m_.nameOf(structId) + " has no Offset");
             return d->get(Deco::Offset);
         }
-        uint32_t off = 0;
-        for (uint32_t i = 0; i < member; ++i) off += naturalSize(t.members[i]);
-        return off;
+        // Natural layout: prefix sums of the member sizes, built once per struct (loading a struct asks for
+        // every member in turn: summing from the start each time was quadratic in the member count).
+        auto it = memberOffsets_.find(structId);
+        if (it == memberOffsets_.end()) {
+            std::vector<uint64_t> sums(t.members.size() + 1, 0);
+            for (size_t i = 0; i < t.members.size(); ++i) sums[i + 1] = sums[i] + naturalSize(t.members[i]);
+            it = memberOffsets_.emplace(structId, std::move(sums)).first;
+        }
+        if (member >= it->second.size()) fail("struct member index " + std::to_string(member) + " out of range");
+        if (it->second[member] > kMaxTypeBytes) fail("member " + std::to_string(member) + " of " + m_.nameOf(structId) + " lies past 2 GiB");
+        return uint32_t(it->second[member]);
+    }
+    mutable std::unordered_map<uint32_t, std::vector<uint64_t>> memberOffsets_;
+    // A byte offset must stay within 32 bits (the VPIR address arithmetic is 32-bit).
+    uint32_t ofs(uint32_t base, uint64_t add) const {
+        if (add > 0xffffffffu - base) fail("byte offset overflows 32 bits");
+        return uint32_t(base + add);
     }
     uint32_t arrayStride(uint32_t arrayType, bool explicitLayout) const {
         if (explicitLayout) {
@@ -1070,7 +1141,7 @@ private:
     }
     void addOffset(RPtr& p, ValueId index, uint32_t constIndex, bool isConst, uint32_t stride) {
         if (isConst) {
-            p.off += constIndex * stride;
+            p.off = ofs(p.off, uint64_t(constIndex) * stride);
             return;
         }
         ValueId i = cast(index, vpir::kU32);
@@ -1127,6 +1198,7 @@ private:
     }
 
     RPtr resolve(uint32_t id, bool write) {
+        Nest nest(resolveDepth_, 256, "access chain");  // (a chain whose base is itself would recurse for ever)
         Scope& s = *scope_;
         if (auto vp = s.varPtrs.find(id); vp != s.varPtrs.end()) {
             RPtr p = vp->second;
@@ -1245,7 +1317,7 @@ private:
             case TypeKind::Struct: {
                 if (!isConst) fail("dynamic struct member index");
                 if (ci >= t.members.size()) fail("struct member index " + std::to_string(ci) + " out of range");
-                p.off += memberOffset(p.type, ci, p.explicitLayout);
+                p.off = ofs(p.off, memberOffset(p.type, ci, p.explicitLayout));
                 uint32_t mt = t.members.at(ci);
                 if (p.explicitLayout) {
                     if (auto d = m_.memberDeco(p.type, ci)) {
@@ -1312,7 +1384,7 @@ private:
                 std::vector<ValueId> parts;
                 for (uint32_t i = 0; i < t.count; ++i) {
                     RPtr q = p;
-                    q.off += i * p.compStride;
+                    q.off = ofs(q.off, uint64_t(i) * p.compStride);
                     parts.push_back(loadScalarVec(q, vtp.element()));
                 }
                 r.v.push_back(vecOf(parts, vtp));
@@ -1330,7 +1402,7 @@ private:
                     for (uint32_t i = 0; i < col.count; ++i) {
                         RPtr q = p;
                         q.type = t.elem;
-                        q.off += i * p.rowMajorStride;
+                        q.off = ofs(q.off, uint64_t(i) * p.rowMajorStride);
                         rows.push_back(loadScalarVec(q, rowType));
                     }
                     for (uint32_t c = 0; c < t.count; ++c) {
@@ -1343,8 +1415,8 @@ private:
                 for (uint32_t c = 0; c < t.count; ++c) {
                     RPtr q = p;
                     q.type = t.elem;
-                    if (p.rowMajorStride) q.off += c * 4, q.compStride = p.rowMajorStride;
-                    else q.off += c * colStride, q.compStride = 4;
+                    if (p.rowMajorStride) q.off = ofs(q.off, uint64_t(c) * 4), q.compStride = p.rowMajorStride;
+                    else q.off = ofs(q.off, uint64_t(c) * colStride), q.compStride = 4;
                     Val cv = loadMem(q);
                     r.v.insert(r.v.end(), cv.v.begin(), cv.v.end());
                 }
@@ -1354,7 +1426,7 @@ private:
                 uint32_t n = arrayLength(t), stride = arrayStride(p.type, p.explicitLayout);
                 for (uint32_t i = 0; i < n; ++i) {
                     RPtr q = p;
-                    q.type = t.elem, q.off += i * stride;
+                    q.type = t.elem, q.off = ofs(q.off, uint64_t(i) * stride);
                     Val e = loadMem(q);
                     r.v.insert(r.v.end(), e.v.begin(), e.v.end());
                 }
@@ -1364,7 +1436,7 @@ private:
                 for (uint32_t i = 0; i < t.members.size(); ++i) {
                     RPtr q = p;
                     q.type = t.members[i];
-                    q.off += memberOffset(p.type, i, p.explicitLayout);
+                    q.off = ofs(q.off, memberOffset(p.type, i, p.explicitLayout));
                     if (p.explicitLayout) {
                         if (auto d = m_.memberDeco(p.type, i)) {
                             q.rowMajorStride = d->has(Deco::RowMajor) ? d->get(Deco::MatrixStride) : 0;
@@ -1399,7 +1471,7 @@ private:
     ValueId addr16(const RPtr& p, uint32_t i) {
         const uint32_t stride = p.compStride == 4 ? smallBytes(p) : p.compStride;
         RPtr q = p;
-        q.off += i * stride;
+        q.off = ofs(q.off, uint64_t(i) * stride);
         return address(q);
     }
     // Word-aligned part / byte-in-word of an address (device addresses are {lo, hi}).
@@ -1477,7 +1549,7 @@ private:
                 }
                 for (uint32_t i = 0; i < t.count; ++i) {
                     RPtr q = p;
-                    q.off += i * p.compStride;
+                    q.off = ofs(q.off, uint64_t(i) * p.compStride);
                     storeScalarVec(q, ext(x, i));
                 }
                 return;
@@ -1487,8 +1559,8 @@ private:
                 for (uint32_t c = 0; c < t.count; ++c) {
                     RPtr q = p;
                     q.type = t.elem;
-                    if (p.rowMajorStride) q.off += c * 4, q.compStride = p.rowMajorStride;
-                    else q.off += c * colStride, q.compStride = 4;
+                    if (p.rowMajorStride) q.off = ofs(q.off, uint64_t(c) * 4), q.compStride = p.rowMajorStride;
+                    else q.off = ofs(q.off, uint64_t(c) * colStride), q.compStride = 4;
                     storeMem(q, v, at);
                 }
                 return;
@@ -1497,7 +1569,7 @@ private:
                 uint32_t n = arrayLength(t), stride = arrayStride(p.type, p.explicitLayout);
                 for (uint32_t i = 0; i < n; ++i) {
                     RPtr q = p;
-                    q.type = t.elem, q.off += i * stride;
+                    q.type = t.elem, q.off = ofs(q.off, uint64_t(i) * stride);
                     storeMem(q, v, at);
                 }
                 return;
@@ -1506,7 +1578,7 @@ private:
                 for (uint32_t i = 0; i < t.members.size(); ++i) {
                     RPtr q = p;
                     q.type = t.members[i];
-                    q.off += memberOffset(p.type, i, p.explicitLayout);
+                    q.off = ofs(q.off, memberOffset(p.type, i, p.explicitLayout));
                     if (p.explicitLayout)
                         if (auto d = m_.memberDeco(p.type, i)) {
                             q.rowMajorStride = d->has(Deco::RowMajor) ? d->get(Deco::MatrixStride) : 0;
@@ -1770,6 +1842,9 @@ private:
             case BuiltIn::SampleId: return vpir::Builtin::SampleId;
             case BuiltIn::SampleMask: if (input) special = IoLeaf::SampleMaskIn; return vpir::Builtin::SampleMask;
             case BuiltIn::FragDepth: return vpir::Builtin::FragDepth;
+            case BuiltIn::PointCoord:
+                if (!input || stage_ != vpir::Stage::Fragment) return special = IoLeaf::Dropped, vpir::Builtin::None;
+                return vpir::Builtin::PointCoord;
             case BuiltIn::PrimitiveId: return vpir::Builtin::PrimitiveId;
             case BuiltIn::Layer: return vpir::Builtin::Layer;
             case BuiltIn::ViewIndex: special = IoLeaf::ViewIndex; return vpir::Builtin::None;
@@ -1826,6 +1901,7 @@ private:
                     bool builtin = d && d->has(Deco::BuiltIn);
                     if (t.kind == TypeKind::Array || t.kind == TypeKind::Matrix) {
                         uint32_t n = t.kind == TypeKind::Array ? arrayLength(t) : t.count;
+                        if (n > kMaxUnroll) fail("interface array of " + std::to_string(n) + " elements (max " + std::to_string(kMaxUnroll) + ")");
                         if (builtin) {  // ClipDistance[] / SampleMask[] / TessLevel…
                             BuiltIn bi = BuiltIn(d->get(Deco::BuiltIn));
                             for (uint32_t i = 0; i < n; ++i) {
@@ -2264,7 +2340,7 @@ private:
         using F = vpgpu::Format;
         auto word = [&](uint32_t byteOff) {
             RPtr q = p;
-            q.off += byteOff;
+            q.off = ofs(q.off, byteOff);
             return b_->load(q.target, address(q), vpir::kU32);
         };
         auto bitsAt = [&](ValueId w, ValueId off, uint32_t count, bool sign) {
@@ -2594,6 +2670,7 @@ private:
 
     // Emits blocks from `label` until the region ends (stop reached, or every path left it).
     void flow(uint32_t label, uint32_t stop) {
+        Nest nest(flowDepth_, 320, "control flow");  // (a malformed CFG can lead a construct back into itself; a chain of else-ifs nests one level per branch)
         uint32_t cur = label;
         bool enteringHeader = false;
         while (cur) {
@@ -3022,6 +3099,11 @@ private:
     // arrays up to kMaxDescriptorArray, as large as maxPerStageDescriptorSampledImages) the chain would nest
     // `count` deep: a balanced tree of `idx < mid` tests nests log2(count).
     static constexpr uint32_t kChainMax = 64, kMaxDescriptorArray = 256;
+    // Limits that keep a hostile module from exhausting memory: nodes of the lowered function (calls are inlined, composites
+    // are flattened), leaves of one composite value, bytes of one type in memory.
+    static constexpr uint32_t kMaxUnroll = 1024;  // arms of a dynamic index into an interface / buffer array
+    static constexpr size_t kMaxNodes = size_t(1) << 20;
+    static constexpr uint64_t kMaxLeaves = 1u << 16, kMaxTypeBytes = 0x7fffffffu;
     template <class F>
     void armsOn(ValueId idx, uint32_t count, F&& arm) {
         if (count <= kChainMax) {
@@ -3056,6 +3138,8 @@ private:
     // `in` once per element in an if-chain on the run-time index (an out-of-range index takes the
     // last element); a result is carried out of the arms in variables.
     void unrollForced(const Instr& in, uint32_t ix, uint32_t count, std::unordered_map<uint32_t, uint32_t>& forced) {
+        Nest nest(unrollDepth_, 16, "dynamic index unroll");
+        if (count > kMaxUnroll) fail("dynamic index into " + std::to_string(count) + " elements (max " + std::to_string(kMaxUnroll) + ")");
         const ValueId idx = cast(get1(ix), vpir::kU32);
         const bool hasResult = in.op != OpStore && in.op != OpCopyMemory && in.op != OpAtomicStore;
         const uint32_t resId = hasResult ? w(in, 2) : 0;
@@ -3082,6 +3166,7 @@ private:
     // index (an out-of-range index takes the last element), and defines its result from a
     // variable written in every arm.
     void unrollDynamic(const Instr& in, uint32_t hid) {
+        Nest nest(unrollDepth_, 16, "descriptor array unroll");
         const bool hadEntry = scope_->handles.count(hid) != 0;
         const Handle h = hadEntry ? scope_->handles[hid] : handle(hid);
         const size_t which = h.dyn[0].idx != kNoValue ? 0 : 1;
@@ -4107,7 +4192,7 @@ private:
                         FRange a = arg(5);
                         auto f = [&](double d) {
                             return !std::isfinite(d) ? d : e == GLSL_Floor ? std::floor(d) : e == GLSL_Ceil ? std::ceil(d)
-                                   : e == GLSL_Trunc ? std::trunc(d) : e == GLSL_Round ? std::round(d) : std::nearbyint(d);
+                                   : e == GLSL_Trunc ? std::trunc(d) : std::nearbyint(d);  // Round lowers to Op::Round (rint)
                         };
                         r = {f(a.lo), f(a.hi)};
                         return known(r);
@@ -4712,7 +4797,7 @@ private:
         if (st.kind != TypeKind::Struct || member >= st.members.size()) fail("OpArrayLength: bad struct member");
         const uint32_t arr = st.members[member];
         if (T(arr).kind != TypeKind::RuntimeArray) fail("OpArrayLength: the member is not a runtime array");
-        const uint32_t off = p.off + memberOffset(p.type, member, true);
+        const uint32_t off = ofs(p.off, memberOffset(p.type, member, true));
         const uint32_t stride = arrayStride(arr, true);
         if (!stride) fail("OpArrayLength: runtime array without an ArrayStride");
         const int bs = resource(vpir::ResourceKind::BufferSize, out_.resources[p.target].index, nullptr);
@@ -5460,6 +5545,7 @@ void Lowering::run() {
 
     phase_ = "globals";
     b_ = std::make_unique<FunctionBuilder>(out_, "main");
+    b_->setNodeLimit(kMaxNodes);
     // Module-scope memory.
     for (uint32_t id : m_.globalOrder) {
         const GlobalVar& g = m_.globals.at(id);
@@ -5507,6 +5593,7 @@ void Lowering::run() {
         }
     }
     if (stage_ == vpir::Stage::Compute) zeroWorkgroup();
+    if (fit->second.blocks.empty()) fail("entry function has no body");
     flow(fit->second.blocks.front().label, 0);
     phase_ = "finish";
     cur_ = nullptr;

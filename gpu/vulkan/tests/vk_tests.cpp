@@ -1,8 +1,10 @@
 // VPVulkan tests on the null backend. Usage: vpvk_tests <group> <path to libVPVulkan>.
 #include "vpvk/config.h"
 #include <dlfcn.h>
+#include <sys/resource.h>
 #include <unistd.h>  // mkdtemp on macOS (libc++ <cstdlib> does not declare it)
 
+#include <csignal>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -5289,7 +5291,7 @@ void testYcbcr() {
   w.dstSet = set, w.dstBinding = 0, w.descriptorCount = 1, w.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
   w.pImageInfo = &dii;
   vkUpdateDescriptorSets(c.dev, 1, &w, 0, nullptr);
-  CHECK(from<DescriptorSetObj>(set)->slots[0][0].sampler == from<Sampler>(smp));
+  CHECK(from<DescriptorSetObj>(set)->slots(0)[0].sampler == from<Sampler>(smp));
 
   DrawRig rig(c);
   VkShaderModule vs = module(c, "pos.vert.spv"), fs = module(c, "ycbcr.frag.spv");
@@ -7878,6 +7880,11 @@ void testArchiveIndex() {
     if (FILE* f = std::fopen(ai::keysPath(ar).c_str(), "wb")) { uint64_t bad[2] = {1, 0}; std::fwrite(bad, 8, 2, f); std::fclose(f); }
     CHECK(!ai::read(ai::keysPath(ar), out));
   }
+  {  // a header that claims far more keys than the file holds: refused before anything is reserved
+    std::vector<uint64_t> big;
+    if (FILE* f = std::fopen(ai::keysPath(ar).c_str(), "wb")) { uint64_t bad[2] = {ai::kMagic, 1ull << 27}; std::fwrite(bad, 8, 2, f); std::fclose(f); }
+    CHECK(!ai::read(ai::keysPath(ar), big) && big.empty() && big.capacity() < 4096);
+  }
   fs::remove_all(dir);
 }
 
@@ -8032,9 +8039,11 @@ void testZeroInitHost() {
   CHECK(mtl && vpvk_image_zero_pending(mtl) == 1);
   {  // a submit holds the lock: the clear does not wait, and the image is still pending (the host must not present it)
     int r = 0;
-    std::lock_guard<std::mutex> lock(d->submitMutex);
-    std::thread([&] { r = vpvk_image_zero_clear(mtl); }).join();
-    CHECK(r == -1 && vpvk_image_zero_pending(mtl) == 1);
+    {
+      std::lock_guard<std::mutex> lock(d->submitMutex);
+      std::thread([&] { r = vpvk_image_zero_clear(mtl); }).join();
+    }
+    CHECK(r == -1 && vpvk_image_zero_pending(mtl) == 1);  // (outside the lock: registry -> submit is the only order)
   }
   const uint64_t before = d->zeroCleared;
   CHECK(vpvk_image_zero_clear(mtl) == 1);
@@ -14780,7 +14789,580 @@ void testPending() {
   vkDestroyCommandPool(c.dev, pool, nullptr);
   vkDestroyBuffer(c.dev, b, nullptr);
   vkFreeMemory(c.dev, m, nullptr);
+
+  // Another thread is inside vkQueueSubmit (holds submitMutex): the report says BUSY and must not unlock a mutex it never took.
+  {
+    std::mutex gate;
+    std::condition_variable cv;
+    bool held = false, release = false;
+    std::thread other([&] {
+      std::lock_guard<std::mutex> submit(d->submitMutex);
+      {
+        std::lock_guard<std::mutex> g(gate);
+        held = true;
+      }
+      cv.notify_all();
+      std::unique_lock<std::mutex> g(gate);
+      cv.wait(g, [&] { return release; });
+    });
+    {
+      std::unique_lock<std::mutex> g(gate);
+      cv.wait(g, [&] { return held; });
+    }
+    CHECK(has("submit_mutex=BUSY"));
+    {
+      std::lock_guard<std::mutex> g(gate);
+      release = true;
+    }
+    cv.notify_all();
+    other.join();
+  }
   d->platform = std::move(gpu->inner);  // the stand-in goes before the device does
+}
+
+// ---- Resource audit of gpu/vulkan (notas/auditoria.md V1-V21): one group, one block per finding ----------------------
+// V2: a timeline semaphore signaled by submits and never polled keeps only the signals still in flight.
+void testAuditTimelinePending() {
+  Ctx c;
+  VkCommandPoolCreateInfo pi{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+  VkCommandPool pool;
+  vkCreateCommandPool(c.dev, &pi, nullptr, &pool);
+  VkCommandBufferAllocateInfo ai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+  ai.commandPool = pool, ai.commandBufferCount = 1;
+  VkCommandBuffer cb;
+  vkAllocateCommandBuffers(c.dev, &ai, &cb);
+  VkSemaphoreTypeCreateInfo ti{VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO};
+  ti.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
+  VkSemaphoreCreateInfo sci{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
+  sci.pNext = &ti;
+  VkSemaphore sem;
+  vkCreateSemaphore(c.dev, &sci, nullptr, &sem);
+  for (uint64_t frame = 1; frame <= 300; ++frame) {
+    VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    vkBeginCommandBuffer(cb, &bi);
+    vkEndCommandBuffer(cb);
+    const uint64_t waitV = frame - 1, sigV = frame;
+    VkTimelineSemaphoreSubmitInfo ts{VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO};
+    ts.waitSemaphoreValueCount = 1, ts.pWaitSemaphoreValues = &waitV, ts.signalSemaphoreValueCount = 1, ts.pSignalSemaphoreValues = &sigV;
+    const VkPipelineStageFlags st = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+    VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+    si.pNext = &ts, si.waitSemaphoreCount = 1, si.pWaitSemaphores = &sem, si.pWaitDstStageMask = &st;
+    si.commandBufferCount = 1, si.pCommandBuffers = &cb, si.signalSemaphoreCount = 1, si.pSignalSemaphores = &sem;
+    CHECK(vkQueueSubmit(c.queue, 1, &si, VK_NULL_HANDLE) == VK_SUCCESS);
+    CHECK(vkQueueWaitIdle(c.queue) == VK_SUCCESS);
+  }
+  size_t pending;
+  {
+    Semaphore* s = from<Semaphore>(sem);
+    std::lock_guard<std::mutex> l(s->m);
+    pending = s->pending.size();
+  }
+  CHECK(pending <= 2);  // nothing polled the counter: the submits pruned what had finished
+  uint64_t v = 0;
+  vkGetSemaphoreCounterValue(c.dev, sem, &v);
+  CHECK(v == 300);
+  vkDestroySemaphore(c.dev, sem, nullptr);
+  vkDestroyCommandPool(c.dev, pool, nullptr);
+}
+
+// V1: a host call that found the live device holds it (registry mutex) until it is done with it: vkDestroyDevice waits.
+void testAuditLiveDevice() {
+  auto c = std::make_unique<Ctx>();
+  Device* d = from<Device>(c->dev);
+  std::unique_lock<std::mutex> zl(d->zeroNativeMutex);
+  std::atomic<int> pendingResult{-1};
+  std::atomic<bool> destroyed{false};
+  std::thread query([&] { pendingResult = vpvk_image_zero_pending(reinterpret_cast<void*>(1)); });  // blocks on zeroNativeMutex
+  std::this_thread::sleep_for(std::chrono::milliseconds(150));
+  std::thread destroy([&] {
+    c.reset();
+    destroyed = true;
+  });
+  std::this_thread::sleep_for(std::chrono::milliseconds(250));
+  if (destroyed) {  // the device is gone under the waiting query: unlocking its mutex is undefined, do not go on
+    CHECK(!destroyed);
+    std::fflush(stdout);
+    std::_Exit(1);
+  }
+  zl.unlock();
+  query.join();
+  destroy.join();
+  CHECK(pendingResult == 0 && destroyed);
+}
+
+// V3: the devices of a process share one recipe store per directory; a shader text read back from recipes.bin is checked
+// against its hash.
+void testAuditRecipes() {
+  char tmpl[] = "/tmp/vpvk_audit_recipes_XXXXXX";
+  const char* dir = mkdtemp(tmpl);
+  CHECK(dir != nullptr);
+  if (!dir) return;
+  setenv("VP_PIPELINE_CACHE_DIR", dir, 1);
+  {
+    Ctx a, b;
+    const Device* da = from<Device>(a.dev);
+    const Device* db = from<Device>(b.dev);
+    CHECK(da->recipes && da->recipes->enabled() && da->recipes.get() == db->recipes.get());
+  }
+  unsetenv("VP_PIPELINE_CACHE_DIR");
+  const std::string file = std::string(dir) + "/recipes.bin";
+  RecipeStore s(dir);
+  StageInput in;
+  in.spirv = 0x1234;
+  const std::vector<uint32_t> words = {0x07230203u, 0x00010000u, 0u, 1u, 0u};
+  ShaderBlob blob;
+  blob.source = "kernel void audit_recipe_text() { /* the text that is read back */ }";
+  s.addStage(in, in.hash(), words, 77, blob);
+  ShaderBlob out;
+  CHECK(s.shaderBlob(77, out) && out.source == blob.source);
+  std::string bytes;
+  {
+    std::ifstream f(file, std::ios::binary);
+    bytes.assign(std::istreambuf_iterator<char>(f), {});
+  }
+  const size_t at = bytes.find(blob.source);
+  CHECK(at != std::string::npos);
+  if (at != std::string::npos) {
+    bytes[at + 8] ^= 0x20;  // a torn or foreign record: the bytes at the stored offset are not the text that was stored
+    std::ofstream f(file, std::ios::binary | std::ios::trunc);
+    f.write(bytes.data(), std::streamsize(bytes.size()));
+  }
+  ShaderBlob bad;
+  CHECK(!s.shaderBlob(77, bad));
+  std::filesystem::remove_all(dir);
+}
+
+// V4: two devices submitting from two threads (the shared statics of the submit tick); meant for TSan.
+void testAuditTwoDevices() {
+  Ctx a, b;
+  auto work = [](Ctx& c) {
+    VkCommandPoolCreateInfo pi{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+    VkCommandPool pool;
+    vkCreateCommandPool(c.dev, &pi, nullptr, &pool);
+    VkCommandBufferAllocateInfo ai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+    ai.commandPool = pool, ai.commandBufferCount = 1;
+    VkCommandBuffer cb;
+    vkAllocateCommandBuffers(c.dev, &ai, &cb);
+    for (int i = 0; i < 3000; ++i) {
+      VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+      vkBeginCommandBuffer(cb, &bi);
+      vkEndCommandBuffer(cb);
+      VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+      si.commandBufferCount = 1, si.pCommandBuffers = &cb;
+      CHECK(vkQueueSubmit(c.queue, 1, &si, VK_NULL_HANDLE) == VK_SUCCESS);
+    }
+    vkQueueWaitIdle(c.queue);
+    vkDestroyCommandPool(c.dev, pool, nullptr);
+  };
+  std::thread ta(work, std::ref(a)), tb(work, std::ref(b));
+  ta.join();
+  tb.join();
+}
+
+// V5: chunks of a command buffer's upload arena go back on vkTrimCommandPool (reset command buffers) and on a reset with
+// RELEASE_RESOURCES; a plain reset keeps them for the next recording.
+void testAuditArena() {
+  Ctx c;
+  VkDeviceMemory m = alloc(c, 1 << 20, 1);
+  VkBuffer b = buffer(c, 1 << 17, m, 0);
+  VkCommandPoolCreateInfo pi{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+  VkCommandPool pool;
+  vkCreateCommandPool(c.dev, &pi, nullptr, &pool);
+  VkCommandBufferAllocateInfo ai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+  ai.commandPool = pool, ai.commandBufferCount = 1;
+  VkCommandBuffer cb;
+  vkAllocateCommandBuffers(c.dev, &ai, &cb);
+  Recorder& r = *from<CommandBuffer>(cb)->rec;
+  auto record = [&] {
+    VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    vkBeginCommandBuffer(cb, &bi);
+    for (int i = 0; i < 10; ++i) vkCmdFillBuffer(cb, b, 0, 65536, 0x01020304u);  // a word pattern: 64 KiB of arena each
+    vkEndCommandBuffer(cb);
+    VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+    si.commandBufferCount = 1, si.pCommandBuffers = &cb;
+    CHECK(vkQueueSubmit(c.queue, 1, &si, VK_NULL_HANDLE) == VK_SUCCESS);
+    vkQueueWaitIdle(c.queue);
+  };
+  record();
+  CHECK(r.arena.chunks.size() == 10);
+  CHECK(vkResetCommandBuffer(cb, 0) == VK_SUCCESS);
+  CHECK(r.arena.chunks.size() == 10);  // a plain reset keeps them: the next recording reuses them
+  vkTrimCommandPool(c.dev, pool, 0);
+  CHECK(r.arena.chunks.size() == 1);   // trim keeps one
+  record();
+  CHECK(r.arena.chunks.size() == 10);
+  CHECK(vkResetCommandBuffer(cb, VK_COMMAND_BUFFER_RESET_RELEASE_RESOURCES_BIT) == VK_SUCCESS);
+  CHECK(r.arena.chunks.empty() && r.ops.capacity() == 0);
+  record();
+  vkResetCommandPool(c.dev, pool, VK_COMMAND_POOL_RESET_RELEASE_RESOURCES_BIT);
+  CHECK(r.arena.chunks.empty() && r.ops.capacity() == 0);
+  c.gpu().pipelines().waitIdle();
+  vkDestroyCommandPool(c.dev, pool, nullptr);
+  vkDestroyBuffer(c.dev, b, nullptr);
+  vkFreeMemory(c.dev, m, nullptr);
+}
+
+// V7: the forced-MSAA variant a submission asks for is not waited for one at a time: pipelineFor hands the key over.
+void testAuditForcedVariant() {
+  Ctx c;
+  Device* dev = from<Device>(c.dev);
+  DrawRig rig(c);
+  VkShaderModule vs = module(c, "pos.vert.spv"), fs = module(c, "solid.frag.spv");
+  VkPipelineLayoutCreateInfo plci{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+  VkPipelineLayout pl;
+  vkCreatePipelineLayout(c.dev, &plci, nullptr, &pl);
+  VkPipeline pipe = makePosPipeline(c, rig, pl, PipeOpts{}, vs, fs);
+  const PipelineObj* po = from<PipelineObj>(pipe);
+  CHECK(po->ok && !dev->translator);  // synchronous pipelines (the group's setting)
+  c.gpu().pipelines().waitIdle();
+  auto& nb = static_cast<vpgpu::NullBackend&>(dev->platform->backend());
+  std::mutex gm;
+  std::condition_variable gcv;
+  bool open = false;
+  nb.onCompile = [&] {
+    std::unique_lock lock(gm);
+    gcv.wait(lock, [&] { return open; });
+  };
+  std::vector<vpgpu::PipelineKey> fresh;
+  const auto t0 = std::chrono::steady_clock::now();
+  const vpgpu::PipelineKey k = pipelineFor(dev, *po, 4, nullptr, nullptr, &fresh);
+  const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+  CHECK(k.value && k.value != po->key.value);
+  CHECK(fresh.size() == 1 && fresh[0].value == k.value);
+  CHECK(ms < 1000.0);  // the compile is held: waiting for it would have taken the whole budget
+  {
+    std::lock_guard lock(gm);
+    open = true;
+  }
+  gcv.notify_all();
+  c.gpu().pipelines().waitIdle();
+  nb.onCompile = nullptr;
+  vkDestroyPipeline(c.dev, pipe, nullptr);
+  vkDestroyShaderModule(c.dev, vs, nullptr), vkDestroyShaderModule(c.dev, fs, nullptr);
+  vkDestroyPipelineLayout(c.dev, pl, nullptr);
+}
+
+// V8: a submit with skipped draws logs the first ones, then one in 600 (the log has no end otherwise).
+void testAuditSubmitLog() {
+  Ctx c;
+  DrawRig rig(c);
+  VkShaderModule vs = module(c, "pos.vert.spv"), fs = module(c, "solid.frag.spv");
+  VkPipelineLayoutCreateInfo plci{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+  VkPipelineLayout pl;
+  vkCreatePipelineLayout(c.dev, &plci, nullptr, &pl);
+  PipeOpts dyn;
+  dyn.dynamic = {VK_DYNAMIC_STATE_SCISSOR};
+  VkPipeline pipe = makePosPipeline(c, rig, pl, dyn, vs, fs);
+  c.gpu().pipelines().waitIdle();
+  const std::string log = captureStderr([&] {
+    for (int i = 0; i < 300; ++i) {
+      rig.begin();
+      vkCmdBindPipeline(rig.cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
+      const VkRect2D empty{{4, 4}, {0, 0}};
+      vkCmdSetScissor(rig.cb, 0, 1, &empty);
+      vkCmdDraw(rig.cb, 3, 1, 0, 0);  // skipped: empty scissor
+      vkCmdEndRenderPass(rig.cb);
+      vkEndCommandBuffer(rig.cb);
+      VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+      si.commandBufferCount = 1, si.pCommandBuffers = &rig.cb;
+      CHECK(vkQueueSubmit(c.queue, 1, &si, VK_NULL_HANDLE) == VK_SUCCESS);
+    }
+  });
+  const size_t lines = countOf(log, "vk.submit n=");
+  CHECK(lines >= 8 && lines <= 80);
+  vkDeviceWaitIdle(c.dev);
+  vkDestroyPipeline(c.dev, pipe, nullptr);
+  vkDestroyShaderModule(c.dev, vs, nullptr), vkDestroyShaderModule(c.dev, fs, nullptr);
+  vkDestroyPipelineLayout(c.dev, pl, nullptr);
+}
+
+// V9: with the VPKTAA UI mask on, a pipeline keeps only the fragment stage's SPIR-V (the one a mask variant translates again).
+void testAuditSources() {
+  vpvk_config_set_taa_native(1);
+  {
+    Ctx c;
+    CHECK(taaUiMaskOn());
+    DrawRig rig(c);
+    VkShaderModule vs = module(c, "pos.vert.spv"), fs = module(c, "solid.frag.spv");
+    VkPipelineLayoutCreateInfo plci{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    VkPipelineLayout pl;
+    vkCreatePipelineLayout(c.dev, &plci, nullptr, &pl);
+    VkPipeline pipe = makePosPipeline(c, rig, pl, PipeOpts{}, vs, fs);
+    const PipelineObj* po = from<PipelineObj>(pipe);
+    CHECK(po->ok && po->sources.size() == 1 && po->sources[0].stage == VK_SHADER_STAGE_FRAGMENT_BIT);
+    c.gpu().pipelines().waitIdle();
+    vkDestroyPipeline(c.dev, pipe, nullptr);
+    vkDestroyShaderModule(c.dev, vs, nullptr), vkDestroyShaderModule(c.dev, fs, nullptr);
+    vkDestroyPipelineLayout(c.dev, pl, nullptr);
+  }
+  vpvk_config_set_taa_native(0);
+}
+
+// V12: freeing descriptor sets and command buffers one by one (O(1) each, any order).
+void testAuditFreeOrder() {
+  Ctx c;
+  VkDescriptorSetLayoutBinding b{0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_ALL, nullptr};
+  VkDescriptorSetLayoutCreateInfo lci{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+  lci.bindingCount = 1, lci.pBindings = &b;
+  VkDescriptorSetLayout sl;
+  vkCreateDescriptorSetLayout(c.dev, &lci, nullptr, &sl);
+  VkDescriptorPoolSize ps{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 64};
+  VkDescriptorPoolCreateInfo pci{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+  pci.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT, pci.maxSets = 64, pci.poolSizeCount = 1, pci.pPoolSizes = &ps;
+  VkDescriptorPool pool;
+  vkCreateDescriptorPool(c.dev, &pci, nullptr, &pool);
+  std::vector<VkDescriptorSetLayout> layouts(40, sl);
+  VkDescriptorSetAllocateInfo ai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+  ai.descriptorPool = pool, ai.descriptorSetCount = 40, ai.pSetLayouts = layouts.data();
+  std::vector<VkDescriptorSet> sets(40);
+  CHECK(vkAllocateDescriptorSets(c.dev, &ai, sets.data()) == VK_SUCCESS);
+  auto* po = from<DescriptorPoolObj>(pool);
+  CHECK(po->sets.size() == 40);
+  for (int i = 0; i < 40; i += 3) CHECK(vkFreeDescriptorSets(c.dev, pool, 1, &sets[i]) == VK_SUCCESS);  // from the front, scattered
+  CHECK(po->sets.size() == 40 - 14);
+  for (int i = 39; i >= 0; --i)
+    if (i % 3) CHECK(vkFreeDescriptorSets(c.dev, pool, 1, &sets[i]) == VK_SUCCESS);
+  CHECK(po->sets.empty());
+
+  VkCommandPoolCreateInfo cpi{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+  VkCommandPool cp;
+  vkCreateCommandPool(c.dev, &cpi, nullptr, &cp);
+  VkCommandBufferAllocateInfo cai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+  cai.commandPool = cp, cai.commandBufferCount = 40;
+  std::vector<VkCommandBuffer> cbs(40);
+  CHECK(vkAllocateCommandBuffers(c.dev, &cai, cbs.data()) == VK_SUCCESS);
+  auto* cpo = from<CommandPool>(cp);
+  for (int i = 0; i < 40; i += 3) vkFreeCommandBuffers(c.dev, cp, 1, &cbs[i]);
+  CHECK(cpo->buffers.size() == 40 - 14);
+  for (int i = 39; i >= 0; --i)
+    if (i % 3) vkFreeCommandBuffers(c.dev, cp, 1, &cbs[i]);
+  CHECK(cpo->buffers.empty());
+  vkDestroyCommandPool(c.dev, cp, nullptr);
+  vkDestroyDescriptorPool(c.dev, pool, nullptr);
+  vkDestroyDescriptorSetLayout(c.dev, sl, nullptr);
+}
+
+// V11: a set keeps its descriptors in one block (no vector per binding) and sizes inline-uniform storage only for layouts that have it.
+void testAuditSetStorage() {
+  Ctx c;
+  VkDescriptorSetLayoutBinding b[3] = {{0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 3, VK_SHADER_STAGE_ALL, nullptr},
+                                       {5, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_ALL, nullptr},
+                                       {7, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 2, VK_SHADER_STAGE_ALL, nullptr}};
+  VkDescriptorSetLayoutCreateInfo lci{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+  lci.bindingCount = 3, lci.pBindings = b;
+  VkDescriptorSetLayout sl;
+  vkCreateDescriptorSetLayout(c.dev, &lci, nullptr, &sl);
+  VkDescriptorPoolSize ps[2] = {{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 20}, {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 4}};
+  VkDescriptorPoolCreateInfo pci{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+  pci.maxSets = 4, pci.poolSizeCount = 2, pci.pPoolSizes = ps;
+  VkDescriptorPool pool;
+  vkCreateDescriptorPool(c.dev, &pci, nullptr, &pool);
+  VkDescriptorSetAllocateInfo ai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+  ai.descriptorPool = pool, ai.descriptorSetCount = 1, ai.pSetLayouts = &sl;
+  VkDescriptorSet set;
+  CHECK(vkAllocateDescriptorSets(c.dev, &ai, &set) == VK_SUCCESS);
+  const DescriptorSetObj* so = from<DescriptorSetObj>(set);
+  CHECK(so->flat.size() == 6 && so->slots(0).size() == 3 && so->slots(1).size() == 1 && so->slots(2).size() == 2);
+  CHECK(so->inlineData.empty());
+  VkDeviceMemory m = alloc(c, 4096, 1);
+  VkBuffer buf = buffer(c, 4096, m, 0);
+  VkDescriptorBufferInfo bi{buf, 0, 256};
+  VkWriteDescriptorSet w{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+  w.dstSet = set, w.dstBinding = 0, w.dstArrayElement = 2, w.descriptorCount = 1, w.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+  w.pBufferInfo = &bi;
+  vkUpdateDescriptorSets(c.dev, 1, &w, 0, nullptr);
+  CHECK(so->slots(0)[2].buffer == from<Buffer>(buf) && !so->slots(0)[1].buffer && !so->slots(2)[0].buffer);
+  w.dstBinding = 7, w.dstArrayElement = 1;
+  vkUpdateDescriptorSets(c.dev, 1, &w, 0, nullptr);
+  CHECK(so->slots(2)[1].buffer == from<Buffer>(buf) && !so->slots(2)[0].buffer);
+  vkDestroyBuffer(c.dev, buf, nullptr);
+  vkFreeMemory(c.dev, m, nullptr);
+  vkDestroyDescriptorPool(c.dev, pool, nullptr);
+  vkDestroyDescriptorSetLayout(c.dev, sl, nullptr);
+}
+
+// V6: the rewrite of recipes.bin (compaction / refresh) writes with the store unlocked, carries over what is appended meanwhile
+// and never leaves a damaged file, also when the write fails half way (file size limit) or an append fails (V3).
+std::string auditFile(const std::string& path) {
+  std::ifstream f(path, std::ios::binary);
+  return std::string(std::istreambuf_iterator<char>(f), {});
+}
+void auditAddStage(RecipeStore& s, uint64_t n, size_t textBytes) {
+  StageInput in;
+  in.spirv = 0x1000 + n;
+  const std::vector<uint32_t> words = {0x07230203u, 0x00010000u, 0u, uint32_t(n), 0u};
+  ShaderBlob blob;
+  blob.source = "// shader " + std::to_string(n) + "\n" + std::string(textBytes, char('a' + n % 26));
+  s.addStage(in, in.hash(), words, 0x5000 + n, blob);
+  vpgpu::PipelineState st;  // a pipeline using it: the clean-up of a refresh keeps only what a pipeline needs
+  st.vertexShader = 0x5000 + n;
+  st.label = "audit" + std::to_string(n);
+  s.addPipeline(st, {in.hash(), 0, 0});
+}
+bool auditHas(RecipeStore& s, uint64_t n, size_t textBytes) {
+  ShaderBlob b;
+  const std::string want = "// shader " + std::to_string(n) + "\n" + std::string(textBytes, char('a' + n % 26));
+  return s.shaderBlob(0x5000 + n, b) && b.source == want;
+}
+void testAuditRecipeRewrite() {
+  char tmpl[] = "/tmp/vpvk_audit_rewrite_XXXXXX";
+  const char* dirp = mkdtemp(tmpl);
+  CHECK(dirp != nullptr);
+  if (!dirp) return;
+  const std::string dir = dirp, file = dir + "/recipes.bin";
+  constexpr size_t kText = 20000;
+  std::signal(SIGXFSZ, SIG_IGN);
+  {
+    RecipeStore s(dir);
+    CHECK(s.enabled());
+    // One input given many MSL ids: every re-record supersedes the one before (dead records), so the file is due for compaction.
+    StageInput in;
+    in.spirv = 0x77;
+    const std::vector<uint32_t> words = {0x07230203u, 0x00010000u, 0u, 7u, 0u};
+    for (uint64_t k = 0; k < 300; ++k) {
+      ShaderBlob blob;
+      blob.source = "// dead " + std::to_string(k) + std::string(kText, 'd');
+      s.addStage(in, in.hash(), words, 0x9000 + k, blob);
+    }
+    vpgpu::PipelineState last;
+    last.vertexShader = 0x9000 + 299;
+    last.label = "audit_dead";
+    s.addPipeline(last, {in.hash(), 0, 0});
+    for (uint64_t n = 0; n < 20; ++n) auditAddStage(s, n, kText);
+    CHECK(s.needsRefresh());
+    const std::string before = auditFile(file);
+
+    // A write that fails half way: the file size limit stops the temporary file. The old file stays as it was.
+    struct rlimit old {};
+    getrlimit(RLIMIT_FSIZE, &old);
+    struct rlimit lim = old;
+    lim.rlim_cur = 100000;  // the compacted file is ~400 KB: the temporary file cannot be completed
+    setrlimit(RLIMIT_FSIZE, &lim);
+    const RecipeStore::RefreshResult failed = s.refresh(1);
+    setrlimit(RLIMIT_FSIZE, &old);
+    CHECK(!failed.rewritten);
+    CHECK(auditFile(file) == before && !std::filesystem::exists(file + ".tmp"));
+    CHECK(auditHas(s, 3, kText));
+
+    // An append that fails (the file is at the limit): the file is cut back to its last whole record, nothing is half written.
+    lim.rlim_cur = before.size();
+    setrlimit(RLIMIT_FSIZE, &lim);
+    auditAddStage(s, 100, kText);
+    setrlimit(RLIMIT_FSIZE, &old);
+    CHECK(auditFile(file) == before);
+    auditAddStage(s, 100, kText);  // the store goes on appending after the failure
+    CHECK(auditFile(file).size() > before.size());
+
+    // The rewrite itself: with the store unlocked (another thread adds stages meanwhile and is not blocked), and the records
+    // added meanwhile are in the new file, at the right offsets.
+    std::atomic<bool> added{false};
+    s.rewriteGate = [&] {
+      std::thread other([&] {
+        for (uint64_t n = 200; n < 205; ++n) auditAddStage(s, n, kText);
+        added = true;
+      });
+      other.join();  // would never return if the rewrite held the lock while it writes
+    };
+    const RecipeStore::RefreshResult r = s.refresh(1);
+    s.rewriteGate = nullptr;
+    CHECK(r.rewritten && added);
+    for (uint64_t n : {0, 1, 19, 100, 200, 204}) CHECK(auditHas(s, n, kText));
+    auditAddStage(s, 300, kText);  // appended after the rewrite: the new file's end
+    CHECK(auditHas(s, 300, kText));
+    CHECK(auditFile(file).size() < before.size());  // compacted: the superseded texts are gone
+  }
+  {
+    RecipeStore t(dir);  // the file on disk, read from scratch
+    CHECK(t.enabled() && !t.needsRefresh());
+    for (uint64_t n : {0, 1, 19, 100, 200, 201, 204, 300}) CHECK(auditHas(t, n, kText));
+    CHECK(t.stageInputs().size() == 20 + 1 + 1 + 5 + 1);
+  }
+  std::filesystem::remove_all(dir);
+}
+
+// V14: the arena room reserved for a later fill (put with no data) is not cleared: whoever asks for it fills all of it.
+void testAuditArenaReserve() {
+  Ctx c;
+  Recorder r;
+  r.device = from<Device>(c.dev);
+  std::vector<uint8_t> pattern(4096, 0xAB);
+  VkDeviceSize off = 0;
+  r.arena.put(r.device, pattern.data(), pattern.size(), off);
+  r.reset();
+  VkDeviceSize off2 = ~VkDeviceSize(0);
+  r.arena.put(r.device, nullptr, pattern.size(), off2);
+  CHECK(off2 == off && r.arena.chunks.size() == 1);
+  CHECK(r.arena.chunks[0].host[off2] == 0xAB && r.arena.chunks[0].host[off2 + 4095] == 0xAB);
+}
+
+// V18: the rate map of an eye pass is built once for the same size and settings (and again when either changes).
+void testAuditFovMapCache() {
+  vpvk_foveation fcfg{VPVK_FOVEATION_M2, 0.4f, 0.3f, 0.0f};
+  vpvk_config_set_foveation(&fcfg);
+  vpvk_config_set_foveation_apply(1);
+  setenv("VPVK_NULL_RATEMAP", "1", 1);
+  CHECK(foveationActive());
+  FoveationState fs;
+  const auto a = fs.mapFor(1920, 1824, 2);
+  const uint64_t builds = fov::rateMapBuilds();
+  CHECK(a);
+  for (int i = 0; i < 50; ++i) CHECK(fs.mapFor(1920, 1824, 2) == a);
+  CHECK(fov::rateMapBuilds() == builds);
+  const auto b = fs.mapFor(1600, 1500, 2);
+  CHECK(b && b != a && fov::rateMapBuilds() == builds + 1);
+  vpvk_foveation wider{VPVK_FOVEATION_M2, 0.7f, 0.3f, 0.2f};
+  vpvk_config_set_foveation(&wider);
+  const auto d = fs.mapFor(1600, 1500, 2);
+  CHECK(d && fov::rateMapBuilds() == builds + 2);
+  vpvk_foveation off{VPVK_FOVEATION_OFF, 0.4f, 0.3f, 0.0f};
+  vpvk_config_set_foveation(&off);
+  unsetenv("VPVK_NULL_RATEMAP");
+}
+
+// V19: a transfer into a linear image syncs only the mips and layers it touches with the memory.
+void testAuditLinearSync() {
+  Ctx c;
+  VkDeviceMemory m = alloc(c, 8 << 20, 1);
+  VkImage opt = image(c, VK_FORMAT_R8G8B8A8_UNORM, 64, 1, VK_IMAGE_USAGE_TRANSFER_SRC_BIT, m);
+  VkImageCreateInfo ii{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+  ii.imageType = VK_IMAGE_TYPE_2D, ii.format = VK_FORMAT_R8G8B8A8_UNORM, ii.extent = {64, 64, 1};
+  ii.mipLevels = 3, ii.arrayLayers = 4, ii.samples = VK_SAMPLE_COUNT_1_BIT, ii.tiling = VK_IMAGE_TILING_LINEAR;
+  ii.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+  VkImage lin = VK_NULL_HANDLE;
+  CHECK(vkCreateImage(c.dev, &ii, nullptr, &lin) == VK_SUCCESS);
+  CHECK(vkBindImageMemory(c.dev, lin, m, 1 << 20) == VK_SUCCESS);
+  const Image* li = from<Image>(lin);
+  CHECK(li->linear && li->hostAlias && li->desc.mips == 3 && li->desc.layers == 4);
+  VkCommandPoolCreateInfo pi{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+  VkCommandPool pool;
+  vkCreateCommandPool(c.dev, &pi, nullptr, &pool);
+  VkCommandBufferAllocateInfo ai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+  ai.commandPool = pool, ai.commandBufferCount = 1;
+  VkCommandBuffer cb;
+  vkAllocateCommandBuffers(c.dev, &ai, &cb);
+  VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+  vkBeginCommandBuffer(cb, &bi);
+  VkImageCopy r{};
+  r.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+  r.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 1, 2, 1};  // mip 1, layer 2
+  r.extent = {32, 32, 1};
+  vkCmdCopyImage(cb, opt, VK_IMAGE_LAYOUT_GENERAL, lin, VK_IMAGE_LAYOUT_GENERAL, 1, &r);
+  vkEndCommandBuffer(cb);
+  vpgpu::Frame frame;
+  TranslateStats st;
+  translate(*from<CommandBuffer>(cb)->rec, frame, st);
+  CHECK(frame.commands().size() == 3);  // sync in, the copy, sync out: one mip and one layer each
+  const auto* in = frame.commands().size() == 3 ? std::get_if<vpgpu::Copy>(&frame.commands()[0]) : nullptr;
+  const auto* out = frame.commands().size() == 3 ? std::get_if<vpgpu::Copy>(&frame.commands()[2]) : nullptr;
+  const LinearLayout want = linearLayout(li->desc, 1, 2);
+  CHECK(in && in->kind == vpgpu::CopyKind::BufferToTexture && in->dstTexture.mip == 1 && in->dstTexture.layer == 2 &&
+        in->dstTexture.layerCount == 1 && in->srcBuffer.offset == want.offset);
+  CHECK(out && out->kind == vpgpu::CopyKind::TextureToBuffer && out->srcTexture.mip == 1 && out->srcTexture.layer == 2 &&
+        out->srcTexture.layerCount == 1 && out->dstBuffer.offset == want.offset);
+  vkDestroyCommandPool(c.dev, pool, nullptr);
+  vkDestroyImage(c.dev, lin, nullptr);
+  vkDestroyImage(c.dev, opt, nullptr);
+  vkFreeMemory(c.dev, m, nullptr);
 }
 
 int main(int argc, char** argv) {
@@ -14799,7 +15381,7 @@ int main(int argc, char** argv) {
       {"quest_gpu_name", testQuestGpuName}, {"native_identity", testNativeIdentity}, {"inline_uniform", testInlineUniformBlock}, {"bda", testBufferDeviceAddress}, {"ycbcr", testYcbcr},
       {"taa_native", testTaaNative}, {"taa_eye_depth", testTaaEyeDepth}, {"taa_uimask", testTaaUiMask}, {"msaa_force", testMsaaForce}, {"depth_tile", testDepthTile}, {"depth_tile_off", testDepthTileOff}, {"d24_emul", testD24Emul}, {"prewarm_variants", testPrewarmVariants}, {"msaa_force_marked", testMsaaForceMarkedEye}, {"aot", testAot}, {"aniso", testAniso}, {"zeroinit", testZeroInit}, {"archive_index", testArchiveIndex}, {"foveation", testFoveation},
       {"stage_keys", testStageKeys}, {"async_pipelines", testAsyncPipelines}, {"sync_pipelines", testSyncPipelines}, {"create_default", testCreateDefault}, {"pso_census", testPsoCensus}, {"cache_state", testCacheState}, {"hide_mesh", testHideMesh}, {"pass_drop", testPassDrop}, {"skip_reasons", testSkipReasons}, {"diag_census", testDiagCensus}, {"pass_dump", testPassDump}, {"indirect_patch", testIndirectPatch}, {"astc3d", testAstc3d},
-      {"perf", testPerf}, {"phase1b", testPhase1b}, {"suspend_resume", testSuspendResume}, {"translator_modes", testTranslatorModes}, {"capture", testCapture}, {"capture_images", testCaptureImages}, {"capture_hooks", testCaptureHooks}, {"capture_codec", testCaptureCodec}, {"capture_env", testCaptureEnv}, {"capture_pools", testCapturePools}, {"capture_host_frames", testCaptureHostFrames}, {"capture_corrupt", testCaptureCorrupt}, {"capture_env_host", testCaptureEnvHost}, {"capture_env_dir", testCaptureEnvDir}, {"capture_devices", testCaptureDevices}, {"capture_unhooked", testCaptureUnhooked}, {"capture_budget", testCaptureBudget}, {"capture_locks", testCaptureLocks}, {"png", testPng}, {"imgdiff", testImgDiff}, {"replay", testReplay}, {"replay_lvp", testReplayLvp}, {"refcaps", testRefCaps}};
+      {"perf", testPerf}, {"phase1b", testPhase1b}, {"suspend_resume", testSuspendResume}, {"translator_modes", testTranslatorModes}, {"capture", testCapture}, {"capture_images", testCaptureImages}, {"capture_hooks", testCaptureHooks}, {"capture_codec", testCaptureCodec}, {"capture_env", testCaptureEnv}, {"capture_pools", testCapturePools}, {"capture_host_frames", testCaptureHostFrames}, {"capture_corrupt", testCaptureCorrupt}, {"capture_env_host", testCaptureEnvHost}, {"capture_env_dir", testCaptureEnvDir}, {"capture_devices", testCaptureDevices}, {"capture_unhooked", testCaptureUnhooked}, {"capture_budget", testCaptureBudget}, {"capture_locks", testCaptureLocks}, {"audit_vk_timeline", testAuditTimelinePending}, {"audit_vk_live", testAuditLiveDevice}, {"audit_vk_recipes", testAuditRecipes}, {"audit_vk_devices", testAuditTwoDevices}, {"audit_vk_arena", testAuditArena}, {"audit_vk_variant", testAuditForcedVariant}, {"audit_vk_submitlog", testAuditSubmitLog}, {"audit_vk_sources", testAuditSources}, {"audit_vk_free", testAuditFreeOrder}, {"audit_vk_sets", testAuditSetStorage}, {"audit_vk_rewrite", testAuditRecipeRewrite}, {"audit_vk_reserve", testAuditArenaReserve}, {"audit_vk_fov", testAuditFovMapCache}, {"audit_vk_linear", testAuditLinearSync}, {"audit_vk", [] { testAuditTimelinePending(); testAuditLiveDevice(); testAuditRecipes(); testAuditTwoDevices(); testAuditArena(); testAuditForcedVariant(); testAuditSubmitLog(); testAuditSources(); testAuditFreeOrder(); testAuditSetStorage(); testAuditRecipeRewrite(); testAuditArenaReserve(); testAuditFovMapCache(); testAuditLinearSync(); }}, {"png", testPng}, {"imgdiff", testImgDiff}, {"replay", testReplay}, {"replay_lvp", testReplayLvp}, {"refcaps", testRefCaps}};
   bool ran = false;
   for (const auto& [name, fn] : groups) {
     if (argc > 1 && std::strcmp(argv[1], name) != 0) continue;

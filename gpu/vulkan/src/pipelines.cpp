@@ -1018,10 +1018,10 @@ void ampCensus() {
 // (recipes) the first time it is needed. `eds`: the command buffer's extended dynamic state, applied
 // on top the same way (a variant per combination of replaced values).
 vpgpu::PipelineKey pipelineFor(Device* dev, const PipelineObj& p, uint8_t passSamples, PipelineObj::TexelVariant* tv,
-                               const BoundState::Eds* eds) {
+                               const BoundState::Eds* eds, std::vector<vpgpu::PipelineKey>* deferAwait) {
   const vpgpu::PipelineState& base = tv ? tv->state : p.state;
   vpgpu::PipelineKey baseKey = tv ? tv->key : p.key;
-  vpgpu::PipelineKey fresh{};  // a variant this call requested: awaited after the lock is released
+  vpgpu::PipelineKey fresh{};  // a variant this call requested: awaited after the lock is released (or by the caller: deferAwait)
   if (!p.compute && passSamples && passSamples != base.samples) {
     std::lock_guard<std::mutex> lock(p.variantMutex);
     auto& list = tv ? tv->samples : p.variants;
@@ -1045,7 +1045,10 @@ vpgpu::PipelineKey pipelineFor(Device* dev, const PipelineObj& p, uint8_t passSa
       baseKey = k;
     }
   }
-  if (fresh.value) awaitPipeline(dev, fresh, "msaa_variant");
+  if (fresh.value) {
+    if (deferAwait) deferAwait->push_back(fresh);
+    else awaitPipeline(dev, fresh, "msaa_variant");
+  }
   if (!eds || p.compute || p.dynamic.empty()) return baseKey;
   // State the pipeline variant above was made from (its samples differ only by the count).
   vpgpu::PipelineState st = base;
@@ -1080,6 +1083,10 @@ vpgpu::BufferId UploadArena::put(Device* d, const void* data, VkDeviceSize size,
     Chunk c;
     c.size = std::max<VkDeviceSize>(65536, (need + 16383) & ~VkDeviceSize(16383));
     c.host = static_cast<uint8_t*>(std::aligned_alloc(16384, c.size));
+    if (!c.host) {  // there is no way to hand the failure back to vkCmd*: stop with the reason instead of a null memcpy
+      logf("vk.err what=upload_arena_alloc_failed bytes=%llu", static_cast<unsigned long long>(c.size));
+      std::abort();
+    }
     vpgpu::BufferDesc bd;
     bd.size = c.size;
     bd.guestMemory = c.host;
@@ -1093,22 +1100,31 @@ vpgpu::BufferId UploadArena::put(Device* d, const void* data, VkDeviceSize size,
   }
   Chunk& c = chunks[current];
   offset = c.used;
+  // data == nullptr: room reserved for a later fill, contents unspecified. Its two callers (vkCmdCopyBufferToImage: decoded 3D ASTC
+  // volumes and budget-shrunk uploads, filled whole at submit by decodedVolumeCopy / shrunkCopy) overwrite every byte they use.
   if (data) std::memcpy(c.host + c.used, data, size);
-  else std::memset(c.host + c.used, 0, size);  // reserved for a later fill (decoded 3D ASTC uploads)
   c.used += need;
   return c.id;
 }
 
-void UploadArena::release(Device* d) {
-  for (auto& c : chunks) {
-    if (d && c.id) {
-      // Same lock as put(): the backend's buffer map and retire list belong to the submit thread.
-      std::lock_guard<std::mutex> lock(d->submitMutex);
-      d->gpu->destroy(c.id);
-    }
-    std::free(c.host);
+static void freeChunk(Device* d, UploadArena::Chunk& c) {
+  if (d && c.id) {
+    // Same lock as put(): the backend's buffer map and retire list belong to the submit thread.
+    std::lock_guard<std::mutex> lock(d->submitMutex);
+    d->gpu->destroy(c.id);
   }
+  std::free(c.host);
+}
+
+void UploadArena::release(Device* d) {
+  for (auto& c : chunks) freeChunk(d, c);
   chunks.clear();
+  current = 0;
+}
+
+void UploadArena::trim(Device* d) {
+  for (size_t i = 1; i < chunks.size(); ++i) freeChunk(d, chunks[i]);
+  if (chunks.size() > 1) chunks.resize(1);
   current = 0;
 }
 
@@ -1294,6 +1310,9 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkCreateDescriptorSetLayout(VkDevice,
   }
   std::sort(data->bindings.begin(), data->bindings.end(),
             [](const SetLayoutBinding& a, const SetLayoutBinding& b) { return a.binding < b.binding; });
+  data->slotStart.push_back(0);
+  for (const SetLayoutBinding& b : data->bindings)
+    data->slotStart.push_back(data->slotStart.back() + (b.type == VK_DESCRIPTOR_TYPE_INLINE_UNIFORM_BLOCK ? 1 : b.count));
   auto* l = new DescriptorSetLayoutObj;
   l->data = data;
   *out = to<VkDescriptorSetLayout>(l);
@@ -1358,22 +1377,23 @@ namespace {
 // An empty set of `layout` (every descriptor unwritten, immutable samplers in place).
 void initDescriptorSet(DescriptorSetObj& s, std::shared_ptr<const SetLayoutData> layout) {
   s.layout = std::move(layout);
-  s.slots.clear(), s.inlineData.clear();
-  s.slots.resize(s.layout->bindings.size());
-  s.inlineData.resize(s.layout->bindings.size());
+  s.flat.clear(), s.inlineData.clear();
+  s.flat.resize(s.layout->slotStart.back());
+  bool inlineBlock = false;
+  for (const SetLayoutBinding& lb : s.layout->bindings) inlineBlock |= lb.type == VK_DESCRIPTOR_TYPE_INLINE_UNIFORM_BLOCK;
+  if (inlineBlock) s.inlineData.resize(s.layout->bindings.size());
   for (size_t b = 0; b < s.layout->bindings.size(); ++b) {
     const SetLayoutBinding& lb = s.layout->bindings[b];
+    const std::span<Descriptor> slot = s.slots(b);
     if (lb.type == VK_DESCRIPTOR_TYPE_INLINE_UNIFORM_BLOCK) {
-      s.slots[b].resize(1);
-      s.slots[b][0].type = lb.type;
+      slot[0].type = lb.type;
       s.inlineData[b].assign(lb.count, 0);
       continue;
     }
-    s.slots[b].resize(lb.count);
     for (uint32_t k = 0; k < lb.immutable.size() && k < lb.count; ++k) {
-      s.slots[b][k].sampler = lb.immutable[k];
-      s.slots[b][k].type = lb.type;
-      s.slots[b][k].immutable = true;
+      slot[k].sampler = lb.immutable[k];
+      slot[k].type = lb.type;
+      slot[k].immutable = true;
     }
   }
 }
@@ -1386,6 +1406,7 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkAllocateDescriptorSets(VkDevice, co
     auto* s = new DescriptorSetObj;
     initDescriptorSet(*s, from<DescriptorSetLayoutObj>(ai->pSetLayouts[i])->data);
     s->pool = pool;
+    s->poolIndex = pool->sets.size();
     pool->sets.push_back(s);
     out[i] = to<VkDescriptorSet>(s);
   }
@@ -1398,7 +1419,7 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkFreeDescriptorSets(VkDevice, VkDesc
   for (uint32_t i = 0; i < n; ++i) {
     if (!sets[i]) continue;
     auto* s = from<DescriptorSetObj>(sets[i]);
-    pool->sets.erase(std::remove(pool->sets.begin(), pool->sets.end(), s), pool->sets.end());
+    pool->remove(s);
     delete s;
   }
   return VK_SUCCESS;
@@ -1410,9 +1431,9 @@ namespace {
 Descriptor* element(DescriptorSetObj* s, uint32_t binding, uint32_t e) {
   for (size_t b = 0; b < s->layout->bindings.size(); ++b) {
     if (s->layout->bindings[b].binding < binding) continue;
-    if (s->layout->bindings[b].binding == binding || e < s->slots[b].size()) {
-      if (e < s->slots[b].size()) return &s->slots[b][e];
-      e -= uint32_t(s->slots[b].size());
+    if (s->layout->bindings[b].binding == binding || e < s->slots(b).size()) {
+      if (e < s->slots(b).size()) return &s->slots(b)[e];
+      e -= uint32_t(s->slots(b).size());
       binding = b + 1 < s->layout->bindings.size() ? s->layout->bindings[b + 1].binding : binding + 1;
     }
   }
@@ -2174,8 +2195,17 @@ void finishGraphics(Device* d, PipelineObj* p, std::vector<PipelineObj::StageSrc
   if (!ok) noteTranslateFail(why, p->key.value, st.label);
   p->inputs = inputs;
   // Only texel buffer / stride variants and the VPKTAA UI-mask variants (maskPipelineKey) retranslate.
-  if (p->texel.empty() && !p->dynStride && !taaUiMaskOn() && !p->depthTileSrc) p->sources.clear();
-  else p->attrs = std::move(attrs);
+  // The texel buffer / stride variants translate every stage again; the UI-mask and depth-in-tile variants only the fragment one.
+  const bool allStages = !p->texel.empty() || p->dynStride;
+  if (!allStages && !taaUiMaskOn() && !p->depthTileSrc) {
+    p->sources.clear();
+  } else {
+    if (!allStages)
+      p->sources.erase(std::remove_if(p->sources.begin(), p->sources.end(),
+                                      [](const PipelineObj::StageSrc& x) { return x.stage != VK_SHADER_STAGE_FRAGMENT_BIT; }),
+                       p->sources.end());
+    p->attrs = std::move(attrs);
+  }
   if (ok && p->failOnCompile && !pipelineKnown(d, p->key)) {
     p->compileRequired = true;
     noteCompileRequired(d, st, p->key, inputs, false);
@@ -2188,7 +2218,7 @@ void finishGraphics(Device* d, PipelineObj* p, std::vector<PipelineObj::StageSrc
     if (d->recipes) d->recipes->addPipeline(st, inputs);
   }  // Depth in tile: the variant the pipeline will need (by its subpass) is made here, off the submit thread. Only for a render
   // pass that already kept a depth on tile (depthTileEarly): a variant is one more pipeline to compile, wasted while no pass uses it.
-  if (ok && p->depthTileEarly && !p->sources.empty() && p->layout) {
+  if (ok && p->depthTileEarly && p->layout) {  // (depthTileSrc keeps the fragment source: a depth-only pipeline has none)
     const bool real = std::any_of(p->sources.begin(), p->sources.end(), [](const PipelineObj::StageSrc& x) {
       return x.stage == VK_SHADER_STAGE_FRAGMENT_BIT && !x.synthetic;
     });
@@ -2889,6 +2919,11 @@ bool resolveBindings(Recorder& r, const PipelineObj& p, const std::array<BoundSt
     if (bc) bc->fail = why;
     return false;
   };
+  {  // one allocation for the draw's bindings instead of a doubling vector per draw
+    size_t n = p.pushStages && p.layout->pushSlot >= 0 ? 1 : 0;
+    for (const PipelineObj::Used& u : p.used) n += size_t(u.slot.count) * (u.slot.type == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER ? 2 : 1);
+    out.reserve(out.size() + n);
+  }
   for (const PipelineObj::Used& u : p.used) {
     const LayoutSlot& ls = u.slot;
     if (ls.set >= sets.size() || !sets[ls.set].set) return bad(BindFail::SetNull);
@@ -2905,7 +2940,7 @@ bool resolveBindings(Recorder& r, const PipelineObj& p, const std::array<BoundSt
         dynBase += lb.count;
     }
     if (bi == SIZE_MAX) return bad(BindFail::BindingMissing);
-    const auto& elems = set->slots[bi];
+    const std::span<const Descriptor> elems = set->slots(bi);
     for (uint32_t e = 0; e < ls.count && e < elems.size(); ++e) {
       const Descriptor& d = elems[e];
       switch (ls.type) {
@@ -3008,8 +3043,8 @@ PipelineObj::TexelVariant* texelVariant(Device* dev, const PipelineObj& p, const
     if (t.set >= sets.size() || !sets[t.set].set) continue;
     const DescriptorSetObj* set = sets[t.set].set;
     for (size_t k = 0; k < set->layout->bindings.size(); ++k)
-      if (set->layout->bindings[k].binding == t.binding && !set->slots[k].empty() && set->slots[k][0].texel) {
-        const vpgpu::Format f = toCoreFormat(set->slots[k][0].texel->format);
+      if (set->layout->bindings[k].binding == t.binding && !set->slots(k).empty() && set->slots(k)[0].texel) {
+        const vpgpu::Format f = toCoreFormat(set->slots(k)[0].texel->format);
         if (f != vpgpu::Format::Undefined) want[i] = f;
         break;
       }
@@ -3355,7 +3390,7 @@ static void forEachBound(const PipelineObj& p, const std::array<BoundState::Set,
     const DescriptorSetObj* set = sets[u.slot.set].set;
     for (size_t k = 0; k < set->layout->bindings.size(); ++k)
       if (set->layout->bindings[k].binding == u.slot.binding) {
-        if (!set->slots[k].empty()) fn(u, set->slots[k][0]);
+        if (!set->slots(k).empty()) fn(u, set->slots(k)[0]);
         break;
       }
   }
@@ -3593,7 +3628,7 @@ OpDraw makeDraw(Recorder& r, uint32_t first, uint32_t count, uint32_t instances,
     d.viewport = {v.x, v.y, v.width, v.height, v.minDepth, v.maxDepth};
     // Diagnostic (one-shot): viewport of multiview draws and any negative-height (flipped) viewport,
     // which Metal does not honour like Vulkan does.
-    static bool mvLogged = false, negLogged = false;
+    static std::atomic<bool> mvLogged{false}, negLogged{false};  // (recording threads of different devices)
     if ((p->viewCount > 1 && !mvLogged) || (v.height < 0 && !negLogged)) {
       (p->viewCount > 1 ? mvLogged : negLogged) = true;
       if (v.height < 0) negLogged = true;
@@ -3774,6 +3809,9 @@ std::string indirectStatsLine(const PipelineCounters& c) {
   return b;
 }
 
+// Set when vk.indirect_stats has logged its last line: noteIndirectArgs then stops reading the records.
+static std::atomic<bool> gIndirectStatsEnded{false};
+
 void indirectStatsLog(int64_t nowNs) {
   static std::atomic<int64_t> nextNs{0};
   static std::mutex m;
@@ -3784,6 +3822,7 @@ void indirectStatsLog(int64_t nowNs) {
   const PipelineCounters& c = pipelineCounters();
   std::lock_guard<std::mutex> lock(m);
   const uint64_t draws = c.indirectDraws.load();
+  if (lines >= 720) gIndirectStatsEnded.store(true, std::memory_order_relaxed);
   if (draws == lastDraws || lines >= 720) return;
   lastDraws = draws, ++lines;
   nextNs.store(nowNs + 5'000'000'000LL, std::memory_order_relaxed);
@@ -3800,6 +3839,7 @@ static void noteIndirectArgs(const Buffer* b, VkDeviceSize off, uint32_t n, uint
   PipelineCounters& pc = pipelineCounters();
   ++pc.indirectDraws;
   if (countBuf) ++pc.indirectCountDraws;
+  if (gIndirectStatsEnded.load(std::memory_order_relaxed)) return;  // the line is not logged any more: nothing to measure
   const auto host = [](const Buffer* x, VkDeviceSize at, VkDeviceSize bytes) -> const uint8_t* {
     return x && x->memory && x->memory->host && at + bytes <= x->size ? x->memory->host + x->offset + at : nullptr;
   };
@@ -4817,7 +4857,13 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdCopyQueryPoolResults(VkCommandBuffer
   op.constants = r.arena.put(r.device, kConstants, sizeof kConstants, op.constantsOffset);
   r.ops.emplace_back(std::move(op));
 }
-VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkTrimCommandPool(VkDevice, VkCommandPool, VkCommandPoolTrimFlags) {}
+// Memory a reset command buffer kept for its next recording (the upload arena beyond one chunk, the capacity of its ops) goes back.
+// Only command buffers in the initial state: a recorded or pending one still needs what it holds.
+VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkTrimCommandPool(VkDevice, VkCommandPool cp, VkCommandPoolTrimFlags) {
+  if (!cp) return;
+  for (CommandBuffer* c : from<CommandPool>(cp)->buffers)
+    if (c->state == CommandBuffer::State::Initial) c->rec->trim();
+}
 
 // =================================================================================================
 // Proc-address table of this file (entry.cpp's lookup asks it before giving up)

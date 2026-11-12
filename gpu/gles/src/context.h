@@ -87,6 +87,12 @@ struct BufferStorage {
     uint8_t* host = nullptr;
     VkDeviceSize size = 0;
     uint64_t lastUse = 0;  // serial of the last submission that references it (0 = never)
+    uint64_t gpuWrite = 0; // serial of the last submission that writes it with the GPU (glReadPixels into a pixel pack buffer)
+    // Byte ranges [lo, hi) the GPU reads in the submissions that have not completed (merged, at most a few; meaningful while
+    // lastUse is past `completed`): a CPU write to bytes outside them can be made in place (Context::prepareWrite).
+    std::vector<std::pair<uint64_t, uint64_t>> reads;
+    void noteRead(uint64_t lo, uint64_t hi);
+    bool readsRange(uint64_t lo, uint64_t hi) const;
     ~BufferStorage();
 };
 using StorageP = std::shared_ptr<BufferStorage>;
@@ -122,17 +128,24 @@ struct Device {
         VkFence fence;
         VkCommandBuffer cb;
         std::vector<std::shared_ptr<void>> keep;  // objects to keep alive until it completes
+        std::vector<StorageP> chunks;             // its streaming chunks: spare ones once it completes
         VkDescriptorPool descPool = VK_NULL_HANDLE;
     };
     std::vector<InFlight> inFlight;
     std::vector<VkDescriptorPool> freePools;
+    // Streaming chunks (Context::stream) of retired submissions, ready to be written again (at most kMaxSpareChunks).
+    static constexpr VkDeviceSize kStreamChunk = 4 << 20;
+    static constexpr size_t kMaxSpareChunks = 4;
+    std::vector<StorageP> spareChunks;
 
     bool init(PFN_vkGetInstanceProcAddr gipa);
     void shutdown();
+    void trim();  // gives back what is cached for reuse (descriptor pools, streaming chunks): made again when needed
     int memoryType(uint32_t bits, VkMemoryPropertyFlags want) const;
     StorageP newStorage(VkDeviceSize size, VkBufferUsageFlags usage);
     void retire(bool wait);         // polls (or waits for) in-flight fences
-    void waitSerial(uint64_t serial);
+    // Waits until serial completed (at most timeoutNs); false when the time ran out first.
+    bool waitSerial(uint64_t serial, uint64_t timeoutNs = UINT64_MAX);
     VkDescriptorPool takePool();
 };
 
@@ -182,6 +195,8 @@ struct Image {  // a VkImage with its memory
     // Diagnostics (compressed images, which only uploads and copies can fill): levels that received texels, a bit per level
     // (gles.unwritten). External images count as written.
     uint32_t written = 0;
+    // Uploads / first transitions of it that wait in Context::xfers_ (recorded when the open pass ends, see Context::recordTransfers).
+    uint32_t xferPending = 0;
     ~Image();
     VkImageAspectFlags aspect() const;
     // A 2D (array) view of one level and `layerCount` layers from `layer`, for attachments.
@@ -540,6 +555,7 @@ public:
     // Occlusion queries are measured by VPVulkan's visibility counters: one pool per context, a slot per query object.
     VkQueryPool occPool_ = VK_NULL_HANDLE;
     std::vector<bool> occBusy_;
+    std::vector<bool> occDirty_;  // slot counted (or is new): reset before it counts again
     uint32_t occActive_ = UINT32_MAX;  // the slot counting draws now
     uint32_t occSlot();                // a free slot (UINT32_MAX: none)
     void occBegin(Query& q);
@@ -636,7 +652,8 @@ public:
     void barrier();                    // full memory barrier (outside passes)
     uint64_t flush(bool wait);         // submits; returns the submission serial (0 if nothing)
     void keep(std::shared_ptr<void> p) { keep_.push_back(std::move(p)); }
-    void useStorage(const StorageP& s);  // marks it used by the open command buffer
+    // Marks it used by the open command buffer, reading bytes [lo, hi) (the whole buffer when not told).
+    void useStorage(const StorageP& s, uint64_t lo = 0, uint64_t hi = UINT64_MAX);
     // image2D bound to one slice of a 3D texture: Metal cannot view a 3D texture as 2D, so the dispatch works on a 2D
     // copy of the slice (copied in before, back after: syncSlicesBack).
     struct SliceSync {
@@ -656,8 +673,10 @@ public:
     Alloc stream(VkDeviceSize size, VkDeviceSize align = 16);
     VkDescriptorSet allocSet(VkDescriptorSetLayout layout);
 
-    // Copy-on-write before a CPU write to a buffer the GPU may use.
-    void prepareWrite(Buffer& b, bool discard);
+    // Before a CPU write to bytes [lo, hi) of a buffer the GPU may use: nothing when the GPU reads none of those bytes (the write is
+    // made in place), else new storage (copy on write; the old one stays alive with the work that reads it). `overwrites`: the
+    // caller writes all of [lo, hi) at once, so those bytes are not copied over.
+    void prepareWrite(Buffer& b, bool discard, uint64_t lo = 0, uint64_t hi = UINT64_MAX, bool overwrites = false);
 
     // Images
     // (Re)creates t.image from its level definitions. `carries`: the caller copies the old texels over (carryTexels), so a new image
@@ -670,6 +689,9 @@ public:
     void makeFormatViews(Texture& t);
     void carryTexels(const ImageP& old, Texture& t);  // copies every level of `old` into t.image (same shape)
     void imageInit(Image& img);       // UNDEFINED -> GENERAL
+    // The same for the image of a texture, made when the pass that is open ends (before anything else that comes after it in the
+    // command buffer): the texture is not in the commands of the pass, or the draw / pass that uses it is prepared after them.
+    void deferImageInit(const ImageP& img);
     VkSampler samplerFor(const SamplerParams& p, const Texture& t);
 
     // Framebuffer resolution: the attachments of the bound draw (or read) framebuffer.
@@ -733,8 +755,14 @@ public:
     void copyTexImage(GLenum target, GLint level, GLenum internalFormat, GLint x, GLint y, GLsizei w, GLsizei h,
                       bool sub, GLint xo, GLint yo, GLint zo);
     void generateMipmap(GLenum target);
-    void copyBufferToImage(Image& img, uint32_t level, uint32_t layer, int32_t x, int32_t y, int32_t z, uint32_t w,
+    // Uploads `data` to a region of a level of `img` (copied into the stream; the copy is recorded by recordTransfers).
+    void copyBufferToImage(const ImageP& img, uint32_t level, uint32_t layer, int32_t x, int32_t y, int32_t z, uint32_t w,
                            uint32_t h, uint32_t d, const uint8_t* data, size_t bytes, bool stencilPlane = false);
+    // The same for texels already written into the stream allocation `a` (convertUploadTo straight into it).
+    void queueUpload(const ImageP& img, uint32_t level, uint32_t layer, int32_t x, int32_t y, int32_t z, uint32_t w, uint32_t h,
+                     uint32_t d, const Alloc& a, bool stencilPlane = false);
+    // Records what deferImageInit / queueUpload kept (outside a pass; endPass does it).
+    void recordTransfers();
     // Keeps an upload to a level above 0 until level 0 defines the image (Texture::pending) / uploads the kept ones.
     void queuePending(Texture& t, uint32_t level, uint32_t layer, int32_t x, int32_t y, int32_t z, uint32_t w, uint32_t h,
                       uint32_t d, const uint8_t* data, size_t bytes);
@@ -742,9 +770,24 @@ public:
 
     // Program use
     enum class Kind { Float, Int, Uint, Bool };
-    bool linkProgram(Program& p);
+    // `ahead`: the result of vpglsl::link for linkInputs(p) (made without Device::lock), instead of linking here.
+    bool linkProgram(Program& p, const vpglsl::LinkResult* ahead = nullptr);
     // The link of linkProgram on explicit shaders (glProgramBinary re-links unregistered ones).
-    bool linkShaders(Program& p, Shader* vs, Shader* fs, Shader* cs);
+    bool linkShaders(Program& p, Shader* vs, Shader* fs, Shader* cs, const vpglsl::LinkResult* ahead = nullptr);
+    // What vpglsl::link is given for the program as it is now: it needs nothing of the device, so glLinkProgram runs it with the
+    // lock released. False when it cannot be made ahead (a single-stage separable program, shaders not compiled): linkShaders
+    // links those, and says why they do not.
+    struct LinkInputs {
+        std::shared_ptr<vpglsl::Shader> vs, fs, cs;
+        vpglsl::LinkOptions options;
+        bool operator==(const LinkInputs& o) const {
+            return vs == o.vs && fs == o.fs && cs == o.cs && options.attribBindings == o.options.attribBindings &&
+                   options.xfbVaryings == o.options.xfbVaryings && options.xfbSeparate == o.options.xfbSeparate &&
+                   options.separable == o.options.separable && options.pipeline == o.options.pipeline;
+        }
+    };
+    bool linkInputs(const Program& p, LinkInputs& in);
+    static vpglsl::LinkResult linkAhead(const LinkInputs& in);
     // The program a draw with a program pipeline whose vertex and fragment stages come from two programs runs: those two
     // stages linked together (cached per pair), with the uniform values / bindings of the two programs copied in.
     Program* pipelineProgram(const ProgramPipeline& pl);
@@ -765,6 +808,44 @@ private:
     std::vector<StorageP> used_;
     VkDescriptorPool descPool_ = VK_NULL_HANDLE;
     bool passOpen_ = false;
+    // Image initialisations and uploads made while a pass is open wait here (in call order) until it ends: a pass is not cut for
+    // each of them. What reads or writes an image with something waiting must come after: beginPass ends the pass for a framebuffer
+    // attachment, bindResources sets xferHazard_ for a sampled / storage image (prepareDraw then ends the pass and prepares the
+    // draw again), every other command is recorded after endPass.
+    struct Xfer {
+        ImageP image;
+        bool init = false;  // UNDEFINED -> GENERAL (else: a copy of `region` from `buffer`)
+        VkBuffer buffer = VK_NULL_HANDLE;
+        VkBufferImageCopy region{};
+    };
+    std::vector<Xfer> xfers_;
+    bool xferHazard_ = false;
+    uint64_t flushes_ = 0;  // command buffers this context has submitted
+    // What the open command buffer has been told by the draws recorded in it (new with every command buffer): the next draw sends
+    // only what differs. VPVulkan keeps the bound pipeline, vertex buffers, descriptor sets and dynamic state of a command buffer
+    // until it ends (across its passes), and the pipelines of this layer make all of this dynamic state dynamic, so a new
+    // command buffer is the only thing that makes what was sent unknown.
+    struct Told {
+        VkPipeline pipeline = VK_NULL_HANDLE;
+        std::vector<VkBuffer> vbufs;
+        std::vector<VkDeviceSize> voffs;
+        bool viewport = false, scissor = false, stencil = false, blend = false, bias = false;
+        VkViewport vp{};
+        VkRect2D sc{};
+        uint32_t ref[2] = {}, compareMask[2] = {}, writeMask[2] = {};
+        float blendColor[4] = {};
+        float depthBias[2] = {};  // constant, slope
+        struct Bind {             // per bind point (graphics, compute)
+            VkPipelineLayout layout = VK_NULL_HANDLE;
+            VkDescriptorSet set = VK_NULL_HANDLE;
+            uint32_t dynamicOffset = 0;
+            std::vector<uint64_t> signature;  // what the descriptors of `set` are
+            VkBuffer ubBuffer = VK_NULL_HANDLE;  // the stream copy of the default block the dynamic offset points at
+            VkDeviceSize ubOffset = 0;
+            std::vector<uint8_t> block;
+        } bind[2];
+    } told_;
+    void imageUsed(const Image& img);  // a command of the open pass reads / writes it: see xfers_
     // Attachments of the open pass invalidated since it began (bit per slot: colour attachment i, kMaxDrawBuffers =
     // depth, +1 = stencil). glInvalidateFramebuffer comes after the pass began, so VPVulkan is told (vpvk_cmd_pass_drop)
     // to store them DONT_CARE; a later write takes the bit back.
@@ -793,13 +874,14 @@ private:
         VkDeviceSize used = 0;
     };
     std::vector<Chunk> chunks_;
-    std::vector<StorageP> spareChunks_;
     std::vector<std::pair<SamplerParams, VkSampler>> samplerCache_;
     std::vector<bool> samplerCacheMip_;
     std::vector<VkSampler> samplerCacheList_;
 
     bool prepareDraw(GLenum mode, VkPrimitiveTopology& topo, uint32_t vertexCount, uint32_t firstVertex,
                      uint32_t instances, bool indexed, VkBuffer& vbufs0);
+    bool prepareDrawOnce(GLenum mode, VkPrimitiveTopology& topo, uint32_t vertexCount, uint32_t firstVertex,
+                         uint32_t instances, bool indexed, VkBuffer& vbufs0);
     VkPipeline pipelineFor(Program& p, const FbInfo& fb, VkPrimitiveTopology topo, const std::vector<VkVertexInputBindingDescription>& binds,
                            const std::vector<VkVertexInputAttributeDescription>& attrs, bool xfb = false);
     bool bindResources(Program& p, const StorageP& xfbScratch = nullptr);
@@ -832,6 +914,7 @@ private:
     void setDynamicState(const FbInfo& fb);
     FbInfo drawFb_;
     uint32_t indexMax_ = 0;
+    bool vertexRowsUnknown_ = false;  // set by the draws whose vertex rows are not told to prepareDraw (indirect, indices not scanned)
     bool provokeOk_ = false;  // set by drawArrays/drawElements, the draws that can run as a rotated list; read once by prepareDraw
     bool provoke_ = false;  // this draw runs as an index list with each primitive's last vertex first (flat varyings, see prepareDraw)
     std::unique_ptr<Texture> black_;

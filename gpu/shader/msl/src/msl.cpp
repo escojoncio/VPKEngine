@@ -120,6 +120,7 @@ const char* builtinAttr(Builtin b) {
         case Builtin::ViewportIndex: return "viewport_array_index";
         case Builtin::AmplificationId: return "amplification_id";
         case Builtin::DepthBias: return "";  // vp_dbias (kDepthBiasDecl), not an attribute
+        case Builtin::PointCoord: return "point_coord";
         case Builtin::None: break;
     }
     return "";
@@ -209,9 +210,10 @@ public:
 
 private:
     // ---- output helpers ----
+    static constexpr unsigned kMaxIndent = 32;
     template <typename... T>
     void line(const T&... parts) {
-        out_.append(depth_ * 4, ' ');
+        out_.append(std::min(depth_, kMaxIndent) * 4, ' ');  // (indentation grows with the square of the nesting: 1000 levels = 28 MB)
         ((out_ += parts), ...);
         out_ += '\n';
     }
@@ -579,6 +581,7 @@ private:
     // (directly or nested in a later node); no other function touches the slot. Constant stores make re-running B
     // (a loop) harmless, and no read can see the array before its fill. The table holds what the array holds at
     // the first read (zero where nothing was stored; later stores win).
+    static constexpr uint32_t kMaxConstTableBytes = 64 * 1024;
     void planConstTables(const Function& f) {
         constTables_.clear();
         if (!useConstTables_) return;
@@ -610,6 +613,7 @@ private:
             if (slotCells_.count(i)) continue;  // scalarized into registers already
             const uint32_t target = kTargetPrivateSlot0 + i;
             if (m_.privateSlots[i] == 0 || m_.privateSlots[i] % 16) continue;
+            if (m_.privateSlots[i] > kMaxConstTableBytes) continue;  // (every word is emitted as text, zeros included)
             bool elsewhere = false;
             for (const Function& g : m_.functions) {
                 if (&g == &f) continue;

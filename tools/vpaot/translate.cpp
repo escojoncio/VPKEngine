@@ -685,19 +685,21 @@ struct Emitter {
     }
     std::string xmm_dst() { return reg_rd(ops[0].reg.value, 128); }
 
+    // The helper of runtime/vp_cpu.h (x86 NaN rules) for a C operator.
+    static const char* fop(const char* cop) { return *cop == '+' ? "add" : *cop == '-' ? "sub" : *cop == '*' ? "mul" : "div"; }
     void sse_scalar(const char* cop, bool dbl) {
         if (ops[0].type != ZYDIS_OPERAND_TYPE_REGISTER) { unsupported("sse-dst"); return; }
         const std::string src = dbl ? f64_rd(ops[1]) : f32_rd(ops[1]);
         const char* fld = dbl ? "f64[0]" : "f32[0]";
-        line(fmt("%s.%s = %s.%s %s %s;", xmm_dst().c_str(), fld, xmm_dst().c_str(), fld, cop, src.c_str()));
+        line(fmt("%s.%s = vp_f%s%d(%s.%s, %s);", xmm_dst().c_str(), fld, fop(cop), dbl ? 64 : 32, xmm_dst().c_str(), fld, src.c_str()));
     }
     void sse_packed(const char* cop, bool dbl) {
         if (ops[0].type != ZYDIS_OPERAND_TYPE_REGISTER) { unsupported("sse-dst"); return; }
         line("const VpXmm s = " + xmm_rd(ops[1]) + ";");
         const int n = dbl ? 2 : 4;
         for (int i = 0; i < n; ++i) {
-            line(fmt("%s.%s[%d] = %s.%s[%d] %s s.%s[%d];", xmm_dst().c_str(), dbl ? "f64" : "f32", i,
-                     xmm_dst().c_str(), dbl ? "f64" : "f32", i, cop, dbl ? "f64" : "f32", i));
+            line(fmt("%s.%s[%d] = vp_f%s%d(%s.%s[%d], s.%s[%d]);", xmm_dst().c_str(), dbl ? "f64" : "f32", i,
+                     fop(cop), dbl ? 64 : 32, xmm_dst().c_str(), dbl ? "f64" : "f32", i, dbl ? "f64" : "f32", i));
         }
     }
     void sse_bitwise(const char* cop, bool invert_first) {
@@ -1306,7 +1308,8 @@ struct Emitter {
             return true;
         case ZYDIS_MNEMONIC_FBLD: line("vp_x87_fbld(cpu, " + ea(ops[0]) + ");"); return true;
         case ZYDIS_MNEMONIC_FBSTP: line("vp_x87_fbstp(cpu, " + ea(ops[0]) + ");"); return true;
-        case ZYDIS_MNEMONIC_FST: case ZYDIS_MNEMONIC_FSTP: case ZYDIS_MNEMONIC_FSTPNCE:
+        case ZYDIS_MNEMONIC_FSTPNCE: line(fmt("vp_x87_fstpnce(cpu, %d);", st(0))); return true;
+        case ZYDIS_MNEMONIC_FST: case ZYDIS_MNEMONIC_FSTP:
             pop = m != ZYDIS_MNEMONIC_FST;
             if (mem) line(fmt("vp_x87_fst_mem(cpu, %s, %d, %d, 0);", ea(ops[0]).c_str(), fkind(ops[0], false), pop));
             else line(fmt("vp_x87_fst_reg(cpu, %d, %d);", st(0), pop));
@@ -1380,10 +1383,10 @@ struct Emitter {
             return true;
         case ZYDIS_MNEMONIC_FNSTCW: line("vp_st16(" + ea(ops[0]) + ", vp_x87_fnstcw(cpu));"); return true;
         case ZYDIS_MNEMONIC_FLDCW: line("vp_x87_fldcw(cpu, vp_ld16(" + ea(ops[0]) + "));"); return true;
-        case ZYDIS_MNEMONIC_FNSTENV: line("vp_x87_fnstenv(cpu, " + ea(ops[0]) + ");"); return true;
-        case ZYDIS_MNEMONIC_FLDENV: line("vp_x87_fldenv(cpu, " + ea(ops[0]) + ");"); return true;
-        case ZYDIS_MNEMONIC_FNSAVE: line("vp_x87_fnsave(cpu, " + ea(ops[0]) + ");"); return true;
-        case ZYDIS_MNEMONIC_FRSTOR: line("vp_x87_frstor(cpu, " + ea(ops[0]) + ");"); return true;
+        case ZYDIS_MNEMONIC_FNSTENV: line(std::string("vp_x87_fnstenv") + (insn->operand_width == 16 ? "_16" : "") + "(cpu, " + ea(ops[0]) + ");"); return true;
+        case ZYDIS_MNEMONIC_FLDENV: line(std::string("vp_x87_fldenv") + (insn->operand_width == 16 ? "_16" : "") + "(cpu, " + ea(ops[0]) + ");"); return true;
+        case ZYDIS_MNEMONIC_FNSAVE: line(std::string("vp_x87_fnsave") + (insn->operand_width == 16 ? "_16" : "") + "(cpu, " + ea(ops[0]) + ");"); return true;
+        case ZYDIS_MNEMONIC_FRSTOR: line(std::string("vp_x87_frstor") + (insn->operand_width == 16 ? "_16" : "") + "(cpu, " + ea(ops[0]) + ");"); return true;
         case ZYDIS_MNEMONIC_FXSAVE: case ZYDIS_MNEMONIC_FXSAVE64: line("vp_x87_fxsave(cpu, " + ea(ops[0]) + ");"); return true;
         case ZYDIS_MNEMONIC_FXRSTOR: case ZYDIS_MNEMONIC_FXRSTOR64: line("vp_x87_fxrstor(cpu, " + ea(ops[0]) + ");"); return true;
         default: return false;
@@ -1857,9 +1860,9 @@ struct Emitter {
         case ZYDIS_MNEMONIC_MAXSS: sse_minmax(true, false); return true;
         case ZYDIS_MNEMONIC_MINSD: sse_minmax(false, true); return true;
         case ZYDIS_MNEMONIC_MAXSD: sse_minmax(true, true); return true;
-        case ZYDIS_MNEMONIC_SQRTSS: line(fmt("%s.f32[0] = sqrtf(%s);", xmm_dst().c_str(), f32_rd(ops[1]).c_str())); return true;
-        case ZYDIS_MNEMONIC_SQRTSD: line(fmt("%s.f64[0] = sqrt(%s);", xmm_dst().c_str(), f64_rd(ops[1]).c_str())); return true;
-        case ZYDIS_MNEMONIC_SQRTPS: line("const VpXmm s = " + xmm_rd(ops[1]) + "; for (int i = 0; i < 4; ++i) " + xmm_dst() + ".f32[i] = sqrtf(s.f32[i]);"); return true;
+        case ZYDIS_MNEMONIC_SQRTSS: line(fmt("%s.f32[0] = vp_fsqrt32(%s);", xmm_dst().c_str(), f32_rd(ops[1]).c_str())); return true;
+        case ZYDIS_MNEMONIC_SQRTSD: line(fmt("%s.f64[0] = vp_fsqrt64(%s);", xmm_dst().c_str(), f64_rd(ops[1]).c_str())); return true;
+        case ZYDIS_MNEMONIC_SQRTPS: line("const VpXmm s = " + xmm_rd(ops[1]) + "; for (int i = 0; i < 4; ++i) " + xmm_dst() + ".f32[i] = vp_fsqrt32(s.f32[i]);"); return true;
         case ZYDIS_MNEMONIC_XORPS: case ZYDIS_MNEMONIC_XORPD: case ZYDIS_MNEMONIC_PXOR: sse_bitwise("^", false); return true;
         case ZYDIS_MNEMONIC_ANDPS: case ZYDIS_MNEMONIC_ANDPD: case ZYDIS_MNEMONIC_PAND: sse_bitwise("&", false); return true;
         case ZYDIS_MNEMONIC_ORPS: case ZYDIS_MNEMONIC_ORPD: case ZYDIS_MNEMONIC_POR: sse_bitwise("|", false); return true;
@@ -1971,18 +1974,18 @@ struct Emitter {
             return true;
         case ZYDIS_MNEMONIC_PMULLD: line("const VpXmm s = " + xmm_rd(ops[1]) + "; for (int i = 0; i < 4; ++i) " + xmm_dst() + ".u32[i] *= s.u32[i];"); return true;
         case ZYDIS_MNEMONIC_PMULUDQ: line("const VpXmm s = " + xmm_rd(ops[1]) + "; for (int i = 0; i < 2; ++i) " + xmm_dst() + ".u64[i] = (uint64_t)" + xmm_dst() + ".u32[2 * i] * s.u32[2 * i];"); return true;
-        case ZYDIS_MNEMONIC_PMULLW: line("const VpXmm s = " + xmm_rd(ops[1]) + "; for (int i = 0; i < 8; ++i) " + xmm_dst() + ".u16[i] = (uint16_t)(" + xmm_dst() + ".u16[i] * s.u16[i]);"); return true;
+        case ZYDIS_MNEMONIC_PMULLW: line("const VpXmm s = " + xmm_rd(ops[1]) + "; for (int i = 0; i < 8; ++i) " + xmm_dst() + ".u16[i] = (uint16_t)((uint32_t)" + xmm_dst() + ".u16[i] * s.u16[i]);"); return true;
         case ZYDIS_MNEMONIC_PMULHW: line("const VpXmm s = " + xmm_rd(ops[1]) + "; for (int i = 0; i < 8; ++i) " + xmm_dst() + ".u16[i] = (uint16_t)(((int32_t)(int16_t)" + xmm_dst() + ".u16[i] * (int16_t)s.u16[i]) >> 16);"); return true;
         case ZYDIS_MNEMONIC_PMULHUW: line("const VpXmm s = " + xmm_rd(ops[1]) + "; for (int i = 0; i < 8; ++i) " + xmm_dst() + ".u16[i] = (uint16_t)(((uint32_t)" + xmm_dst() + ".u16[i] * s.u16[i]) >> 16);"); return true;
-        case ZYDIS_MNEMONIC_PMADDWD: line("const VpXmm a = " + xmm_dst() + ", s = " + xmm_rd(ops[1]) + "; for (int i = 0; i < 4; ++i) " + xmm_dst() + ".i32[i] = (int32_t)(int16_t)a.u16[2*i] * (int16_t)s.u16[2*i] + (int32_t)(int16_t)a.u16[2*i+1] * (int16_t)s.u16[2*i+1];"); return true;
+        case ZYDIS_MNEMONIC_PMADDWD: line("const VpXmm a = " + xmm_dst() + ", s = " + xmm_rd(ops[1]) + "; for (int i = 0; i < 4; ++i) " + xmm_dst() + ".u32[i] = (uint32_t)((int32_t)(int16_t)a.u16[2*i] * (int16_t)s.u16[2*i]) + (uint32_t)((int32_t)(int16_t)a.u16[2*i+1] * (int16_t)s.u16[2*i+1]);"); return true;
         case ZYDIS_MNEMONIC_ROUNDSS: case ZYDIS_MNEMONIC_ROUNDSD: case ZYDIS_MNEMONIC_ROUNDPS: case ZYDIS_MNEMONIC_ROUNDPD: {
             const unsigned imm = (unsigned)ops[2].imm.value.u;
             // imm bit 2: MXCSR's mode (the host's, set by vp_apply_mxcsr); else the mode in bits 0-1.
             const char* fn = (imm & 4) ? "nearbyint" : (imm & 3) == 0 ? "__builtin_roundeven" : (imm & 3) == 1 ? "floor" : (imm & 3) == 2 ? "ceil" : "trunc";
-            if (m == ZYDIS_MNEMONIC_ROUNDSS) line(fmt("%s.f32[0] = (float)%s(%s);", xmm_dst().c_str(), fn, f32_rd(ops[1]).c_str()));
-            else if (m == ZYDIS_MNEMONIC_ROUNDSD) line(fmt("%s.f64[0] = %s(%s);", xmm_dst().c_str(), fn, f64_rd(ops[1]).c_str()));
-            else if (m == ZYDIS_MNEMONIC_ROUNDPD) line(fmt("const VpXmm s = %s; for (int i = 0; i < 2; ++i) %s.f64[i] = %s(s.f64[i]);", xmm_rd(ops[1]).c_str(), xmm_dst().c_str(), fn));
-            else line(fmt("const VpXmm s = %s; for (int i = 0; i < 4; ++i) %s.f32[i] = (float)%s(s.f32[i]);", xmm_rd(ops[1]).c_str(), xmm_dst().c_str(), fn));
+            if (m == ZYDIS_MNEMONIC_ROUNDSS) line(fmt("%s.f32[0] = vp_fquiet32((float)%s(%s));", xmm_dst().c_str(), fn, f32_rd(ops[1]).c_str()));
+            else if (m == ZYDIS_MNEMONIC_ROUNDSD) line(fmt("%s.f64[0] = vp_fquiet64(%s(%s));", xmm_dst().c_str(), fn, f64_rd(ops[1]).c_str()));
+            else if (m == ZYDIS_MNEMONIC_ROUNDPD) line(fmt("const VpXmm s = %s; for (int i = 0; i < 2; ++i) %s.f64[i] = vp_fquiet64(%s(s.f64[i]));", xmm_rd(ops[1]).c_str(), xmm_dst().c_str(), fn));
+            else line(fmt("const VpXmm s = %s; for (int i = 0; i < 4; ++i) %s.f32[i] = vp_fquiet32((float)%s(s.f32[i]));", xmm_rd(ops[1]).c_str(), xmm_dst().c_str(), fn));
             return true;
         }
 #define VP_LANEOP(MN, LANES, T, EXPR) \
@@ -2010,13 +2013,13 @@ struct Emitter {
         VP_LANEOP(MAXPS, 4, "f32", "vp_maxss(a.f32[i], s.f32[i])")
         VP_LANEOP(MINPD, 2, "f64", "vp_minsd(a.f64[i], s.f64[i])")
         VP_LANEOP(MAXPD, 2, "f64", "vp_maxsd(a.f64[i], s.f64[i])")
-        VP_LANEOP(SQRTPD, 2, "f64", "sqrt(s.f64[i])")
-        VP_LANEOP(RCPPS, 4, "f32", "1.0f / s.f32[i]")
-        VP_LANEOP(RSQRTPS, 4, "f32", "1.0f / sqrtf(s.f32[i])")
+        VP_LANEOP(SQRTPD, 2, "f64", "vp_fsqrt64(s.f64[i])")
+        VP_LANEOP(RCPPS, 4, "f32", "vp_rcp_f32(s.f32[i])")
+        VP_LANEOP(RSQRTPS, 4, "f32", "vp_rsqrt_f32(s.f32[i])")
         VP_LANEOP(PABSD, 4, "u32", "(uint32_t)(s.i32[i] < 0 ? -(uint32_t)s.i32[i] : (uint32_t)s.i32[i])")
         VP_LANEOP(PABSW, 8, "u16", "(uint16_t)((int16_t)s.u16[i] < 0 ? -(uint16_t)s.u16[i] : s.u16[i])")
         VP_LANEOP(PABSB, 16, "u8", "(uint8_t)((int8_t)s.u8[i] < 0 ? -(uint8_t)s.u8[i] : s.u8[i])")
-        VP_LANEOP(PSIGND, 4, "i32", "s.i32[i] < 0 ? -a.i32[i] : s.i32[i] == 0 ? 0 : a.i32[i]")
+        VP_LANEOP(PSIGND, 4, "u32", "s.i32[i] < 0 ? -a.u32[i] : s.i32[i] == 0 ? 0 : a.u32[i]")
         VP_LANEOP(CVTPS2DQ, 4, "i32", "vp_cvt_f32_i32(s.f32[i])")
         VP_LANEOP(PUNPCKLBW, 16, "u8", "(i & 1) ? s.u8[i / 2] : a.u8[i / 2]")
         VP_LANEOP(PUNPCKHBW, 16, "u8", "(i & 1) ? s.u8[8 + i / 2] : a.u8[8 + i / 2]")
@@ -2042,13 +2045,13 @@ struct Emitter {
         VP_LANEOP(PMAXSB, 16, "u8", "(int8_t)a.u8[i] > (int8_t)s.u8[i] ? a.u8[i] : s.u8[i]")
         VP_LANEOP(PMINUW, 8, "u16", "a.u16[i] < s.u16[i] ? a.u16[i] : s.u16[i]")
         VP_LANEOP(PMAXUW, 8, "u16", "a.u16[i] > s.u16[i] ? a.u16[i] : s.u16[i]")
-        VP_LANEOP(HADDPD, 2, "f64", "i == 0 ? a.f64[0] + a.f64[1] : s.f64[0] + s.f64[1]")
-        VP_LANEOP(HSUBPS, 4, "f32", "i < 2 ? a.f32[2*i] - a.f32[2*i+1] : s.f32[2*(i-2)] - s.f32[2*(i-2)+1]")
-        VP_LANEOP(HSUBPD, 2, "f64", "i == 0 ? a.f64[0] - a.f64[1] : s.f64[0] - s.f64[1]")
-        VP_LANEOP(ADDSUBPS, 4, "f32", "(i & 1) ? a.f32[i] + s.f32[i] : a.f32[i] - s.f32[i]")
-        VP_LANEOP(ADDSUBPD, 2, "f64", "(i & 1) ? a.f64[i] + s.f64[i] : a.f64[i] - s.f64[i]")
-        VP_LANEOP(HADDPS, 4, "f32", "i < 2 ? a.f32[2*i] + a.f32[2*i+1] : s.f32[2*(i-2)] + s.f32[2*(i-2)+1]")
-        VP_LANEOP(PHADDD, 4, "i32", "i < 2 ? a.i32[2*i] + a.i32[2*i+1] : s.i32[2*(i-2)] + s.i32[2*(i-2)+1]")
+        VP_LANEOP(HADDPD, 2, "f64", "i == 0 ? vp_fadd64(a.f64[0], a.f64[1]) : vp_fadd64(s.f64[0], s.f64[1])")
+        VP_LANEOP(HSUBPS, 4, "f32", "i < 2 ? vp_fsub32(a.f32[2*i], a.f32[2*i+1]) : vp_fsub32(s.f32[2*(i-2)], s.f32[2*(i-2)+1])")
+        VP_LANEOP(HSUBPD, 2, "f64", "i == 0 ? vp_fsub64(a.f64[0], a.f64[1]) : vp_fsub64(s.f64[0], s.f64[1])")
+        VP_LANEOP(ADDSUBPS, 4, "f32", "(i & 1) ? vp_fadd32(a.f32[i], s.f32[i]) : vp_fsub32(a.f32[i], s.f32[i])")
+        VP_LANEOP(ADDSUBPD, 2, "f64", "(i & 1) ? vp_fadd64(a.f64[i], s.f64[i]) : vp_fsub64(a.f64[i], s.f64[i])")
+        VP_LANEOP(HADDPS, 4, "f32", "i < 2 ? vp_fadd32(a.f32[2*i], a.f32[2*i+1]) : vp_fadd32(s.f32[2*(i-2)], s.f32[2*(i-2)+1])")
+        VP_LANEOP(PHADDD, 4, "u32", "i < 2 ? a.u32[2*i] + a.u32[2*i+1] : s.u32[2*(i-2)] + s.u32[2*(i-2)+1]")
         VP_LANEOP(CVTDQ2PD, 2, "f64", "(double)s.i32[i]")
         VP_LANEOP(CVTPS2PD, 2, "f64", "(double)s.f32[i]")
         VP_LANEOP(CVTTPD2DQ, 4, "i32", "i < 2 ? vp_cvtt_f64_i32(s.f64[i]) : 0")
@@ -2079,8 +2082,8 @@ struct Emitter {
         VP_LANEOP(PSUBUSW, 8, "u16", "(uint16_t)(a.u16[i] > s.u16[i] ? a.u16[i] - s.u16[i] : 0)")
         VP_LANEOP(CVTPD2DQ, 4, "i32", "i < 2 ? vp_cvt_f64_i32(s.f64[i]) : 0")
 #undef VP_LANEOP
-        case ZYDIS_MNEMONIC_RSQRTSS: line(fmt("%s.f32[0] = 1.0f / sqrtf(%s);", xmm_dst().c_str(), f32_rd(ops[1]).c_str())); return true;
-        case ZYDIS_MNEMONIC_RCPSS: line(fmt("%s.f32[0] = 1.0f / %s;", xmm_dst().c_str(), f32_rd(ops[1]).c_str())); return true;
+        case ZYDIS_MNEMONIC_RSQRTSS: line(fmt("%s.f32[0] = vp_rsqrt_f32(%s);", xmm_dst().c_str(), f32_rd(ops[1]).c_str())); return true;
+        case ZYDIS_MNEMONIC_RCPSS: line(fmt("%s.f32[0] = vp_rcp_f32(%s);", xmm_dst().c_str(), f32_rd(ops[1]).c_str())); return true;
         case ZYDIS_MNEMONIC_PSLLD: case ZYDIS_MNEMONIC_PSRLD: case ZYDIS_MNEMONIC_PSRAD: case ZYDIS_MNEMONIC_PSLLQ: case ZYDIS_MNEMONIC_PSRLQ:
         case ZYDIS_MNEMONIC_PSLLW: case ZYDIS_MNEMONIC_PSRLW: case ZYDIS_MNEMONIC_PSRAW: {
             const int w = (m == ZYDIS_MNEMONIC_PSLLQ || m == ZYDIS_MNEMONIC_PSRLQ) ? 64 : (m == ZYDIS_MNEMONIC_PSLLW || m == ZYDIS_MNEMONIC_PSRLW || m == ZYDIS_MNEMONIC_PSRAW) ? 16 : 32;
@@ -2134,16 +2137,16 @@ struct Emitter {
             const unsigned imm = (unsigned)ops[2].imm.value.u;
             // As the hardware adds: the masked products (others +0), then (p0 + p1) + (p2 + p3).
             line("const VpXmm a = " + xmm_dst() + ", s = " + xmm_rd(ops[1]) + "; float p[4];");
-            for (int i = 0; i < 4; ++i) line(((imm >> (4 + i)) & 1) ? fmt("p[%d] = a.f32[%d] * s.f32[%d];", i, i, i) : fmt("p[%d] = 0.0f;", i));
-            line("const float d = (p[0] + p[1]) + (p[2] + p[3]);");
+            for (int i = 0; i < 4; ++i) line(((imm >> (4 + i)) & 1) ? fmt("p[%d] = vp_fmul32(a.f32[%d], s.f32[%d]);", i, i, i) : fmt("p[%d] = 0.0f;", i));
+            line("const float d = vp_fadd32(vp_fadd32(p[0], p[1]), vp_fadd32(p[2], p[3]));");
             for (int i = 0; i < 4; ++i) line(fmt("%s.f32[%d] = %s;", xmm_dst().c_str(), i, ((imm >> i) & 1) ? "d" : "0.0f"));
             return true;
         }
         case ZYDIS_MNEMONIC_DPPD: {
             const unsigned imm = (unsigned)ops[2].imm.value.u;
             line("const VpXmm a = " + xmm_dst() + ", s = " + xmm_rd(ops[1]) + "; double p[2];");
-            for (int i = 0; i < 2; ++i) line(((imm >> (4 + i)) & 1) ? fmt("p[%d] = a.f64[%d] * s.f64[%d];", i, i, i) : fmt("p[%d] = 0.0;", i));
-            line("const double d = p[0] + p[1];");
+            for (int i = 0; i < 2; ++i) line(((imm >> (4 + i)) & 1) ? fmt("p[%d] = vp_fmul64(a.f64[%d], s.f64[%d]);", i, i, i) : fmt("p[%d] = 0.0;", i));
+            line("const double d = vp_fadd64(p[0], p[1]);");
             for (int i = 0; i < 2; ++i) line(fmt("%s.f64[%d] = %s;", xmm_dst().c_str(), i, ((imm >> i) & 1) ? "d" : "0.0"));
             return true;
         }
@@ -2398,9 +2401,12 @@ struct Emitter {
             line(fmt("const uint64_t x = %s & VP_MASK(%d), y = %s & VP_MASK(%d);", rd(ops[0], bits, a).c_str(), bits, rd(ops[1], bits).c_str(), bits));
             line(fmt("const unsigned n = (unsigned)(%s) & %u;", rd(ops[2], 8).c_str(), bits == 64 ? 63u : 31u));
             line("if (n) {");
-            if (left) line(fmt("    const uint64_t r = ((x << n) | (y >> (%d - n))) & VP_MASK(%d);", bits, bits));
-            else line(fmt("    const uint64_t r = ((x >> n) | (y << (%d - n))) & VP_MASK(%d);", bits, bits));
-            line(fmt("    vp_flags_%s(VP_FC, %d, x, n, r);", left ? "shl" : "shr", bits));
+            // A 16-bit count above 16 is undefined in the ISA; the count is masked to 5 bits, so (16 - n) can go negative.
+            const char* in = bits == 16 ? "n <= 16 ? " : "";
+            const char* out = bits == 16 ? " : 0" : "";
+            if (left) line(fmt("    const uint64_t r = ((x << n) | (%sy >> (%d - n)%s)) & VP_MASK(%d);", in, bits, out, bits));
+            else line(fmt("    const uint64_t r = ((x >> n) | (%sy << (%d - n)%s)) & VP_MASK(%d);", in, bits, out, bits));
+            line(fmt("    vp_flags_%s(VP_FC, %d, x, n, r);", left ? "shl" : "shrd", bits));
             line("    " + wr(ops[0], bits, "r", a));
             line("}");
             if (bits == 32) line("else { " + wr(ops[0], 32, "x", a) + " }");

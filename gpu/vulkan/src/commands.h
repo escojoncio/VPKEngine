@@ -151,6 +151,10 @@ static_assert(sizeof kSkipReasonNames / sizeof *kSkipReasonNames == size_t(SkipR
 static_assert(size_t(SkipReason::Count) <= kSkipSlots);
 struct OpDraw {
   vpgpu::Draw draw;
+  // The class (taa::DrawClass) the translator gave this draw in the eye pass it is replaying: valid while classEpoch is that pass's
+  // epoch (Translator::classEpoch). Written under submitMutex while the ops are read-only otherwise.
+  mutable uint64_t classEpoch = 0;
+  mutable uint8_t drawClass = 0;
   // Indirect draws: arguments read from the buffer at submit (unified memory) — or, with gpuIndirect,
   // by the GPU when it gets to the draw (arguments written by compute in the same submission):
   // indirectCount draws from gpuBuffer at gpuOffset + i * indirectStride (the app's buffer, or the
@@ -241,6 +245,7 @@ struct UploadArena {
     current = 0;
   }
   void release(Device* d);
+  void trim(Device* d);  // after reset(): keeps the first chunk, gives the others back
 };
 
 // Draw state at the time of a vkCmd*.
@@ -313,8 +318,10 @@ struct PassSamples {
 // Effective sample count of subpass `sub` (0 = no attachments); `observe` feeds the detection.
 uint8_t subpassSamples(const RenderPassObj&, const Framebuffer&, uint32_t sub, bool observe = true, uint64_t markedEye = 0);
 // Pipeline key for a draw into a pass of `passSamples` (variant with that count if it differs).
+// `fresh` (synchronous pipelines, a submission being translated): the variant this call requested is appended to it instead of
+// being waited for here, so the caller waits for all of them at once (awaitFreshVariants).
 vpgpu::PipelineKey pipelineFor(Device*, const PipelineObj&, uint8_t passSamples, PipelineObj::TexelVariant* tv = nullptr,
-                               const BoundState::Eds* eds = nullptr);
+                               const BoundState::Eds* eds = nullptr, std::vector<vpgpu::PipelineKey>* fresh = nullptr);
 
 // Asynchronous pipeline creation (pipelines.cpp "compile policy"). resolvePipeline waits (boosted) for the pipeline's
 // translation: true when ok / key / bindings are valid. gateFramePipelines runs at vkQueueSubmit on the finished
@@ -444,6 +451,16 @@ struct Recorder {
     hasLocalRead = false;
     bound = BoundState{};
     arena.reset();
+  }
+  // Right after reset(): vkResetCommandBuffer / vkResetCommandPool with RELEASE_RESOURCES_BIT give the memory back (the arena's
+  // chunks, the capacity of `ops`); vkTrimCommandPool keeps one arena chunk.
+  void releaseResources() {
+    arena.release(device);
+    std::vector<Op>().swap(ops);
+  }
+  void trim() {
+    arena.trim(device);
+    if (ops.empty()) std::vector<Op>().swap(ops);
   }
   ~Recorder();
 };

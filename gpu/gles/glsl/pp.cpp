@@ -355,12 +355,20 @@ private:
         return false;
     }
 
+    size_t expandSteps_ = 0;  // tokens walked by the expansion in progress (a macro that doubles at each level would never end)
+    static constexpr size_t kMaxExpandSteps = 1'000'000;
+
     void expand(const std::vector<Token>& in, std::vector<Token>& out, std::set<std::string>& hide, int depth = 0) {
         if (depth > 64) {
             error(in.empty() ? 0 : in[0].line, "macro expansion too deep");
             return;
         }
+        if (depth == 0) expandSteps_ = 0;
         for (size_t i = 0; i < in.size();) {
+            if (++expandSteps_ > kMaxExpandSteps) {
+                if (expandSteps_ == kMaxExpandSteps + 1) error(in[i].line, "macro expansion too large");  // once; the callers unwind
+                return;
+            }
             const Token& t = in[i];
             if (t.kind != Tok::Ident || hide.count(t.text)) {
                 out.push_back(t), ++i;
@@ -389,8 +397,21 @@ private:
                 for (Token& b : body) b.line = t.line;
                 body = paste(body);
                 hide.insert(t.text);
+                const size_t before = out.size();
                 expand(body, out, hide, depth + 1);
                 hide.erase(t.text);
+                // A body that ends with the name of a function-like macro takes the "(" after the macro in the input as its call.
+                if (out.size() > before && out.back().kind == Tok::Ident && i + 1 < in.size() && in[i + 1].kind == Tok::Punct &&
+                    in[i + 1].text == "(" && !hide.count(out.back().text)) {
+                    auto fm = defines_.find(out.back().text);
+                    if (fm != defines_.end() && fm->second.function) {
+                        std::vector<Token> rest(1, out.back());
+                        out.pop_back();
+                        rest.insert(rest.end(), in.begin() + long(i) + 1, in.end());
+                        expand(rest, out, hide, depth ? depth : 1);
+                        return;
+                    }
+                }
                 ++i;
                 continue;
             }
@@ -472,7 +493,15 @@ private:
         const Token* undef = nullptr;    // first undefined identifier that was evaluated
         const Token* peek() { return i < t.size() ? &t[i] : nullptr; }
         bool is(const char* p) { return peek() && peek()->kind == Tok::Punct && peek()->text == p; }
+        int nest = 0;  // depth of primary(): "(((...", "!!!..." in a #if cannot overflow the stack
+        struct Nest {
+            int& n;
+            explicit Nest(int& v) : n(v) { ++n; }
+            ~Nest() { --n; }
+        };
         int64_t primary() {
+            Nest guard(nest);
+            if (nest > 256) return bad = true, 0;
             const Token* k = peek();
             if (!k) return bad = true, 0;
             if (is("(")) {
@@ -483,7 +512,7 @@ private:
                 return v;
             }
             if (is("!")) return ++i, !primary();
-            if (is("-")) return ++i, -primary();
+            if (is("-")) return ++i, int64_t(0 - uint64_t(primary()));
             if (is("+")) return ++i, primary();
             if (is("~")) return ++i, ~primary();
             if (k->kind == Tok::IntLit || k->kind == Tok::UintLit || k->kind == Tok::BoolLit) return ++i, int64_t(k->ival);
@@ -528,13 +557,14 @@ private:
                 else if (op == ">") l = l > r;
                 else if (op == "<=") l = l <= r;
                 else if (op == ">=") l = l >= r;
-                else if (op == "<<") l = r >= 0 && r < 64 ? l << r : 0;
+                // Wrapping arithmetic: signed overflow is undefined in C++ (and INT64_MIN / -1 traps).
+                else if (op == "<<") l = r >= 0 && r < 64 ? int64_t(uint64_t(l) << r) : 0;
                 else if (op == ">>") l = r >= 0 && r < 64 ? l >> r : 0;
-                else if (op == "+") l += r;
-                else if (op == "-") l -= r;
-                else if (op == "*") l *= r;
-                else if (op == "/") l = r ? l / r : (skip ? 0 : (bad = true, 0));
-                else if (op == "%") l = r ? l % r : (skip ? 0 : (bad = true, 0));
+                else if (op == "+") l = int64_t(uint64_t(l) + uint64_t(r));
+                else if (op == "-") l = int64_t(uint64_t(l) - uint64_t(r));
+                else if (op == "*") l = int64_t(uint64_t(l) * uint64_t(r));
+                else if (op == "/") l = r == -1 ? int64_t(0 - uint64_t(l)) : r ? l / r : (skip ? 0 : (bad = true, 0));
+                else if (op == "%") l = r == -1 ? 0 : r ? l % r : (skip ? 0 : (bad = true, 0));
             }
             return l;
         }

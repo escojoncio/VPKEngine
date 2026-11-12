@@ -29,7 +29,7 @@ void assembleSequence(uint32_t mode, const uint32_t* s, size_t m, std::vector<ui
                 else out.insert(out.end(), {s[i], s[i + 1], s[i + 2]});
             break;
         case kTriangleFan:
-            for (size_t i = 1; i + 1 < m; ++i) out.insert(out.end(), {s[0], s[i], s[i + 1]});
+            for (size_t i = 1; i + 1 < m; ++i) out.insert(out.end(), {s[i], s[i + 1], s[0]});  // triangle i-1: (v_i, v_i+1, v_0), as Vulkan and GL define the fan
             break;
         default: break;
     }
@@ -47,6 +47,7 @@ void xfbAssemble(uint32_t drawMode, const uint32_t* v, size_t n, bool restart, u
 
 uint64_t xfbWrite(const std::vector<uint32_t>& order, uint32_t perPrim, const uint32_t* records, uint32_t W, std::vector<XfbOut>& outs) {
     uint64_t written = 0;
+    if (!perPrim) return 0;  // would never end: every zero-vertex "primitive" fits
     for (size_t p = 0; (p + 1) * perPrim <= order.size(); ++p) {
         for (const XfbOut& o : outs)
             if (o.used + uint64_t(perPrim) * o.stride > o.room) return written;

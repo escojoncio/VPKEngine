@@ -6,6 +6,8 @@
 #include <cstring>
 #include <map>
 #include <set>
+#include <string_view>
+#include <tuple>
 
 #include "context.h"
 #include "egl_internal.h"
@@ -257,6 +259,12 @@ Context::PassKey Context::passKeyFor(const FbInfo& fb) {
 // become its CLEAR load ops (tile GPUs then never load the old contents) and the list is emptied; when the pass goes
 // on, the list is left for the caller to record as vkCmdClearAttachments.
 bool Context::beginPass(const FbInfo& fb, std::vector<VkClearAttachment>* firstClear) {
+    if (!xfers_.empty()) {  // an attachment with an upload waiting: the pass (even one that goes on) ends first, and the upload goes in
+        auto waiting = [](const FbTarget& t) { return (t.image && t.image->xferPending) || (t.seedImage && t.seedImage->xferPending); };
+        bool hit = waiting(fb.depth) || waiting(fb.stencil);
+        for (const FbTarget& t : fb.color) hit = hit || waiting(t);
+        if (hit) endPass();
+    }
     const PassKey key = passKeyFor(fb);
     // Index: colour attachment i, kMaxDrawBuffers = depth, +1 = stencil.
     std::array<VkAttachmentLoadOp, kMaxDrawBuffers + 2> load;
@@ -699,9 +707,37 @@ bool Context::loadProgramBinary(Program& p, GLenum format, const void* data, siz
     return linkShaders(p, slot[0], slot[1], slot[2]);
 }
 
-bool Context::linkProgram(Program& p) { return linkShaders(p, shader(p.vs), shader(p.fs), shader(p.cs)); }
+bool Context::linkProgram(Program& p, const vpglsl::LinkResult* ahead) {
+    return linkShaders(p, shader(p.vs), shader(p.fs), shader(p.cs), ahead);
+}
 
-bool Context::linkShaders(Program& p, Shader* vs, Shader* fs, Shader* cs) {
+// The options and stages linkShaders gives vpglsl::link (the conditions are its own, for the cases it links itself).
+bool Context::linkInputs(const Program& p, LinkInputs& in) {
+    Shader* vs = shader(p.vs);
+    Shader* fs = shader(p.fs);
+    Shader* cs = shader(p.cs);
+    in = LinkInputs{};
+    in.options.attribBindings = p.attribBindings;
+    in.options.xfbVaryings = p.xfbVaryings;
+    in.options.xfbSeparate = p.xfbMode == 0x8C8D;  // GL_SEPARATE_ATTRIBS
+    if (cs) {
+        if (!cs->compiled) return false;
+        in.cs = cs->parsed;
+        return true;
+    }
+    if (p.separable && (vs ? !fs : fs != nullptr)) return false;
+    if (!vs || !fs || !vs->compiled || !fs->compiled) return false;
+    in.options.separable = p.separable;
+    in.options.pipeline = p.pipelineLink;
+    in.vs = vs->parsed, in.fs = fs->parsed;
+    return true;
+}
+
+vpglsl::LinkResult Context::linkAhead(const LinkInputs& in) {
+    return in.cs ? vpglsl::link(in.cs, nullptr, in.options) : vpglsl::link(in.vs, in.fs, in.options);
+}
+
+bool Context::linkShaders(Program& p, Shader* vs, Shader* fs, Shader* cs, const vpglsl::LinkResult* ahead) {
     vpgpu::HitchSpan hitch(vpgpu::hitchPerf().glLinkUs);  // vk.hitch gles_link_ms (glLinkProgram / glProgramBinary)
     static uint64_t serials = 0;
     // Old objects: the pipelines may be referenced by recorded work; finish it first (link is rare).
@@ -738,7 +774,7 @@ bool Context::linkShaders(Program& p, Shader* vs, Shader* fs, Shader* cs) {
             p.log = "ERROR: compute shader not compiled\n";
             return false;
         }
-        lr = vpglsl::link(cs->parsed, nullptr, lo);
+        lr = ahead ? *ahead : vpglsl::link(cs->parsed, nullptr, lo);
     } else {
         // A separable program may hold one graphics stage: linked with a stub of the other, for its reflection.
         p.singleStage = p.separable && (vs ? !fs : fs != nullptr);
@@ -760,7 +796,7 @@ bool Context::linkShaders(Program& p, Shader* vs, Shader* fs, Shader* cs) {
         }
         lo.separable = p.separable;
         lo.pipeline = p.pipelineLink;
-        lr = vpglsl::link(vs->parsed, fs->parsed, lo);
+        lr = ahead ? *ahead : vpglsl::link(vs->parsed, fs->parsed, lo);
     }
     p.log = lr.log;
     p.varyingDiag = lr.varyingDiag;
@@ -838,8 +874,10 @@ bool Context::linkShaders(Program& p, Shader* vs, Shader* fs, Shader* cs) {
         if (p.refl.storageBlocks[i].initialBinding >= 0) p.storageBindings[i] = GLuint(p.refl.storageBlocks[i].initialBinding);
     p.serial = ++serials;
     p.linked = true;
-    p.stageVs = vs && vs != &stub ? vs->parsed : nullptr;
-    p.stageFs = fs && fs != &stub ? fs->parsed : nullptr;
+    // The parsed stages are kept only for program pipelines (pipelineProgram re-links them): a program that is not separable
+    // does not hold the ASTs of its shaders for the rest of its life.
+    p.stageVs = p.separable && vs && vs != &stub ? vs->parsed : nullptr;
+    p.stageFs = p.separable && fs && fs != &stub ? fs->parsed : nullptr;
     p.bin.valid = true, p.bin.separable = p.separable, p.bin.attribBindings = p.attribBindings;
     p.bin.sources[0] = vs ? vs->compiledSource : nullptr;
     p.bin.sources[1] = fs ? fs->compiledSource : nullptr;
@@ -902,7 +940,8 @@ static std::string callTypeName(int comps, int cols, bool isInt, bool isUint) {
 
 // Repetition counter behind the two uniform diagnostics below: counts every sighting of `key` (at most 512 keys) and says
 // whether its line is due: the first one, then again at the 100th, 1000th and 10000th (`n` = sightings so far).
-static bool uniformLogDue(std::map<std::string, uint32_t>& seen, const std::string& key, uint32_t& n) {
+template <class Key>
+static bool uniformLogDue(std::map<Key, uint32_t>& seen, const Key& key, uint32_t& n) {
     auto it = seen.find(key);
     if (it == seen.end()) {
         if (seen.size() >= 512) return false;
@@ -943,14 +982,17 @@ static void logUniformLenient(const Program* p, const vpglsl::Variable* u, int c
                               GLint location = -1, const uint8_t* prev = nullptr, const void* next = nullptr, GLsizei count = 0,
                               int element = 0) {
     static std::mutex mu;
-    static std::map<std::string, uint32_t> seen;
-    const std::string callType = callTypeName(comps, 0, isInt, isUint);
+    // (program, uniform name, call type, reason, location when the uniform is unknown): hashed, so a repeated call builds no string.
+    using Key = std::tuple<unsigned, uint64_t, int, int, uint64_t, GLint>;
+    static std::map<Key, uint32_t> seen;
     const unsigned prog = p ? unsigned(p->name) : 0u;
-    const std::string name = u ? u->name : std::string("?");
+    const Key key{prog, std::hash<std::string_view>{}(u ? std::string_view(u->name) : std::string_view("?")), comps,
+                  isInt ? 1 : isUint ? 2 : 0, std::hash<std::string_view>{}(reason ? reason : ""), u ? GLint(0) : location};
     std::lock_guard<std::mutex> g(mu);
     uint32_t n = 0;
-    if (!uniformLogDue(seen, std::to_string(prog) + ":" + name + ":" + callType + (reason ? reason : "") + (u ? "" : std::to_string(location)), n))
-        return;
+    if (!uniformLogDue(seen, key, n)) return;
+    const std::string callType = callTypeName(comps, 0, isInt, isUint);
+    const std::string name = u ? u->name : std::string("?");
     std::string extra = reason ? std::string(" reason=") + reason : std::string();
     if (!u) extra += " loc=" + std::to_string(location);
     if (u && prev && next) {
@@ -1435,8 +1477,7 @@ static void noteUnwritten(const Texture& t, const SamplerParams& sp) {
 }
 
 bool Context::bindResources(Program& p, const StorageP& xfbScratch) {
-    VkDescriptorSet set = allocSet(xfbScratch ? p.xfbSetLayout : p.setLayout);
-    if (!set) return false;
+    VkDescriptorSet set = VK_NULL_HANDLE;  // allocated below, once the writes are known (the last draw's set may do)
     std::vector<VkWriteDescriptorSet> writes;
     std::vector<VkDescriptorBufferInfo> bufInfos;
     std::vector<VkDescriptorImageInfo> imgInfos;
@@ -1449,9 +1490,14 @@ bool Context::bindResources(Program& p, const StorageP& xfbScratch) {
     bufInfos.reserve(2 + p.refl.blocks.size() + p.refl.storageBlocks.size() + p.refl.atomicBuffers.size());
     imgInfos.reserve(imgCount);
     texelViews.reserve(texelCount);
-    // Default block: this draw's copy in the stream (offset passed as the dynamic offset).
-    Alloc ub = stream(p.defaultBlock.size(), dev->props.limits.minUniformBufferOffsetAlignment);
-    std::memcpy(ub.host, p.defaultBlock.data(), p.defaultBlock.size());
+    // Default block: a copy in the stream (offset passed as the dynamic offset); the last draw's when the values are the same.
+    Told::Bind& bd = told_.bind[p.csModule ? 1 : 0];
+    if (!bd.ubBuffer || bd.block != p.defaultBlock) {
+        const Alloc fresh = stream(p.defaultBlock.size(), dev->props.limits.minUniformBufferOffsetAlignment);
+        std::memcpy(fresh.host, p.defaultBlock.data(), p.defaultBlock.size());
+        bd.ubBuffer = fresh.buffer, bd.ubOffset = fresh.offset, bd.block = p.defaultBlock;
+    }
+    const Alloc ub{bd.ubBuffer, bd.ubOffset, nullptr};
     bufInfos.push_back({ub.buffer, 0, p.defaultBlock.size()});
     VkWriteDescriptorSet w{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
     w.dstSet = set, w.dstBinding = vpglsl::kDefaultBlockBinding, w.descriptorCount = 1;
@@ -1507,6 +1553,7 @@ bool Context::bindResources(Program& p, const StorageP& xfbScratch) {
                     else ii.imageView = im.storageView(uint32_t(iu.level), im.layers > 1 && !iu.layered ? uint32_t(iu.layer) : 0, 1, VK_IMAGE_VIEW_TYPE_2D, fmt);
                     if (!ii.imageView) ii.imageView = blackTexture().image->storageView(0, 0, 1, VK_IMAGE_VIEW_TYPE_2D);
                     keep(t->image);
+                    imageUsed(im);
                 } else {
                     ii.imageView = blackTexture().image->storageView(0, 0, 1, VK_IMAGE_VIEW_TYPE_2D);  // unbound unit: reads 0 (undefined in GL)
                 }
@@ -1558,6 +1605,7 @@ bool Context::bindResources(Program& p, const StorageP& xfbScratch) {
                 ii.imageView = t->sampledView();
                 if (t->image->format->compressed) noteUnwritten(*t, sp);
                 keep(t->image);
+                imageUsed(*t->image);
                 t->image->invalid.clear();
             } else {
                 if (t) noteIncomplete(*t, sp, why);
@@ -1580,11 +1628,11 @@ bool Context::bindResources(Program& p, const StorageP& xfbScratch) {
         Buffer* buf = buffer(ib.buffer);
         VkDescriptorBufferInfo bi{};
         if (buf && buf->storage && VkDeviceSize(ib.offset) < VkDeviceSize(buf->size)) {
-            useStorage(buf->storage);
             bi.buffer = buf->storage->buffer;
             bi.offset = VkDeviceSize(ib.offset);
             const VkDeviceSize avail = VkDeviceSize(buf->size) - VkDeviceSize(ib.offset);  // the buffer may have shrunk since the bind
             bi.range = ib.size ? std::min<VkDeviceSize>(VkDeviceSize(ib.size), avail) : avail;
+            useStorage(buf->storage, bi.offset, bi.offset + bi.range);
         } else {
             Alloc z = stream(std::max<uint32_t>(16, b.size), 256);
             std::memset(z.host, 0, std::max<uint32_t>(16, b.size));
@@ -1633,10 +1681,37 @@ bool Context::bindResources(Program& p, const StorageP& xfbScratch) {
         s.pBufferInfo = &bufInfos.back();
         writes.push_back(s);
     }
-    dev->vk.vkUpdateDescriptorSets(dev->device, uint32_t(writes.size()), writes.data(), 0, nullptr);
+    // What the descriptors are (every handle and range written): the set of the last draw is reused when it was the same.
+    std::vector<uint64_t> signature;
+    auto handle = [](auto h) { return uint64_t(reinterpret_cast<uintptr_t>(h)); };
+    for (const VkWriteDescriptorSet& w : writes) {
+        signature.insert(signature.end(), {uint64_t(w.dstBinding) << 32 | w.dstArrayElement, uint64_t(w.descriptorType) << 32 | w.descriptorCount});
+        for (uint32_t i = 0; i < w.descriptorCount; ++i) {
+            if (w.pImageInfo)
+                signature.insert(signature.end(), {handle(w.pImageInfo[i].sampler), handle(w.pImageInfo[i].imageView), uint64_t(w.pImageInfo[i].imageLayout)});
+            else if (w.pTexelBufferView)
+                signature.push_back(handle(w.pTexelBufferView[i]));
+            else
+                signature.insert(signature.end(), {handle(w.pBufferInfo[i].buffer), w.pBufferInfo[i].offset, w.pBufferInfo[i].range});
+        }
+    }
+    const VkPipelineLayout layout = xfbScratch ? p.xfbPipeLayout : p.pipeLayout;
     const uint32_t dynOff = uint32_t(ub.offset);
-    dev->vk.vkCmdBindDescriptorSets(cmd(), p.csModule ? VK_PIPELINE_BIND_POINT_COMPUTE : VK_PIPELINE_BIND_POINT_GRAPHICS,
-                                    xfbScratch ? p.xfbPipeLayout : p.pipeLayout, 0, 1, &set, 1, &dynOff);
+    const bool same = bd.set && bd.layout == layout && bd.signature == signature;
+    if (same) {
+        set = bd.set;
+    } else {
+        set = allocSet(xfbScratch ? p.xfbSetLayout : p.setLayout);
+        if (!set) return false;
+        for (VkWriteDescriptorSet& w : writes) w.dstSet = set;
+        dev->vk.vkUpdateDescriptorSets(dev->device, uint32_t(writes.size()), writes.data(), 0, nullptr);
+    }
+    // (allocSet may have submitted: `bd` is then a new command buffer's, told nothing, and the bind below is made.)
+    if (!same || bd.set != set || bd.layout != layout || bd.dynamicOffset != dynOff) {
+        dev->vk.vkCmdBindDescriptorSets(cmd(), p.csModule ? VK_PIPELINE_BIND_POINT_COMPUTE : VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 0, 1, &set,
+                                        1, &dynOff);
+        bd.set = set, bd.layout = layout, bd.dynamicOffset = dynOff, bd.signature = std::move(signature);
+    }
     return true;
 }
 
@@ -1649,7 +1724,8 @@ Texture& Context::blackTexture() {
         black_->wantStorage = true;  // also the stand-in for unbound image units (1x1: no compression to lose)
         realizeTexture(*black_);
         const uint8_t px[4] = {0, 0, 0, 255};
-        copyBufferToImage(*black_->image, 0, 0, 0, 0, 0, 1, 1, 1, px, 4);
+        copyBufferToImage(black_->image, 0, 0, 0, 0, 0, 1, 1, 1, px, 4);
+        endPass();  // made before any draw uses it (it is a stand-in in descriptors): recorded now, ending the pass it is made in
     }
     return *black_;
 }
@@ -1695,10 +1771,14 @@ VkBufferView Context::blackTexelBufferView() {
 
 void Context::setDynamicState(const FbInfo& fb) {
     VkCommandBuffer c = cmd();
+    Told& t = told_;
     VkViewport v{float(viewport[0]), float(viewport[1]), float(viewport[2]), float(viewport[3]), depthRange[0], depthRange[1]};
     if (v.width <= 0) v.width = 1;
     if (v.height <= 0) v.height = 1;
-    dev->vk.vkCmdSetViewport(c, 0, 1, &v);
+    if (!t.viewport || std::memcmp(&v, &t.vp, sizeof v)) {
+        dev->vk.vkCmdSetViewport(c, 0, 1, &v);
+        t.vp = v, t.viewport = true;
+    }
     VkRect2D s{{0, 0}, {fb.width, fb.height}};
     if (scissorTest) {
         int32_t x0 = std::max(0, scissor[0]), y0 = std::max(0, scissor[1]);
@@ -1706,16 +1786,30 @@ void Context::setDynamicState(const FbInfo& fb) {
         int32_t y1 = std::min<int32_t>(int32_t(fb.height), scissor[1] + std::max(0, scissor[3]));
         s = {{x0, y0}, {uint32_t(std::max(0, x1 - x0)), uint32_t(std::max(0, y1 - y0))}};
     }
-    dev->vk.vkCmdSetScissor(c, 0, 1, &s);
+    if (!t.scissor || std::memcmp(&s, &t.sc, sizeof s)) {
+        dev->vk.vkCmdSetScissor(c, 0, 1, &s);
+        t.sc = s, t.scissor = true;
+    }
     // GL clamps the reference to the stencil range (Vulkan keeps the low 8 bits: 256 would compare as 0).
-    dev->vk.vkCmdSetStencilReference(c, VK_STENCIL_FACE_FRONT_BIT, uint32_t(std::clamp(stencil[0].ref, 0, 255)));
-    dev->vk.vkCmdSetStencilReference(c, VK_STENCIL_FACE_BACK_BIT, uint32_t(std::clamp(stencil[1].ref, 0, 255)));
-    dev->vk.vkCmdSetStencilCompareMask(c, VK_STENCIL_FACE_FRONT_BIT, stencil[0].mask);
-    dev->vk.vkCmdSetStencilCompareMask(c, VK_STENCIL_FACE_BACK_BIT, stencil[1].mask);
-    dev->vk.vkCmdSetStencilWriteMask(c, VK_STENCIL_FACE_FRONT_BIT, stencil[0].writeMask);
-    dev->vk.vkCmdSetStencilWriteMask(c, VK_STENCIL_FACE_BACK_BIT, stencil[1].writeMask);
-    dev->vk.vkCmdSetBlendConstants(c, blendColor);
-    dev->vk.vkCmdSetDepthBias(c, polygonOffset[1], 0.0f, polygonOffset[0]);
+    const VkStencilFaceFlags faces[2] = {VK_STENCIL_FACE_FRONT_BIT, VK_STENCIL_FACE_BACK_BIT};
+    for (int f = 0; f < 2; ++f) {
+        const uint32_t ref = uint32_t(std::clamp(stencil[f].ref, 0, 255));
+        if (!t.stencil || t.ref[f] != ref) dev->vk.vkCmdSetStencilReference(c, faces[f], ref), t.ref[f] = ref;
+    }
+    for (int f = 0; f < 2; ++f)
+        if (!t.stencil || t.compareMask[f] != stencil[f].mask) dev->vk.vkCmdSetStencilCompareMask(c, faces[f], stencil[f].mask), t.compareMask[f] = stencil[f].mask;
+    for (int f = 0; f < 2; ++f)
+        if (!t.stencil || t.writeMask[f] != stencil[f].writeMask) dev->vk.vkCmdSetStencilWriteMask(c, faces[f], stencil[f].writeMask), t.writeMask[f] = stencil[f].writeMask;
+    t.stencil = true;
+    if (!t.blend || std::memcmp(blendColor, t.blendColor, sizeof blendColor)) {
+        dev->vk.vkCmdSetBlendConstants(c, blendColor);
+        std::memcpy(t.blendColor, blendColor, sizeof blendColor), t.blend = true;
+    }
+    const float bias[2] = {polygonOffset[1], polygonOffset[0]};
+    if (!t.bias || std::memcmp(bias, t.depthBias, sizeof bias)) {
+        dev->vk.vkCmdSetDepthBias(c, bias[0], 0.0f, bias[1]);
+        std::memcpy(t.depthBias, bias, sizeof bias), t.bias = true;
+    }
 }
 
 // ---- vertex input -----------------------------------------------------------------------------------
@@ -1948,9 +2042,32 @@ Program* Context::computeProgram() {
 }
 
 bool Context::prepareDraw(GLenum mode, VkPrimitiveTopology& topo, uint32_t vertexCount, uint32_t firstVertex,
-                          uint32_t instances, bool indexed, VkBuffer&) {
+                          uint32_t instances, bool indexed, VkBuffer& vbufs0) {
+    if (!passOpen_) recordTransfers();  // no pass to wait for
+    const bool provokeOk = provokeOk_;
+    struct Reset {
+        bool& flag;
+        ~Reset() { flag = false; }
+    } rowsReset{vertexRowsUnknown_};  // (told to this one draw only)
+    for (int attempt = 0;; ++attempt) {
+        provokeOk_ = provokeOk;
+        xferHazard_ = false;
+        const uint64_t submitted = flushes_;
+        const bool ok = prepareDrawOnce(mode, topo, vertexCount, firstVertex, instances, indexed, vbufs0);
+        if ((!xferHazard_ && flushes_ == submitted) || attempt) return ok;
+        // The draw reads an image with an upload waiting (bindResources found it): the pass ends and the upload goes in, then the
+        // draw is prepared again (what the first try recorded was state, not a draw). Same when the descriptor pool ran out and
+        // allocSet submitted the command buffer in the middle of it: the pass, pipeline and stream data it recorded are not in the new one.
+        xferHazard_ = false;
+        endPass();
+    }
+}
+
+bool Context::prepareDrawOnce(GLenum mode, VkPrimitiveTopology& topo, uint32_t vertexCount, uint32_t firstVertex,
+                              uint32_t instances, bool indexed, VkBuffer&) {
     const bool provokeOk = provokeOk_;
     provokeOk_ = false;
+    const bool rowsUnknown = vertexRowsUnknown_;
     switch (mode) {
         case gl::POINTS: topo = VK_PRIMITIVE_TOPOLOGY_POINT_LIST; break;
         case gl::LINES: topo = VK_PRIMITIVE_TOPOLOGY_LINE_LIST; break;
@@ -2037,7 +2154,10 @@ bool Context::prepareDraw(GLenum mode, VkPrimitiveTopology& topo, uint32_t verte
                 if (b && b->storage) {
                     srcBase = b->storage->host + where;
                     vb = b->storage->buffer, vo = where;
-                    useStorage(b->storage);
+                    // The bytes of the rows the draw reads (to the end of the last row's stride); all of it when the rows are not known.
+                    if (rowsUnknown) useStorage(b->storage);
+                    else useStorage(b->storage, where + uint64_t(firstRow) * stride,
+                                    rows > firstRow ? where + uint64_t(rows) * std::max(stride, esize) : where);
                 } else if (vbind.buffer == 0 && vbind.offset) {  // client array (relativeOffset alone is not a pointer)
                     srcBase = reinterpret_cast<const uint8_t*>(where);
                 }
@@ -2094,8 +2214,14 @@ bool Context::prepareDraw(GLenum mode, VkPrimitiveTopology& topo, uint32_t verte
         return false;
     }
     VkCommandBuffer c = cmd();
-    dev->vk.vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_GRAPHICS, pl);
-    if (!bufs.empty()) dev->vk.vkCmdBindVertexBuffers(c, 0, uint32_t(bufs.size()), bufs.data(), offs.data());
+    if (told_.pipeline != pl) {
+        dev->vk.vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_GRAPHICS, pl);
+        told_.pipeline = pl;
+    }
+    if (!bufs.empty() && (told_.vbufs != bufs || told_.voffs != offs)) {
+        dev->vk.vkCmdBindVertexBuffers(c, 0, uint32_t(bufs.size()), bufs.data(), offs.data());
+        told_.vbufs = bufs, told_.voffs = offs;
+    }
     if (!bindResources(*p, xfbScratch_)) return false;
     setDynamicState(drawFb_);
     if (!rasterizerDiscard && !xfbScratch_) ++drawCount;  // occlusion queries (see Query)
@@ -2204,6 +2330,7 @@ bool Context::captureTransformFeedback(GLenum mode, uint32_t count, uint32_t fir
         const auto& ib = tf.buffers[b];
         Buffer* buf = ib.buffer ? buffer(ib.buffer) : nullptr;
         if (!buf || !buf->storage) return true;
+        if (uint64_t(ib.offset) > uint64_t(buf->size)) return true;  // the buffer shrank under the binding: no room
         bufs[b] = buf;
         const uint64_t avail = ib.size ? uint64_t(ib.size) : uint64_t(buf->size) - uint64_t(ib.offset);
         XfbOut& o = outs[b];
@@ -2327,11 +2454,19 @@ void Context::drawElements(GLenum mode, GLsizei count, GLenum type, const void* 
         std::memcpy(&v, src + 4 * i, 4);
         return v;
     };
-    for (GLsizei i = 0; i < count; ++i) {
-        uint32_t v = at(i);
-        if (primitiveRestart && v == restart) continue;
-        maxIdx = std::max(maxIdx, v);
+    // The highest index only matters to vertex data that is copied (client arrays, converted formats): with every attribute read
+    // in place from its buffer and the indices read in place too, the scan is skipped.
+    bool needMax = true;
+    if (eb && isz >= 2) {
+        Program* gp = graphicsProgram();
+        needMax = !(gp && gp->linked && gp->vsModule && attribsDirect(*gp, va));
     }
+    if (needMax)
+        for (GLsizei i = 0; i < count; ++i) {
+            uint32_t v = at(i);
+            if (primitiveRestart && v == restart) continue;
+            maxIdx = std::max(maxIdx, v);
+        }
     indexMax_ = maxIdx + uint32_t(std::max(0, baseVertex));
     const TransformFeedback& tf = curTf();
     if (tf.active && !tf.paused && mode <= gl::TRIANGLE_FAN) {
@@ -2351,6 +2486,7 @@ void Context::drawElements(GLenum mode, GLsizei count, GLenum type, const void* 
     // on, those modes are split at the restart index here and drawn as a plain list.
     const bool splitRestart = primitiveRestart && (mode == gl::POINTS || mode == gl::LINES || mode == gl::TRIANGLES || mode == gl::LINE_LOOP);
     const GLenum dm = splitRestart && mode == gl::LINE_LOOP ? GLenum(gl::LINES) : mode;
+    vertexRowsUnknown_ = !needMax;  // (the indices were not scanned: the rows they reach are not known)
     if (!prepareDraw(dm, topo, 0, 0, uint32_t(instances), true, unused)) return;
     if (splitRestart) {
         const size_t per = mode == gl::POINTS ? 1 : mode == gl::TRIANGLES ? 3 : 2;
@@ -2392,6 +2528,14 @@ void Context::drawElements(GLenum mode, GLsizei count, GLenum type, const void* 
         std::memcpy(s.host, list.data(), list.size() * 4);
         dev->vk.vkCmdBindIndexBuffer(cmd(), s.buffer, s.offset, VK_INDEX_TYPE_UINT32);
         dev->vk.vkCmdDrawIndexed(cmd(), uint32_t(list.size()), uint32_t(instances), 0, baseVertex, 0);
+        return;
+    }
+    // 16 / 32-bit indices in an element buffer are read in place (no copy); 8-bit ones are widened and line loops closed below.
+    if (eb && isz >= 2 && mode != gl::LINE_LOOP && reinterpret_cast<uintptr_t>(indices) % isz == 0) {
+        useStorage(eb->storage, reinterpret_cast<uintptr_t>(indices), reinterpret_cast<uintptr_t>(indices) + uint64_t(count) * isz);
+        dev->vk.vkCmdBindIndexBuffer(cmd(), eb->storage->buffer, VkDeviceSize(reinterpret_cast<uintptr_t>(indices)),
+                                     isz == 2 ? VK_INDEX_TYPE_UINT16 : VK_INDEX_TYPE_UINT32);
+        dev->vk.vkCmdDrawIndexed(cmd(), uint32_t(count), uint32_t(instances), 0, baseVertex, 0);
         return;
     }
     // Indices are copied into the stream (8-bit widened to 16, line loops closed).
@@ -2522,6 +2666,7 @@ void Context::drawIndirect(GLenum mode, GLenum indexType, const void* indirect) 
         VkPrimitiveTopology topo;
         VkBuffer unused;
         indexMax_ = 0;
+        vertexRowsUnknown_ = true;
         if (!prepareDraw(mode, topo, 0, 0, 1, indexType != 0, unused)) return;
         useStorage(ib->storage);
         if (indexType) {
@@ -2831,6 +2976,34 @@ void Context::readPixels(GLint x, GLint y, GLsizei w, GLsizei h, GLenum format, 
     if (x1 <= x0 || y1 <= y0) return;
     const uint32_t cw = uint32_t(x1 - x0), ch = uint32_t(y1 - y0);
     const uint32_t tb = src.image->format->texelBytes;
+    Buffer* pb = nullptr;
+    if (pixelPack) {
+        pb = buffer(pixelPack);
+        if (!pb || !pb->storage) return setError(gl::INVALID_OPERATION, format);
+        // The writes must stay inside the buffer.
+        const size_t rl = packRowLength ? size_t(packRowLength) : size_t(w);
+        const size_t rb = (rl * outPx + size_t(packAlignment) - 1) / size_t(packAlignment) * size_t(packAlignment);
+        const size_t first = (size_t(packSkipRows) + size_t(y0 - y)) * rb + (size_t(packSkipPixels) + size_t(x0 - x)) * outPx;
+        const size_t last = (size_t(packSkipRows) + size_t(y0 - y) + ch - 1) * rb + (size_t(packSkipPixels) + size_t(x0 - x) + cw) * outPx;
+        if (reinterpret_cast<uintptr_t>(pixels) + last > size_t(pb->size)) return setError(gl::INVALID_OPERATION, format);
+        // The texels are the pixels (RGBA8 as RGBA / UNSIGNED_BYTE) and the rows fall on texel boundaries: the GPU copies the image
+        // into the buffer itself, no wait and no pass over the pixels on the host. Reading the buffer then waits (MapBufferRange).
+        const size_t at = reinterpret_cast<uintptr_t>(pixels) + first;
+        if (readbackIsCopy(*src.image->format, format, type) && outPx == tb && at % tb == 0 && rb % tb == 0) {
+            useStorage(pb->storage);
+            pb->storage->gpuWrite = dev->submitted + 1;
+            barrier();
+            VkBufferImageCopy r{};
+            r.bufferOffset = at;
+            r.bufferRowLength = uint32_t(rb / tb);
+            r.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, src.level, src.layer, 1};
+            r.imageOffset = {x0, y0, 0};
+            r.imageExtent = {cw, ch, 1};
+            src.image->invalid.clear();
+            dev->vk.vkCmdCopyImageToBuffer(cmd(), src.image->image, VK_IMAGE_LAYOUT_GENERAL, pb->storage->buffer, 1, &r);
+            return;
+        }
+    }
     Alloc s = stream(VkDeviceSize(cw) * ch * tb, 16);
     barrier();
     VkBufferImageCopy r{};
@@ -2845,9 +3018,7 @@ void Context::readPixels(GLint x, GLint y, GLsizei w, GLsizei h, GLenum format, 
     flush(true);
     // Into the client (or pixel pack buffer) with the pack state.
     uint8_t* dst = static_cast<uint8_t*>(pixels);
-    if (pixelPack) {
-        Buffer* pb = buffer(pixelPack);
-        if (!pb || !pb->storage) return setError(gl::INVALID_OPERATION, format);
+    if (pb) {
         prepareWrite(*pb, false);
         dst = pb->storage->host + reinterpret_cast<uintptr_t>(pixels);
     }

@@ -1493,6 +1493,9 @@ void texHistTick(bool force) {
   const int64_t nowNs = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
   if (!force && nowNs < nextNs.load(std::memory_order_relaxed)) return;
   nextNs.store(nowNs + 5'000'000'000LL, std::memory_order_relaxed);
+  // Every device calls this from its own submit thread (its own submitMutex): the statics below need a lock of their own.
+  static std::mutex tickMutex;
+  std::lock_guard<std::mutex> tick(tickMutex);
   static std::string last;
   static unsigned lines = 0;
   static uint64_t lastNew = 0, lastGone = 0;
@@ -1698,7 +1701,7 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkCreateDevice(VkPhysicalDevice pd,
   // vkCreate*Pipelines calls are cache hits. With vpvk_prewarm() run by the app beforehand this is
   // mostly binary-archive lookups.
   refreshTranslatorMode();  // VPVK_AMPLIFY / VPVK_FETCH_NATIVE as the host set them for this device
-  d->recipes = std::make_unique<RecipeStore>(RecipeStore::defaultDir());
+  d->recipes = RecipeStore::forDir(RecipeStore::defaultDir());  // one store per directory: every device appends to the one file
   d->created = std::chrono::steady_clock::now();
   d->internalClient = internalClient();
   const bool doPrewarm = d->recipes->enabled() && prewarmEnabled();
@@ -2702,11 +2705,11 @@ thread_local bool tInNativeSubmit = false;
 // The device of that callback (vpvk_taa_native_encode / vpvk_depth_resolve_encode run inside it and
 // must not take the registry mutex: lock order is registry -> submit).
 thread_local Device* tNativeDevice = nullptr;
-void* imageNative(Device* d, const Image* img) {
+void* imageNative(Device* d, const Image* img, bool submitHeld = false) {
   vpgpu::ScopedPool pool;  // guest thread: nativeTexture hands back autoreleased Metal objects
   if (!d || !img || !img->id) return nullptr;
   if (img->native) return img->native;
-  if (tInNativeSubmit) {
+  if (tInNativeSubmit || submitHeld) {
     void* n = d->platform->nativeTexture(img->id);
     zeroNoteNative(*d, *img, n);
     return n;
@@ -2715,6 +2718,17 @@ void* imageNative(Device* d, const Image* img) {
   void* n = d->platform->nativeTexture(img->id);
   zeroNoteNative(*d, *img, n);
   return n;
+}
+// The live device with its submit mutex taken (or tried: `lock` stays unowned when it is busy). Registry -> submit order, as
+// vpvk_native_submit: vkDestroyDevice takes the device out of the registry and then drains the submit mutex, so a device
+// found here is not deleted while the caller holds `lock`. Null: no device.
+Device* liveDeviceSubmitLocked(std::unique_lock<std::mutex>& lock, bool tryOnly = false) {
+  std::lock_guard<std::mutex> live(liveDeviceMutex());
+  Device* d = liveDevice();
+  if (!d) return nullptr;
+  if (tryOnly) lock = std::unique_lock<std::mutex>(d->submitMutex, std::try_to_lock);
+  else lock = std::unique_lock<std::mutex>(d->submitMutex);
+  return d;
 }
 }  // namespace
 
@@ -2726,11 +2740,16 @@ VPVK_EXPORT void vkGetMTLTextureMVK(VkImage image, void** out) {
   *out = nullptr;
   if (!image) return;
   Device* d;
-  {
+  std::unique_lock<std::mutex> submit;
+  if (tInNativeSubmit) {  // inside a vpvk_native_submit callback: this thread holds the submit mutex, the device cannot go
+    d = tNativeDevice;
+  } else if (from<Image>(image)->native) {  // known already: the device is only tested for null, never used
     std::lock_guard<std::mutex> l(liveDeviceMutex());
     d = liveDevice();
+  } else {
+    d = liveDeviceSubmitLocked(submit);
   }
-  *out = imageNative(d, from<Image>(image));
+  *out = imageNative(d, from<Image>(image), true);
   static std::atomic<unsigned> ok{0}, miss{0};
   if (*out ? ok.fetch_add(1) < 1 : miss.fetch_add(1) < 8)
     logf("vk.mvk get_mtl_texture image=%p texture=%p%s", static_cast<void*>(image), *out,
@@ -2916,9 +2935,10 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkDestroyCommandPool(VkDevice, VkCommandP
 }
 
 VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkResetCommandPool(VkDevice, VkCommandPool cp,
-                                                              VkCommandPoolResetFlags) {
+                                                              VkCommandPoolResetFlags flags) {
   for (CommandBuffer* c : from<CommandPool>(cp)->buffers) {
     c->rec->reset();
+    if (flags & VK_COMMAND_POOL_RESET_RELEASE_RESOURCES_BIT) c->rec->releaseResources();
     c->state = CommandBuffer::State::Initial;
   }
   return VK_SUCCESS;
@@ -2932,6 +2952,7 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkAllocateCommandBuffers(VkDevice dv,
     auto* c = new CommandBuffer;
     c->device = from<Device>(dv);
     c->pool = p;
+    c->poolIndex = p->buffers.size();
     c->level = ai->level;
     c->rec = std::make_unique<Recorder>();
     c->rec->device = c->device;
@@ -2947,7 +2968,7 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkFreeCommandBuffers(VkDevice, VkCommandP
   for (uint32_t i = 0; i < n; ++i) {
     if (!bufs[i]) continue;
     CommandBuffer* c = from<CommandBuffer>(bufs[i]);
-    p->buffers.erase(std::remove(p->buffers.begin(), p->buffers.end(), c), p->buffers.end());
+    p->removeBuffer(c);
     delete c;
   }
 }
@@ -2978,9 +2999,10 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkEndCommandBuffer(VkCommandBuffer cb
 }
 
 VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkResetCommandBuffer(VkCommandBuffer cb,
-                                                                VkCommandBufferResetFlags) {
+                                                                VkCommandBufferResetFlags flags) {
   CommandBuffer* c = from<CommandBuffer>(cb);
   c->rec->reset();
+  if (flags & VK_COMMAND_BUFFER_RESET_RELEASE_RESOURCES_BIT) c->rec->releaseResources();
   c->state = CommandBuffer::State::Initial;
   return VK_SUCCESS;
 }
@@ -3505,6 +3527,9 @@ namespace {
 // vk.perf (perf.h): at most one line per second, written by whichever submit crosses the second (submitMutex held).
 void perfTick(Device* d) {
   static PerfLine line;
+  static std::mutex lineMutex;  // one PerfLine for every device: a submit that finds it busy leaves the line to the other
+  std::unique_lock<std::mutex> busy(lineMutex, std::try_to_lock);
+  if (!busy.owns_lock()) return;
   PipelineCounters& pc = pipelineCounters();
   PerfSample ext;
   ext.psoCreateUs = pc.blockedCreateUs.load(std::memory_order_relaxed);
@@ -3625,7 +3650,11 @@ void runBatches(Device* d, std::vector<DeferredBatch>& list, size_t count) {
       d->fovLog.next = d->submits + 600;
     }
   }
-  if (st.dropped || st.skippedDraws || st.skippedDispatches || d->submits <= 3 || d->submits % 600 == 0) {
+  // Skips and drops: the first 64 submits that have any, then one in 600 of them (each line is I/O on the submit thread).
+  const bool skipLine = (st.dropped || st.skippedDraws || st.skippedDispatches) &&
+                        (d->skipLogCount < 64 || d->skipLogCount % 600 == 0);
+  if (st.dropped || st.skippedDraws || st.skippedDispatches) ++d->skipLogCount;
+  if (skipLine || d->submits <= 3 || d->submits % 600 == 0) {
     std::string skipBy;  // skipped draws by reason
     if (st.skippedDraws) {
       skipBy = " skip_by{";
@@ -3665,6 +3694,7 @@ void runBatches(Device* d, std::vector<DeferredBatch>& list, size_t count) {
   for (size_t i = 0; i < count; ++i)
     for (const auto& [s, v] : list[i].signals) {  // reached once this frame finishes
       std::lock_guard<std::mutex> l(s->m);
+      advanceTimeline(*d->platform, *s);  // a counter nobody polls would keep every signal ever made
       s->pending.push_back({v, frames});
     }
   if (!st.queries.empty()) applyQueryEvents(st.queries, frames);
@@ -3735,9 +3765,14 @@ void submitDeferred(Device* d) {
 VPVK_EXPORT int vpvk_image_zero_pending(void* mtl) {
   vpgpu::ScopedPool pool;  // guest thread: no autorelease pool of its own (see scoped_pool.h)
   if (!mtl) return 0;
+  // Registry mutex held throughout: vkDestroyDevice takes the device out of the registry first, so it waits for this. Inside a
+  // vpvk_native_submit callback this thread holds the submit mutex (registry -> submit order): the device cannot go, no registry.
+  std::unique_lock<std::mutex> live;
   vpvk::Device* d;
-  {
-    std::lock_guard<std::mutex> l(liveDeviceMutex());
+  if (tInNativeSubmit) {
+    d = tNativeDevice;
+  } else {
+    live = std::unique_lock<std::mutex>(liveDeviceMutex());
     d = liveDevice();
   }
   if (!d) return 0;
@@ -3752,13 +3787,9 @@ VPVK_EXPORT int vpvk_image_zero_pending(void* mtl) {
 VPVK_EXPORT int vpvk_mark_eye_image(void* image) {
   vpgpu::ScopedPool pool;  // guest thread: no autorelease pool of its own (see scoped_pool.h)
   if (!image) return 0;
-  vpvk::Device* d;
-  {
-    std::lock_guard<std::mutex> l(liveDeviceMutex());
-    d = liveDevice();
-  }
+  std::unique_lock<std::mutex> lock;
+  vpvk::Device* d = liveDeviceSubmitLocked(lock);
   if (!d) return 0;
-  std::lock_guard<std::mutex> lock(d->submitMutex);
   vpvk::Image* i = vpvk::from<vpvk::Image>(reinterpret_cast<VkImage>(image));
   i->eye = true;
   for (auto& p : i->planes) p->eye = true;
@@ -3787,13 +3818,9 @@ VPVK_EXPORT int vpvk_mark_eye_image(void* image) {
 VPVK_EXPORT int vpvk_image_zero_clear(void* mtl) {
   vpgpu::ScopedPool pool;  // guest thread: no autorelease pool of its own (see scoped_pool.h)
   if (!mtl) return 0;
-  vpvk::Device* d;
-  {
-    std::lock_guard<std::mutex> l(liveDeviceMutex());
-    d = liveDevice();
-  }
+  std::unique_lock<std::mutex> lock;
+  vpvk::Device* d = liveDeviceSubmitLocked(lock, true);
   if (!d) return 0;
-  std::unique_lock<std::mutex> lock(d->submitMutex, std::try_to_lock);
   if (!lock.owns_lock()) return -1;
   uint64_t key;
   {

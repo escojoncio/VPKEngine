@@ -108,8 +108,8 @@ struct Machine {
             case Op::Not:
                 out = map1(a[0], t, [&](uint32_t x) { return s == Scalar::Bool ? uint32_t(!x) : ~x; });
                 return true;
-            case Op::Add: out = fl32 ? F2([](float x, float y) { return x + y; }) : I2([](auto x, auto y) { return x + y; }); return true;
-            case Op::Sub: out = fl32 ? F2([](float x, float y) { return x - y; }) : I2([](auto x, auto y) { return x - y; }); return true;
+            case Op::Add: out = fl32 ? F2([](float x, float y) { return x + y; }) : map2(a[0], a[1], t, [](uint32_t x, uint32_t y) { return x + y; }); return true;
+            case Op::Sub: out = fl32 ? F2([](float x, float y) { return x - y; }) : map2(a[0], a[1], t, [](uint32_t x, uint32_t y) { return x - y; }); return true;
             case Op::Mul:
                 out = fl32 ? F2([](float x, float y) { return x * y; })
                            : map2(a[0], a[1], t, [](uint32_t x, uint32_t y) { return x * y; });

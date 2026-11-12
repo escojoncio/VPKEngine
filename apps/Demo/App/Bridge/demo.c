@@ -15,11 +15,25 @@ u64 vp_main_native(u64* mem);
 #define STACK 0x2f0000000ull
 #define DATA  0x300000000ull
 static double now_ms(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec * 1e3 + t.tv_nsec / 1e6; }
+/* Only on free memory: MAP_FIXED would replace what is mapped there. The address is a hint (plus
+ * MAP_FIXED_NOREPLACE where there is one); a mapping put elsewhere is given back. */
 static int fixed(uint64_t at, uint64_t size) {
     const uint64_t page = 16384;
     const uint64_t start = at & ~(page - 1), end = (at + size + page - 1) & ~(page - 1);
-    void* p = mmap((void*)(uintptr_t)start, end - start, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
-    return p == MAP_FAILED ? -1 : 0;
+    int flags = MAP_PRIVATE | MAP_ANONYMOUS;
+#ifdef MAP_FIXED_NOREPLACE
+    flags |= MAP_FIXED_NOREPLACE;
+#endif
+    void* p = mmap((void*)(uintptr_t)start, end - start, PROT_READ | PROT_WRITE, flags, -1, 0);
+    if (p == MAP_FAILED) return -1;
+    if ((uint64_t)(uintptr_t)p != start) { munmap(p, end - start); return -1; }
+    return 0;
+}
+/* What fixed() mapped, given back: the button can be pressed again. */
+static void release(uint64_t at, uint64_t size) {
+    const uint64_t page = 16384;
+    const uint64_t start = at & ~(page - 1), end = (at + size + page - 1) & ~(page - 1);
+    munmap((void*)(uintptr_t)start, end - start);
 }
 vp_demo_result vp_demo_run(const char* elf_path) {
     vp_demo_result r;
@@ -27,41 +41,46 @@ vp_demo_result vp_demo_run(const char* elf_path) {
     FILE* f = fopen(elf_path, "rb");
     if (!f) { snprintf(r.message, sizeof r.message, "cannot open %s", elf_path); return r; }
     fseek(f, 0, SEEK_END); long size = ftell(f); fseek(f, 0, SEEK_SET);
-    unsigned char* elf = malloc(size);
-    if (fread(elf, 1, size, f) != (size_t)size) { fclose(f); snprintf(r.message, sizeof r.message, "short read"); return r; }
+    unsigned char* elf = size >= 64 ? malloc(size) : NULL;
+    if (!elf || fread(elf, 1, size, f) != (size_t)size) { fclose(f); free(elf); snprintf(r.message, sizeof r.message, "cannot read %s", elf_path); return r; }
     fclose(f);
     uint64_t entry, phoff; uint16_t phnum;
     memcpy(&entry, elf + 24, 8); memcpy(&phoff, elf + 32, 8); memcpy(&phnum, elf + 56, 2);
+    if (phoff > (uint64_t)size || (uint64_t)phnum * 56 > (uint64_t)size - phoff) { free(elf); snprintf(r.message, sizeof r.message, "bad program headers"); return r; }
     /* One mapping for the whole image (the segments are 4 KB apart; the device's pages are 16 KB). */
     uint64_t lo = UINT64_MAX, hi = 0;
     for (uint16_t i = 0; i < phnum; ++i) {
-        unsigned char* ph = elf + phoff + i * 56; uint32_t type; uint64_t vaddr, memsz;
-        memcpy(&type, ph, 4); memcpy(&vaddr, ph + 16, 8); memcpy(&memsz, ph + 40, 8);
+        unsigned char* ph = elf + phoff + i * 56; uint32_t type; uint64_t off, vaddr, filesz, memsz;
+        memcpy(&type, ph, 4); memcpy(&off, ph + 8, 8); memcpy(&vaddr, ph + 16, 8); memcpy(&filesz, ph + 32, 8); memcpy(&memsz, ph + 40, 8);
         if (type != 1 || !memsz) continue;
+        if (memsz > UINT64_MAX - vaddr || off > (uint64_t)size || filesz > (uint64_t)size - off || filesz > memsz) { free(elf); snprintf(r.message, sizeof r.message, "bad segment"); return r; }
         if (vaddr < lo) lo = vaddr;
         if (vaddr + memsz > hi) hi = vaddr + memsz;
     }
-    if (lo >= hi || fixed(lo, hi - lo)) { snprintf(r.message, sizeof r.message, "cannot map the guest at %#llx", (unsigned long long)lo); return r; }
+    if (lo >= hi || fixed(lo, hi - lo)) { free(elf); snprintf(r.message, sizeof r.message, "cannot map the guest at %#llx", (unsigned long long)lo); return r; }
     for (uint16_t i = 0; i < phnum; ++i) {
         unsigned char* ph = elf + phoff + i * 56; uint32_t type; uint64_t off, vaddr, filesz, memsz;
         memcpy(&type, ph, 4); memcpy(&off, ph + 8, 8); memcpy(&vaddr, ph + 16, 8); memcpy(&filesz, ph + 32, 8); memcpy(&memsz, ph + 40, 8);
         if (type != 1 || !memsz) continue;
         memcpy((void*)(uintptr_t)vaddr, elf + off, filesz);
     }
-    if (fixed(STACK, 0x100000) || fixed(DATA, 1 << 20)) { snprintf(r.message, sizeof r.message, "cannot map the stack or data"); return r; }
+    if (fixed(STACK, 0x100000)) { release(lo, hi - lo); free(elf); snprintf(r.message, sizeof r.message, "cannot map the stack or data"); return r; }
+    if (fixed(DATA, 1 << 20)) { release(STACK, 0x100000); release(lo, hi - lo); free(elf); snprintf(r.message, sizeof r.message, "cannot map the stack or data"); return r; }
     VpCpu c; memset(&c, 0, sizeof c); c.mxcsr = 0x1f80;
     c.r[VP_RSP] = STACK + 0x100000 - 0x100 - 8; vp_st64(c.r[VP_RSP], VP_HOST_EXIT_ADDRESS);
     c.r[VP_RDI] = DATA;
     double t0 = now_ms();
     const int fault = vp_run(&c, entry);
     r.translated_ms = now_ms() - t0;
-    if (fault) { snprintf(r.message, sizeof r.message, "translated code faulted: %s at %#llx", c.fault_what, (unsigned long long)c.fault_rip); return r; }
+    if (fault) { release(DATA, 1 << 20); release(STACK, 0x100000); release(lo, hi - lo); free(elf); snprintf(r.message, sizeof r.message, "translated code faulted: %s at %#llx", c.fault_what, (unsigned long long)c.fault_rip); return r; }
     r.translated = c.r[VP_RAX];
     u64* mem2 = calloc(1 << 17, 8);
+    if (!mem2) { release(DATA, 1 << 20); release(STACK, 0x100000); release(lo, hi - lo); free(elf); snprintf(r.message, sizeof r.message, "out of memory"); return r; }
     t0 = now_ms();
     r.native = vp_main_native(mem2);
     r.native_ms = now_ms() - t0;
     free(mem2); free(elf);
+    release(DATA, 1 << 20); release(STACK, 0x100000); release(lo, hi - lo);
     r.ok = r.translated == r.native;
     snprintf(r.message, sizeof r.message, r.ok ? "x86-64 program translated ahead of time and run natively: result %016llx, identical to the arm64 build"
                                               : "MISMATCH: translated %016llx, native %016llx", (unsigned long long)r.translated, (unsigned long long)r.native);

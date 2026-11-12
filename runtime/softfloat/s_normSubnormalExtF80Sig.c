@@ -45,7 +45,7 @@ struct exp32_sig64 softfloat_normSubnormalExtF80Sig( uint_fast64_t sig )
 
     shiftDist = softfloat_countLeadingZeros64( sig );
     z.exp = -shiftDist;
-    z.sig = sig<<shiftDist;
+    z.sig = sig<<(shiftDist & 63); /* sig == 0 (zero + zero in addMags) gives a count of 64: shifting by 64 is undefined */
     return z;
 
 }

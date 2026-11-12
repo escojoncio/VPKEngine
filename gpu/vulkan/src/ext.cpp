@@ -50,11 +50,11 @@ bool nativeExtras() {
   return !questIdentity() && (tInternal || !off);
 }
 
-namespace {
-// Moves the semaphore's finished submissions into `completed` (non-blocking). In value order, smallest first, stopping at
-// the first unfinished one: batches of different queues can run (and so be appended) out of value order, and a counter
-// value promises that the work signaling it or any smaller value has finished.
-void advance(Platform& p, Semaphore& s) {
+// Moves the semaphore's finished submissions into `completed` (non-blocking), `s.m` held. In value order, smallest first, stopping
+// at the first unfinished one: batches of different queues can run (and so be appended) out of value order, and a counter
+// value promises that the work signaling it or any smaller value has finished. Also called by every submit that signals the
+// semaphore (entry.cpp), so a counter nobody polls does not keep every signal it ever had.
+void advanceTimeline(Platform& p, Semaphore& s) {
   while (!s.pending.empty()) {
     const auto it = std::min_element(s.pending.begin(), s.pending.end(),
                                      [](const auto& a, const auto& b) { return a.first < b.first; });
@@ -63,7 +63,6 @@ void advance(Platform& p, Semaphore& s) {
     s.pending.erase(it);
   }
 }
-}  // namespace
 
 }  // namespace vpvk
 
@@ -75,7 +74,7 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkGetSemaphoreCounterValue(VkDevice d
   if (d->platform->lost()) return VK_ERROR_DEVICE_LOST;
   Semaphore* s = from<Semaphore>(sem);
   std::lock_guard<std::mutex> l(s->m);
-  advance(*d->platform, *s);
+  advanceTimeline(*d->platform, *s);
   *value = s->completed;
   s->poll.note(VK_SUCCESS);  // vk.pending (pending.cpp)
   return VK_SUCCESS;
@@ -106,7 +105,7 @@ static VkResult waitSemaphores(VkDevice dv, const VkSemaphoreWaitInfo* info, uin
     for (uint32_t i = 0; i < info->semaphoreCount; ++i) {
       Semaphore* s = from<Semaphore>(info->pSemaphores[i]);
       std::lock_guard<std::mutex> l(s->m);
-      advance(*d->platform, *s);
+      advanceTimeline(*d->platform, *s);
       if (s->completed >= info->pValues[i]) {
         ++done;
         continue;

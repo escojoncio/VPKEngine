@@ -48,7 +48,7 @@ env:
 jobs:
   vpvulkan:
     concurrency:
-      group: gles-vpvulkan-${{ github.sha }}
+      group: gles-vpvulkan-${{ github.run_id }}
       cancel-in-progress: true
     if: github.event_name == 'workflow_dispatch' || contains(github.event.head_commit.message, '[gles')
     runs-on: macos-26
@@ -233,7 +233,7 @@ jobs:
     needs: [vpvulkan, shim, deqp-build]
     if: inputs.cases == ''
     concurrency:
-      group: gles-smoke-${{ github.sha }}
+      group: gles-smoke-${{ github.run_id }}
       cancel-in-progress: true
     runs-on: macos-26
     timeout-minutes: 40
@@ -288,10 +288,12 @@ jobs:
     needs: [vpvulkan, shim, deqp-build]
     if: inputs.cases != ''
     concurrency:
-      group: gles-focus-${{ github.ref }}
+      group: gles-focus-${{ github.run_id }}
       cancel-in-progress: true
     runs-on: macos-26
     timeout-minutes: 60
+    env:
+      CASES: ${{ inputs.cases }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
@@ -310,7 +312,7 @@ jobs:
           export VPGLES_VULKAN_LIB="$GITHUB_WORKSPACE/lib/libVPVulkan.dylib"
           for m in gles2 gles3 gles31; do
             mkdir -p build/focus/$m
-            (cd deqp-bin && ./deqp-$m --deqp-runmode=stdout-caselist --deqp-case='${{ inputs.cases }}' $GL_ARGS \
+            (cd deqp-bin && ./deqp-$m --deqp-runmode=stdout-caselist --deqp-case="$CASES" $GL_ARGS \
               > "$GITHUB_WORKSPACE/build/focus/$m/caselist.txt" 2> "$GITHUB_WORKSPACE/build/logs/$m-caselist-stderr.txt") || true
             sed -n 's/^TEST: //p' build/focus/$m/caselist.txt > build/focus/$m/cases.txt
             wc -l build/focus/$m/cases.txt
@@ -340,9 +342,11 @@ jobs:
           git -C cts-mp sparse-checkout set external/openglcts/data/gl_cts/data/mustpass/gles/aosp_mustpass/main
       - name: Lots of the profile
         id: m
+        env:
+          SHARD_SIZE: ${{ inputs.shard-size || '1500' }}
         run: |
           python3 -I tools/cts/gles_caselists.py cts-mp/external/openglcts/data/gl_cts/data/mustpass/gles/aosp_mustpass/main \
-            build/caselists --profile rapida --shard-size "${{ inputs.shard-size || '1500' }}"
+            build/caselists --profile rapida --shard-size "$SHARD_SIZE"
           echo "matrix=$(cat build/caselists/matrix.json)" >> "$GITHUB_OUTPUT"
           cat build/caselists/rapida/index.tsv
       - uses: actions/upload-artifact@v4

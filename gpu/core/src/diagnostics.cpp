@@ -286,10 +286,11 @@ std::string attStr(const char* slot, const Attachment& a, uint16_t layers, const
   static const char* const kStore[] = {"D", "S", "R", "SR"};
   const TextureDesc* d = res ? res->get(a.texture) : nullptr;
   const char ld = a.load == LoadAction::Load ? 'L' : a.load == LoadAction::Clear ? 'C' : 'D';
+  const unsigned mip = std::min<unsigned>(a.mip, 31);  // a shift by 32 or more is undefined; a mip that deep is 1 texel anyway
   char b[160];
   std::snprintf(b, sizeof b, "%s=t%u/%s/s%u/%ux%ux%u/m%u/l%u/%c%s/u%s", slot, a.texture.index,
                 d ? formatInfo(a.format != Format::Undefined ? a.format : d->format).name : "?", d ? unsigned(d->samples) : 0u,
-                d ? std::max(1u, d->width >> a.mip) : 0u, d ? std::max(1u, d->height >> a.mip) : 0u, unsigned(layers),
+                d ? std::max(1u, d->width >> mip) : 0u, d ? std::max(1u, d->height >> mip) : 0u, unsigned(layers),
                 unsigned(a.mip), unsigned(a.layer), ld, kStore[int(a.store)], d ? usageStr(d->usage).c_str() : "?");
   std::string o = b;
   if (a.resolve) o += "->t" + std::to_string(a.resolve.index);

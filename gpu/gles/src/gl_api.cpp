@@ -30,7 +30,7 @@ namespace {
 using S = int64_t;  // stack-passed integer argument (see the header comment)
 
 struct Lock {
-    std::lock_guard<std::recursive_mutex> l;
+    std::unique_lock<std::recursive_mutex> l;
     Lock() : l(device()->lock) {}
 };
 #define CTX(...)                 \
@@ -999,7 +999,7 @@ void BufferSubData(GLenum target, GLintptr off, GLsizeiptr size, const void* dat
     if (off < 0 || size < 0 || off + size > b->size) return c->setError(gl::INVALID_VALUE, target);
     if (b->mapped) return c->setError(gl::INVALID_OPERATION, target);
     if (!data || !size) return;
-    c->prepareWrite(*b, off == 0 && size == b->size);
+    c->prepareWrite(*b, off == 0 && size == b->size, uint64_t(off), uint64_t(off + size), true);
     std::memcpy(b->storage->host + off, data, size_t(size));
 }
 // gles.map_stats: how often a MAP_UNSYNCHRONIZED write found its storage still in use by unfinished GPU work (the race window)
@@ -1042,14 +1042,14 @@ void* MapBufferRange(GLenum target, GLintptr off, GLsizeiptr len, GLbitfield acc
         c->setError(gl::INVALID_OPERATION, target);
         return nullptr;
     }
-    if (b->mapped) {
+    if (b->mapped || !b->storage) {  // no data store (glBufferData never called): nothing to map
         c->setError(gl::INVALID_OPERATION, target);
         return nullptr;
     }
     if (access & gl::MAP_READ_BIT) {
         if (b->storage->lastUse > c->dev->completed) c->flush(true);  // GPU writes visible
     } else if (!(access & gl::MAP_UNSYNCHRONIZED_BIT)) {
-        c->prepareWrite(*b, (access & gl::MAP_INVALIDATE_BUFFER_BIT) != 0);
+        c->prepareWrite(*b, (access & gl::MAP_INVALIDATE_BUFFER_BIT) != 0, uint64_t(off), uint64_t(off + len));
     } else {
         // UNSYNCHRONIZED write: the caller promises the GPU is not reading the range, but a draw already sent and not completed
         // may still read this storage (the GPU here is further behind than the game's buffer ring expects): write to a new one.
@@ -1058,7 +1058,7 @@ void* MapBufferRange(GLenum target, GLintptr off, GLsizeiptr len, GLbitfield acc
             const BufferStorage* old = b->storage.get();
             const uint64_t oldSize = old->size;
             const bool discard = (access & gl::MAP_INVALIDATE_BUFFER_BIT) != 0;
-            c->prepareWrite(*b, discard);
+            c->prepareWrite(*b, discard, uint64_t(off), uint64_t(off + len));
             mapStats.unsyncInuse.fetch_add(1, std::memory_order_relaxed);
             if (discard) mapStats.discardInuse.fetch_add(1, std::memory_order_relaxed);
             else if (b->storage.get() != old) {
@@ -2114,7 +2114,7 @@ void DeleteFramebuffers(GLsizei n, const GLuint* names) {
     if (n < 0) return c->setError(gl::INVALID_VALUE);
     for (GLsizei i = 0; i < n; ++i) {
         if (!names[i] || !c->fbos.count(names[i])) continue;
-        c->endPass();
+        if (c->drawFbo == names[i]) c->endPass();  // the pass holds the attachments' views, not the framebuffer object
         if (c->drawFbo == names[i]) c->drawFbo = 0;
         if (c->readFbo == names[i]) c->readFbo = 0;
         c->fbos.erase(names[i]);
@@ -2150,7 +2150,15 @@ Framebuffer* targetFbo(Context* c, GLenum target) {
     return c->fbo(n);
 }
 bool setAttachment(Context* c, Framebuffer* f, GLenum att, const Attachment& a) {
-    c->endPass();
+    // The same attachment again (games re-attach every frame) changes nothing: the open pass goes on (beginPass compares the
+    // attachments it would have with the open pass's).
+    const bool same = att >= gl::COLOR_ATTACHMENT0 && att < gl::COLOR_ATTACHMENT0 + kMaxDrawBuffers
+                          ? f->color[att - gl::COLOR_ATTACHMENT0] == a
+                      : att == gl::DEPTH_ATTACHMENT         ? f->depth == a
+                      : att == gl::STENCIL_ATTACHMENT       ? f->stencil == a
+                      : att == gl::DEPTH_STENCIL_ATTACHMENT ? f->depth == a && f->stencil == a
+                                                            : false;
+    if (!same) c->endPass();
     if (att >= gl::COLOR_ATTACHMENT0 && att < gl::COLOR_ATTACHMENT0 + kMaxDrawBuffers) {
         f->color[att - gl::COLOR_ATTACHMENT0] = a;
         return true;
@@ -2345,16 +2353,19 @@ void DrawBuffers(GLsizei n, const GLenum* bufs) {
     CTX()
     if (n < 0 || n > kMaxDrawBuffers) return c->setError(gl::INVALID_VALUE);
     Framebuffer* f = c->fbo(c->drawFbo);
-    c->endPass();
     if (c->drawFbo == 0) {
         if (n != 1 || (bufs[0] != gl::BACK && bufs[0] != gl::NONE)) return c->setError(gl::INVALID_OPERATION);
+        if (f->drawBuffers[0] != bufs[0]) c->endPass();
         f->drawBuffers[0] = bufs[0];
         return;
     }
     for (GLsizei i = 0; i < n; ++i)
         if (bufs[i] != gl::NONE && bufs[i] != gl::COLOR_ATTACHMENT0 + GLenum(i)) return c->setError(gl::INVALID_OPERATION);
-    f->drawBuffers.fill(gl::NONE);
-    for (GLsizei i = 0; i < n; ++i) f->drawBuffers[size_t(i)] = bufs[i];
+    auto drawBuffers = f->drawBuffers;
+    drawBuffers.fill(gl::NONE);
+    for (GLsizei i = 0; i < n; ++i) drawBuffers[size_t(i)] = bufs[i];
+    if (drawBuffers != f->drawBuffers) c->endPass();  // the same draw buffers again: the open pass goes on
+    f->drawBuffers = drawBuffers;
 }
 void ReadBuffer(GLenum b) {
     CTX()
@@ -2445,7 +2456,15 @@ void CompileShader(GLuint n) {
     Shader* s = shaderOrError(c, n);
     if (!s) return;
     vpglsl::Stage st = s->type == gl::VERTEX_SHADER ? vpglsl::Stage::Vertex : s->type == gl::FRAGMENT_SHADER ? vpglsl::Stage::Fragment : vpglsl::Stage::Compute;
-    vpglsl::ParseResult r = vpglsl::parse(st, s->sourceText());
+    // The parse needs nothing of the device: it runs without the global lock (a slow compile does not stall the other threads' GL
+    // calls). The text is immutable and shared; what the shader is afterwards is checked again with the lock back.
+    const std::shared_ptr<const std::string> text = s->source;
+    static const std::string none;
+    lock_.l.unlock();
+    vpglsl::ParseResult r = vpglsl::parse(st, text ? *text : none);
+    lock_.l.lock();
+    s = c->shader(n);
+    if (!s || s->source != text) return;  // deleted or given another source meanwhile (the application raced itself)
     s->parsed = r.shader;
     s->compiled = r.shader != nullptr;
     if (s->compiled) s->compiledSource = s->source;  // the same object: no second copy of the text
@@ -2522,6 +2541,15 @@ void detachAll(Context* c, Program* p) {
             *s = 0;
         }
 }
+// The program goes with the work that may use its pipelines (kept until that submission retires), not after a wait for the GPU.
+static void eraseProgram(Context* c, GLuint n) {
+    auto it = c->share->programs.find(n);
+    if (it == c->share->programs.end()) return;
+    detachAll(c, it->second.get());
+    std::shared_ptr<void> hold(std::move(it->second));
+    c->share->programs.erase(it);
+    c->keep(std::move(hold));
+}
 void DeleteProgram(GLuint n) {
     CTX()
     if (!n) return;
@@ -2531,9 +2559,7 @@ void DeleteProgram(GLuint n) {
         p->deletePending = true;
         return;
     }
-    c->flush(true);  // its pipelines may be in recorded work
-    detachAll(c, p);
-    c->share->programs.erase(n);
+    eraseProgram(c, n);
 }
 GLboolean IsProgram(GLuint n) {
     CTX(0)
@@ -2583,7 +2609,20 @@ void LinkProgram(GLuint pn) {
     if (!p) return;
     if (c->curTf().active && pn == c->program) return c->setError(gl::INVALID_OPERATION);  // the program being captured
     static int unwrittenLines = 0, failedLines = 0;  // varying diagnostics per session: at most 64 lines of each kind
-    const bool ok = c->linkProgram(*p);
+    // The link of the shaders needs nothing of the device: it runs without the global lock (a slow link does not stall the other
+    // threads' GL calls). If the program or its shaders changed meanwhile (the application raced itself) it is linked again here.
+    Context::LinkInputs in, again;
+    vpglsl::LinkResult ahead;
+    bool haveAhead = c->linkInputs(*p, in);
+    if (haveAhead) {
+        lock_.l.unlock();
+        ahead = Context::linkAhead(in);
+        lock_.l.lock();
+        p = c->prog(pn);
+        if (!p) return;  // deleted meanwhile
+        haveAhead = c->linkInputs(*p, again) && again == in;
+    }
+    const bool ok = c->linkProgram(*p, haveAhead ? &ahead : nullptr);
     if (!ok) logf("gles.program link_failed name=%u log=%s", pn, p->log.c_str());
     if (!p->varyingDiag.empty() && (ok ? unwrittenLines : failedLines) < 64) {
         ++(ok ? unwrittenLines : failedLines);
@@ -2601,9 +2640,7 @@ void UseProgram(GLuint pn) {
     Program* old = c->prog(c->program);
     c->program = pn;
     if (old && old->deletePending && old->name != pn) {
-        c->flush(true);
-        detachAll(c, old);
-        c->share->programs.erase(old->name);
+        eraseProgram(c, old->name);
     }
 }
 void ValidateProgram(GLuint pn) {
@@ -3636,7 +3673,7 @@ GLenum ClientWaitSync(GLsync s, GLbitfield flags, GLuint64 timeout) {
     c->dev->retire(false);
     if (c->dev->completed >= it->second->serial) return gl::ALREADY_SIGNALED;
     if (!timeout) return gl::TIMEOUT_EXPIRED;
-    c->dev->waitSerial(it->second->serial);
+    if (!c->dev->waitSerial(it->second->serial, timeout)) return gl::TIMEOUT_EXPIRED;
     return gl::CONDITION_SATISFIED;
 }
 void WaitSync(GLsync s, GLbitfield flags, GLuint64 timeout) {  // one queue: already ordered

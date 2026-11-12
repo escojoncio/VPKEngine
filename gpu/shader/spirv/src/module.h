@@ -105,7 +105,9 @@ struct SpirvModule {
     std::unordered_map<uint32_t, uint32_t> resultType;   // id -> type id, for every typed result
     std::unordered_map<uint32_t, std::string> names;     // OpName, for diagnostics
 
-    uint32_t w(const Instr& in, uint32_t i) const { return words[in.at + i]; }
+    // A word past the end of the module reads as 0 (an id no instruction defines): an instruction shorter than its
+    // opcode needs at the end of the words must not read outside them.
+    uint32_t w(const Instr& in, uint32_t i) const { return in.at + i < words.size() ? words[in.at + i] : 0; }
     const TypeInfo* type(uint32_t id) const {
         auto it = types.find(id);
         return it == types.end() ? nullptr : &it->second;

@@ -193,6 +193,10 @@ class Pool {
   std::vector<uint32_t> free_;
 };
 
+// A texture dimension at `mip`, 0 when the shift is out of range (a shift by 32 or more is undefined; Attachment::mip is
+// a client value).
+inline uint32_t mipShift(uint32_t v, uint32_t mip) { return mip >= 32 ? 0 : v >> mip; }
+
 class ResourceTable {
  public:
   BufferId createBuffer(BufferDesc d) { return d.size ? buffers_.create(std::move(d)) : BufferId{}; }

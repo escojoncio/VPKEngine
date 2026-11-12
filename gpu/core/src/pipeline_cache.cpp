@@ -4,6 +4,7 @@
 #include <chrono>
 #include <cstdio>
 #include <fstream>
+#include <mutex>
 #include <sstream>
 #include <utility>
 #if defined(__APPLE__)
@@ -149,11 +150,14 @@ PipelineCache::Status PipelineCache::request(const PipelineState& state, Pipelin
     if (e.status == Status::Failed || e.status == Status::Compiling) return e.status;
     ++frame_.misses, ++total_.misses;
     if (!workers_.empty()) {
-      // Re-queuing an already queued state is how its priority gets raised; the stale job is
-      // skipped by the worker once the state is no longer Queued.
+      // Re-queuing an already queued state is how its priority gets raised (only a more urgent request does it: the same
+      // or a lower one would pile a copy of the state into the queue per request); the stale job is skipped by the worker
+      // once the state is no longer Queued.
+      if (e.status == Status::Queued && priority >= e.queuedPriority) return Status::Queued;
       e.state = state;
+      if (e.status != Status::Queued) e.queuedAt = Clock::now();
       e.status = Status::Queued;
-      e.queuedAt = Clock::now();
+      e.queuedPriority = priority;
       queue_.push({priority, nextOrder_++, state});
       syncBacklogLocked();
       wake_.notify_one();
@@ -251,6 +255,7 @@ void PipelineCache::boost(PipelineKey key) {
   auto it = entries_.find(key.value);
   if (it == entries_.end() || it->second.status != Status::Queued || it->second.boosted || workers_.empty()) return;
   it->second.boosted = true;
+  it->second.queuedPriority = Priority::Urgent;
   queue_.push({Priority::Urgent, nextOrder_++, it->second.state});
   syncBacklogLocked();
   wake_.notify_one();
@@ -324,15 +329,38 @@ PipelineStats PipelineCache::totals() const {
 bool PipelineCache::save(const DiskCachePath& path) const {
   std::error_code ec;
   std::filesystem::create_directories(path.root, ec);
-  std::ofstream out(path.keyList(), std::ios::trunc);
-  if (!out) return false;
-  std::lock_guard lock(mutex_);
-  for (const auto& [key, e] : entries_) {
-    if (e.status != Status::Ready) continue;
-    forEachField(e.state, [&](const auto& v) { out << asInt(v) << ' '; });
-    out << '\n';
+  std::ostringstream text;
+  {
+    std::lock_guard lock(mutex_);
+    for (const auto& [key, e] : entries_) {
+      if (e.status != Status::Ready) continue;
+      forEachField(e.state, [&](const auto& v) { text << asInt(v) << ' '; });
+      text << '\n';
+    }
   }
-  return static_cast<bool>(out);
+  // Written beside the list and renamed over it: a stop in the middle of the write (the app is killed in the background)
+  // leaves the previous list, not a truncated one. One writer at a time shares the temporary's name.
+  static std::mutex fileMutex;
+  std::lock_guard fileLock(fileMutex);
+  std::filesystem::path tmp = path.keyList();
+  tmp += ".tmp";
+  {
+    std::ofstream out(tmp, std::ios::trunc);
+    if (!out) return false;
+    out << text.str();
+    out.flush();
+    if (!out) {
+      out.close();
+      std::filesystem::remove(tmp, ec);
+      return false;
+    }
+  }
+  std::filesystem::rename(tmp, path.keyList(), ec);
+  if (ec) {
+    std::filesystem::remove(tmp, ec);
+    return false;
+  }
+  return true;
 }
 
 size_t PipelineCache::prefetch(const DiskCachePath& path) {
@@ -347,6 +375,8 @@ size_t PipelineCache::prefetch(const DiskCachePath& path) {
       ok = ok && static_cast<bool>(fields >> x);
       v = static_cast<std::remove_reference_t<decltype(v)>>(x);
     });
+    for (const Format f : s.colorFormats) ok = ok && f < Format::Count;
+    ok = ok && s.depthFormat < Format::Count;
     if (ok && request(s, Priority::Prefetch) != Status::Failed) ++queued;
   }
   return queued;
@@ -369,7 +399,10 @@ bool PipelineCache::decode(const uint64_t* in, size_t count, PipelineState& s) {
   if (count != encodedSize()) return false;
   size_t i = 0;
   forEachField(s, [&](auto& v) { v = static_cast<std::remove_reference_t<decltype(v)>>(in[i++]); });
-  return true;
+  // A key list written by another build or damaged: a format past the enum would index the backend's format tables.
+  for (const Format f : s.colorFormats)
+    if (f >= Format::Count) return false;
+  return s.depthFormat < Format::Count;
 }
 
 }  // namespace vpgpu

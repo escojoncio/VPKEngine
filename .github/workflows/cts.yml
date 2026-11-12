@@ -297,6 +297,7 @@ jobs:
       VPVK_STRICT_FEATURES: "1"
       EXTRA_ENV: ${{ inputs.extra_env }}
       REPEAT: ${{ inputs.repeat }}
+      CASES: ${{ inputs.cases }}
     concurrency:
       group: cts-focus-${{ github.run_id }}
       cancel-in-progress: true
@@ -313,7 +314,7 @@ jobs:
         run: |
           mkdir -p deqp-vk-bin build/logs build/focus && tar -C deqp-vk-bin -xf pack/deqp-vk-bin.tar && chmod +x deqp-vk-bin/deqp-vk
           (cd deqp-vk-bin && ./deqp-vk --deqp-vk-library-path="$GITHUB_WORKSPACE/lib/libVPVulkan.dylib" \
-            --deqp-runmode=stdout-caselist --deqp-case='${{ inputs.cases }}' \
+            --deqp-runmode=stdout-caselist --deqp-case="$CASES" \
             > "$GITHUB_WORKSPACE/build/focus/caselist.txt" 2> "$GITHUB_WORKSPACE/build/logs/caselist-stderr.txt") || true
           sed -n 's/^TEST: //p' build/focus/caselist.txt > build/focus/cases.txt
           wc -l build/focus/cases.txt
@@ -322,7 +323,8 @@ jobs:
             python3 -I tools/cts/run_lot.py --deqp deqp-vk-bin/deqp-vk --lib lib/libVPVulkan.dylib --full \
               --caselist build/focus/cases.txt --out build/focus/out$n --budget-min 45 --idle-s 300 2>&1 | tee -a build/logs/focus-run.txt
             cp build/focus/out$n/fails.txt "build/logs/fails-$n.txt" 2>/dev/null || true
-            echo "run $n: $(grep -c '^===' build/focus/out$n/fails.txt 2>/dev/null || echo 0) fails" | tee -a build/logs/focus-rate.txt
+            nfails=$(grep -c '^===' build/focus/out$n/fails.txt 2>/dev/null || true)  # (grep -c prints 0 and fails when none: no "|| echo 0")
+            echo "run $n: ${nfails:-0} fails" | tee -a build/logs/focus-rate.txt
           done
           out=build/focus/out1
           cp $out/summary.md $out/lot.json $out/fails.txt $out/fails-full.txt build/logs/ 2>/dev/null || true
@@ -346,9 +348,11 @@ jobs:
           git -C cts-mp sparse-checkout set external/vulkancts/mustpass/main
       - name: Lots of the profile
         id: m
+        env:
+          SHARD_SIZE: ${{ inputs.shard-size || '1000' }}
         run: |
           python3 -I tools/cts/caselists.py cts-mp/external/vulkancts/mustpass/main build/caselists --profile rapida \
-            --shard-size "${{ inputs.shard-size || '1000' }}"
+            --shard-size "$SHARD_SIZE"
           echo "matrix=$(cat build/caselists/matrix.json)" >> "$GITHUB_OUTPUT"
           cat build/caselists/rapida/index.tsv
       - uses: actions/upload-artifact@v4

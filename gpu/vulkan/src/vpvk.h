@@ -6,7 +6,9 @@
 #include <vulkan/vulkan_metal.h>
 #include <vulkan/vk_icd.h>
 
+#include <algorithm>
 #include <array>
+#include <span>
 #include <atomic>
 #include <cstdint>
 #include <deque>
@@ -181,6 +183,11 @@ struct FoveationState {
 
  private:
   std::shared_ptr<const vpgpu::RateMap> cur_;
+  // What cur_ was built from: the same size and settings give the same map without building it (a rate map is the zones of
+  // two eyes, rebuilt for every eye pass otherwise).
+  uint32_t curW_ = 0, curH_ = 0;
+  uint16_t curLayers_ = 0;
+  FovConfig curCfg_;
 };
 bool platformRateMapSupported();  // platform_metal.mm (sondeo una vez); platform_null.cpp: VPVK_NULL_RATEMAP=1
 
@@ -414,6 +421,8 @@ struct Semaphore {
   std::atomic<int64_t> waitNs{0};                      // when it was last asked
   std::atomic<uint32_t> waiting{0};                    // threads inside vkWaitSemaphores on it
 };
+// ext.cpp: moves the finished submissions of a timeline semaphore into `completed`, `s.m` held (non-blocking).
+void advanceTimeline(Platform& p, Semaphore& s);
 // config.cpp: the Quest 3 / Adreno 740 identity (vpvk_config_set_quest_identity, VPVK_QUEST_IDENTITY=1). Off by
 // default: the device then reports what the Apple GPU supports. Not latched (read per query).
 bool questIdentity();
@@ -481,6 +490,7 @@ struct SetLayoutBinding {
 struct SetLayoutData {
   std::vector<SetLayoutBinding> bindings;  // sorted by binding
   bool push = false;                       // VK_KHR_push_descriptor layout: never allocated from a pool
+  std::vector<uint32_t> slotStart;         // bindings.size() + 1 entries: where each binding's elements start in DescriptorSetObj::flat
   const SetLayoutBinding* find(uint32_t b) const {
     for (const auto& x : bindings)
       if (x.binding == b) return &x;
@@ -521,14 +531,28 @@ struct Descriptor {
 struct DescriptorPoolObj;
 struct DescriptorSetObj {
   std::shared_ptr<const SetLayoutData> layout;
-  std::vector<std::vector<Descriptor>> slots;  // parallel to layout->bindings, one per element
+  std::vector<Descriptor> flat;  // the elements of every binding back to back (layout->slotStart): one allocation per set
+  std::span<Descriptor> slots(size_t b) { return {flat.data() + layout->slotStart[b], flat.data() + layout->slotStart[b + 1]}; }
+  std::span<const Descriptor> slots(size_t b) const { return {flat.data() + layout->slotStart[b], flat.data() + layout->slotStart[b + 1]}; }
   // VK_EXT_inline_uniform_block: the bytes of each inline block binding (parallel to layout->bindings,
-  // empty for the others). The binding's descriptorCount is its size; it has a single slot.
+  // empty for the others). The binding's descriptorCount is its size; it has a single slot. Empty (not even sized) for a layout
+  // with no inline block.
   std::vector<std::vector<uint8_t>> inlineData;
   DescriptorPoolObj* pool = nullptr;
+  size_t poolIndex = 0;  // position in pool->sets (DescriptorPoolObj::remove)
 };
 struct DescriptorPoolObj {
   std::vector<DescriptorSetObj*> sets;
+  // O(1): the last set takes the freed one's place (the order of a pool's sets means nothing).
+  void remove(DescriptorSetObj* s) {
+    if (s->poolIndex < sets.size() && sets[s->poolIndex] == s) {
+      sets[s->poolIndex] = sets.back();
+      sets[s->poolIndex]->poolIndex = s->poolIndex;
+      sets.pop_back();
+    } else {
+      sets.erase(std::remove(sets.begin(), sets.end(), s), sets.end());
+    }
+  }
 };
 
 struct DescriptorUpdateTemplateObj {
@@ -708,6 +732,7 @@ struct Recorder;  // commands.cpp
 struct CommandBuffer : Dispatchable {
   Device* device = nullptr;
   CommandPool* pool = nullptr;
+  size_t poolIndex = 0;  // position in pool->buffers (CommandPool::removeBuffer)
   VkCommandBufferLevel level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
   enum class State : uint8_t { Initial, Recording, Executable, Invalid } state = State::Initial;
   std::unique_ptr<Recorder> rec;
@@ -728,6 +753,16 @@ struct DeferredBatch {
 struct CommandPool {
   uint32_t family = 0;
   std::vector<CommandBuffer*> buffers;
+  // O(1): the last command buffer takes the freed one's place (the order of a pool's buffers means nothing).
+  void removeBuffer(CommandBuffer* c) {
+    if (c->poolIndex < buffers.size() && buffers[c->poolIndex] == c) {
+      buffers[c->poolIndex] = buffers.back();
+      buffers[c->poolIndex]->poolIndex = c->poolIndex;
+      buffers.pop_back();
+    } else {
+      buffers.erase(std::remove(buffers.begin(), buffers.end(), c), buffers.end());
+    }
+  }
 };
 
 // VPKTAA UI mask (taa_native.h): the classifier that outlives a command buffer (a scene is often
@@ -951,7 +986,7 @@ struct Device : Dispatchable {
   PhysicalDevice* physical = nullptr;
   std::unique_ptr<Platform> platform;
   std::unique_ptr<vpgpu::Device> gpu;
-  std::unique_ptr<RecipeStore> recipes;  // pipeline recipes for prewarming the next run
+  std::shared_ptr<RecipeStore> recipes;  // pipeline recipes for prewarming the next run (RecipeStore::forDir: shared by the devices of a process)
   // Recipes stored by FAIL_ON_PIPELINE_COMPILE_REQUIRED probes of this run (pipelines.cpp noteCompileRequired): not compiled, so
   // pipelineKnown does not count them.
   std::mutex probeMutex;
@@ -988,6 +1023,7 @@ struct Device : Dispatchable {
   std::atomic<uint64_t> occLateFrame{0}, occBudgetFrame{UINT64_MAX}, occBudgetUsedNs{0};
   int64_t (*clockNs)() = nullptr;
   uint64_t submits = 0;
+  uint64_t skipLogCount = 0;  // submits with skipped or dropped work so far (entry.cpp: only the first ones and one in 600 are logged)
   std::vector<DeferredBatch> deferred;  // submitMutex; submission order (batches of one queue keep their order, queues are independent)
   // vpvk_dump_pending: when each vpgpu frame was handed to the backend (by frame index % 64), and how many are noted.
   std::atomic<int64_t> frameNs[64]{};

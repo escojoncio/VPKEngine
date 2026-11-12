@@ -21,7 +21,7 @@ typedef struct VpConvertConfig {
     const char* work_dir;   /* where the conversion keeps its state */
     const char* output;     /* the library to write */
     /* Files the compiler and linker need, as the app bundles them:
-     *   runtime/            vp_cpu.h vp_emit.h vp_regs.h, runtime/freestanding/ string.h math.h
+     *   runtime/            vp_cpu.h vp_emit.h vp_regs.h vp_rcp_tables.h, runtime/freestanding/ string.h math.h
      *   clang/include/      clang's own headers (stddef.h, stdint.h, ...)
      *   tbd/                libVPRuntime.tbd libSystem.tbd                                    */
     const char* sdk_dir;

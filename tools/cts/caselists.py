@@ -73,10 +73,6 @@ def keep_sample(name, stride):
     return stride <= 1 or zlib.crc32(name.encode()) % stride == 0
 
 
-def keep_sample(name, stride):
-    return stride <= 1 or zlib.crc32(name.encode()) % stride == 0
-
-
 def selected(base, profile):
     """[(group label, case name)] in run order."""
     out = []

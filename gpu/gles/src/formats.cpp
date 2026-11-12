@@ -107,6 +107,9 @@ const uint8_t kAstcDims[14][2] = {{4, 4}, {5, 4}, {5, 5}, {6, 5}, {6, 6}, {8, 5}
                                   {10, 5}, {10, 6}, {10, 8}, {10, 10}, {12, 10}, {12, 12}};
 // VK_FORMAT_ASTC_4x4_UNORM_BLOCK = 157, then (unorm, srgb) pairs in the same order.
 
+float halfToFloat(uint16_t h);
+uint16_t floatToHalf(float f);
+
 std::vector<FormatInfo>& table() {
     static std::vector<FormatInfo> t = [] {
         std::vector<FormatInfo> v;
@@ -145,11 +148,11 @@ std::vector<FormatInfo>& table() {
             }
         // Unsized luminance/alpha formats (GLES 2): stored as R8 / RG8 with a sampling swizzle.
         auto lum = [&](GLenum internal, VkFormat vk, uint8_t bytes, VkComponentSwizzle r, VkComponentSwizzle g,
-                       VkComponentSwizzle b, VkComponentSwizzle a, GLenum ctype) {
+                       VkComponentSwizzle b, VkComponentSwizzle a, GLenum ctype, uint8_t floatBits = 16) {
             FormatInfo f;
             f.vk = vk, f.internal = internal, f.baseFormat = internal, f.texelBytes = bytes, f.componentType = ctype;
             f.swz[0] = r, f.swz[1] = g, f.swz[2] = b, f.swz[3] = a;
-            if (ctype == FLOAT) f.redBits = 16;  // half float (OES_texture_half_float)
+            if (ctype == FLOAT) f.redBits = floatBits;  // half float (OES_texture_half_float) or float (OES_texture_float)
             v.push_back(f);
         };
         lum(LUMINANCE, VK_FORMAT_R8_UNORM, 1, VK_COMPONENT_SWIZZLE_R, VK_COMPONENT_SWIZZLE_R, VK_COMPONENT_SWIZZLE_R,
@@ -165,6 +168,13 @@ std::vector<FormatInfo>& table() {
             VK_COMPONENT_SWIZZLE_R, FLOAT);
         lum(LUMINANCE_ALPHA, VK_FORMAT_R16G16_SFLOAT, 4, VK_COMPONENT_SWIZZLE_R, VK_COMPONENT_SWIZZLE_R,
             VK_COMPONENT_SWIZZLE_R, VK_COMPONENT_SWIZZLE_G, FLOAT);
+        // ... and with FLOAT data (OES_texture_float).
+        lum(LUMINANCE, VK_FORMAT_R32_SFLOAT, 4, VK_COMPONENT_SWIZZLE_R, VK_COMPONENT_SWIZZLE_R, VK_COMPONENT_SWIZZLE_R,
+            VK_COMPONENT_SWIZZLE_ONE, FLOAT, 32);
+        lum(ALPHA, VK_FORMAT_R32_SFLOAT, 4, VK_COMPONENT_SWIZZLE_ZERO, VK_COMPONENT_SWIZZLE_ZERO, VK_COMPONENT_SWIZZLE_ZERO,
+            VK_COMPONENT_SWIZZLE_R, FLOAT, 32);
+        lum(LUMINANCE_ALPHA, VK_FORMAT_R32G32_SFLOAT, 8, VK_COMPONENT_SWIZZLE_R, VK_COMPONENT_SWIZZLE_R,
+            VK_COMPONENT_SWIZZLE_R, VK_COMPONENT_SWIZZLE_G, FLOAT, 32);
         return v;
     }();
     return t;
@@ -181,10 +191,11 @@ const FormatInfo* bySized(GLenum internal) {
 const FormatInfo* formatFor(GLenum internal, GLenum format, GLenum type) {
     if (const FormatInfo* f = bySized(internal)) {
         if (internal == LUMINANCE || internal == ALPHA || internal == LUMINANCE_ALPHA) {
-            // Half-float luminance / alpha (OES_texture_half_float) is R16F / RG16F with a swizzle; float is not emulated: unknown.
-            if (type == HALF_FLOAT_OES)
+            // Half-float / float luminance and alpha (OES_texture_half_float, OES_texture_float) are R16F / RG16F / R32F / RG32F
+            // with a swizzle.
+            if (type == HALF_FLOAT_OES || type == FLOAT)
                 for (const FormatInfo& x : table())
-                    if (x.internal == internal && x.componentType == FLOAT) return &x;
+                    if (x.internal == internal && x.componentType == FLOAT && x.redBits == (type == FLOAT ? 32 : 16)) return &x;
             if (type != 0 && type != UNSIGNED_BYTE) return nullptr;
         }
         return f;
@@ -240,6 +251,28 @@ static uint32_t components(GLenum format) {
         case DEPTH_STENCIL: return 1;
         default: return 0;
     }
+}
+
+// RGB floats into R11F_G11F_B10F (negative and NaN read 0; no sign bit, 6/6/5 mantissa bits truncated from half precision).
+static uint32_t pack11f10f(const float c[3]) {
+    auto uf = [&](float v) { return v != v || v <= 0 ? uint16_t(0) : floatToHalf(v); };
+    return uint32_t(uf(c[0]) >> 4) | uint32_t(uf(c[1]) >> 4) << 11 | uint32_t(uf(c[2]) >> 5) << 22;
+}
+
+// RGB floats into RGB9_E5 (ES 3.0 / EXT_texture_shared_exponent 8.5.2 "Shared exponent texture color conversion").
+static uint32_t packRgb9e5(const float c[3]) {
+    const float kMax = 65408.0f;  // (511 / 512) * 2^(31 - 15)
+    float r[3];
+    for (int k = 0; k < 3; ++k) r[k] = c[k] != c[k] || c[k] < 0 ? 0.0f : c[k] > kMax ? kMax : c[k];
+    const float maxc = std::fmax(r[0], std::fmax(r[1], r[2]));
+    int e = maxc > 0 ? int(std::floor(std::log2(maxc))) : -16;
+    if (e < -16) e = -16;
+    int expShared = e + 16;
+    double denom = std::ldexp(1.0, expShared - 15 - 9);
+    if (std::floor(maxc / denom + 0.5) == 512.0) ++expShared, denom *= 2;
+    uint32_t m[3];
+    for (int k = 0; k < 3; ++k) m[k] = uint32_t(std::floor(r[k] / denom + 0.5));
+    return m[0] | m[1] << 9 | m[2] << 18 | uint32_t(expShared) << 27;
 }
 
 GLenum transferError(const FormatInfo& f, GLenum format, GLenum type, bool sub) {
@@ -318,9 +351,15 @@ uint32_t compressedSize(const FormatInfo& f, uint32_t w, uint32_t h) {
 
 bool convertUpload(const FormatInfo& dst, GLenum format, GLenum type, const uint8_t* src, uint32_t n,
                    std::vector<uint8_t>& out) {
+    if (!clientPixelBytes(format, type)) return false;
+    out.resize(size_t(n) * dst.texelBytes);
+    return convertUploadTo(dst, format, type, src, n, out.data());
+}
+
+bool convertUploadTo(const FormatInfo& dst, GLenum format, GLenum type, const uint8_t* src, uint32_t n, uint8_t* out) {
     const uint32_t inBytes = clientPixelBytes(format, type);
     if (!inBytes) return false;
-    out.resize(size_t(n) * dst.texelBytes);
+    const size_t outBytes = size_t(n) * dst.texelBytes;
     // Same layout: copy.
     const bool rgbToRgba = (format == RGB || format == RGB_INTEGER) && dst.texelBytes == inBytes / 3 * 4 &&
                            (type == UNSIGNED_BYTE || type == BYTE || type == FLOAT || type == HALF_FLOAT ||
@@ -329,7 +368,7 @@ bool convertUpload(const FormatInfo& dst, GLenum format, GLenum type, const uint
     if (rgbToRgba) {
         const uint32_t cb = inBytes / 3;
         for (uint32_t i = 0; i < n; ++i) {
-            uint8_t* d = &out[size_t(i) * dst.texelBytes];
+            uint8_t* d = out + size_t(i) * dst.texelBytes;
             std::memcpy(d, src + size_t(i) * inBytes, inBytes);
             // alpha = 1 in the type's representation
             if (type == FLOAT) {
@@ -360,7 +399,7 @@ bool convertUpload(const FormatInfo& dst, GLenum format, GLenum type, const uint
                 uint32_t p;
                 std::memcpy(&p, src + 4 * i, 4);
                 const uint16_t q = uint16_t(p >> 16);
-                std::memcpy(&out[2 * i], &q, 2);
+                std::memcpy(out + 2 * i, &q, 2);
                 continue;
             }
             double v;  // normalized depth 0..1
@@ -379,13 +418,13 @@ bool convertUpload(const FormatInfo& dst, GLenum format, GLenum type, const uint
             }
             if (dst.vk == VK_FORMAT_D16_UNORM) {
                 const uint16_t q = uint16_t(std::lround(v * 65535.0));
-                std::memcpy(&out[2 * i], &q, 2);
+                std::memcpy(out + 2 * i, &q, 2);
             } else if (dst.vk == VK_FORMAT_D32_SFLOAT) {
                 const float q = float(v);
-                std::memcpy(&out[4 * i], &q, 4);
+                std::memcpy(out + 4 * i, &q, 4);
             } else {
                 const uint32_t q = uint32_t(std::lround(v * 16777215.0));
-                std::memcpy(&out[4 * i], &q, 4);
+                std::memcpy(out + 4 * i, &q, 4);
             }
         }
         return true;
@@ -396,17 +435,69 @@ bool convertUpload(const FormatInfo& dst, GLenum format, GLenum type, const uint
             uint32_t p;
             std::memcpy(&p, src + 4 * i, 4);
             uint32_t q = p >> 8;
-            std::memcpy(&out[4 * i], &q, 4);
+            std::memcpy(out + 4 * i, &q, 4);
+        }
+        return true;
+    }
+    // 32-bit float client data into half float storage (ES 3.0 table 3.2: R16F, RG16F, RGB16F, RGBA16F take FLOAT).
+    if (type == FLOAT && !dst.compressed && dst.componentType == FLOAT && dst.redBits == 16 && !dst.depth) {
+        const uint32_t sc = components(format), dc = dst.texelBytes / 2;
+        if (!sc || sc > dc) return false;
+        for (uint32_t i = 0; i < n; ++i)
+            for (uint32_t k = 0; k < dc; ++k) {
+                float v = 0;
+                if (k < sc) std::memcpy(&v, src + (size_t(i) * sc + k) * 4, 4);
+                else if (k == 3) v = 1.0f;
+                const uint16_t h = floatToHalf(v);
+                std::memcpy(&out[(size_t(i) * dc + k) * 2], &h, 2);
+            }
+        return true;
+    }
+    // HALF_FLOAT / FLOAT RGB data into the packed shared-exponent and 11/11/10 float formats.
+    if (format == RGB && (type == FLOAT || type == HALF_FLOAT || type == HALF_FLOAT_OES) &&
+        (dst.vk == VK_FORMAT_B10G11R11_UFLOAT_PACK32 || dst.vk == VK_FORMAT_E5B9G9R9_UFLOAT_PACK32)) {
+        const bool f32 = type == FLOAT;
+        for (uint32_t i = 0; i < n; ++i) {
+            float c[3];
+            for (int k = 0; k < 3; ++k) {
+                if (f32) {
+                    std::memcpy(&c[k], src + (size_t(i) * 3 + k) * 4, 4);
+                } else {
+                    uint16_t h;
+                    std::memcpy(&h, src + (size_t(i) * 3 + k) * 2, 2);
+                    c[k] = halfToFloat(h);
+                }
+            }
+            const uint32_t q = dst.vk == VK_FORMAT_E5B9G9R9_UFLOAT_PACK32 ? packRgb9e5(c) : pack11f10f(c);
+            std::memcpy(&out[4 * size_t(i)], &q, 4);
+        }
+        return true;
+    }
+    // 8-bit and 2-10-10-10 client data into RGB5_A1 (GL R 15..11, G 10..6, B 5..1, A 0 -> Vulkan A1R5G5B5).
+    if (dst.vk == VK_FORMAT_A1R5G5B5_UNORM_PACK16 && format == RGBA && (type == UNSIGNED_BYTE || type == UNSIGNED_INT_2_10_10_10_REV)) {
+        for (uint32_t i = 0; i < n; ++i) {
+            uint32_t r, g, b, a;
+            if (type == UNSIGNED_BYTE) {
+                const uint8_t* p = src + 4 * size_t(i);
+                r = (p[0] * 31u + 127) / 255, g = (p[1] * 31u + 127) / 255, b = (p[2] * 31u + 127) / 255, a = p[3] >= 128;
+            } else {
+                uint32_t p;
+                std::memcpy(&p, src + 4 * size_t(i), 4);
+                r = ((p & 1023) * 31 + 511) / 1023, g = (((p >> 10) & 1023) * 31 + 511) / 1023, b = (((p >> 20) & 1023) * 31 + 511) / 1023;
+                a = (p >> 30) >= 2;
+            }
+            const uint16_t q = uint16_t(a << 15 | r << 10 | g << 5 | b);
+            std::memcpy(&out[2 * size_t(i)], &q, 2);
         }
         return true;
     }
     if (inBytes == dst.texelBytes) {
         if (type == UNSIGNED_SHORT_5_6_5 && dst.vk == VK_FORMAT_R5G6B5_UNORM_PACK16) {
-            std::memcpy(out.data(), src, out.size());
+            std::memcpy(out, src, outBytes);
             return true;
         }
         if (type == UNSIGNED_SHORT_4_4_4_4 && dst.vk == VK_FORMAT_R4G4B4A4_UNORM_PACK16) {
-            std::memcpy(out.data(), src, out.size());  // same bit order (R in 15..12)
+            std::memcpy(out, src, outBytes);  // same bit order (R in 15..12)
             return true;
         }
         if (type == UNSIGNED_SHORT_5_5_5_1 && dst.vk == VK_FORMAT_A1R5G5B5_UNORM_PACK16) {
@@ -415,7 +506,7 @@ bool convertUpload(const FormatInfo& dst, GLenum format, GLenum type, const uint
                 uint16_t p;
                 std::memcpy(&p, src + 2 * i, 2);
                 uint16_t q = uint16_t((p & 1) << 15 | (p >> 1));
-                std::memcpy(&out[2 * i], &q, 2);
+                std::memcpy(out + 2 * i, &q, 2);
             }
             return true;
         }
@@ -425,27 +516,30 @@ bool convertUpload(const FormatInfo& dst, GLenum format, GLenum type, const uint
                 uint32_t p;
                 std::memcpy(&p, src + 4 * i, 4);
                 uint32_t q = (p >> 8) | (p & 0xFF) << 24;
-                std::memcpy(&out[4 * i], &q, 4);
+                std::memcpy(out + 4 * i, &q, 4);
             }
             return true;
         }
-        std::memcpy(out.data(), src, out.size());
+        std::memcpy(out, src, outBytes);
         return true;
     }
     // 8-bit RGBA into 16-bit packed targets (GLES 2 apps uploading RGBA bytes to an RGBA4 texture).
     if (type == UNSIGNED_BYTE && format == RGBA && dst.vk == VK_FORMAT_R4G4B4A4_UNORM_PACK16) {
         for (uint32_t i = 0; i < n; ++i) {
             const uint8_t* p = src + 4 * i;
-            uint16_t q = uint16_t((p[0] >> 4) << 12 | (p[1] >> 4) << 8 | (p[2] >> 4) << 4 | (p[3] >> 4));
-            std::memcpy(&out[2 * i], &q, 2);
+            // unorm8 -> unorm4 rounds to nearest (ES 3.0 2.1.6.1): (v * 15 + 127) / 255, 255 -> 15, 8 -> 0 (not v >> 4)
+            auto q4 = [](uint32_t v) { return (v * 15u + 127u) / 255u; };
+            uint16_t q = uint16_t(q4(p[0]) << 12 | q4(p[1]) << 8 | q4(p[2]) << 4 | q4(p[3]));
+            std::memcpy(out + 2 * i, &q, 2);
         }
         return true;
     }
     if (type == UNSIGNED_BYTE && format == RGB && dst.vk == VK_FORMAT_R5G6B5_UNORM_PACK16) {
         for (uint32_t i = 0; i < n; ++i) {
             const uint8_t* p = src + 3 * i;
-            uint16_t q = uint16_t((p[0] >> 3) << 11 | (p[1] >> 2) << 5 | (p[2] >> 3));
-            std::memcpy(&out[2 * i], &q, 2);
+            const uint32_t r = (p[0] * 31u + 127u) / 255u, g = (p[1] * 63u + 127u) / 255u, b = (p[2] * 31u + 127u) / 255u;  // rounded, not >> 3 / >> 2
+            uint16_t q = uint16_t(r << 11 | g << 5 | b);
+            std::memcpy(out + 2 * i, &q, 2);
         }
         return true;
     }
@@ -470,10 +564,11 @@ uint16_t floatToHalf(float f) {
     const int e = int(ab >> 23) - 127;
     if (e < -14) {                                              // subnormal half
         const float scaled = std::ldexp(std::fabs(f), 24);
-        return uint16_t(sign | uint32_t(std::lround(scaled)));
+        return uint16_t(sign | uint32_t(std::nearbyint(scaled)));
     }
     uint32_t h = uint32_t(e + 15) << 10 | ((ab >> 13) & 0x3FF);
-    if (ab & 0x1000) ++h;                                       // round to nearest (ties up; carries into the exponent)
+    const uint32_t tail = ab & 0x1FFF;
+    if (tail > 0x1000 || (tail == 0x1000 && (h & 1))) ++h;      // round to nearest even (carries into the exponent)
     return uint16_t(sign | h);
 }
 
@@ -683,6 +778,11 @@ bool convertReadbackGeneric(const FormatInfo& src, GLenum format, GLenum type, c
 
 }  // namespace
 
+bool readbackIsCopy(const FormatInfo& src, GLenum format, GLenum type) {
+    return format == RGBA && type == UNSIGNED_BYTE && (src.vk == VK_FORMAT_R8G8B8A8_UNORM || src.vk == VK_FORMAT_R8G8B8A8_SRGB) &&
+           src.swz[3] != VK_COMPONENT_SWIZZLE_ONE;  // (RGB8 is stored as RGBA: its alpha reads 1 whatever is in memory)
+}
+
 bool convertReadback(const FormatInfo& src, GLenum format, GLenum type, const uint8_t* in, uint32_t n, uint8_t* out) {
     const uint32_t outBytes = clientPixelBytes(format, type);
     if (!outBytes) return false;
@@ -705,9 +805,9 @@ bool convertReadback(const FormatInfo& src, GLenum format, GLenum type, const ui
                 for (uint32_t i = 0; i < n; ++i) {
                     uint16_t p;
                     std::memcpy(&p, in + 2 * i, 2);
-                    out[4 * i] = uint8_t(((p >> 11) & 31) * 255 / 31);
-                    out[4 * i + 1] = uint8_t(((p >> 5) & 63) * 255 / 63);
-                    out[4 * i + 2] = uint8_t((p & 31) * 255 / 31);
+                    out[4 * i] = uint8_t((((p >> 11) & 31) * 255 + 15) / 31);  // unorm5/6 -> unorm8 rounds to nearest
+                    out[4 * i + 1] = uint8_t((((p >> 5) & 63) * 255 + 31) / 63);
+                    out[4 * i + 2] = uint8_t(((p & 31) * 255 + 15) / 31);
                     out[4 * i + 3] = 255;
                 }
                 return true;
@@ -723,10 +823,8 @@ bool convertReadback(const FormatInfo& src, GLenum format, GLenum type, const ui
                     uint16_t h;
                     std::memcpy(&h, in + 2 * i, 2);
                     // half -> float -> unorm8
-                    uint32_t s = (h >> 15) & 1, e = (h >> 10) & 31, m = h & 1023;
-                    float v = e == 0 ? std::ldexp(float(m), -24) : e == 31 ? 1e30f : std::ldexp(float(m | 1024), int(e) - 25);
-                    if (s) v = -v;
-                    v = v < 0 ? 0 : v > 1 ? 1 : v;
+                    float v = halfToFloat(h);
+                    v = !(v > 0) ? 0 : v > 1 ? 1 : v;                  // NaN and negatives read 0
                     out[i] = uint8_t(std::lround(v * 255.0f));
                 }
                 return true;
@@ -734,7 +832,7 @@ bool convertReadback(const FormatInfo& src, GLenum format, GLenum type, const ui
                 for (uint32_t i = 0; i < n * 4; ++i) {
                     float v;
                     std::memcpy(&v, in + 4 * i, 4);
-                    v = v < 0 ? 0 : v > 1 ? 1 : v;
+                    v = !(v > 0) ? 0 : v > 1 ? 1 : v;                  // NaN and negatives read 0
                     out[i] = uint8_t(std::lround(v * 255.0f));
                 }
                 return true;

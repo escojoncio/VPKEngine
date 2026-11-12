@@ -24,6 +24,7 @@
 
 #include "vpgpu/core/background.h"
 #include "vpgpu/core/pipeline_cache.h"
+#include "vpgpu/core/submit_order.h"
 
 namespace vpgpu::metal {
 
@@ -361,10 +362,22 @@ struct MetalBackend::Impl {
     if (orderValue) [cb encodeWaitForEvent:order value:orderValue];
   }
   void signalled(id<MTLCommandBuffer> cb) { [cb encodeSignalEvent:order value:++orderValue]; }
+  // Command buffers whose place in the order is fixed but whose commit waits for the app to be foreground again; guarded by
+  // orderMutex. No thread ever parks in the background gate while holding orderMutex (the main thread, which the gate lets
+  // through, may need it to commit interop work, and it is the one that ends the pause): a thread that would park hands its
+  // command buffer over, and the next thread that may commit sends the whole batch in order.
+  vpgpu::DeferredCommits<id<MTLCommandBuffer>> deferred;
+  // orderMutex held: the command buffer joins the pending ones and every one of them is committed, oldest first, unless this
+  // thread would park in the gate.
+  void commitOrdered(id<MTLCommandBuffer> cb) {
+    deferred.push(cb);
+    for (id<MTLCommandBuffer> pending : deferred.take(vpgpu::backgroundGate())) [pending commit];
+  }
   id<MTLResidencySet> residency;  // M4: attached to the MTL4CommandQueue the same way
   bool residencyDirty = false;
   dispatch_semaphore_t inFlight;
-  std::atomic<uint64_t> completed{0};  // frames below this index have finished (handlers ran)
+  vpgpu::CompletionFrontier completion;  // frames below completion.completed() have finished (handlers ran)
+  std::atomic<uint32_t> interopInFlight{0};  // encodeInterop command buffers committed whose handler has not finished (waitIdle)
   uint64_t submits = 0;
   std::vector<Slot> slots;
   std::vector<id> graveyard;
@@ -380,7 +393,8 @@ struct MetalBackend::Impl {
   // of one shape get distinct textures while encoders reuse them (contents never outlive one).
   std::unordered_map<uint64_t, std::vector<id<MTLTexture>>> memoryless;
 
-  std::mutex pipelineMutex;  // guards pipelines, functions, archive
+  std::mutex pipelineMutex;  // guards pipelines, functions
+  std::mutex archiveMutex;   // guards archive (adding a pipeline compiles it: submit, which takes pipelineMutex per draw, must not wait)
   std::unordered_map<uint64_t, Pipeline> pipelines;
   std::unordered_map<uint64_t, id<MTLFunction>> functions;
   id<MTLBinaryArchive> archive;
@@ -654,7 +668,7 @@ bool MetalBackend::Impl::buildRender(const PipelineState& s, Pipeline& p, std::s
 
   NSError* e = nil;
   {
-    std::lock_guard lock(pipelineMutex);  // MTLBinaryArchive is not documented as thread-safe
+    std::lock_guard lock(archiveMutex);  // MTLBinaryArchive is not documented as thread-safe
     if (archive) {
       d.binaryArchives = @[ archive ];
       if (![archive addRenderPipelineFunctionsWithDescriptor:d error:&e])
@@ -689,7 +703,7 @@ bool MetalBackend::Impl::buildCompute(const PipelineState& s, Pipeline& p, std::
   if (!d.computeFunction) return false;
   NSError* e = nil;
   {
-    std::lock_guard lock(pipelineMutex);
+    std::lock_guard lock(archiveMutex);
     if (archive) {
       d.binaryArchives = @[ archive ];
       if (![archive addComputePipelineFunctionsWithDescriptor:d error:&e])
@@ -729,9 +743,17 @@ struct Open {
 
 void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const CompiledFrame& compiled) {
   if (compiled.encoders.empty()) {  // nothing for the GPU; keeps the frontier's fences out of reuse
+    completion.submitted(frameIndex, false);  // done as soon as the frames before it are
     std::lock_guard lock(doneMutex);
     done.push_back({frameIndex, {}});
     return;
+  }
+  // Parks here while the app is in the background, holding neither orderMutex nor a frame slot; once through, sends any
+  // command buffer that had to wait for the foreground (commitOrdered), so a slot it holds is free again.
+  vpgpu::backgroundGate().waitForeground();
+  {
+    std::lock_guard lock(orderMutex);
+    for (id<MTLCommandBuffer> pending : deferred.take(vpgpu::backgroundGate())) [pending commit];
   }
   dispatch_semaphore_wait(inFlight, DISPATCH_TIME_FOREVER);
   // Consecutive command buffers use different slots, so the frontier carried over from the
@@ -1271,14 +1293,12 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
       std::lock_guard lock(impl->doneMutex);
       impl->done.push_back(std::move(d));
     }
-    // One queue: command buffers finish in order, but keep the frontier monotonic regardless.
-    for (uint64_t c = impl->completed.load(); c < frameIndex + 1 && !impl->completed.compare_exchange_weak(c, frameIndex + 1);) {
-    }
+    impl->completion.finished(frameIndex);  // one in-order queue: every earlier command buffer finished too
     dispatch_semaphore_signal(sem);
   }];
   signalled(cb);
-  vpgpu::backgroundGate().waitForeground();  // parks while the app is in the background (visionOS fails the commit)
-  [cb commit];
+  completion.submitted(frameIndex, true);
+  commitOrdered(cb);  // commits now, or when the app is foreground again (visionOS fails a commit in the background)
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1293,6 +1313,10 @@ MetalBackend::MetalBackend(const ShaderProvider& shaders, LogSink log, MetalOpti
 MetalBackend::~MetalBackend() {
   if (ok()) {
     vpgpu::backgroundGate().release();  // a commit parked for the background holds a frame waitIdle() waits for
+    {
+      std::lock_guard lock(impl_->orderMutex);  // ... and so does one handed over for it: commit it now
+      for (id<MTLCommandBuffer> pending : impl_->deferred.takeAll()) [pending commit];
+    }
     waitIdle();
   }
 }
@@ -1304,6 +1328,7 @@ const MetalCaps& MetalBackend::caps() const { return impl_->caps; }
 void MetalBackend::createBuffer(BufferId handle, const BufferDesc& d) {
   Impl& m = *impl_;
   if (!ok()) return;
+  @autoreleasepool {  // callable from any client thread, which may have no pool of its own
   Impl::Buffer b{handle.generation, nil, 0};
   if (d.guestMemory) {
     // No-copy buffers must start on a page and span whole pages: widen the window around the
@@ -1331,20 +1356,24 @@ void MetalBackend::createBuffer(BufferId handle, const BufferDesc& d) {
     m.residencyDirty = true;
   }
   m.buffers[handle.index] = b;
+  }
 }
 
 void MetalBackend::createTexture(TextureId handle, const TextureDesc& d) {
   Impl& m = *impl_;
   if (!ok()) return;
-  m.textures[handle.index] = {handle.generation, nil, d, false};
-  // Render targets wait for their first use: one that only ever lives on tile never gets memory.
-  const bool deferred = !d.persistent && m.tileMemory && (d.usage & (usage::colorTarget | usage::depthTarget));
-  if (!deferred) m.texture(handle);
+  @autoreleasepool {
+    m.textures[handle.index] = {handle.generation, nil, d, false};
+    // Render targets wait for their first use: one that only ever lives on tile never gets memory.
+    const bool deferred = !d.persistent && m.tileMemory && (d.usage & (usage::colorTarget | usage::depthTarget));
+    if (!deferred) m.texture(handle);
+  }
 }
 
 void MetalBackend::createSampler(SamplerId handle, const SamplerDesc& d) {
   Impl& m = *impl_;
   if (!ok()) return;
+  @autoreleasepool {
   MTLSamplerDescriptor* s = [MTLSamplerDescriptor new];
   s.minFilter = d.minFilter == Filter::Linear ? MTLSamplerMinMagFilterLinear : MTLSamplerMinMagFilterNearest;
   s.magFilter = d.magFilter == Filter::Linear ? MTLSamplerMinMagFilterLinear : MTLSamplerMinMagFilterNearest;
@@ -1369,6 +1398,7 @@ void MetalBackend::createSampler(SamplerId handle, const SamplerDesc& d) {
     return;
   }
   m.samplers[handle.index] = {handle.generation, st};
+  }
 }
 
 void MetalBackend::destroyBuffer(BufferId handle) {
@@ -1427,12 +1457,14 @@ bool MetalBackend::takeTimings(uint64_t& frameIndex, GpuTimings& out) {
   return true;
 }
 
-uint64_t MetalBackend::completedFrames() const { return impl_->completed.load(); }
+uint64_t MetalBackend::completedFrames() const { return impl_->completion.completed(); }
 
 void MetalBackend::waitIdle() {
   // Holding every slot means every completion handler has run (not only that the GPU finished).
   for (size_t i = 0; i < impl_->slots.size(); ++i) dispatch_semaphore_wait(impl_->inFlight, DISPATCH_TIME_FOREVER);
   for (size_t i = 0; i < impl_->slots.size(); ++i) dispatch_semaphore_signal(impl_->inFlight);
+  // Interop command buffers are not frames: their handlers use *impl_ too.
+  for (int i = 0; i < 5000 && impl_->interopInFlight.load(std::memory_order_acquire); ++i) usleep(1000);
 }
 
 void* MetalBackend::contents(BufferId handle) const {
@@ -1447,6 +1479,7 @@ bool MetalBackend::encodeInterop(const std::function<void(void* commandBuffer)>&
                                  std::function<void()> completed) {
   if (!impl_->queue || !encode) return false;
   @autoreleasepool {
+    vpgpu::backgroundGate().waitForeground();  // before the lock: a thread parked here holds nothing the main thread may need
     std::lock_guard lock(impl_->orderMutex);
     id<MTLCommandBuffer> cb = [impl_->queue commandBuffer];
     if (!cb) return false;
@@ -1460,10 +1493,11 @@ bool MetalBackend::encodeInterop(const std::function<void(void* commandBuffer)>&
       if (finished.status == MTLCommandBufferStatusError)
         impl->err("what=command_buffer f=interop label=%s error=%s", token(name).c_str(), token(str(finished.error)).c_str());
       if (*done) (*done)();
+      impl->interopInFlight.fetch_sub(1, std::memory_order_release);  // last use of *impl
     }];
     impl_->signalled(cb);
-    vpgpu::backgroundGate().waitForeground();
-    [cb commit];
+    impl_->interopInFlight.fetch_add(1, std::memory_order_relaxed);
+    impl_->commitOrdered(cb);
   }
   return true;
 }
@@ -1471,13 +1505,15 @@ bool MetalBackend::encodeInterop(const std::function<void(void* commandBuffer)>&
 void* MetalBackend::nativeTexture(TextureId handle) { return (__bridge void*)impl_->texture(handle); }
 
 bool MetalBackend::saveArchive() {
-  std::lock_guard lock(impl_->pipelineMutex);
-  if (!impl_->archive) return false;
-  NSError* e = nil;
-  const auto path = impl_->options.cacheRoot / "pipelines.metalar";
-  if ([impl_->archive serializeToURL:[NSURL fileURLWithPath:@(path.c_str())] error:&e]) return true;
-  impl_->err("what=archive_save error=%s", token(str(e)).c_str());
-  return false;
+  @autoreleasepool {
+    std::lock_guard lock(impl_->archiveMutex);
+    if (!impl_->archive) return false;
+    NSError* e = nil;
+    const auto path = impl_->options.cacheRoot / "pipelines.metalar";
+    if ([impl_->archive serializeToURL:[NSURL fileURLWithPath:@(path.c_str())] error:&e]) return true;
+    impl_->err("what=archive_save error=%s", token(str(e)).c_str());
+    return false;
+  }
 }
 
 }  // namespace vpgpu::metal

@@ -899,7 +899,7 @@ int vp_codesign_describe(const char* path, char* out, size_t out_len) {
                     txt(&t, "    execSeg base %llu limit %llu flags 0x%llx\n", (unsigned long long)((uint64_t)be32(b + 64) << 32 | be32(b + 68)),
                         (unsigned long long)((uint64_t)be32(b + 72) << 32 | be32(b + 76)), (unsigned long long)((uint64_t)be32(b + 80) << 32 | be32(b + 84)));
                 (void)hash_off;
-            } else if (magic == 0xfade0b01u) {
+            } else if (magic == 0xfade0b01u && len >= 8) {
                 describe_cms(&t, b + 8, len - 8);
             }
         }

@@ -1,0 +1,30 @@
+; Compute shader whose storage block puts a vec4 at byte 0xFFFFFFF4 and stores to its component 3: that float would sit at
+; byte 2^32, past what the 32-bit address arithmetic holds. The lowering must refuse it instead of storing at byte 0.
+OpCapability Cap:Shader
+OpMemoryModel AddrModel:Logical MemModel:GLSL450
+OpEntryPoint Model:GLCompute %main "main"
+OpExecutionMode %main ExecMode:LocalSize 1 1 1
+OpDecorate %blk Deco:Block
+OpMemberDecorate %blk 0 Deco:Offset 0
+OpMemberDecorate %blk 1 Deco:Offset 0xFFFFFFF4
+OpDecorate %buf Deco:DescriptorSet 0
+OpDecorate %buf Deco:Binding 0
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%u32 = OpTypeInt 32 0
+%i32 = OpTypeInt 32 1
+%f32 = OpTypeFloat 32
+%v4 = OpTypeVector %f32 4
+%blk = OpTypeStruct %u32 %v4
+%pblk = OpTypePointer Storage:StorageBuffer %blk
+%pf = OpTypePointer Storage:StorageBuffer %f32
+%buf = OpVariable %pblk Storage:StorageBuffer
+%c1 = OpConstant %i32 1
+%c3 = OpConstant %i32 3
+%one = OpConstant %f32 f32:1.0
+%main = OpFunction %void 0 %fn
+%l = OpLabel
+%p = OpAccessChain %pf %buf %c1 %c3
+OpStore %p %one
+OpReturn
+OpFunctionEnd

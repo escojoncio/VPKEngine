@@ -13,6 +13,7 @@
 #include <cstring>
 #include <memory>
 #include <mutex>
+#include <vector>
 
 #include "taa_native.h"
 #include "vpktaa_native_msl.h"
@@ -47,16 +48,8 @@ static_assert(sizeof(GpuEye) == 192 && sizeof(GpuParams) == 512, "layout del MSL
 
 enum : uint32_t { kHistory = 1, kDepth = 2, kRevZ = 4, kMotion = 8, kOutSrgb = 16, kMask = 32, kRcasColor = 64, kRcasDenoise = 128 };
 
-id<MTLTexture> asArray(id<MTLTexture> t) {
-  if (!t) return nil;
-  if (t.textureType == MTLTextureType2DArray || t.textureType == MTLTextureType2DMultisampleArray) return t;
-  if (t.textureType == MTLTextureType2D)
-    return [t newTextureViewWithPixelFormat:t.pixelFormat textureType:MTLTextureType2DArray levels:NSMakeRange(0, 1)
-                                     slices:NSMakeRange(0, 1)];
-  if (t.textureType == MTLTextureType2DMultisample)
-    return [t newTextureViewWithPixelFormat:t.pixelFormat textureType:MTLTextureType2DMultisampleArray
-                                     levels:NSMakeRange(0, 1) slices:NSMakeRange(0, 1)];
-  return nil;
+int64_t nowNs() {
+  return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
 }
 bool isDepthFormat(MTLPixelFormat f) {
   return f == MTLPixelFormatDepth16Unorm || f == MTLPixelFormatDepth32Float || f == MTLPixelFormatDepth32Float_Stencil8;
@@ -85,7 +78,67 @@ struct TaaNativeMetal::Impl {
   // Profundidad MSAA resuelta, por clave.
   struct Resolved {
     id<MTLTexture> tex;
+    int64_t use = 0;  // nowNs() of the last resolveDepth that used it
   } depthOut[8];
+  int64_t histUse = 0;  // nowNs() of the last encode that read or wrote the history
+  // El 2D (o 2D MSAA) de un ojo visto como array de 1 capa: una vista por textura, guardada mientras se use (hecha de nuevo cada
+  // frame era una alocación por entrada y frame). Una vista retiene su base, así que la que lleva más de kViewIdleNs sin pedirse
+  // se descarta (encode) o se suelta con las demás (release): acota cuánto vive una textura del juego ya destruida.
+  struct ArrayView {
+    id<MTLTexture> base, view;
+    int64_t use = 0;
+  };
+  std::vector<ArrayView> views;
+  static constexpr int64_t kViewIdleNs = 2'000'000'000;
+  static constexpr size_t kMaxViews = 64;
+  id<MTLTexture> asArray(id<MTLTexture> t) {
+    if (!t) return nil;
+    if (t.textureType == MTLTextureType2DArray || t.textureType == MTLTextureType2DMultisampleArray) return t;
+    if (t.textureType != MTLTextureType2D && t.textureType != MTLTextureType2DMultisample) return nil;
+    const int64_t now = nowNs();
+    for (ArrayView& v : views)
+      if (v.base == t) {
+        v.use = now;
+        return v.view;
+      }
+    id<MTLTexture> v = [t newTextureViewWithPixelFormat:t.pixelFormat
+                                            textureType:t.textureType == MTLTextureType2D ? MTLTextureType2DArray
+                                                                                           : MTLTextureType2DMultisampleArray
+                                                 levels:NSMakeRange(0, 1)
+                                                 slices:NSMakeRange(0, 1)];
+    if (v) {
+      if (views.size() >= kMaxViews) views.erase(views.begin());
+      views.push_back({t, v, now});
+    }
+    return v;
+  }
+  void dropIdleViews(int64_t now) {
+    views.erase(std::remove_if(views.begin(), views.end(), [&](const ArrayView& v) { return now - v.use > kViewIdleNs; }), views.end());
+  }
+  // Devuelve la memoria de lo que lleva sin usarse `idleMs` (0 = todo): la historia y la profundidad resuelta cuando el TAA está
+  // apagado (nadie llama a encode) o en un trim. Quien llama tiene el submitMutex (como encode). Los command buffers en vuelo
+  // retienen lo que usan. Devuelve los bytes soltados.
+  uint64_t release(uint32_t idleMs) {
+    const int64_t now = nowNs();
+    const int64_t idle = int64_t(idleMs) * 1'000'000;
+    const uint64_t before = taaBytes;
+    if (hist[0] && now - histUse >= idle) {
+      for (auto& t : hist) t = nil;
+      histW = histH = 0;
+      histValid[0] = histValid[1] = false;
+      cur = 0;
+    }
+    for (Resolved& r : depthOut)
+      if (r.tex && now - r.use >= idle) r.tex = nil;
+    for (ArrayView& v : views)
+      if (now - v.use >= idle) v.view = nil, v.base = nil;
+    views.erase(std::remove_if(views.begin(), views.end(), [](const ArrayView& v) { return !v.view; }), views.end());
+    publishBytes();
+    if (before != taaBytes)
+      logf("vk.taa native released mib=%.1f live_mib=%.1f idle_ms=%u", double(before - taaBytes) / 1048576.0,
+           double(taaBytes) / 1048576.0, idleMs);
+    return before - taaBytes;
+  }
   // Medida.
   // Estado con vida propia: el completed handler de un command buffer en vuelo puede ejecutarse
   // después de destruir este Impl (taa_ muere antes que backend_), así que lo captura por shared_ptr.
@@ -173,7 +226,10 @@ struct TaaNativeMetal::Impl {
   }
 
   bool ensureHistory(uint32_t w, uint32_t h) {
-    if (hist[0] && histW == w && histH == h) return true;
+    if (hist[0] && histW == w && histH == h) {
+      histUse = nowNs();
+      return true;
+    }
     MTLTextureDescriptor* td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA16Float
                                                                                   width:w height:h mipmapped:NO];
     td.textureType = MTLTextureType2DArray;
@@ -185,6 +241,7 @@ struct TaaNativeMetal::Impl {
       vpgpu::metal2::attr::track("taa.hist", t);
     }
     publishBytes();
+    histUse = nowNs();
     histW = w, histH = h;
     histValid[0] = histValid[1] = false;
     logf("vk.taa native history %ux%u rgba16f x2 layers x2 (%.1f MiB)", w, h, double(w) * h * 8 * 2 * 2 / 1048576.0);
@@ -196,6 +253,7 @@ struct TaaNativeMetal::Impl {
     id<MTLTexture> s = asArray(src);
     if (!s) return nullptr;
     Resolved& r = depthOut[std::clamp(key, 0, 7)];
+    r.use = nowNs();
     if (!r.tex || r.tex.width != s.width || r.tex.height != s.height || r.tex.arrayLength != s.arrayLength) {
       MTLTextureDescriptor* td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatDepth32Float
                                                                                     width:s.width height:s.height
@@ -231,6 +289,7 @@ struct TaaNativeMetal::Impl {
   bool encode(const Platform::TaaNativeArgs& a, id<MTLCommandBuffer> cb) {
     const auto* f = static_cast<const vpvk_taa_native_frame*>(a.frame);
     if (!init()) return false;
+    dropIdleViews(nowNs());
     id<MTLTexture> out = (__bridge id<MTLTexture>)f->output;
     id<MTLTexture> color[2], depth[2], motion[2], mask[2];
     for (int e = 0; e < 2; ++e) {
@@ -421,6 +480,7 @@ TaaNativeMetal::~TaaNativeMetal() { delete impl_; }
 bool TaaNativeMetal::encode(const Platform::TaaNativeArgs& a, void* cb) {
   return impl_->device && cb && a.frame && impl_->encode(a, (__bridge id<MTLCommandBuffer>)cb);
 }
+uint64_t TaaNativeMetal::release(uint32_t idleMs) { return impl_->device ? impl_->release(idleMs) : 0; }
 void* TaaNativeMetal::resolveDepth(void* cb, void* depthMS, bool reversedZ, int mode, int key) {
   return impl_->device && cb ? impl_->resolveDepth((__bridge id<MTLCommandBuffer>)cb, (__bridge id<MTLTexture>)depthMS,
                                                    reversedZ, mode, key)

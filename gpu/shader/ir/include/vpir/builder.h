@@ -23,6 +23,11 @@ public:
     // must not have functions added by anyone else until finish().
     FunctionBuilder(Module& module, std::string name, Type returnType = kVoid);
 
+    // Caps the nodes of this function (0 = no cap). A frontend that expands its input (an array value into one
+    // access per element, calls inlined) sets it so a hostile input fails with std::length_error instead of
+    // exhausting memory.
+    void setNodeLimit(size_t nodes) { limit_ = nodes; }
+
     ValueId param(Type t);
     uint32_t variable(Type t);
 
@@ -83,12 +88,16 @@ private:
 
     Module& module_;
     size_t index_;
-    // Path from the function body to the innermost open region: node index + which branch.
+    // Path from the function body to the innermost open region: node index + which branch, and the
+    // block being filled. Child blocks live in nodes of heap buffers of their parents, which are not
+    // appended to while the child is open, so the pointer stays valid (only the function body can move).
     struct Open {
         size_t node;
         bool inElse;
+        Block* inner;
     };
     std::vector<Open> open_;
+    size_t limit_ = 0, nodes_ = 0;
 };
 
 }  // namespace vpir

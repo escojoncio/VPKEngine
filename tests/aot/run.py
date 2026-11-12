@@ -76,7 +76,7 @@ def main():
             if x86:
                 sources.append(ROOT / "tests" / "aot" / "native_x86.c")
             run([CC, "-O2", "-g", "-std=gnu11", "-frounding-math", "-Wall", "-Wno-unused-variable", "-Wno-unused-but-set-variable",
-                 "-Wno-unused-label", "-I", ROOT / "runtime", "-o", out / "harness", *sources, "-lm", "-latomic"])
+                 "-Wno-unused-label", "-I", ROOT / "runtime", *os.environ.get("VPCFLAGS", "").split(), "-o", out / "harness", *sources, "-lm", "-latomic"])
             golden = GOLDEN / f"{name}.txt"
             cmd = [out / "harness", out / "code.bin"]
             needs = [f for l in case.read_text().splitlines() if l.startswith("# requires:")
@@ -137,7 +137,8 @@ def main():
     except RuntimeError as e:
         failed.append("self_loader")
         print(f"FAIL self_loader\n{e}")
-    print(f"{len(cases) - len(failed)}/{len(cases)} passed")
+    case_failures = [f for f in failed if f != "self_loader"]  # (self_loader is a check of its own, not one of `cases`)
+    print(f"{len(cases) - len(case_failures)}/{len(cases)} passed" + (", self_loader FAILED" if "self_loader" in failed else ""))
     return 1 if failed else 0
 
 

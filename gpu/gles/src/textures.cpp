@@ -176,7 +176,7 @@ bool Context::realizeTexture(Texture& t, bool carries) {
     mai.memoryTypeIndex = uint32_t(dev->memoryType(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT));
     dev->vk.vkAllocateMemory(dev->device, &mai, nullptr, &img->memory);
     dev->vk.vkBindImageMemory(dev->device, img->image, img->memory, 0);
-    imageInit(*img);
+    deferImageInit(img);
     // Keep the old image alive until recorded work that samples it has run.
     if (t.image) keep(t.image);
     t.image = img;
@@ -225,12 +225,20 @@ void Context::carryTexels(const ImageP& old, Texture& t) {
     barrier();
 }
 
-void Context::copyBufferToImage(Image& img, uint32_t level, uint32_t layer, int32_t x, int32_t y, int32_t z,
+void Context::copyBufferToImage(const ImageP& img, uint32_t level, uint32_t layer, int32_t x, int32_t y, int32_t z,
                                 uint32_t w, uint32_t h, uint32_t d, const uint8_t* data, size_t bytes, bool stencilPlane) {
     Alloc a = stream(bytes, 16);
     std::memcpy(a.host, data, bytes);
-    barrier();
-    VkBufferImageCopy r{};
+    queueUpload(img, level, layer, x, y, z, w, h, d, a, stencilPlane);
+}
+
+void Context::queueUpload(const ImageP& image, uint32_t level, uint32_t layer, int32_t x, int32_t y, int32_t z, uint32_t w,
+                          uint32_t h, uint32_t d, const Alloc& a, bool stencilPlane) {
+    Image& img = *image;
+    Xfer xf;
+    xf.image = image;
+    xf.buffer = a.buffer;
+    VkBufferImageCopy& r = xf.region;
     r.bufferOffset = a.offset;
     r.imageSubresource = {stencilPlane ? VkImageAspectFlags(VK_IMAGE_ASPECT_STENCIL_BIT)
                                        : img.aspect() & ~VkImageAspectFlags(img.format->stencil && img.format->depth ? VK_IMAGE_ASPECT_STENCIL_BIT : 0),
@@ -240,8 +248,10 @@ void Context::copyBufferToImage(Image& img, uint32_t level, uint32_t layer, int3
     if (img.type != VK_IMAGE_TYPE_3D) r.imageSubresource.baseArrayLayer = layer + uint32_t(z);
     img.invalid.clear();
     if (level < 32) img.written |= 1u << level;
-    dev->vk.vkCmdCopyBufferToImage(cmd(), a.buffer, img.image, VK_IMAGE_LAYOUT_GENERAL, 1, &r);
-    barrier();
+    // Recorded when the open pass ends (or at once when none is open: nothing would be gained by waiting).
+    xfers_.push_back(std::move(xf));
+    ++img.xferPending;
+    if (!passOpen_) recordTransfers();
 }
 
 // Uploads kept for levels above 0 are dropped when TexImage specifies that (level, face) anew. Returns the bytes freed.
@@ -284,7 +294,7 @@ void Context::flushPending(Texture& t) {
             if (lv.format != im.format || lv.w != std::max(1u, im.width >> u.level) || lv.h != std::max(1u, im.height >> u.level) ||
                 lv.d != depthAt)
                 continue;  // the level no longer fits the base: it stays undefined, as GL leaves it
-            copyBufferToImage(*t.image, u.level, u.layer, u.x, u.y, u.z, u.w, u.h, u.d, u.data.data(), u.data.size());
+            copyBufferToImage(t.image, u.level, u.layer, u.x, u.y, u.z, u.w, u.h, u.d, u.data.data(), u.data.size());
         }
     }
     t.pending.clear(), t.pending.shrink_to_fit(), t.pendingBytes = 0;
@@ -423,7 +433,7 @@ void Context::texImage(GLenum target, GLint level, GLenum internalFormat, GLsize
         const size_t need = size_t(compressedSize(*fi, uint32_t(w), uint32_t(h))) * depthN;
         if (size_t(imageSize) != need) return setError(gl::INVALID_VALUE);
         if (early) queuePending(*t, uint32_t(level), layer, xo, yo, zo, uint32_t(w), uint32_t(h), depthN, src, need);
-        else copyBufferToImage(*t->image, uint32_t(level), layer, xo, yo, zo, uint32_t(w), uint32_t(h), depthN, src, need);
+        else copyBufferToImage(t->image, uint32_t(level), layer, xo, yo, zo, uint32_t(w), uint32_t(h), depthN, src, need);
         return;
     }
     const uint32_t px = clientPixelBytes(format, type);
@@ -433,15 +443,33 @@ void Context::texImage(GLenum target, GLint level, GLenum internalFormat, GLsize
     const uint32_t align = uint32_t(unpackAlignment);
     const size_t rowBytes = (size_t(rowLen) * px + align - 1) / align * align;
     const uint32_t imgH = unpackImageHeight ? uint32_t(unpackImageHeight) : uint32_t(h);
-    std::vector<uint8_t> tight(size_t(w) * h * depthN * px);
-    for (uint32_t z = 0; z < depthN; ++z)
-        for (uint32_t y = 0; y < uint32_t(h); ++y) {
-            const uint8_t* row = src + (size_t(z + unpackSkipImages) * imgH + y + unpackSkipRows) * rowBytes +
-                                 size_t(unpackSkipPixels) * px;
-            std::memcpy(&tight[(size_t(z) * h + y) * w * px], row, size_t(w) * px);
+    // Rows already tight (the default unpack state): the source is converted in place, no second copy of it.
+    const bool tightSrc = rowBytes == size_t(w) * px && !unpackSkipPixels && !unpackSkipRows && !unpackSkipImages &&
+                          (depthN == 1 || imgH == uint32_t(h));
+    std::vector<uint8_t> tight;
+    if (!tightSrc) {
+        tight.resize(size_t(w) * h * depthN * px);
+        for (uint32_t z = 0; z < depthN; ++z)
+            for (uint32_t y = 0; y < uint32_t(h); ++y) {
+                const uint8_t* row = src + (size_t(z + unpackSkipImages) * imgH + y + unpackSkipRows) * rowBytes +
+                                     size_t(unpackSkipPixels) * px;
+                std::memcpy(&tight[(size_t(z) * h + y) * w * px], row, size_t(w) * px);
+            }
+    }
+    const uint8_t* rows = tightSrc ? src : tight.data();
+    const uint32_t texels = uint32_t(w) * h * depthN;
+    if (!early && !(fi->depth && fi->stencil && format == gl::DEPTH_STENCIL)) {
+        // Converted straight into the staging memory of the upload: no vector of the size of the image on the way.
+        const Alloc a = stream(VkDeviceSize(texels) * fi->texelBytes, 16);
+        if (!convertUploadTo(*fi, format, type, rows, texels, a.host)) {
+            logf("gles.err what=upload_conversion format=0x%x type=0x%x internal=0x%x", format, type, fi->internal);
+            return setError(gl::INVALID_OPERATION);
         }
+        queueUpload(t->image, uint32_t(level), layer, xo, yo, zo, uint32_t(w), uint32_t(h), depthN, a);
+        return;
+    }
     std::vector<uint8_t> converted;
-    if (!convertUpload(*fi, format, type, tight.data(), uint32_t(w) * h * depthN, converted)) {
+    if (!convertUpload(*fi, format, type, rows, texels, converted)) {
         logf("gles.err what=upload_conversion format=0x%x type=0x%x internal=0x%x", format, type, fi->internal);
         return setError(gl::INVALID_OPERATION);
     }
@@ -464,10 +492,10 @@ void Context::texImage(GLenum target, GLint level, GLenum internalFormat, GLsize
                 splane[i] = uint8_t(q >> 24);
             }
         }
-        copyBufferToImage(*t->image, uint32_t(level), layer, xo, yo, zo, uint32_t(w), uint32_t(h), depthN, dplane.data(), dplane.size());
-        copyBufferToImage(*t->image, uint32_t(level), layer, xo, yo, zo, uint32_t(w), uint32_t(h), depthN, splane.data(), splane.size(), true);
+        copyBufferToImage(t->image, uint32_t(level), layer, xo, yo, zo, uint32_t(w), uint32_t(h), depthN, dplane.data(), dplane.size());
+        copyBufferToImage(t->image, uint32_t(level), layer, xo, yo, zo, uint32_t(w), uint32_t(h), depthN, splane.data(), splane.size(), true);
     } else
-        copyBufferToImage(*t->image, uint32_t(level), layer, xo, yo, zo, uint32_t(w), uint32_t(h), depthN, converted.data(),
+        copyBufferToImage(t->image, uint32_t(level), layer, xo, yo, zo, uint32_t(w), uint32_t(h), depthN, converted.data(),
                           converted.size());
 }
 
@@ -701,7 +729,7 @@ void Context::copyTexImage(GLenum target, GLint level, GLenum internalFormat, GL
                 else o[0] = row[4 * i], o[1] = row[4 * i + 3];
             }
         }
-        copyBufferToImage(*t->image, uint32_t(level), isCubeFace(target) ? face : 0, xo + (sx - x), yo + (sy - y), isCubeFace(target) ? 0 : zo, cw,
+        copyBufferToImage(t->image, uint32_t(level), isCubeFace(target) ? face : 0, xo + (sx - x), yo + (sy - y), isCubeFace(target) ? 0 : zo, cw,
                           ch, 1, out.data(), out.size());
         return;
     }

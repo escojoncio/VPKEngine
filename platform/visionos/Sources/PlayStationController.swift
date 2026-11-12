@@ -65,6 +65,7 @@ final class PlayStationController: @unchecked Sendable {
 
     /// Starts watching for controllers. On the main thread.
     func start() {
+        guard observers.isEmpty else { return choose() } // already watching: a second call would double every notification
         GCController.shouldMonitorBackgroundEvents = true
         let center = NotificationCenter.default
         observers.append(center.addObserver(forName: .GCControllerDidConnect, object: nil, queue: .main) { [weak self] _ in

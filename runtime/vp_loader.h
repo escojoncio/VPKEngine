@@ -47,7 +47,8 @@ int vp_load_image_at(const char* path, uint64_t load_at, VpImportResolver resolv
  * is the one it was translated from (link base and code fingerprint). */
 int vp_load_module(const char* path, VpModule* module, uint64_t load_at, VpImportResolver resolve, void* user, VpLoadedImage* out);
 
-/* Maps `size` bytes read/write at exactly `at` (guest addresses are host addresses). */
+/* Maps `size` bytes read/write at exactly `at` (guest addresses are host addresses). Returns -1,
+ * mapping nothing, when any of that range (rounded to 64 KB) is already mapped. */
 int vp_map_fixed(uint64_t at, uint64_t size);
 
 #ifdef __cplusplus

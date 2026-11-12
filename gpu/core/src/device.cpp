@@ -118,30 +118,21 @@ SamplerId Device::createSampler(SamplerDesc d) {
   return id;
 }
 
+// The backend destroy runs under resMutex_: once the slot is free another thread can create into the same index, and its
+// backend create must not reach the backend before this destroy (resMutex_ comes before every backend table lock).
 void Device::destroy(BufferId id) {
-  bool gone;
-  {
-    std::lock_guard lock(resMutex_);
-    gone = resources_.destroy(id);
-  }
-  if (gone) backend_.destroyBuffer(id);
+  std::lock_guard lock(resMutex_);
+  if (resources_.destroy(id)) backend_.destroyBuffer(id);
 }
 void Device::destroy(TextureId id) {
-  bool gone;
-  {
-    std::lock_guard lock(resMutex_);
-    gone = resources_.destroy(id);
-    if (gone) keptStoreSeen_.erase(uint64_t{id.generation} << 32 | id.index);
-  }
-  if (gone) backend_.destroyTexture(id);
+  std::lock_guard lock(resMutex_);
+  if (!resources_.destroy(id)) return;
+  keptStoreSeen_.erase(uint64_t{id.generation} << 32 | id.index);
+  backend_.destroyTexture(id);
 }
 void Device::destroy(SamplerId id) {
-  bool gone;
-  {
-    std::lock_guard lock(resMutex_);
-    gone = resources_.destroy(id);
-  }
-  if (gone) backend_.destroySampler(id);
+  std::lock_guard lock(resMutex_);
+  if (resources_.destroy(id)) backend_.destroySampler(id);
 }
 
 void Device::trackRenderTargets(uint64_t index, const CompiledFrame& compiled, std::vector<std::string>& lines) {
@@ -293,7 +284,7 @@ void Device::trackRenderTargets(uint64_t index, const CompiledFrame& compiled, s
 }
 
 FrameReport Device::submit(const Frame& frame) {
-  const uint64_t index = frame_++;
+  const uint64_t index = frame_.fetch_add(1, std::memory_order_relaxed);
   const auto start = std::chrono::steady_clock::now();
   compile_.splitViews = splitViewsSwitch().load(std::memory_order_relaxed) != 0;  // run-time switch: read once per frame
   // Run-time heavy-geometry limit (0 = the value this Device started with). One above it applies to frames only while it is
@@ -554,8 +545,8 @@ FrameReport Device::submit(const Frame& frame) {
           }
           std::snprintf(buf, sizeof buf, "pass=%zu kind=render label=%s fmt=%s %ux%ux%u samples=%u draws=%u merged=%u rp=%s",
                         i, label.empty() ? "-" : label.substr(0, 40).c_str(),
-                        td ? formatInfo(td->format).name : "-", td ? td->width >> a.mip : 0u,
-                        td ? td->height >> a.mip : 0u, unsigned(e.pass.layerCount), td ? unsigned(td->samples) : 0u,
+                        td ? formatInfo(td->format).name : "-", td ? mipShift(td->width, a.mip) : 0u,
+                        td ? mipShift(td->height, a.mip) : 0u, unsigned(e.pass.layerCount), td ? unsigned(td->samples) : 0u,
                         draws, e.passes, rps.empty() ? "-" : rps.c_str());
         } else {
           uint32_t dispatches = 0, copies = 0;
@@ -619,18 +610,16 @@ FrameReport Device::submit(const Frame& frame) {
     }
     // Slow frames: all of the first 200, then one in four (a game that runs slow throughout, ITR2, made
     // this the loudest tag; gpu.sec above keeps p50/p95/max/over10 of every frame, so nothing is lost).
-    static uint64_t slowLogged = 0;
     if (!(done < 300 || done % 90 == 0)) {
       if (!(t.frameMs > 12.0)) continue;
-      if (slowLogged++ >= 200 && (slowLogged & 3)) continue;
+      if (slowLogged_++ >= 200 && (slowLogged_ & 3)) continue;
     }
     char buf[64];
     std::snprintf(buf, sizeof buf, "gpu.time f=%llu gpu_ms=%.3f", (unsigned long long)done, t.frameMs);
     std::string line = buf;
     // Slow frames carry each encoder's GPU time (submission order) so the costly pass shows
     // without the "Diagnóstico de rendimiento" switch. Every 2nd logged slow frame (1 in 8 of the slow ones), to keep the log small.
-    static uint64_t slowSeen = 0;
-    if (t.frameMs > 12.0 && !t.encoderMs.empty() && (slowSeen++ % 2) == 0) {
+    if (t.frameMs > 12.0 && !t.encoderMs.empty() && (slowSeen_++ % 2) == 0) {
       line += " enc_ms=";
       for (size_t i = 0; i < t.encoderMs.size() && i < 24; ++i) {
         char e[16];

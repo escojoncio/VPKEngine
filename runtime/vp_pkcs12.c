@@ -6,10 +6,18 @@
  */
 #include "vp_pkcs12.h"
 
+#include <pthread.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+/* memset that the optimizer may not drop: for secrets in memory that is freed or goes out of scope
+ * right after (explicit_bzero is not in every SDK). */
+static void wipe(void* p, size_t n) {
+    static void* (*const volatile zero)(void*, int, size_t) = memset;
+    zero(p, 0, n);
+}
 
 /* ---- the system's ciphers ---------------------------------------------------------------- */
 
@@ -59,9 +67,11 @@ static void hmac(int h, const uint8_t* key, size_t klen, const uint8_t* d, size_
 }
 
 
+static pthread_once_t providers_once = PTHREAD_ONCE_INIT;
+static void load_providers(void) { OSSL_PROVIDER_load(NULL, "legacy"); OSSL_PROVIDER_load(NULL, "default"); }
+
 static int cbc_decrypt(int c, const uint8_t* key, size_t klen, const uint8_t* iv, const uint8_t* in, size_t n, uint8_t* out, size_t* out_len) {
-    static int providers;
-    if (!providers) { OSSL_PROVIDER_load(NULL, "legacy"); OSSL_PROVIDER_load(NULL, "default"); providers = 1; }
+    pthread_once(&providers_once, load_providers);
     const EVP_CIPHER* cipher = c == C_3DES ? EVP_des_ede3_cbc()
                              : c == C_RC2 ? EVP_rc2_cbc()
                              : klen == 16 ? EVP_aes_128_cbc() : klen == 24 ? EVP_aes_192_cbc() : EVP_aes_256_cbc();
@@ -90,14 +100,13 @@ static int pbkdf2(int h, const uint8_t* pw, size_t pwlen, const uint8_t* salt, s
     if (!block) return -1;
     if (slen) memcpy(block, salt, slen);
     if (!pw) pw = &none;
-    uint8_t U[64], T[64];
+    uint8_t U[64], T[64], next[64];
     for (uint32_t index = 1; n; ++index) {
         block[slen] = (uint8_t)(index >> 24); block[slen + 1] = (uint8_t)(index >> 16);
         block[slen + 2] = (uint8_t)(index >> 8); block[slen + 3] = (uint8_t)index;
         hmac(h, pw, pwlen, block, slen + 4, U);
         memcpy(T, U, u);
         for (unsigned long i = 1; i < iter; ++i) {
-            uint8_t next[64];
             hmac(h, pw, pwlen, U, u, next);
             memcpy(U, next, u);
             for (size_t k = 0; k < u; ++k) T[k] ^= U[k];
@@ -107,6 +116,7 @@ static int pbkdf2(int h, const uint8_t* pw, size_t pwlen, const uint8_t* salt, s
         out += take;
         n -= take;
     }
+    wipe(U, sizeof U); wipe(T, sizeof T); wipe(next, sizeof next);
     free(block);
     return 0;
 }
@@ -218,6 +228,7 @@ static int p12_kdf(int h, const uint8_t* pw, size_t pwlen, const uint8_t* salt, 
             }
         }
     }
+    wipe(buf, v + ilen); wipe(A, sizeof A); wipe(B, sizeof B); /* the password is tiled into buf */
     free(buf);
     return 0;
 }
@@ -265,11 +276,10 @@ static const uint8_t OID_PKCS12_PBE[] = {0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x0
 
 /* Decrypts `in` with the algorithm `alg` (an AlgorithmIdentifier's contents). The plaintext is
  * malloc'd. Returns a VP_P12_* code. */
-static int decrypt(Span alg, Span in, const Password* pw, uint8_t** out, size_t* out_len) {
+static int decrypt_with(Span alg, Span in, const Password* pw, uint8_t** out, size_t* out_len, uint8_t key[32], uint8_t iv[16]) {
     Span oid, params;
     if (der_expect(&alg, 0x06, &oid)) return VP_P12_MALFORMED;
     if (der_expect(&alg, 0x30, &params)) return VP_P12_MALFORMED;
-    uint8_t key[32], iv[16];
     size_t key_len = 0;
     int cipher = 0;
     if (oid.n == sizeof OID_PKCS12_PBE + 1 && !memcmp(oid.p, OID_PKCS12_PBE, sizeof OID_PKCS12_PBE)) {
@@ -347,6 +357,14 @@ static int decrypt(Span alg, Span in, const Password* pw, uint8_t** out, size_t*
     *out = plain;
     *out_len = plain_len;
     return VP_P12_OK;
+}
+
+/* The key and IV derived from the password are wiped on every way out. */
+static int decrypt(Span alg, Span in, const Password* pw, uint8_t** out, size_t* out_len) {
+    uint8_t key[32], iv[16];
+    const int r = decrypt_with(alg, in, pw, out, out_len, key, iv);
+    wipe(key, sizeof key); wipe(iv, sizeof iv);
+    return r;
 }
 
 /* ---- bags -------------------------------------------------------------------------------- */
@@ -452,7 +470,7 @@ static int read_safe_contents(Reader* r, Span contents) {
                     rc = VP_P12_BAD_PASSWORD;
                 }
                 if (!rc && !had && r->out->key) { memcpy(r->key_id, id, id_len); r->key_id_len = id_len; }
-                memset(plain, 0, plain_len);
+                wipe(plain, plain_len); /* the decrypted private key */
                 free(plain);
             }
         } else if (OID_IS(type, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x0c, 0x0a, 0x01, 0x03)) { /* certBag */
@@ -495,6 +513,7 @@ static int verify_mac(Span mac_data, Span auth_content, const Password* pw) {
     uint8_t key[64], mac[64];
     if (p12_kdf(h, pw->bmp, pw->bmp_len, salt.p, salt.n, 3, iter, key, u)) return VP_P12_NO_MEMORY;
     hmac(h, key, u, auth_content.p, auth_content.n, mac);
+    wipe(key, sizeof key);
     if (memcmp(mac, digest.p, u)) {
         say(pw->err, pw->err_len, "wrong password (the file's integrity check does not match)");
         return VP_P12_BAD_PASSWORD;
@@ -563,6 +582,7 @@ static int read_with(const uint8_t* der, size_t len, const Password* pw, VpPkcs1
                 say(pw->err, pw->err_len, "the password does not decrypt the certificates");
                 r = VP_P12_BAD_PASSWORD;
             }
+            wipe(plain, plain_len); /* may hold a key bag */
             free(plain);
             if (r) return r;
         }
@@ -595,7 +615,7 @@ const uint8_t* vp_pkcs12_cert(const VpPkcs12* p, int i, size_t* len) {
 
 void vp_pkcs12_free(VpPkcs12* p) {
     if (!p) return;
-    if (p->key) { memset(p->key, 0, p->key_len); free(p->key); }
+    if (p->key) { wipe(p->key, p->key_len); free(p->key); }
     for (int i = 0; i < p->cert_count; ++i) free(p->certs[i]);
     memset(p, 0, sizeof *p);
 }
@@ -617,6 +637,7 @@ int vp_pkcs12_read(const uint8_t* der, size_t len, const char* password, VpPkcs1
         Password none = {password, bmp, 0, err, err_len};
         r = read_with(der, len, &none, out);
     }
+    wipe(bmp, bmp_len); /* the password, as UTF-16 */
     free(bmp);
     if (r) vp_pkcs12_free(out);
     return r;

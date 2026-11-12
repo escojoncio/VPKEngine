@@ -1,0 +1,19 @@
+; A 16 MiB private array filled with constants at constant addresses and read at a run-time address would be a
+; program-scope constant table (planConstTables): 4 M words of zeros, ~260 MB of MSL. Tables over 64 KiB stay arrays.
+module fragment
+private_slot 16777216
+
+input i : u32 location(0) flat
+output color : vec4<f32> location(0)
+
+func main() {
+  %0 = load_input i : u32
+  %1 = const 0 : u32
+  %2 = const 1065353216 : u32
+  store private_0, %1, %2
+  %3 = const 4 : u32
+  %4 = mul %0, %3 : u32
+  %5 = load private_0, %4 : f32
+  %6 = construct %5, %5, %5, %5 : vec4<f32>
+  store_output color, %6
+}

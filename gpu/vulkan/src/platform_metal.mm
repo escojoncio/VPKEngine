@@ -9,6 +9,7 @@
 #include "vpvk.h"
 #include "taa_native_metal.h"
 
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <mutex>
@@ -54,9 +55,21 @@ class MetalPlatform final : public Platform {
   void dumpInFlight(const char* why) override { backend_.dumpInFlight(why); }
   uint32_t gpuBacklogMs() const override { return backend_.gpuBacklogMs(); }
   uint32_t lastFrameChunks() const override { return backend_.lastFrameHangSplits(); }
-  size_t trimMemory(int level, std::string& report) override { return backend_.trimMemory(level, report); }
-  size_t drainRetired(uint32_t minIdleMs, std::string& report) override { return backend_.drainRetired(minIdleMs, report); }
-  size_t trimSerialized(std::string& report) override { return backend_.trimSerialized(report); }
+  size_t trimMemory(int level, std::string& report) override {
+    if (level) taaTrim_.store(true, std::memory_order_relaxed);  // the TAA state is released by trimSerialized (submit mutex held)
+    return backend_.trimMemory(level, report);
+  }
+  // Both below run with the submit mutex held, as taaNativeEncode: the TAA's textures are ours. The history and resolved depth
+  // of a TAA that is switched off (nothing encodes) go after kTaaIdleMs; a trim also takes what nothing used for kTaaTrimIdleMs.
+  size_t drainRetired(uint32_t minIdleMs, std::string& report) override {
+    if (taa_) taa_->release(kTaaIdleMs);
+    return backend_.drainRetired(minIdleMs, report);
+  }
+  size_t trimSerialized(std::string& report) override {
+    const size_t moved = backend_.trimSerialized(report);
+    if (taa_ && taaTrim_.exchange(false, std::memory_order_relaxed)) return moved + size_t(taa_->release(kTaaTrimIdleMs));
+    return moved;
+  }
   void diagCounters(std::vector<std::pair<const char*, uint64_t>>& out) const override { backend_.diagCounters(out); }
   void diagRanges(std::vector<std::pair<uintptr_t, uint64_t>>& out) const override { backend_.diagRanges(out); }
   std::string archiveSummary() override {
@@ -183,6 +196,8 @@ class MetalPlatform final : public Platform {
     if (!taa_) taa_ = std::make_unique<TaaNativeMetal>(backend_.nativeDevice());
     return taa_.get();
   }
+  static constexpr uint32_t kTaaIdleMs = 5000, kTaaTrimIdleMs = 250;
+  std::atomic<bool> taaTrim_{false};  // trimMemory asked: trimSerialized releases the TAA's idle textures
   vpgpu::metal2::ShaderTable shaders_;
   vpgpu::metal2::MetalBackend backend_;
   std::unique_ptr<TaaNativeMetal> taa_;

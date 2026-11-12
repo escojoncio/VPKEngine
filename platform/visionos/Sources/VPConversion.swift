@@ -243,13 +243,20 @@ final class VPConversion {
             return -20
         }
         // For the next conversion of the game (made for another reason): part of its pack then.
-        let line = "\(module)+0x\(String(offset, radix: 16))\n"
-        if let handle = try? FileHandle(forWritingTo: missingLog(for: game)) {
-            handle.seekToEndOfFile()
-            handle.write(Data(line.utf8))
-            try? handle.close()
-        } else {
-            try? line.write(to: missingLog(for: game), atomically: true, encoding: .utf8)
+        // Once: the file keeps what earlier sessions wrote (a fragment built before is loaded again
+        // in every session), and the runtime writes the same lines (vp_note_missing).
+        let entry = "\(module)+0x\(String(offset, radix: 16))"
+        let line = entry + "\n"
+        let file = missingLog(for: game)
+        let written = (try? String(contentsOf: file, encoding: .utf8)) ?? ""
+        if !written.split(whereSeparator: \.isNewline).contains(where: { $0 == entry }) {
+            if let handle = try? FileHandle(forWritingTo: file) {
+                _ = try? handle.seekToEnd()
+                try? handle.write(contentsOf: Data(line.utf8))
+                try? handle.close()
+            } else {
+                try? line.write(to: file, atomically: true, encoding: .utf8)
+            }
         }
         VPGamePack.log(String(format: "VPKEngine: on demand: %@+0x%@ ready in %.2f s", module, String(offset, radix: 16), Date().timeIntervalSince(started)))
         return 0
@@ -741,7 +748,16 @@ final class ConversionLog: @unchecked Sendable {
     }
 
     func beginRun(reason: String, game: URL, jobs: Int, previous: Timing, foreground: Bool) {
-        queue.sync { runStart = Date() }
+        queue.sync {
+            runStart = Date()
+            // The log is appended to forever: past 4 MB the earlier runs go to conversion.log.old (one copy).
+            let size = (try? FileManager.default.attributesOfItem(atPath: url.path)[.size] as? Int) ?? 0
+            if size > 4 << 20 {
+                let old = url.appendingPathExtension("old")
+                try? FileManager.default.removeItem(at: old)
+                try? FileManager.default.moveItem(at: url, to: old)
+            }
+        }
         let info = ProcessInfo.processInfo
         let free = (try? URL(fileURLWithPath: NSHomeDirectory()).resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey]))?
             .volumeAvailableCapacityForImportantUsage ?? 0
@@ -773,8 +789,8 @@ final class ConversionLog: @unchecked Sendable {
     private func append(_ text: String) {
         let data = Data(text.utf8)
         if let handle = try? FileHandle(forWritingTo: url) {
-            handle.seekToEndOfFile()
-            handle.write(data)
+            _ = try? handle.seekToEnd()
+            try? handle.write(contentsOf: data)
             try? handle.close()
         } else {
             try? data.write(to: url)

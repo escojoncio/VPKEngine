@@ -44,6 +44,8 @@ class BackgroundGate {
   // Called before committing a command buffer: returns at once in the foreground and on the main thread, else parks
   // until foreground, release() or shutdown().
   void waitForeground();
+  // True when waitForeground() on this thread would park right now (it does not park).
+  bool wouldPark() const;
   // Wakes the threads parked now (a backend being destroyed waits for their command buffers); a later pause parks again.
   void release();
   // release() and never park again.

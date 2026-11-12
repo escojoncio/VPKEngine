@@ -504,9 +504,21 @@ enum VPGamePack {
         let folder = VPKLegacy.folder(in: FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0])
             .appendingPathComponent("OnDemand", isDirectory: true)
         try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        // This library's copies made for an earlier version of it (another size, date or certificate)
+        // stay otherwise for good: "<name>-<24 hex of the tag>-<variant>.dylib" with another tag goes.
+        let stem = source.deletingPathExtension().lastPathComponent
+        for old in (try? FileManager.default.contentsOfDirectory(at: folder, includingPropertiesForKeys: nil)) ?? [] {
+            let file = old.lastPathComponent
+            guard file.hasPrefix(stem + "-") else { continue }
+            let rest = file.dropFirst(stem.count + 1)
+            let isTag = rest.count > 25 && rest.prefix(24).allSatisfy { $0.isHexDigit } && rest[rest.index(rest.startIndex, offsetBy: 24)] == "-"
+            if isTag && !rest.hasPrefix(tag + "-") {
+                try? FileManager.default.removeItem(at: old)
+            }
+        }
         var lastReason = "?"
         for variant in SignatureVariant.ordered() {
-            let signed = folder.appendingPathComponent("\(source.deletingPathExtension().lastPathComponent)-\(tag)-\(variant.name).dylib")
+            let signed = folder.appendingPathComponent("\(stem)-\(tag)-\(variant.name).dylib")
             if !FileManager.default.fileExists(atPath: signed.path) {
                 let partial = signed.appendingPathExtension("partial")
                 try? FileManager.default.removeItem(at: partial)

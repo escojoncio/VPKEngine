@@ -106,6 +106,17 @@ static int write_registry(int argc, char** argv) {
     return 0;
 }
 
+// One whole line (any length): a line longer than a fixed buffer would be read as several.
+static bool read_line(FILE* f, std::string& line) {
+    line.clear();
+    char buf[512];
+    while (fgets(buf, sizeof buf, f)) {
+        line += buf;
+        if (line.back() == '\n') return true;
+    }
+    return !line.empty();
+}
+
 int main(int argc, char** argv) {
     if (argc >= 2 && !strcmp(argv[1], "--registry")) return write_registry(argc, argv);
     std::string elf, raw, out, stats_path;
@@ -161,12 +172,12 @@ int main(int argc, char** argv) {
             // the module changes in it before it runs. Translated as changed.
             FILE* pf = fopen(patch_file.c_str(), "r");
             if (!pf) throw std::runtime_error("cannot read " + patch_file);
-            char buf[4096];
+            std::string line;
             size_t changed = 0;
-            while (fgets(buf, sizeof buf, pf)) {
+            while (read_line(pf, line)) {
                 char* end = nullptr;
-                const uint64_t off = strtoull(buf, &end, 16);
-                if (end == buf) continue;
+                const uint64_t off = strtoull(line.c_str(), &end, 16);
+                if (end == line.c_str()) continue;
                 char* p = end;
                 while (*p == ' ' || *p == '\t') ++p;
                 for (uint64_t k = 0; isxdigit((unsigned char)p[0]) && isxdigit((unsigned char)p[1]); p += 2, ++k) {
@@ -185,10 +196,10 @@ int main(int argc, char** argv) {
         for (const auto& path : roots_files) {
             FILE* rf = fopen(path.c_str(), "r");
             if (!rf) throw std::runtime_error("cannot read " + path);
-            char buf[512];
+            std::string line;
             size_t added = 0;
-            while (fgets(buf, sizeof buf, rf)) {
-                char* p = buf;
+            while (read_line(rf, line)) {
+                char* p = line.data();
                 if (char* hash = strchr(p, '#')) *hash = 0;
                 if (char* plus = strchr(p, '+')) {
                     // "module+0xOFF": only this module's lines (a log covers every module of a game).

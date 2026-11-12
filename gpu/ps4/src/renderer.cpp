@@ -55,6 +55,10 @@ constexpr uint64_t kRingBytes = 16ull << 20;
 constexpr uint64_t kPage = 16384;
 constexpr uint64_t kGdsBytes = 64 * 1024;
 constexpr uint64_t kDummyBytes = 64 * 1024;
+// Cached GPU objects (targets, textures, samplers, translated shaders) that no draw, sample or flip used for kEvictIdle submits
+// are released (checked every kSweepEvery submits): a game that loads levels or changes resolution would otherwise keep every
+// surface it ever made. The idle time is long: whatever the game still uses is touched far more often than that.
+constexpr uint64_t kEvictIdle = 2048, kSweepEvery = 128;
 
 vpgpu::Primitive toPrimitive(PrimitiveType p) {
     switch (p) {
@@ -258,6 +262,7 @@ struct Renderer::Impl {
         void* memory = nullptr;
         BufferId id;
     } dummy;
+    bool dummyDirty = false;  // a draw bound it writable since it was cleared
     bool dummyBuffer() {
         if (dummy.id) return true;
         if (!dummy.memory) dummy.memory = std::aligned_alloc(kPage, kDummyBytes);
@@ -364,8 +369,10 @@ struct Renderer::Impl {
         std::vector<vpgcn::Binding> bindings;
         std::vector<vpir::Resource> resources;  // Module::resources (kind index, access)
         std::optional<uint32_t> userDataSlot;
+        mutable uint64_t lastUse = 0;  // submit (Renderer::frame_) of the last draw that asked for it
     };
     std::unordered_map<uint64_t, std::vector<vpgcn::Binding>> sourcesByProgram;  // level 1
+    std::unordered_map<uint64_t, uint64_t> sourceUse;                              // level 1: last submit that asked
     std::unordered_map<uint64_t, Translated> translated;                          // level 2
     std::set<uint64_t> registered;
 
@@ -522,8 +529,18 @@ struct Renderer::Impl {
         return m.key;
     }
 
+    std::vector<std::pair<const vpgcn::DescriptorSource*, vpgcn::DescriptorInfo>> infoScratch;  // lookupShader's, reused
+    std::vector<uint32_t> wordsScratch;
+
     const Translated* shader(const Stage& s, vpgcn::ShaderStage stage) {
+        const Translated* t = lookupShader(s, stage);
+        t->lastUse = r.frame_;
+        return t;
+    }
+
+    const Translated* lookupShader(const Stage& s, vpgcn::ShaderStage stage) {
         const uint64_t key1 = programKeyCached(s, stage);
+        sourceUse[key1] = r.frame_;
         auto it1 = sourcesByProgram.find(key1);
         if (it1 == sourcesByProgram.end()) {
             vpgcn::LiftResult first = vpgcn::lift(liftInput(s, stage));
@@ -540,29 +557,34 @@ struct Renderer::Impl {
         }
         if (auto bad = translated.find(key1); bad != translated.end() && !bad->second.ok) return &bad->second;
 
-        // What the real descriptors say about the texture and typed-buffer slots.
-        std::map<vpgcn::DescriptorSource, vpgcn::DescriptorInfo> infos;
+        // What the real descriptors say about the texture and typed-buffer slots (a few entries: a list of the bindings'
+        // sources, reused from draw to draw, instead of a map built each time).
+        auto& infos = infoScratch;
+        infos.clear();
+        auto known = [&](const vpgcn::DescriptorSource& src) {
+            return std::find_if(infos.begin(), infos.end(), [&](const auto& e) { return *e.first == src; });
+        };
         Hash h;
         h.value(key1);
-        std::vector<uint32_t> words;
+        std::vector<uint32_t>& words = wordsScratch;
         for (const vpgcn::Binding& b : it1->second) {
-            if (!b.dwords || infos.count(b.source)) continue;
+            if (!b.dwords || known(b.source) != infos.end()) continue;
             vpgcn::DescriptorInfo info;
-            bool known = false;
+            bool read = false;
             if ((b.kind == vpir::ResourceKind::Texture || b.kind == vpir::ResourceKind::StorageTexture) &&
                 readDescriptor(s, b.source, b.dwords, words)) {
                 const ImageDesc d = decodeImage(words);
                 info.dim = texDim(d);
                 info.elem = texElem(d);
-                known = true;
+                read = true;
             } else if (b.kind == vpir::ResourceKind::Buffer && readDescriptor(s, b.source, b.dwords, words)) {
                 const BufferDesc d = decodeBuffer(words);
                 info.dfmt = d.dataFormat;
                 info.nfmt = d.numFormat;
-                known = true;
+                read = true;
             }
-            if (!known) continue;
-            infos[b.source] = info;
+            if (!read) continue;
+            infos.push_back({&b.source, info});
             h.value(b.slot);
             h.value(info.dim);
             h.value(info.elem);
@@ -575,7 +597,7 @@ struct Renderer::Impl {
 
         vpgcn::LiftInput in = liftInput(s, stage);
         in.describe = [&](const vpgcn::DescriptorSource& src) -> std::optional<vpgcn::DescriptorInfo> {
-            auto f = infos.find(src);
+            auto f = known(src);
             return f == infos.end() ? std::nullopt : std::optional(f->second);
         };
         vpgcn::LiftResult lifted = vpgcn::lift(in);
@@ -620,7 +642,7 @@ struct Renderer::Impl {
         uint32_t width = 0, height = 0;
         uint8_t samples = 1;
         uint16_t layers = 1;
-        uint64_t lastUse = 0;
+        mutable uint64_t lastUse = 0;  // submit of the last draw, sample or flip that used it
     };
     std::map<uint64_t, std::vector<Target>> colorTargets, depthTargets;  // by guest address
     std::map<uint64_t, TextureId> latestColor;
@@ -689,6 +711,7 @@ struct Renderer::Impl {
         // sampled lines every frame it is used, the whole source every kRecheck frames.
         uint64_t sample = 0, full = 0;
         uint64_t checkedFrame = ~0ull, fullFrame = 0;
+        uint64_t lastUse = 0;     // submit of the last draw that sampled it
         bool storage = false;     // created writable
         bool gpuWritten = false;  // a shader wrote it: the GPU copy is the truth, never re-upload
         // Shape, to find it again through a T# of another format (same texel size).
@@ -778,11 +801,12 @@ struct Renderer::Impl {
             for (const Target& c : t->second)
                 if (c.width >= d.width && c.height >= d.height) {  // (CB width is the pitch)
                     if (c.format != f) note("render target sampled with another format (no view yet: its own format)");
+                    c.lastUse = r.frame_;
                     return c.id;
                 }
         if (auto t = depthTargets.find(d.address); t != depthTargets.end())
             for (const Target& c : t->second)
-                if (c.width >= d.width && c.height >= d.height) return c.id;
+                if (c.width >= d.width && c.height >= d.height) return c.lastUse = r.frame_, c.id;
         if (d.dstSel != std::array<uint8_t, 4>{4, 5, 6, 7}) note("texture component swizzle ignored");
         if (d.type == 14 || d.type == 15) note("MSAA texture read as single-sample");
 
@@ -864,6 +888,7 @@ struct Renderer::Impl {
                 if (on) t.gpuWritten = true;
             }
         } markWritten{tex, storage};
+        tex.lastUse = r.frame_;
         if (tex.gpuWritten) return tex.id;
         check(tex, d.address);
         if (!tex.dirty) return tex.id;
@@ -967,7 +992,9 @@ struct Renderer::Impl {
     std::vector<Staging> stagings;
     uint8_t* staging(uint64_t bytes, BufferId& id, uint64_t& offset) {
         Ring& ring = rings[ringIndex];
-        if (bytes <= kRingBytes / 2) {
+        // Only small sources share the ring with the draws' uploads (user data, constants, indices): a 1080p texture takes half of
+        // it and the draws after it find "upload ring full". Bigger ones get a buffer of their own.
+        if (bytes <= kRingBytes / 32) {
             ensureRing();
             const uint64_t at = (ring.head + 255) / 256 * 256;
             if (ring.memory && at + bytes <= kRingBytes) {
@@ -991,14 +1018,24 @@ struct Renderer::Impl {
         return static_cast<uint8_t*>(memory);
     }
 
-    std::unordered_map<uint64_t, SamplerId> samplers;
+    struct CachedSampler {
+        SamplerId id;
+        uint64_t lastUse = 0;
+    };
+    std::unordered_map<uint64_t, CachedSampler> samplers;
+    struct RetiredSampler {
+        SamplerId id;
+        uint64_t after;
+    };
+    std::vector<RetiredSampler> retiredSamplers;
 
     SamplerId sampler(std::span<const uint32_t> words) {
         Hash h;
         h.bytes(words.data(), words.size_bytes());
-        SamplerId& id = samplers[h.h];
-        if (!id) id = r.device_.createSampler(decodeSampler(words));
-        return id;
+        CachedSampler& c = samplers[h.h];
+        if (!c.id) c.id = r.device_.createSampler(decodeSampler(words));
+        c.lastUse = r.frame_;
+        return c.id;
     }
 
     // ---- Bindings ---------------------------------------------------------------------------------
@@ -1041,7 +1078,8 @@ struct Renderer::Impl {
                         // unmapped V# gets a zero buffer of our own instead of losing the whole draw.
                         if (!dummyBuffer()) return why = "buffer outside guest memory", false;
                         note(address ? "buffer outside guest memory bound as zeros" : "null buffer bound as zeros");
-                        std::memset(dummy.memory, 0, kDummyBytes);
+                        if (dummyDirty) std::memset(dummy.memory, 0, kDummyBytes);  // only after a binding that writes it
+                        dummyDirty = a.write;
                         a.range = ResourceRange::bytes(dummy.id, 0, kDummyBytes);
                         break;
                     }
@@ -1562,10 +1600,85 @@ struct Renderer::Impl {
             std::free(x.memory);
             return true;
         });
+        std::erase_if(retiredSamplers, [&](const RetiredSampler& x) {
+            if (x.after > r.frame_ + 1) return false;
+            r.device_.destroy(x.id);
+            return true;
+        });
+        if (r.frame_ % kSweepEvery == 0) evictIdle();
         return report;
     }
 
+    // Releases what nothing used for kEvictIdle submits (see kEvictIdle). Called between frames, after submit: no pending draw
+    // holds a pointer into these caches. GPU objects go through the retire lists (frames in flight may still read them).
+    // Kept: textures a shader wrote (the GPU copy is the only one), the registered-shader set (the backend cannot unregister).
+    void evictIdle() {
+        auto idle = [&](uint64_t last) { return r.frame_ > last && r.frame_ - last > kEvictIdle; };
+        std::vector<TextureId> gone;  // ids released this sweep
+        auto sweepTargets = [&](std::map<uint64_t, std::vector<Target>>& cache) {
+            for (auto it = cache.begin(); it != cache.end();) {
+                std::erase_if(it->second, [&](const Target& t) {
+                    if (!idle(t.lastUse)) return false;
+                    retiredTextures.push_back({t.id, r.frame_ + kFrames});
+                    gone.push_back(t.id);
+                    return true;
+                });
+                it = it->second.empty() ? cache.erase(it) : std::next(it);
+            }
+        };
+        sweepTargets(colorTargets);
+        sweepTargets(depthTargets);
+        if (!gone.empty())
+            std::erase_if(latestColor, [&](const auto& e) { return std::find(gone.begin(), gone.end(), e.second) != gone.end(); });
+        for (auto at = textures.begin(); at != textures.end();) {
+            std::erase_if(at->second, [&](const auto& e) {
+                const Texture& t = e.second;
+                if (t.gpuWritten || !idle(t.lastUse)) return false;
+                if (t.id) retiredTextures.push_back({t.id, r.frame_ + kFrames});
+                return true;
+            });
+            at = at->second.empty() ? textures.erase(at) : std::next(at);
+        }
+        for (auto it = samplers.begin(); it != samplers.end();) {
+            if (idle(it->second.lastUse)) {
+                retiredSamplers.push_back({it->second.id, r.frame_ + kFrames});
+                it = samplers.erase(it);
+            } else {
+                ++it;
+            }
+        }
+        // Level 2 (state-specialised) first, then level 1 with the failed programs filed under their level-1 key.
+        for (auto it = translated.begin(); it != translated.end();) {
+            if (it->second.ok && idle(it->second.lastUse)) it = translated.erase(it);
+            else ++it;
+        }
+        for (auto it = sourceUse.begin(); it != sourceUse.end();) {
+            if (idle(it->second)) {
+                sourcesByProgram.erase(it->first);
+                translated.erase(it->first);  // (a program that failed to lift: keyed by its level-1 key)
+                it = sourceUse.erase(it);
+            } else {
+                ++it;
+            }
+        }
+        // (programMemo holds program keys, not objects: a stale slot is rechecked against its generation)
+    }
+
     ~Impl() {
+        // Everything the renderer made on the device: guest buffers, targets, textures, samplers and what waited to be released.
+        for (auto& [base, b] : guestBuffers)
+            if (b.id) r.device_.destroy(b.id);
+        for (Retired& x : retired) r.device_.destroy(x.id);
+        for (auto* cache : {&colorTargets, &depthTargets})
+            for (auto& [address, list] : *cache)
+                for (Target& t : list) r.device_.destroy(t.id);
+        for (auto& [address, shapes] : textures)
+            for (auto& [shape, t] : shapes)
+                if (t.id) r.device_.destroy(t.id);
+        for (RetiredTexture& x : retiredTextures) r.device_.destroy(x.id);
+        for (auto& [key, c] : samplers)
+            if (c.id) r.device_.destroy(c.id);
+        for (RetiredSampler& x : retiredSamplers) r.device_.destroy(x.id);
         if (gds.id) r.device_.destroy(gds.id);
         std::free(gds.memory);
         if (dummy.id) r.device_.destroy(dummy.id);
@@ -1665,12 +1778,17 @@ std::string Renderer::describeAt(uint64_t address, uint64_t bytes) const { retur
 vpgpu::TextureId Renderer::colorTargetSlice(uint64_t address, uint32_t width, uint32_t height, uint16_t& layer) const {
     layer = 0;
     const Impl::Target* t = impl_->targetSlice(address, width, height, layer);
+    if (t) t->lastUse = frame_;  // a flip uses it: not idle
     return t ? t->id : vpgpu::TextureId{};
 }
 
 vpgpu::TextureId Renderer::colorTargetAt(uint64_t address) const {
     auto it = impl_->latestColor.find(address);
-    return it == impl_->latestColor.end() ? vpgpu::TextureId{} : it->second;
+    if (it == impl_->latestColor.end()) return {};
+    if (auto t = impl_->colorTargets.find(address); t != impl_->colorTargets.end())  // a flip uses it: not idle
+        for (const Impl::Target& c : t->second)
+            if (c.id == it->second) c.lastUse = frame_;
+    return it->second;
 }
 
 }  // namespace vpps4

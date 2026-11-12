@@ -93,7 +93,14 @@ bool passDumpScene(const vpgpu::Frame& frame, vpgpu::Device& gpu) {
   return draws >= kPassDumpSceneDraws;
 }
 
+// Every device's submit thread counts into the one PassDump (each device has its own submit mutex): the counters need a lock.
+static std::mutex& nextMutex() {
+  static std::mutex m;
+  return m;
+}
+
 bool passDumpNext(PassDump& p, int64_t nowNs) {
+  std::lock_guard<std::mutex> lock(nextMutex());
   const uint64_t n = p.seen++;
   if (n < p.start) return false;
   if (n < p.windowEnd) return true;
@@ -202,6 +209,11 @@ std::string passDumpSummary(int64_t nowNs) {
   if (nowNs < 0) nowNs = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
   Summary& s = summary();
   std::lock_guard<std::mutex> lock(s.m);
+  uint64_t sceneSeen;
+  {
+    std::lock_guard<std::mutex> nl(nextMutex());
+    sceneSeen = passDump().seen;
+  }
   if (s.startNs < 0) s.startNs = nowNs, s.nextNs = nowNs + 5'000'000'000LL;
   if (nowNs < s.nextNs || s.lines >= 720 || !s.t.frames) return {};
   s.nextNs = nowNs + 5'000'000'000LL;
@@ -211,7 +223,7 @@ std::string passDumpSummary(int64_t nowNs) {
   std::string sp;
   for (uint32_t i : skip) sp += (sp.empty() ? "" : ",") + std::to_string(i);
   std::string l = "vk.pdump.sum t=" + std::to_string((nowNs - s.startNs) / 1'000'000'000LL) + "s frames=" + std::to_string(t.frames) +
-                  " scene_seen=" + std::to_string(passDump().seen) + " passes=" + std::to_string(t.passes) + " draws=" + std::to_string(t.draws) +
+                  " scene_seen=" + std::to_string(sceneSeen) + " passes=" + std::to_string(t.passes) + " draws=" + std::to_string(t.draws) +
                   " gate_dropped=" + std::to_string(t.gateSkipped) + " skipped{" + nonZero(t.skipped, kSkipReasonNames, size_t(SkipReason::Count)) +
                   "} unbound{" + nonZero(t.bindFail, kBindFailNames, size_t(BindFail::Count)) + "} fallback{mask_plain=" +
                   std::to_string(t.fallbackMask) + ",depth_tile_plain=" + std::to_string(t.fallbackDepthTile) + "} tex{sampled=" +

@@ -20,6 +20,8 @@ case "$PLATFORM" in
     macos) TARGET=arm64-apple-macos11; PV="macos 11.0 11.0" ;;
     *) echo "PLATFORM must be xros, ios or macos" >&2; exit 2 ;;
 esac
+# The pieces of C and the objects are kept in lists split at white space: a WORK with one would break them.
+case "$WORK" in *[[:space:]]*) echo "WORK ($WORK) has a space in its path: use another folder" >&2; exit 2 ;; esac
 mkdir -p "$WORK"
 start=$(date +%s)
 

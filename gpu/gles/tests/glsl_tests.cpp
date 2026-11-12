@@ -1910,6 +1910,36 @@ void testShLighting() {
 
 }  // namespace
 
+// G18: a hostile shader (deep nesting, macros that double at every level) fails to compile; it does not overflow the stack or run
+// away. Ordinary nesting still compiles.
+void testLimits() {
+    auto wrap = [](const std::string& expr) { return "void main() { float x = " + expr + "; gl_Position = vec4(x); }"; };
+    const std::string deepParens = std::string(20000, '(') + "1.0" + std::string(20000, ')');
+    CHECK(compileFails(Stage::Vertex, wrap(deepParens), "too deeply"));
+    std::string unary;
+    for (int i = 0; i < 20000; ++i) unary += "- ";
+    CHECK(vpglsl::parse(Stage::Vertex, wrap(unary + "1.0")).shader == nullptr);
+    std::string braces = "void main() ";
+    for (int i = 0; i < 20000; ++i) braces += "{ ";
+    for (int i = 0; i < 20000; ++i) braces += "} ";
+    CHECK(compileFails(Stage::Vertex, braces, "too deeply"));
+    // Real nesting depths are fine.
+    std::string ok = std::string(60, '(') + "1.0" + std::string(60, ')');
+    CHECK(vpglsl::parse(Stage::Vertex, wrap(ok)).shader != nullptr);
+    std::string okStmt = "void main() { float x = 0.0; ";
+    for (int i = 0; i < 40; ++i) okStmt += "if (x < 1.0) { ";
+    okStmt += "x = 1.0; ";
+    for (int i = 0; i < 40; ++i) okStmt += "} ";
+    okStmt += "gl_Position = vec4(x); }";
+    CHECK(vpglsl::parse(Stage::Vertex, okStmt).shader != nullptr);
+    // #if with deep parentheses.
+    CHECK(vpglsl::parse(Stage::Vertex, "#if " + std::string(20000, '(') + "1" + std::string(20000, ')') + "\nvoid main() {}\n#endif\n").shader == nullptr);
+    // A macro that doubles at each of 40 levels would expand to 2^40 tokens.
+    std::string macros = "#define M0 x\n";
+    for (int i = 1; i <= 40; ++i) macros += "#define M" + std::to_string(i) + " M" + std::to_string(i - 1) + " M" + std::to_string(i - 1) + "\n";
+    CHECK(compileFails(Stage::Vertex, macros + "void main() { float x = 1.0; M40 }\n", "too large"));
+}
+
 int main(int argc, char** argv) {
     if (argc < 2) return 2;
     const std::map<std::string, std::function<void()>> tests = {
@@ -1918,7 +1948,7 @@ int main(int argc, char** argv) {
         {"textures", testTextures}, {"external", testExternalSampler}, {"link", testLink},
         {"compute", testCompute}, {"ssbo", testStorageBlocks}, {"images", testImages}, {"atomics", testAtomics},
         {"gather", testGather}, {"fbfetch", testFramebufferFetch}, {"exts", testExtensions}, {"texbuffer", testTextureBuffers}, {"exec", testExecute}, {"packed", testPackedUniforms}, {"shlight", testShLighting},
-        {"lenient", testLenient}, {"xfb", testXfb}, {"invariant", testInvariant}, {"semantics", testSemantics},
+        {"lenient", testLenient}, {"xfb", testXfb}, {"invariant", testInvariant}, {"semantics", testSemantics}, {"limits", testLimits},
     };
     auto it = tests.find(argv[1]);
     if (it == tests.end()) return 2;

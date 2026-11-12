@@ -32,6 +32,9 @@ std::vector<uint32_t> readWords(const fs::path& p) {
     return w;
 }
 
+// The hash of "<stage>_<hash>[...]": empty for a name too short to hold one (substr past the end throws).
+std::string hashOf(const std::string& name) { return name.size() > 3 ? name.substr(3, 18) : std::string(); }
+
 // SGPRs (codes < 104) read before any write, in straight-line order up to the first s_endpgm.
 unsigned liveInSgprs(std::span<const uint32_t> code) {
     std::set<unsigned> written;
@@ -68,7 +71,7 @@ int main(int argc, char** argv) {
     std::vector<fs::path> programs;
     for (const auto& e : fs::directory_iterator(dir)) {
         std::string n = e.path().filename().string();
-        if (n.ends_with(".fetch.bin")) fetchByHash[n.substr(3, 18)] = e.path();
+        if (n.ends_with(".fetch.bin")) fetchByHash[hashOf(n)] = e.path();
         else if (n.ends_with(".bin")) programs.push_back(e.path());
     }
     std::sort(programs.begin(), programs.end());
@@ -83,7 +86,7 @@ int main(int argc, char** argv) {
         in.stage = stage == "vs" ? vpgcn::ShaderStage::Vertex : stage == "fs" ? vpgcn::ShaderStage::Pixel : vpgcn::ShaderStage::Compute;
         if (stage != "vs" && stage != "fs" && stage != "cs") continue;  // (other hardware stages: later)
         if (in.stage == vpgcn::ShaderStage::Vertex) {
-            auto it = fetchByHash.find(name.substr(3, 18));
+            auto it = fetchByHash.find(hashOf(name));
             if (it != fetchByHash.end()) fetch = readWords(it->second);
         }
         in.code = code;

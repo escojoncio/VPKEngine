@@ -15,6 +15,8 @@
 #include <string.h>
 #include <math.h>
 
+#include "vp_rcp_tables.h"
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -309,7 +311,8 @@ static inline void vp_flags_dec_m(VpCpu* c, int bits, uint64_t a, uint64_t r, un
  * the flag update for a zero count, as the hardware does. */
 static inline void vp_flags_shl_m(VpCpu* c, int bits, uint64_t a, unsigned n, uint64_t r, unsigned mk) {
     vp_flags_result_m(c, bits, r, mk);
-    const uint8_t cf = (uint8_t)((a >> (bits - n)) & 1);
+    /* Past the width every bit is out: CF is architecturally undefined for 8/16-bit counts above it. */
+    const uint8_t cf = n <= (unsigned)bits ? (uint8_t)((a >> (bits - n)) & 1) : 0;
     if (mk & VP_F_CF) c->cf = cf;
     if (mk & VP_F_OF) c->of = (n == 1) ? (uint8_t)(cf ^ VP_SIGN(bits, r)) : 0; /* undefined for n > 1 */
     if (mk & VP_F_AF) c->af = 0;
@@ -322,9 +325,15 @@ static inline void vp_flags_shr_m(VpCpu* c, int bits, uint64_t a, unsigned n, ui
 }
 static inline void vp_flags_sar_m(VpCpu* c, int bits, uint64_t a, unsigned n, uint64_t r, unsigned mk) {
     vp_flags_result_m(c, bits, r, mk);
-    if (mk & VP_F_CF) c->cf = (uint8_t)((a >> (n - 1)) & 1);
+    /* Past the width of an 8/16-bit operand CF is its sign bit: the shift is arithmetic on the sign-extended value. */
+    if (mk & VP_F_CF) c->cf = n <= (unsigned)bits ? (uint8_t)((a >> (n - 1)) & 1) : VP_SIGN(bits, a);
     if (mk & VP_F_OF) c->of = 0;
     if (mk & VP_F_AF) c->af = 0;
+}
+/* SHRD: as SHR, but OF (count 1 only) is the sign change MSB(r) ^ MSB(a). */
+static inline void vp_flags_shrd_m(VpCpu* c, int bits, uint64_t a, unsigned n, uint64_t r, unsigned mk) {
+    vp_flags_shr_m(c, bits, a, n, r, mk & ~VP_F_OF);
+    if (mk & VP_F_OF) c->of = (n == 1) ? (uint8_t)(VP_SIGN(bits, a) ^ VP_SIGN(bits, r)) : 0;
 }
 
 /* The unmasked names, as macros so that the mask in force at the use site applies. */
@@ -339,6 +348,7 @@ static inline void vp_flags_sar_m(VpCpu* c, int bits, uint64_t a, unsigned n, ui
 #define vp_flags_shl(c, b, x, n, r) vp_flags_shl_m(c, b, x, n, r, VP_FLAG_MASK)
 #define vp_flags_shr(c, b, x, n, r) vp_flags_shr_m(c, b, x, n, r, VP_FLAG_MASK)
 #define vp_flags_sar(c, b, x, n, r) vp_flags_sar_m(c, b, x, n, r, VP_FLAG_MASK)
+#define vp_flags_shrd(c, b, x, n, r) vp_flags_shrd_m(c, b, x, n, r, VP_FLAG_MASK)
 
 /* Sign extension of the low `bits` of v to 64. */
 static inline int64_t vp_sext(int bits, uint64_t v) {
@@ -432,7 +442,7 @@ static inline int vp_div1(VpCpu* c, int bits, uint64_t src, int is_signed) {
                           : (__int128)n;
         const __int128 d = vp_sext(bits, src);
         __int128 sq;
-        if (d == -1 && sn == -((__int128)1 << (2 * bits - 1))) {
+        if (d == -1 && sn == (__int128)(0 - ((unsigned __int128)1 << (2 * bits - 1)))) {
             return 1;
         }
         sq = sn / d;
@@ -517,6 +527,35 @@ static inline int64_t vp_cvtt_f64_i64(double d) {
     if (!(d > -9223372036854777856.0 && d < 9223372036854775808.0)) return INT64_MIN;
     return (int64_t)d;
 }
+/* RCPPS/RSQRTPS/RCPSS/RSQRTSS: the 12-bit approximations of the Intel CPUs, bit for bit, from the
+ * tables of vp_rcp_tables.h. A denormal operand counts as zero (infinity, whatever DAZ says), a
+ * denormal result is zero, a NaN is quieted, and the square root of a negative number is the
+ * indefinite. (AMD CPUs, Jaguar included, use other tables: only the Intel ones could be measured.) */
+static inline float vp_rcp_f32(float f) {
+    uint32_t x, o; memcpy(&x, &f, 4);
+    const uint32_t s = x & 0x80000000u, e = (x >> 23) & 255, m = x & 0x7FFFFF;
+    if (e == 255) o = m ? (x | 0x400000u) : s;
+    else if (e == 0) o = s | 0x7F800000u;
+    else {
+        const int oe = 126 - ((int)e - 127);
+        o = oe >= 255 ? (s | 0x7F800000u) : oe <= 0 ? s : (s | ((uint32_t)oe << 23) | ((uint32_t)vp_rcp_table[m >> 12] << 11));
+    }
+    float r; memcpy(&r, &o, 4); return r;
+}
+static inline float vp_rsqrt_f32(float f) {
+    uint32_t x, o; memcpy(&x, &f, 4);
+    const uint32_t s = x & 0x80000000u, e = (x >> 23) & 255, m = x & 0x7FFFFF;
+    if (e == 255) o = m ? (x | 0x400000u) : s ? 0xFFC00000u : 0;
+    else if (e == 0) o = s | 0x7F800000u;
+    else if (s) o = 0xFFC00000u;
+    else {
+        const int k = (int)e - 127, h = k >> 1; /* floor(k / 2) */
+        const int oe = 126 - h;
+        o = oe >= 255 ? 0x7F800000u : oe <= 0 ? 0 : (((uint32_t)oe << 23) | ((uint32_t)vp_rsqrt_table[k & 1][m >> 13] << 11));
+    }
+    float r; memcpy(&r, &o, 4); return r;
+}
+
 /* CVT* (rounding by MXCSR.RC, nearest-even by default): rint follows the current host rounding
  * mode, which vp_apply_mxcsr sets from MXCSR. */
 static inline int32_t vp_cvt_f32_i32(float f) {
@@ -528,8 +567,9 @@ static inline int64_t vp_cvt_f32_i64(float f) {
     return (int64_t)rintf(f);
 }
 static inline int32_t vp_cvt_f64_i32(double d) {
-    if (!(d > -2147483649.0 && d < 2147483648.0)) return INT32_MIN;
-    return (int32_t)rint(d);
+    const double r = rint(d); /* 2147483647.7 rounds to 2^31: out of range, the indefinite (as on x86) */
+    if (!(r >= -2147483648.0 && r < 2147483648.0)) return INT32_MIN;
+    return (int32_t)r;
 }
 static inline int64_t vp_cvt_f64_i64(double d) {
     if (!(d > -9223372036854777856.0 && d < 9223372036854775808.0)) return INT64_MIN;
@@ -551,6 +591,44 @@ static inline void vp_comisd(VpCpu* c, double a, double b) {
 }
 
 /* MINSS/MAXSS semantics: if either is NaN, or both are zero, the second operand is returned. */
+/* Float arithmetic with the x86 NaN rules, the same on every host (a plain C `a + b` follows the
+ * host: ARM propagates a signaling NaN before a quiet one and its default NaN is positive; x86 picks
+ * the first operand and its indefinite is negative). With a NaN operand the result is the first
+ * operand if it is a NaN, else the second, quieted; an invalid operation without a NaN operand gives
+ * the indefinite (negative QNaN). `a` is the destination / first source of the instruction. */
+static inline float vp_nan32(float a, float b) {
+    uint32_t x;
+    if (a != a) memcpy(&x, &a, 4);
+    else if (b != b) memcpy(&x, &b, 4);
+    else x = 0xFFC00000u;
+    x |= 0x400000u;
+    float r; memcpy(&r, &x, 4); return r;
+}
+static inline double vp_nan64(double a, double b) {
+    uint64_t x;
+    if (a != a) memcpy(&x, &a, 8);
+    else if (b != b) memcpy(&x, &b, 8);
+    else x = UINT64_C(0xFFF8000000000000);
+    x |= UINT64_C(0x0008000000000000);
+    double r; memcpy(&r, &x, 8); return r;
+}
+#define VP_FOP(NAME, T, NAN, EXPR) \
+    static inline T NAME(T a, T b) { const T r = (EXPR); return __builtin_expect(r == r, 1) ? r : NAN(a, b); }
+VP_FOP(vp_fadd32, float, vp_nan32, a + b)
+VP_FOP(vp_fsub32, float, vp_nan32, a - b)
+VP_FOP(vp_fmul32, float, vp_nan32, a * b)
+VP_FOP(vp_fdiv32, float, vp_nan32, a / b)
+VP_FOP(vp_fadd64, double, vp_nan64, a + b)
+VP_FOP(vp_fsub64, double, vp_nan64, a - b)
+VP_FOP(vp_fmul64, double, vp_nan64, a * b)
+VP_FOP(vp_fdiv64, double, vp_nan64, a / b)
+#undef VP_FOP
+static inline float vp_fsqrt32(float a) { const float r = sqrtf(a); return __builtin_expect(r == r, 1) ? r : vp_nan32(a, a); }
+static inline double vp_fsqrt64(double a) { const double r = sqrt(a); return __builtin_expect(r == r, 1) ? r : vp_nan64(a, a); }
+/* ROUND*: a signaling NaN comes out quiet. */
+static inline float vp_fquiet32(float a) { if (a != a) { uint32_t x; memcpy(&x, &a, 4); x |= 0x400000u; memcpy(&a, &x, 4); } return a; }
+static inline double vp_fquiet64(double a) { if (a != a) { uint64_t x; memcpy(&x, &a, 8); x |= UINT64_C(0x0008000000000000); memcpy(&a, &x, 8); } return a; }
+
 static inline float vp_minss(float a, float b) { return (a < b) ? a : b; }
 static inline float vp_maxss(float a, float b) { return (a > b) ? a : b; }
 static inline double vp_minsd(double a, double b) { return (a < b) ? a : b; }
@@ -827,6 +905,7 @@ void vp_x87_fld_mem(VpCpu* c, uint64_t a, int kind);       /* kind: 0 f32, 1 f64
 void vp_x87_fld_reg(VpCpu* c, int i);
 void vp_x87_fld_const(VpCpu* c, int which);                 /* 1, l2t, l2e, pi, lg2, ln2, 0 */
 void vp_x87_fst_reg(VpCpu* c, int i, int pop);
+void vp_x87_fstpnce(VpCpu* c, int i);
 void vp_x87_fst_mem(VpCpu* c, uint64_t a, int kind, int pop, int truncate);
 void vp_x87_arith_mem(VpCpu* c, int op, uint64_t a, int kind); /* op: add sub subr mul div divr */
 void vp_x87_arith_reg(VpCpu* c, int op, int dst, int src, int pop);
@@ -851,6 +930,11 @@ void vp_x87_fnstenv(VpCpu* c, uint64_t a);
 void vp_x87_fldenv(VpCpu* c, uint64_t a);
 void vp_x87_fnsave(VpCpu* c, uint64_t a);
 void vp_x87_frstor(VpCpu* c, uint64_t a);
+/* With the operand-size prefix: the 14-byte environment (94 bytes with the registers). */
+void vp_x87_fnstenv_16(VpCpu* c, uint64_t a);
+void vp_x87_fldenv_16(VpCpu* c, uint64_t a);
+void vp_x87_fnsave_16(VpCpu* c, uint64_t a);
+void vp_x87_frstor_16(VpCpu* c, uint64_t a);
 void vp_x87_fxsave(VpCpu* c, uint64_t a);
 void vp_x87_fxrstor(VpCpu* c, uint64_t a);
 void vp_x87_fprem(VpCpu* c, int ieee);

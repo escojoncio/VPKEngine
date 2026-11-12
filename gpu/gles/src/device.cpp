@@ -123,6 +123,7 @@ void Device::shutdown() {
     retire(true);
     for (VkDescriptorPool p : freePools) vk.vkDestroyDescriptorPool(device, p, nullptr);
     freePools.clear();
+    spareChunks.clear();
     vk.vkDestroyCommandPool(device, pool, nullptr);
     vk.vkDestroyDevice(device, nullptr);
     vk.vkDestroyInstance(instance, nullptr);
@@ -166,14 +167,22 @@ BufferStorage::~BufferStorage() {
     dev->vk.vkFreeMemory(dev->device, memory, nullptr);
 }
 
+void Device::trim() {
+    for (VkDescriptorPool p : freePools) vk.vkDestroyDescriptorPool(device, p, nullptr);
+    freePools.clear();
+    spareChunks.clear();
+}
+
 void Device::retire(bool wait) {
     for (auto it = inFlight.begin(); it != inFlight.end();) {
         VkResult r = wait ? vk.vkWaitForFences(device, 1, &it->fence, VK_TRUE, UINT64_MAX) : vk.vkGetFenceStatus(device, it->fence);
-        if (r != VK_SUCCESS) {
+        if (r != VK_SUCCESS && r > 0) {  // not ready yet; an error (VK_ERROR_DEVICE_LOST) will never signal: it counts as done
             ++it;
             continue;
         }
         completed = std::max(completed, it->serial);
+        for (StorageP& c : it->chunks)
+            if (c->size == kStreamChunk && spareChunks.size() < kMaxSpareChunks) spareChunks.push_back(std::move(c));
         vk.vkDestroyFence(device, it->fence, nullptr);
         vk.vkFreeCommandBuffers(device, pool, 1, &it->cb);
         if (it->descPool) {
@@ -184,12 +193,20 @@ void Device::retire(bool wait) {
     }
 }
 
-void Device::waitSerial(uint64_t serial) {
+bool Device::waitSerial(uint64_t serial, uint64_t timeoutNs) {
+    const auto start = std::chrono::steady_clock::now();
     while (completed < serial && !inFlight.empty()) {
         InFlight& f = inFlight.front();
-        vk.vkWaitForFences(device, 1, &f.fence, VK_TRUE, UINT64_MAX);
+        uint64_t left = timeoutNs;
+        if (timeoutNs != UINT64_MAX) {  // the part of the timeout that is left
+            const uint64_t spent = uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
+            left = spent >= timeoutNs ? 0 : timeoutNs - spent;
+        }
+        const VkResult r = vk.vkWaitForFences(device, 1, &f.fence, VK_TRUE, left);
         retire(false);
+        if (r == VK_TIMEOUT) break;  // ran out (retire polled once more: the fence may have signalled meanwhile)
     }
+    return completed >= serial || inFlight.empty();
 }
 
 VkDescriptorPool Device::takePool() {
@@ -427,6 +444,7 @@ VkCommandBuffer Context::cmd() {
     VkCommandBufferAllocateInfo ai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
     ai.commandPool = dev->pool, ai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY, ai.commandBufferCount = 1;
     dev->vk.vkAllocateCommandBuffers(dev->device, &ai, &cb_);
+    told_ = Told{};  // a new command buffer has been told nothing
     VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     dev->vk.vkBeginCommandBuffer(cb_, &bi);
@@ -445,6 +463,24 @@ uint32_t Context::occSlot() {
             return UINT32_MAX;
         }
         occBusy_.assign(kSlots, false);
+        occDirty_.assign(kSlots, true);  // a new pool is undefined until reset
+    }
+    for (uint32_t i = 0; i < kSlots; ++i)
+        if (!occBusy_[i] && !occDirty_[i]) return occBusy_[i] = true, i;
+    // No clean slot: reset every free one at once (a reset is outside a pass: one cut for all, not one per query).
+    bool any = false;
+    for (uint32_t i = 0; i < kSlots; ++i) any = any || (!occBusy_[i] && occDirty_[i]);
+    if (!any) return UINT32_MAX;
+    endPass();
+    for (uint32_t i = 0; i < kSlots;) {
+        if (occBusy_[i] || !occDirty_[i]) {
+            ++i;
+            continue;
+        }
+        uint32_t n = 0;
+        while (i + n < kSlots && !occBusy_[i + n] && occDirty_[i + n]) occDirty_[i + n] = false, ++n;
+        dev->vk.vkCmdResetQueryPool(cmd(), occPool_, i, n);
+        i += n;
     }
     for (uint32_t i = 0; i < kSlots; ++i)
         if (!occBusy_[i]) return occBusy_[i] = true, i;
@@ -453,11 +489,14 @@ uint32_t Context::occSlot() {
 
 void Context::occBegin(Query& q) {
     q.endSerial = 0;  // set again by occEnd if this run is counted
+    if (occActive_ != UINT32_MAX) return;  // another query counting: this one stays coherent
+    // A counter that was used must be reset before it counts again: that is a cut of the pass, so a query that runs again takes
+    // a clean counter (the used one is reset with the others when none is left).
+    if (q.slot != UINT32_MAX && occDirty_[q.slot]) occBusy_[q.slot] = false, q.slot = UINT32_MAX;
     if (q.slot == UINT32_MAX) q.slot = occSlot();
-    if (q.slot == UINT32_MAX || occActive_ != UINT32_MAX) return;  // no slot / another query counting: this one stays coherent
-    endPass();
-    dev->vk.vkCmdResetQueryPool(cmd(), occPool_, q.slot, 1);
+    if (q.slot == UINT32_MAX) return;  // no slot: this one stays coherent
     dev->vk.vkCmdBeginQuery(cmd(), occPool_, q.slot, 0);
+    occDirty_[q.slot] = true;
     occActive_ = q.slot;
 }
 
@@ -525,32 +564,128 @@ bool Context::occResult(Query& q, bool wait, uint64_t& value, OccWait* how) {
 }
 
 void Context::endPass() {
-    if (!passOpen_) return;
-    dev->vk.vkCmdEndRendering(cb_);
-    passOpen_ = false;
-    pass_ = PassKey{};
-    passDrop_ = 0;
+    if (passOpen_) {
+        dev->vk.vkCmdEndRendering(cb_);
+        passOpen_ = false;
+        pass_ = PassKey{};
+        passDrop_ = 0;
+    }
+    // Whatever waited for the end of the pass goes before the next command (every command that needs the pass closed comes here).
+    if (!xfers_.empty()) recordTransfers();
+}
+
+static void memoryBarrier(Device* dev, VkCommandBuffer c) {
+    VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+    mb.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
+    mb.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+    dev->vk.vkCmdPipelineBarrier(c, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &mb, 0, nullptr, 0,
+                                 nullptr);
+}
+
+static void initBarrier(Device* dev, VkCommandBuffer c, const Image& img) {
+    VkImageMemoryBarrier ib{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+    ib.srcAccessMask = 0;
+    ib.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+    ib.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    ib.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+    ib.srcQueueFamilyIndex = ib.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    ib.image = img.image;
+    ib.subresourceRange = {img.aspect(), 0, VK_REMAINING_MIP_LEVELS, 0, VK_REMAINING_ARRAY_LAYERS};
+    dev->vk.vkCmdPipelineBarrier(c, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 1,
+                                 &ib);
 }
 
 void Context::barrier() {
     endPass();
-    VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
-    mb.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
-    mb.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
-    dev->vk.vkCmdPipelineBarrier(cmd(), VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1,
-                                 &mb, 0, nullptr, 0, nullptr);
+    memoryBarrier(dev, cmd());
 }
 
-void Context::useStorage(const StorageP& s) {
-    if (!s) return;
-    if (s->lastUse != dev->submitted + 1) {
-        s->lastUse = dev->submitted + 1;  // the serial the open command buffer will get
-        used_.push_back(s);
+// What xfers_ kept, in call order, with one barrier before and one after (and one between two writes of an image).
+void Context::recordTransfers() {
+    if (xfers_.empty()) return;
+    std::vector<Xfer> ops;
+    ops.swap(xfers_);
+    VkCommandBuffer c = cmd();
+    memoryBarrier(dev, c);
+    std::vector<const Image*> written;
+    for (Xfer& x : ops) {
+        Image& img = *x.image;
+        img.xferPending = 0;
+        const bool again = std::find(written.begin(), written.end(), &img) != written.end();
+        if (x.init) {
+            initBarrier(dev, c, img);
+        } else {
+            if (again) memoryBarrier(dev, c);
+            dev->vk.vkCmdCopyBufferToImage(c, x.buffer, img.image, VK_IMAGE_LAYOUT_GENERAL, 1, &x.region);
+        }
+        if (!again) written.push_back(&img);
+        if (keep_.empty() || keep_.back().get() != x.image.get()) keep(std::move(x.image));  // alive until the submission is done
+    }
+    memoryBarrier(dev, c);
+}
+
+void Context::imageUsed(const Image& img) {
+    if (!img.xferPending) return;
+    if (passOpen_) xferHazard_ = true;  // prepareDraw ends the pass and prepares the draw again
+    else recordTransfers();
+}
+
+void Context::deferImageInit(const ImageP& img) {
+    Xfer x;
+    x.image = img;
+    x.init = true;
+    xfers_.push_back(std::move(x));
+    ++img->xferPending;
+}
+
+void BufferStorage::noteRead(uint64_t lo, uint64_t hi) {
+    hi = std::min<uint64_t>(hi, size);
+    if (lo >= hi) return;
+    for (auto it = reads.begin(); it != reads.end();) {  // merge with what it touches
+        if (it->second < lo || hi < it->first) {
+            ++it;
+            continue;
+        }
+        lo = std::min(lo, it->first), hi = std::max(hi, it->second);
+        it = reads.erase(it);
+    }
+    reads.emplace_back(lo, hi);
+    if (reads.size() > 8) {  // too many: one range that holds them all
+        uint64_t a = UINT64_MAX, b = 0;
+        for (const auto& r : reads) a = std::min(a, r.first), b = std::max(b, r.second);
+        reads.assign(1, {a, b});
     }
 }
 
+bool BufferStorage::readsRange(uint64_t lo, uint64_t hi) const {
+    hi = std::min<uint64_t>(hi, size);
+    if (lo >= hi) return false;
+    for (const auto& r : reads)
+        if (r.first < hi && lo < r.second) return true;
+    return false;
+}
+
+void Context::useStorage(const StorageP& s, uint64_t lo, uint64_t hi) {
+    if (!s) return;
+    if (s->lastUse != dev->submitted + 1) {
+        if (s->lastUse <= dev->completed) s->reads.clear();  // the work those ranges were read by is done
+        s->lastUse = dev->submitted + 1;  // the serial the open command buffer will get
+        used_.push_back(s);
+    }
+    s->noteRead(lo, hi);
+}
+
 uint64_t Context::flush(bool wait) {
+    if (!cb_ && !xfers_.empty()) cmd();  // uploads that wait for a pass to end: they are recorded and submitted
     if (!cb_) {
+        // Nothing is recorded: what was kept alive (deleted objects an earlier submission may still use) goes with the newest
+        // submission in flight (the queue is in order: it ends after all of them), or is released if none is.
+        if (!keep_.empty()) {
+            if (!dev->inFlight.empty())
+                for (auto& k : keep_) dev->inFlight.back().keep.push_back(std::move(k));
+            keep_.clear();
+            dev->retire(false);
+        }
         if (wait) dev->waitSerial(dev->submitted);
         return 0;
     }
@@ -566,15 +701,16 @@ uint64_t Context::flush(bool wait) {
     f.cb = cb_;
     f.descPool = descPool_;
     for (auto& s : used_) f.keep.push_back(s);
-    for (auto& c : chunks_) f.keep.push_back(c.storage);
+    for (auto& c : chunks_) f.chunks.push_back(c.storage);
     for (auto& k : keep_) f.keep.push_back(std::move(k));
     dev->inFlight.push_back(std::move(f));
     used_.clear();
     keep_.clear();
-    // Chunks go back to the spare list once their submission retires (kept alive by keep above;
-    // reused only through spareChunks_ after the wait below or a later retire).
+    // The chunks stay alive with the submission (f.chunks); once it retires they go to Device::spareChunks.
     chunks_.clear();
     cb_ = VK_NULL_HANDLE;
+    ++flushes_;
+    told_ = Told{};
     descPool_ = VK_NULL_HANDLE;
     const uint64_t serial = dev->submitted;
     if (wait) dev->waitSerial(serial);
@@ -583,10 +719,18 @@ uint64_t Context::flush(bool wait) {
 }
 
 Context::Alloc Context::stream(VkDeviceSize size, VkDeviceSize align) {
-    constexpr VkDeviceSize kChunk = 4 << 20;
+    constexpr VkDeviceSize kChunk = Device::kStreamChunk;
     if (chunks_.empty() || (chunks_.back().used + align - 1) / align * align + size > chunks_.back().storage->size) {
         Chunk c;
-        c.storage = dev->newStorage(std::max(kChunk, size), VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
+        // A spare chunk nobody else holds (a readback keeps its chunk alive while it reads it) is written again.
+        if (size <= kChunk)
+            for (size_t i = 0; i < dev->spareChunks.size(); ++i)
+                if (dev->spareChunks[i].use_count() == 1) {
+                    c.storage = std::move(dev->spareChunks[i]);
+                    dev->spareChunks.erase(dev->spareChunks.begin() + long(i));
+                    break;
+                }
+        if (!c.storage) c.storage = dev->newStorage(std::max(kChunk, size), VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
                                                               VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
                                                               VK_BUFFER_USAGE_TRANSFER_DST_BIT);
         chunks_.push_back(c);
@@ -610,30 +754,34 @@ VkDescriptorSet Context::allocSet(VkDescriptorSetLayout layout) {
     return VK_NULL_HANDLE;
 }
 
-void Context::prepareWrite(Buffer& b, bool discard) {
+void Context::prepareWrite(Buffer& b, bool discard, uint64_t lo, uint64_t hi, bool overwrites) {
     if (!b.storage) return;
+    // What the GPU has still to write (a readback into it) is in the host memory only when the work is done: the copy below, or the
+    // application's write over it, would be made on bytes that are not there yet.
+    if (!discard && b.storage->gpuWrite > dev->completed) flush(true);
     const uint64_t pending = b.storage->lastUse;
     const bool gpuMayRead = pending && pending > dev->completed;
     if (!gpuMayRead) return;
+    // The GPU reads other bytes only (a game that fills a ring buffer a bit at a time): the write is made in place.
+    if (!b.storage->readsRange(lo, hi)) return;
     // New storage (copy on write); the old one stays alive with the work that reads it.
     StorageP fresh = dev->newStorage(b.storage->size, b.storage->dev ? kAllUsage : 0);
     if (!fresh) return;
-    if (!discard) std::memcpy(fresh->host, b.storage->host, size_t(b.storage->size));
+    if (!discard) {
+        const uint64_t size = b.storage->size, a = std::min<uint64_t>(lo, size), z = std::min<uint64_t>(hi, size);
+        if (overwrites && a < z) {  // what the caller is about to overwrite is not copied
+            std::memcpy(fresh->host, b.storage->host, size_t(a));
+            std::memcpy(fresh->host + z, b.storage->host + z, size_t(size - z));
+        } else {
+            std::memcpy(fresh->host, b.storage->host, size_t(size));
+        }
+    }
     b.storage = fresh;
 }
 
 void Context::imageInit(Image& img) {
     endPass();
-    VkImageMemoryBarrier ib{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
-    ib.srcAccessMask = 0;
-    ib.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
-    ib.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    ib.newLayout = VK_IMAGE_LAYOUT_GENERAL;
-    ib.srcQueueFamilyIndex = ib.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    ib.image = img.image;
-    ib.subresourceRange = {img.aspect(), 0, VK_REMAINING_MIP_LEVELS, 0, VK_REMAINING_ARRAY_LAYERS};
-    dev->vk.vkCmdPipelineBarrier(cmd(), VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr,
-                                 0, nullptr, 1, &ib);
+    initBarrier(dev, cmd(), img);
 }
 
 static VkFilter filterOf(GLenum f) { return f == gl::NEAREST || f == gl::NEAREST_MIPMAP_NEAREST || f == gl::NEAREST_MIPMAP_LINEAR ? VK_FILTER_NEAREST : VK_FILTER_LINEAR; }

@@ -17,6 +17,7 @@ bool Vk::loadInstance(PFN_vkGetInstanceProcAddr gipa, VkInstance instance) {
 }
 
 bool Vk::loadDevice(VkDevice device) {
+    if (!vkGetDeviceProcAddr || !vkGetInstanceProcAddr) return false;  // loadInstance did not run or failed: nothing to call
     bool ok = true;
 #define VPGLES_LOAD(f)                                                 \
     f = reinterpret_cast<PFN_##f>(vkGetDeviceProcAddr(device, #f));    \

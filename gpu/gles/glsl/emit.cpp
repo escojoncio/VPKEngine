@@ -671,13 +671,6 @@ private:
                 attachment(0, Base::Float);
                 break;
             }
-            case BuiltinVar::PointCoord: {
-                // No VPIR builtin yet: (0.5, 0.5), the centre of the point (documented in bitacora).
-                vi.storage = SC::Private;
-                vi.ptr = globalVar(typeId(s->type), SC::Private, "gl_PointCoord");
-                pointCoordVar_ = vi.ptr;
-                break;
-            }
             default: {
                 const bool input = s->builtin != BuiltinVar::Position && s->builtin != BuiltinVar::PointSize &&
                                    s->builtin != BuiltinVar::FragDepth;
@@ -828,7 +821,6 @@ private:
         dummy.ret = Type::make(Base::Void);
         inst(head, OpFunction, {voidT_, fid, 0, fnType(dummy)});
         uint32_t entry = id();
-        if (pointCoordVar_) store(pointCoordVar_, splat(constF(0.5f), Type::make(Base::Float, 2)));
         if (workGroupSizeVar_)
             store(workGroupSizeVar_, opV(OpCompositeConstruct, typeId(Type::make(Base::Uint, 3)),
                                          {constU(sh_.localSize[0]), constU(sh_.localSize[1]), constU(sh_.localSize[2])}));
@@ -1294,7 +1286,32 @@ private:
         return opV(OpCompositeConstruct, typeId(t.columnType()), parts);
     }
 
+    // Index expressions of an l-value evaluated once: an l-value that is read and then written (op=, ++/--, out and inout
+    // arguments, swizzle and vector-component stores) is walked twice, and `a[i++] += 1` must increment i once (GLSL ES 3.10 5.8).
+    std::map<const Expr*, uint32_t> pinned_;
+    void pinIndices(const Expr& l) {
+        if (l.k == EK::Index) {
+            pinIndices(*l.a[0]);
+            const Expr& idx = *l.a[1];
+            if (!idx.hasConst && !pinned_.count(&idx)) pinned_[&idx] = value(idx);
+        } else if (l.k == EK::Field || l.k == EK::Swizzle) {
+            pinIndices(*l.a[0]);
+        }
+    }
+    void unpinIndices(const Expr& l) {
+        if (l.k == EK::Index) {
+            unpinIndices(*l.a[0]);
+            pinned_.erase(l.a[1].get());
+        } else if (l.k == EK::Field || l.k == EK::Swizzle) {
+            unpinIndices(*l.a[0]);
+        }
+    }
+
     uint32_t value(const Expr& e) {
+        if (!pinned_.empty()) {
+            auto it = pinned_.find(&e);
+            if (it != pinned_.end()) return it->second;
+        }
         if (e.hasConst && e.type.isScalar()) return constOf(e.type, e.constF, e.constI);
         switch (e.k) {
             case EK::IntLit: return constI(int32_t(uint32_t(e.i)));
@@ -1347,12 +1364,16 @@ private:
             case EK::Assign: {
                 const Expr& l = *e.a[0];
                 uint32_t v;
-                if (e.op == "=") v = value(*e.a[1]);
-                else {
+                if (e.op == "=") {
+                    v = value(*e.a[1]);
+                    pinIndices(l);
+                } else {
+                    pinIndices(l);
                     std::string bop = e.op.substr(0, e.op.size() - 1);
                     v = arith(bop, value(l), l.type, value(*e.a[1]), e.a[1]->type, l.type);
                 }
                 assignTo(l, v);
+                unpinIndices(l);
                 return v;
             }
             case EK::PreInc:
@@ -1360,10 +1381,12 @@ private:
             case EK::PostInc:
             case EK::PostDec: {
                 const Expr& l = *e.a[0];
+                pinIndices(l);
                 uint32_t old = value(l);
                 const bool inc = e.k == EK::PreInc || e.k == EK::PostInc;
                 uint32_t nv = arith(inc ? "+" : "-", old, l.type, one(l.type), l.type.scalarType(), l.type);
                 assignTo(l, nv);
+                unpinIndices(l);
                 return e.k == EK::PreInc || e.k == EK::PreDec ? nv : old;
             }
             case EK::Unary: return unary(e);
@@ -1620,6 +1643,7 @@ private:
                 continue;
             }
             uint32_t tmp = localVar(typeId(p->type));
+            if (p->dir != ParamDir::In) pinIndices(a);
             if (p->dir != ParamDir::Out) store(tmp, value(a));
             if (p->dir != ParamDir::In) writeBack.push_back({&a, tmp});
             args.push_back(tmp);
@@ -1628,6 +1652,7 @@ private:
         w.insert(w.end(), args.begin(), args.end());
         uint32_t r = opV(OpFunctionCall, typeId(f->ret), w);
         for (auto& [a, tmp] : writeBack) assignTo(*a, load(a->type, tmp));
+        for (auto& [a, tmp] : writeBack) unpinIndices(*a);
         return r;
     }
 
@@ -2069,7 +2094,7 @@ private:
 
     const Shader& sh_;
     const ProgramLayout& L_;
-    uint32_t glsl_ = 0, voidT_ = 0, boolT_ = 0, mainId_ = 0, pointCoordVar_ = 0;
+    uint32_t glsl_ = 0, voidT_ = 0, boolT_ = 0, mainId_ = 0;
     bool writesDepth_ = false, usesMultiview_ = false;
     StructDef defaultStruct_;
     std::vector<std::unique_ptr<StructDef>> blockStructs_;

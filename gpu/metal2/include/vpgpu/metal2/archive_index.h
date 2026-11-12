@@ -51,6 +51,9 @@ inline bool read(const std::filesystem::path& path, std::vector<uint64_t>& keys)
   if (!f) return false;
   uint64_t head[2] = {0, 0};
   bool ok = std::fread(head, 8, 2, f) == 2 && head[0] == kMagic && head[1] < (1ull << 28);
+  if (ok) {  // the file must hold exactly the keys the header counts: a damaged count reserves nothing
+    ok = std::fseek(f, 0, SEEK_END) == 0 && std::ftell(f) == long(16 + head[1] * 8) && std::fseek(f, 16, SEEK_SET) == 0;
+  }
   if (ok) {
     keys.resize(size_t(head[1]));
     ok = std::fread(keys.data(), 8, keys.size(), f) == keys.size();

@@ -58,7 +58,7 @@ bool reflect(const std::vector<uint32_t>& w, Reflect& r) {
   for (size_t i = 5; i < w.size();) {
     const uint32_t wc = w[i] >> 16, op = w[i] & 0xFFFF;
     if (!wc || i + wc > w.size()) return false;
-    const uint32_t* o = &w[i + 1];
+    const uint32_t* o = w.data() + i + 1;  // (not &w[i + 1]: i + 1 == w.size() for an instruction without operands at the end)
     switch (op) {
       case 15: {  // OpEntryPoint
         if (wc < 4) break;

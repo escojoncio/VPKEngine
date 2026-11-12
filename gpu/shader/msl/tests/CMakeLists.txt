@@ -31,3 +31,6 @@ add_test(NAME vpmsl.reject.wave64 COMMAND vpmsl_golden ${CMAKE_CURRENT_SOURCE_DI
 add_test(NAME vpmsl.reject.private_atomic COMMAND vpmsl_golden ${CMAKE_CURRENT_SOURCE_DIR}/reject/private_atomic.vpir --reject "atomics are not allowed on private memory")
 # Lod queries need derivatives.
 add_test(NAME vpmsl.reject.query_lod_vertex COMMAND vpmsl_golden ${CMAKE_CURRENT_SOURCE_DIR}/reject/query_lod_vertex.vpir --reject "lod queries are fragment-only")
+
+# Size limits: a 16 MiB private array with constant stores must not become a constant table (the MSL would be ~260 MB).
+add_test(NAME vpmsl.limits.big_private_table COMMAND vpmsl_golden ${CMAKE_CURRENT_SOURCE_DIR}/limits/big_private_table.vpir --max-source 1000000)

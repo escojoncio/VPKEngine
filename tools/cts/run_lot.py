@@ -20,6 +20,14 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import summarize  # noqa: E402
 
 
+def tail_text(path, nbytes):
+    """The last `nbytes` bytes of a file as text: a deqp log is hundreds of MB with a verbose driver, never read it whole."""
+    with open(path, "rb") as fh:
+        fh.seek(0, os.SEEK_END)
+        fh.seek(max(0, fh.tell() - nbytes))
+        return fh.read().decode(errors="replace")
+
+
 def run_once(cmd, cwd, qpa, log, idle_s, deadline, env=None):
     """-> (exit code, why) with why in {"exit", "idle", "budget"}."""
     with open(log, "wb") as lf:
@@ -101,11 +109,11 @@ def main():
         if rc != 0 and os.path.exists(log):  # what the process said as it died (published with the report)
             with open(os.path.join(out, "crash-tails.txt"), "a") as ct:
                 ct.write(f"=== attempt {n} exit={rc} cases={todo[:1] + [c for c in res][-2:]}\n")
-                ct.write("".join(open(log, errors="replace").readlines()[-40:]) + "\n")
+                ct.write("".join(tail_text(log, 64 * 1024).splitlines(keepends=True)[-40:]) + "\n")
         todo = [c for c in todo if c not in done]
         if progress == 0 and rc != 0:       # deqp-vk could not even start the first case
             startup_failed = True
-            tail = open(log, errors="replace").read()[-1500:] if os.path.exists(log) else ""
+            tail = tail_text(log, 1500) if os.path.exists(log) else ""
             print("deqp-vk made no progress; giving up. Log tail:\n" + tail, flush=True)
             break
         if rc == 0 and not open_case and not term:

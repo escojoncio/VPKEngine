@@ -81,6 +81,19 @@ int locationCount(const Type& t) {
     return n * leaves;
 }
 
+// Varying locations a type takes (Vulkan interface matching rules, as ES 3.00 4.3.4 counts them): a matrix one per column, an array one run per
+// element, a struct the sum of its members.
+int varyingSlots(const Type& t) {
+    int n = 1;
+    for (int d : t.dims) n *= std::max(1, d);
+    if (t.base == Base::Struct) {
+        int sum = 0;
+        for (const Member& m : t.st->members) sum += varyingSlots(m.type);
+        return n * sum;
+    }
+    return n * (t.cols ? t.cols : 1);
+}
+
 constexpr int kMaxUniformLocations = 1048576;  // GL_MAX_UNIFORM_LOCATIONS (gl_api.cpp)
 
 bool usedAnywhere(const Shader&, const Symbol* s) { return s->used; }
@@ -384,6 +397,9 @@ LinkResult link(const std::shared_ptr<Shader>& vs, const std::shared_ptr<Shader>
             const int n = slots(s->type);
             for (int k = 0; k < n; ++k) {
                 if (loc + k >= 32) return error("attribute '" + s->name + "' location out of range");
+                if ((taken & (1u << (loc + k))) &&
+                    strict("attribute_location_alias", "attribute '" + s->name + "' shares location " + std::to_string(loc + k) + " with another active attribute"))
+                    return r;
                 taken |= 1u << (loc + k);
             }
             L.attribLocation[s->name] = loc;
@@ -444,7 +460,7 @@ LinkResult link(const std::shared_ptr<Shader>& vs, const std::shared_ptr<Shader>
             if (!out && in->used && in->location >= 0)
                 for (const GlobalDecl& vg : vs->globals) {
                     const Symbol* o = vg.sym;
-                    if (o->storage == Storage::Out && o->location == in->location && o->type == in->type && !fragmentReads(o->name))
+                    if (o->storage == Storage::Out && o->location == in->location && sameType(o->type, in->type) && !fragmentReads(o->name))
                         out = o;
                 }
             if (!out) {
@@ -457,7 +473,7 @@ LinkResult link(const std::shared_ptr<Shader>& vs, const std::shared_ptr<Shader>
                 }
                 continue;
             }
-            if (out->type != in->type) {
+            if (!sameType(out->type, in->type)) {
                 note(in, "!type");
                 return error("varying '" + in->name + "' has different types in the two stages");
             }
@@ -466,9 +482,7 @@ LinkResult link(const std::shared_ptr<Shader>& vs, const std::shared_ptr<Shader>
                 return error("varying '" + in->name + "' has different interpolation qualifiers");
             }
             if (!in->used) continue;
-            Type el = in->type.isArray() ? in->type.element() : in->type;
-            int n = (in->type.isArray() ? in->type.dims[0] : 1) * (el.cols ? el.cols : 1);
-            if (el.base == Base::Struct) return error("struct varyings are not supported ('" + in->name + "')");
+            const int n = varyingSlots(in->type);
             pairs.push_back({in, out, in->location >= 0 ? in->location : out->location, n});
             if (in->interp == Interp::Flat) r.reflection.flatVaryings = true;
         }
@@ -528,6 +542,7 @@ LinkResult link(const std::shared_ptr<Shader>& vs, const std::shared_ptr<Shader>
         // ---- fragment outputs ------------------------------------------------------------------
         int autoLoc = 0;
         int outputs = 0;
+        uint32_t outTaken = 0;
         for (const GlobalDecl& g : fs->globals) {
             const Symbol* s = g.sym;
             if (s->storage != Storage::Out) continue;
@@ -535,6 +550,13 @@ LinkResult link(const std::shared_ptr<Shader>& vs, const std::shared_ptr<Shader>
             int loc = s->location >= 0 ? s->location : autoLoc;
             int n = s->type.isArray() ? s->type.dims[0] : 1;
             if (loc + n > 8) return error("fragment output '" + s->name + "' location out of range");
+            {
+                const uint32_t bits = ((n >= 32 ? 0u : 1u << n) - 1u) << loc;
+                if ((outTaken & bits) &&
+                    strict("output_location_alias", "fragment output '" + s->name + "' shares a location with another output"))
+                    return r;
+                outTaken |= bits;
+            }
             L.outputLocation[s->name] = loc;
             autoLoc = loc + n;
             Variable v;

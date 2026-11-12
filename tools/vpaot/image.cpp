@@ -43,14 +43,20 @@ std::vector<uint8_t> unwrap_self(const std::vector<uint8_t>& self) {
     }
     const uint64_t phoff = get<uint64_t>(self, base + 32);
     const uint16_t phnum = get<uint16_t>(self, base + 56);
+    if (phoff > self.size() - base || uint64_t(phnum) * 56 > self.size() - base - phoff) {
+        throw std::runtime_error("SELF program headers out of the file");
+    }
     std::vector<Phdr> ph(phnum);
     for (uint16_t i = 0; i < phnum; ++i) {
         std::memcpy(&ph[i], self.data() + base + phoff + i * 56, 56);
     }
-    size_t end = 0;
-    for (const auto& p : ph) end = std::max<size_t>(end, p.offset + p.filesz);
+    const size_t header_end = size_t(phoff) + size_t(phnum) * 56;
+    size_t end = header_end;
+    for (const auto& p : ph) {
+        if (p.filesz > (uint64_t(1) << 31) || p.offset > (uint64_t(1) << 31)) throw std::runtime_error("bad SELF program header");
+        end = std::max<size_t>(end, p.offset + p.filesz);
+    }
     std::vector<uint8_t> elf(end);
-    const size_t header_end = phoff + size_t(phnum) * 56;
     std::memcpy(elf.data(), self.data() + base, header_end);
     for (uint16_t i = 0; i < count; ++i) {
         const uint64_t flags = get<uint64_t>(self, 32 + i * 32);
@@ -61,7 +67,7 @@ std::vector<uint8_t> unwrap_self(const std::vector<uint8_t>& self) {
         const size_t index = (flags >> 20) & 4095;
         if (index >= ph.size()) throw std::runtime_error("bad SELF segment index");
         const auto& p = ph[index];
-        if (size != p.filesz || off + size > self.size()) throw std::runtime_error("bad SELF segment");
+        if (size != p.filesz || size > self.size() || off > self.size() - size) throw std::runtime_error("bad SELF segment");
         std::memcpy(elf.data() + p.offset, self.data() + off, size);
     }
     return elf;
