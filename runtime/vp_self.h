@@ -18,7 +18,6 @@ static inline uint64_t vp_self_pad(uint64_t align) {
  * one pad for the header area). `pad_sum` is capped at VP_SELF_MAX_PAD_SUM, so a file of N bytes never justifies more than N + 66 MiB
  * however many program headers it has. A few bytes "at 2 GiB" are refused before the image is reserved. */
 static inline uint64_t vp_self_end_limit(uint64_t self_size, uint64_t pad_sum) {
-    pad_sum *= 2;
     if (pad_sum > VP_SELF_MAX_PAD_SUM) pad_sum = VP_SELF_MAX_PAD_SUM;
     if (self_size >= VP_SELF_MAX_ELF) return VP_SELF_MAX_ELF;
     const uint64_t l = self_size + pad_sum + VP_SELF_MAX_PAD;
