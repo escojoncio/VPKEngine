@@ -2197,6 +2197,12 @@ private:
             if (int(i) == depthShadowOutput_) v = depthShadowValue();
             if (int(i) == depthEmulOutput_) v = d24Depth(v);
             if (int(i) == sampleMaskOutput_) v = sampleMaskOwn_ ? u32(o_.sampleMask) : bin(Op::And, v, u32(o_.sampleMask), vpir::kU32);
+            if (o_.uiTint && stage_ == vpir::Stage::Fragment && o.builtin == vpir::Builtin::None && o.location == 0 && o.index == 0 &&
+                o.type.scalar == Scalar::F32 && o.type.width == 4) {  // VPVK_UI_TINT diagnostic
+                iface_.uiTinted = true;
+                v = o_.uiTint == 3 ? vecOf({ext(v, 0), ext(v, 1), ext(v, 2), f32(1.0f)}, o.type)
+                                   : vecOf({f32(1.0f), f32(0.0f), f32(1.0f), f32(1.0f)}, o.type);
+            }
             if (auto m = clipMirror_.find(int(i)); m != clipMirror_.end()) v = loadVar(outputShadow_[size_t(m->second)]);
             b_->storeOutput(uint32_t(i), v);
         }

@@ -1678,6 +1678,17 @@ void testQuestExtras() {
     CHECK(h1 == b.hash());
   }
   {
+    // VPVK_UI_TINT: a tinted stage never shares a key with the normal one; tint 0 keeps the old bytes (and hash), the mode is in the key.
+    StageInput a;
+    a.spirv = 1;
+    const uint64_t h0 = a.hash();
+    StageInput t1 = a, t3 = a;
+    t1.opt.uiTint = 1, t3.opt.uiTint = 3;
+    CHECK(h0 != t1.hash() && t1.hash() != t3.hash() && h0 != t3.hash());
+    t1.opt.uiTint = 0;
+    CHECK(t1.hash() == h0);
+  }
+  {
     // Formats added for Quest parity.
     const VkFormatFeatureFlags colour = VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT | VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT |
                                         VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT | VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT |

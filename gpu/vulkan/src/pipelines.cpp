@@ -1785,7 +1785,7 @@ StageOut translateStage(Device* d, const PipelineObj::StageSrc& src, const Pipel
                         uint32_t viewMask = 0, const std::vector<PipelineObj::TexelBinding>* texel = nullptr,
                         uint16_t colorIntKinds = 0, int uiMaskSlot = -1, bool uiMaskAlpha = false, bool a2cTest = false,
                         uint32_t sampleMask = ~0u, bool d24Emul = false, int depthShadowSlot = -1, int depthFetchSlot = -1,
-                        int depthFetchTexSlot = -1) {
+                        int depthFetchTexSlot = -1, uint8_t uiTint = 0) {
   StageOut o;
   if (!src.module) {
     logf("vk.err what=shader pipeline=%s stage=%u error=\"no module\"", label.c_str(), unsigned(src.stage));
@@ -1808,6 +1808,7 @@ StageOut translateStage(Device* d, const PipelineObj::StageSrc& src, const Pipel
     opt.sampleMask = sampleMask;
     opt.d24Emul = d24Emul;
     opt.depthShadowSlot = int8_t(depthShadowSlot), opt.depthFetchSlot = int8_t(depthFetchSlot), opt.depthFetchTexSlot = depthFetchTexSlot;
+    opt.uiTint = uiTint;
   }
   // Foveation: multiview stages of exactly two views (rate map layer = view) carry the viewport index / the
   // FragCoord mapping, in every pass they may run in (outside a foveated pass the backend binds an identity map
@@ -1840,7 +1841,7 @@ StageOut translateStage(Device* d, const PipelineObj::StageSrc& src, const Pipel
   // again: the store hands back the shader id and the interface, and the MSL is registered with the
   // backend once per device. Translating 3000+ stages at ShaderWarmup froze the game thread for ~5 s.
   StageInput in;
-  const bool recordable = d->recipes && src.words && !src.words->empty();
+  const bool recordable = d->recipes && src.words && !src.words->empty() && !opt.uiTint;  // (a tinted diagnostic stage is never persisted)
   if (recordable) {
     in.spirv = src.hash;
     in.opt = opt;
@@ -3080,6 +3081,19 @@ bool uiMaskUsesAlpha(const vpgpu::BlendState& b) {
                        b.srcAlpha == vpgpu::BlendFactor::SrcAlpha);
 }
 
+// VPVK_UI_TINT (diagnostic, read once): 0/unset = off; 1 = the UI draws' colour 0 is opaque magenta; 2 = the same without depth test and
+// cull; 3 = their own rgb with alpha 1. Only the UI-class mask variants (".umu") change; their stages are never recorded in the recipes
+// (translateStage: recordable is false when uiTint is set) and a shader without a float vec4 location 0 is left as it is (SpirvInterface::uiTinted).
+uint8_t uiTintMode() {
+  static const uint8_t mode = [] {
+    const char* e = std::getenv("VPVK_UI_TINT");
+    const long v = e && *e ? std::strtol(e, nullptr, 10) : 0;
+    if (e) logf("vk.ui_tint read mode=%ld", v);
+    return uint8_t(v >= 1 && v <= 3 ? v : 0);
+  }();
+  return mode;
+}
+
 }  // namespace
 
 bool maskPipelineKey(Device* dev, const PipelineObj& p, PipelineObj::TexelVariant* tv, uint8_t passSamples, bool ui,
@@ -3100,6 +3114,8 @@ bool maskPipelineKey(Device* dev, const PipelineObj& p, PipelineObj::TexelVarian
   st.samples = samples;
   std::array<uint64_t, 3> inputs = tv ? tv->inputs : p.inputs;
   bool translated = true;
+  bool uiTinted = false;  // the fragment shader really had a float vec4 location 0 to tint
+  const uint8_t tint = ui ? uiTintMode() : uint8_t(0);
   if (ui) {
     // The fragment stage again, writing the mask (colour 0's alpha when the draw blends by alpha).
     std::vector<PipelineObj::TexelBinding> tb = p.texel;
@@ -3109,8 +3125,9 @@ bool maskPipelineKey(Device* dev, const PipelineObj& p, PipelineObj::TexelVarian
     for (const PipelineObj::StageSrc& src : p.sources) {
       if (src.stage != VK_SHADER_STAGE_FRAGMENT_BIT || src.synthetic) continue;  // (a depth-only draw does not mark the mask)
       StageOut o = translateStage(dev, src, *p.layout, p.viewCount, p.attrs, p.vertexBuffers, st.label + ".um", p.viewMask,
-                                  tv ? &tb : nullptr, p.colorIntKinds, slot, uiMaskUsesAlpha(base.blend[0]), p.a2cTest, p.sampleMask, p.d24Emul);
-      if (o.ok) st.fragmentShader = o.id, inputs[1] = o.input, translated = true;
+                                  tv ? &tb : nullptr, p.colorIntKinds, slot, uiMaskUsesAlpha(base.blend[0]), p.a2cTest, p.sampleMask, p.d24Emul, -1, -1, -1,
+                                  tint);
+      if (o.ok) st.fragmentShader = o.id, inputs[1] = o.input, translated = true, uiTinted = o.iface.uiTinted;
       break;
     }
     if (!translated) {
@@ -3121,6 +3138,13 @@ bool maskPipelineKey(Device* dev, const PipelineObj& p, PipelineObj::TexelVarian
     }
   }
   const bool writes = ui && translated;
+  const bool tinted = writes && tint != 0 && uiTinted;
+  if (tinted) {
+    if (tint == 2) st.depthTest = false, st.cull = vpgpu::CullMode::None;
+    st.label += ".tint" + std::to_string(tint);
+    static std::atomic<unsigned> nTint{0};
+    if (const unsigned n = nTint.fetch_add(1) + 1; n == 1 || n % 32 == 0) logf("vk.ui_tint mode=%u pipelines=%u", unsigned(tint), n);
+  }
   applyUiMaskTarget(st, writes);  // (the prewarm builds the '.ums' variant the same way)
   mv.key = st.key();
   mv.ok = true;
@@ -3132,7 +3156,7 @@ bool maskPipelineKey(Device* dev, const PipelineObj& p, PipelineObj::TexelVarian
     logf("vk.taa uimask pipeline_variant pipeline=%s ui=%d samples=%u", st.label.c_str(), writes ? 1 : 0, unsigned(samples));
   retainKey(dev, p, mv.key);
   dev->gpu->pipelines().request(st, mv.key, vpgpu::Priority::Blocking);
-  if (dev->recipes) dev->recipes->addPipeline(st, inputs);
+  if (dev->recipes && !tinted) dev->recipes->addPipeline(st, inputs);
   // Built while a submission is translated (submitMutex held): in synchronous mode the key is only noted and runBatches
   // waits for all of them once (awaitFreshVariants), not one compile at a time under the mutex.
   if (!dev->translator) dev->uiMask.freshVariants.push_back(mv.key);
