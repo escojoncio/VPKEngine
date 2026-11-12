@@ -36,7 +36,7 @@ if(BUILD_TESTING OR NOT DEFINED BUILD_TESTING)
     find_package(Threads REQUIRED)
     target_link_libraries(vpgles_tests PRIVATE ${CMAKE_DL_LIBS} Threads::Threads)
     target_include_directories(vpgles_tests PRIVATE include src ${CMAKE_CURRENT_SOURCE_DIR}/../vulkan/third_party/vulkan-headers/include)
-    foreach(t egl eglthreads formats buffers mapunsync textures fbo msrbo msrtt_depth program draw invalidate multiview errors ubo readback external es31 progbin recipe xfb uniform_raw uniform_strict audit_lost audit_calls audit_compile audit_xfb audit2_xfer audit2_dyn audit2_buf audit2_pbo audit2_upload audit2_egl audit2_link audit2_link2 audit3_egl_last audit3_egl_refs audit3_pbo audit3_xfer_shared audit3_stale_stamp)
+    foreach(t egl eglthreads formats buffers mapunsync textures fbo msrbo msrtt_depth program draw invalidate multiview errors ubo readback external es31 progbin recipe xfb uniform_raw uniform_strict audit_lost audit_calls audit_compile audit_xfb audit2_xfer audit2_dyn audit2_buf audit2_pbo audit2_upload audit2_egl audit2_link audit2_link2 audit3_egl_last audit3_egl_refs audit3_pbo audit3_xfer_shared audit3_stale_stamp audit4_xfer_own_pass)
       add_test(NAME gpu_gles.gl.${t} COMMAND vpgles_tests ${t} $<TARGET_FILE:VPVulkan>)
     endforeach()
     # GL_RENDERER follows the Quest identity's GPU name (VPVK_QUEST_GPU_NAME, latched at the first query): its own run.

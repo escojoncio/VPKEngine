@@ -24,6 +24,7 @@ step() { # name, command...: a build or test that fails counts once
 build() { out=$1; shift; "$@" -o "$OUT/$out" 2>"$OUT/$out.cc.log" || { echo "FAIL $out (build: $(head -c 300 "$OUT/$out.cc.log"))"; bad=$((bad + 1)); return 1; }; }
 
 build loader_bounds $CC $CF $UB "$D/loader_bounds.c" $RT $LIBS && step loader_bounds "$OUT/loader_bounds" "$OUT"
+build loader_self $CC $CF $UB "$D/loader_self.c" $RT $LIBS && step loader_self "$OUT/loader_self" "$OUT"
 build loader_stubs $CC $CF $UB "$D/loader_stubs.c" $RT $LIBS && step loader_stubs "$OUT/loader_stubs" "$OUT"
 build loader_shared $CC $CF $UB "$D/loader_shared.c" $RT $LIBS && step loader_shared "$OUT/loader_shared" "$OUT"
 build loader_shared_tsan $CC $CF $TS "$D/loader_shared.c" $RT $LIBS && step loader_shared_tsan "$OUT/loader_shared_tsan" "$OUT"
@@ -50,10 +51,12 @@ step pack_spaces sh "$D/pack_spaces.sh"
 step audit_scripts sh "$D/audit_scripts.sh"
 step pkcs12_secrets sh "$D/pkcs12_secrets.sh" "$OUT/pkcs12"
 if [ -n "${VPAOT:-}" ]; then
+    step self_valid sh "$D/../aot/self_valid/run.sh" "$VPAOT" "$OUT/self_valid"
+    step self_malformed sh "$D/../aot/self_malformed/run.sh" "$VPAOT" "$OUT/self_malformed"
     step patch_longline sh "$D/patch_longline.sh" "$VPAOT"
     step ubsan_aot sh "$D/ubsan_aot.sh" "$VPAOT" "$OUT/ubsan_aot"
 else
-    echo "SKIP patch_longline, ubsan_aot (set VPAOT)"
+    echo "SKIP self_valid, self_malformed, patch_longline, ubsan_aot (set VPAOT)"
 fi
 echo "run_local: $bad failed"
 [ "$bad" -eq 0 ]

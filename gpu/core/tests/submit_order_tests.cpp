@@ -374,6 +374,44 @@ void testCompletionFrontier() {
     f.submitted(1, false);
     CHECK(f.completed() == 4);
   }
+  {  // a repeated index with work is ignored: a second entry in the queue could never finish
+    CompletionFrontier f;
+    f.submitted(0, true);
+    f.submitted(0, true);
+    f.finished(0);
+    CHECK(f.completed() == 1);
+    f.submitted(1, true);
+    f.finished(1);
+    f.submitted(1, true);  // repeat of a frame that already finished
+    CHECK(f.completed() == 2);
+    f.submitted(2, false);
+    CHECK(f.completed() == 3);
+  }
+  {  // a repeat of a late frame (gap closed once) is ignored too
+    CompletionFrontier f;
+    f.submitted(2, true);
+    f.submitted(0, true);
+    f.submitted(0, true);
+    f.submitted(1, false);
+    f.finished(2);
+    f.finished(0);
+    CHECK(f.completed() == 3);
+  }
+  {  // indices that never arrive: the pending ranges are bounded, the oldest is given up and the frontier moves on
+    CompletionFrontier f;
+    f.submitted(0, false);
+    CHECK(f.completed() == 1);
+    // every other index is missing: 1, 3, 5, ... never come
+    for (uint64_t i = 2; i < 2 * 5000; i += 2) f.submitted(i, false);
+    CHECK(f.completed() > 1);       // not frozen at the first missing index
+    CHECK(f.completed() < 2 * 5000);  // but not past the newest ranges still pending
+    const uint64_t c = f.completed();
+    f.submitted(2 * 5000 - 1, true);  // the newest missing index still counts: it holds the frontier... and finishes
+    f.finished(2 * 5000 - 1);
+    CHECK(f.completed() >= c);
+    f.submitted(1, true);  // a frame of a given-up range: ignored (taken for a repeat), no stale entry in flight
+    CHECK(f.completed() >= c);
+  }
   {  // against a model, random arrival order: completed() is the lowest frame not yet handed over or not yet finished
     uint64_t seed = 88172645463325252ull;
     auto rnd = [&] { seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17; return seed; };

@@ -260,7 +260,13 @@ Context::PassKey Context::passKeyFor(const FbInfo& fb) {
 // on, the list is left for the caller to record as vkCmdClearAttachments.
 bool Context::beginPass(const FbInfo& fb, std::vector<VkClearAttachment>* firstClear) {
     if (!xfers_.empty()) {  // an attachment with an upload waiting: the pass (even one that goes on) ends first, and the upload goes in
-        auto waiting = [](const FbTarget& t) { return (t.image && t.image->xferPending) || (t.seedImage && t.seedImage->xferPending); };
+        // Only this context's own waiting uploads count: the image's xferPending also holds those of another context of the share group,
+        // which records them itself (cutting this pass for them would end it at every draw of this context).
+        auto mine = [&](const Image* i) {
+            return i && i->xferPending &&
+                   std::any_of(xfers_.begin(), xfers_.end(), [&](const Xfer& x) { return x.image.get() == i; });
+        };
+        auto waiting = [&](const FbTarget& t) { return mine(t.image) || mine(t.seedImage.get()); };
         bool hit = waiting(fb.depth) || waiting(fb.stencil);
         for (const FbTarget& t : fb.color) hit = hit || waiting(t);
         if (hit) endPass();

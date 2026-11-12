@@ -6349,8 +6349,8 @@ void testAudit3EglRefs() {
     CHECK(eglMakeCurrent(a.dpy, surfB, surfB, ctxB) == 0);
     CHECK(eglGetError() == 0x3006 /*EGL_BAD_CONTEXT*/);
     CHECK(eglMakeCurrent(a.dpy, nullptr, nullptr, nullptr) != 0);
-    // A terminate with no initialize outstanding answers success and does nothing (what was made meanwhile stays); the display can be
-    // initialized again.
+    // A terminate with no initialize outstanding answers success and does nothing (releaseDisplay is not run: what was made meanwhile
+    // stays); the display can be initialized again. (Deliberate: EGL 1.5 3.2 would release on every eglTerminate.)
     void* surfC = eglCreatePbufferSurface(a.dpy, a.config, sattrs);
     void* ctxC = eglCreateContext(a.dpy, a.config, nullptr, cattrs);
     CHECK(surfC && ctxC);
@@ -6459,6 +6459,7 @@ void testAudit3StaleStamp() {
     glBufferData(gl::PIXEL_PACK_BUFFER, 64 * 64 * 4 + 64, nullptr, 0x88E1 /*STREAM_READ*/);
     const EGLint sattrs[] = {egl::WIDTH, 8, egl::HEIGHT, 8, egl::NONE};
     std::vector<void*> surfaces;
+    const float patch[4] = {1, 2, 3, 4};
     // A temporary context submits and waits (creating a surface zero-fills its images): a submission of someone else.
     auto foreign = [&] {
         void* s = eglCreatePbufferSurface(e.dpy, e.config, sattrs);
@@ -6502,7 +6503,6 @@ void testAudit3StaleStamp() {
     glDrawArrays(gl::TRIANGLES, 0, 3);
     foreign();
     resetCalls();
-    const float patch[4] = {1, 2, 3, 4};
     glBufferSubData(gl::ARRAY_BUFFER, 0, 16, patch);
     CHECK(calls.buffersCreated > 0);
     settle();
@@ -6519,6 +6519,17 @@ void testAudit3StaleStamp() {
     glTexImage2D(gl::TEXTURE_2D, 0, gl::RGBA, 8, 8, 0, gl::RGBA, gl::UNSIGNED_BYTE, nullptr);
     CHECK(submits > before);
     glBindBuffer(gl::PIXEL_UNPACK_BUFFER, 0);
+    settle();
+    // 5. A CPU write over a pixel buffer the open command buffer's readback writes waits for the readback (else the GPU would write over
+    //    the application's bytes later, or the copy of the storage would miss them).
+    glDrawArrays(gl::TRIANGLES, 0, 3);
+    glBindBuffer(gl::PIXEL_PACK_BUFFER, pb);
+    glReadPixels(0, 0, 8, 8, gl::RGBA, gl::UNSIGNED_BYTE, nullptr);
+    foreign();
+    before = submits;
+    glBufferSubData(gl::PIXEL_PACK_BUFFER, 0, 16, patch);
+    CHECK(submits > before);
+    glBindBuffer(gl::PIXEL_PACK_BUFFER, 0);
     settle();
     for (void* s : surfaces) eglDestroySurface(e.dpy, s);
     alarm(0);
@@ -6605,6 +6616,86 @@ void testAudit3XferShared() {
     CHECK(u != std::string::npos && d != std::string::npos && u < d);
     alarm(0);
     glFinish();
+    eglDestroyContext(a.dpy, ctxB);
+    eglDestroySurface(a.dpy, surfB);
+    a.down();
+}
+
+// Round 4 (M4), two contexts of one share group: a texture another context has an upload waiting for is an attachment of this one, and
+// this one has uploads of its own waiting (so its pass check runs): its draws go on in the open pass (only its own waiting uploads of
+// the attachment end it; the other context records its own).
+void testAudit4XferOwnPass() {
+    Egl a;
+    CHECK(a.up());
+    SteadyKit ka;
+    ka.up();
+    G(glDrawArrays, void (*)(GLenum, GLint, GLsizei));
+    G(glFlush, void (*)());
+    G(glFinish, void (*)());
+    G(glGenTextures, void (*)(GLsizei, GLuint*));
+    G(glBindTexture, void (*)(GLenum, GLuint));
+    G(glActiveTexture, void (*)(GLenum));
+    G(glTexImage2D, void (*)(GLenum, GLint, GLint, GLsizei, GLsizei, GLint, GLenum, GLenum, const void*));
+    G(glTexSubImage2D, void (*)(GLenum, GLint, GLint, GLint, GLsizei, GLsizei, GLenum, GLenum, const void*));
+    G(glGenFramebuffers, void (*)(GLsizei, GLuint*));
+    G(glBindFramebuffer, void (*)(GLenum, GLuint));
+    G(glFramebufferTexture2D, void (*)(GLenum, GLenum, GLenum, GLuint, GLint));
+    G(eglCreateContext, void* (*)(void*, void*, void*, const EGLint*));
+    G(eglCreatePbufferSurface, void* (*)(void*, void*, const EGLint*));
+    G(eglMakeCurrent, uint32_t (*)(void*, void*, void*, void*));
+    G(eglDestroyContext, uint32_t (*)(void*, void*));
+    G(eglDestroySurface, uint32_t (*)(void*, void*));
+    watchdog(60);
+    const uint8_t px[16 * 16 * 4] = {};
+    GLuint target = 0;
+    glGenTextures(1, &target);
+    glBindTexture(gl::TEXTURE_2D, target);
+    glTexImage2D(gl::TEXTURE_2D, 0, gl::RGBA, 16, 16, 0, gl::RGBA, gl::UNSIGNED_BYTE, px);
+    glBindTexture(gl::TEXTURE_2D, ka.tex);
+    settle();
+    const EGLint sattrs[] = {egl::WIDTH, 16, egl::HEIGHT, 16, egl::NONE};
+    const EGLint cattrs[] = {egl::CONTEXT_CLIENT_VERSION, 3, egl::NONE};
+    void* surfB = eglCreatePbufferSurface(a.dpy, a.config, sattrs);
+    void* ctxB = eglCreateContext(a.dpy, a.config, a.ctx, cattrs);
+    CHECK(surfB && ctxB);
+    std::atomic<int> step{0};
+    int passesB = -1;
+    std::thread th([&] {
+        eglMakeCurrent(a.dpy, surfB, surfB, ctxB);
+        SteadyKit kb;
+        kb.up();
+        GLuint fbo = 0, side = 0;
+        glGenFramebuffers(1, &fbo);
+        glBindFramebuffer(gl::FRAMEBUFFER, fbo);
+        glFramebufferTexture2D(gl::FRAMEBUFFER, gl::COLOR_ATTACHMENT0, gl::TEXTURE_2D, target, 0);
+        settle();
+        glDrawArrays(gl::TRIANGLES, 0, 3);  // B's pass is open on `target`
+        glActiveTexture(0x84C1 /*TEXTURE1*/);  // an upload of B's own (a texture the draws do not sample) waits for the pass to end
+        glGenTextures(1, &side);
+        glBindTexture(gl::TEXTURE_2D, side);
+        glTexImage2D(gl::TEXTURE_2D, 0, gl::RGBA, 4, 4, 0, gl::RGBA, gl::UNSIGNED_BYTE, px);
+        glActiveTexture(0x84C0 /*TEXTURE0*/);
+        step = 1;
+        while (step != 2) std::this_thread::yield();
+        resetCalls();
+        glDrawArrays(gl::TRIANGLES, 0, 3);  // A has an upload of `target` waiting: not B's business
+        glDrawArrays(gl::TRIANGLES, 0, 3);
+        passesB = counts.passes;
+        step = 3;
+        glFinish();
+        glBindFramebuffer(gl::FRAMEBUFFER, 0);
+        eglMakeCurrent(a.dpy, nullptr, nullptr, nullptr);
+    });
+    glDrawArrays(gl::TRIANGLES, 0, 3);
+    glBindTexture(gl::TEXTURE_2D, target);
+    glTexSubImage2D(gl::TEXTURE_2D, 0, 0, 0, 4, 4, gl::RGBA, gl::UNSIGNED_BYTE, px);  // A's pass is open: the upload waits
+    while (step != 1) std::this_thread::yield();
+    step = 2;
+    while (step != 3) std::this_thread::yield();
+    glFinish();
+    th.join();
+    CHECK(passesB == 0);
+    alarm(0);
     eglDestroyContext(a.dpy, ctxB);
     eglDestroySurface(a.dpy, surfB);
     a.down();
@@ -6773,7 +6864,7 @@ int main(int argc, char** argv) {
         {"audit_lost", testAuditLost}, {"audit_calls", testAuditCalls}, {"audit_compile", testAuditCompile}, {"audit_xfb", testAuditXfb},
         {"audit2_xfer", testAudit2Xfer}, {"audit2_dyn", testAudit2Dyn}, {"audit2_buf", testAudit2Buf}, {"audit2_pbo", testAudit2Pbo},
         {"audit2_upload", testAudit2Upload}, {"audit2_egl", testAudit2Egl}, {"audit2_link", testAudit2Link}, {"audit2_link2", testAudit2LinkShared},
-        {"audit3_egl_last", testAudit3EglLast}, {"audit3_egl_refs", testAudit3EglRefs}, {"audit3_pbo", testAudit3Pbo}, {"audit3_xfer_shared", testAudit3XferShared}, {"audit3_stale_stamp", testAudit3StaleStamp},
+        {"audit3_egl_last", testAudit3EglLast}, {"audit3_egl_refs", testAudit3EglRefs}, {"audit3_pbo", testAudit3Pbo}, {"audit3_xfer_shared", testAudit3XferShared}, {"audit3_stale_stamp", testAudit3StaleStamp}, {"audit4_xfer_own_pass", testAudit4XferOwnPass},
     };
     auto it = tests.find(argv[1]);
     if (ok && it != tests.end()) it->second();

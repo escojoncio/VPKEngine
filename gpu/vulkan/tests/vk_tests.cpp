@@ -8368,15 +8368,87 @@ void testFoveation() {
 // rejected modules, without checking what it was made for. With it left out the digest is the one of the 69 modules again.
 // ptr_negative.comp.spv (the shader audit's variable-pointers fixture) is in it, like the other modules that need a layout: rejected here,
 // contributing its name. 0x1b236d258ca7683b = the 69 modules above plus it, the same in Release and ASan/UBSan.
-// Adding a fixture to gpu/shader/spirv/tests moves digest and count: the test then prints every module with its shader id (the new one
-// is the file you added), and the count check says so on its own.
+// The corpus is a fixed list (kCorpus in corpusDigest): fixtures added to gpu/shader/spirv/tests by other zones (ptr_unsigned_big.comp.spv...)
+// are not part of it. Adding one to the corpus is an edit of that list, kCorpusModules and kCorpusDigest; the test then prints every module.
 constexpr uint64_t kCorpusDigest = 0x1b236d258ca7683bull;  // the "corpus digest" line the test prints
 constexpr unsigned kCorpusModules = 70;
 
 uint64_t corpusDigest(unsigned& modules, unsigned& failed, std::vector<std::string>* listing = nullptr) {
-  std::vector<std::string> names;
-  for (const auto& e : std::filesystem::directory_iterator(VPVK_SPIRV_TESTS))
-    if (e.path().extension() == ".spv" && e.path().filename() != "offset_overflow.comp.spv") names.push_back(e.path().filename().string());
+  // A fixed list of this zone's own: fixtures other zones add to gpu/shader/spirv/tests (their audits' ptr_unsigned_big.comp.spv...)
+  // do not move the digest or the count. Adding a module to the corpus here is a deliberate edit of this list, kCorpusModules and kCorpusDigest.
+  static const char* const kCorpus[] = {
+    "array_length.comp.spv",
+    "bda.comp.spv",
+    "bitcast16.comp.spv",
+    "bool_iface.frag.spv",
+    "bool_iface.vert.spv",
+    "clip.vert.spv",
+    "clip_invariant.vert.spv",
+    "cull.comp.opt.spv",
+    "cull.comp.spv",
+    "depth_write.frag.spv",
+    "dot.comp.spv",
+    "draw_params.vert.spv",
+    "dual_source.frag.spv",
+    "dyn_buffer.comp.spv",
+    "dyn_index.frag.spv",
+    "dyn_index_big.frag.spv",
+    "f16.frag.spv",
+    "f16_insert.vert.spv",
+    "f16math.comp.spv",
+    "fetch_f.comp.spv",
+    "fetch_i.comp.spv",
+    "fetch_offset_kill.frag.spv",
+    "fetch_u.comp.spv",
+    "fixes.comp.spv",
+    "fixes.frag.spv",
+    "fixes.vert.spv",
+    "ftoi.comp.spv",
+    "ftoi_bounded.comp.spv",
+    "helper.frag.spv",
+    "inline_ubo.frag.spv",
+    "int16.comp.spv",
+    "int8.comp.spv",
+    "ldexp.comp.spv",
+    "lit.frag.opt.spv",
+    "lit.frag.spv",
+    "loop_kill.frag.spv",
+    "loop_once.frag.spv",
+    "membar.comp.spv",
+    "membar_image.comp.spv",
+    "mesh_multiview.vert.opt.spv",
+    "mesh_multiview.vert.spv",
+    "outinit.frag.spv",
+    "pos.vert.spv",
+    "ptr_negative.comp.spv",
+    "rowmajor.comp.spv",
+    "solid.frag.spv",
+    "storage16.comp.spv",
+    "storage_write.comp.spv",
+    "store_f.comp.spv",
+    "store_i.comp.spv",
+    "store_u.comp.spv",
+    "subgroup_arith.comp.spv",
+    "subgroup_cube.comp.spv",
+    "subgroup_shuffle.comp.spv",
+    "submask.comp.spv",
+    "subpass.frag.opt.spv",
+    "subpass.frag.spv",
+    "tex1d.frag.spv",
+    "tex_ms.frag.spv",
+    "tex_tint.frag.spv",
+    "texel_fetch.comp.spv",
+    "two_kill.frag.spv",
+    "uimask.frag.spv",
+    "uimask.vert.spv",
+    "varptr.comp.spv",
+    "varptr_call.comp.spv",
+    "vertex_store.vert.spv",
+    "wg_spec_atomic.comp.spv",
+    "ycbcr.frag.spv",
+    "zeroinit.comp.spv",
+  };
+  std::vector<std::string> names(std::begin(kCorpus), std::end(kCorpus));
   std::sort(names.begin(), names.end());
   uint64_t h = 0xcbf29ce484222325ull;
   auto mix = [&](uint64_t v) { h = (h ^ v) * 0x100000001b3ull; };
@@ -15310,7 +15382,7 @@ void testAuditRecipeRewrite() {
   }
   {
     RecipeStore t(dir);  // the file on disk, read from scratch
-    CHECK(t.enabled() && !t.needsRefresh());
+    CHECK(t.enabled() && t.needsRefresh());  // (the drift the 300 MSLs of one input noted is not lost by the compaction: testAuditRecipeDriftWindow)
     for (uint64_t n : {0, 1, 19, 100, 200, 201, 204, 300}) CHECK(auditHas(t, n, kText));
     CHECK(t.stageInputs().size() == 20 + 1 + 1 + 5 + 1);
   }
@@ -15649,6 +15721,39 @@ void testAuditRecipeDriftWindow() {
       RecipeStore t(dir);  // the file as the next run reads it
       CHECK(t.enabled());
       CHECK(t.needsRefresh() == (cs != NoDrift));  // (NoDrift is the control: the compacted file says nothing of drift)
+    }
+    std::filesystem::remove_all(dir);
+  }
+  // The file's drift is retranslated by this refresh (it took every input): a drift noted in this run before the refresh is covered
+  // by that, and the compacted file must not carry a record for it (it would retranslate on every load for ever).
+  {
+    char tmpl[] = "/tmp/vpvk_audit_drift2_XXXXXX";
+    const char* dirp = mkdtemp(tmpl);
+    CHECK(dirp != nullptr);
+    if (!dirp) return;
+    const std::string dir = dirp;
+    {
+      RecipeStore a(dir);  // a previous run: a stage, a drift of it
+      for (uint64_t n = 0; n < 5; ++n) auditAddStage(a, n, kText);
+      drift3(a);
+    }
+    {
+      std::shared_ptr<RecipeStore> s = RecipeStore::forDir(dir);  // this run: the file's drift is loaded
+      CHECK(s->needsRefresh());
+      {
+        StageInput i3;  // and another one noted in this run, before the refresh (input 3 again, with a third MSL)
+        i3.spirv = 0x1000 + 3;
+        ShaderBlob blob;
+        blob.source = "// shader 3 once more";
+        s->addStage(i3, i3.hash(), w3, 0x7004, blob);
+      }
+      const RecipeStore::RefreshResult r = s->refresh(1);
+      CHECK(r.rewritten);
+    }
+    {
+      RecipeStore t(dir);
+      CHECK(t.enabled());
+      CHECK(!t.needsRefresh());  // everything was retranslated by the refresh: no drift left in the file
     }
     std::filesystem::remove_all(dir);
   }
@@ -15997,9 +16102,11 @@ void testAuditRefreshFileMoved() {
     }
     RecipeStore s(dir);
     CHECK(s.enabled() && s.needsRefresh() && s.stageInputs().size() == 4);
+    bool entered = false;  // (the gate must not clear itself while it runs: that frees the closure it is executing)
     if (moved)
       s.translateGate = [&] {
-        s.translateGate = nullptr;
+        if (entered) return;
+        entered = true;
         s.setTranslator(other);  // for the nested refresh nothing is stale: only the compaction is due, and it moves the offsets
         s.refresh(1);
         s.setTranslator(base);

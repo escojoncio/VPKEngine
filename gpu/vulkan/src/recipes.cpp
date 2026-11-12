@@ -878,10 +878,12 @@ RecipeStore::RefreshResult RecipeStore::refresh(unsigned threads) {
   std::unordered_set<uint64_t> oldInputs, oldShaders, oldSpirv;
   uint64_t genAtJobs = 0;
   uint32_t idAtJobs = 0;
+  bool driftAtJobs = false, driftWrittenAtJobs = false;
   {
     std::lock_guard lock(mutex_);
     if (!file_) return r;
     genAtJobs = rewriteGen_, idAtJobs = translator_;
+    driftAtJobs = drift_, driftWrittenAtJobs = driftWritten_;
     for (const auto& kv : inputs_) oldInputs.insert(kv.first);
     for (const auto& kv : shaders_) oldShaders.insert(kv.first);
     for (const auto& kv : spirv_) oldSpirv.insert(kv.first);
@@ -1010,6 +1012,10 @@ RecipeStore::RefreshResult RecipeStore::refresh(unsigned threads) {
   for (auto it = spirv_.begin(); it != spirv_.end();)
     it = usedSpirv.count(it->first) || !oldSpirv.count(it->first) ? std::next(it) : spirv_.erase(it);
   drift_ = false;
+  // Every input was retranslated when the file's drift was set at the start (the jobs took them all): a drift noted in this run before
+  // that is covered too, and must not be written again (the compacted file would carry it for ever). One noted since (driftWritten_
+  // set after the jobs) or while nothing was retranslated (no drift_ at the start) stays: the rewrite writes its record.
+  if (driftAtJobs && driftWrittenAtJobs) driftWritten_ = false;
   r.rewritten = rewrite(lock);
   r.ms = std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
   logf("gpu.pso.recipe refresh retranslated=%u same_msl=%u failed=%u dropped_pipelines=%u pipelines=%zu shaders=%zu "

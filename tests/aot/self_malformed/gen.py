@@ -23,6 +23,7 @@ cases = {
  "huge_filesz": self_file(0, 64, 1, ph(0, 1 << 40)),
  "big_filesz": self_file(0, 64, 1, ph(0, 1 << 30)),  # below the 2 GiB cap but far more than the file holds: refused before reserving it
  "big_offset": self_file(0, 64, 1, ph((1 << 31) - 16, 16), tail=bytes(16)),  # a few bytes of data far into the image: refused before reserving 2 GiB
+ "offset_past_align": self_file(0, 64, 1, ph(3 << 21, 0x14), tail=bytes(0x14)),  # 6 MiB with 4 KiB alignment: padding does not justify it (a 2 MiB-aligned segment at 2 MiB is in ../self_valid)
  "offset_overflow": self_file(0, 64, 1, ph(0xFFFFFFFFFFFFFFF0, 0x20)),
  "seg_off_overflow": self_file(1, 64, 1, ph(0, 16), segs=[(0x800, 0xFFFFFFFFFFFFFFF8, 16, 16)], tail=bytes(16)),
  "seg_index": self_file(1, 64, 1, ph(0, 16), segs=[(0x800 | (5 << 20), 0, 16, 16)], tail=bytes(16)),

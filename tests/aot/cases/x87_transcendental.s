@@ -1,3 +1,6 @@
+# requires: intel
+# (f2xm1 with |x| > 1 and fyl2xp1 with x <= -1 are undefined in the SDM, and AMD's microcode differs from Intel's: the whole file is
+# measured on Intel. Elsewhere the translation is compared with the golden file only, which --write-golden never rewrites there.)
 # x87 transcendental instructions on ordinary arguments: results to the last bit of the extended format
 # (the hardware's own are within one unit of the correctly rounded value, and equal to it for most arguments;
 # these are the ones where the two agree).

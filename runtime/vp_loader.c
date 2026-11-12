@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0 */
 #include "vp_loader.h"
+#include "vp_self.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -302,9 +303,16 @@ static unsigned char* unwrap_self(const unsigned char* self, size_t size, size_t
     if (phoff > size - base || (uint64_t)phnum * 56 > size - base - phoff) return NULL;
     const size_t header_end = (size_t)phoff + (size_t)phnum * 56;
     size_t end = header_end;
+    /* The same limit as tools/vpaot/image.cpp (vp_self.h): the end of a segment is in proportion to the file. */
+    uint64_t pad_sum = 0;
     for (uint16_t i = 0; i < phnum; ++i) {
         Phdr p; memcpy(&p, self + base + phoff + i * 56, 56);
-        if (p.filesz > (UINT64_C(1) << 31) || p.offset > (UINT64_C(1) << 31)) return NULL;
+        if (p.filesz) pad_sum += vp_self_pad(p.align);
+    }
+    const uint64_t cap = vp_self_end_limit(size, pad_sum);
+    for (uint16_t i = 0; i < phnum; ++i) {
+        Phdr p; memcpy(&p, self + base + phoff + i * 56, 56);
+        if (p.filesz > size || p.filesz > cap || p.offset > cap - p.filesz) return NULL;
         if (p.offset + p.filesz > end) end = p.offset + p.filesz;
     }
     unsigned char* elf = calloc(1, end);

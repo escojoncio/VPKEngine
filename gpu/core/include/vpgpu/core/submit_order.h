@@ -163,14 +163,24 @@ class CompletionFrontier {
   // Call before that command buffer is committed. Contract: for a frame with work, this call and the commit (or the hand-over
   // to DeferredCommits) happen under the same lock (the backend's commits.lock), so that the order of the calls is the
   // order of the queue that finished() relies on. A frame whose index never reaches this call freezes completed() below it
-  // for good (nothing can tell it was skipped): every index handed out must be submitted, even if its frame is dropped.
+  // (nothing can tell it was skipped) until kMaxGaps later ranges are pending: every index handed out must be submitted, even if its
+  // frame is dropped.
+  // An index that was already submitted (repeated call) is ignored, work or not: a second entry in the queue could never finish
+  // and would hold the frontier for good.
   void submitted(uint64_t index, bool work) {
     std::lock_guard lock(mutex_);
     if (index >= end_) {
-      if (index > end_) gaps_[end_] = index;  // [end_, index) is still to come
+      if (index > end_) {
+        gaps_[end_] = index;  // [end_, index) is still to come
+        // Indices that never come would make this grow without bound: past kMaxGaps pending ranges the oldest is given up (its
+        // indices count as handed over, so the frontier moves on instead of freezing for good). A frame of a given-up range that
+        // does arrive later is taken for a repeat and ignored, including its work: the bound is for a caller that breaks the
+        // "every index is submitted" contract, which is not supposed to happen.
+        while (gaps_.size() > kMaxGaps) gaps_.erase(gaps_.begin());
+      }
       end_ = index + 1;
-    } else {
-      closeGap(index);  // a late frame; a repeated index is in no gap
+    } else if (!closeGap(index)) {
+      return;  // a repeated index (or one of a given-up range): nothing to record
     }
     if (work) inFlight_.push_back(index);
     publish();
@@ -191,16 +201,20 @@ class CompletionFrontier {
     for (const uint64_t i : inFlight_) now = std::min(now, i);
     if (now > completed_.load(std::memory_order_relaxed)) completed_.store(now, std::memory_order_release);
   }
-  void closeGap(uint64_t index) {
+  // True if `index` was in a gap (a late frame), which is now closed at it.
+  bool closeGap(uint64_t index) {
     auto it = gaps_.upper_bound(index);
-    if (it == gaps_.begin()) return;
+    if (it == gaps_.begin()) return false;
     --it;
-    if (index >= it->second) return;
+    if (index >= it->second) return false;
     const uint64_t from = it->first, to = it->second;
     gaps_.erase(it);
     if (from < index) gaps_[from] = index;
     if (index + 1 < to) gaps_[index + 1] = to;
+    return true;
   }
+
+  static constexpr size_t kMaxGaps = 1024;  // ranges of indices not handed over yet that are tracked at once
 
   std::mutex mutex_;
   std::deque<uint64_t> inFlight_;           // frames with a command buffer not yet finished, in queue order

@@ -599,6 +599,19 @@ void dummyCleared() {
         readIt(f);
         CHECK(zeros(f));
     }
+    {  // written at submit 0, read-bound at 1 (cleared), the GPU executes the write late; unused until submit 8: the binding there clears
+        Fixture f;
+        writeIt(f);
+        CHECK(f.backend.zerosMemory != nullptr);
+        if (!f.backend.zerosMemory) return;
+        f.renderer.submit();
+        readIt(f);
+        CHECK(zeros(f));
+        gpuWrites(f);
+        for (int i = 0; i < 7; ++i) f.renderer.submit();  // (submits 1..7: the dummy is not bound)
+        readIt(f);
+        CHECK(zeros(f));
+    }
 }
 
 // Over the memory budget the oldest targets the last submit did not use go; the presented one and the latest stay.

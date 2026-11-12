@@ -216,9 +216,11 @@ static EGLBoolean Terminate(EGLDisplay d) {
     if (d != kDisplay) return err(BAD_DISPLAY);
     if (Device* dv = device()) {
         std::lock_guard<std::recursive_mutex> l(dv->lock);
-        // Android's semantics: every eglInitialize is matched by an eglTerminate and only the last one releases the display (another
-        // component's initialize + terminate must not take it from the game). A terminate with none outstanding does nothing (EGL:
-        // terminating a display that is not initialized succeeds and has no effect); it used to release.
+        // DELIBERATE deviation from EGL 1.5 3.2 (there every eglTerminate releases the display's resources, however many
+        // eglInitialize preceded it): Android's semantics. Every eglInitialize is matched by an eglTerminate and only the last one
+        // releases the display (another component's initialize + terminate must not take it from the game). A terminate with none
+        // outstanding succeeds and does nothing (releaseDisplay is not run), as EGL says for a display that is not initialized.
+        // vpgles_shutdown starts the count again (eglResetDisplay).
         if (gDisplay.refs > 1) {
             --gDisplay.refs;
             return TRUE_;

@@ -1,3 +1,5 @@
+# requires: intel
+# (the 12-bit tables are Intel's; AMD's differ, so elsewhere only the golden file is compared.)
 # RCPPS / RSQRTPS / RCPSS / RSQRTSS (and the VEX forms): the 12-bit approximations must match the hardware bit for bit.
 .text
 .globl _start
