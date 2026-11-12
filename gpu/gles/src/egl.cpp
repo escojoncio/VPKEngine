@@ -106,8 +106,6 @@ bool err(EGLint e) {
     return false;
 }
 
-std::mutex gEglLock;
-
 // What the display owns (Device::lock): eglTerminate releases it, and a handle that is not in these is refused instead of followed.
 std::set<Context*> gContexts;
 std::set<Surface*> gSurfaces;
@@ -204,7 +202,7 @@ static EGLDisplay GetPlatformDisplay(EGLenum, void*, const intptr_t*) { return k
 
 static EGLBoolean Initialize(EGLDisplay d, EGLint* major, EGLint* minor) {
     if (d != kDisplay) return err(BAD_DISPLAY);
-    if (!device()) return err(NOT_INITIALIZED);
+    if (!device() || !device()->device) return err(NOT_INITIALIZED);  // (no Device, or the one vpgles_shutdown ended)
     {
         std::lock_guard<std::recursive_mutex> l(device()->lock);
         ++gDisplay.refs;
@@ -561,9 +559,9 @@ static EGLint GetError() {
     return e;
 }
 static EGLBoolean WaitGL() {
-    if (Context* c = current()) {
+    if (current()) {
         std::lock_guard<std::recursive_mutex> l(device()->lock);
-        c->flush(true);
+        if (Context* c = current()) c->flush(true);  // (read again under the lock: see CTX)
     }
     return TRUE_;
 }

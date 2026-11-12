@@ -3456,7 +3456,7 @@ std::shared_ptr<MetalBackend::Impl::CbTimes> MetalBackend::Impl::trackCb(id<MTLC
 }
 
 void MetalBackend::Impl::timedCommit(id<MTLCommandBuffer> c, const std::shared_ptr<CbTimes>& t) {
-  vpgpu::backgroundGate().waitForeground();  // parks while the app is in the background (visionOS fails the commit)
+  vpgpu::backgroundGate().waitForeground(this);  // parks while the app is in the background (visionOS fails the commit)
   t->commitStartNs.store(steadyNs());
   [c commit];
   t->commitEndNs.store(steadyNs());
@@ -4566,7 +4566,7 @@ bool MetalBackend::Impl::encodeNative(NativeEncodeFn fn, void* user) {
     impl->doneCv.notify_all();
     dispatch_semaphore_signal(sem);  // last: once every slot is back the backend may be destroyed
   }];
-  vpgpu::backgroundGate().waitForeground();  // once for the three: they commit back to back
+  vpgpu::backgroundGate().waitForeground(this);  // once for the three: they commit back to back
   [headCb commit];
   [clientCb commit];
   [tailCb commit];
@@ -6290,8 +6290,10 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
           }
           const bool failC = (useC || useD) && !ps && !pending && !shutC, failS = useS && !pss && !pendingS && !shutS;
           if (failC) ++missingPipelines;
-          if ((failC && blitWarned.insert("seed_pipeline").second) || (failS && blitWarned.insert("seed_pipeline_stencil").second))
-            err("what=seed_pipeline f=%llu enc=%u error=%s", (unsigned long long)frameIndex, e, (ps ? serr : perr).c_str());
+          // Each failure warns once, with its own error (both inserts are made: a warning already given for one must not hide the other's).
+          const bool warnC = failC && blitWarned.insert("seed_pipeline").second, warnS = failS && blitWarned.insert("seed_pipeline_stencil").second;
+          if (warnC) err("what=seed_pipeline f=%llu enc=%u error=%s", (unsigned long long)frameIndex, e, perr.c_str());
+          if (warnS) err("what=seed_pipeline_stencil f=%llu enc=%u error=%s", (unsigned long long)frameIndex, e, serr.c_str());
           if (failS) ++missingPipelines;
           const bool anyDepthStencil = rp.depthAttachment.texture || rp.stencilAttachment.texture;
           if (ps || pss) {
@@ -7824,7 +7826,7 @@ MetalBackend::~MetalBackend() {
   if (impl_->warmQueue) dispatch_sync(impl_->warmQueue, ^{});  // the internal warm-up stops at its next item
   if (impl_->seedQueue) dispatch_sync(impl_->seedQueue, ^{});  // and the seed pipelines
   if (ok()) {
-    vpgpu::backgroundGate().release();  // a commit parked for the background holds a slot drain() waits for
+    vpgpu::backgroundGate().release(impl_.get());  // (only this backend's threads: another live backend keeps its own) a commit parked for the background holds a slot drain() waits for
     bool drained = false;
     impl_->drain(UINT64_MAX, drained);
     if (!drained) {

@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <deque>
 #include <map>
@@ -124,6 +125,9 @@ class CommitQueue {
 
   // A thread inside a submit / interop call: make one BEFORE the call can park in the gate and keep it until the call is over
   // (the destructor of the object ends the use of the queue's owner).
+  // Contract: it covers a call that is already running (or parked in the gate) when the owner's destructor starts. A call that
+  // only begins after the destructor started (between its first statement and this constructor) is a call on an object being
+  // destroyed, which no counter can make safe: the caller must have stopped its threads, as for any C++ object.
   class Inside {
    public:
     explicit Inside(CommitQueue& q) : q_(q.inside_) { q_.fetch_add(1, std::memory_order_acq_rel); }

@@ -374,8 +374,7 @@ LinkResult link(const std::shared_ptr<Shader>& vs, const std::shared_ptr<Shader>
                 if (b->buffer) {  // readonly in every stage that uses the block
                     for (Shader* o2 : stages)
                         for (const UniformBlockDecl* ob : o2->blocks)
-                            if (ob->buffer && ob->name == b->name && ob->instanceSym->used)
-                                for (const Member& m : ob->members) ub.readOnly = ub.readOnly && (m.mem & kReadonly);
+                            if (ob->buffer && ob->name == b->name && ob->instanceSym->used) ub.readOnly = ub.readOnly && !ob->written;
                 }
                 const std::string prefix = b->instance.empty() ? "" : b->name + ".";
                 for (size_t i = 0; i < off.size(); ++i)

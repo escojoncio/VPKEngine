@@ -64,7 +64,7 @@ void BackgroundGate::removeResumeHook(uint64_t id) {
   resumeHooks_.erase(id);
 }
 
-void BackgroundGate::waitForeground() {
+void BackgroundGate::waitForeground(const void* owner) {
   if (!active()) return;
   std::unique_lock lock(mutex_);
   if (!background_ || shutdown_) return;
@@ -74,7 +74,11 @@ void BackgroundGate::waitForeground() {
   }
   ++episodeBlocked_, ++blockedTotal_;
   const uint64_t epoch = epoch_;
-  cv_.wait(lock, [&] { return !background_ || shutdown_ || epoch_ != epoch; });
+  OwnerState* st = owner ? &owners_[owner] : nullptr;  // (std::map nodes are stable while waiters > 0 keeps the entry)
+  const uint64_t ownerEpoch = st ? st->epoch : 0;
+  if (st) ++st->waiters;
+  cv_.wait(lock, [&] { return !background_ || shutdown_ || epoch_ != epoch || (st && st->epoch != ownerEpoch); });
+  if (st && --st->waiters == 0) owners_.erase(owner);
 }
 
 bool BackgroundGate::wouldPark() const {
@@ -83,10 +87,13 @@ bool BackgroundGate::wouldPark() const {
   return background_ && !shutdown_ && std::this_thread::get_id() != main_;
 }
 
-void BackgroundGate::release() {
+void BackgroundGate::release(const void* owner) {
   {
     std::lock_guard lock(mutex_);
-    ++epoch_;
+    if (owner) {
+      const auto it = owners_.find(owner);  // nobody parked for it: nothing to wake, nothing to remember
+      if (it != owners_.end()) ++it->second.epoch;
+    } else ++epoch_;
   }
   cv_.notify_all();
 }

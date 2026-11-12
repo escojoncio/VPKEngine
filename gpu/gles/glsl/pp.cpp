@@ -9,6 +9,7 @@
 #include <functional>
 #include <iterator>
 #include <map>
+#include <new>
 
 namespace vpglsl {
 
@@ -28,11 +29,19 @@ const char* const kPuncts[] = {
 // the source is bounded in tokens (the same number as the expansion's step limit): a hostile 4 MB source (2M tokens) took 530 MB before
 // this limit. Real shaders are far below it (1M tokens are 3-4 MB of text).
 constexpr size_t kMaxLexTokens = 1'000'000;      // tokens other than line ends, in the whole source (inactive #if blocks count: they are lexed)
+// The lexer builds a copy of the source and a line number per byte (about 5 bytes per byte of source) before it makes a token.
+constexpr size_t kMaxSourceBytes = size_t(64) << 20;
 constexpr size_t kMaxLexNewlines = 1'000'000;    // line-end tokens (kept for the directives)
 
 }  // namespace
 
 std::vector<Token> lex(const std::string& in, std::string& log) {
+    if (in.size() > kMaxSourceBytes) {
+        log += "ERROR: 0:1: shader source too large (more than 64 MiB)\n";
+        Token end;
+        end.kind = Tok::End;
+        return {end};
+    }
     // Line continuations first (GLSL ES 3.00+; harmless for 1.00 sources, which never use them).
     std::string s;
     s.reserve(in.size());
@@ -59,7 +68,8 @@ std::vector<Token> lex(const std::string& in, std::string& log) {
     bool space = false;
     size_t i = 0;
     auto lineAt = [&](size_t p) { return p < lineOf.size() ? lineOf[p] : line; };
-    while (i < s.size()) {
+    bool tooBig = false;
+    while (i < s.size() && !tooBig) {
         if (out.size() - newlines > kMaxLexTokens || newlines > kMaxLexNewlines) {
             log += "ERROR: 0:" + std::to_string(lineAt(i)) + ": shader source too large (more than " + std::to_string(kMaxLexTokens) + " tokens or " + std::to_string(kMaxLexNewlines) + " lines)\n";
             line = lineAt(i);
@@ -94,6 +104,13 @@ std::vector<Token> lex(const std::string& in, std::string& log) {
                     Token t;
                     t.kind = Tok::Newline, t.line = lineAt(k), t.ival = 1;  // ival 1: inside a comment
                     out.push_back(t), ++newlines;
+                    if (newlines > kMaxLexNewlines) {  // (checked here: a comment of millions of lines is one pass of this loop)
+                        log += "ERROR: 0:" + std::to_string(lineAt(k)) + ": shader source too large (more than " + std::to_string(kMaxLexTokens) +
+                               " tokens or " + std::to_string(kMaxLexNewlines) + " lines)\n";
+                        line = lineAt(k);
+                        tooBig = true;
+                        break;
+                    }
                 }
             i = e + 2, space = true;
             continue;
@@ -227,7 +244,7 @@ std::vector<const char*> supportedExtensions() {
 
 class Pp {
 public:
-    Pp(Stage stage, std::string& log) : stage_(stage), log_(log) {}
+    Pp(Stage, std::string& log) : log_(log) {}
 
     PpResult run(const std::string& source) {
         const size_t logBefore = log_.size();
@@ -240,7 +257,7 @@ public:
         for (const char* e : supportedExtensions()) defineSimple(e, "1");
         size_t i = 0;
         bool firstToken = true;
-        while (toks[i].kind != Tok::End) {
+        while (toks[i].kind != Tok::End && !outputOverflow_) {
             // Gather one line.
             std::vector<Token> line;
             {  // (reserved: a line of a million tokens must not grow by doubling next to the copy it comes from)
@@ -339,58 +356,62 @@ private:
         return false;
     }
 
-    // True when the call of `name` (a function-like macro, or an object-like alias of one) expands to text that ends with the name of a
-    // function-like macro: a "(" on the next line then calls that name (`#define F(y) A` / `F(0)` / `(5)`).
-    bool callEndsWithFunction(const std::string& name) const {
-        const std::string* cur = &name;
-        for (int k = 0; k < 64; ++k) {
-            auto it = defines_.find(*cur);
-            if (it == defines_.end()) return false;
-            const auto& b = it->second.body;
-            if (it->second.function) return !b.empty() && b.back().kind == Tok::Ident && namesFunction(b.back().text);
-            if (b.empty() || b.back().kind != Tok::Ident) return false;
-            cur = &b.back().text;
-        }
-        return false;
-    }
-
-    // Expands everything accumulated so far; keeps an unfinished trailing macro call. The scan for an unfinished call resumes where the
-    // previous one stopped (pending_ only grows until it is expanded), so a call open over N lines costs N, not N^2.
+    // Expands the text accumulated so far, except an unfinished trailing macro call: parentheses left open after a function-like macro
+    // name wait for more lines (the scan for that resumes where the previous one stopped: pending_ only grows until it is expanded, so a
+    // call open over N lines costs N, not N^2). When the expansion of the lines ends with the NAME of a function-like macro that has no
+    // "(" after it (`#define F(y) A` / `F(0)` / `(5)`; `ID(G)` / `(7)`), everything before that name is released and the name alone stays
+    // pending, so the "(" of the next line calls it (C99 6.10.3.4, as cpp does). The expansion budget is per flush, so a long run of
+    // such lines costs each line its own share.
     size_t scanned_ = 0;
-    int scanDepth_ = 0;
-    bool scanAfterFn_ = false, scanClosedFn_ = false;  // scanClosedFn_: the last token closed a call whose expansion ends with a function name
-    std::string scanName_, scanLastIdent_;
+    int scanDepth_ = 0, rawDepth_ = 0;  // rawDepth_: every "(" not yet closed, call or not
+    bool scanAfterFn_ = false;
 
     void flushPending(bool final) {
         if (pending_.empty()) return;
         if (!final) {
-            // Unbalanced parentheses after a function-like macro name: wait for more lines.
             for (; scanned_ < pending_.size(); ++scanned_) {
                 const Token& t = pending_[scanned_];
-                scanClosedFn_ = false;
                 if (t.kind == Tok::Ident) {
                     scanAfterFn_ = namesFunction(t.text);
-                    scanLastIdent_ = t.text;
                     continue;
                 }
-                if (t.kind == Tok::Punct && t.text == "(" && (scanAfterFn_ || scanDepth_ > 0)) {
-                    if (scanDepth_++ == 0) scanName_ = scanLastIdent_;
-                } else if (t.kind == Tok::Punct && t.text == ")" && scanDepth_ > 0) {
-                    if (--scanDepth_ == 0) scanClosedFn_ = callEndsWithFunction(scanName_);
+                if (t.kind == Tok::Punct && t.text == "(") {
+                    ++rawDepth_;
+                    if (scanAfterFn_ || scanDepth_ > 0) ++scanDepth_;
+                } else if (t.kind == Tok::Punct && t.text == ")") {
+                    if (rawDepth_ > 0) --rawDepth_;
+                    if (scanDepth_ > 0) --scanDepth_;
                 }
                 scanAfterFn_ = false;
             }
-            if (scanDepth_ > 0) return;
-            if (pending_.back().kind == Tok::Ident && namesFunction(pending_.back().text)) return;
-            if (scanClosedFn_) return;
+            // (a "(" left open after the expansion of an earlier call, `A() (1` with `#define A(p) D`, is no call to the scan: the text
+            // waits for its ")" all the same; waiting only delays the expansion, which cannot differ for text without a call)
+            if (scanDepth_ > 0 || rawDepth_ > 0) return;
         }
         std::vector<Token> outv;
         std::set<std::string> hide;
+        const size_t logBefore = log_.size();
         expand(pending_, outv, hide);
-        for (Token& t : outv) res_.tokens.push_back(std::move(t));
         pending_.clear();
-        scanned_ = 0, scanDepth_ = 0, scanAfterFn_ = scanClosedFn_ = false;
+        scanned_ = 0, scanDepth_ = rawDepth_ = 0, scanAfterFn_ = false;
+        if (!final && log_.size() == logBefore && endsWithName_ && !outv.empty() && outv.back().kind == Tok::Ident && !outv.back().painted) {
+            auto fm = defines_.find(outv.back().text);
+            if (fm != defines_.end() && fm->second.function) {
+                pending_.push_back(std::move(outv.back()));
+                outv.pop_back();
+            }
+        }
+        if (res_.tokens.size() + outv.size() > kMaxOutputTokens) {
+            if (!outputOverflow_) error(outv.empty() ? 0 : outv.front().line, "macro expansion too large");
+            outputOverflow_ = true;
+            return;
+        }
+        for (Token& t : outv) res_.tokens.push_back(std::move(t));
     }
+    // The expansion budget is per flush; the tokens that all of them leave are limited too (a line of 260000 tokens, 300 times over,
+    // took 3 GB). Same order as the limit on the source.
+    static constexpr size_t kMaxOutputTokens = 2'000'000;
+    bool outputOverflow_ = false;
 
     // Collects the arguments of a function-like call starting at `in[i]` == "(". Returns false when
     // the call is unterminated.
@@ -417,13 +438,14 @@ private:
 
     size_t expandSteps_ = 0;  // work of the expansion in progress, in tokens (a macro that doubles at each level would never end)
     bool expandOverflow_ = false;
+    int topLine_ = 0;  // line of the macro name that the expansion in progress started from (where its errors are reported)
     static constexpr size_t kMaxExpandSteps = 1'000'000;
     // Counts `n` tokens of work (walked, copied, collected or pasted) against kMaxExpandSteps. True once past it: the error is
     // reported once and every caller unwinds.
     bool charge(size_t n, int line) {
         expandSteps_ += n;
         if (expandSteps_ <= kMaxExpandSteps) return false;
-        if (!expandOverflow_) error(line, "macro expansion too large");
+        if (!expandOverflow_) error(topLine_ ? topLine_ : line, "macro expansion too large");
         expandOverflow_ = true;
         return true;
     }
@@ -447,6 +469,7 @@ private:
         if (depth == 0) expandSteps_ = 0, expandOverflow_ = false;
         for (size_t i = 0; i < in.size();) {
             ends.v = false;
+            if (depth == 0) topLine_ = in[i].line;
             if (charge(1, in[i].line)) return;
             const Token& t = in[i];
             if (t.kind != Tok::Ident) {
@@ -588,9 +611,14 @@ private:
                 std::string l;
                 std::vector<Token> re = lex(text, l);
                 int line = out.back().line;
-                out.pop_back();
+                std::vector<Token> good;
                 for (Token& r : re)
-                    if (r.kind != Tok::End && r.kind != Tok::Newline) r.line = line, out.push_back(r);
+                    if (r.kind != Tok::End && r.kind != Tok::Newline) r.line = line, good.push_back(r);
+                // The result must be ONE valid token (C99 6.10.3.3): `1 ## F` is "1F", `+ ## -` is two tokens.
+                if (good.size() != 1 || good[0].kind == Tok::Bad || !l.empty())
+                    error(line, "pasting \"" + out.back().text + "\" and \"" + in[i + 1].text + "\" does not give a valid preprocessing token");
+                out.pop_back();
+                for (Token& r : good) out.push_back(r);
                 ++i;
                 continue;
             }
@@ -728,6 +756,8 @@ private:
         const int ln = line[0].line;
         if (line.size() == 1) return;  // null directive
         const std::string d = line[1].text;
+        // A conditional ends the wait for the "(" of a call, as every other directive does (cpp: `F(0)` / `#if 1` / `(1)` leaves `A (1)`).
+        if (d == "if" || d == "ifdef" || d == "ifndef" || d == "elif" || d == "else" || d == "endif") flushPending(true);
         if (d == "if" || d == "ifdef" || d == "ifndef") {
             bool parent = active();
             bool v = false;
@@ -912,7 +942,6 @@ private:
         strict("unknown_directive", ln, "unknown directive #" + d);
     }
 
-    Stage stage_;
     std::string& log_;
     std::map<std::string, Macro> defines_;
     std::vector<Cond> conds_;
@@ -922,7 +951,6 @@ private:
     int lineDelta_ = 0;       // #line: added to the line of every following token
     int fileNo_ = 0;          // #line's source string number: what __FILE__ expands to
     bool sawToken_ = false;   // a non-directive token has been seen (#extension must come before)
-    int physLine_ = 0;
 };
 
 }  // namespace
@@ -958,7 +986,17 @@ Caps caps() {
 PpResult runPreprocessor(const std::string& source, Stage stage, std::string& log) {
     vpir::StackGuard stackGuard;  // (the nested expansion stops before the stack of this thread does)
     Pp p(stage, log);
-    return p.run(source);
+    try {
+        return p.run(source);
+    } catch (const std::bad_alloc&) {
+        log += "ERROR: 0:0: out of memory in the preprocessor\n";
+        PpResult r;
+        r.ok = false;
+        Token end;
+        end.kind = Tok::End;
+        r.tokens.push_back(end);
+        return r;
+    }
 }
 
 std::string preprocess(const std::string& source, Stage stage, std::string& log, int& version) {

@@ -3,6 +3,7 @@
 // driver-style layout, so a test passes only if VPVulkan could actually run the shader.
 // Usage: vpglsl_tests <group>
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -276,6 +277,32 @@ void testMacroRescan() {
         CHECK(ppTokens(fn + "F(0)\n(5)\n", log) == "[ 5 ]" && log.empty());
         CHECK(ppTokens(fn + "F(0)\nx\n", log) == "A x" && log.empty());
         CHECK(ppTokens(fn + "F(0) F(1)\n(5)\n", log) == "A [ 5 ]" && log.empty());
+        // A call whose expansion ends with the name of a function-like macro: the "(" of the next line calls it, however the name came
+        // about (nested bodies, several tokens before it, an argument that is a name, a call open over several lines).
+        {
+            const std::string d = "#define A(x) [x]\n#define G(y) A\n#define F(y) G(y)\n#define ID(x) x\n#define H(x) 1 , x\n#define K(x) x A\n"
+                                  "#define M(p, q) p q\n#define N(y) M\n";
+            auto t = [&](const std::string& src, const char* want) {
+                log.clear();
+                const std::string got = ppTokens(d + src, log);
+                if (got != want || !log.empty()) std::fprintf(stderr, "  rescan [%s]: got '%s' want '%s' %s\n", src.c_str(), got.c_str(), want, log.c_str());
+                CHECK(got == want && log.empty());
+            };
+            t("F(0)\n(5)\n", "[ 5 ]");
+            t("N(0)\n(5,\n6)\n", "5 6");
+            t("ID(A)\n(7)\n", "[ 7 ]");
+            t("ID(ID)\n(A)\n(8)\n", "ID ( A ) ( 8 )");  // (ID is painted inside its own expansion: cpp gives the same)
+            t("H(2)\n(3) K(1)\n(4)\n", "1 , 2 ( 3 ) 1 [ 4 ]");
+            t("G(0) G(1)\n(9)\n", "A [ 9 ]");
+            t("F(0)\n#define Z 3\n(5) Z\n", "A ( 5 ) 3");  // (a directive ends the wait)
+            // Each retained line has its own expansion budget: 200000 lines used to fail at the 166669th.
+            std::string many = "#define A(x) [x]\n#define F(y) A\n";
+            for (int i = 0; i < 200000; ++i) many += "F(0)\n";
+            many += "(5)\n";
+            log.clear();
+            const std::string r = ppTokens(many, log);
+            CHECK(log.empty() && r.size() == size_t(200002) * 2 - 1);
+        }
         // An alias that is not called stays a name; an unterminated call through it is still an error.
         log.clear();
         CHECK(ppTokens(al + "B\nx\n", log) == "A x" && log.empty());
@@ -336,9 +363,10 @@ void testMacroRescan() {
             CHECK(l.empty() && r.size() == size_t(lines) * 2 - 1);
             return ms;
         };
-        const double t1 = openCall(15000), t2 = openCall(60000);
+        double t1 = 1e9, t2 = 1e9;  // (best of 3: a loaded machine slows single runs)
+        for (int rep = 0; rep < 3; ++rep) t1 = std::min(t1, openCall(15000)), t2 = std::min(t2, openCall(60000));
         if (std::getenv("VPGLSL_TIMES")) std::fprintf(stderr, "  open call: %.0f ms for 15000 lines, %.0f ms for 60000\n", t1, t2);
-        CHECK(t2 < 8 * t1 + 100);
+        CHECK(t2 < 12 * t1 + 300);  // (linear: about 4; quadratic: about 16 and 46 s at 60000 lines)
         log.clear();
     }
     // Walking the arguments of a call counts as expansion work, whether or not the body uses them.
@@ -382,8 +410,9 @@ void testPpFuzz() {
     if (fd < 0) return;
     close(fd);
     const std::string cmd = std::string("cpp -P -undef -nostdinc -w ") + path + " 2>/dev/null";
-    if (std::system("cpp --version >/dev/null 2>&1") != 0) {
-        std::printf("ppfuzz: no cpp, skipped\n");
+    // GNU cpp only (macOS's `cpp` is clang's: it prints other spacing and has other rules for some calls).
+    if (std::system("cpp --version 2>&1 | grep -qi 'free software foundation'") != 0) {
+        std::printf("ppfuzz: no GNU cpp, skipped\n");
         std::remove(path);
         return;
     }
@@ -410,7 +439,9 @@ void testPpFuzz() {
         return r;
     };
     int compared = 0, different = 0;
-    for (int n = 0; n < 300; ++n) {
+    const auto started = std::chrono::steady_clock::now();
+    for (int n = 0; n < 3000; ++n) {
+        if (std::chrono::steady_clock::now() - started > std::chrono::seconds(25)) break;  // (bounded time)
         std::string src;
         for (const char* name : names) {
             const int kind = name[0] == 'E' ? 0 : pick(6);  // 0 empty (E always: what follows a name that ends an expansion), 1-2 object, 3-5 function with 0-2 parameters
@@ -424,8 +455,12 @@ void testPpFuzz() {
                 src += std::string("#define ") + name + "(" + list + ") " + seq(0, ps) + "\n";
             }
         }
-        for (int k = 1 + pick(5), i = 0; i < k; ++i) src += (i ? " " : "") + item(0, {});
-        src += "\n";
+        std::string use;
+        for (int k = 1 + pick(5), i = 0; i < k; ++i) use += (i ? " " : "") + item(0, {});
+        // Line breaks anywhere between the tokens: inside the calls, between "(" ... ")" that follow a call, between a name and its "(".
+        for (char& ch : use)
+            if (ch == ' ' && pick(3) == 0) ch = '\n';
+        src += use + "\n";
         if (FILE* f = std::fopen(path, "w")) std::fputs(src.c_str(), f), std::fclose(f);
         std::string want;
         FILE* pipe = popen(cmd.c_str(), "r");
@@ -438,15 +473,31 @@ void testPpFuzz() {
             if (++different <= 3) std::fprintf(stderr, "  ppfuzz %d: cpp accepts, the compiler says:\n%s%s", n, log.c_str(), src.c_str());
             continue;
         }
-        auto squeeze = [](const std::string& t) {
-            std::string r;
-            for (char ch : t)
-                if (ch != ' ' && ch != '\n') r += ch;
+        // Compared as tokens (`x y` is not `xy`): runs of identifier / number characters, or one other character.
+        auto tokens = [](const std::string& t) {
+            std::vector<std::string> r;
+            for (size_t i = 0; i < t.size();) {
+                const unsigned char ch = static_cast<unsigned char>(t[i]);
+                if (std::isspace(ch)) {
+                    ++i;
+                    continue;
+                }
+                size_t j = i + 1;
+                if (std::isalnum(ch) || ch == '_' || ch == '.')
+                    while (j < t.size() && (std::isalnum(static_cast<unsigned char>(t[j])) || t[j] == '_' || t[j] == '.')) ++j;
+                r.push_back(t.substr(i, j - i));
+                i = j;
+            }
             return r;
         };
         ++compared;
-        if (squeeze(got) != squeeze(want)) {
-            if (++different <= 3) std::fprintf(stderr, "  ppfuzz %d differs from cpp:\n%s  cpp:  %s\n  ours: %s\n", n, src.c_str(), squeeze(want).c_str(), squeeze(got).c_str());
+        if (tokens(got) != tokens(want)) {
+            auto join = [&](const std::string& t) {
+                std::string r;
+                for (const std::string& x : tokens(t)) r += x + " ";
+                return r;
+            };
+            if (++different <= 3) std::fprintf(stderr, "  ppfuzz %d differs from cpp:\n%s  cpp:  %s\n  ours: %s\n", n, src.c_str(), join(want).c_str(), join(got).c_str());
         }
     }
     std::remove(path);
@@ -2168,21 +2219,36 @@ void testLimits() {
 // Deep but legitimate nesting (machine generated shaders: else-if ladders, chained ?:, nested calls) compiles on the small stack of
 // a worker thread; hostile nesting is an error, never a crash.
 namespace {
-size_t smallStackBytes() {
+// gcc defines __SANITIZE_*; clang answers __has_feature (also on macOS).
 #if defined(__SANITIZE_ADDRESS__) || defined(__SANITIZE_THREAD__)
-    return 8u << 20;  // (the sanitizer's frames are several times larger)
+constexpr bool kSanitized = true;
+#elif defined(__has_feature)
+#if __has_feature(address_sanitizer) || __has_feature(thread_sanitizer)
+constexpr bool kSanitized = true;
 #else
-    return 512u << 10;
+constexpr bool kSanitized = false;
 #endif
-}
-void onSmallStack(const std::function<void()>& fn, size_t bytes = 0) {
+#else
+constexpr bool kSanitized = false;
+#endif
+size_t smallStackBytes() { return kSanitized ? size_t(8) << 20 : size_t(512) << 10; }  // (the sanitizers' frames are several times larger)
+// False when the system refused that stack size (nothing was run).
+bool onSmallStack(const std::function<void()>& fn, size_t bytes = 0) {
+    if (!bytes) bytes = smallStackBytes();
+    const size_t page = size_t(sysconf(_SC_PAGESIZE) > 0 ? sysconf(_SC_PAGESIZE) : 4096);
+    bytes = (bytes + page - 1) / page * page;  // (macOS arm64 has 16 KB pages and refuses other sizes)
     pthread_attr_t a;
     pthread_attr_init(&a);
-    pthread_attr_setstacksize(&a, bytes ? bytes : smallStackBytes());
+    if (pthread_attr_setstacksize(&a, bytes) != 0) {  // refused: skip this size rather than run on the default stack
+        pthread_attr_destroy(&a);
+        std::fprintf(stderr, "  (stack of %zu bytes refused: skipped)\n", bytes);
+        return false;
+    }
     pthread_t t;
     CHECK(pthread_create(&t, &a, [](void* p) -> void* { (*static_cast<const std::function<void()>*>(p))(); return nullptr; }, const_cast<std::function<void()>*>(&fn)) == 0);
     pthread_join(t, nullptr);
     pthread_attr_destroy(&a);
+    return true;
 }
 const char* const kFragHead = "#version 300 es\nprecision highp float;\nflat in int id; out vec4 o;\n";
 std::string elseIfChain(int n) {
@@ -2230,7 +2296,7 @@ void testNesting() {
                 CHECK(r.shader != nullptr || r.log.find("too deeply") != std::string::npos);
                 (void)build(vs, longSum(sum));  // (a result or an error; the point is that it returns)
             }
-        }, (kb << 10) * (smallStackBytes() > (1u << 20) ? 16 : 1));
+        }, (kb << 10) * (kSanitized ? 16 : 1));
     }
     // How much nesting fits in a small stack depends on the frame sizes of the compiler and the sanitizers, so there the compile is
     // required to give a result or a clean error; on the full stack of this thread (`strict`) it is required to succeed.
@@ -2305,27 +2371,39 @@ void testNesting() {
     // The MSL emitter and the IR optimizer recurse over the nesting of the IR (blocks, loops, ladders): given a thread with little stack
     // they end in an error instead of a crash. (The IR comes from the lowering of 300 nested ifs, made on this thread.)
     {
-        const size_t scale = smallStackBytes() > (1u << 20) ? 16 : 1;
+        const size_t scale = kSanitized ? 16 : 1;
         Program deep = build(vs, nestedIfs(300));
         CHECK(deep.ok);
-        // emitMsl (verify, optimize and the emitter all check the stack): an error or a shader on every stack, never a crash.
+        // emitMsl (verify, optimize and the emitter all check the stack): an error or a shader on every stack, never a crash. A
+        // stack size the system refuses is skipped (and not counted); the largest one must give the shader itself.
+        int ran = 0;
         for (size_t kb : {24, 32, 48, 64, 96, 144, 256, 1024}) {
             std::string msg;
-            bool ok = false;
-            onSmallStack([&] {
+            bool ok = false, executed = false;
+            const bool started = onSmallStack([&] {
+                executed = true;
                 vpmsl::EmitResult e = vpmsl::emitMsl(deep.fs.module, {});
                 ok = e.errors.empty() && !e.shader.source.empty();
                 if (!e.errors.empty()) msg = e.errors[0];
             }, (kb << 10) * scale);
+            if (!started || !executed) continue;
+            ++ran;
             if (!ok) std::fprintf(stderr, "  emitMsl on %zu KB: %s\n", kb, msg.c_str());
             CHECK(ok || msg.find("too deeply") != std::string::npos);
+            if (kb == 1024) CHECK(ok);
         }
-        // optimize: std::length_error once the stack the caller's StackGuard allows is used up, never a crash.
-        int thrown = 0, done = 0;
+        CHECK(ran > 0);
+        // optimize: std::length_error once the stack the caller's StackGuard allows is used up, never a crash. One that completes
+        // gives the module the full stack gives (and a valid one).
+        vpir::Module reference = deep.fs.module;
+        vpir::optimize(reference);
+        const std::string want = vpir::print(reference);
+        ran = 0;
         for (size_t kb : {24, 32, 40, 48, 56, 64, 96, 192, 1024}) {
             vpir::Module copy = deep.fs.module;
-            bool threw = false;
-            onSmallStack([&] {
+            bool threw = false, executed = false;
+            const bool started = onSmallStack([&] {
+                executed = true;
                 vpir::StackGuard guard;
                 try {
                     vpir::optimize(copy);
@@ -2333,10 +2411,43 @@ void testNesting() {
                     threw = true;
                 }
             }, (kb << 10) * scale);
-            threw ? ++thrown : ++done;
+            if (!started || !executed) continue;
+            ++ran;
+            if (!threw) CHECK(vpir::print(copy) == want);
+            if (kb == 1024) CHECK(!threw);
         }
-        CHECK(done > 0);
-        if (scale == 1) CHECK(thrown > 0);  // (a thread of 24 KB cannot optimize 300 nested levels)
+        CHECK(ran > 0);
+        // The guard fires, deterministically: a module nested 20000 levels (built bottom-up, destroyed on this thread) needs more
+        // stack than any 24 KB thread has, whatever the frame sizes. optimize() throws, verify() and emitMsl() return an error.
+        {
+            vpir::Module deepMod;
+            deepMod.stage = vpir::Stage::Compute;
+            vpir::Function fn;
+            fn.name = "main";
+            vpir::Block cur;
+            for (int i = 0; i < 20000; ++i) {
+                vpir::Node n;
+                n.kind = vpir::NodeKind::If;
+                n.body = std::move(cur);
+                cur = vpir::Block();
+                cur.push_back(std::move(n));
+            }
+            fn.body = std::move(cur);
+            deepMod.functions.push_back(std::move(fn));
+            bool threw = false, verifyDeep = false, emitDeep = false;
+            const bool started = onSmallStack([&] {
+                vpir::StackGuard guard;
+                try {
+                    vpir::optimize(deepMod);
+                } catch (const std::length_error&) {
+                    threw = true;
+                }
+                for (const std::string& e : vpir::verify(deepMod)) verifyDeep = verifyDeep || e.find("too deeply") != std::string::npos;
+                vpmsl::EmitResult er = vpmsl::emitMsl(deepMod, {});
+                for (const std::string& e : er.errors) emitDeep = emitDeep || e.find("too deeply") != std::string::npos;
+            }, (size_t(24) << 10) * scale);
+            if (started) CHECK(threw && verifyDeep && emitDeep);
+        }
     }
 }
 
@@ -2370,6 +2481,7 @@ void testConstConv() {
     CHECK(holds("const uint a = 4294967295u * 4294967295u;", "a == 1u"));
     CHECK(holds("const uvec2 a = uvec2(4294967295u) * uvec2(4294967295u);", "a.x == 1u && a.y == 1u"));
     CHECK(holds("const int a = 65536 * 65536;", "a == 0"));
+    CHECK(holds("const int a = abs(-2147483647 - 1);", "a == -2147483647 - 1"));  // (wraps to 32 bits)
     CHECK(holds("const ivec2 a = ivec2(65536) * ivec2(65537);", "a.x == 65536"));
     // Floats out of range as such compile (an infinity), and so do their uses.
     const std::string head = "#version 300 es\nprecision highp float;\nout vec4 o;\n";
@@ -2395,12 +2507,7 @@ long peakKb() {
 }  // namespace
 
 void testMemory() {
-    const bool sanitized =
-#if defined(__SANITIZE_ADDRESS__) || defined(__SANITIZE_THREAD__)
-        true;
-#else
-        false;
-#endif
+    const bool sanitized = kSanitized;
 #if defined(__linux__)
     if (!sanitized) {  // (RLIMIT_AS does not limit the address space of a process on Darwin)
         struct rlimit rl = {1ull << 30, 1ull << 30};
@@ -2419,6 +2526,19 @@ void testMemory() {
         }
         huge += "0;\n";
         CHECK(compileFails(Stage::Vertex, huge, "source too large"));
+    }
+    // The source itself is limited in bytes (the lexer's copy and line table take about 5 bytes per byte).
+    CHECK(compileFails(Stage::Vertex, std::string((size_t(64) << 20) + 1, ' '), "source too large"));
+    // A comment of millions of lines: one Newline token per line is kept, the limit is checked inside the comment too (N=20M used to be
+    // a std::bad_alloc, 4M took 395 MB).
+    CHECK(compileFails(Stage::Vertex, "/*" + std::string(4000000, '\n') + "*/\nvoid main(){}\n", "source too large"));
+    CHECK(compileFails(Stage::Vertex, "/*" + std::string(20000000, '\n') + "*/\nvoid main(){}\n", "source too large"));
+    // (and a '//' comment with continuations, and line continuations alone)
+    {
+        std::string cont = "// ";
+        for (int i = 0; i < 3000000; ++i) cont += "\\\n";
+        cont += "\nvoid main(){}\n";
+        (void)vpglsl::parse(Stage::Vertex, cont);
     }
     // 100000 nested macro calls, and macros that double at each of 40 levels.
     {

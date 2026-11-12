@@ -1532,6 +1532,7 @@ private:
                         why = "l-value required (can't modify readonly '" + inst->sym->block->members[size_t(e.field)].name + "')";
                         return false;
                     }
+                    inst->sym->block->written = true;  // (the linker tells the GL layer which storage blocks no shader can write)
                     return true;
                 }
                 return isLValue(*e.a[0], why);
@@ -2152,8 +2153,20 @@ private:
 
 }  // namespace
 
+static ParseResult parseImpl(Stage stage, const std::string& source, ParseResult r);
+
 ParseResult parse(Stage stage, const std::string& source) {
     ParseResult r;
+    try {
+        return parseImpl(stage, source, r);
+    } catch (const std::bad_alloc&) {  // (memory ran out whatever the limits: an error, not an abort)
+        r.shader = nullptr;
+        r.log += "ERROR: 0:0: out of memory\n";
+        return r;
+    }
+}
+
+static ParseResult parseImpl(Stage stage, const std::string& source, ParseResult r) {
     PpResult pp = runPreprocessor(source, stage, r.log);
     r.version = pp.version;
     r.lenient = pp.lenient;

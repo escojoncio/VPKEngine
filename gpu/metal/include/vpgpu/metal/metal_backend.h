@@ -124,8 +124,8 @@ class MetalBackend final : public Backend {
 
   // Blocks until every submitted frame has finished on the GPU and its completion handler ran (no time limit: a command buffer
   // held back for the background goes out when the app is foreground again, or when this thread may commit it), then waits for
-  // the encodeInterop command buffers still in flight for at most 5 s (an interop buffer that has not completed by then is not
-  // waited for; the destructor, which needs them gone, waits without limit).
+  // the encodeInterop command buffers still in flight, also without a limit (CONTRACT CHANGE: it used to give up on those after 5 s;
+  // a command buffer that never completes ends with an error status and its handler runs, as for the frames).
   void waitIdle();
   // CPU pointer to a buffer's first byte (shared storage), or null.
   void* contents(BufferId) const;

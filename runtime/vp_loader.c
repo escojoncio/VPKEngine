@@ -154,6 +154,8 @@ static void gaps(const void* owner, uint64_t start, uint64_t end, int map, uint6
     }
 }
 
+static void release_image_locked(uint64_t start, uint64_t end);
+
 /* Maps [start,end) read/write for `owner` (a VpModule, OWNER_PLAIN or OWNER_OVER) and records it.
  * Free memory is mapped without replacing anything; what the owner may replace (see `replaceable`)
  * is replaced. Nothing is mapped on failure, except that a replaced range stays replaced. */
@@ -178,13 +180,15 @@ static int map_range(uint64_t start, uint64_t end, const void* owner) {
     }
     mapped_forget(start, end);
     mapped[mapped_count++] = (Mapped){start, end, owner};
-    if (owner != OWNER_PLAIN && owner != OWNER_OVER) { /* a module has one image: an earlier one elsewhere goes */
-        for (size_t i = 0; i < mapped_count;) {
+    if (owner != OWNER_PLAIN && owner != OWNER_OVER) { /* a module has one image: an earlier one elsewhere goes, a prepared range comes back as prepared */
+        unsigned guard = 0; /* (each release removes its entry; the bound only keeps a bug from looping for ever) */
+        for (size_t i = 0; i < mapped_count && guard < 1024;) {
             if (mapped[i].owner == owner && mapped[i].start != start) {
+                const uint64_t os = mapped[i].start, oe = mapped[i].end;
                 vp_detach_module((VpModule*)(uintptr_t)owner);
-                munmap((void*)(uintptr_t)mapped[i].start, mapped[i].end - mapped[i].start);
-                origin_sub(mapped[i].start, mapped[i].end);
-                mapped[i] = mapped[--mapped_count];
+                release_image_locked(os, oe);
+                i = 0; /* the table changed */
+                ++guard;
             } else ++i;
         }
     }
@@ -222,13 +226,18 @@ out:
 
 /* With mapped_lock held and room for one more entry: unmaps [start,end) if all of it is the
  * loader's. */
-static int unmap_locked(uint64_t start, uint64_t end) {
-    for (uint64_t cursor = start; cursor < end;) { /* all of it must be the loader's */
+static int all_loaders(uint64_t start, uint64_t end) {
+    for (uint64_t cursor = start; cursor < end;) {
         uint64_t next = cursor;
         for (size_t i = 0; i < mapped_count; ++i) if (mapped[i].start <= cursor && cursor < mapped[i].end) next = mapped[i].end;
-        if (next == cursor) return -1;
+        if (next == cursor) return 0;
         cursor = next;
     }
+    return 1;
+}
+
+static int unmap_locked(uint64_t start, uint64_t end) {
+    if (!all_loaders(start, end)) return -1; /* all of it must be the loader's */
     munmap((void*)(uintptr_t)start, end - start);
     mapped_forget(start, end);
     origin_sub(start, end);
@@ -247,41 +256,48 @@ out:
     return rc;
 }
 
-/* A load that failed after mapping: the image goes, and what an embedder had prepared there goes
+/* With mapped_lock held: the image at [start,end) goes, and what an embedder had prepared there goes
  * back to being prepared (registered as vp_map_fixed_over, but PROT_NONE: nothing committed), so
- * that there is no hole and the load can be retried. One lock hold, so nothing can map in between.
- * Best effort for the restoration (memory that is no longer free is left alone). */
-static void abandon_image(uint64_t start, uint64_t end) {
-    pthread_mutex_lock(&mapped_lock);
+ * that there is no hole. One lock hold, so nothing can map in between. Best effort for the
+ * restoration (memory that is no longer free is left alone; out of memory costs the restoration,
+ * never the release itself: the image is unmapped whatever happens). */
+static void release_image_locked(uint64_t start, uint64_t end) {
+    if (!all_loaders(start, end)) return; /* not (all) the loader's any more (unmapped by vp_unmap_fixed meanwhile): never touch memory that is someone else's */
     size_t n = 0;
     for (size_t i = 0; i < origin_count; ++i) if (origin[i].start < end && origin[i].end > start) ++n;
-    if (mapped_reserve(1 + n)) {
-        n = 0;
-        if (mapped_reserve(1)) { pthread_mutex_unlock(&mapped_lock); return; }
-    }
+    if (mapped_reserve(1 + n)) n = 0;
     Span* sp = n ? malloc(n * sizeof *sp) : NULL;
     if (!sp) n = 0;
     size_t k = 0;
     for (size_t i = 0; i < origin_count && k < n; ++i) {
         if (origin[i].start < end && origin[i].end > start) sp[k++] = (Span){origin[i].start > start ? origin[i].start : start, origin[i].end < end ? origin[i].end : end};
     }
-    if (unmap_locked(start, end) == 0) {
-        for (size_t i = 0; i < k; ++i) {
-            int flags = MAP_PRIVATE | MAP_ANONYMOUS;
+    /* The image is exactly the entry map_range recorded, so forgetting it only shrinks or deletes entries: no room is needed
+     * (unmap_locked's check of a possible split is for the general case). */
+    munmap((void*)(uintptr_t)start, end - start);
+    mapped_forget(start, end);
+    origin_sub(start, end);
+    for (size_t i = 0; i < k && mapped_count < mapped_cap; ++i) {
+        int flags = MAP_PRIVATE | MAP_ANONYMOUS;
 #ifdef MAP_NORESERVE
-            flags |= MAP_NORESERVE;
+        flags |= MAP_NORESERVE;
 #endif
 #ifdef MAP_FIXED_NOREPLACE
-            flags |= MAP_FIXED_NOREPLACE;
+        flags |= MAP_FIXED_NOREPLACE;
 #endif
-            void* p = mmap((void*)(uintptr_t)sp[i].start, sp[i].end - sp[i].start, PROT_NONE, flags, -1, 0);
-            if (p == MAP_FAILED) continue;
-            if ((uint64_t)(uintptr_t)p != sp[i].start) { munmap(p, sp[i].end - sp[i].start); continue; }
-            mapped[mapped_count++] = (Mapped){sp[i].start, sp[i].end, OWNER_OVER};
-            origin_add(sp[i].start, sp[i].end);
-        }
+        void* p = mmap((void*)(uintptr_t)sp[i].start, sp[i].end - sp[i].start, PROT_NONE, flags, -1, 0);
+        if (p == MAP_FAILED) continue;
+        if ((uint64_t)(uintptr_t)p != sp[i].start) { munmap(p, sp[i].end - sp[i].start); continue; }
+        mapped[mapped_count++] = (Mapped){sp[i].start, sp[i].end, OWNER_OVER};
+        origin_add(sp[i].start, sp[i].end);
     }
     free(sp);
+}
+
+/* A load that failed after mapping: the image goes (see release_image_locked) and the load can be retried. */
+static void abandon_image(uint64_t start, uint64_t end) {
+    pthread_mutex_lock(&mapped_lock);
+    release_image_locked(start, end);
     pthread_mutex_unlock(&mapped_lock);
 }
 

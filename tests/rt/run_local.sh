@@ -31,6 +31,7 @@ build loader_shared_tsan $CC $CF $TS "$D/loader_shared.c" $RT $LIBS && step load
 build loader_many $CC $CF $UB "$D/loader_many.c" $RT $LIBS && step loader_many "$OUT/loader_many"
 build loader_rollback $CC $CF $UB "$D/loader_rollback.c" $RT $LIBS && step loader_rollback "$OUT/loader_rollback" "$OUT"
 build loader_reload $CC $CF $UB "$D/loader_reload.c" $RT $LIBS && step loader_reload "$OUT/loader_reload" "$OUT"
+[ "$(uname)" = Linux ] && build loader_oom $CC $CF $UB "$D/loader_oom.c" $RT -Wl,--wrap=malloc,--wrap=calloc,--wrap=realloc $LIBS && step loader_oom "$OUT/loader_oom" "$OUT"
 build loader_stack $CC $CF $UB "$D/loader_stack.c" $RT $LIBS && step loader_stack "$OUT/loader_stack" "$OUT"
 build loader_natives $CC $CF $UB "$D/loader_natives.c" $RT $LIBS && step loader_natives "$OUT/loader_natives" "$OUT"
 build map_noreplace $CC $CF $UB "$D/map_noreplace.c" $RT $LIBS && step map_noreplace "$OUT/map_noreplace" "$OUT"

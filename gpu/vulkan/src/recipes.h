@@ -176,6 +176,8 @@ class RecipeStore {
   // (its offsets, its lock) instead of each keeping a private view of a file that all of them grow. Held weakly: the file is
   // closed when the last device lets go. An empty dir gives a disabled store of its own.
   static std::shared_ptr<RecipeStore> forDir(const std::string& dir);
+  // The host changed the translator mode (refreshTranslatorMode): the stores of the live devices record in it from now on.
+  static void retargetLive(uint32_t id);
   // The id the stages recorded and looked up from here on carry (translatorId() when a device is created: the mode is the host's to change
   // between devices, and a store shared by them follows it).
   void setTranslator(uint32_t id);

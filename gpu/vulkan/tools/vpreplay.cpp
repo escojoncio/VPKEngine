@@ -1286,6 +1286,9 @@ struct R {
     else if constexpr (ID == id::vkCreateQueryPool) return "vkDestroyQueryPool";
     else return nullptr;
   }
+  void forget(uint64_t id) {  // the file destroyed it itself: nothing to clean up at the end
+    made_.erase(std::remove_if(made_.begin(), made_.end(), [&](const auto& m) { return m.first == id; }), made_.end());
+  }
   // What is left of the objects the file made when it ends (the file's own destroy calls took theirs out of `h`).
   void destroyLeftovers() {
     if (!device) return;
@@ -1394,7 +1397,7 @@ void run(R& r, const Call& c) {
     }
     r.pre<ID>(c, a);
     r.execute<ID>(c, *d);
-    if (destroyed) r.h.erase(destroyed);
+    if (destroyed) r.h.erase(destroyed), r.forget(destroyed);
     if constexpr (R::kKeeps<ID>) r.keep.emplace_back(std::move(d));
   }
 }
@@ -1566,6 +1569,7 @@ void run<id::vkFreeMemory>(R& r, const Call& c) {
   r.fn<id::vkFreeMemory>()(r.device, it->second.h, nullptr);  // implicitly unmaps
   r.mems.erase(it);
   r.h.erase(id);
+  r.forget(id);
 }
 
 template <uint16_t ID>

@@ -128,6 +128,26 @@ int main(int argc, char** argv) {
     CHECK(readable(W1) && load(4, A + 0x200000, W2, 0, &out) == 0, "pic load elsewhere: %s", out.error);
     CHECK(readable(W2) && !readable(W1), "the earlier place of a reloaded module stays mapped");
 
+    /* 7. a position-independent module loaded into a range the embedder prepared and then again somewhere else gives the first
+     * range back as prepared (PROT_NONE, still the embedder's reservation), not as a hole */
+    const uint64_t V = UINT64_C(0x680000000);
+    CHECK(mmap((void*)(uintptr_t)V, 1 << 24, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_FIXED, -1, 0) != MAP_FAILED, "cannot reserve V");
+    CHECK(vp_map_fixed_over(V + 0x10000, TEST_IMG) == 0 && vp_map_fixed_over(V + 0x100000, TEST_IMG) == 0, "prepare two ranges");
+    CHECK(load(5, A + 0x300000, V + 0x10000, 0, &out) == 0, "pic load into a prepared range: %s", out.error);
+    CHECK(readable(V + 0x10000), "the image is not readable");
+    CHECK(load(5, A + 0x300000, V + 0x100000, 0, &out) == 0, "pic load into the other prepared range: %s", out.error);
+    CHECK(readable(V + 0x100000) && !readable(V + 0x10000), "the first place of the reloaded module stays readable");
+    /* (Without MAP_FIXED_NOREPLACE, e.g. on macOS, the address is only a hint: an occupied one gives another address.) */
+    int probe = MAP_PRIVATE | MAP_ANONYMOUS;
+#ifdef MAP_FIXED_NOREPLACE
+    probe |= MAP_FIXED_NOREPLACE;
+#endif
+    void* hole = mmap((void*)(uintptr_t)(V + 0x10000), 0x10000, PROT_READ, probe, -1, 0);
+    CHECK(hole == MAP_FAILED || (uint64_t)(uintptr_t)hole != V + 0x10000, "the first place was unmapped: a hole in the embedder's reservation");
+    if (hole != MAP_FAILED) munmap(hole, 0x10000);
+    CHECK(vp_map_fixed_over(V + 0x10000, TEST_IMG) == 0, "the first place is not the embedder's range again");
+    CHECK(load(5, A + 0x300000, V + 0x10000, 0, &out) == 0, "pic load back into the first range: %s", out.error);
+
     printf(failures ? "loader_reload: %d FAILED\n" : "loader_reload: ok\n", failures);
     return failures != 0;
 }

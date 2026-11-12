@@ -159,6 +159,7 @@ struct UniformBlockDecl {
     uint8_t packing = 0;  // declared layout: 0 none (shared), 1 shared, 2 packed, 3 std140, 4 std430
     bool rowMajor = false;  // the block's default matrix layout
     bool buffer = false;  // shader storage block
+    bool written = false;  // some l-value (assignment, ++/--, out / inout argument, atomic) names a member of this storage block
     Symbol* instanceSym = nullptr;  // the variable that names the block (instance or hidden)
 };
 

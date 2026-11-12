@@ -3,6 +3,7 @@
 // Each case lowers with a driver-style layout, verifies, emits MSL and checks what the lowering
 // promises (bindings reported, multiview, the subpass-read pattern, workgroup size…).
 #include <pthread.h>
+#include <unistd.h>
 
 #include <algorithm>
 #include <chrono>
@@ -2547,7 +2548,7 @@ std::vector<uint32_t> elseIfChain(uint32_t levels) {
 
 struct StackJob {
     std::vector<uint32_t> words;
-    bool parsed = false, lowered = false;
+    bool parsed = false, lowered = false, skipped = false;
     std::string error;
 };
 void* stackJob(void* p) {
@@ -2571,7 +2572,13 @@ StackJob lowerOnStack(uint32_t levels, size_t kb) {
     if (!kb) return stackJob(&job), job;  // this thread
     pthread_attr_t attr;
     pthread_attr_init(&attr);
-    pthread_attr_setstacksize(&attr, kb * 1024);
+    const long pg = sysconf(_SC_PAGESIZE) > 0 ? sysconf(_SC_PAGESIZE) : 4096;  // (16 KB pages on macOS arm64: round up)
+    const size_t bytes = (kb * 1024 + size_t(pg) - 1) / size_t(pg) * size_t(pg);
+    if (pthread_attr_setstacksize(&attr, bytes) != 0) {  // refused: skip this size (no job: the caller treats it as not run)
+        pthread_attr_destroy(&attr);
+        job.skipped = true;
+        return job;
+    }
     pthread_t th;
     if (pthread_create(&th, &attr, stackJob, &job) != 0) std::abort();
     pthread_join(th, nullptr);
@@ -2584,10 +2591,15 @@ StackJob lowerOnStack(uint32_t levels, size_t kb) {
 // and the sanitizers, so no threshold is assumed: over a wide range of depths and stack sizes every job must either lower or fail with
 // a message (and the full stack of this thread lowers what a small one lowers).
 void stackLimit() {
-    int lowered = 0, refused = 0;
+    int lowered = 0, refused = 0, skipped = 0, total = 0;
     for (size_t kb : {size_t(64), size_t(128), size_t(256), size_t(512)}) {
         for (uint32_t levels : {20u, 100u, 300u, 1000u, 3000u, 20000u}) {
             const StackJob j = lowerOnStack(levels, kb);
+            ++total;
+            if (j.skipped) {
+                ++skipped;
+                continue;
+            }
             CHECK(j.parsed);
             if (j.lowered) {
                 ++lowered;
@@ -2599,6 +2611,10 @@ void stackLimit() {
         }
     }
     // The ends of the range: a short ladder on the largest stack lowers (even under a sanitizer), a ladder past the level cap does not.
+    if (skipped == total) {  // (every stack size was refused by the system: nothing was tested)
+        std::printf("stack_limit: skipped, the system refused every thread stack size\n");
+        return;
+    }
     CHECK(lowered > 0 && refused > 0);
     // A job that a small stack lowers lowers on the full stack of this thread too.
     const StackJob big = lowerOnStack(300, 0);

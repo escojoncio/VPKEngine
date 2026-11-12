@@ -5545,7 +5545,7 @@ void testAuditCompile() {
     }
     t.join();
     CHECK(compileUs > 20000);  // (a compile too short to tell)
-    CHECK(during > 100);       // (a compile that held the lock lets through only the call that was waiting)
+    CHECK(during > std::max<long>(20, compileUs / 100 / 5));  // (a compile that held the lock lets through only the call that was waiting)
     alarm(0);
     e.down();
 }
@@ -7226,62 +7226,234 @@ void testAudit5Readonly() {
     a.down();
 }
 
+// ---- round 5, review of round 3 ----
+void audit5ShutdownRace() {
+    G(eglMakeCurrent, uint32_t (*)(void*, void*, void*, void*));
+    G(eglCreateContext, void* (*)(void*, void*, void*, const EGLint*));
+    G(eglCreatePbufferSurface, void* (*)(void*, void*, const EGLint*));
+    G(glGetError, GLenum (*)());
+    G(glFlush, void (*)());
+    watchdog(60);
+    Egl a;
+    CHECK(a.up());
+    SteadyKit ka; ka.up();
+    G(glDrawArrays, void (*)(GLenum, GLint, GLsizei));
+    for (int i = 0; i < 200; ++i) glDrawArrays(gl::TRIANGLES, 0, 3);
+    const EGLint sattrs[] = {egl::WIDTH, 16, egl::HEIGHT, 16, egl::NONE};
+    const EGLint cattrs[] = {egl::CONTEXT_CLIENT_VERSION, 3, egl::NONE};
+    void* surfB = eglCreatePbufferSurface(a.dpy, a.config, sattrs);
+    void* ctxB = eglCreateContext(a.dpy, a.config, a.ctx, cattrs);
+    std::atomic<int> step{0};
+    std::atomic<long> n{0};
+    void* surfC = eglCreatePbufferSurface(a.dpy, a.config, sattrs);
+    void* ctxC = eglCreateContext(a.dpy, a.config, a.ctx, cattrs);
+    std::atomic<int> up{0};
+    std::thread th([&] {
+        eglMakeCurrent(a.dpy, surfB, surfB, ctxB);
+        ++up;
+        while (step != 2) { glGetError(); glFlush(); ++n; }   // a render thread still issuing GL calls
+    });
+    std::thread th2([&] {
+        eglMakeCurrent(a.dpy, surfC, surfC, ctxC);
+        ++up;
+        while (step != 2) { glGetError(); glFlush(); ++n; }   // a loader thread
+    });
+    while (up != 2) std::this_thread::yield();
+    while (n < 1000) std::this_thread::yield();
+    auto shutdown = reinterpret_cast<void (*)()>(dlsym(gLib, "vpgles_shutdown"));
+    shutdown();
+    std::printf("  shutdown done while thread B was calling GL\n"); std::fflush(stdout);
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    step = 2;
+    th.join(); th2.join();
+    std::printf("  thread B survived, calls=%ld\n", long(n)); std::fflush(stdout);
+    alarm(0);
+}
+void audit5AtomicRO() {
+    Egl a; CHECK(a.up());
+    G(glCreateShader, GLuint (*)(GLenum));
+    G(glShaderSource, void (*)(GLuint, GLsizei, const char* const*, const GLint*));
+    G(glCompileShader, void (*)(GLuint));
+    G(glGetShaderiv, void (*)(GLuint, GLenum, GLint*));
+    G(glGetShaderInfoLog, void (*)(GLuint, GLsizei, GLsizei*, char*));
+    const char* cases[][2] = {
+        {"atomicAdd anon", "layout(std430, binding=0) readonly buffer B { uint a[]; };\nvoid main(){ atomicAdd(a[0], 1u); }\n"},
+        {"atomicExchange inst", "layout(std430, binding=0) readonly buffer B { int a[]; } b;\nvoid main(){ atomicExchange(b.a[0], 1); }\n"},
+        {"atomicCompSwap", "layout(std430, binding=0) readonly buffer B { uint a[]; };\nvoid main(){ atomicCompSwap(a[0], 0u, 1u); }\n"},
+        {"whole-array assign inst", "layout(std430, binding=0) readonly buffer B { float a[4]; } b;\nvoid main(){ float t[4]; t[0]=1.0;t[1]=1.0;t[2]=1.0;t[3]=1.0; b.a = t; }\n"},
+        {"modf out", "layout(std430, binding=0) readonly buffer B { float a[]; };\nvoid main(){ float f = modf(1.5, a[0]); }\n"},
+        {"frexp out", "layout(std430, binding=0) readonly buffer B { highp int a[]; };\nvoid main(){ float f = frexp(1.5, a[0]); }\n"},
+        {"compound +=", "layout(std430, binding=0) readonly buffer B { float a[]; };\nvoid main(){ a[0] += 1.0; }\n"},
+        {"struct whole assign", "struct S { vec4 v; };\nlayout(std430, binding=0) readonly buffer B { S s; } b;\nvoid main(){ S t; t.v = vec4(1.0); b.s = t; }\n"},
+        {"nested array-of-struct elt", "struct S { vec4 v[2]; };\nlayout(std430, binding=0) readonly buffer B { S s[]; } b;\nvoid main(){ b.s[1].v[1].y = 1.0; }\n"},
+    };
+    for (auto& c : cases) {
+        std::string s = std::string("#version 310 es\nlayout(local_size_x = 1) in;\n") + c[1];
+        GLuint sh = glCreateShader(gl::COMPUTE_SHADER);
+        const char* p = s.c_str();
+        glShaderSource(sh, 1, &p, nullptr);
+        glCompileShader(sh);
+        GLint ok = 0;
+        glGetShaderiv(sh, gl::COMPILE_STATUS, &ok);
+        char log[512] = {};
+        glGetShaderInfoLog(sh, sizeof log, nullptr, log);
+        std::printf("  %-28s compiled=%d %s\n", c[0], ok, ok ? "(WRITE TO READONLY ACCEPTED)" : log);
+        CHECK(ok == 0);  // a write to a readonly member (atomics, out arguments, whole-array / struct assignment, compound) is an error
+    }
+    forbidLines.clear();
+    a.down();
+}
+void audit5IndexInPlace() {
+    Egl a; CHECK(a.up());
+    SteadyKit ka; ka.up();
+    G(glGenBuffers, void (*)(GLsizei, GLuint*));
+    G(glBindBuffer, void (*)(GLenum, GLuint));
+    G(glBufferData, void (*)(GLenum, GLsizeiptr, const void*, GLenum));
+    G(glBufferSubData, void (*)(GLenum, GLintptr, GLsizeiptr, const void*));
+    G(glCopyBufferSubData, void (*)(GLenum, GLenum, GLintptr, GLintptr, GLsizeiptr));
+    G(glDrawElements, void (*)(GLenum, GLsizei, GLenum, const void*));
+    G(glDrawArrays, void (*)(GLenum, GLint, GLsizei));
+    watchdog(60);
+    settle();
+    const uint16_t idx[6] = {0, 1, 2, 2, 1, 0};
+    GLuint b[2];
+    glGenBuffers(2, b);
+    glBindBuffer(0x8F36, b[0]);
+    glBufferData(0x8F36, 12, idx, gl::STATIC_DRAW);
+    glBindBuffer(gl::ELEMENT_ARRAY_BUFFER, b[1]);
+    glBufferData(gl::ELEMENT_ARRAY_BUFFER, 12, nullptr, gl::STATIC_DRAW);
+    glBindBuffer(0x8F37, b[1]);
+    glDrawArrays(gl::TRIANGLES, 0, 3);
+    glCopyBufferSubData(0x8F36, 0x8F37, 0, 0, 12);
+    const int s0 = submits;
+    resetCalls();
+    glDrawElements(gl::TRIANGLES, 6, gl::UNSIGNED_SHORT, nullptr);  // 16-bit, attribs direct: the GPU reads the indices in place
+    std::printf("  drawElements(USHORT, in place) after GPU copy into the element buffer: submits=%d waits=%d (need 0/0)\n", submits - s0, int(calls.waits));
+    CHECK(submits == s0 && calls.waits == 0);  // read in place by the GPU, in order after the copy: the CPU does not wait
+    settle();
+    alarm(0);
+    a.down();
+}
+void audit5PassSplit() {
+    Egl a; CHECK(a.up());
+    G(glGenBuffers, void (*)(GLsizei, GLuint*));
+    G(glBindBuffer, void (*)(GLenum, GLuint));
+    G(glBindBufferBase, void (*)(GLenum, GLuint, GLuint));
+    G(glBufferData, void (*)(GLenum, GLsizeiptr, const void*, GLenum));
+    G(glBufferSubData, void (*)(GLenum, GLintptr, GLsizeiptr, const void*));
+    G(glUseProgram, void (*)(GLuint));
+    G(glDrawArrays, void (*)(GLenum, GLint, GLsizei));
+    watchdog(60);
+    const char* vs = "#version 310 es\nvoid main(){ gl_Position = vec4(float(gl_VertexID)-1.0, 0.0, 0.0, 1.0); }\n";
+    for (int ro = 0; ro < 2; ++ro) {
+        const char* fsS = ro ? "#version 310 es\nprecision highp float;\nlayout(std430, binding = 0) readonly buffer B { vec4 c[16]; };\nout vec4 o;\nvoid main(){ o = c[3]; }\n"
+                             : "#version 310 es\nprecision highp float;\nlayout(std430, binding = 0) buffer B { vec4 c[16]; };\nout vec4 o;\nvoid main(){ o = c[3]; }\n";
+        const GLuint p = program(vs, fsS);
+        glUseProgram(p);
+        GLuint b;
+        glGenBuffers(1, &b);
+        glBindBuffer(kSSBO, b);
+        std::vector<float> data(64, 1.0f);
+        glBufferData(kSSBO, 256, data.data(), gl::DYNAMIC_DRAW);
+        glBindBufferBase(kSSBO, 0, b);
+        settle();
+        resetCalls();
+        const int s0 = submits;
+        for (int f = 0; f < 10; ++f) {
+            for (int obj = 0; obj < 20; ++obj) { glBufferSubData(kSSBO, 16, 64, data.data()); glDrawArrays(gl::TRIANGLES, 0, 3); }
+            vpgles_flush(0);
+        }
+        std::printf("  SSBO only READ by the shader, %s: 10 frames x 20 (partial update + draw): passes=%d copies=%d submits=%d waits=%d buffersCreated=%d trace[0..60]=%s\n",
+                    ro ? "declared readonly" : "NOT declared readonly", counts.passes, int(calls.copyBuffer), submits - s0, int(calls.waits), int(calls.buffersCreated), gTrace.substr(0, 60).c_str());
+        if (ro) CHECK(counts.passes <= 12);
+        else CHECK(counts.passes <= 12);  // a block the shader only reads (no l-value on it) is as readonly as a declared one: updates do not cut the pass
+        settle();
+    }
+    alarm(0);
+    a.down();
+}
+
+void audit5AfterShutdown() {
+    G(eglInitialize, uint32_t (*)(void*, EGLint*, EGLint*));
+    G(eglMakeCurrent, uint32_t (*)(void*, void*, void*, void*));
+    G(eglGetError, EGLint (*)());
+    watchdog(30);
+    Egl a; CHECK(a.up());
+    eglMakeCurrent(a.dpy, nullptr, nullptr, nullptr);
+    auto shutdown = reinterpret_cast<void (*)()>(dlsym(gLib, "vpgles_shutdown"));
+    shutdown();
+    EGLint maj, min;
+    const uint32_t i = eglInitialize(a.dpy, &maj, &min);
+    const EGLint ierr = eglGetError();
+    std::printf("  eglInitialize after vpgles_shutdown (no vpgles_init) = %u err=%#x\n", i, ierr); std::fflush(stdout);
+    CHECK(i == 0 && ierr == 0x3001 /*EGL_NOT_INITIALIZED*/);  // the Device is dead: nothing may be made on it
+    alarm(0);
+}
+
 // G12: linking a program does not hold the global lock while the shaders are linked: another thread's GL calls go through.
 void testAudit2Link() {
     Egl e;
     CHECK(e.up());
     G(glGetError, GLenum (*)());
-    watchdog(90);
-    std::atomic<bool> ready{false}, linking{false}, done{false};
-    std::atomic<long> during{0}, linkUs{0};
-    std::atomic<int> linked{-1};
-    std::thread t([&] {
-        Egl f;
-        G(glCreateShader, GLuint (*)(GLenum));
-        G(glShaderSource, void (*)(GLuint, GLsizei, const char* const*, const GLint*));
-        G(glCompileShader, void (*)(GLuint));
-        G(glCreateProgram, GLuint (*)());
-        G(glAttachShader, void (*)(GLuint, GLuint));
-        G(glLinkProgram, void (*)(GLuint));
-        G(glGetProgramiv, void (*)(GLuint, GLenum, GLint*));
-        if (!f.up()) return void(done = true);
-        // A vertex shader with a long body: the emitter has a lot to write (the compile has been made already).
-        std::string vs = "attribute vec4 a; uniform vec4 u[16]; varying vec4 v;\nvoid main() {\n vec4 x = a;\n";
-        for (int i = 0; i < 12000; ++i) vs += " x = x * u[" + std::to_string(i % 16) + "] + vec4(" + std::to_string(i % 7) + ".5);\n";
-        vs += " v = x; gl_Position = x;\n}\n";
-        const char* fs = "precision mediump float; varying vec4 v; void main() { gl_FragColor = v; }\n";
-        const GLuint sv = glCreateShader(gl::VERTEX_SHADER), sf = glCreateShader(gl::FRAGMENT_SHADER);
-        const char* p = vs.c_str();
-        glShaderSource(sv, 1, &p, nullptr);
-        glShaderSource(sf, 1, &fs, nullptr);
-        glCompileShader(sv);
-        glCompileShader(sf);
-        const GLuint prog = glCreateProgram();
-        glAttachShader(prog, sv);
-        glAttachShader(prog, sf);
-        linking = true;  // (before `ready`: the caller's loop starts on linking)
-        ready = true;
-        const auto t0 = std::chrono::steady_clock::now();
-        glLinkProgram(prog);
-        linkUs = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count();
-        linking = false;
-        GLint ok = 0;
-        glGetProgramiv(prog, gl::LINK_STATUS, &ok);
-        linked = ok;
-        f.down();
-        done = true;
-    });
-    while (!ready) std::this_thread::yield();
-    while (linking && !done) {
-        glGetError();
-        if (linking) ++during;
-        std::this_thread::sleep_for(std::chrono::microseconds(100));
+    watchdog(120);
+    // One attempt links a vertex shader of `lines` statements. A link too short to tell (the machine is fast) is tried again with a longer
+    // shader; the check is relative to the link's length (a link that held the lock lets through only the call that was waiting, while one
+    // that does not lets through about one call per 100 us of sleep), not an absolute count that a slow or fast machine can miss.
+    for (int lines = 12000, attemptNo = 0; attemptNo < 4; lines *= 3, ++attemptNo) {
+        std::atomic<bool> ready{false}, linking{false}, done{false};
+        std::atomic<long> during{0}, linkUs{0};
+        std::atomic<int> linked{-1};
+        std::thread t([&] {
+            Egl f;
+            G(glCreateShader, GLuint (*)(GLenum));
+            G(glShaderSource, void (*)(GLuint, GLsizei, const char* const*, const GLint*));
+            G(glCompileShader, void (*)(GLuint));
+            G(glCreateProgram, GLuint (*)());
+            G(glAttachShader, void (*)(GLuint, GLuint));
+            G(glLinkProgram, void (*)(GLuint));
+            G(glGetProgramiv, void (*)(GLuint, GLenum, GLint*));
+            if (!f.up()) return void(done = true);
+            // A vertex shader with a long body: the emitter has a lot to write (the compile has been made already).
+            std::string vs = "attribute vec4 a; uniform vec4 u[16]; varying vec4 v;\nvoid main() {\n vec4 x = a;\n";
+            for (int i = 0; i < lines; ++i) vs += " x = x * u[" + std::to_string(i % 16) + "] + vec4(" + std::to_string(i % 7) + ".5);\n";
+            vs += " v = x; gl_Position = x;\n}\n";
+            const char* fs = "precision mediump float; varying vec4 v; void main() { gl_FragColor = v; }\n";
+            const GLuint sv = glCreateShader(gl::VERTEX_SHADER), sf = glCreateShader(gl::FRAGMENT_SHADER);
+            const char* p = vs.c_str();
+            glShaderSource(sv, 1, &p, nullptr);
+            glShaderSource(sf, 1, &fs, nullptr);
+            glCompileShader(sv);
+            glCompileShader(sf);
+            const GLuint prog = glCreateProgram();
+            glAttachShader(prog, sv);
+            glAttachShader(prog, sf);
+            linking = true;  // (before `ready`: the caller's loop starts on linking)
+            ready = true;
+            const auto t0 = std::chrono::steady_clock::now();
+            glLinkProgram(prog);
+            linkUs = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count();
+            linking = false;
+            GLint ok = 0;
+            glGetProgramiv(prog, gl::LINK_STATUS, &ok);
+            linked = ok;
+            f.down();
+            done = true;
+        });
+        while (!ready && !done) std::this_thread::yield();
+        while (linking && !done) {
+            glGetError();
+            if (linking) ++during;
+            std::this_thread::sleep_for(std::chrono::microseconds(100));
+        }
+        t.join();
+        if (std::getenv("VPGLES_LOG")) std::printf("  lines %d: link %ld us, %ld calls through, linked=%d\n", lines, long(linkUs), long(during), int(linked));
+        CHECK(linked == 1);
+        if (linkUs < 30000 && attemptNo < 3) continue;  // too short to tell: a longer shader
+        CHECK(linkUs >= 30000);
+        // (>= a fifth of the 100 us polls that fit in the link: the loop's own time per call and the sleep's overshoot take the rest)
+        CHECK(during > std::max<long>(20, linkUs / 100 / 5));
+        break;
     }
-    t.join();
-    if (std::getenv("VPGLES_LOG")) std::printf("  link %ld us, %ld calls through, linked=%d\n", long(linkUs), long(during), int(linked));
-    CHECK(linked == 1);
-    CHECK(linkUs > 20000);  // (a link too short to tell)
-    CHECK(during > 100);    // (a link that held the lock lets through only the call that was waiting)
     alarm(0);
     e.down();
 }
@@ -7389,7 +7561,7 @@ int main(int argc, char** argv) {
         {"audit_lost", testAuditLost}, {"audit_calls", testAuditCalls}, {"audit_compile", testAuditCompile}, {"audit_xfb", testAuditXfb},
         {"audit2_xfer", testAudit2Xfer}, {"audit2_dyn", testAudit2Dyn}, {"audit2_buf", testAudit2Buf}, {"audit2_pbo", testAudit2Pbo},
         {"audit2_upload", testAudit2Upload}, {"audit2_egl", testAudit2Egl}, {"audit2_link", testAudit2Link}, {"audit2_link2", testAudit2LinkShared},
-        {"audit3_egl_last", testAudit3EglLast}, {"audit3_egl_refs", testAudit3EglRefs}, {"audit3_pbo", testAudit3Pbo}, {"audit3_xfer_shared", testAudit3XferShared}, {"audit3_stale_stamp", testAudit3StaleStamp}, {"audit4_xfer_own_pass", testAudit4XferOwnPass}, {"audit4_reads_b", testAudit4ReadsB}, {"audit4_reads_ctl", testAudit4ReadsCtl}, {"audit4_copygrow", testAudit4CopyGrow}, {"audit4_reinit", testAudit4Reinit}, {"audit5_perf", testAudit5Perf}, {"audit5_readonly", testAudit5Readonly}, {"audit5_texbuf", testAudit5TexBuf}, {"audit5_index", testAudit5IndexRead}, {"audit5_balance", testAudit5Balance}, {"audit5_shutdown0", testAudit5Shutdown0}, {"audit5_shutdown1", testAudit5Shutdown1},
+        {"audit3_egl_last", testAudit3EglLast}, {"audit3_egl_refs", testAudit3EglRefs}, {"audit3_pbo", testAudit3Pbo}, {"audit3_xfer_shared", testAudit3XferShared}, {"audit3_stale_stamp", testAudit3StaleStamp}, {"audit4_xfer_own_pass", testAudit4XferOwnPass}, {"audit4_reads_b", testAudit4ReadsB}, {"audit4_reads_ctl", testAudit4ReadsCtl}, {"audit4_copygrow", testAudit4CopyGrow}, {"audit4_reinit", testAudit4Reinit}, {"audit5_perf", testAudit5Perf}, {"audit5_race", audit5ShutdownRace}, {"audit5_atomic_ro", audit5AtomicRO}, {"audit5_index_inplace", audit5IndexInPlace}, {"audit5_pass_split", audit5PassSplit}, {"audit5_after_shutdown", audit5AfterShutdown}, {"audit5_readonly", testAudit5Readonly}, {"audit5_texbuf", testAudit5TexBuf}, {"audit5_index", testAudit5IndexRead}, {"audit5_balance", testAudit5Balance}, {"audit5_shutdown0", testAudit5Shutdown0}, {"audit5_shutdown1", testAudit5Shutdown1},
     };
     auto it = tests.find(argv[1]);
     if (ok && it != tests.end()) it->second();

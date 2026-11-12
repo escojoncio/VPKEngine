@@ -35,7 +35,7 @@ if(BUILD_TESTING OR NOT DEFINED BUILD_TESTING)
   if(NOT MSVC)
     target_compile_options(vpgpu_submit_order_tests PRIVATE -Wall -Wextra)
   endif()
-  foreach(t wouldpark deferred resumeflush flushrules closing noparkunderlock parkunderlock frontier gaugewait oncemap)
+  foreach(t wouldpark ownerrelease deferred resumeflush flushrules closing noparkunderlock parkunderlock frontier gaugewait oncemap)
     add_test(NAME gpu_core.submit_order.${t} COMMAND vpgpu_submit_order_tests ${t})
   endforeach()
   # Regressions of the misc audit (pipeline cache re-queue, key decode range, pass dump mip shift, range saturation).

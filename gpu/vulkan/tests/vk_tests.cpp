@@ -9671,6 +9671,7 @@ void testSyncPipelines() {
 namespace vpvk {
 uint32_t createWaitMs();   // pipelines.cpp
 void resetCreateWaitMs();  // pipelines.cpp (tests)
+void resetDrawWaitMs();    // pipelines.cpp (tests): VPVK_PIPELINE_DRAW_WAIT_MS is read once
 }
 void testCreateDefault() {
   unsetenv("VPVK_GLES_SYNC_PIPELINES");
@@ -15970,7 +15971,7 @@ struct LockRig {
   std::thread blocker;
   std::promise<void> held, release;
   std::atomic<bool> blockerDone{false};
-  int markResult = -1, nestedResult = -1;
+  int markResult = -1, nestedResult = -1, zeroClearResult = -2;
   void* nativeDevice = nullptr;
   void* mask = reinterpret_cast<void*>(uintptr_t(1));
 };
@@ -16055,6 +16056,7 @@ void testAuditLockOrder() {
       LockRig& r = *static_cast<LockRig*>(user);
       r.markResult = vpvk_mark_eye_image(r.img);
       r.nestedResult = vpvk_native_submit([](void*, void*) {}, nullptr);
+      r.zeroClearResult = vpvk_image_zero_clear(reinterpret_cast<void*>(uintptr_t(0x1234)));  // (an unknown texture)
     };
     std::promise<void> done;
     std::future<void> doneF = done.get_future();
@@ -16064,7 +16066,33 @@ void testAuditLockOrder() {
     });
     if (!readyWithin(doneF, 10000)) dieOnDeadlock("re-entrant host calls inside the native_submit callback");
     t.join();
-    CHECK(rig.markResult == 0 && rig.nestedResult == 0);
+    CHECK(rig.markResult == 0 && rig.nestedResult == 0 && rig.zeroClearResult == 0);
+  }
+  // 2c. vpvk_image_zero_clear inside the callback is served (the submit mutex is this thread's): 0 for a texture it does not know, not the
+  // "busy, retry" -1 it answered for ever there.
+  // 2d. A callback that leaves by an exception does not leave the thread believing it still holds the submit mutex.
+  {
+    LockRig rig;
+    auto cb = [](void*, void* user) {
+      LockRig& r = *static_cast<LockRig*>(user);
+      r.zeroClearResult = vpvk_image_zero_clear(reinterpret_cast<void*>(uintptr_t(0x1234)));
+      throw 7;
+    };
+    std::promise<void> done;
+    std::future<void> doneF = done.get_future();
+    int caught = 0, after = -1;
+    std::thread t([&] {
+      try {
+        vpvk_native_submit(cb, &rig);
+      } catch (int v) {
+        caught = v;
+      }
+      after = vpvk_native_submit([](void*, void*) {}, nullptr);  // would be refused (0) if the flag were stuck
+      done.set_value();
+    });
+    if (!readyWithin(doneF, 10000)) dieOnDeadlock("native_submit callback that throws");
+    t.join();
+    CHECK(caught == 7 && after == 1 && rig.zeroClearResult == 0);
   }
   // 3. gpu.hold: a vkQueueSubmit keeps the submit mutex while its pipelines compile. Whoever waits for that mutex in a host call must not
   // stop the per-frame calls that take the registry (gpu lost / backlog, the memory budget of the physical device).
@@ -16289,17 +16317,31 @@ void testAuditStoreTranslatorMode() {
     RecipeStore other(dir);  // and in the mode before, it is the stale one
     CHECK(other.needsRefresh());
   }
+  {
+    // The host changes the mode with a device alive and the engine refreshes it by another way than forDir (vpvk_precompile_spirv, the
+    // prewarm): the live store follows at once, what it records from there is labelled with the new id.
+    setenv("VPVK_AMPLIFY", "0", 1);
+    refreshTranslatorMode();
+    std::filesystem::remove(dir + "/recipes.bin");
+    std::shared_ptr<RecipeStore> live = RecipeStore::forDir(dir);
+    setenv("VPVK_AMPLIFY", "1", 1);
+    refreshTranslatorMode();  // (no forDir)
+    auditAddStage(*live, 7, 100);
+    RecipeStore reload(dir);  // in the new mode
+    CHECK(reload.enabled() && !reload.needsRefresh());
+  }
   if (oldAmp) setenv("VPVK_AMPLIFY", saved.c_str(), 1);
   else unsetenv("VPVK_AMPLIFY");
   refreshTranslatorMode();
   std::filesystem::remove_all(dir);
 }
 
-// V23: a submission that asks for many MSAA variants at once (forced MSAA, synchronous pipelines) waits for each of them: the budget
-// (VPVK_PIPELINE_DRAW_WAIT_MS) is every variant's own, so none reaches the backend still compiling. Whole path: vkQueueSubmit -> translate
-// (forceMsaa, pipelineFor) -> runBatches -> awaitFreshVariants. The compiles are slowed so that all of them need more than one budget.
+// V23: a submission that asks for many MSAA variants at once (forced MSAA, synchronous pipelines) waits for all of them within one budget
+// (VPVK_PIPELINE_DRAW_WAIT_MS, one absolute deadline for the call), so none reaches the backend still compiling while they fit in it. Whole path: vkQueueSubmit -> translate
+// (forceMsaa, pipelineFor) -> runBatches -> awaitFreshVariants. The compiles are slowed (the variants overlap on the workers).
 void testAuditForcedVariantsAwait() {
-  setenv("VPVK_PIPELINE_DRAW_WAIT_MS", "500", 1);
+  setenv("VPVK_PIPELINE_DRAW_WAIT_MS", "5000", 1);  // (one budget for all the variants of the call: 24 x 200 ms of compiles on the workers fit)
+  resetDrawWaitMs();
   vpvk_taa_jitter eyeOnly{0, 64, 64, 0, 0, 0};  // the eye's size: the 64x64 pass of the rig is an eye pass
   vpvk_taa_set_jitter(&eyeOnly);
   vpvk_config_set_msaa_force(4);
@@ -16364,12 +16406,14 @@ void testAuditForcedVariantsAwait() {
   vpvk_taa_jitter off{};
   vpvk_taa_set_jitter(&off);
   unsetenv("VPVK_PIPELINE_DRAW_WAIT_MS");
+  resetDrawWaitMs();
 }
 
-// V23b: the wait of a submission for its fresh variants has a global cap (8 budgets): compiles that hang cannot stall the submit (the submit
-// mutex is held) for variants x budget.
+// V23b: the wait of a submission for its fresh variants is one budget in all: compiles that hang cannot stall the submit (the submit
+// mutex is held) for more than that, however many variants.
 void testAuditForcedVariantsCap() {
   setenv("VPVK_PIPELINE_DRAW_WAIT_MS", "100", 1);
+  resetDrawWaitMs();
   vpvk_taa_jitter eyeOnly{0, 64, 64, 0, 0, 0};  // the eye's size: the 64x64 pass of the rig is an eye pass
   vpvk_taa_set_jitter(&eyeOnly);
   vpvk_config_set_msaa_force(4);
@@ -16404,6 +16448,7 @@ void testAuditForcedVariantsCap() {
       std::unique_lock lock(gm);
       gcv.wait(lock, [&] { return open; });
     };
+    c.gpu().setHoldMs(0);  // (the core's own frame hold would add its 1.5 s to the submit: only awaitFreshVariants is measured)
     rig.begin();
     VkBuffer bufs[1] = {vb};
     VkDeviceSize offs[1] = {0};
@@ -16429,7 +16474,8 @@ void testAuditForcedVariantsCap() {
       }
     CHECK(dev->msaaTwins.passes == 1 && variants == size_t(kN));
     CHECK(unready > 0);                 // hung compiles are not waited for for ever...
-    CHECK(ms >= 700.0 && ms < 4000.0);  // ...the whole wait is a few budgets (8 x 100 ms), not variants x budget (2.4 s and more)
+    std::printf("  forced variants submit with hung compiles: %.0f ms\n", ms);
+    CHECK(ms >= 80.0 && ms < 700.0);    // ...the whole wait is one budget (100 ms), not variants x budget (2.4 s) nor 8 budgets
     {
       std::lock_guard lock(gm);
       open = true;
@@ -16449,10 +16495,14 @@ void testAuditForcedVariantsCap() {
   vpvk_taa_jitter off{};
   vpvk_taa_set_jitter(&off);
   unsetenv("VPVK_PIPELINE_DRAW_WAIT_MS");
+  resetDrawWaitMs();
 }
 
 // V24: RELEASE_RESOURCES every frame costs next to nothing (engines pass the bit on each reset), a reset never waits for the submit mutex
 // (the excess is handed to the device and freed by its next submission), and a chunk made for one huge copy is not the one that is kept.
+extern "C" size_t vpvk_trim_memory(int level, char* out, size_t cap);
+extern "C" size_t vpvk_idle_drain(unsigned min_idle_ms, char* out, size_t cap);
+
 void testAuditReleaseCost() {
   Ctx c;
   Device* d = from<Device>(c.dev);
@@ -16562,6 +16612,51 @@ void testAuditReleaseCost() {
     rec.arena.trim(rec.device);
     CHECK(rec.arena.chunks.size() == 1);  // a normal one is kept
   }
+  // 4. The hysteresis keeps a big chunk the last recording used (a game that uploads that much every frame would allocate it again under
+  // the submit mutex), and gives it back once a recording does not use it.
+  {
+    Recorder rec;
+    rec.device = d;
+    VkDeviceSize off = 0;
+    rec.arena.put(rec.device, nullptr, 4u << 20, off);
+    rec.reset();
+    rec.arena.retireExcess(rec.device, 1);
+    CHECK(rec.arena.chunks.size() == 1 && rec.arena.chunks[0].size >= (4u << 20));
+    rec.reset();  // the next recording used nothing
+    rec.arena.retireExcess(rec.device, 1);
+    CHECK(rec.arena.chunks.empty());
+    CHECK(tryDrainRetiredChunks(d));
+  }
+  // 5. The chunks a reset retired are freed by the host's trim / idle drain too (no submission needed), without waiting for the submit mutex.
+  auto retire = [&] {
+    recordOnly(10, 0);
+    submit();
+    vkResetCommandBuffer(cb, VK_COMMAND_BUFFER_RESET_RELEASE_RESOURCES_BIT);
+    for (uint32_t i = 0; i < Recorder::kReleaseFrames; ++i) {
+      recordOnly(1, 0);
+      vkResetCommandBuffer(cb, VK_COMMAND_BUFFER_RESET_RELEASE_RESOURCES_BIT);
+    }
+  };
+  auto retired = [&] {
+    std::lock_guard<std::mutex> l(d->retiredChunksMutex);
+    return d->retiredChunks.size();
+  };
+  retire();
+  CHECK(retired() > 0);
+  vpvk_idle_drain(0, nullptr, 0);
+  CHECK(retired() == 0);
+  retire();
+  CHECK(retired() > 0);
+  vpvk_trim_memory(0, nullptr, 0);
+  CHECK(retired() == 0);
+  retire();
+  {
+    std::lock_guard<std::mutex> held(d->submitMutex);  // a busy device: nothing is waited for, nothing is freed
+    vpvk_idle_drain(0, nullptr, 0);
+    CHECK(retired() > 0);
+  }
+  vpvk_idle_drain(0, nullptr, 0);
+  CHECK(retired() == 0);
   vkDestroyCommandPool(c.dev, pool, nullptr);
   vkDestroyBuffer(c.dev, b, nullptr);
   vkFreeMemory(c.dev, m, nullptr);

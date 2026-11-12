@@ -260,7 +260,6 @@ private:
     std::map<std::string, uint32_t> defaultIndex_;  // uniform name -> member index
     std::map<const UniformBlockDecl*, uint32_t> blockVars_;
     std::map<const UniformBlockDecl*, Type> blockTypes_;
-    uint32_t fragDataVar_ = 0;
     std::vector<std::pair<const Symbol*, const Expr*>> initialisers_;
     uint32_t positionVar_ = 0;
     // Atomic counters: symbol -> (storage buffer variable of its binding, first word).

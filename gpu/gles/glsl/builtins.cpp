@@ -588,7 +588,10 @@ void fold(Expr& e, const std::vector<ExprP>& args) {
     auto x = [&](size_t i) { return args[i]->constI; };
     const bool isF = e.type.base == Base::Float;
     auto setF = [&](double v) { e.hasConst = true, e.constF = roundF32(v), e.constI = satI64(v); };
-    auto setI = [&](int64_t v) { e.hasConst = true, e.constI = v, e.constF = double(v); };
+    auto setI = [&](int64_t v) {  // (wrapped to 32 bits: abs(INT_MIN) is INT_MIN)
+        v = e.type.base == Base::Uint ? int64_t(uint32_t(v)) : int64_t(int32_t(v));
+        e.hasConst = true, e.constI = v, e.constF = double(v);
+    };
     if (n == "abs") isF ? setF(std::fabs(f(0))) : setI(x(0) < 0 ? -x(0) : x(0));
     else if (n == "min") isF ? setF(std::min(f(0), f(1))) : setI(std::min(x(0), x(1)));
     else if (n == "max") isF ? setF(std::max(f(0), f(1))) : setI(std::max(x(0), x(1)));

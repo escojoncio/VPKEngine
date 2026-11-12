@@ -33,10 +33,14 @@ struct Lock {
     std::unique_lock<std::recursive_mutex> l;
     Lock() : l(device()->lock) {}
 };
+// (current() is read again with the lock held: vpgles_shutdown deletes the contexts under it, so a thread that read `c` and then waited
+// for the lock must not use it; the second read sees the ended session.)
 #define CTX(...)                 \
     Context* c = current();      \
     if (!c) return __VA_ARGS__;  \
-    Lock lock_;
+    Lock lock_;                  \
+    c = current();               \
+    if (!c) return __VA_ARGS__;
 
 // ---- errors, state queries ----------------------------------------------------------------------------
 GLenum GetError() {
@@ -4095,6 +4099,9 @@ extern "C" int vpgles_init(void* gipa) {
 
 extern "C" void vpgles_shutdown(void) {
     if (!gDev) return;
+    // Under the device lock from the first release to the last Vulkan call: another thread's GL / EGL call either finished before or
+    // finds the session ended (no context, no surface) when it gets the lock.
+    std::lock_guard<std::recursive_mutex> l(gDev->lock);
     eglShutdownDisplay();  // (objects released while the Device is alive)
     gDev->shutdown();
     gInitResult = -1;

@@ -1,12 +1,17 @@
 // Background GPU pause. visionOS fails every MTLCommandBuffer committed while the app is in the background
 // (kIOGPUCommandBufferCallbackErrorBackgroundExecutionNotPermitted) and writes GPU hang dumps. The host sets the
-// flag from its scene-phase callback (main thread); each backend calls gateCommit() right before it commits a
-// command buffer, so the committing thread (renderer / submit threads) parks until the app is foreground again.
+// flag from its scene-phase callback (main thread). A backend calls waitForeground(owner) before it takes the lock that
+// fixes the order of its commits, so a submit / interop thread parks (holding no lock and no frame slot) until the app is
+// foreground again; a thread that would park under that lock hands its command buffer over instead (CommitQueue /
+// DeferredCommits in submit_order.h, wouldPark() decides) and the resume hook sends the batch. The older metal2 backend
+// still parks in waitForeground(owner) right before its commits. `owner` is the same pointer the backend later passes to
+// release(owner) (its Impl*); a caller without an owner (nullptr) is woken only by release() / shutdown().
 //
 // The main thread never parks: the thread that last called set(true) is "main", and a commit it makes while in the
 // background goes through and is counted (mainThreadPassed()). Skipping the commit instead would leave the command
-// buffer's completion handler (frame slot, fences) pending for ever. The engine itself commits only from its submit
-// threads. Platform neutral (no Metal): the null platform tests it.
+// buffer's completion handler (frame slot, fences) pending for ever. The gate is process wide, shared by every backend:
+// release(owner) wakes only the threads that parked for that owner (a backend being destroyed must not make another live
+// backend's threads commit in the background). Platform neutral (no Metal): the null platform tests it.
 #pragma once
 
 #include <atomic>
@@ -42,12 +47,14 @@ class BackgroundGate {
   // True while commits park: background and not shut down. Lock free (stall detectors poll it).
   bool active() const { return active_.load(std::memory_order_acquire); }
   // Called before committing a command buffer: returns at once in the foreground and on the main thread, else parks
-  // until foreground, release() or shutdown().
-  void waitForeground();
+  // until foreground, release() (all owners), release(owner) for the same `owner`, or shutdown(). `owner`: whoever will call
+  // release(owner) for it (a backend passes itself); nullptr = only the global release() and shutdown() wake it.
+  void waitForeground(const void* owner = nullptr);
   // True when waitForeground() on this thread would park right now (it does not park).
   bool wouldPark() const;
   // Wakes the threads parked now (a backend being destroyed waits for their command buffers); a later pause parks again.
-  void release();
+  // release(owner), owner != nullptr: only the threads that parked with that owner; release() / nullptr: every parked thread.
+  void release(const void* owner = nullptr);
   // release() and never park again.
   void shutdown();
   void setLog(LogFn);
@@ -73,7 +80,9 @@ class BackgroundGate {
   std::condition_variable cv_;
   std::atomic<bool> active_{false};
   bool background_ = false, shutdown_ = false;
-  uint64_t epoch_ = 0;  // bumped by release()
+  uint64_t epoch_ = 0;  // bumped by release() (all owners)
+  struct OwnerState { uint64_t epoch = 0; uint32_t waiters = 0; };
+  std::map<const void*, OwnerState> owners_;  // owners with threads parked now (the entry goes with the last one); release(owner) bumps epoch
   uint64_t episodeBlocked_ = 0, blockedTotal_ = 0, mainPassed_ = 0;
   std::thread::id main_;
   LogFn log_;

@@ -2123,7 +2123,10 @@ bool Context::prepareDrawOnce(GLenum mode, VkPrimitiveTopology& topo, uint32_t v
     // The attributes the CPU has to read (conversions, unaligned or divisor > 1 ones) come from buffers the GPU may still have to write
     // (a copy, transform feedback, a shader): wait for that now, before this draw records anything (a flush in the middle would leave the
     // storages bound so far outside the command buffer that gets the draw).
+    // (Nothing recorded writes a storage and no submission is in flight: nothing to look for, the common case.)
+    const bool anyGpuWrite = !gpuWrites_.empty() || dev->completed < dev->submitted;
     for (const auto& av : p->refl.attributes) {
+        if (!anyGpuWrite) break;
         const int cols = av.glType >= 0x8B5A && av.glType <= 0x8B5C ? int(av.glType - 0x8B5A + 2)
                          : (av.glType >= 0x8B65 && av.glType <= 0x8B6A) ? int((av.glType - 0x8B65) / 2 + 2) : 1;
         for (int c = 0; c < cols * av.arraySize; ++c) {
@@ -2465,7 +2468,17 @@ void Context::drawElements(GLenum mode, GLsizei count, GLenum type, const void* 
         if (!eb->storage) return setError(gl::INVALID_OPERATION, mode);
         const uintptr_t off = reinterpret_cast<uintptr_t>(indices);
         if (off + size_t(count) * isz > size_t(eb->size)) return setError(gl::INVALID_OPERATION, mode);
-        if (gpuWritePending(*eb->storage)) flush(true);  // the indices are read on the CPU (the scan for the highest one)
+        // The indices are read on the CPU (the scan for the highest one, transform feedback, restart splitting, provoking-vertex rotation,
+        // widening of 8-bit ones, line loops) unless the draw reads them in place on the GPU, in order after whatever writes them.
+        if (gpuWritePending(*eb->storage)) {
+            const TransformFeedback& tf0 = curTf();
+            Program* gp0 = graphicsProgram();
+            const bool direct = eb && isz >= 2 && mode != gl::LINE_LOOP && off % isz == 0 && gp0 && gp0->linked && gp0->vsModule &&
+                                attribsDirect(*gp0, va) && !(tf0.active && !tf0.paused && mode <= gl::TRIANGLE_FAN) &&
+                                !(primitiveRestart && (mode == gl::POINTS || mode == gl::LINES || mode == gl::TRIANGLES)) &&
+                                !gp0->refl.flatVaryings;
+            if (!direct) flush(true);
+        }
         src = eb->storage->host + off;
     } else {
         src = static_cast<const uint8_t*>(indices);

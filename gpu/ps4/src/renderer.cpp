@@ -1113,11 +1113,16 @@ struct Renderer::Impl {
                         // (a ring is written again only kFrames submits later).
                         note(address ? "buffer outside guest memory bound as zeros" : "null buffer bound as zeros");
                         if (res.access == vpir::Access::ReadWrite) {
+                            // Only the addressable bytes (the V#'s size, 256 at least, kDummyBytes at most): a dispatch full of null RW bindings
+                            // must not use the ring up. A ring too full for even that falls through to the sink (writes dropped, reads
+                            // unspecified) rather than losing the dispatch.
                             if (!makeDummy(dummy, "vpps4 zeros")) return why = "buffer outside guest memory", false;
-                            auto at = upload(dummy.memory, kDummyBytes);
-                            if (!at) return why = "upload ring full", false;
-                            a.range = ResourceRange::bytes(rings[ringIndex].id, *at, kDummyBytes);
-                            break;
+                            const uint64_t slice = size ? std::min<uint64_t>((size + 255) / 256 * 256, kDummyBytes) : 256;
+                            if (auto at = upload(dummy.memory, slice)) {
+                                a.range = ResourceRange::bytes(rings[ringIndex].id, *at, slice);
+                                break;
+                            }
+                            note("null read-write buffer bound to the sink (upload ring full)");
                         }
                         Dummy& d = a.write ? sink : dummy;
                         if (!makeDummy(d, a.write ? "vpps4 sink" : "vpps4 zeros")) return why = "buffer outside guest memory", false;

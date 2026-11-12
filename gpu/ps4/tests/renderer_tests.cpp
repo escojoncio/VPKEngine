@@ -604,6 +604,29 @@ void dummyCleared() {
     }
 }
 
+// Many dispatches of null read-write bindings in one frame: each takes only its addressable bytes of the upload ring, so none is lost to a
+// full ring.
+void nullRwRing() {
+    const Program cs = load("cs_bytes");
+    Fixture f;
+    for (int i = 0; i < 600; ++i) {
+        vpps4::DispatchState x;
+        x.cs.code = cs.code;
+        x.cs.fetch = cs.fetch;
+        x.cs.address = kBase + 0x82000;
+        x.cs.userSgprs = 4;
+        x.cs.ldsBytes = 64;
+        f.renderer.dispatch(x);
+    }
+    for (int i = 0; i < 50; ++i) f.renderer.draw(f.state());
+    f.renderer.submit();
+    const auto& st = f.renderer.stats();
+    CHECK(st.dispatched == 600);
+    CHECK(st.drawn == 50);
+    for (const auto& [why, n] : st.skipped) std::fprintf(stderr, "  skip %s x%d\n", why.c_str(), int(n));
+    CHECK(st.skipped.empty());
+}
+
 // The host sets the budget (Hooks::targetBudgetBytes), and the last 8 presented targets stay even over it, not only the latest one.
 void evictBudgetConfigured() {
     Fixture f(256ull << 20);  // 4 targets of 64 MiB
@@ -731,6 +754,7 @@ int main(int argc, char** argv) {
     else if (t == "evict_keeps_written") evictKeepsWritten();
     else if (t == "evict_keeps_presented") evictKeepsPresented();
     else if (t == "evict_budget_configured") evictBudgetConfigured();
+    else if (t == "null_rw_ring") nullRwRing();
     else if (t == "evict_budget") evictBudget();
     else if (t == "dummy_cleared") dummyCleared();
     else if (t == "big_staging") bigStaging();

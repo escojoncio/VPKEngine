@@ -269,6 +269,19 @@ uint32_t createWaitMs() {
 }
 void resetCreateWaitMs() { gCreateWaitMs.store(-1, std::memory_order_relaxed); }
 
+// VPVK_PIPELINE_DRAW_WAIT_MS: read once (a submission with fresh variants calls awaitFreshVariants every time); the draw wait of
+// awaitPipeline shares it. resetDrawWaitMs() is for tests.
+std::atomic<int64_t> gDrawWaitMs{-1};
+uint32_t drawWaitMs() {
+  int64_t v = gDrawWaitMs.load(std::memory_order_relaxed);
+  if (v < 0) {
+    v = waitBudgetMs("VPVK_PIPELINE_DRAW_WAIT_MS", 2000);
+    gDrawWaitMs.store(v, std::memory_order_relaxed);
+  }
+  return uint32_t(v);
+}
+void resetDrawWaitMs() { gDrawWaitMs.store(-1, std::memory_order_relaxed); }
+
 // Per-boot counters (struct in commands.h), all threads: the "vk.boot_summary" line, pipelineSummary().
 PipelineCounters& pipelineCounters() {
   static PipelineCounters c;
@@ -370,8 +383,7 @@ unsigned noteCreateUnready(Device* dev, const std::vector<vpgpu::PipelineKey>& k
 }
 
 void awaitPipeline(Device* dev, vpgpu::PipelineKey k, const char* what) {
-  static const uint32_t budget = waitBudgetMs("VPVK_PIPELINE_DRAW_WAIT_MS", 2000);
-  awaitPipelines(dev, {k}, budget, what);
+  awaitPipelines(dev, {k}, drawWaitMs(), what);
 }
 
 // Asynchronous creation: waits (boosted to the front of the pool) for the translation of `p`. True when it is
@@ -1126,7 +1138,7 @@ void UploadArena::retireExcess(Device* d, size_t keep) { shrink(d, keep, true); 
 void UploadArena::shrink(Device* d, size_t keep, bool defer) {
   std::vector<Chunk> kept;
   for (Chunk& c : chunks) {
-    if (kept.size() < keep && c.size <= kMaxKeptChunk) {
+    if (kept.size() < keep && (c.size <= kMaxKeptChunk || (defer && c.lastUsed))) {
       kept.push_back(c);
     } else if (defer && d && c.id) {  // (no submit mutex on this path: the device destroys the buffer at its next submission)
       std::lock_guard<std::mutex> lock(d->retiredChunksMutex);
@@ -1137,6 +1149,13 @@ void UploadArena::shrink(Device* d, size_t keep, bool defer) {
   }
   chunks.swap(kept);
   current = 0;
+}
+
+bool tryDrainRetiredChunks(Device* d) {
+  std::unique_lock<std::mutex> lock(d->submitMutex, std::try_to_lock);
+  if (!lock.owns_lock()) return false;
+  drainRetiredChunks(d);
+  return true;
 }
 
 void drainRetiredChunks(Device* d) {
@@ -3286,20 +3305,12 @@ bool depthPipelineKey(Device* dev, const PipelineObj& p, int kind, int texSlot, 
 }
 void awaitFreshVariants(Device* dev) {
   if (!dev || dev->uiMask.freshVariants.empty()) return;
-  const uint32_t budget = waitBudgetMs("VPVK_PIPELINE_DRAW_WAIT_MS", 2000);  // (read here, not latched: tests change it)
   std::vector<vpgpu::PipelineKey> keys;
   keys.swap(dev->uiMask.freshVariants);
-  // The budget is each variant's own, as when every one was awaited where it was made (awaitPipeline): they compile in parallel on the
-  // core's workers and the waits overlap, but a frame with many new variants (forced MSAA after a scene change: one per pipeline)
-  // needs more than one budget in all, and the ones left over would reach the submit not compiled. The whole wait (the submit mutex
-  // is held) is capped at kMaxBudgets budgets: compiles that hang cannot stall the submit for variants x budget.
-  constexpr uint32_t kMaxBudgets = 8;
-  const auto end = std::chrono::steady_clock::now() + std::chrono::milliseconds(uint64_t(budget) * kMaxBudgets);
-  for (vpgpu::PipelineKey k : keys) {
-    const auto left = std::chrono::duration_cast<std::chrono::milliseconds>(end - std::chrono::steady_clock::now()).count();
-    if (left <= 0) break;
-    awaitPipelines(dev, {k}, std::min<uint32_t>(budget, uint32_t(left)), "uimask_variant");
-  }
+  // One budget for the whole call, however many variants: they compile in parallel on the core's workers and the wait has one absolute
+  // deadline (the submit mutex is held meanwhile, and vpvk_native_submit / vpvk_mark_eye_image / vkGetMTLTextureMVK wait behind it). A
+  // frame with more new variants than the workers finish in one budget sends the rest still compiling: the draw gate covers them.
+  awaitPipelines(dev, keys, drawWaitMs(), "uimask_variant");
 }
 
 // VK_EXT_index_type_uint8: Metal has no 8-bit indices, so the indices a draw reads are widened to 16 bits first. The command

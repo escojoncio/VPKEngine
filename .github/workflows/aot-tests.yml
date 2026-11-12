@@ -26,7 +26,7 @@ jobs:
           submodules: recursive
       - name: Workflow checks (modes of scripts run directly, concurrency groups, injection)
         run: |
-          python3 -I -c 'import yaml' 2>/dev/null || sudo apt-get install -y --no-install-recommends python3-yaml
+          python3 -I -c 'import yaml' 2>/dev/null || { sudo apt-get update && sudo apt-get install -y --no-install-recommends python3-yaml; }
           python3 -I tests/ci/check_workflows.py
           python3 -I tests/ci/test_check_workflows.py
       - name: Tools

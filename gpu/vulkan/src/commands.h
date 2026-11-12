@@ -235,13 +235,14 @@ struct UploadArena {
     uint8_t* host = nullptr;
     vpgpu::BufferId id;
     VkDeviceSize size = 0, used = 0;
+    bool lastUsed = false;  // held something in the recording that reset() ended
   };
   std::vector<Chunk> chunks;
   size_t current = 0;
   // Copies `size` bytes, 256-aligned (constant buffers need 16). Returns the chunk's buffer.
   vpgpu::BufferId put(Device* d, const void* data, VkDeviceSize size, VkDeviceSize& offset);
   void reset() {
-    for (auto& c : chunks) c.used = 0;
+    for (auto& c : chunks) c.lastUsed = c.used != 0, c.used = 0;
     current = 0;
   }
   size_t touched() const {  // chunks holding something (the recording that is being reset)
@@ -253,12 +254,16 @@ struct UploadArena {
   void trim(Device* d);  // after reset(): keeps the first (normal-sized) chunk, gives the others back; takes the submit mutex
   // After reset(): keeps `keep` normal-sized chunks, hands the others to the device to free at its next submission (no submit mutex here).
   void retireExcess(Device* d, size_t keep);
-  static constexpr VkDeviceSize kMaxKeptChunk = 1 << 20;  // a chunk made for one huge copy is not kept: the next one is a normal 64 KiB
+  // A chunk made for one huge copy is not kept by trim (the next one is a normal 64 KiB), nor by the hysteresis of releaseResources unless
+  // the last recording used it (a game that uploads that much every frame would otherwise allocate it again under the submit mutex).
+  static constexpr VkDeviceSize kMaxKeptChunk = 1 << 20;
  private:
   void shrink(Device* d, size_t keep, bool defer);
 };
 // Frees the chunks Recorder::releaseResources retired. Called with d->submitMutex held.
 void drainRetiredChunks(Device* d);
+// The same without waiting: false when the submit mutex is busy (the next submission frees them anyway).
+bool tryDrainRetiredChunks(Device* d);
 
 // Draw state at the time of a vkCmd*.
 struct BoundState {

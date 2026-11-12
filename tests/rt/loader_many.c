@@ -95,6 +95,9 @@ static int run(const char* what, unsigned nslots, unsigned nsyms, int expect_ok)
         bad = 1;
     }
     if (!bad) printf("ok   %s (%u slots, %u symbols, %.1f ms)\n", what, nslots, nsyms, ms);
+    /* The module stays registered (static): nothing it points to may be freed under it. */
+    vp_detach_module(m);
+    m->imports = NULL; m->import_count = 0;
     free(im); free(names);
     return bad;
 }

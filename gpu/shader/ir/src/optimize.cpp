@@ -264,6 +264,8 @@ private:
 
 }  // namespace
 
+// (Recurses over the nesting like the other passes and checks the stack the same way: protected by the StackGuard of the caller, optimize()'s
+// or fbfetch's, which is set by emitMsl and the frontends; without one only the nesting bounds of the producers apply.)
 void removeDeadValues(Function& f) {
     // Use counts once, then one walk from the end of each block: every user of a value comes after its definition (in the
     // block or in a nested block of a later node), so when an instruction is reached the dead users of its result are

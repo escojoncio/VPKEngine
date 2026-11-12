@@ -80,8 +80,9 @@ struct UniformBlock {
     uint32_t element = 0;  // descriptor array element (block arrays: one GL block per element)
     std::vector<Variable> members;  // offsets within the block
     uint32_t stages = 0;
-    // Shader storage blocks: every member is `readonly` (the block qualifier reaches its members, and the compiler rejects a write to a
-    // readonly member) in every stage that uses the block: no shader can write the bound buffer. Uniform blocks: true.
+    // Shader storage blocks: no stage that uses the block has an l-value (assignment, ++/--, out / inout argument, atomic) on one of its
+    // members, so no shader can write the bound buffer (a `readonly` block qualifier is the same thing, and a write to a readonly member is
+    // an error). Uniform blocks: true.
     bool readOnly = true;
 };
 

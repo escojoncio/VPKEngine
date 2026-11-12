@@ -14,6 +14,17 @@
 
 typedef struct { uint32_t type, flags; uint64_t offset, vaddr, paddr, filesz, memsz, align; } Ph;
 
+/* The registry keeps the pointers it is given: modules live in a static array (the limit is checked). */
+static VpModule* new_module(const char* name) {
+    static VpModule mods[64];
+    static int nmods;
+    if (nmods >= (int)(sizeof mods / sizeof mods[0])) { printf("FAIL: more test modules than the array holds\n"); exit(2); }
+    VpModule* m = &mods[nmods++];
+    m->name = name; m->link_base = UINT64_C(0x500000000); m->size = 0x1000;
+    vp_register_module(m);
+    return m;
+}
+
 /* A SELF with one data segment: program header `p`, its `p.filesz` bytes in the SELF. */
 static int write_self(const char* path, Ph p) {
     uint8_t f[512];
@@ -41,11 +52,7 @@ static int check(const char* dir, const char* name, Ph p, int accepted) {
     char path[512];
     snprintf(path, sizeof path, "%s/%s.self", dir, name);
     if (write_self(path, p)) { printf("FAIL %s: cannot write\n", name); return 1; }
-    static VpModule mods[32];  /* the registry keeps the pointers */
-    static int nmods;
-    VpModule* mp = &mods[nmods++];
-    mp->name = name; mp->link_base = UINT64_C(0x500000000); mp->size = 0x1000;
-    vp_register_module(mp);
+    VpModule* mp = new_module(name);
     VpLoadedImage out;
     vp_load_module(path, mp, 0, NULL, NULL, &out);
     const int refused = strcmp(out.error, "bad SELF") == 0;
@@ -87,11 +94,7 @@ static int check_many(const char* dir, const char* name, unsigned n, uint64_t al
     char path[512];
     snprintf(path, sizeof path, "%s/%s.self", dir, name);
     if (write_many(path, n, align, far, backed, step)) { printf("FAIL %s: cannot write\n", name); return 1; }
-    static VpModule mods[32];  /* the registry keeps the pointers */
-    static int nmods;
-    VpModule* mp = &mods[nmods++];
-    mp->name = name; mp->link_base = UINT64_C(0x500000000); mp->size = 0x1000;
-    vp_register_module(mp);
+    VpModule* mp = new_module(name);
     VpLoadedImage out;
     vp_load_module(path, mp, 0, NULL, NULL, &out);
     if ((strcmp(out.error, "bad SELF") != 0) != accepted) { printf("FAIL %s: %s (%s)\n", name, accepted ? "refused" : "accepted", out.error); return 1; }
@@ -146,11 +149,9 @@ int main(int argc, char** argv) {
         if (!o || fwrite(f, 1, sizeof f, o) != sizeof f) { printf("FAIL phnum_zero: cannot write\n"); bad++; }
         else {
             fclose(o);
-            static VpModule pm;
-            pm.name = "phnum_zero"; pm.link_base = UINT64_C(0x500000000); pm.size = 0x1000;
-            vp_register_module(&pm);
+            VpModule* pm = new_module("phnum_zero");
             VpLoadedImage out;
-            vp_load_module(path, &pm, 0, NULL, NULL, &out);
+            vp_load_module(path, pm, 0, NULL, NULL, &out);
             if (strcmp(out.error, "bad SELF") != 0) { printf("FAIL phnum_zero: %s\n", out.error); bad++; } else printf("ok   phnum_zero\n");
         }
     }

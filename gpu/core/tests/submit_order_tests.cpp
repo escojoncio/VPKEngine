@@ -52,6 +52,38 @@ void testWouldPark() {
   CHECK(!other);  // shut down: nothing parks
 }
 
+// release(owner) wakes only the threads that parked for that owner; release() wakes all.
+void testOwnerRelease() {
+  QuietGate g;
+  g.set(true);
+  int a = 0, b = 0;
+  std::atomic<int> doneA{0}, doneB{0}, doneN{0}, parked{0};
+  auto park = [&](const void* owner, std::atomic<int>& done) {
+    return std::thread([&, owner] { ++parked; g.waitForeground(owner); ++done; });
+  };
+  std::thread ta = park(&a, doneA), tb = park(&b, doneB), tn = park(nullptr, doneN);
+  while (parked < 3 || g.blockedTotal() < 3) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  g.release(&a);
+  ta.join();
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  CHECK(doneA == 1 && doneB == 0 && doneN == 0);  // the others stay parked
+  g.release(&a);  // nobody left for a: changes nothing
+  std::this_thread::sleep_for(std::chrono::milliseconds(20));
+  CHECK(doneB == 0 && doneN == 0);
+  g.release();  // every owner
+  tb.join();
+  tn.join();
+  CHECK(doneB == 1 && doneN == 1);
+  // a thread that parks after a release(owner) parks again (only a later release wakes it)
+  std::atomic<int> doneC{0};
+  std::thread tc = park(&a, doneC);
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  CHECK(doneC == 0);
+  g.set(false);
+  tc.join();
+  CHECK(doneC == 1);
+}
+
 void testDeferredCommits() {
   QuietGate g;
   DeferredCommits<int> d;
@@ -639,6 +671,7 @@ void testOnceMap() {
 int main(int argc, char** argv) {
   const std::vector<std::pair<const char*, std::function<void()>>> groups = {
       {"wouldpark", testWouldPark},
+      {"ownerrelease", testOwnerRelease},
       {"deferred", testDeferredCommits},
       {"resumeflush", testResumeFlush},
       {"flushrules", testFlushRules},

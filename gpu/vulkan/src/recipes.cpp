@@ -282,12 +282,15 @@ uint32_t refreshTranslatorMode() {
   }
   const uint32_t m = (fetch & 1) | (flag("VPVK_AMPLIFY") ? 2u : 0u) | ((fetch & 2) << 1) | (kill && *kill == '0' ? 8u : 0u) |
                      (invOff ? 16u : 0u) | (flag("VPVK_AMPLIFY_CLIP") ? 32u : 0u);
-  if (gTranslatorMode.exchange(m) != m) {
+  const uint32_t prevMode = gTranslatorMode.exchange(m);
+  if (prevMode != m) {
     logf("vk.translator mode=%u native_fetch=%u amplify=%u unpack_fetch=%u kill_exit=%u amplify_clip=%u id=%u", m, m & 1,
          (m >> 1) & 1, (m >> 2) & 1, (~m >> 3) & 1, (m >> 5) & 1, kTranslatorVersion | m << 16);
     // math=fast is metal_backend.mm's MTLMathModeFast. Whether a library really compiled with preserveInvariance
     // (and how many fell back without it) is in the gpu.shader.lib lines: invariant= / invariant_retries=.
     logf("gpu.shaderfx invariant_pos=%u math=fast", (~m >> 4) & 1);
+    // The stores of live devices follow the new mode (what they record from here on is labelled with it), not only the next forDir.
+    if (prevMode != ~0u) RecipeStore::retargetLive(kTranslatorVersion | m << 16);  // (the first read has no store to follow)
   }
   return m;
 }
@@ -415,12 +418,29 @@ RecipeStore::RecipeStore(std::string dir, uint32_t translatorVersion, uint64_t t
        translator_, (unsigned long long)size_);
 }
 
+namespace {
+struct OpenStores {
+  std::mutex mutex;
+  std::map<std::string, std::weak_ptr<RecipeStore>> open;
+};
+OpenStores& openStores() {
+  static auto* os = new OpenStores;  // leaked on purpose: devices may be destroyed from threads that outlive static destructors
+  return *os;
+}
+}  // namespace
+
+void RecipeStore::retargetLive(uint32_t id) {
+  OpenStores& os = openStores();
+  std::lock_guard<std::mutex> lock(os.mutex);
+  for (auto& [dir, weak] : os.open)
+    if (std::shared_ptr<RecipeStore> live = weak.lock()) live->setTranslator(id);
+}
+
 std::shared_ptr<RecipeStore> RecipeStore::forDir(const std::string& dir) {
   if (dir.empty()) return std::make_shared<RecipeStore>(dir);
-  static auto* mutex = new std::mutex;  // leaked on purpose: devices may be destroyed from threads that outlive static destructors
-  static auto* open = new std::map<std::string, std::weak_ptr<RecipeStore>>;
-  std::lock_guard<std::mutex> lock(*mutex);
-  std::weak_ptr<RecipeStore>& slot = (*open)[dir];
+  OpenStores& os = openStores();
+  std::lock_guard<std::mutex> lock(os.mutex);
+  std::weak_ptr<RecipeStore>& slot = os.open[dir];
   if (std::shared_ptr<RecipeStore> live = slot.lock()) {
     live->setTranslator(translatorId());  // the host may have changed VPVK_AMPLIFY / VPVK_FETCH_NATIVE for this device (the mode is process-wide)
     return live;

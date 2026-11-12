@@ -408,7 +408,8 @@ enum VPGamePack {
         let modified = (attributes[.modificationDate] as? Date)?.timeIntervalSince1970 ?? 0
         var digest = [UInt8](repeating: 0, count: 32)
         let identityText = "\(source.path)|\(size)|\(modified)|\(leaf.base64EncodedString())"
-        identityText.withCString { vp_sha256($0, strlen($0), &digest) }
+        let identityBytes = Array(identityText.utf8)
+        vp_sha256(identityBytes, identityBytes.count, &digest)
         let tag = digest.prefix(12).map { String(format: "%02x", $0) }.joined()
         if let reason = failed[tag] { throw Problem.loading(reason) } // every variant was refused in this run already
         let folder = VPKLegacy.folder(in: FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0])
@@ -502,7 +503,8 @@ enum VPGamePack {
         let modified = (attributes[.modificationDate] as? Date)?.timeIntervalSince1970 ?? 0
         var digest = [UInt8](repeating: 0, count: 32)
         let identityText = "\(source.path)|\(size)|\(modified)|\(leaf.base64EncodedString())"
-        identityText.withCString { vp_sha256($0, strlen($0), &digest) }
+        let identityBytes = Array(identityText.utf8)
+        vp_sha256(identityBytes, identityBytes.count, &digest)
         let tag = digest.prefix(12).map { String(format: "%02x", $0) }.joined()
         let folder = VPKLegacy.folder(in: FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0])
             .appendingPathComponent("OnDemand", isDirectory: true)
@@ -513,12 +515,18 @@ enum VPGamePack {
         let library = source.deletingPathExtension().lastPathComponent
         var pairDigest = [UInt8](repeating: 0, count: 32)
         let pairText = game + "\u{0}" + library
-        pairText.withCString { vp_sha256($0, strlen($0), &pairDigest) }
+        let pairBytes = Array(pairText.utf8) // (all of it: withCString + strlen stopped at the NUL, so the library was never hashed)
+        vp_sha256(pairBytes, pairBytes.count, &pairDigest)
         let stem = library + "-" + pairDigest.prefix(8).map { String(format: "%02x", $0) }.joined()
         // What goes: this pair's copies made for an earlier version of the library (another tag), and
         // the copies (and their ".partial") of the two older namings, which nothing opens now:
         // "<library>-<tag>-<variant>.dylib" and "<game>-<library>-<tag>-<variant>.dylib". Only those
         // exact shapes (24 hex, a variant name, ".dylib"[".partial"]) are matched.
+        // (The copies of the previous hash too: it was sha256(game) only, strlen cut "game NUL library" at the NUL.)
+        var legacyDigest = [UInt8](repeating: 0, count: 32)
+        let legacyBytes = Array(game.utf8)
+        vp_sha256(legacyBytes, legacyBytes.count, &legacyDigest)
+        let legacyStem = library + "-" + legacyDigest.prefix(8).map { String(format: "%02x", $0) }.joined()
         let variantNames = ["req4k", "req16k", "plain4k", "plain16k"]
         func tagged(_ rest: Substring) -> Bool {
             guard rest.count > 25, rest.prefix(24).allSatisfy({ $0.isHexDigit }),
@@ -536,6 +544,7 @@ enum VPGamePack {
                 orphan = tagged(rest) && !rest.hasPrefix(tag + "-")
             }
             if !orphan, file.hasPrefix(library + "-") { orphan = tagged(file.dropFirst(library.count + 1)) }
+            if !orphan, file.hasPrefix(legacyStem + "-") { orphan = tagged(file.dropFirst(legacyStem.count + 1)) }
             let oldStem = game + "-" + library + "-"
             if !orphan, file.hasPrefix(oldStem) { orphan = tagged(file.dropFirst(oldStem.count)) }
             if orphan { try? FileManager.default.removeItem(at: old) }

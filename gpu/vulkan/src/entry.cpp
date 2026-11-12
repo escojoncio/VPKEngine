@@ -3847,7 +3847,7 @@ VPVK_EXPORT int vpvk_image_zero_clear(void* mtl) {
   std::unique_lock<std::mutex> lock;
   vpvk::Device* d = liveDeviceSubmitLocked(lock, true);
   if (!d) return 0;
-  if (!lock.owns_lock()) return -1;
+  if (!lock.owns_lock() && !tInNativeSubmit) return -1;  // (inside a vpvk_native_submit callback this thread holds the submit mutex)
   uint64_t key;
   {
     std::lock_guard<std::mutex> l(d->zeroNativeMutex);
@@ -3932,11 +3932,16 @@ VPVK_EXPORT int vpvk_native_submit(vpvk_native_encode_fn fn, void* user) {
   std::unique_lock<std::mutex> lock;
   Device* d = liveDeviceSubmitLocked(lock);
   if (!d || !d->platform) return 0;
-  tInNativeSubmit = true;
-  tNativeDevice = d;
-  const bool ok = d->platform->encodeNative(fn, user);
-  tNativeDevice = nullptr;
-  tInNativeSubmit = false;
+  bool ok;
+  {
+    // Restored whichever way the callback leaves (an exception through the platform's encode, a longjmp-free unwind): a flag left set
+    // would make every later host call on this thread believe it still holds the submit mutex.
+    struct NativeScope {
+      NativeScope(Device* dev) { tInNativeSubmit = true, tNativeDevice = dev; }
+      ~NativeScope() { tNativeDevice = nullptr, tInNativeSubmit = false; }
+    } scope(d);
+    ok = d->platform->encodeNative(fn, user);
+  }
   // The first success and the first few failures (a failure would repeat every frame).
   static std::atomic<unsigned> okLogged{0}, failLogged{0};
   if ((ok ? okLogged : failLogged).fetch_add(1) < (ok ? 1u : 8u))
@@ -4200,6 +4205,7 @@ VPVK_EXPORT size_t vpvk_trim_memory(int level, char* out, size_t cap) {
     (void)live.try_lock();  // busy: counts as a failed attempt
   }
   if (d && lock.owns_lock()) {
+    drainRetiredChunks(d);  // (arena chunks command buffer resets gave up: freed here as at the next submission)
     d->platform->trimSerialized(report);  // moves to the graveyard; the drain below returns what no frame reads
     std::string drained;
     freed += d->platform->drainRetired(0, drained);
@@ -4227,6 +4233,7 @@ VPVK_EXPORT size_t vpvk_idle_drain(unsigned min_idle_ms, char* out, size_t cap) 
   if (!d || !d->platform) return 0;
   std::unique_lock<std::mutex> lock(d->submitMutex, std::try_to_lock);
   if (!lock.owns_lock()) return 0;
+  drainRetiredChunks(d);  // (arena chunks command buffer resets gave up)
   std::string report;
   const size_t freed = d->platform->drainRetired(min_idle_ms, report);
   lock.unlock();
