@@ -232,6 +232,9 @@ struct Renderer::Impl {
     bool programMemoOn = !optedOut("VPKENGINE_PROGRAM_MEMO_OFF");
     bool bindMemo = !optedOut("VPKENGINE_BIND_MEMO_OFF");
     bool drawCache = !optedOut("VPKENGINE_DRAW_CACHE_OFF");
+    // VPKENGINE_DRAW_SERIAL_CHECK=1: the fixed key of a draw whose DrawState::stateSerial says it is the last one's is made anyway and
+    // compared (the probe on does the same); a wrong serial is counted (RATES dc_serial_wrong) and the key made is the one used.
+    bool serialCheck = optedOut("VPKENGINE_DRAW_SERIAL_CHECK");
     // Ranges a map of ranges (cpuRead, busy) was found to hold whole, by where the range asked for starts (direct mapped). The maps
     // only grow (ranges merge, none is taken out but by a clear, which clears this too), so each is inside a range of the map as it
     // is now, and finding a range inside one says what the map would say, without walking it.
@@ -6132,6 +6135,9 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         uint64_t invalid[dc::Witness::Parts] = {}, slowPath[kSlowPaths] = {};
         uint64_t texTarget = 0, texMemory = 0;  // texture bindings an image backs or the GPU wrote (resolved in every draw) / of plain memory
         uint64_t servedFixed = 0, servedStage = 0, servedTexture = 0;  // prologues, translations and textures taken from the cache
+        // Draws looked at whose fixed key the host's serial gave (not made) / that had to make it (no serial, or another) / whose
+        // serial, checked, was wrong (the key made was not the last draw's).
+        uint64_t serialHit = 0, serialMiss = 0, serialWrong = 0;
     } dcStat;
     // What a prologue (drawFixed) resolved and left, as dcServe takes it again.
     struct DcKept {
@@ -6158,6 +6164,9 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
     dc::StageKey dcTransKey;                    // (its key)
     dc::FixedKey dcPrevKey;                     // the key of the last draw looked at, and its hash
     uint64_t dcPrevHash = 0;
+    uint64_t dcPrevSerial = 0;                  // its DrawState::stateSerial, and what else its key follows (0: none)
+    uint8_t dcPrevSamples = 0;
+    bool dcPrevFoveation = false;
     std::vector<const char*> noteTapeKept;      // the notes of its prologue (fixedNote)
     // The draw being looked at: its keys, what was found for them and what the draw resolved, until it is recorded.
     struct DcDraw {
@@ -6186,7 +6195,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
     // indices to prepare, clears (its own or waiting), depth copy, a colour target kept attached for it (a depth-only draw
     // whose depth has a partner), nor a host that looks at the draw or seeds its targets.
     // The others are counted by what keeps them out. A draw recorded again without its partner was counted the first time.
-    bool dcBegin(const DrawState& d) {
+    bool dcBegin(const DrawState& d, bool observe) {
         if (noPartnerOnce) return false;
         const bool other = d.primitive == PrimitiveType::Patch || needsConversion(d.primitive) ||
                            (d.indexAddress && indicesNeedPrep(d) && !indicesKnownClean(d)) || d.depth.depthClear || d.depth.stencilClear ||
@@ -6198,18 +6207,26 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
             return false;
         }
         DcDraw& o = dcDraw;
-        dc::fixedKey(d, r.maxSamples_, o.key, r.foveation_);
-        if (o.key == dcPrevKey) {  // (a run of draws with one state: the hash is the last one's)
-            o.hash = dcPrevHash;
-        } else {
-            o.hash = dcPrevHash = o.key.hash();
-            std::memcpy(dcPrevKey.bytes.data(), o.key.bytes.data(), o.key.size);
-            dcPrevKey.size = o.key.size;
+        // The host's serial is the last looked-at draw's: so is the key (o.key, o.hash stand), unless the renderer's own settings moved.
+        const bool serial = d.stateSerial && d.stateSerial == dcPrevSerial && r.maxSamples_ == dcPrevSamples && r.foveation_ == dcPrevFoveation;
+        bool wrong = false;
+        if (!serial || serialCheck || observe) {
+            dc::fixedKey(d, r.maxSamples_, o.key, r.foveation_);
+            if (o.key == dcPrevKey) {  // (a run of draws with one state: the hash is the last one's)
+                o.hash = dcPrevHash;
+            } else {
+                wrong = serial;
+                o.hash = dcPrevHash = o.key.hash();
+                std::memcpy(dcPrevKey.bytes.data(), o.key.bytes.data(), o.key.size);
+                dcPrevKey.size = o.key.size;
+            }
         }
+        ++(serial ? dcStat.serialHit : dcStat.serialMiss), dcStat.serialWrong += wrong;
+        dcPrevSerial = d.stateSerial, dcPrevSamples = r.maxSamples_, dcPrevFoveation = r.foveation_;
         o.block = dcFixed.find(o.key, o.hash);
         o.found = o.block != nullptr;
         o.stale = o.block ? o.block->seal.stale(dcNow()) : 0;
-        o.differs = 0;
+        o.differs = wrong;
         o.served = false;
         o.keep.ok = false;
         o.stage[0].on = o.stage[1].on = false;
@@ -6437,6 +6454,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         C("dc_fixed_hit", dcStat.fixedHit), C("dc_fixed_miss", dcStat.fixedMiss), C("dc_stage_hit", dcStat.stageHit), C("dc_stage_miss", dcStat.stageMiss);
         C("dc_would_differ", dcStat.wouldDiffer), C("dc_tex_target", dcStat.texTarget), C("dc_tex_memory", dcStat.texMemory);
         C("dc_served_fixed", dcStat.servedFixed), C("dc_served_stage", dcStat.servedStage), C("dc_served_texture", dcStat.servedTexture);
+        C("dc_serial_hit", dcStat.serialHit), C("dc_serial_miss", dcStat.serialMiss), C("dc_serial_wrong", dcStat.serialWrong);
         for (unsigned p = 0; p < dc::Witness::Parts; ++p) C(std::string("dc_invalid_") + dc::kWitnessParts[p], dcStat.invalid[p]);
         static const char* const slow[DcStats::kSlowPaths] = {"gs", "rectlist", "indirect", "otro"};
         for (unsigned k = 0; k < DcStats::kSlowPaths; ++k) C(std::string("dc_slow_path_") + slow[k], dcStat.slowPath[k]);
@@ -6452,7 +6470,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         if (cap.armed) cap.drawSampled.clear();  // (what a dispatch sampled is not this draw's)
         if (d.count == 0 || d.instances == 0) return skip("empty draw");
         const bool observe = vpgpu::probe::enabled();
-        const bool watch = (drawCache || observe) && dcBegin(d);
+        const bool watch = (drawCache || observe) && dcBegin(d, observe);
         if (isDepthCopy(d)) return handled("depth copy"), depthCopy(d);
         if (d.raster.cullFront && d.raster.cullBack) return skip("both faces culled");
         DrawWork w;

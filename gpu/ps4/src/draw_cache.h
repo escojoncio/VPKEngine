@@ -135,7 +135,7 @@ struct Put {
         [[maybe_unused]] const auto& [color, blend, blendColor, depth, depthStencil, viewport, scissor, scissorRegs, raster, rop3, degamma,
                                       alphaToMask, alphaToMaskOffsets, earlyZ, depthBeforeShader, psKill, psExportsZ, psExportsStencil,
                                       psExportsMask, primitive, indexAddress, index32, indexSwap, count, instances, firstVertex,
-                                      indirectAddress, indirectCountAddress, drawIndex, vs, ps, es, gs, geom] = d;
+                                      indirectAddress, indirectCountAddress, drawIndex, vs, ps, es, gs, geom, stateSerial] = d;
         all(color, blend, blendColor, depth, depthStencil, viewport, scissor, scissorRegs, raster, rop3, degamma, alphaToMask,
             alphaToMaskOffsets, earlyZ, depthBeforeShader, psKill, psExportsZ, psExportsStencil, psExportsMask, primitive, vs, ps, es, gs,
             geom);

@@ -40,6 +40,7 @@
 #include "vpps4/renderer.h"
 
 #include "capture_backend.h"
+#include "../src/draw_cache.h"
 
 #ifndef VPPS4_LIFT_DIR
 #error "VPPS4_LIFT_DIR must point at gpu/shader/gcn/tests/lift"
@@ -50,6 +51,7 @@
 
 namespace {
 
+namespace dc = vpps4::dc;
 int failures = 0;
 #define CHECK(c)                                                              \
     do {                                                                      \
@@ -1380,6 +1382,109 @@ void drawCacheFrames() {
     pr::registry().reset();
 }
 
+// ---- The host's serial of its register writes ------------------------------------------------------------------------------
+// DrawState::stateSerial: the same, and not 0, as the draw looked at before says its fixed key is that draw's, and the renderer
+// does not make it again. Played like the host: a serial that moves when the fixed state of a draw is not the last one's (a clear
+// draw the host adds is given 0). A host that forgets a write (a serial that never moves) is found, by the key made anyway when the
+// probe is on or VPKENGINE_DRAW_SERIAL_CHECK=1, and counted (RATES dc_serial_wrong, dc_would_differ), which then draws as usual.
+struct SerialCounts {
+    uint64_t hit = 0, miss = 0, wrong = 0, differ = 0, draws = 0;
+};
+enum class Serial { None, Right, Stuck };
+void stampSerials(Script& s, Serial model) {
+    dc::FixedKey prev, k;
+    uint64_t serial = 0;
+    bool have = false;
+    for (Step& st : s) {
+        if (st.kind != Step::Draw) continue;
+        if (st.draw.primitive == vpps4::PrimitiveType::RectList || st.draw.depth.depthClear) continue;  // (the host's own clear draws: 0)
+        dc::fixedKey(st.draw, 1, k);
+        if (!have || !(k == prev)) ++serial, prev = k, have = true;
+        st.draw.stateSerial = model == Serial::Right ? serial : model == Serial::Stuck ? 1 : 0;
+    }
+}
+void drawSerial() {
+    namespace pr = vpgpu::probe;
+    constexpr unsigned kFrames = 4, kEye0 = 24, kEye1 = 12;
+    SerialCounts counts;
+    const auto script = [&counts](Serial model) {
+        return [&counts, model](Scene& sc) {
+            Script s;
+            const auto draw = [&s](const vpps4::DrawState& d) {
+                Step st;
+                st.draw = d;
+                s.push_back(std::move(st));
+            };
+            vpps4::DrawState eye[2];
+            for (unsigned e = 0; e < 2; ++e) {
+                eye[e] = Scene::passState(Scene::kEyeColor + Scene::kTargetStride * e, Scene::kEyeDepth + Scene::kTargetStride * e, Scene::kEyeW,
+                                          Scene::kEyeH);
+                eye[e].depthStencil.depthTest = true;
+                eye[e].depthStencil.depthFunc = 3;
+            }
+            for (unsigned k = 0; k < (kEye0 + kEye1) * 0x1c0 / 4; ++k) sc.g.words(kArena)[k] = sc.rnd();
+            const auto object = [&](unsigned e, unsigned i) {
+                return sc.materialDraw(eye[e], 1 + i % 4, i % Scene::kMeshes, 4 + e, kArena + 0x1c0ull * (e * kEye0 + i), true);
+            };
+            for (unsigned f = 0; f < kFrames; ++f) {
+                for (unsigned i = 0; i < kEye0; ++i) draw(object(0, i));
+                for (unsigned i = 0; i < kEye1; ++i) draw(object(1, i));
+                s.push_back(submitStep());
+            }
+            // Blend changed for a stretch, then as it was; a clear of the host's between two draws of one state.
+            vpps4::DrawState blended = object(0, 0);
+            blended.blend[0].enable = true;
+            draw(object(0, 0)), draw(blended), draw(blended), draw(object(0, 1));
+            draw(Scene::depthClear(Scene::passState(0, Scene::kEyeDepth, Scene::kEyeW, Scene::kEyeH)));
+            draw(object(0, 1)), draw(object(0, 2)), draw(object(0, 3));
+            s.push_back(submitStep());
+            stampSerials(s, model);
+            s.push_back(call([&counts](vpps4::Renderer& r) {
+                pr::setEnabled(true);  // (only to publish: the draws were made with the probe as the run had it)
+                r.publishProbe(1);
+                const auto c = [](const char* name) { return pr::counter("RATES", name).get(); };
+                counts = {c("dc_serial_hit"), c("dc_serial_miss"), c("dc_serial_wrong"), c("dc_would_differ"), c("dc_fixed_hit") + c("dc_fixed_miss")};
+                pr::setEnabled(false);
+            }));
+            return s;
+        };
+    };
+    const auto play = [&](Serial model, bool check, bool probe) {
+        pr::setEnabled(probe);
+        if (check) setenv("VPKENGINE_DRAW_SERIAL_CHECK", "1", 1);
+        Outcome o = run(script(model), false);
+        unsetenv("VPKENGINE_DRAW_SERIAL_CHECK");
+        pr::setEnabled(false);
+        if (std::getenv("VPPS4_SHOW_COUNTS"))
+            std::printf("serial model %d check %d probe %d: hit %llu miss %llu wrong %llu differ %llu draws %llu\n", int(model), int(check), int(probe),
+                        (unsigned long long)counts.hit, (unsigned long long)counts.miss, (unsigned long long)counts.wrong,
+                        (unsigned long long)counts.differ, (unsigned long long)counts.draws);
+        return o;
+    };
+    const Outcome off = run(script(Serial::None), true);
+    // The serial as the host keeps it, with the key not made again: the same commands as with the cache off, and most draws take it.
+    const Outcome right = play(Serial::Right, false, false);
+    CHECK(same(right, off, "draw serial"));
+    const SerialCounts hits = counts;
+    const uint64_t watched = hits.hit + hits.miss;
+    CHECK(hits.draws == watched && watched >= kFrames * (kEye0 + kEye1));
+    CHECK(hits.hit + 2 * kFrames + 6 >= watched);  // (a new key at each pass of each frame, and a few at the end)
+    CHECK(hits.wrong == 0 && hits.differ == 0);
+    // No serial (0): the key is made in every draw, none is taken from the serial.
+    CHECK(same(play(Serial::None, false, false), off, "draw serial none"));
+    CHECK(counts.hit == 0 && counts.miss == counts.draws && counts.draws == watched);
+    // The same with the key made anyway (the check on, or the probe): the serial is never wrong, and the commands the same.
+    for (const bool probe : {false, true}) {
+        CHECK(same(play(Serial::Right, !probe, probe), off, "draw serial checked"));
+        CHECK(counts.hit == hits.hit && counts.wrong == 0 && counts.differ == 0);
+    }
+    // A host that forgets writes: found by the check and by the probe, drawn as usual (the key it made is the one used).
+    for (const bool probe : {false, true}) {
+        CHECK(same(play(Serial::Stuck, !probe, probe), off, "draw serial stuck"));
+        CHECK(counts.wrong > 0 && counts.differ >= counts.wrong);
+    }
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -1397,6 +1502,7 @@ int main(int argc, char** argv) {
     else if (t == "equal_caches") equalCaches();
     else if (t == "equal_frames") equalFrames();
     else if (t == "draw_cache_frames") drawCacheFrames();
+    else if (t == "draw_serial") drawSerial();
     else return std::fprintf(stderr, "unknown test %s\n", t.c_str()), 2;
     return failures ? 1 : 0;
 }

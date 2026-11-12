@@ -67,7 +67,7 @@ if(BUILD_TESTING OR NOT DEFINED BUILD_TESTING)
     if(NOT MSVC)
       target_compile_options(vpps4_perdraw_tests PRIVATE -Wall -Wextra -Werror)
     endif()
-    foreach(t equal_picture equal_buffers equal_textures equal_reuse equal_programs equal_targets equal_caches equal_frames draw_cache_frames)
+    foreach(t equal_picture equal_buffers equal_textures equal_reuse equal_programs equal_targets equal_caches equal_frames draw_cache_frames draw_serial)
       add_test(NAME vpps4.perdraw_${t} COMMAND vpps4_perdraw_tests ${t})
     endforeach()
     # The replay of a call capture (vpps4/callcap.h: a host's calls over a few pictures, in a file): vp4replay FILE compares the

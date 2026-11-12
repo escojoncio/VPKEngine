@@ -2,7 +2,7 @@
 // its own, on a backend that writes down everything it is given (tests/capture_backend.h), and compares the paths of the
 // renderer over it: the same calls with each per-draw shortcut switched off must leave the same bytes.
 //
-// Usage: vp4replay FILE [--time R] [--off NAME[=VALUE]]... [--in-flight N] [--dump] [--digest] [--rates]
+// Usage: vp4replay FILE [--time R] [--off NAME[=VALUE]]... [--in-flight N] [--dump] [--digest] [--rates] [--stamp-serial]
 //   (default)      replays FILE with every shortcut on and with each switch of the list off (R passes each, default 5), and
 //                  prints: draws, us/draw of every path per picture (the least of the passes), whether the paths left the
 //                  same bytes, and where the first difference is. Exit 1 if they differ, 2 if FILE cannot be replayed.
@@ -11,6 +11,9 @@
 //   --dump         what FILE holds, record by record counts and per picture; nothing is replayed
 //   --digest       one replay with every shortcut on: a hash of the bytes it left
 //   --rates        one replay with the probe on: the RATES family of the renderer (hit rates of its caches)
+//   --stamp-serial gives the draws the DrawState::stateSerial a host would that counted exactly the changes of the fixed key (a
+//                  capture holds none, or the host's own): the most hits the serial can give. With VPKENGINE_DRAW_SERIAL_CHECK=1
+//                  RATES dc_serial_wrong must stay 0.
 //
 // The guest memory of the capture is mapped at its own addresses (the capturing host's regions, pages of zeros where the
 // capture holds nothing): the addresses must be free in this process.
@@ -18,6 +21,7 @@
 #include <array>
 #include <bit>
 #include <chrono>
+#include <cstddef>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -37,6 +41,7 @@
 #include "vpps4/formats.h"
 #include "vpps4/renderer.h"
 
+#include "../src/draw_cache.h"
 #include "../tests/capture_backend.h"
 
 namespace vp4replay {
@@ -57,6 +62,7 @@ struct Options {
     uint64_t inFlight = ~uint64_t(0);     // Capture::inFlight (past every frame: the Done records alone say when a frame finished)
     const uint8_t* guestHost = nullptr;  // Capture::guestHost (the guest buffers are named by their distance from it)
     bool rates = false;                  // the probe on, and the RATES lines of its summary kept
+    bool stampSerial = false;            // the draws get a stateSerial that follows their fixed key
 };
 
 struct Picture {
@@ -109,6 +115,9 @@ private:
     std::map<uint64_t, uint64_t> mapped_;  // [begin, end), not merged
 };
 
+// (a capture made before DrawState::stateSerial, its last field, holds the struct up to it: that serial is 0, "not known")
+static_assert(offsetof(vpps4::DrawState, stateSerial) + sizeof(uint64_t) == sizeof(vpps4::DrawState));
+
 inline Run replay(const std::string& path, const Options& options) {
     using Clock = std::chrono::steady_clock;
     namespace cc = vpps4::callcap;
@@ -121,7 +130,8 @@ inline Run replay(const std::string& path, const Options& options) {
     while (!haveConfig && reader.next(rec))
         if (rec.type == Type::Config && rec.payload.size() == sizeof cfg) std::memcpy(&cfg, rec.payload.data(), sizeof cfg), haveConfig = true;
     if (!haveConfig) return out.error = "no Config record", out;
-    if (cfg.version != cc::Config{}.version || cfg.drawStateBytes != sizeof(vpps4::DrawState) || cfg.dispatchStateBytes != sizeof(vpps4::DispatchState) ||
+    const size_t drawBytes = cfg.drawStateBytes == sizeof(vpps4::DrawState) - sizeof(uint64_t) ? cfg.drawStateBytes : sizeof(vpps4::DrawState);
+    if (cfg.version != cc::Config{}.version || cfg.drawStateBytes != drawBytes || cfg.dispatchStateBytes != sizeof(vpps4::DispatchState) ||
         cfg.colorTargetBytes != sizeof(vpps4::ColorTarget) || cfg.imageDescBytes != sizeof(vpps4::ImageDesc))
         return out.error = "captured by a build with another layout of the call structs (or another version of the file)", out;
 
@@ -131,6 +141,8 @@ inline Run replay(const std::string& path, const Options& options) {
         bool mirrored;
     };
     std::vector<Region> regions;
+    vpps4::dc::FixedKey stampKey, stampPrev;  // (--stamp-serial)
+    uint64_t stampSerial = 0;
     std::set<std::tuple<uint64_t, uint64_t, uint64_t>> misses;  // (address, size, generation) the host had no region for
     uint64_t generation = 0;
     bool mirroredLast = true;
@@ -272,14 +284,19 @@ inline Run replay(const std::string& path, const Options& options) {
                         case Call::Draw: {
                             cc::StageRef refs[4];
                             vpps4::DrawState d;
-                            if (n != sizeof d + sizeof refs) {
+                            if (n != drawBytes + sizeof refs) {
                                 bad("Draw");
                                 break;
                             }
-                            std::memcpy(static_cast<void*>(&d), p, sizeof d), std::memcpy(refs, p + sizeof d, sizeof refs);
+                            std::memcpy(static_cast<void*>(&d), p, drawBytes), std::memcpy(refs, p + drawBytes, sizeof refs);
                             if (!stage(d.vs, refs[0]) || !stage(d.ps, refs[1]) || !stage(d.es, refs[2]) || !stage(d.gs, refs[3])) {
                                 out.error = "a program of draw " + std::to_string(out.draws) + " cannot be mapped at its address";
                                 break;
+                            }
+                            if (options.stampSerial && d.primitive != vpps4::PrimitiveType::RectList && !d.depth.depthClear) {
+                                vpps4::dc::fixedKey(d, cfg.maxSamples, stampKey, cfg.foveation != 0);
+                                if (!stampSerial || !(stampKey == stampPrev)) ++stampSerial, stampPrev = stampKey;
+                                d.stateSerial = stampSerial;
                             }
                             const auto t0 = Clock::now();
                             renderer.draw(d);
@@ -530,6 +547,7 @@ int main(int argc, char** argv) {
         if (arg == "--dump") dump = true;
         else if (arg == "--digest") digest = true;
         else if (arg == "--rates") options.rates = true;
+        else if (arg == "--stamp-serial") options.stampSerial = true;
         else if (arg == "--time" && i + 1 < argc) passes = unsigned(std::max(1, std::atoi(argv[++i])));
         else if (arg == "--in-flight" && i + 1 < argc) options.inFlight = std::strtoull(argv[++i], nullptr, 0);
         else if (arg == "--off" && i + 1 < argc) {
@@ -540,7 +558,7 @@ int main(int argc, char** argv) {
         else file.clear(), i = argc;
     }
     if (file.empty()) {
-        std::fprintf(stderr, "usage: vp4replay FILE [--time R] [--off NAME[=VALUE]]... [--in-flight N] [--dump] [--digest] [--rates]\n");
+        std::fprintf(stderr, "usage: vp4replay FILE [--time R] [--off NAME[=VALUE]]... [--in-flight N] [--dump] [--digest] [--rates] [--stamp-serial]\n");
         return 2;
     }
     if (dump) return vp4replay::dump(file, stdout) ? 0 : 2;

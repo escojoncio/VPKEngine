@@ -233,6 +233,11 @@ struct DrawState {
     Stage vs, ps;
     Stage es, gs;                  // geometry pipeline (geom.enabled): vs is then the copy shader
     GeometryState geom;
+    // The host's count of the writes that can change the draw cache's fixed key (every field above but the programs, their user
+    // data and the geometry: draw_cache.h). Not 0 and the same as the last draw looked at: the fixed key is that draw's, and it
+    // is not made again. It must move on any such write, when in doubt too; 0 = not known (a key is made, as always).
+    // VPKENGINE_DRAW_SERIAL_CHECK=1, or the probe on, makes the key anyway and counts a serial that was wrong (RATES dc_serial_wrong).
+    uint64_t stateSerial = 0;
 };
 
 struct DispatchState {

@@ -253,6 +253,7 @@ void fixedKey() {
     SAME(d.indirectAddress += 0x100);
     SAME(d.indirectCountAddress += 0x100);
     SAME(d.drawIndex += 1);
+    SAME(d.stateSerial += 1);  // (the host's count of the writes: it is not part of what it counts)
 #undef DIFFERS
 #undef SAME
     // The host's sample limit is.
