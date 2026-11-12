@@ -486,8 +486,11 @@ enum VPGamePack {
     /// A library translated on demand while the game runs (vpconvert's vp_convert_fragment, in the
     /// game's VPS4/VPKEngine/<game>/ondemand): signed like the pack (the variant the system accepted
     /// first) into the app's own folder and loaded; its module registers itself and the engine
-    /// attaches it. Quick (a small library).
-    static func loadFragment(_ source: URL) throws {
+    /// attaches it. Quick (a small library). The folder is the app's, shared by all games, and two
+    /// games have libraries of the same name (eboot_ondemand_<offset>): `game` (the game's folder
+    /// name) is part of the signed copy's name, so that one game's copies are never taken for
+    /// another's old ones.
+    static func loadFragment(_ source: URL, game: String) throws {
         fragmentLock.lock()
         defer { fragmentLock.unlock() }
         if fragmentsLoaded.contains(source.path) { return }
@@ -504,17 +507,38 @@ enum VPGamePack {
         let folder = VPKLegacy.folder(in: FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0])
             .appendingPathComponent("OnDemand", isDirectory: true)
         try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
-        // This library's copies made for an earlier version of it (another size, date or certificate)
-        // stay otherwise for good: "<name>-<24 hex of the tag>-<variant>.dylib" with another tag goes.
-        let stem = source.deletingPathExtension().lastPathComponent
+        // Name of a copy: "<library>-<16 hex of sha256(game NUL library)>-<24 hex tag>-<variant>.dylib".
+        // The hash makes the (game, library) pair unambiguous even when both contain hyphens
+        // ("a-b" + "c" and "a" + "b-c" gave the same name before).
+        let library = source.deletingPathExtension().lastPathComponent
+        var pairDigest = [UInt8](repeating: 0, count: 32)
+        let pairText = game + "\u{0}" + library
+        pairText.withCString { vp_sha256($0, strlen($0), &pairDigest) }
+        let stem = library + "-" + pairDigest.prefix(8).map { String(format: "%02x", $0) }.joined()
+        // What goes: this pair's copies made for an earlier version of the library (another tag), and
+        // the copies (and their ".partial") of the two older namings, which nothing opens now:
+        // "<library>-<tag>-<variant>.dylib" and "<game>-<library>-<tag>-<variant>.dylib". Only those
+        // exact shapes (24 hex, a variant name, ".dylib"[".partial"]) are matched.
+        let variantNames = ["req4k", "req16k", "plain4k", "plain16k"]
+        func tagged(_ rest: Substring) -> Bool {
+            guard rest.count > 25, rest.prefix(24).allSatisfy({ $0.isHexDigit }),
+                  rest[rest.index(rest.startIndex, offsetBy: 24)] == "-" else { return false }
+            var tail = String(rest.dropFirst(25))
+            if tail.hasSuffix(".partial") { tail = String(tail.dropLast(8)) }
+            guard tail.hasSuffix(".dylib") else { return false }
+            return variantNames.contains(String(tail.dropLast(6)))
+        }
         for old in (try? FileManager.default.contentsOfDirectory(at: folder, includingPropertiesForKeys: nil)) ?? [] {
             let file = old.lastPathComponent
-            guard file.hasPrefix(stem + "-") else { continue }
-            let rest = file.dropFirst(stem.count + 1)
-            let isTag = rest.count > 25 && rest.prefix(24).allSatisfy { $0.isHexDigit } && rest[rest.index(rest.startIndex, offsetBy: 24)] == "-"
-            if isTag && !rest.hasPrefix(tag + "-") {
-                try? FileManager.default.removeItem(at: old)
+            var orphan = false
+            if file.hasPrefix(stem + "-") {
+                let rest = file.dropFirst(stem.count + 1)
+                orphan = tagged(rest) && !rest.hasPrefix(tag + "-")
             }
+            if !orphan, file.hasPrefix(library + "-") { orphan = tagged(file.dropFirst(library.count + 1)) }
+            let oldStem = game + "-" + library + "-"
+            if !orphan, file.hasPrefix(oldStem) { orphan = tagged(file.dropFirst(oldStem.count)) }
+            if orphan { try? FileManager.default.removeItem(at: old) }
         }
         var lastReason = "?"
         for variant in SignatureVariant.ordered() {
@@ -550,14 +574,14 @@ enum VPGamePack {
 
     /// Every library translated on demand before for this game (a folder of them), loaded now so
     /// that the game does not stop to translate them again. Ones that fail are logged and skipped.
-    static func loadFragments(in folder: URL) -> Int {
+    static func loadFragments(in folder: URL, game: String) -> Int {
         let files = ((try? FileManager.default.contentsOfDirectory(at: folder, includingPropertiesForKeys: nil)) ?? [])
             .filter { $0.pathExtension == "dylib" }
             .sorted { $0.lastPathComponent < $1.lastPathComponent }
         var loaded = 0
         for file in files {
             do {
-                try loadFragment(file)
+                try loadFragment(file, game: game)
                 loaded += 1
             } catch {
                 log("VPKEngine: \(file.lastPathComponent) not loaded: \(error.localizedDescription)")

@@ -1120,10 +1120,35 @@ void UploadArena::release(Device* d) {
   current = 0;
 }
 
-void UploadArena::trim(Device* d) {
-  for (size_t i = 1; i < chunks.size(); ++i) freeChunk(d, chunks[i]);
-  if (chunks.size() > 1) chunks.resize(1);
+void UploadArena::trim(Device* d) { shrink(d, 1, false); }
+void UploadArena::retireExcess(Device* d, size_t keep) { shrink(d, keep, true); }
+
+void UploadArena::shrink(Device* d, size_t keep, bool defer) {
+  std::vector<Chunk> kept;
+  for (Chunk& c : chunks) {
+    if (kept.size() < keep && c.size <= kMaxKeptChunk) {
+      kept.push_back(c);
+    } else if (defer && d && c.id) {  // (no submit mutex on this path: the device destroys the buffer at its next submission)
+      std::lock_guard<std::mutex> lock(d->retiredChunksMutex);
+      d->retiredChunks.emplace_back(c.id, c.host);
+    } else {
+      freeChunk(d, c);
+    }
+  }
+  chunks.swap(kept);
   current = 0;
+}
+
+void drainRetiredChunks(Device* d) {
+  std::vector<std::pair<vpgpu::BufferId, uint8_t*>> list;
+  {
+    std::lock_guard<std::mutex> lock(d->retiredChunksMutex);
+    list.swap(d->retiredChunks);
+  }
+  for (auto& [id, host] : list) {
+    d->gpu->destroy(id);  // (submit mutex held by the caller, as in freeChunk)
+    std::free(host);
+  }
 }
 
 Recorder::~Recorder() { arena.release(device); }
@@ -1849,6 +1874,7 @@ StageOut translateStage(Device* d, const PipelineObj::StageSrc& src, const Pipel
     opt.layout.push_back(b);
   }
   opt.pushConstantSlot = pl.pushSlot;
+  const uint32_t modeAtStart = translatorId();
   applyTranslatorMode(opt);  // process-wide modes: not part of the recipe input (the store's translator id carries them)
   opt.robustBuffers = robustBuffersEffective();  // part of the input: another value is another MSL under another key
   if (opt.stage == vpir::Stage::Vertex) {
@@ -1964,7 +1990,8 @@ StageOut translateStage(Device* d, const PipelineObj::StageSrc& src, const Pipel
   }
   ShaderBlob blob = blobOf(o.msl);
   if (recordable)  // translator input, so a later translator can redo it
-    d->recipes->addStage(in, o.input, *src.words, o.id, blob, &stored);
+    if (translatorId() == modeAtStart)  // (a host that changed the mode meanwhile: this MSL is of neither id, it is not recorded)
+      d->recipes->addStage(in, o.input, *src.words, o.id, blob, &stored);
   {
     std::lock_guard<std::mutex> lock(d->shaderMutex);
     d->platform->addShader(o.id, std::move(blob));
@@ -2970,7 +2997,8 @@ bool resolveBindings(Recorder& r, const PipelineObj& p, const std::array<BoundSt
         case VK_DESCRIPTOR_TYPE_INLINE_UNIFORM_BLOCK: {
           // The block's bytes are copied into the command buffer's upload memory now: later
           // vkUpdateDescriptorSets calls do not reach a draw already recorded.
-          const std::vector<uint8_t>& bytes = set->inlineData[bi];
+          static const std::vector<uint8_t> none;
+          const std::vector<uint8_t>& bytes = bi < set->inlineData.size() ? set->inlineData[bi] : none;  // (a set layout with no inline block there)
           std::vector<uint8_t> padded(bytes);
           padded.resize(std::max<size_t>(16, (bytes.size() + 15) & ~size_t(15)), 0);
           VkDeviceSize off;
@@ -3258,10 +3286,20 @@ bool depthPipelineKey(Device* dev, const PipelineObj& p, int kind, int texSlot, 
 }
 void awaitFreshVariants(Device* dev) {
   if (!dev || dev->uiMask.freshVariants.empty()) return;
-  static const uint32_t budget = waitBudgetMs("VPVK_PIPELINE_DRAW_WAIT_MS", 2000);
+  const uint32_t budget = waitBudgetMs("VPVK_PIPELINE_DRAW_WAIT_MS", 2000);  // (read here, not latched: tests change it)
   std::vector<vpgpu::PipelineKey> keys;
   keys.swap(dev->uiMask.freshVariants);
-  awaitPipelines(dev, keys, budget, "uimask_variant");
+  // The budget is each variant's own, as when every one was awaited where it was made (awaitPipeline): they compile in parallel on the
+  // core's workers and the waits overlap, but a frame with many new variants (forced MSAA after a scene change: one per pipeline)
+  // needs more than one budget in all, and the ones left over would reach the submit not compiled. The whole wait (the submit mutex
+  // is held) is capped at kMaxBudgets budgets: compiles that hang cannot stall the submit for variants x budget.
+  constexpr uint32_t kMaxBudgets = 8;
+  const auto end = std::chrono::steady_clock::now() + std::chrono::milliseconds(uint64_t(budget) * kMaxBudgets);
+  for (vpgpu::PipelineKey k : keys) {
+    const auto left = std::chrono::duration_cast<std::chrono::milliseconds>(end - std::chrono::steady_clock::now()).count();
+    if (left <= 0) break;
+    awaitPipelines(dev, {k}, std::min<uint32_t>(budget, uint32_t(left)), "uimask_variant");
+  }
 }
 
 // VK_EXT_index_type_uint8: Metal has no 8-bit indices, so the indices a draw reads are widened to 16 bits first. The command
@@ -4446,6 +4484,7 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdUpdateBuffer(VkCommandBuffer cb, VkB
   Recorder& r = rec(cb);
   OpUpload u;
   u.src = r.arena.put(r.device, data, size, u.srcOffset);
+  if (!data) std::memset(r.arena.chunks[r.arena.current].host + u.srcOffset, 0, size);  // (invalid use; the room is not the chunk's old contents)
   u.dst = from<Buffer>(dst), u.dstOffset = off, u.size = size;
   r.ops.emplace_back(u);
 }

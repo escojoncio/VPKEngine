@@ -50,8 +50,9 @@ def main():
         try:
             for line in open("/proc/cpuinfo"):
                 if line.startswith("flags"):
-                    cpu_flags = set(line.split(":", 1)[1].split())
-                    break
+                    cpu_flags |= set(line.split(":", 1)[1].split())
+                elif line.startswith("vendor_id") and "GenuineIntel" in line:
+                    cpu_flags.add("intel")  # (not a CPU flag: for cases about vendor-specific undefined behaviour)
         except OSError:
             pass
     failed = []

@@ -2,6 +2,7 @@
 // Usage: vpgpu_submit_order_tests [group]  (no group = all).
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdio>
 #include <cstring>
 #include <functional>
@@ -67,7 +68,7 @@ void testDeferredCommits() {
     d.push(3);
     b = d.take(g);
   }).join();
-  CHECK(a.empty() && b.empty() && d.size() == 2);
+  CHECK(a.empty() && b.empty() && d.size() == 2 && d.pending() == 2);
   // Main thread in the background may commit (the gate lets it through): it gets the others' items first, oldest first.
   d.push(4);
   CHECK((d.take(g) == std::vector<int>{2, 3, 4}));
@@ -78,7 +79,7 @@ void testDeferredCommits() {
   g.set(false);
   std::vector<int> c;
   std::thread([&] { c = d.take(g); }).join();
-  CHECK((c == std::vector<int>{5, 6}));
+  CHECK((c == std::vector<int>{5, 6}) && d.pending() == 0);
   // takeAll ignores the gate.
   g.set(true);
   d.push(7);
@@ -87,7 +88,145 @@ void testDeferredCommits() {
     d.push(8);
     e = d.takeAll();
   }).join();
-  CHECK((e == std::vector<int>{7, 8}) && d.size() == 0);
+  CHECK((e == std::vector<int>{7, 8}) && d.size() == 0 && d.pending() == 0);
+}
+
+// The Metal backend's commit machinery (CommitQueue) as the backend drives it. `alive` stands for the backend object: checks on
+// it in the threads that call into the model are the "use after free" of a destroyed backend.
+struct Model {
+  QuietGate g;
+  CommitQueue<int> q{g};
+  std::atomic<bool> alive{true};
+  std::vector<int> committed;  // written with q.lock held
+  std::function<void(int)> rec = [this](int v) { committed.push_back(v); };
+  // Impl::submit / encodeInterop: counted before the gate can park the thread.
+  void submit(int v) {
+    CommitQueue<int>::Inside in(q);
+    g.waitForeground();
+    std::lock_guard l(q.lock);
+    CHECK(alive);
+    q.push(v, rec);
+    CHECK(alive);
+  }
+  bool flush() { return q.flush(rec); }
+  // ~MetalBackend.
+  void destroy() {
+    q.closing = true;
+    g.release();
+    {
+      std::lock_guard l(q.lock);
+      q.commitReady(rec);
+    }
+    q.waitNoneInside([&] {
+      g.release();
+      flush();
+    });
+    alive = false;
+  }
+};
+
+// A commit handed over in the background must go out when the app is foreground again even if no later commit comes. The
+// backend's resume hook runs on the main thread and must not block, not even while another thread holds the order lock: it only
+// queues the flush to a worker (a serial queue in the backend), which retries until the lock is free. Here: the hook returns at
+// once with the order lock held elsewhere, and the item is committed once the lock is free.
+void testResumeFlush() {
+  Model m;
+  std::mutex qm;
+  std::condition_variable qcv;
+  int queued = 0;
+  bool stop = false;
+  std::thread worker([&] {  // the serial flush queue
+    std::unique_lock ql(qm);
+    for (;;) {
+      qcv.wait(ql, [&] { return queued || stop; });
+      if (!queued) return;
+      --queued;
+      ql.unlock();
+      while (!m.flush()) std::this_thread::yield();  // the lock is busy: try again
+      ql.lock();
+    }
+  });
+  int hookRuns = 0;
+  const uint64_t id = m.g.addResumeHook([&] {
+    ++hookRuns;
+    if (!m.q.deferred.pending()) return;
+    std::lock_guard ql(qm);
+    ++queued;
+    qcv.notify_one();
+  });
+  m.g.set(true);
+  CHECK(hookRuns == 0);  // not on the way to the background
+  std::unique_lock held(m.q.lock);  // another thread is encoding: it holds the order lock
+  std::thread([&] {
+    m.q.deferred.push(1);  // (the thread that handed its commit over, then the lock moved on)
+    CHECK(m.q.deferred.take(m.g).empty());  // would park: handed over
+  }).join();
+  CHECK(m.q.deferred.pending() == 1);
+  m.g.set(false);  // returns although the lock is held: the hook did not wait for it
+  CHECK(hookRuns == 1);
+  held.unlock();
+  while (m.q.deferred.pending()) std::this_thread::yield();
+  m.g.removeResumeHook(id);
+  {
+    std::lock_guard ql(qm);
+    stop = true;
+  }
+  qcv.notify_all();
+  worker.join();  // the worker is done with the lock after this
+  CHECK((m.committed == std::vector<int>{1}));
+  m.g.set(true);
+  m.g.set(false);
+  CHECK(hookRuns == 1);  // removed
+}
+
+// flush(): a thread that would park skips even the lock; one that may commit never waits for it; the owner of the lock gets
+// "busy" instead of undefined behaviour.
+void testFlushRules() {
+  Model m;
+  m.g.set(true);  // this thread is main
+  std::thread([&] {
+    std::lock_guard l(m.q.lock);
+    m.q.push(1, m.rec);  // would park: held back
+  }).join();
+  CHECK(m.q.deferred.pending() == 1 && m.committed.empty());
+  {
+    std::lock_guard l(m.q.lock);
+    bool r = false;
+    std::thread([&] { r = m.flush(); }).join();
+    CHECK(r);  // would park: nothing to do, and the busy lock was not even tried
+    CHECK(m.committed.empty());
+  }
+  m.g.set(false);
+  {
+    std::lock_guard l(m.q.lock);
+    bool r = true;
+    std::thread([&] { r = m.flush(); }).join();
+    CHECK(!r);                 // may commit but the lock is busy
+    CHECK(!m.flush());         // the owner itself: busy, no deadlock
+    CHECK(m.committed.empty());
+  }
+  CHECK(m.flush());
+  CHECK((m.committed == std::vector<int>{1}) && m.q.deferred.pending() == 0);
+  CHECK(m.flush());  // nothing pending
+}
+
+// Teardown while threads are parked in the gate (or have just been let through): the destructor sets `closing`, releases the
+// gate and must not return before they left the call, and what they handed over is committed (with take(gate) it would stay
+// held back: the gate still says "background" for them). `alive` fails the check if a thread still runs in the model afterwards.
+void testClosingTeardown() {
+  for (int round = 0; round < 20; ++round) {
+    Model m;
+    m.g.set(true);  // this thread is main; the others park
+    const int n = 3;
+    std::vector<std::thread> ts;
+    for (int i = 0; i < n; ++i) ts.emplace_back([&m, i] { m.submit(i); });
+    while (m.g.blockedTotal() < uint64_t(n)) std::this_thread::yield();  // all parked (their Inside is counted)
+    CHECK(m.q.insideCount() == uint32_t(n));
+    m.destroy();
+    CHECK(m.q.insideCount() == 0);
+    CHECK(m.committed.size() == size_t(n) && m.q.deferred.pending() == 0);
+    for (auto& t : ts) t.join();
+  }
 }
 
 // The scenario of the audit (C6): a thread that cannot commit must not sit on the order lock. Model: an order lock, a "submit"
@@ -202,6 +341,77 @@ void testCompletionFrontier() {
     f.finished(0);
     CHECK(f.completed() == 2);
   }
+  {  // calls out of index order (the indices come from an atomic counter, the calls from different threads): the frontier follows
+     // the queue order of the command buffers for finished() and the indices for what is still unknown
+    CompletionFrontier f;
+    f.submitted(1, true);
+    CHECK(f.completed() == 0);  // frame 0 was not handed over yet
+    f.submitted(0, true);       // queue order is now 1, 0
+    CHECK(f.completed() == 0);
+    f.finished(1);
+    CHECK(f.completed() == 0);  // frame 0 is still in flight although a higher index finished
+    f.finished(0);
+    CHECK(f.completed() == 2);
+  }
+  {  // an empty frame that arrives before an earlier one is not complete: the earlier frame is not even known yet
+    CompletionFrontier f;
+    f.submitted(1, false);
+    CHECK(f.completed() == 0);
+    f.submitted(0, true);
+    CHECK(f.completed() == 0);
+    f.finished(0);
+    CHECK(f.completed() == 2);
+  }
+  {  // gaps closed in any order; a repeated index changes nothing
+    CompletionFrontier f;
+    f.submitted(3, false);
+    f.submitted(0, false);
+    CHECK(f.completed() == 1);
+    f.submitted(2, false);
+    CHECK(f.completed() == 1);
+    f.submitted(2, false);
+    CHECK(f.completed() == 1);
+    f.submitted(1, false);
+    CHECK(f.completed() == 4);
+  }
+  {  // against a model, random arrival order: completed() is the lowest frame not yet handed over or not yet finished
+    uint64_t seed = 88172645463325252ull;
+    auto rnd = [&] { seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17; return seed; };
+    for (int round = 0; round < 300; ++round) {
+      const uint64_t n = 1 + rnd() % 12;
+      std::vector<uint64_t> order(n);
+      for (uint64_t i = 0; i < n; ++i) order[i] = i;
+      for (uint64_t i = n; i > 1; --i) std::swap(order[i - 1], order[rnd() % i]);
+      std::vector<bool> work(n);
+      for (uint64_t i = 0; i < n; ++i) work[i] = rnd() & 1;
+      CompletionFrontier f;
+      std::vector<bool> handed(n, false), done(n, true);
+      std::deque<uint64_t> queue;  // work frames in queue order, not finished
+      uint64_t next = 0;
+      auto model = [&] {
+        uint64_t m = n;
+        for (uint64_t i = 0; i < n; ++i)
+          if (!handed[i] || !done[i]) { m = i; break; }
+        return m;
+      };
+      while (next < n || !queue.empty()) {
+        if (next < n && (queue.empty() || rnd() % 3)) {
+          const uint64_t i = order[next++];
+          handed[i] = true;
+          if (work[i]) { done[i] = false; queue.push_back(i); }
+          f.submitted(i, work[i]);
+        } else {
+          const size_t k = rnd() % queue.size();  // some command buffer finishes: it and every earlier one in the queue
+          for (size_t j = 0; j <= k; ++j) done[queue[j]] = true;
+          const uint64_t i = queue[k];
+          queue.erase(queue.begin(), queue.begin() + long(k) + 1);
+          f.finished(i);
+        }
+        CHECK(f.completed() == model());
+        if (f.completed() != model()) break;
+      }
+    }
+  }
   {  // concurrent: a reader never sees a frame done before its finish, writers on different threads
     CompletionFrontier f;
     std::atomic<uint64_t> finishedUpTo{0};  // frames [0, n) whose finished() call has been made
@@ -264,6 +474,22 @@ void testGaugeWait() {
   }
   g.leave();
   CHECK(g.active() == 0);
+  {  // an unbounded wait (the largest duration) must not overflow the clock arithmetic into "already over"
+    g.enter();
+    std::thread t([&] {
+      std::this_thread::sleep_for(milliseconds(100));
+      g.leave();
+    });
+    const auto s = steady_clock::now();
+    const bool idle = g.waitInactive(nanoseconds::max());
+    CHECK(idle);
+    CHECK(steady_clock::now() - s >= milliseconds(90));
+    t.join();
+    g.enter();
+    CHECK(!g.waitInactive(nanoseconds(-5)));  // a negative timeout is a poll
+    CHECK(!g.waitInactive(nanoseconds::min()));  // so is the most negative one (it must not overflow either)
+    g.leave();
+  }
 }
 
 // OnceMap: each key is built once even when the warm job and the submit thread ask together; other keys build in parallel; a
@@ -362,6 +588,9 @@ int main(int argc, char** argv) {
   const std::vector<std::pair<const char*, std::function<void()>>> groups = {
       {"wouldpark", testWouldPark},
       {"deferred", testDeferredCommits},
+      {"resumeflush", testResumeFlush},
+      {"flushrules", testFlushRules},
+      {"closing", testClosingTeardown},
       {"noparkunderlock", testNoParkUnderOrderLock},
       {"parkunderlock", testParkUnderLockIsADeadlock},
       {"frontier", testCompletionFrontier},

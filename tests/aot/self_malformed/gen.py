@@ -21,6 +21,8 @@ cases = {
  "huge_phnum": self_file(0, 64, 65535, ph(0, 0)),
  "phnum_zero_data": self_file(1, 64, 0, segs=[(0x800, 200, 8, 8)]),
  "huge_filesz": self_file(0, 64, 1, ph(0, 1 << 40)),
+ "big_filesz": self_file(0, 64, 1, ph(0, 1 << 30)),  # below the 2 GiB cap but far more than the file holds: refused before reserving it
+ "big_offset": self_file(0, 64, 1, ph((1 << 31) - 16, 16), tail=bytes(16)),  # a few bytes of data far into the image: refused before reserving 2 GiB
  "offset_overflow": self_file(0, 64, 1, ph(0xFFFFFFFFFFFFFFF0, 0x20)),
  "seg_off_overflow": self_file(1, 64, 1, ph(0, 16), segs=[(0x800, 0xFFFFFFFFFFFFFFF8, 16, 16)], tail=bytes(16)),
  "seg_index": self_file(1, 64, 1, ph(0, 16), segs=[(0x800 | (5 << 20), 0, 16, 16)], tail=bytes(16)),

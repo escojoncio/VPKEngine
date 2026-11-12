@@ -192,7 +192,7 @@ __attribute__((weak)) int vp_dispatch_miss_possible(uint64_t target) {
     return vp_hooks.dispatch_miss_possible ? vp_hooks.dispatch_miss_possible(target) : 0;
 }
 
-#define VP_MAX_NATIVES 16384
+#define VP_MAX_NATIVES 262144 /* 4 MB of zero pages: only the used part is ever touched */
 static struct { uint64_t guest; VpNative fn; } vp_natives[VP_MAX_NATIVES];
 static size_t vp_native_count;
 /* Natives are registered while other threads dispatch (a runtime that loads a module while the
@@ -205,7 +205,7 @@ static unsigned vp_native_seq;
 #define NAT_FN(i) __atomic_load_n(&vp_natives[i].fn, __ATOMIC_RELAXED)
 #define NAT_SET(i, g, f) (__atomic_store_n(&vp_natives[i].guest, (g), __ATOMIC_RELAXED), __atomic_store_n(&vp_natives[i].fn, (f), __ATOMIC_RELAXED))
 
-void vp_register_native(uint64_t guest, VpNative fn) {
+int vp_register_native(uint64_t guest, VpNative fn) {
     pthread_mutex_lock(&vp_natives_lock);
     size_t lo = 0, hi = vp_native_count;
     while (lo < hi) {
@@ -218,7 +218,7 @@ void vp_register_native(uint64_t guest, VpNative fn) {
     } else if (vp_native_count >= VP_MAX_NATIVES) {
         pthread_mutex_unlock(&vp_natives_lock);
         fprintf(stderr, "vp: the table of %d natives is full: %#llx is not registered\n", VP_MAX_NATIVES, (unsigned long long)guest);
-        return;
+        return -1;
     } else {
         __atomic_store_n(&vp_native_seq, vp_native_seq + 1, __ATOMIC_RELAXED);
         __atomic_thread_fence(__ATOMIC_RELEASE);
@@ -229,6 +229,7 @@ void vp_register_native(uint64_t guest, VpNative fn) {
     }
     pthread_mutex_unlock(&vp_natives_lock);
     vp_dispatch_changed(); /* cached embedder targets must not shadow a new native */
+    return 0;
 }
 
 static VpNative vp_find_native(uint64_t guest) {

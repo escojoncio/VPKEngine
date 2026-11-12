@@ -53,7 +53,11 @@ std::vector<uint8_t> unwrap_self(const std::vector<uint8_t>& self) {
     const size_t header_end = size_t(phoff) + size_t(phnum) * 56;
     size_t end = header_end;
     for (const auto& p : ph) {
-        if (p.filesz > (uint64_t(1) << 31) || p.offset > (uint64_t(1) << 31)) throw std::runtime_error("bad SELF program header");
+        // The image is reserved up to the end of its last segment, so that end must be in proportion to the file: a segment's data is
+        // in the SELF (filesz <= its size) and the ELF is no bigger than its SELF but for padding (offset + filesz <= twice the
+        // file plus 1 MiB). Each term is capped first, so the sum cannot overflow.
+        const uint64_t cap = uint64_t(self.size()) * 2 + (uint64_t(1) << 20);
+        if (p.filesz > self.size() || p.offset > cap || p.offset + p.filesz > cap) throw std::runtime_error("bad SELF program header");
         end = std::max<size_t>(end, p.offset + p.filesz);
     }
     std::vector<uint8_t> elf(end);

@@ -176,9 +176,14 @@ class RecipeStore {
   // (its offsets, its lock) instead of each keeping a private view of a file that all of them grow. Held weakly: the file is
   // closed when the last device lets go. An empty dir gives a disabled store of its own.
   static std::shared_ptr<RecipeStore> forDir(const std::string& dir);
+  // The id the stages recorded and looked up from here on carry (translatorId() when a device is created: the mode is the host's to change
+  // between devices, and a store shared by them follows it).
+  void setTranslator(uint32_t id);
 
   // Tests: called by a rewrite (refresh / compaction) with the store unlocked, after it copied the index and before it writes the new file.
   std::function<void()> rewriteGate;
+  // Tests: called by refresh() with the store unlocked, after the jobs were made and before the workers read the file for them.
+  std::function<void()> translateGate;
 
   bool enabled() const { return file_ != nullptr; }
   // One translated stage: the input (hash = input.hash()), its module words (stored once per
@@ -289,6 +294,7 @@ class RecipeStore {
   uint64_t code_ = kTranslatorCode;
   mutable std::mutex mutex_;
   std::condition_variable rewriteDone_;
+  uint64_t rewriteGen_ = 0;  // completed rewrites: the file offsets of an earlier generation (refresh's jobs) point into another file
   bool rewriting_ = false;  // a rewrite is writing the temporary file (mutex_ released)
   FILE* file_ = nullptr;
   std::unordered_map<uint64_t, ShaderBlob> shaders_;

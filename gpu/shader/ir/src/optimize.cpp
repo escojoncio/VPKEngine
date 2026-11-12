@@ -290,7 +290,9 @@ void removeDeadValues(Function& f) {
     walk(f.body, walk);
     if (!any) return;
     auto sweep = [&](Block& b, auto& self) -> void {
-        std::erase_if(b, [&](const Node& n) { return n.kind == NodeKind::Inst && n.inst.result != kNoValue && dead[n.inst.result]; });
+        std::erase_if(b, [&](const Node& n) {
+            return n.kind == NodeKind::Inst && n.inst.result != kNoValue && n.inst.result < dead.size() && dead[n.inst.result];
+        });
         for (Node& n : b) {
             self(n.body, self);
             self(n.elseBody, self);

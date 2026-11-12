@@ -425,6 +425,21 @@ void testLinkRules() {
                                        "#version 300 es\nprecision mediump float; in vec4 v; layout(location = 0) out vec4 o; layout(location = 1) out vec4 p; void main() { o = v; p = v; }");
         CHECK(r.ok);
     }
+    {  // GLSL ES 1.00 (ES 2.0 2.10.4) lets glBindAttribLocation alias attributes: the strict link does not refuse it
+        vpglsl::LinkOptions lo;
+        lo.attribBindings = {{"a", 0}, {"b", 0}};
+        auto v100 = vpglsl::parse(Stage::Vertex, "attribute vec4 a; attribute vec4 b; varying vec4 v; void main() { v = a + b; gl_Position = v; }");
+        auto f100 = vpglsl::parse(Stage::Fragment, "precision mediump float; varying vec4 v; void main() { gl_FragColor = v; }");
+        auto v300 = vpglsl::parse(Stage::Vertex, "#version 300 es\nin vec4 a; in vec4 b; out vec4 v; void main() { v = a + b; gl_Position = v; }");
+        auto f300 = vpglsl::parse(Stage::Fragment, fsOk);
+        CHECK(v100.shader && f100.shader && v300.shader && f300.shader);
+        if (v100.shader && f100.shader) {
+            auto l = vpglsl::link(v100.shader, f100.shader, lo);
+            if (!l.ok) std::fprintf(stderr, "  ES 1.00 aliased attributes: %s\n", l.log.c_str());
+            CHECK(l.ok);
+        }
+        if (v300.shader && f300.shader) CHECK(!vpglsl::link(v300.shader, f300.shader, lo).ok);  // (ES 3.00 still refuses)
+    }
     vpglsl::setStrictMode(0);
     {  // lenient (the default): the same shaders link, the rule is only noted
         LinkResultOrError r = linkPair(vsAlias, fsOk);
@@ -596,6 +611,25 @@ void testPointCoord() {
     const std::string text = vpir::print(s.fs);
     CHECK(text.find("point_coord") != std::string::npos);
     CHECK(s.fsMsl.find("[[point_coord]]") != std::string::npos);
+    // Metal's [[point_coord]] has t = 0 at the top of the point, and the GLES layer keeps GL's row 0 (bottom) as memory row 0, so
+    // t_GL = 1 - t_Metal: gl_PointCoord is (s, 1 - t) of the rasterizer's coordinate. (The Vulkan path, gl_PointCoord of a SPIR-V
+    // module, is not touched: there row 0 is the top.)
+    CHECK(s.fsMsl.find("1.0f - in_point_coord.y") != std::string::npos);
+    CHECK(s.fsMsl.find("in_point_coord.x") != std::string::npos);
+    {  // And by running the fragment stage: the rasterizer's (0.25, 0.125) reads as (0.25, 0.875)
+        vpireval::Invocation inv;
+        vpireval::Value pc;
+        pc.type = vpir::kF32.withWidth(2);
+        const float raster[2] = {0.25f, 0.125f};
+        std::memcpy(pc.bits, raster, sizeof raster);
+        inv.builtins[vpir::Builtin::PointCoord] = pc;
+        std::string err;
+        CHECK(vpireval::run(s.fs, inv, err));
+        if (!err.empty()) std::fprintf(stderr, "  eval: %s\n", err.c_str());
+        float got[4] = {};
+        if (inv.outputs.count(0)) std::memcpy(got, inv.outputs[0].bits, sizeof got);
+        CHECK(got[0] == 0.25f && got[1] == 0.875f && got[2] == 0.0f && got[3] == 1.0f);
+    }
     // Unused: no input.
     Stages u = buildStages("#version 300 es\nin vec4 a; void main() { gl_Position = a; }",
                            "#version 300 es\nprecision mediump float; out vec4 o; void main() { o = vec4(1.0); }");

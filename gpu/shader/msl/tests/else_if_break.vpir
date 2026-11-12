@@ -1,0 +1,718 @@
+module fragment
+
+input a : vec4<f32> location(0)
+output color : vec4<f32> location(0)
+constant_buffer params : index(0)
+
+; The same ladder inside a loop, with a break in the sixth rung: that break would leave the do-block, so the first rungs stay nested and the do-block
+; starts at the first rung from which 64 are left without one.
+func main() {
+  %0 = load_input a : vec4<f32>
+  %1 = extract %0, 0 : f32
+  %2 = convert %1 : u32
+  loop {
+    %3 = const 0 : u32
+    %4 = add %2, %3 : u32
+    %5 = load params, %4 : f32
+    %6 = div %1, %5 : f32
+    %7 = const 0.0 : f32
+    %8 = lt %6, %7 : bool
+    if %8 {
+      store_output color, %0
+    } else {
+      %9 = const 16 : u32
+      %10 = add %2, %9 : u32
+      %11 = load params, %10 : f32
+      %12 = div %1, %11 : f32
+      %13 = const 1.0 : f32
+      %14 = lt %12, %13 : bool
+      if %14 {
+        store_output color, %0
+      } else {
+        %15 = const 32 : u32
+        %16 = add %2, %15 : u32
+        %17 = load params, %16 : f32
+        %18 = div %1, %17 : f32
+        %19 = const 2.0 : f32
+        %20 = lt %18, %19 : bool
+        if %20 {
+          store_output color, %0
+        } else {
+          %21 = const 48 : u32
+          %22 = add %2, %21 : u32
+          %23 = load params, %22 : f32
+          %24 = div %1, %23 : f32
+          %25 = const 3.0 : f32
+          %26 = lt %24, %25 : bool
+          if %26 {
+            store_output color, %0
+          } else {
+            %27 = const 64 : u32
+            %28 = add %2, %27 : u32
+            %29 = load params, %28 : f32
+            %30 = div %1, %29 : f32
+            %31 = const 4.0 : f32
+            %32 = lt %30, %31 : bool
+            if %32 {
+              store_output color, %0
+            } else {
+              %33 = const 80 : u32
+              %34 = add %2, %33 : u32
+              %35 = load params, %34 : f32
+              %36 = div %1, %35 : f32
+              %37 = const 5.0 : f32
+              %38 = lt %36, %37 : bool
+              if %38 {
+                store_output color, %0
+                break
+              } else {
+                %39 = const 96 : u32
+                %40 = add %2, %39 : u32
+                %41 = load params, %40 : f32
+                %42 = div %1, %41 : f32
+                %43 = const 6.0 : f32
+                %44 = lt %42, %43 : bool
+                if %44 {
+                  store_output color, %0
+                } else {
+                  %45 = const 112 : u32
+                  %46 = add %2, %45 : u32
+                  %47 = load params, %46 : f32
+                  %48 = div %1, %47 : f32
+                  %49 = const 7.0 : f32
+                  %50 = lt %48, %49 : bool
+                  if %50 {
+                    store_output color, %0
+                  } else {
+                    %51 = const 128 : u32
+                    %52 = add %2, %51 : u32
+                    %53 = load params, %52 : f32
+                    %54 = div %1, %53 : f32
+                    %55 = const 8.0 : f32
+                    %56 = lt %54, %55 : bool
+                    if %56 {
+                      store_output color, %0
+                    } else {
+                      %57 = const 144 : u32
+                      %58 = add %2, %57 : u32
+                      %59 = load params, %58 : f32
+                      %60 = div %1, %59 : f32
+                      %61 = const 9.0 : f32
+                      %62 = lt %60, %61 : bool
+                      if %62 {
+                        store_output color, %0
+                      } else {
+                        %63 = const 160 : u32
+                        %64 = add %2, %63 : u32
+                        %65 = load params, %64 : f32
+                        %66 = div %1, %65 : f32
+                        %67 = const 10.0 : f32
+                        %68 = lt %66, %67 : bool
+                        if %68 {
+                          store_output color, %0
+                        } else {
+                          %69 = const 176 : u32
+                          %70 = add %2, %69 : u32
+                          %71 = load params, %70 : f32
+                          %72 = div %1, %71 : f32
+                          %73 = const 11.0 : f32
+                          %74 = lt %72, %73 : bool
+                          if %74 {
+                            store_output color, %0
+                          } else {
+                            %75 = const 192 : u32
+                            %76 = add %2, %75 : u32
+                            %77 = load params, %76 : f32
+                            %78 = div %1, %77 : f32
+                            %79 = const 12.0 : f32
+                            %80 = lt %78, %79 : bool
+                            if %80 {
+                              store_output color, %0
+                            } else {
+                              %81 = const 208 : u32
+                              %82 = add %2, %81 : u32
+                              %83 = load params, %82 : f32
+                              %84 = div %1, %83 : f32
+                              %85 = const 13.0 : f32
+                              %86 = lt %84, %85 : bool
+                              if %86 {
+                                store_output color, %0
+                              } else {
+                                %87 = const 224 : u32
+                                %88 = add %2, %87 : u32
+                                %89 = load params, %88 : f32
+                                %90 = div %1, %89 : f32
+                                %91 = const 14.0 : f32
+                                %92 = lt %90, %91 : bool
+                                if %92 {
+                                  store_output color, %0
+                                } else {
+                                  %93 = const 240 : u32
+                                  %94 = add %2, %93 : u32
+                                  %95 = load params, %94 : f32
+                                  %96 = div %1, %95 : f32
+                                  %97 = const 15.0 : f32
+                                  %98 = lt %96, %97 : bool
+                                  if %98 {
+                                    store_output color, %0
+                                  } else {
+                                    %99 = const 256 : u32
+                                    %100 = add %2, %99 : u32
+                                    %101 = load params, %100 : f32
+                                    %102 = div %1, %101 : f32
+                                    %103 = const 16.0 : f32
+                                    %104 = lt %102, %103 : bool
+                                    if %104 {
+                                      store_output color, %0
+                                    } else {
+                                      %105 = const 272 : u32
+                                      %106 = add %2, %105 : u32
+                                      %107 = load params, %106 : f32
+                                      %108 = div %1, %107 : f32
+                                      %109 = const 17.0 : f32
+                                      %110 = lt %108, %109 : bool
+                                      if %110 {
+                                        store_output color, %0
+                                      } else {
+                                        %111 = const 288 : u32
+                                        %112 = add %2, %111 : u32
+                                        %113 = load params, %112 : f32
+                                        %114 = div %1, %113 : f32
+                                        %115 = const 18.0 : f32
+                                        %116 = lt %114, %115 : bool
+                                        if %116 {
+                                          store_output color, %0
+                                        } else {
+                                          %117 = const 304 : u32
+                                          %118 = add %2, %117 : u32
+                                          %119 = load params, %118 : f32
+                                          %120 = div %1, %119 : f32
+                                          %121 = const 19.0 : f32
+                                          %122 = lt %120, %121 : bool
+                                          if %122 {
+                                            store_output color, %0
+                                          } else {
+                                            %123 = const 320 : u32
+                                            %124 = add %2, %123 : u32
+                                            %125 = load params, %124 : f32
+                                            %126 = div %1, %125 : f32
+                                            %127 = const 20.0 : f32
+                                            %128 = lt %126, %127 : bool
+                                            if %128 {
+                                              store_output color, %0
+                                            } else {
+                                              %129 = const 336 : u32
+                                              %130 = add %2, %129 : u32
+                                              %131 = load params, %130 : f32
+                                              %132 = div %1, %131 : f32
+                                              %133 = const 21.0 : f32
+                                              %134 = lt %132, %133 : bool
+                                              if %134 {
+                                                store_output color, %0
+                                              } else {
+                                                %135 = const 352 : u32
+                                                %136 = add %2, %135 : u32
+                                                %137 = load params, %136 : f32
+                                                %138 = div %1, %137 : f32
+                                                %139 = const 22.0 : f32
+                                                %140 = lt %138, %139 : bool
+                                                if %140 {
+                                                  store_output color, %0
+                                                } else {
+                                                  %141 = const 368 : u32
+                                                  %142 = add %2, %141 : u32
+                                                  %143 = load params, %142 : f32
+                                                  %144 = div %1, %143 : f32
+                                                  %145 = const 23.0 : f32
+                                                  %146 = lt %144, %145 : bool
+                                                  if %146 {
+                                                    store_output color, %0
+                                                  } else {
+                                                    %147 = const 384 : u32
+                                                    %148 = add %2, %147 : u32
+                                                    %149 = load params, %148 : f32
+                                                    %150 = div %1, %149 : f32
+                                                    %151 = const 24.0 : f32
+                                                    %152 = lt %150, %151 : bool
+                                                    if %152 {
+                                                      store_output color, %0
+                                                    } else {
+                                                      %153 = const 400 : u32
+                                                      %154 = add %2, %153 : u32
+                                                      %155 = load params, %154 : f32
+                                                      %156 = div %1, %155 : f32
+                                                      %157 = const 25.0 : f32
+                                                      %158 = lt %156, %157 : bool
+                                                      if %158 {
+                                                        store_output color, %0
+                                                      } else {
+                                                        %159 = const 416 : u32
+                                                        %160 = add %2, %159 : u32
+                                                        %161 = load params, %160 : f32
+                                                        %162 = div %1, %161 : f32
+                                                        %163 = const 26.0 : f32
+                                                        %164 = lt %162, %163 : bool
+                                                        if %164 {
+                                                          store_output color, %0
+                                                        } else {
+                                                          %165 = const 432 : u32
+                                                          %166 = add %2, %165 : u32
+                                                          %167 = load params, %166 : f32
+                                                          %168 = div %1, %167 : f32
+                                                          %169 = const 27.0 : f32
+                                                          %170 = lt %168, %169 : bool
+                                                          if %170 {
+                                                            store_output color, %0
+                                                          } else {
+                                                            %171 = const 448 : u32
+                                                            %172 = add %2, %171 : u32
+                                                            %173 = load params, %172 : f32
+                                                            %174 = div %1, %173 : f32
+                                                            %175 = const 28.0 : f32
+                                                            %176 = lt %174, %175 : bool
+                                                            if %176 {
+                                                              store_output color, %0
+                                                            } else {
+                                                              %177 = const 464 : u32
+                                                              %178 = add %2, %177 : u32
+                                                              %179 = load params, %178 : f32
+                                                              %180 = div %1, %179 : f32
+                                                              %181 = const 29.0 : f32
+                                                              %182 = lt %180, %181 : bool
+                                                              if %182 {
+                                                                store_output color, %0
+                                                              } else {
+                                                                %183 = const 480 : u32
+                                                                %184 = add %2, %183 : u32
+                                                                %185 = load params, %184 : f32
+                                                                %186 = div %1, %185 : f32
+                                                                %187 = const 30.0 : f32
+                                                                %188 = lt %186, %187 : bool
+                                                                if %188 {
+                                                                  store_output color, %0
+                                                                } else {
+                                                                  %189 = const 496 : u32
+                                                                  %190 = add %2, %189 : u32
+                                                                  %191 = load params, %190 : f32
+                                                                  %192 = div %1, %191 : f32
+                                                                  %193 = const 31.0 : f32
+                                                                  %194 = lt %192, %193 : bool
+                                                                  if %194 {
+                                                                    store_output color, %0
+                                                                  } else {
+                                                                    %195 = const 512 : u32
+                                                                    %196 = add %2, %195 : u32
+                                                                    %197 = load params, %196 : f32
+                                                                    %198 = div %1, %197 : f32
+                                                                    %199 = const 32.0 : f32
+                                                                    %200 = lt %198, %199 : bool
+                                                                    if %200 {
+                                                                      store_output color, %0
+                                                                    } else {
+                                                                      %201 = const 528 : u32
+                                                                      %202 = add %2, %201 : u32
+                                                                      %203 = load params, %202 : f32
+                                                                      %204 = div %1, %203 : f32
+                                                                      %205 = const 33.0 : f32
+                                                                      %206 = lt %204, %205 : bool
+                                                                      if %206 {
+                                                                        store_output color, %0
+                                                                      } else {
+                                                                        %207 = const 544 : u32
+                                                                        %208 = add %2, %207 : u32
+                                                                        %209 = load params, %208 : f32
+                                                                        %210 = div %1, %209 : f32
+                                                                        %211 = const 34.0 : f32
+                                                                        %212 = lt %210, %211 : bool
+                                                                        if %212 {
+                                                                          store_output color, %0
+                                                                        } else {
+                                                                          %213 = const 560 : u32
+                                                                          %214 = add %2, %213 : u32
+                                                                          %215 = load params, %214 : f32
+                                                                          %216 = div %1, %215 : f32
+                                                                          %217 = const 35.0 : f32
+                                                                          %218 = lt %216, %217 : bool
+                                                                          if %218 {
+                                                                            store_output color, %0
+                                                                          } else {
+                                                                            %219 = const 576 : u32
+                                                                            %220 = add %2, %219 : u32
+                                                                            %221 = load params, %220 : f32
+                                                                            %222 = div %1, %221 : f32
+                                                                            %223 = const 36.0 : f32
+                                                                            %224 = lt %222, %223 : bool
+                                                                            if %224 {
+                                                                              store_output color, %0
+                                                                            } else {
+                                                                              %225 = const 592 : u32
+                                                                              %226 = add %2, %225 : u32
+                                                                              %227 = load params, %226 : f32
+                                                                              %228 = div %1, %227 : f32
+                                                                              %229 = const 37.0 : f32
+                                                                              %230 = lt %228, %229 : bool
+                                                                              if %230 {
+                                                                                store_output color, %0
+                                                                              } else {
+                                                                                %231 = const 608 : u32
+                                                                                %232 = add %2, %231 : u32
+                                                                                %233 = load params, %232 : f32
+                                                                                %234 = div %1, %233 : f32
+                                                                                %235 = const 38.0 : f32
+                                                                                %236 = lt %234, %235 : bool
+                                                                                if %236 {
+                                                                                  store_output color, %0
+                                                                                } else {
+                                                                                  %237 = const 624 : u32
+                                                                                  %238 = add %2, %237 : u32
+                                                                                  %239 = load params, %238 : f32
+                                                                                  %240 = div %1, %239 : f32
+                                                                                  %241 = const 39.0 : f32
+                                                                                  %242 = lt %240, %241 : bool
+                                                                                  if %242 {
+                                                                                    store_output color, %0
+                                                                                  } else {
+                                                                                    %243 = const 640 : u32
+                                                                                    %244 = add %2, %243 : u32
+                                                                                    %245 = load params, %244 : f32
+                                                                                    %246 = div %1, %245 : f32
+                                                                                    %247 = const 40.0 : f32
+                                                                                    %248 = lt %246, %247 : bool
+                                                                                    if %248 {
+                                                                                      store_output color, %0
+                                                                                    } else {
+                                                                                      %249 = const 656 : u32
+                                                                                      %250 = add %2, %249 : u32
+                                                                                      %251 = load params, %250 : f32
+                                                                                      %252 = div %1, %251 : f32
+                                                                                      %253 = const 41.0 : f32
+                                                                                      %254 = lt %252, %253 : bool
+                                                                                      if %254 {
+                                                                                        store_output color, %0
+                                                                                      } else {
+                                                                                        %255 = const 672 : u32
+                                                                                        %256 = add %2, %255 : u32
+                                                                                        %257 = load params, %256 : f32
+                                                                                        %258 = div %1, %257 : f32
+                                                                                        %259 = const 42.0 : f32
+                                                                                        %260 = lt %258, %259 : bool
+                                                                                        if %260 {
+                                                                                          store_output color, %0
+                                                                                        } else {
+                                                                                          %261 = const 688 : u32
+                                                                                          %262 = add %2, %261 : u32
+                                                                                          %263 = load params, %262 : f32
+                                                                                          %264 = div %1, %263 : f32
+                                                                                          %265 = const 43.0 : f32
+                                                                                          %266 = lt %264, %265 : bool
+                                                                                          if %266 {
+                                                                                            store_output color, %0
+                                                                                          } else {
+                                                                                            %267 = const 704 : u32
+                                                                                            %268 = add %2, %267 : u32
+                                                                                            %269 = load params, %268 : f32
+                                                                                            %270 = div %1, %269 : f32
+                                                                                            %271 = const 44.0 : f32
+                                                                                            %272 = lt %270, %271 : bool
+                                                                                            if %272 {
+                                                                                              store_output color, %0
+                                                                                            } else {
+                                                                                              %273 = const 720 : u32
+                                                                                              %274 = add %2, %273 : u32
+                                                                                              %275 = load params, %274 : f32
+                                                                                              %276 = div %1, %275 : f32
+                                                                                              %277 = const 45.0 : f32
+                                                                                              %278 = lt %276, %277 : bool
+                                                                                              if %278 {
+                                                                                                store_output color, %0
+                                                                                              } else {
+                                                                                                %279 = const 736 : u32
+                                                                                                %280 = add %2, %279 : u32
+                                                                                                %281 = load params, %280 : f32
+                                                                                                %282 = div %1, %281 : f32
+                                                                                                %283 = const 46.0 : f32
+                                                                                                %284 = lt %282, %283 : bool
+                                                                                                if %284 {
+                                                                                                  store_output color, %0
+                                                                                                } else {
+                                                                                                  %285 = const 752 : u32
+                                                                                                  %286 = add %2, %285 : u32
+                                                                                                  %287 = load params, %286 : f32
+                                                                                                  %288 = div %1, %287 : f32
+                                                                                                  %289 = const 47.0 : f32
+                                                                                                  %290 = lt %288, %289 : bool
+                                                                                                  if %290 {
+                                                                                                    store_output color, %0
+                                                                                                  } else {
+                                                                                                    %291 = const 768 : u32
+                                                                                                    %292 = add %2, %291 : u32
+                                                                                                    %293 = load params, %292 : f32
+                                                                                                    %294 = div %1, %293 : f32
+                                                                                                    %295 = const 48.0 : f32
+                                                                                                    %296 = lt %294, %295 : bool
+                                                                                                    if %296 {
+                                                                                                      store_output color, %0
+                                                                                                    } else {
+                                                                                                      %297 = const 784 : u32
+                                                                                                      %298 = add %2, %297 : u32
+                                                                                                      %299 = load params, %298 : f32
+                                                                                                      %300 = div %1, %299 : f32
+                                                                                                      %301 = const 49.0 : f32
+                                                                                                      %302 = lt %300, %301 : bool
+                                                                                                      if %302 {
+                                                                                                        store_output color, %0
+                                                                                                      } else {
+                                                                                                        %303 = const 800 : u32
+                                                                                                        %304 = add %2, %303 : u32
+                                                                                                        %305 = load params, %304 : f32
+                                                                                                        %306 = div %1, %305 : f32
+                                                                                                        %307 = const 50.0 : f32
+                                                                                                        %308 = lt %306, %307 : bool
+                                                                                                        if %308 {
+                                                                                                          store_output color, %0
+                                                                                                        } else {
+                                                                                                          %309 = const 816 : u32
+                                                                                                          %310 = add %2, %309 : u32
+                                                                                                          %311 = load params, %310 : f32
+                                                                                                          %312 = div %1, %311 : f32
+                                                                                                          %313 = const 51.0 : f32
+                                                                                                          %314 = lt %312, %313 : bool
+                                                                                                          if %314 {
+                                                                                                            store_output color, %0
+                                                                                                          } else {
+                                                                                                            %315 = const 832 : u32
+                                                                                                            %316 = add %2, %315 : u32
+                                                                                                            %317 = load params, %316 : f32
+                                                                                                            %318 = div %1, %317 : f32
+                                                                                                            %319 = const 52.0 : f32
+                                                                                                            %320 = lt %318, %319 : bool
+                                                                                                            if %320 {
+                                                                                                              store_output color, %0
+                                                                                                            } else {
+                                                                                                              %321 = const 848 : u32
+                                                                                                              %322 = add %2, %321 : u32
+                                                                                                              %323 = load params, %322 : f32
+                                                                                                              %324 = div %1, %323 : f32
+                                                                                                              %325 = const 53.0 : f32
+                                                                                                              %326 = lt %324, %325 : bool
+                                                                                                              if %326 {
+                                                                                                                store_output color, %0
+                                                                                                              } else {
+                                                                                                                %327 = const 864 : u32
+                                                                                                                %328 = add %2, %327 : u32
+                                                                                                                %329 = load params, %328 : f32
+                                                                                                                %330 = div %1, %329 : f32
+                                                                                                                %331 = const 54.0 : f32
+                                                                                                                %332 = lt %330, %331 : bool
+                                                                                                                if %332 {
+                                                                                                                  store_output color, %0
+                                                                                                                } else {
+                                                                                                                  %333 = const 880 : u32
+                                                                                                                  %334 = add %2, %333 : u32
+                                                                                                                  %335 = load params, %334 : f32
+                                                                                                                  %336 = div %1, %335 : f32
+                                                                                                                  %337 = const 55.0 : f32
+                                                                                                                  %338 = lt %336, %337 : bool
+                                                                                                                  if %338 {
+                                                                                                                    store_output color, %0
+                                                                                                                  } else {
+                                                                                                                    %339 = const 896 : u32
+                                                                                                                    %340 = add %2, %339 : u32
+                                                                                                                    %341 = load params, %340 : f32
+                                                                                                                    %342 = div %1, %341 : f32
+                                                                                                                    %343 = const 56.0 : f32
+                                                                                                                    %344 = lt %342, %343 : bool
+                                                                                                                    if %344 {
+                                                                                                                      store_output color, %0
+                                                                                                                    } else {
+                                                                                                                      %345 = const 912 : u32
+                                                                                                                      %346 = add %2, %345 : u32
+                                                                                                                      %347 = load params, %346 : f32
+                                                                                                                      %348 = div %1, %347 : f32
+                                                                                                                      %349 = const 57.0 : f32
+                                                                                                                      %350 = lt %348, %349 : bool
+                                                                                                                      if %350 {
+                                                                                                                        store_output color, %0
+                                                                                                                      } else {
+                                                                                                                        %351 = const 928 : u32
+                                                                                                                        %352 = add %2, %351 : u32
+                                                                                                                        %353 = load params, %352 : f32
+                                                                                                                        %354 = div %1, %353 : f32
+                                                                                                                        %355 = const 58.0 : f32
+                                                                                                                        %356 = lt %354, %355 : bool
+                                                                                                                        if %356 {
+                                                                                                                          store_output color, %0
+                                                                                                                        } else {
+                                                                                                                          %357 = const 944 : u32
+                                                                                                                          %358 = add %2, %357 : u32
+                                                                                                                          %359 = load params, %358 : f32
+                                                                                                                          %360 = div %1, %359 : f32
+                                                                                                                          %361 = const 59.0 : f32
+                                                                                                                          %362 = lt %360, %361 : bool
+                                                                                                                          if %362 {
+                                                                                                                            store_output color, %0
+                                                                                                                          } else {
+                                                                                                                            %363 = const 960 : u32
+                                                                                                                            %364 = add %2, %363 : u32
+                                                                                                                            %365 = load params, %364 : f32
+                                                                                                                            %366 = div %1, %365 : f32
+                                                                                                                            %367 = const 60.0 : f32
+                                                                                                                            %368 = lt %366, %367 : bool
+                                                                                                                            if %368 {
+                                                                                                                              store_output color, %0
+                                                                                                                            } else {
+                                                                                                                              %369 = const 976 : u32
+                                                                                                                              %370 = add %2, %369 : u32
+                                                                                                                              %371 = load params, %370 : f32
+                                                                                                                              %372 = div %1, %371 : f32
+                                                                                                                              %373 = const 61.0 : f32
+                                                                                                                              %374 = lt %372, %373 : bool
+                                                                                                                              if %374 {
+                                                                                                                                store_output color, %0
+                                                                                                                              } else {
+                                                                                                                                %375 = const 992 : u32
+                                                                                                                                %376 = add %2, %375 : u32
+                                                                                                                                %377 = load params, %376 : f32
+                                                                                                                                %378 = div %1, %377 : f32
+                                                                                                                                %379 = const 62.0 : f32
+                                                                                                                                %380 = lt %378, %379 : bool
+                                                                                                                                if %380 {
+                                                                                                                                  store_output color, %0
+                                                                                                                                } else {
+                                                                                                                                  %381 = const 1008 : u32
+                                                                                                                                  %382 = add %2, %381 : u32
+                                                                                                                                  %383 = load params, %382 : f32
+                                                                                                                                  %384 = div %1, %383 : f32
+                                                                                                                                  %385 = const 63.0 : f32
+                                                                                                                                  %386 = lt %384, %385 : bool
+                                                                                                                                  if %386 {
+                                                                                                                                    store_output color, %0
+                                                                                                                                  } else {
+                                                                                                                                    %387 = const 1024 : u32
+                                                                                                                                    %388 = add %2, %387 : u32
+                                                                                                                                    %389 = load params, %388 : f32
+                                                                                                                                    %390 = div %1, %389 : f32
+                                                                                                                                    %391 = const 64.0 : f32
+                                                                                                                                    %392 = lt %390, %391 : bool
+                                                                                                                                    if %392 {
+                                                                                                                                      store_output color, %0
+                                                                                                                                    } else {
+                                                                                                                                      %393 = const 1040 : u32
+                                                                                                                                      %394 = add %2, %393 : u32
+                                                                                                                                      %395 = load params, %394 : f32
+                                                                                                                                      %396 = div %1, %395 : f32
+                                                                                                                                      %397 = const 65.0 : f32
+                                                                                                                                      %398 = lt %396, %397 : bool
+                                                                                                                                      if %398 {
+                                                                                                                                        store_output color, %0
+                                                                                                                                      } else {
+                                                                                                                                        %399 = const 1056 : u32
+                                                                                                                                        %400 = add %2, %399 : u32
+                                                                                                                                        %401 = load params, %400 : f32
+                                                                                                                                        %402 = div %1, %401 : f32
+                                                                                                                                        %403 = const 66.0 : f32
+                                                                                                                                        %404 = lt %402, %403 : bool
+                                                                                                                                        if %404 {
+                                                                                                                                          store_output color, %0
+                                                                                                                                        } else {
+                                                                                                                                          %405 = const 1072 : u32
+                                                                                                                                          %406 = add %2, %405 : u32
+                                                                                                                                          %407 = load params, %406 : f32
+                                                                                                                                          %408 = div %1, %407 : f32
+                                                                                                                                          %409 = const 67.0 : f32
+                                                                                                                                          %410 = lt %408, %409 : bool
+                                                                                                                                          if %410 {
+                                                                                                                                            store_output color, %0
+                                                                                                                                          } else {
+                                                                                                                                            %411 = const 1088 : u32
+                                                                                                                                            %412 = add %2, %411 : u32
+                                                                                                                                            %413 = load params, %412 : f32
+                                                                                                                                            %414 = div %1, %413 : f32
+                                                                                                                                            %415 = const 68.0 : f32
+                                                                                                                                            %416 = lt %414, %415 : bool
+                                                                                                                                            if %416 {
+                                                                                                                                              store_output color, %0
+                                                                                                                                            } else {
+                                                                                                                                              %417 = const 1104 : u32
+                                                                                                                                              %418 = add %2, %417 : u32
+                                                                                                                                              %419 = load params, %418 : f32
+                                                                                                                                              %420 = div %1, %419 : f32
+                                                                                                                                              %421 = const 69.0 : f32
+                                                                                                                                              %422 = lt %420, %421 : bool
+                                                                                                                                              if %422 {
+                                                                                                                                                store_output color, %0
+                                                                                                                                              } else {
+                                                                                                                                                discard
+                                                                                                                                              }
+                                                                                                                                            }
+                                                                                                                                          }
+                                                                                                                                        }
+                                                                                                                                      }
+                                                                                                                                    }
+                                                                                                                                  }
+                                                                                                                                }
+                                                                                                                              }
+                                                                                                                            }
+                                                                                                                          }
+                                                                                                                        }
+                                                                                                                      }
+                                                                                                                    }
+                                                                                                                  }
+                                                                                                                }
+                                                                                                              }
+                                                                                                            }
+                                                                                                          }
+                                                                                                        }
+                                                                                                      }
+                                                                                                    }
+                                                                                                  }
+                                                                                                }
+                                                                                              }
+                                                                                            }
+                                                                                          }
+                                                                                        }
+                                                                                      }
+                                                                                    }
+                                                                                  }
+                                                                                }
+                                                                              }
+                                                                            }
+                                                                          }
+                                                                        }
+                                                                      }
+                                                                    }
+                                                                  }
+                                                                }
+                                                              }
+                                                            }
+                                                          }
+                                                        }
+                                                      }
+                                                    }
+                                                  }
+                                                }
+                                              }
+                                            }
+                                          }
+                                        }
+                                      }
+                                    }
+                                  }
+                                }
+                              }
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+    break
+  }
+}

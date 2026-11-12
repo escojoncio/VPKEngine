@@ -1,5 +1,6 @@
 // Lexer and preprocessor (GLSL ES 3.20 §3, which ES 1.00 and 3.00 are subsets of).
 #include "pp.h"
+#include "vpir/stack.h"
 
 #include <algorithm>
 #include <atomic>
@@ -355,23 +356,46 @@ private:
         return false;
     }
 
-    size_t expandSteps_ = 0;  // tokens walked by the expansion in progress (a macro that doubles at each level would never end)
+    size_t expandSteps_ = 0;  // work of the expansion in progress, in tokens (a macro that doubles at each level would never end)
+    bool expandOverflow_ = false;
     static constexpr size_t kMaxExpandSteps = 1'000'000;
+    // Counts `n` tokens of work (walked, copied, collected or pasted) against kMaxExpandSteps. True once past it: the error is
+    // reported once and every caller unwinds.
+    bool charge(size_t n, int line) {
+        expandSteps_ += n;
+        if (expandSteps_ <= kMaxExpandSteps) return false;
+        if (!expandOverflow_) error(line, "macro expansion too large");
+        expandOverflow_ = true;
+        return true;
+    }
+
+    // Set by expand(): the last token it wrote is the name of a function-like macro that had no "(" after it in `in`, so a "(" that
+    // follows `in` in the enclosing text calls it. False when anything else (even a macro that expands to nothing) follows the name.
+    bool endsWithName_ = false;
+    // The levels of nested expansion (arguments, bodies) are bounded by the stack left, and by this count as a backstop.
+    static constexpr int kMaxExpandDepth = 1000;
 
     void expand(const std::vector<Token>& in, std::vector<Token>& out, std::set<std::string>& hide, int depth = 0) {
-        if (depth > 64) {
+        struct Ends {
+            bool& dst;
+            bool v = false;
+            ~Ends() { dst = v; }
+        } ends{endsWithName_};
+        if (depth > kMaxExpandDepth || vpir::stackLow()) {
             error(in.empty() ? 0 : in[0].line, "macro expansion too deep");
             return;
         }
-        if (depth == 0) expandSteps_ = 0;
+        if (depth == 0) expandSteps_ = 0, expandOverflow_ = false;
         for (size_t i = 0; i < in.size();) {
-            if (++expandSteps_ > kMaxExpandSteps) {
-                if (expandSteps_ == kMaxExpandSteps + 1) error(in[i].line, "macro expansion too large");  // once; the callers unwind
-                return;
-            }
+            ends.v = false;
+            if (charge(1, in[i].line)) return;
             const Token& t = in[i];
-            if (t.kind != Tok::Ident || hide.count(t.text)) {
+            if (t.kind != Tok::Ident) {
                 out.push_back(t), ++i;
+                continue;
+            }
+            if (t.painted || hide.count(t.text)) {
+                out.push_back(t), out.back().painted = true, ++i;
                 continue;
             }
             if (t.text == "__LINE__") {
@@ -391,84 +415,116 @@ private:
                 out.push_back(t), ++i;
                 continue;
             }
-            const Macro& m = it->second;
-            if (!m.function) {
-                std::vector<Token> body = m.body;
-                for (Token& b : body) b.line = t.line;
-                body = paste(body);
-                hide.insert(t.text);
+            // `name` is the macro being expanded: the token at in[i], or, below, a function-like macro name that ended the expansion
+            // of the previous one and takes the "(" that follows it in the input as its call (C99 6.10.3.4: the rescan goes on with
+            // the rest of the source). The loop replaces a recursion over a copy of the rest of the input. `at` is where the "(" of
+            // a call would be.
+            const Token* name = &t;
+            const Macro* mac = &it->second;
+            Token carried;  // storage for a name that came out of an expansion
+            size_t at = i + 1;
+            bool nameLast = false;  // the expansion ended with a function-like name that nothing in `in` follows
+            for (;;) {
                 const size_t before = out.size();
-                expand(body, out, hide, depth + 1);
-                hide.erase(t.text);
-                // A body that ends with the name of a function-like macro takes the "(" after the macro in the input as its call.
-                if (out.size() > before && out.back().kind == Tok::Ident && i + 1 < in.size() && in[i + 1].kind == Tok::Punct &&
-                    in[i + 1].text == "(" && !hide.count(out.back().text)) {
-                    auto fm = defines_.find(out.back().text);
-                    if (fm != defines_.end() && fm->second.function) {
-                        std::vector<Token> rest(1, out.back());
-                        out.pop_back();
-                        rest.insert(rest.end(), in.begin() + long(i) + 1, in.end());
-                        expand(rest, out, hide, depth ? depth : 1);
+                nameLast = false;
+                if (!mac->function) {
+                    if (charge(mac->body.size(), name->line)) return;
+                    std::vector<Token> body = mac->body;
+                    for (Token& b : body) b.line = name->line;
+                    body = paste(body);
+                    hide.insert(name->text);
+                    expand(body, out, hide, depth + 1);
+                    hide.erase(name->text);
+                    nameLast = endsWithName_;
+                } else {
+                    if (at >= in.size() || in[at].kind != Tok::Punct || in[at].text != "(") {
+                        out.push_back(*name);  // name of a function-like macro without a call
+                        nameLast = at >= in.size();
+                        break;
+                    }
+                    size_t j = at;
+                    std::vector<std::vector<Token>> args;
+                    const bool closed = collectArgs(in, j, args);
+                    if (charge(j - at, name->line)) return;
+                    if (!closed) {
+                        error(name->line, "unterminated macro call '" + name->text + "'");
                         return;
                     }
+                    if (mac->params.empty() && args.size() == 1 && args[0].empty()) args.clear();
+                    if (args.size() != mac->params.size()) {
+                        error(name->line, "macro '" + name->text + "' expects " + std::to_string(mac->params.size()) + " arguments");
+                        at = j;
+                        break;
+                    }
+                    // Arguments are fully expanded before substitution, except next to ##.
+                    std::vector<Token> body;
+                    for (size_t k = 0; k < mac->body.size(); ++k) {
+                        const Token& b = mac->body[k];
+                        int p = -1;
+                        if (b.kind == Tok::Ident)
+                            for (size_t q = 0; q < mac->params.size(); ++q)
+                                if (mac->params[q] == b.text) p = int(q);
+                        if (p < 0) {
+                            Token c = b;
+                            c.line = name->line;
+                            body.push_back(c);
+                            continue;
+                        }
+                        const bool nearPaste = (k > 0 && mac->body[k - 1].text == "##") ||
+                                               (k + 1 < mac->body.size() && mac->body[k + 1].text == "##");
+                        if (nearPaste) {
+                            if (charge(args[size_t(p)].size(), name->line)) return;
+                            if (args[size_t(p)].empty()) {  // an empty argument next to ## is a placemarker (C99 6.10.3.3)
+                                Token pm;
+                                pm.kind = Tok::Punct, pm.line = name->line, pm.placemarker = true;
+                                body.push_back(pm);
+                            }
+                            for (Token a : args[size_t(p)]) a.line = name->line, body.push_back(a);
+                        } else {
+                            std::vector<Token> ex;
+                            expand(args[size_t(p)], ex, hide, depth + 1);
+                            if (charge(ex.size() + 1, name->line)) return;
+                            for (Token a : ex) a.line = name->line, body.push_back(a);
+                        }
+                    }
+                    if (charge(body.size(), name->line)) return;
+                    body = paste(body);
+                    hide.insert(name->text);
+                    expand(body, out, hide, depth + 1);
+                    hide.erase(name->text);
+                    nameLast = endsWithName_;
+                    at = j;
                 }
-                ++i;
-                continue;
-            }
-            size_t j = i + 1;
-            if (j >= in.size() || in[j].kind != Tok::Punct || in[j].text != "(") {
-                out.push_back(t), ++i;  // name of a function-like macro without a call
-                continue;
-            }
-            std::vector<std::vector<Token>> args;
-            if (!collectArgs(in, j, args)) {
-                error(t.line, "unterminated macro call '" + t.text + "'");
-                return;
-            }
-            if (m.params.empty() && args.size() == 1 && args[0].empty()) args.clear();
-            if (args.size() != m.params.size()) {
-                error(t.line, "macro '" + t.text + "' expects " + std::to_string(m.params.size()) + " arguments");
-                i = j;
-                continue;
-            }
-            // Arguments are fully expanded before substitution, except next to ##.
-            std::vector<Token> body;
-            for (size_t k = 0; k < m.body.size(); ++k) {
-                const Token& b = m.body[k];
-                int p = -1;
-                if (b.kind == Tok::Ident)
-                    for (size_t q = 0; q < m.params.size(); ++q)
-                        if (m.params[q] == b.text) p = int(q);
-                if (p < 0) {
-                    Token c = b;
-                    c.line = t.line;
-                    body.push_back(c);
-                    continue;
+                // The expansion ends with the name of a function-like macro (not one met inside its own expansion) and a "(" follows in
+                // the input: that name is called with it.
+                if (nameLast && out.size() > before && out.back().kind == Tok::Ident && !out.back().painted && !hide.count(out.back().text) &&
+                    at < in.size() && in[at].kind == Tok::Punct && in[at].text == "(") {
+                    auto fm = defines_.find(out.back().text);
+                    if (fm != defines_.end() && fm->second.function) {
+                        Token next = std::move(out.back());
+                        out.pop_back();
+                        carried = std::move(next);
+                        name = &carried;
+                        mac = &fm->second;
+                        continue;
+                    }
                 }
-                const bool nearPaste = (k > 0 && m.body[k - 1].text == "##") ||
-                                       (k + 1 < m.body.size() && m.body[k + 1].text == "##");
-                if (nearPaste) {
-                    for (Token a : args[size_t(p)]) a.line = t.line, body.push_back(a);
-                } else {
-                    std::vector<Token> ex;
-                    expand(args[size_t(p)], ex, hide, depth + 1);
-                    for (Token a : ex) a.line = t.line, body.push_back(a);
-                }
+                break;
             }
-            body = paste(body);
-            hide.insert(t.text);
-            // Rescan with the rest of the input so a macro producing a function-like name followed
-            // by "(" in the source still works: only the body is rescanned here (common case).
-            expand(body, out, hide, depth + 1);
-            hide.erase(t.text);
-            i = j;
+            ends.v = nameLast && at >= in.size();
+            i = std::max(at, i + 1);
         }
     }
 
     std::vector<Token> paste(const std::vector<Token>& in) {
         std::vector<Token> out;
         for (size_t i = 0; i < in.size(); ++i) {
-            if (in[i].kind == Tok::Punct && in[i].text == "##" && !out.empty() && i + 1 < in.size()) {
+            if (in[i].kind == Tok::Punct && in[i].text == "##" && !in[i].placemarker && !out.empty() && i + 1 < in.size()) {
+                if (out.back().placemarker || in[i + 1].placemarker) {  // a placemarker pastes to the other operand
+                    if (out.back().placemarker) out.back() = in[i + 1];
+                    ++i;
+                    continue;
+                }
                 std::string text = out.back().text + in[i + 1].text;
                 std::string l;
                 std::vector<Token> re = lex(text, l);
@@ -481,6 +537,7 @@ private:
             }
             out.push_back(in[i]);
         }
+        std::erase_if(out, [](const Token& x) { return x.placemarker; });
         return out;
     }
 
@@ -840,6 +897,7 @@ Caps caps() {
 }
 
 PpResult runPreprocessor(const std::string& source, Stage stage, std::string& log) {
+    vpir::StackGuard stackGuard;  // (the nested expansion stops before the stack of this thread does)
     Pp p(stage, log);
     return p.run(source);
 }

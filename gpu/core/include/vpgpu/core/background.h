@@ -57,6 +57,11 @@ class BackgroundGate {
   using PauseHook = std::function<void()>;
   uint64_t addPauseHook(PauseHook fn);
   void removePauseHook(uint64_t id);
+  // Same, for each transition back to the foreground (set(false); not release() nor shutdown()): `fn` runs on the thread that
+  // calls set(false), after parked threads were woken. A backend uses it to send command buffers it had to hold back.
+  // removeResumeHook waits for a running call of that hook to end.
+  uint64_t addResumeHook(PauseHook fn);
+  void removeResumeHook(uint64_t id);
 
   uint64_t blockedTotal() const;      // commits that ever parked
   uint64_t mainThreadPassed() const;  // commits the main thread made in the background (not parked)
@@ -73,7 +78,7 @@ class BackgroundGate {
   std::thread::id main_;
   LogFn log_;
   std::mutex hookMutex_;  // guards hooks_ and is held while they run
-  std::map<uint64_t, PauseHook> hooks_;
+  std::map<uint64_t, PauseHook> hooks_, resumeHooks_;
   uint64_t nextHook_ = 1;
 };
 

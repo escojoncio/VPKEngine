@@ -19,6 +19,8 @@ struct Token {
     uint64_t ival = 0;   // IntLit/UintLit (wrapped to 32 bits by the parser)
     double fval = 0;     // FloatLit
     bool spaceBefore = false;
+    bool placemarker = false;  // the empty argument next to a ## of a macro body (never leaves the substitution)
+    bool painted = false;  // a macro name met inside its own expansion: never expanded again
 };
 
 // Splits one source into tokens (comments removed, line continuations joined). Newline tokens are

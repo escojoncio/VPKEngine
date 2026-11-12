@@ -24,6 +24,10 @@ namespace {
 
 struct Display {
     bool initialized = false;
+    // eglInitialize calls not yet matched by an eglTerminate (Device::lock); the last eglTerminate releases the display. This is a
+    // deliberate deviation from EGL 1.5 section 3.2 (where one eglTerminate ends the display whatever the initialize count): Android's
+    // semantics, which the games and the components sharing the display expect.
+    int refs = 0;
 };
 Display gDisplay;
 void* const kDisplay = &gDisplay;
@@ -196,7 +200,11 @@ static EGLDisplay GetPlatformDisplay(EGLenum, void*, const intptr_t*) { return k
 static EGLBoolean Initialize(EGLDisplay d, EGLint* major, EGLint* minor) {
     if (d != kDisplay) return err(BAD_DISPLAY);
     if (!device()) return err(NOT_INITIALIZED);
-    gDisplay.initialized = true;
+    {
+        std::lock_guard<std::recursive_mutex> l(device()->lock);
+        ++gDisplay.refs;
+        gDisplay.initialized = true;
+    }
     installCrashTrace();
     if (major) *major = 1;
     if (minor) *minor = 5;
@@ -208,10 +216,21 @@ static EGLBoolean Terminate(EGLDisplay d) {
     if (d != kDisplay) return err(BAD_DISPLAY);
     if (Device* dv = device()) {
         std::lock_guard<std::recursive_mutex> l(dv->lock);
+        // Android's semantics: every eglInitialize is matched by an eglTerminate and only the last one releases the display (another
+        // component's initialize + terminate must not take it from the game). A terminate with none outstanding does nothing (EGL:
+        // terminating a display that is not initialized succeeds and has no effect); it used to release.
+        if (gDisplay.refs > 1) {
+            --gDisplay.refs;
+            return TRUE_;
+        }
+        if (gDisplay.refs == 0) return TRUE_;
+        gDisplay.refs = 0;
         texStatsTick(true);
         recipeStatsTick(true);
         mapStatsTick(true);
         releaseDisplay();
+        gDisplay.initialized = false;
+        return TRUE_;
     }
     gDisplay.initialized = false;
     return TRUE_;
@@ -359,6 +378,10 @@ static void freeSurface(Surface* s) {
     if (c) c->flush(true);
     else device()->waitSerial(device()->submitted);
     gSurfaces.erase(s);
+    for (Context* other : gContexts) {  // a context that is not current keeps the surfaces it last had: not any more
+        if (other->draw == s) other->draw = nullptr;
+        if (other->read == s) other->read = nullptr;
+    }
     delete s;
 }
 // Un hilo deja de tener `s` como draw/read; si estaba pendiente de destruir y ya nadie la usa, se borra.
@@ -485,7 +508,7 @@ static EGLBoolean MakeCurrent(EGLDisplay d, EGLSurface draw, EGLSurface read, EG
     tRead = nr;
     unbindSurface(oldDraw);
     unbindSurface(oldRead);
-    if (old && old != ctx && old->dead) gContexts.erase(old), delete old;  // destruido mientras era actual (forgetContext ya hecho)
+    if (old && old != ctx && old->dead) forgetContext(old), gContexts.erase(old), delete old;  // destruido mientras era actual
     if (ctx) {
         const bool first = !ctx->draw && !ctx->viewport[2];
         ctx->draw = tDraw;
@@ -620,11 +643,11 @@ static EGLBoolean DestroyImageKHR(EGLDisplay, EGLImage i) {
 // when the display is initialized again (Device::lock held).
 static void releaseDisplay() {
     for (Context* c : std::vector<Context*>(gContexts.begin(), gContexts.end())) {
+        forgetContext(c);  // (also the current one: it is deleted when it stops being current, and nothing may keep pointing at it)
         if (c->owned) {
             c->dead = true;
             continue;
         }
-        forgetContext(c);
         gContexts.erase(c);
         delete c;
     }
@@ -640,6 +663,13 @@ static void releaseDisplay() {
     gSyncs.clear(), gImages.clear();
     device()->waitSerial(device()->submitted);
     device()->trim();
+}
+
+// vpgles_shutdown: the initialize count starts again.
+void eglResetDisplay() {
+    std::lock_guard<std::recursive_mutex> l(device()->lock);
+    gDisplay.refs = 0;
+    gDisplay.initialized = false;
 }
 
 }  // namespace vpgles

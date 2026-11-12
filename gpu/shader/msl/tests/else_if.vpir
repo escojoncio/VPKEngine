@@ -1,0 +1,44 @@
+module fragment
+
+input a : vec4<f32> location(0)
+output color : vec4<f32> location(0)
+
+; An else that holds only an if is written `else if`: a ladder of rungs nests one level per rung in the IR but
+; stays flat in the source (clang stops at 256 nested braces). An else with anything else next to the if stays nested.
+func main() {
+  %0 = load_input a : vec4<f32>
+  %1 = extract %0, 0 : f32
+  %2 = extract %0, 1 : f32
+  %3 = extract %0, 2 : f32
+  %4 = const 0.5 : f32
+  %5 = lt %1, %4 : bool
+  %6 = lt %2, %4 : bool
+  %7 = lt %3, %4 : bool
+  %8 = add %0, %0 : vec4<f32>
+  %9 = mul %0, %0 : vec4<f32>
+  if %5 {
+    store_output color, %0
+  } else {
+    if %6 {
+      store_output color, %8
+    } else {
+      if %7 {
+        store_output color, %9
+      }
+    }
+  }
+  if %5 {
+    store_output color, %0
+  } else {
+    %10 = sub %0, %9 : vec4<f32>
+    if %6 {
+      store_output color, %10
+    } else {
+      if %7 {
+        store_output color, %8
+      } else {
+        store_output color, %9
+      }
+    }
+  }
+}

@@ -2,6 +2,7 @@
 #include "vpvk/config.h"
 #include <dlfcn.h>
 #include <sys/resource.h>
+#include <sys/wait.h>
 #include <unistd.h>  // mkdtemp on macOS (libc++ <cstdlib> does not declare it)
 
 #include <csignal>
@@ -27,6 +28,7 @@
 #include "taa_native.h"
 #include <cmath>
 #include <condition_variable>
+#include <future>
 #include <mutex>
 
 #include "texdecode.h"
@@ -40,6 +42,7 @@ using namespace vpvk;
 extern "C" void vkGetMTLTextureMVK(VkImage, void**);
 extern "C" uint32_t vpvk_device_wait_compiles(VkDevice);  // entry.cpp (AVP 0017, dlsym'd by the host)
 extern "C" void vpvk_internal_scope(int on);  // ext.cpp
+namespace vpvk { std::mutex& liveDeviceMutex(); }  // entry.cpp (the registry mutex; no header declares it)
 
 namespace {
 
@@ -8358,14 +8361,22 @@ void testFoveation() {
 // output moves it. When this test fails the translator's OUTPUT changed: bump kLowerVersion (SPIR-V -> VPIR) or
 // kEmitVersion (VPIR -> MSL) in recipes.h, then update kCorpusDigest to the printed value in the same change.
 // (0xe59a6cb9b65b9167 = the previous 0x2bf74b975e022b22 plus depth_write.frag.spv, the D24 emulation fixture: the translator's output
-// for the 68 earlier modules is unchanged, checked by taking the file out. 0x356364120ca33839 = that plus offset_overflow.comp.spv
-// (the shader audit's fixture): the 69 earlier modules still give 0xe59a6cb9b65b9167, checked the same way.)
-constexpr uint64_t kCorpusDigest = 0x356364120ca33839ull;  // the "corpus digest" line the test prints
+// for the 68 earlier modules is unchanged, checked by taking the file out.)
+// offset_overflow.comp.spv (the shader audit's fixture) is not part of the corpus: it is a module the lowering must refuse, run by
+// gpu_spirv.offset_overflow with the layout it needs. Here, with no layout, it stops at "descriptor set 0 binding 0 is not in the pipeline
+// layout" before the offset arithmetic (VPVK_CORPUS_VERBOSE=1 prints it), so it would only add its name to the digest, like the other
+// rejected modules, without checking what it was made for. With it left out the digest is the one of the 69 modules again.
+// ptr_negative.comp.spv (the shader audit's variable-pointers fixture) is in it, like the other modules that need a layout: rejected here,
+// contributing its name. 0x1b236d258ca7683b = the 69 modules above plus it, the same in Release and ASan/UBSan.
+// Adding a fixture to gpu/shader/spirv/tests moves digest and count: the test then prints every module with its shader id (the new one
+// is the file you added), and the count check says so on its own.
+constexpr uint64_t kCorpusDigest = 0x1b236d258ca7683bull;  // the "corpus digest" line the test prints
+constexpr unsigned kCorpusModules = 70;
 
-uint64_t corpusDigest(unsigned& modules, unsigned& failed) {
+uint64_t corpusDigest(unsigned& modules, unsigned& failed, std::vector<std::string>* listing = nullptr) {
   std::vector<std::string> names;
   for (const auto& e : std::filesystem::directory_iterator(VPVK_SPIRV_TESTS))
-    if (e.path().extension() == ".spv") names.push_back(e.path().filename().string());
+    if (e.path().extension() == ".spv" && e.path().filename() != "offset_overflow.comp.spv") names.push_back(e.path().filename().string());
   std::sort(names.begin(), names.end());
   uint64_t h = 0xcbf29ce484222325ull;
   auto mix = [&](uint64_t v) { h = (h ^ v) * 0x100000001b3ull; };
@@ -8394,6 +8405,7 @@ uint64_t corpusDigest(unsigned& modules, unsigned& failed) {
       if (std::getenv("VPVK_CORPUS_VERBOSE")) std::printf("  corpus reject %s: %s\n", n.c_str(), error.c_str());
     }
     mix(id);
+    if (listing) listing->push_back(n + (id ? " id=" + std::to_string(id) : " rejected"));
   }
   return h;
 }
@@ -8411,11 +8423,18 @@ void testStageKeys() {
 
   // The translator's output for the corpus: bump discipline (see kCorpusDigest).
   unsigned modules = 0, failed = 0;
-  const uint64_t digest = corpusDigest(modules, failed);
+  std::vector<std::string> listing;
+  const uint64_t digest = corpusDigest(modules, failed, &listing);
   std::printf("corpus digest modules=%u failed=%u digest=0x%016llx translator=%s\n", modules, failed,
               (unsigned long long)digest, translatorTag().c_str());
   CHECK(modules > 20);
+  CHECK(modules == kCorpusModules);  // false: a fixture was added to / removed from gpu/shader/spirv/tests (kCorpusModules, kCorpusDigest)
   CHECK(digest == kCorpusDigest);  // false: output changed, bump kLowerVersion / kEmitVersion and update kCorpusDigest
+  if (digest != kCorpusDigest || modules != kCorpusModules) {
+    std::printf("  corpus: %u modules (expected %u), digest 0x%016llx (expected 0x%016llx); modules, in digest order:\n", modules,
+                kCorpusModules, (unsigned long long)digest, (unsigned long long)kCorpusDigest);
+    for (const std::string& l : listing) std::printf("    %s\n", l.c_str());
+  }
 
   // robustBuffers: the checks against the buffer sizes (vp_args.bs<N>) are in the MSL by default and gone with it off.
   {
@@ -14960,8 +14979,9 @@ void testAuditTwoDevices() {
   tb.join();
 }
 
-// V5: chunks of a command buffer's upload arena go back on vkTrimCommandPool (reset command buffers) and on a reset with
-// RELEASE_RESOURCES; a plain reset keeps them for the next recording.
+// V5: chunks of a command buffer's upload arena go back on vkTrimCommandPool (reset command buffers, keeping one) and, with the
+// RELEASE_RESOURCES bit, only the excess over what the recordings used and only after kReleaseFrames consecutive resets that find it; a
+// plain reset keeps them all.
 void testAuditArena() {
   Ctx c;
   VkDeviceMemory m = alloc(c, 1 << 20, 1);
@@ -14974,29 +14994,44 @@ void testAuditArena() {
   VkCommandBuffer cb;
   vkAllocateCommandBuffers(c.dev, &ai, &cb);
   Recorder& r = *from<CommandBuffer>(cb)->rec;
-  auto record = [&] {
+  auto record = [&](int fills, int ops = 0) {
     VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     vkBeginCommandBuffer(cb, &bi);
-    for (int i = 0; i < 10; ++i) vkCmdFillBuffer(cb, b, 0, 65536, 0x01020304u);  // a word pattern: 64 KiB of arena each
+    for (int i = 0; i < fills; ++i) vkCmdFillBuffer(cb, b, 0, 65536, 0x01020304u);  // a word pattern: 64 KiB of arena each
+    for (int i = 0; i < ops; ++i) vkCmdFillBuffer(cb, b, 0, 16, 0);                 // (no arena)
     vkEndCommandBuffer(cb);
     VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
     si.commandBufferCount = 1, si.pCommandBuffers = &cb;
     CHECK(vkQueueSubmit(c.queue, 1, &si, VK_NULL_HANDLE) == VK_SUCCESS);
     vkQueueWaitIdle(c.queue);
   };
-  record();
+  record(10);
   CHECK(r.arena.chunks.size() == 10);
   CHECK(vkResetCommandBuffer(cb, 0) == VK_SUCCESS);
   CHECK(r.arena.chunks.size() == 10);  // a plain reset keeps them: the next recording reuses them
   vkTrimCommandPool(c.dev, pool, 0);
   CHECK(r.arena.chunks.size() == 1);   // trim keeps one
-  record();
+  record(10);
   CHECK(r.arena.chunks.size() == 10);
-  CHECK(vkResetCommandBuffer(cb, VK_COMMAND_BUFFER_RESET_RELEASE_RESOURCES_BIT) == VK_SUCCESS);
-  CHECK(r.arena.chunks.empty() && r.ops.capacity() == 0);
-  record();
+  // The bit every frame with the same load: nothing is given back, nothing is allocated again.
+  const uint8_t* first = r.arena.chunks[0].host;
+  for (int i = 0; i < 20; ++i) {
+    CHECK(vkResetCommandBuffer(cb, VK_COMMAND_BUFFER_RESET_RELEASE_RESOURCES_BIT) == VK_SUCCESS);
+    record(10, 300);
+  }
+  CHECK(r.arena.chunks.size() == 10 && r.arena.chunks[0].host == first && r.ops.capacity() >= 310);
+  // The load drops: the excess goes after kReleaseFrames consecutive resets with the bit, not before.
+  CHECK(vkResetCommandBuffer(cb, VK_COMMAND_BUFFER_RESET_RELEASE_RESOURCES_BIT) == VK_SUCCESS);  // (ends the 10-chunk recording)
+  for (uint32_t i = 1; i <= Recorder::kReleaseFrames; ++i) {
+    record(1);
+    CHECK(vkResetCommandBuffer(cb, VK_COMMAND_BUFFER_RESET_RELEASE_RESOURCES_BIT) == VK_SUCCESS);
+    CHECK(r.arena.chunks.size() == (i < Recorder::kReleaseFrames ? 10u : 1u));
+  }
+  CHECK(r.ops.capacity() <= 2 * 1 + 64 + 8);  // (the capacity of the 310-op frames went with them)
+  record(10);  // heavier again: the chunks are made again, and everything works
+  CHECK(r.arena.chunks.size() == 10);
   vkResetCommandPool(c.dev, pool, VK_COMMAND_POOL_RESET_RELEASE_RESOURCES_BIT);
-  CHECK(r.arena.chunks.empty() && r.ops.capacity() == 0);
+  CHECK(r.arena.chunks.size() == 10);  // (one reset with the bit: the hysteresis keeps what the last recording used)
   c.gpu().pipelines().waitIdle();
   vkDestroyCommandPool(c.dev, pool, nullptr);
   vkDestroyBuffer(c.dev, b, nullptr);
@@ -15282,19 +15317,702 @@ void testAuditRecipeRewrite() {
   std::filesystem::remove_all(dir);
 }
 
-// V14: the arena room reserved for a later fill (put with no data) is not cleared: whoever asks for it fills all of it.
+// V14: the arena room reserved for a later fill (put with no data) keeps its place and chunk; whoever asks for it fills all of it. The one
+// caller that cannot promise that is vkCmdUpdateBuffer with a null pData (invalid use, but it must not upload whatever the chunk held):
+// that room is zeros.
 void testAuditArenaReserve() {
   Ctx c;
-  Recorder r;
-  r.device = from<Device>(c.dev);
+  VkDeviceMemory m = alloc(c, 1 << 16, 1);
+  VkBuffer b = buffer(c, 4096, m, 0);
+  VkCommandPoolCreateInfo pi{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+  VkCommandPool pool;
+  vkCreateCommandPool(c.dev, &pi, nullptr, &pool);
+  VkCommandBufferAllocateInfo ai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+  ai.commandPool = pool, ai.commandBufferCount = 1;
+  VkCommandBuffer cb;
+  vkAllocateCommandBuffers(c.dev, &ai, &cb);
+  Recorder& r = *from<CommandBuffer>(cb)->rec;
+  VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
   std::vector<uint8_t> pattern(4096, 0xAB);
-  VkDeviceSize off = 0;
-  r.arena.put(r.device, pattern.data(), pattern.size(), off);
-  r.reset();
-  VkDeviceSize off2 = ~VkDeviceSize(0);
-  r.arena.put(r.device, nullptr, pattern.size(), off2);
-  CHECK(off2 == off && r.arena.chunks.size() == 1);
-  CHECK(r.arena.chunks[0].host[off2] == 0xAB && r.arena.chunks[0].host[off2 + 4095] == 0xAB);
+  vkBeginCommandBuffer(cb, &bi);
+  vkCmdUpdateBuffer(cb, b, 0, pattern.size(), pattern.data());
+  const OpUpload first = std::get<OpUpload>(r.ops.back());
+  CHECK(r.arena.chunks.size() == 1 && r.arena.chunks[0].host[first.srcOffset] == 0xAB);
+  vkEndCommandBuffer(cb);
+  CHECK(vkResetCommandBuffer(cb, 0) == VK_SUCCESS);  // the chunk stays, with the pattern in it
+  vkBeginCommandBuffer(cb, &bi);
+  VkDeviceSize reserved = ~VkDeviceSize(0);
+  r.arena.put(r.device, nullptr, pattern.size(), reserved);  // a reservation: placed in the same chunk, contents not promised
+  CHECK(reserved == first.srcOffset && r.arena.chunks.size() == 1);
+  r.arena.reset();
+  vkCmdUpdateBuffer(cb, b, 0, pattern.size(), nullptr);
+  const OpUpload second = std::get<OpUpload>(r.ops.back());
+  CHECK(second.srcOffset == first.srcOffset && r.arena.chunks.size() == 1);
+  bool zeros = true;
+  for (size_t i = 0; i < pattern.size(); ++i) zeros = zeros && r.arena.chunks[0].host[second.srcOffset + i] == 0;
+  CHECK(zeros);
+  vkEndCommandBuffer(cb);
+  vkDestroyCommandPool(c.dev, pool, nullptr);
+  vkDestroyBuffer(c.dev, b, nullptr);
+  vkFreeMemory(c.dev, m, nullptr);
+}
+
+// ---- second review of gpu/vulkan: registry / submit lock order, recipe store failures, translator mode ---------------------------
+// A Platform whose native encode runs the callback at once (the null platform has no native queue): what vpvk_native_submit needs to
+// run a host callback on the calling thread with the submit mutex held, like the Metal one.
+class NativeCallbackPlatform final : public Platform {
+ public:
+  explicit NativeCallbackPlatform(std::unique_ptr<Platform> inner) : inner_(std::move(inner)) {}
+  vpgpu::Backend& backend() override { return inner_->backend(); }
+  void* nativeDevice() override { return reinterpret_cast<void*>(uintptr_t(0xD3)); }
+  bool encodeNative(void (*fn)(void*, void*), void* user) override {
+    fn(nullptr, user);
+    return true;
+  }
+
+ private:
+  std::unique_ptr<Platform> inner_;
+};
+void* const kFakeNativeDevice = reinterpret_cast<void*>(uintptr_t(0xD3));
+
+// A deadlock cannot be undone: report it and end the process (the other tests of the group would only hang behind it).
+void dieOnDeadlock(const char* what) {
+  std::printf("  FAIL %s: deadlock (no thread came back)\n", what);
+  std::fflush(stdout);
+  std::_Exit(1);
+}
+// Waits for `f` up to `ms`; false when it did not come back.
+template <class T>
+bool readyWithin(std::future<T>& f, int ms) { return f.wait_for(std::chrono::milliseconds(ms)) == std::future_status::ready; }
+
+// Waits until a host call is blocked on the device's submit mutex (it counts itself in Device::hostUsers before it waits). Bounded: 10 s.
+void waitUntilHostCallWaits(Device* d) {
+  const auto end = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+  while (d->hostUsers.load() == 0 && std::chrono::steady_clock::now() < end) std::this_thread::yield();
+}
+
+struct LockRig {
+  Device* dev = nullptr;
+  VkImage img = VK_NULL_HANDLE;
+  std::thread blocker;
+  std::promise<void> held, release;
+  std::atomic<bool> blockerDone{false};
+  int markResult = -1, nestedResult = -1;
+  void* nativeDevice = nullptr;
+  void* mask = reinterpret_cast<void*>(uintptr_t(1));
+};
+
+VkImage auditImage(VkDevice dev) {
+  VkImageCreateInfo ii{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+  ii.imageType = VK_IMAGE_TYPE_2D, ii.format = VK_FORMAT_R8G8B8A8_UNORM, ii.extent = {64, 64, 1}, ii.mipLevels = 1, ii.arrayLayers = 1;
+  ii.samples = VK_SAMPLE_COUNT_1_BIT, ii.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+  VkImage img = VK_NULL_HANDLE;
+  vkCreateImage(dev, &ii, nullptr, &img);
+  return img;
+}
+
+// V19: the registry mutex (liveDeviceMutex) and the submit mutex. A thread inside a vpvk_native_submit callback holds the submit mutex and
+// may call vpvk_native_device (vpvk/config.h); another one in vpvk_mark_eye_image / vkGetMTLTextureMVK used to wait for the submit mutex
+// WITH the registry taken: the callback then waited for the registry. A host call never waits for the submit mutex holding the registry
+// (it pins the device instead), in the callback the device calls take no registry at all, and the host calls that need the submit mutex
+// are refused there.
+void testAuditLockOrder() {
+  Ctx c;
+  Device* d = from<Device>(c.dev);
+  d->platform = std::make_unique<NativeCallbackPlatform>(std::move(d->platform));
+  const VkImage img = auditImage(c.dev);
+  // 1. The deadlock itself: the callback (submit mutex held) calls vpvk_native_device while another thread, in vpvk_mark_eye_image, holds
+  // the registry waiting for that mutex. (The callback waits until the other thread is seen holding the registry: that is the interleaving.)
+  {
+    LockRig rig;
+    rig.img = img, rig.dev = d;
+    auto cb = [](void*, void* user) {
+      LockRig& r = *static_cast<LockRig*>(user);
+      r.blocker = std::thread([&r] {
+        vpvk_mark_eye_image(r.img);
+        r.blockerDone = true;
+      });
+      waitUntilHostCallWaits(r.dev);  // (that thread waits for the submit mutex this callback holds)
+      r.nativeDevice = vpvk_native_device();
+    };
+    std::promise<void> done;
+    std::future<void> doneF = done.get_future();
+    std::thread t([&] {
+      CHECK(vpvk_native_submit(cb, &rig) == 1);
+      done.set_value();
+    });
+    if (!readyWithin(doneF, 10000)) dieOnDeadlock("native_submit callback vs vpvk_mark_eye_image");
+    t.join();
+    rig.blocker.join();
+    CHECK(rig.blockerDone && rig.nativeDevice == kFakeNativeDevice);
+  }
+  // 2. Inside the callback the device calls do not touch the registry: another thread holds it for the whole callback.
+  {
+    LockRig rig;
+    auto cb = [](void*, void* user) {
+      LockRig& r = *static_cast<LockRig*>(user);
+      std::future<void> heldF = r.held.get_future(), releaseF = r.release.get_future();
+      r.blocker = std::thread([&r, releaseF = std::move(releaseF)]() mutable {
+        std::lock_guard<std::mutex> registry(liveDeviceMutex());
+        r.held.set_value();
+        releaseF.wait();
+      });
+      heldF.wait();  // the registry is held now, until this callback is done with its calls
+      int w, h, s;
+      r.nativeDevice = vpvk_native_device();
+      r.mask = vpvk_ui_mask_texture(0, &w, &h, &s);
+      r.release.set_value();
+    };
+    std::promise<void> done;
+    std::future<void> doneF = done.get_future();
+    std::thread t([&] {
+      vpvk_native_submit(cb, &rig);
+      done.set_value();
+    });
+    if (!readyWithin(doneF, 10000)) dieOnDeadlock("device calls inside the native_submit callback");
+    t.join();
+    rig.blocker.join();
+    CHECK(rig.nativeDevice == kFakeNativeDevice && rig.mask == nullptr);
+  }
+  // 2b. The host calls that need the submit mutex are refused inside the callback (it holds it): 0, not a wait for itself.
+  {
+    LockRig rig;
+    rig.img = img;
+    auto cb = [](void*, void* user) {
+      LockRig& r = *static_cast<LockRig*>(user);
+      r.markResult = vpvk_mark_eye_image(r.img);
+      r.nestedResult = vpvk_native_submit([](void*, void*) {}, nullptr);
+    };
+    std::promise<void> done;
+    std::future<void> doneF = done.get_future();
+    std::thread t([&] {
+      vpvk_native_submit(cb, &rig);
+      done.set_value();
+    });
+    if (!readyWithin(doneF, 10000)) dieOnDeadlock("re-entrant host calls inside the native_submit callback");
+    t.join();
+    CHECK(rig.markResult == 0 && rig.nestedResult == 0);
+  }
+  // 3. gpu.hold: a vkQueueSubmit keeps the submit mutex while its pipelines compile. Whoever waits for that mutex in a host call must not
+  // stop the per-frame calls that take the registry (gpu lost / backlog, the memory budget of the physical device).
+  struct Blocker {
+    const char* name;
+    std::function<void()> run;
+  };
+  const Blocker blockers[] = {{"vpvk_mark_eye_image", [&] { vpvk_mark_eye_image(img); }},
+                              {"vkGetMTLTextureMVK", [&] { void* out; vkGetMTLTextureMVK(img, &out); }},
+                              {"vpvk_native_submit", [&] { vpvk_native_submit([](void*, void*) {}, nullptr); }}};
+  for (const Blocker& b : blockers) {
+    std::promise<void> held, release, perFrameDone;
+    std::future<void> heldF = held.get_future(), perFrameF = perFrameDone.get_future();
+    std::shared_future<void> releaseF = release.get_future().share();
+    std::thread hold([&] {  // the frame being held
+      std::lock_guard<std::mutex> submit(d->submitMutex);
+      held.set_value();
+      releaseF.wait();
+    });
+    heldF.wait();
+    std::thread waiter(b.run);
+    waitUntilHostCallWaits(d);
+    std::thread perFrame([&] {
+      VkPhysicalDeviceMemoryBudgetPropertiesEXT bud{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT};
+      VkPhysicalDeviceMemoryProperties2 mp{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2, &bud};
+      vkGetPhysicalDeviceMemoryProperties2(c.pd, &mp);
+      vpvk_gpu_lost();
+      vpvk_gpu_backlog_ms();
+      vpvk_gpu_last_frame_chunks();
+      perFrameDone.set_value();
+    });
+    const bool ok = readyWithin(perFrameF, 5000);
+    if (!ok) std::printf("  FAIL per-frame calls stopped behind a held submit mutex (%s)\n", b.name);
+    release.set_value();  // the frame is committed
+    hold.join();
+    waiter.join();
+    perFrame.join();
+    CHECK(ok);
+  }
+  vkDestroyImage(c.dev, img, nullptr);
+}
+
+// V20: a failed write that also fails to reopen the file (the store ends up without one) must not be written to again by the same
+// addStage (it did: a null FILE*), and the store must stay off. The child process has a file size limit and the path is a directory.
+void testAuditRecipeNoFile() {
+  char tmpl[] = "/tmp/vpvk_audit_nofile_XXXXXX";
+  const char* dirp = mkdtemp(tmpl);
+  CHECK(dirp != nullptr);
+  if (!dirp) return;
+  const std::string dir = dirp, file = dir + "/recipes.bin";
+  constexpr size_t kText = 5000;
+  std::signal(SIGXFSZ, SIG_IGN);
+  RecipeStore s(dir);
+  auditAddStage(s, 1, kText);
+  const size_t before = auditFile(file).size();
+  // The size of the shader record of a second MSL for the same input, measured in a twin store (tag, length, payload).
+  char tmpl2[] = "/tmp/vpvk_audit_nofile2_XXXXXX";
+  const std::string dir2 = mkdtemp(tmpl2);
+  size_t shaderRecord = 0;
+  {
+    RecipeStore twin(dir2);
+    auditAddStage(twin, 1, kText);
+    StageInput in;
+    in.spirv = 0x1001;
+    const std::vector<uint32_t> words = {0x07230203u, 0x00010000u, 0u, 1u, 0u};
+    ShaderBlob blob;
+    blob.source = "// shader 1\n" + std::string(kText, 'b');
+    twin.addStage(in, in.hash(), words, 0x6001, blob);
+    const std::string bytes = auditFile(dir2 + "/recipes.bin");
+    uint32_t len = 0;
+    std::memcpy(&len, bytes.data() + before + 1, 4);
+    shaderRecord = 5 + len;
+    CHECK(bytes[before] == 'S');
+  }
+  std::filesystem::remove_all(dir2);
+  // The path becomes a directory (the open stream keeps writing to the unlinked file): the reopen after a failed write cannot succeed.
+  std::filesystem::remove(file);
+  std::filesystem::create_directory(file);
+  const pid_t pid = fork();
+  if (pid == 0) {
+    struct rlimit lim {};
+    getrlimit(RLIMIT_FSIZE, &lim);
+    lim.rlim_cur = before + shaderRecord + 2;  // the shader record fits, the drift record that follows does not
+    setrlimit(RLIMIT_FSIZE, &lim);
+    StageInput in;
+    in.spirv = 0x1001;
+    const std::vector<uint32_t> words = {0x07230203u, 0x00010000u, 0u, 1u, 0u};
+    ShaderBlob blob;
+    blob.source = "// shader 1\n" + std::string(kText, 'b');
+    s.addStage(in, in.hash(), words, 0x6001, blob);  // same input, other MSL: a drift
+    _exit(s.enabled() ? 2 : 0);
+  }
+  int status = 0;
+  waitpid(pid, &status, 0);
+  CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+  if (WIFSIGNALED(status)) std::printf("  addStage killed the process: signal %d\n", WTERMSIG(status));
+  std::filesystem::remove_all(dir);
+}
+
+// V21: a drift is not lost by a rewrite. The compacted file drops the drift record written before it (and nothing in refresh retranslated),
+// so the rewrite writes one again when a drift was noted before its copy of the index; a drift found while it works with the store
+// unlocked is covered by that record, or (none noted before) writes its own.
+void testAuditRecipeDriftWindow() {
+  constexpr size_t kText = 2000;
+  const std::vector<uint32_t> w3 = {0x07230203u, 0x00010000u, 0u, 3u, 0u};
+  auto drift3 = [&](RecipeStore& s) {  // input 3 again, with another MSL
+    StageInput i3;
+    i3.spirv = 0x1000 + 3;
+    ShaderBlob blob;
+    blob.source = "// shader 3 again";
+    s.addStage(i3, i3.hash(), w3, 0x7003, blob);
+  };
+  enum Case { DriftBefore, DriftBeforeAndInWindow, DriftOnlyInWindow, NoDrift };
+  for (Case cs : {DriftBefore, DriftBeforeAndInWindow, DriftOnlyInWindow, NoDrift}) {
+    char tmpl[] = "/tmp/vpvk_audit_drift_XXXXXX";
+    const char* dirp = mkdtemp(tmpl);
+    CHECK(dirp != nullptr);
+    if (!dirp) return;
+    const std::string dir = dirp;
+    {
+      RecipeStore s(dir);
+      StageInput in;
+      in.spirv = 0x77;
+      const std::vector<uint32_t> words = {0x07230203u, 0x00010000u, 0u, 7u, 0u};
+      const uint32_t base = translatorId();
+      for (uint64_t k = 0; k < 300; ++k) {
+        ShaderBlob blob;
+        blob.source = "// dead " + std::to_string(k) + std::string(200, 'd');
+        if (cs == DriftBefore || cs == DriftBeforeAndInWindow) {
+          s.addStage(in, in.hash(), words, 0x9000 + k, blob);  // one input, many MSLs: drifts, and a file due for compaction
+        } else {  // dead records without a drift: the same input recorded under alternating translator ids
+          s.setTranslator(base + uint32_t((k + 1) % 2));  // (ends on `base`)
+          s.addStage(in, in.hash(), words, 0x9000, blob);
+        }
+      }
+      s.setTranslator(base);
+      vpgpu::PipelineState last;
+      last.vertexShader = cs == DriftBefore || cs == DriftBeforeAndInWindow ? 0x9000 + 299 : 0x9000;
+      last.label = "audit_dead";
+      StageInput in7;
+      in7.spirv = 0x77;
+      s.addPipeline(last, {in7.hash(), 0, 0});
+      for (uint64_t n = 0; n < 5; ++n) auditAddStage(s, n, kText);
+      CHECK(s.needsRefresh());
+      if (cs == DriftBeforeAndInWindow || cs == DriftOnlyInWindow)
+        s.rewriteGate = [&] {
+          std::thread other([&] { drift3(s); });  // while the compacted copy is written
+          other.join();
+        };
+      const RecipeStore::RefreshResult r = s.refresh(1);
+      s.rewriteGate = nullptr;
+      CHECK(r.rewritten);
+    }
+    {
+      RecipeStore t(dir);  // the file as the next run reads it
+      CHECK(t.enabled());
+      CHECK(t.needsRefresh() == (cs != NoDrift));  // (NoDrift is the control: the compacted file says nothing of drift)
+    }
+    std::filesystem::remove_all(dir);
+  }
+}
+
+// V22: forDir hands the one store of a directory to every device of the process; a device created after the host changed the
+// translator mode (VPVK_AMPLIFY / VPVK_FETCH_NATIVE) translates in the new mode, so what it records is labelled with the new id.
+void testAuditStoreTranslatorMode() {
+  char tmpl[] = "/tmp/vpvk_audit_mode_XXXXXX";
+  const char* dirp = mkdtemp(tmpl);
+  CHECK(dirp != nullptr);
+  if (!dirp) return;
+  const std::string dir = dirp;
+  const char* oldAmp = std::getenv("VPVK_AMPLIFY");
+  const std::string saved = oldAmp ? oldAmp : "";
+  setenv("VPVK_AMPLIFY", "0", 1);
+  refreshTranslatorMode();
+  const uint32_t idOff = translatorId();
+  {
+    std::shared_ptr<RecipeStore> first = RecipeStore::forDir(dir);  // the first device
+    setenv("VPVK_AMPLIFY", "1", 1);
+    refreshTranslatorMode();  // the host's next device
+    const uint32_t idOn = translatorId();
+    CHECK(idOn != idOff);
+    std::shared_ptr<RecipeStore> second = RecipeStore::forDir(dir);
+    CHECK(second == first);
+    auditAddStage(*second, 1, 100);
+    RecipeStore reload(dir);  // from scratch, in the mode the record was made in
+    CHECK(reload.enabled() && !reload.needsRefresh());  // (labelled with the old id it would be stale: a retranslation for nothing)
+    setenv("VPVK_AMPLIFY", "0", 1);
+    refreshTranslatorMode();
+    RecipeStore other(dir);  // and in the mode before, it is the stale one
+    CHECK(other.needsRefresh());
+  }
+  if (oldAmp) setenv("VPVK_AMPLIFY", saved.c_str(), 1);
+  else unsetenv("VPVK_AMPLIFY");
+  refreshTranslatorMode();
+  std::filesystem::remove_all(dir);
+}
+
+// V23: a submission that asks for many MSAA variants at once (forced MSAA, synchronous pipelines) waits for each of them: the budget
+// (VPVK_PIPELINE_DRAW_WAIT_MS) is every variant's own, so none reaches the backend still compiling. Whole path: vkQueueSubmit -> translate
+// (forceMsaa, pipelineFor) -> runBatches -> awaitFreshVariants. The compiles are slowed so that all of them need more than one budget.
+void testAuditForcedVariantsAwait() {
+  setenv("VPVK_PIPELINE_DRAW_WAIT_MS", "500", 1);
+  vpvk_taa_jitter eyeOnly{0, 64, 64, 0, 0, 0};  // the eye's size: the 64x64 pass of the rig is an eye pass
+  vpvk_taa_set_jitter(&eyeOnly);
+  vpvk_config_set_msaa_force(4);
+  {
+    Ctx c;
+    Device* dev = from<Device>(c.dev);
+    CHECK(msaaForce() == 4 && !dev->translator);
+    DrawRig rig(c);
+    VkDeviceMemory vm = alloc(c, 4096, 1);
+    VkBuffer vb = buffer(c, 4096, vm, 0);
+    VkShaderModule vs = module(c, "pos.vert.spv"), fs = module(c, "solid.frag.spv");
+    VkPipelineLayoutCreateInfo plci{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    VkPipelineLayout pl;
+    vkCreatePipelineLayout(c.dev, &plci, nullptr, &pl);
+    constexpr int kN = 24;  // (more than the workers can compile in one budget at 200 ms each)
+    VkPipeline pipes[kN];
+    std::set<uint64_t> keys;
+    for (int i = 0; i < kN; ++i) {
+      PipeOpts o;
+      o.colorMask = 1u + uint32_t(i % 15);
+      o.cull = i < 15 ? VK_CULL_MODE_NONE : VK_CULL_MODE_BACK_BIT;
+      pipes[i] = makePosPipeline(c, rig, pl, o, vs, fs);
+      keys.insert(from<PipelineObj>(pipes[i])->key.value);
+    }
+    c.gpu().pipelines().waitIdle();
+    CHECK(keys.size() == size_t(kN));
+    auto& nb = static_cast<vpgpu::NullBackend&>(dev->platform->backend());
+    nb.onCompile = [] { std::this_thread::sleep_for(std::chrono::milliseconds(200)); };
+    rig.begin();
+    VkBuffer bufs[1] = {vb};
+    VkDeviceSize offs[1] = {0};
+    vkCmdBindVertexBuffers(rig.cb, 0, 1, bufs, offs);
+    for (int i = 0; i < kN; ++i) {
+      vkCmdBindPipeline(rig.cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipes[i]);
+      vkCmdDraw(rig.cb, 3, 1, 0, 0);
+    }
+    vkCmdEndRenderPass(rig.cb);
+    vkEndCommandBuffer(rig.cb);
+    VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+    si.commandBufferCount = 1, si.pCommandBuffers = &rig.cb;
+    CHECK(vkQueueSubmit(c.queue, 1, &si, VK_NULL_HANDLE) == VK_SUCCESS);
+    // Right after the submit (nothing waited for the compiles here): every variant it asked for is compiled.
+    size_t variants = 0, unready = 0;
+    for (int i = 0; i < kN; ++i)
+      for (const auto& [samples, k] : from<PipelineObj>(pipes[i])->variants) {
+        ++variants;
+        const auto st = c.gpu().pipelines().status(k);
+        unready += st == vpgpu::PipelineCache::Status::Queued || st == vpgpu::PipelineCache::Status::Compiling;
+      }
+    CHECK(dev->msaaTwins.passes == 1 && variants == size_t(kN));
+    CHECK(unready == 0);
+    nb.onCompile = nullptr;
+    c.gpu().pipelines().waitIdle();
+    vkQueueWaitIdle(c.queue);
+    for (VkPipeline p : pipes) vkDestroyPipeline(c.dev, p, nullptr);
+    vkDestroyShaderModule(c.dev, vs, nullptr), vkDestroyShaderModule(c.dev, fs, nullptr);
+    vkDestroyPipelineLayout(c.dev, pl, nullptr);
+    vkDestroyBuffer(c.dev, vb, nullptr);
+    vkFreeMemory(c.dev, vm, nullptr);
+  }
+  vpvk_config_set_msaa_force(0);
+  vpvk_taa_jitter off{};
+  vpvk_taa_set_jitter(&off);
+  unsetenv("VPVK_PIPELINE_DRAW_WAIT_MS");
+}
+
+// V23b: the wait of a submission for its fresh variants has a global cap (8 budgets): compiles that hang cannot stall the submit (the submit
+// mutex is held) for variants x budget.
+void testAuditForcedVariantsCap() {
+  setenv("VPVK_PIPELINE_DRAW_WAIT_MS", "100", 1);
+  vpvk_taa_jitter eyeOnly{0, 64, 64, 0, 0, 0};  // the eye's size: the 64x64 pass of the rig is an eye pass
+  vpvk_taa_set_jitter(&eyeOnly);
+  vpvk_config_set_msaa_force(4);
+  {
+    Ctx c;
+    Device* dev = from<Device>(c.dev);
+    CHECK(msaaForce() == 4 && !dev->translator);
+    DrawRig rig(c);
+    VkDeviceMemory vm = alloc(c, 4096, 1);
+    VkBuffer vb = buffer(c, 4096, vm, 0);
+    VkShaderModule vs = module(c, "pos.vert.spv"), fs = module(c, "solid.frag.spv");
+    VkPipelineLayoutCreateInfo plci{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    VkPipelineLayout pl;
+    vkCreatePipelineLayout(c.dev, &plci, nullptr, &pl);
+    constexpr int kN = 24;  // (more than the workers can compile in one budget at 200 ms each)
+    VkPipeline pipes[kN];
+    std::set<uint64_t> keys;
+    for (int i = 0; i < kN; ++i) {
+      PipeOpts o;
+      o.colorMask = 1u + uint32_t(i % 15);
+      o.cull = i < 15 ? VK_CULL_MODE_NONE : VK_CULL_MODE_BACK_BIT;
+      pipes[i] = makePosPipeline(c, rig, pl, o, vs, fs);
+      keys.insert(from<PipelineObj>(pipes[i])->key.value);
+    }
+    c.gpu().pipelines().waitIdle();
+    CHECK(keys.size() == size_t(kN));
+    auto& nb = static_cast<vpgpu::NullBackend&>(dev->platform->backend());
+    std::mutex gm;
+    std::condition_variable gcv;
+    bool open = false;
+    nb.onCompile = [&] {  // the compiles hang until the test lets them go
+      std::unique_lock lock(gm);
+      gcv.wait(lock, [&] { return open; });
+    };
+    rig.begin();
+    VkBuffer bufs[1] = {vb};
+    VkDeviceSize offs[1] = {0};
+    vkCmdBindVertexBuffers(rig.cb, 0, 1, bufs, offs);
+    for (int i = 0; i < kN; ++i) {
+      vkCmdBindPipeline(rig.cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipes[i]);
+      vkCmdDraw(rig.cb, 3, 1, 0, 0);
+    }
+    vkCmdEndRenderPass(rig.cb);
+    vkEndCommandBuffer(rig.cb);
+    VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+    si.commandBufferCount = 1, si.pCommandBuffers = &rig.cb;
+    const auto t0 = std::chrono::steady_clock::now();
+    CHECK(vkQueueSubmit(c.queue, 1, &si, VK_NULL_HANDLE) == VK_SUCCESS);
+    const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    // Right after the submit (nothing waited for the compiles here): every variant it asked for is compiled.
+    size_t variants = 0, unready = 0;
+    for (int i = 0; i < kN; ++i)
+      for (const auto& [samples, k] : from<PipelineObj>(pipes[i])->variants) {
+        ++variants;
+        const auto st = c.gpu().pipelines().status(k);
+        unready += st == vpgpu::PipelineCache::Status::Queued || st == vpgpu::PipelineCache::Status::Compiling;
+      }
+    CHECK(dev->msaaTwins.passes == 1 && variants == size_t(kN));
+    CHECK(unready > 0);                 // hung compiles are not waited for for ever...
+    CHECK(ms >= 700.0 && ms < 4000.0);  // ...the whole wait is a few budgets (8 x 100 ms), not variants x budget (2.4 s and more)
+    {
+      std::lock_guard lock(gm);
+      open = true;
+    }
+    gcv.notify_all();
+    c.gpu().pipelines().waitIdle();
+    nb.onCompile = nullptr;
+    c.gpu().pipelines().waitIdle();
+    vkQueueWaitIdle(c.queue);
+    for (VkPipeline p : pipes) vkDestroyPipeline(c.dev, p, nullptr);
+    vkDestroyShaderModule(c.dev, vs, nullptr), vkDestroyShaderModule(c.dev, fs, nullptr);
+    vkDestroyPipelineLayout(c.dev, pl, nullptr);
+    vkDestroyBuffer(c.dev, vb, nullptr);
+    vkFreeMemory(c.dev, vm, nullptr);
+  }
+  vpvk_config_set_msaa_force(0);
+  vpvk_taa_jitter off{};
+  vpvk_taa_set_jitter(&off);
+  unsetenv("VPVK_PIPELINE_DRAW_WAIT_MS");
+}
+
+// V24: RELEASE_RESOURCES every frame costs next to nothing (engines pass the bit on each reset), a reset never waits for the submit mutex
+// (the excess is handed to the device and freed by its next submission), and a chunk made for one huge copy is not the one that is kept.
+void testAuditReleaseCost() {
+  Ctx c;
+  Device* d = from<Device>(c.dev);
+  VkDeviceMemory m = alloc(c, 1 << 20, 1);
+  VkBuffer b = buffer(c, 1 << 17, m, 0);
+  VkCommandPoolCreateInfo pi{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+  VkCommandPool pool;
+  vkCreateCommandPool(c.dev, &pi, nullptr, &pool);
+  VkCommandBufferAllocateInfo ai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+  ai.commandPool = pool, ai.commandBufferCount = 1;
+  VkCommandBuffer cb;
+  vkAllocateCommandBuffers(c.dev, &ai, &cb);
+  Recorder& r = *from<CommandBuffer>(cb)->rec;
+  VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+  auto recordOnly = [&](int fills, int ops) {  // recorded, not submitted
+    vkBeginCommandBuffer(cb, &bi);
+    for (int i = 0; i < fills; ++i) vkCmdFillBuffer(cb, b, 0, 65536, 0x01020304u);
+    for (int i = 0; i < ops; ++i) vkCmdFillBuffer(cb, b, 0, 16, 0);
+    vkEndCommandBuffer(cb);
+  };
+  auto submit = [&] {
+    VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+    si.commandBufferCount = 1, si.pCommandBuffers = &cb;
+    CHECK(vkQueueSubmit(c.queue, 1, &si, VK_NULL_HANDLE) == VK_SUCCESS);
+    vkQueueWaitIdle(c.queue);
+  };
+  // 1. No wait for the submit mutex: the resets that give the excess back run while a submission holds the mutex.
+  recordOnly(10, 0);
+  submit();
+  CHECK(vkResetCommandBuffer(cb, VK_COMMAND_BUFFER_RESET_RELEASE_RESOURCES_BIT) == VK_SUCCESS);
+  {
+    std::promise<void> held, release, done;
+    std::future<void> heldF = held.get_future(), doneF = done.get_future();
+    std::shared_future<void> releaseF = release.get_future().share();
+    std::thread holder([&] {
+      std::lock_guard<std::mutex> submitMutex(d->submitMutex);
+      held.set_value();
+      releaseF.wait();
+    });
+    heldF.wait();
+    std::thread resets([&] {
+      for (uint32_t i = 0; i < Recorder::kReleaseFrames; ++i) {
+        recordOnly(1, 0);
+        vkResetCommandBuffer(cb, VK_COMMAND_BUFFER_RESET_RELEASE_RESOURCES_BIT);
+      }
+      done.set_value();
+    });
+    const bool ok = doneF.wait_for(std::chrono::seconds(5)) == std::future_status::ready;
+    release.set_value();
+    holder.join();
+    resets.join();
+    CHECK(ok);  // (not: the resets waited for the mutex the holder keeps)
+    CHECK(r.arena.chunks.size() == 1);
+    {
+      std::lock_guard<std::mutex> l(d->retiredChunksMutex);
+      CHECK(d->retiredChunks.size() == 9);  // given back, not yet freed
+    }
+    recordOnly(1, 0);
+    submit();  // the next submission frees them
+    {
+      std::lock_guard<std::mutex> l(d->retiredChunksMutex);
+      CHECK(d->retiredChunks.empty());
+    }
+  }
+  // 2. Cost per frame (recording + reset): with the bit it stays close to a plain reset. (The old behaviour, every chunk and the ops
+  // freed on each reset and made again by the next recording, is timed too, for the printed comparison.)
+  using Clock = std::chrono::steady_clock;
+  enum Mode { Plain, Bit, Old };
+  auto perFrameUs = [&](Mode mode) {
+    double best = 1e18;
+    for (int trial = 0; trial < 7; ++trial) {
+      const auto t0 = Clock::now();
+      for (int i = 0; i < 100; ++i) {
+        recordOnly(6, 1500);
+        if (mode == Bit) {
+          vkResetCommandBuffer(cb, VK_COMMAND_BUFFER_RESET_RELEASE_RESOURCES_BIT);
+        } else if (mode == Old) {
+          r.reset();
+          r.arena.release(r.device);
+          std::vector<Op>().swap(r.ops);
+        } else {
+          vkResetCommandBuffer(cb, 0);
+        }
+      }
+      best = std::min(best, std::chrono::duration<double, std::micro>(Clock::now() - t0).count() / 100);
+    }
+    return best;
+  };
+  vkResetCommandBuffer(cb, 0);
+  perFrameUs(Plain);  // warm
+  const double plain = perFrameUs(Plain), bit = perFrameUs(Bit), old = perFrameUs(Old);
+  std::printf("  release cost per frame: plain=%.0f us bit=%.0f us (x%.2f) old_free_all=%.0f us (x%.2f)\n", plain, bit, bit / plain, old, old / plain);
+  CHECK(bit <= plain * 1.5);
+  // 3. A chunk made for one huge copy is not the one kept (trim, and the excess given back after the bit): the next chunk is a normal one.
+  {
+    Recorder rec;
+    rec.device = d;
+    VkDeviceSize off = 0;
+    rec.arena.put(rec.device, nullptr, 4u << 20, off);
+    CHECK(rec.arena.chunks.size() == 1 && rec.arena.chunks[0].size >= (4u << 20));
+    rec.reset();
+    rec.arena.trim(rec.device);
+    CHECK(rec.arena.chunks.empty());
+    rec.arena.put(rec.device, nullptr, 4096, off);
+    CHECK(rec.arena.chunks.size() == 1 && rec.arena.chunks[0].size == 65536);
+    rec.reset();
+    rec.arena.trim(rec.device);
+    CHECK(rec.arena.chunks.size() == 1);  // a normal one is kept
+  }
+  vkDestroyCommandPool(c.dev, pool, nullptr);
+  vkDestroyBuffer(c.dev, b, nullptr);
+  vkFreeMemory(c.dev, m, nullptr);
+}
+
+// V25: a refresh whose workers read modules back at offsets taken before another rewrite renamed the file (the offsets point into the new
+// one) does not take the failed read for a lost input: the input stays, stale, for the next refresh. (A real failure, no rewrite meanwhile,
+// still drops it.)
+void testAuditRefreshFileMoved() {
+  constexpr size_t kText = 300;
+  for (bool moved : {true, false}) {
+    char tmpl[] = "/tmp/vpvk_audit_moved_XXXXXX";
+    const char* dirp = mkdtemp(tmpl);
+    CHECK(dirp != nullptr);
+    if (!dirp) return;
+    const std::string dir = dirp;
+    const uint32_t base = translatorId();
+    const uint32_t other = base + 1000;
+    auto stage = [&](RecipeStore& s, uint64_t n, uint64_t msl) {  // a module whose id is its real hash (the workers check it)
+      const std::vector<uint32_t> words = {0x07230203u, 0x00010000u, 0u, uint32_t(n), 0u};
+      StageInput in;
+      in.spirv = spirvHash(words.data(), words.size());
+      ShaderBlob blob;
+      blob.source = "// shader " + std::to_string(msl) + std::string(kText, 'x');
+      s.addStage(in, in.hash(), words, msl, blob);
+      vpgpu::PipelineState st;
+      st.vertexShader = msl;
+      st.label = "moved" + std::to_string(n);
+      s.addPipeline(st, {in.hash(), 0, 0});
+    };
+    {
+      RecipeStore w(dir, other);  // an older translator wrote everything: all of it is stale for the store below
+      for (uint64_t k = 0; k < 300; ++k) {  // dead records in front of the live ones: a compaction moves the offsets
+        w.setTranslator(other + uint32_t((k + 1) % 2));
+        stage(w, 99, 0x9000);
+      }
+      w.setTranslator(other);
+      for (uint64_t n = 0; n < 3; ++n) stage(w, n, 0x5000 + n);
+    }
+    RecipeStore s(dir);
+    CHECK(s.enabled() && s.needsRefresh() && s.stageInputs().size() == 4);
+    if (moved)
+      s.translateGate = [&] {
+        s.translateGate = nullptr;
+        s.setTranslator(other);  // for the nested refresh nothing is stale: only the compaction is due, and it moves the offsets
+        s.refresh(1);
+        s.setTranslator(base);
+      };
+    const RecipeStore::RefreshResult r = s.refresh(1);
+    s.translateGate = nullptr;
+    if (moved) {
+      CHECK(r.failed == 0 && s.stageInputs().size() == 4);  // all kept (the fake modules do not parse, so none was retranslated either)
+    } else {
+      CHECK(r.failed == 4 && s.stageInputs().empty());  // the control: the modules read fine, do not translate, and go
+    }
+    std::filesystem::remove_all(dir);
+  }
 }
 
 // V18: the rate map of an eye pass is built once for the same size and settings (and again when either changes).
@@ -15520,7 +16238,7 @@ int main(int argc, char** argv) {
       {"quest_gpu_name", testQuestGpuName}, {"native_identity", testNativeIdentity}, {"inline_uniform", testInlineUniformBlock}, {"bda", testBufferDeviceAddress}, {"ycbcr", testYcbcr},
       {"taa_native", testTaaNative}, {"taa_eye_depth", testTaaEyeDepth}, {"taa_uimask", testTaaUiMask}, {"msaa_force", testMsaaForce}, {"depth_tile", testDepthTile}, {"depth_tile_off", testDepthTileOff}, {"d24_emul", testD24Emul}, {"prewarm_variants", testPrewarmVariants}, {"msaa_force_marked", testMsaaForceMarkedEye}, {"aot", testAot}, {"aniso", testAniso}, {"zeroinit", testZeroInit}, {"archive_index", testArchiveIndex}, {"foveation", testFoveation},
       {"stage_keys", testStageKeys}, {"async_pipelines", testAsyncPipelines}, {"sync_pipelines", testSyncPipelines}, {"create_default", testCreateDefault}, {"pso_census", testPsoCensus}, {"cache_state", testCacheState}, {"hide_mesh", testHideMesh}, {"pass_drop", testPassDrop}, {"skip_reasons", testSkipReasons}, {"diag_census", testDiagCensus}, {"pass_dump", testPassDump}, {"indirect_patch", testIndirectPatch}, {"astc3d", testAstc3d},
-      {"perf", testPerf}, {"phase1b", testPhase1b}, {"suspend_resume", testSuspendResume}, {"translator_modes", testTranslatorModes}, {"capture", testCapture}, {"capture_images", testCaptureImages}, {"capture_hooks", testCaptureHooks}, {"capture_codec", testCaptureCodec}, {"capture_env", testCaptureEnv}, {"capture_pools", testCapturePools}, {"capture_host_frames", testCaptureHostFrames}, {"capture_corrupt", testCaptureCorrupt}, {"capture_env_host", testCaptureEnvHost}, {"capture_env_dir", testCaptureEnvDir}, {"capture_devices", testCaptureDevices}, {"capture_unhooked", testCaptureUnhooked}, {"capture_budget", testCaptureBudget}, {"capture_locks", testCaptureLocks}, {"audit_vk_timeline", testAuditTimelinePending}, {"audit_vk_live", testAuditLiveDevice}, {"audit_vk_recipes", testAuditRecipes}, {"audit_vk_devices", testAuditTwoDevices}, {"audit_vk_arena", testAuditArena}, {"audit_vk_variant", testAuditForcedVariant}, {"audit_vk_submitlog", testAuditSubmitLog}, {"audit_vk_sources", testAuditSources}, {"audit_vk_free", testAuditFreeOrder}, {"audit_vk_sets", testAuditSetStorage}, {"audit_vk_rewrite", testAuditRecipeRewrite}, {"audit_vk_reserve", testAuditArenaReserve}, {"audit_vk_fov", testAuditFovMapCache}, {"audit_vk_linear", testAuditLinearSync}, {"audit_vk_inputs", testAuditInputsResident}, {"audit_vk_classes", testAuditClassCache}, {"audit_vk_batch", testAuditCapturePartialBatch}, {"audit_vk", [] { testAuditTimelinePending(); testAuditLiveDevice(); testAuditRecipes(); testAuditTwoDevices(); testAuditArena(); testAuditForcedVariant(); testAuditSubmitLog(); testAuditSources(); testAuditFreeOrder(); testAuditSetStorage(); testAuditRecipeRewrite(); testAuditArenaReserve(); testAuditFovMapCache(); testAuditLinearSync(); testAuditInputsResident(); testAuditClassCache(); testAuditCapturePartialBatch(); }}, {"png", testPng}, {"imgdiff", testImgDiff}, {"replay", testReplay}, {"replay_lvp", testReplayLvp}, {"refcaps", testRefCaps}};
+      {"perf", testPerf}, {"phase1b", testPhase1b}, {"suspend_resume", testSuspendResume}, {"translator_modes", testTranslatorModes}, {"capture", testCapture}, {"capture_images", testCaptureImages}, {"capture_hooks", testCaptureHooks}, {"capture_codec", testCaptureCodec}, {"capture_env", testCaptureEnv}, {"capture_pools", testCapturePools}, {"capture_host_frames", testCaptureHostFrames}, {"capture_corrupt", testCaptureCorrupt}, {"capture_env_host", testCaptureEnvHost}, {"capture_env_dir", testCaptureEnvDir}, {"capture_devices", testCaptureDevices}, {"capture_unhooked", testCaptureUnhooked}, {"capture_budget", testCaptureBudget}, {"capture_locks", testCaptureLocks}, {"audit_vk_timeline", testAuditTimelinePending}, {"audit_vk_live", testAuditLiveDevice}, {"audit_vk_recipes", testAuditRecipes}, {"audit_vk_devices", testAuditTwoDevices}, {"audit_vk_arena", testAuditArena}, {"audit_vk_variant", testAuditForcedVariant}, {"audit_vk_submitlog", testAuditSubmitLog}, {"audit_vk_sources", testAuditSources}, {"audit_vk_free", testAuditFreeOrder}, {"audit_vk_sets", testAuditSetStorage}, {"audit_vk_rewrite", testAuditRecipeRewrite}, {"audit_vk_reserve", testAuditArenaReserve}, {"audit_vk_lockorder", testAuditLockOrder}, {"audit_vk_nofile", testAuditRecipeNoFile}, {"audit_vk_drift", testAuditRecipeDriftWindow}, {"audit_vk_mode", testAuditStoreTranslatorMode}, {"audit_vk_await", testAuditForcedVariantsAwait}, {"audit_vk_moved", testAuditRefreshFileMoved}, {"audit_vk_awaitcap", testAuditForcedVariantsCap}, {"audit_vk_release", testAuditReleaseCost}, {"audit_vk_fov", testAuditFovMapCache}, {"audit_vk_linear", testAuditLinearSync}, {"audit_vk_inputs", testAuditInputsResident}, {"audit_vk_classes", testAuditClassCache}, {"audit_vk_batch", testAuditCapturePartialBatch}, {"audit_vk", [] { testAuditTimelinePending(); testAuditLiveDevice(); testAuditRecipes(); testAuditTwoDevices(); testAuditArena(); testAuditForcedVariant(); testAuditSubmitLog(); testAuditSources(); testAuditFreeOrder(); testAuditSetStorage(); testAuditRecipeRewrite(); testAuditArenaReserve(); testAuditLockOrder(); testAuditRecipeNoFile(); testAuditRecipeDriftWindow(); testAuditStoreTranslatorMode(); testAuditForcedVariantsAwait(); testAuditRefreshFileMoved(); testAuditForcedVariantsCap(); testAuditReleaseCost(); testAuditFovMapCache(); testAuditLinearSync(); testAuditInputsResident(); testAuditClassCache(); testAuditCapturePartialBatch(); }}, {"png", testPng}, {"imgdiff", testImgDiff}, {"replay", testReplay}, {"replay_lvp", testReplayLvp}, {"refcaps", testRefCaps}};
   bool ran = false;
   for (const auto& [name, fn] : groups) {
     if (argc > 1 && std::strcmp(argv[1], name) != 0) continue;

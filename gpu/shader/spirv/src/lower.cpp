@@ -1227,8 +1227,19 @@ private:
                 if (p.kind != RPtr::Mem) fail("OpPtrAccessChain on a non-memory pointer");
                 auto d = m_.deco(typeOf(m_.w(in, 3)));
                 const uint32_t stride = d && d->has(Deco::ArrayStride) ? d->get(Deco::ArrayStride) : naturalSize(p.type);
-                addOffset(p, isConstant(el) ? kNoValue : get1(el), isConstant(el) ? uint32_t(constScalar(el)) : 0,
-                          isConstant(el), stride);
+                const TypeInfo& et = T(typeOf(el));
+                const uint64_t raw = isConstant(el) ? constScalar(el) : 0;
+                if (isConstant(el) && et.sign && (et.width == 64 ? int64_t(raw) < 0 : int32_t(uint32_t(raw)) < 0)) {
+                    // A step back (a negative signed element): added to the dynamic part as a u32 constant, so the sum with the offset is
+                    // modular like a dynamic index's, and a constant offset added later (a member, a following element) can bring it back
+                    // into range without the constant part overflowing. (An unsigned element of 2^31 or more is a huge step forward:
+                    // addOffset refuses it.)
+                    const int64_t back = et.width == 64 ? int64_t(raw) : int64_t(int32_t(uint32_t(raw)));
+                    const ValueId k = u32(uint32_t(uint64_t(back) * stride));
+                    p.dyn = p.dyn == kNoValue ? k : bin(Op::Add, p.dyn, k, vpir::kU32);
+                } else {
+                    addOffset(p, isConstant(el) ? kNoValue : get1(el), isConstant(el) ? uint32_t(raw) : 0, isConstant(el), stride);
+                }
             }
             first = 5;
         }
@@ -2670,7 +2681,7 @@ private:
 
     // Emits blocks from `label` until the region ends (stop reached, or every path left it).
     void flow(uint32_t label, uint32_t stop) {
-        Nest nest(flowDepth_, 320, "control flow");  // (a malformed CFG can lead a construct back into itself; a chain of else-ifs nests one level per branch)
+        Nest nest(flowDepth_, 4096, "control flow");  // (a malformed CFG can lead a construct back into itself; a chain of else-ifs nests one level per branch: the level count is a backstop, stackLow() in Nest is the bound that matters)
         uint32_t cur = label;
         bool enteringHeader = false;
         while (cur) {

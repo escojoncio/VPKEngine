@@ -2679,7 +2679,7 @@ void Context::drawIndirect(GLenum mode, GLenum indexType, const void* indirect) 
         }
         return;
     }
-    if (ib->storage->lastUse > dev->completed) flush(true);  // the GPU may have written the command
+    if (storageBusy(*ib->storage)) flush(true);  // the GPU may have written the command
     uint32_t w[5] = {};
     std::memcpy(w, ib->storage->host + off, cmdSize);
     if (!indexType) return drawArrays(mode, GLint(w[2]), GLsizei(w[0]), GLsizei(w[1]));
@@ -2989,9 +2989,10 @@ void Context::readPixels(GLint x, GLint y, GLsizei w, GLsizei h, GLenum format, 
         // The texels are the pixels (RGBA8 as RGBA / UNSIGNED_BYTE) and the rows fall on texel boundaries: the GPU copies the image
         // into the buffer itself, no wait and no pass over the pixels on the host. Reading the buffer then waits (MapBufferRange).
         const size_t at = reinterpret_cast<uintptr_t>(pixels) + first;
-        if (readbackIsCopy(*src.image->format, format, type) && outPx == tb && at % tb == 0 && rb % tb == 0) {
+        // (Vulkan: bufferRowLength must be at least the copy's width: a PACK_ROW_LENGTH smaller than it goes through the host.)
+        if (readbackIsCopy(*src.image->format, format, type) && outPx == tb && at % tb == 0 && rb % tb == 0 && rb >= size_t(cw) * tb) {
             useStorage(pb->storage);
-            pb->storage->gpuWrite = dev->submitted + 1;
+            noteGpuWrite(pb->storage);
             barrier();
             VkBufferImageCopy r{};
             r.bufferOffset = at;

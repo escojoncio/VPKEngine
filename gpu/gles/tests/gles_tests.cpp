@@ -123,6 +123,10 @@ PFN_vkCmdBindIndexBuffer realBindIndexBuffer;
 PFN_vkDestroyBuffer realDestroyBuffer;
 bool deviceLost = false;       // fence status / waits answer VK_ERROR_DEVICE_LOST
 bool fenceWaitStuck = false;   // fence waits answer VK_TIMEOUT (the GPU is not done)
+// One submission at a time (audit3_pbo): markSubmit 1 = the next vkQueueSubmit's fence is `slowFence` (not signalled until waited for), 2 = `stuckFence`
+// (never signalled: each wait on it times out and is counted in stuckWaits).
+int markSubmit = 0, stuckWaits = 0;
+VkFence slowFence = VK_NULL_HANDLE, stuckFence = VK_NULL_HANDLE;
 int submits = 0, buffersDestroyed = 0, bigBuffersCreated = 0;
 VkBuffer lastIndexBuffer = VK_NULL_HANDLE;
 VkDeviceSize lastIndexOffset = 0;
@@ -138,6 +142,7 @@ struct Calls {
     VkRect2D scissor{};
     uint32_t stencilRef[2] = {0, 0};
     VkBuffer lastCopyDst = VK_NULL_HANDLE;
+    uint32_t lastCopyRowLength = 0, lastCopyWidth = 0;  // bufferRowLength / imageExtent.width of the last vkCmdCopyImageToBuffer region
 } calls;
 PFN_vkCmdEndRendering realEndRendering;
 PFN_vkCmdSetViewport realSetViewport;
@@ -239,6 +244,7 @@ VKAPI_ATTR void VKAPI_CALL myCopyToBuffer(VkCommandBuffer c, VkImage i, VkImageL
     ++counts.copiesToBuffer;
     trace('R');
     calls.lastCopyDst = b;
+    if (n) calls.lastCopyRowLength = r[n - 1].bufferRowLength, calls.lastCopyWidth = r[n - 1].imageExtent.width;
     realCopyToBuffer(c, i, l, b, n, r);
 }
 
@@ -314,16 +320,22 @@ VKAPI_ATTR VkResult VKAPI_CALL myGetQueryResults(VkDevice d, VkQueryPool p, uint
 
 VKAPI_ATTR VkResult VKAPI_CALL myGetFenceStatus(VkDevice d, VkFence f) {
     if (deviceLost) return VK_ERROR_DEVICE_LOST;
+    if (f != VK_NULL_HANDLE && (f == stuckFence || f == slowFence)) return VK_NOT_READY;
     return occFenceStuck ? VK_NOT_READY : realGetFenceStatus(d, f);
 }
 VKAPI_ATTR VkResult VKAPI_CALL myWaitForFences(VkDevice d, uint32_t n, const VkFence* f, VkBool32 all, uint64_t timeout) {
     ++calls.waits;
     if (deviceLost) return VK_ERROR_DEVICE_LOST;
     if (fenceWaitStuck) return VK_TIMEOUT;
+    if (n == 1 && f[0] != VK_NULL_HANDLE && f[0] == stuckFence) return ++stuckWaits, VK_TIMEOUT;
+    if (n == 1 && f[0] != VK_NULL_HANDLE && f[0] == slowFence) slowFence = VK_NULL_HANDLE;  // it finishes when waited for
     return realWaitForFences(d, n, f, all, timeout);
 }
 VKAPI_ATTR VkResult VKAPI_CALL myQueueSubmit(VkQueue q, uint32_t n, const VkSubmitInfo* si, VkFence f) {
     ++submits;
+    if (markSubmit == 1) slowFence = f;
+    else if (markSubmit == 2) stuckFence = f;
+    markSubmit = 0;
     return realQueueSubmit(q, n, si, f);
 }
 VKAPI_ATTR void VKAPI_CALL myBindIndexBuffer(VkCommandBuffer c, VkBuffer b, VkDeviceSize o, VkIndexType t) {
@@ -6168,6 +6180,436 @@ void testAudit2Egl() {
     eglTerminate(b.dpy);
 }
 
+// ---- third audit round (review of the second) ------------------------------------------------------------------------------------
+// The host's calls (vpgles_flush / vpgles_wrap_image) from a thread with no current context go to the last context made current: once
+// that one is released there is none, and they do nothing (the image is never looked at).
+void hostCallsWithoutContext() {
+    vpgles_flush(1);
+    CHECK(vpgles_wrap_image(reinterpret_cast<void*>(0x10), VK_FORMAT_R8G8B8A8_UNORM, gl::TEXTURE_2D, 4, 4, 1, 1) == 0);
+}
+
+// G14 (round 3): a context destroyed, or released by eglTerminate, while it was current is deleted when it stops being current; nothing
+// the layer keeps for the host (the last current context) may still point at it. Every way a context can end, then the host's calls
+// (the sanitizer builds find the use after free); handles of what eglTerminate released are refused.
+void testAudit3EglLast() {
+    G(eglTerminate, uint32_t (*)(void*));
+    G(eglDestroyContext, uint32_t (*)(void*, void*));
+    G(eglDestroySurface, uint32_t (*)(void*, void*));
+    G(eglMakeCurrent, uint32_t (*)(void*, void*, void*, void*));
+    G(eglGetCurrentContext, void* (*)());
+    G(eglCreateSyncKHR, void* (*)(void*, uint32_t, const EGLint*));
+    G(eglDestroySyncKHR, uint32_t (*)(void*, void*));
+    G(eglClientWaitSyncKHR, EGLint (*)(void*, void*, EGLint, uint64_t));
+    G(eglGetSyncAttribKHR, uint32_t (*)(void*, void*, EGLint, EGLint*));
+    G(eglCreateImageKHR, void* (*)(void*, void*, uint32_t, void*, const EGLint*));
+    G(eglDestroyImageKHR, uint32_t (*)(void*, void*));
+    G(eglGetError, EGLint (*)());
+    G(glFinish, void (*)());
+    G(glGetError, GLenum (*)());
+    G(glGenTextures, void (*)(GLsizei, GLuint*));
+    G(glBindTexture, void (*)(GLenum, GLuint));
+    G(glTexImage2D, void (*)(GLenum, GLint, GLint, GLsizei, GLsizei, GLint, GLenum, GLenum, const void*));
+    G(glEGLImageTargetTexture2DOES, void (*)(GLenum, void*));
+    watchdog(90);
+    const uint8_t px[4 * 4 * 4] = {};
+    // 1. eglDestroyContext of the current context, then it stops being current.
+    {
+        Egl e;
+        CHECK(e.up());
+        CHECK(eglDestroyContext(e.dpy, e.ctx) != 0);
+        CHECK(eglGetCurrentContext() == e.ctx);
+        glFinish();
+        CHECK(eglMakeCurrent(e.dpy, nullptr, nullptr, nullptr) != 0);
+        hostCallsWithoutContext();
+        eglDestroySurface(e.dpy, e.surface);
+        eglTerminate(e.dpy);
+        hostCallsWithoutContext();
+    }
+    // 2. eglTerminate while current, then it stops being current.
+    {
+        Egl e;
+        CHECK(e.up());
+        CHECK(eglTerminate(e.dpy) != 0);
+        CHECK(eglGetCurrentContext() == e.ctx);
+        glFinish();
+        CHECK(eglMakeCurrent(e.dpy, nullptr, nullptr, nullptr) != 0);
+        hostCallsWithoutContext();
+    }
+    // 3. eglTerminate while current, then another context is made current in its place (the display was initialized again).
+    {
+        Egl c;
+        CHECK(c.up());
+        CHECK(eglTerminate(c.dpy) != 0);
+        Egl d;
+        CHECK(d.up());
+        vpgles_flush(1);
+        glFinish();
+        CHECK(glGetError() == gl::NO_ERROR);
+        d.down();
+        CHECK(eglTerminate(d.dpy) != 0);
+        hostCallsWithoutContext();
+    }
+    // 4. A context another thread made current and released is the "last current": eglTerminate from this thread deletes it.
+    {
+        Egl t;
+        std::atomic<bool> up{false};
+        std::thread th([&] {
+            up = t.up();
+            eglMakeCurrent(t.dpy, nullptr, nullptr, nullptr);
+        });
+        th.join();
+        CHECK(up);
+        CHECK(eglGetCurrentContext() == nullptr);
+        CHECK(eglTerminate(t.dpy) != 0);
+        hostCallsWithoutContext();
+    }
+    // 5. A context another thread still has current when eglTerminate is called here: it goes when that thread releases it.
+    {
+        Egl t;
+        std::atomic<int> step{0};
+        std::atomic<bool> up{false};
+        std::thread th([&] {
+            up = t.up();
+            step = 1;
+            while (step != 2) std::this_thread::yield();
+            eglMakeCurrent(t.dpy, nullptr, nullptr, nullptr);
+            step = 3;
+        });
+        while (step != 1) std::this_thread::yield();
+        CHECK(up);
+        CHECK(eglTerminate(t.dpy) != 0);
+        hostCallsWithoutContext();
+        step = 2;
+        while (step != 3) std::this_thread::yield();
+        hostCallsWithoutContext();
+        th.join();
+    }
+    // 6. Handles of what eglTerminate released (syncs, images) are refused, not followed.
+    {
+        Egl e;
+        CHECK(e.up());
+        GLuint tex = 0;
+        glGenTextures(1, &tex);
+        glBindTexture(gl::TEXTURE_2D, tex);
+        glTexImage2D(gl::TEXTURE_2D, 0, gl::RGBA, 4, 4, 0, gl::RGBA, gl::UNSIGNED_BYTE, px);
+        void* image = eglCreateImageKHR(e.dpy, e.ctx, 0x30B1 /*EGL_GL_TEXTURE_2D_KHR*/, reinterpret_cast<void*>(uintptr_t(tex)), nullptr);
+        void* sync = eglCreateSyncKHR(e.dpy, 0x30F9 /*SYNC_FENCE_KHR*/, nullptr);
+        CHECK(image != nullptr && sync != nullptr);
+        CHECK(eglTerminate(e.dpy) != 0);
+        eglGetError();
+        CHECK(eglDestroyImageKHR(e.dpy, image) == 0);
+        CHECK(eglDestroySyncKHR(e.dpy, sync) == 0);
+        CHECK(eglClientWaitSyncKHR(e.dpy, sync, 0, 0) != 0x30F6 /*CONDITION_SATISFIED_KHR*/);
+        EGLint v = 0;
+        CHECK(eglGetSyncAttribKHR(e.dpy, sync, 0x30F1 /*SYNC_TYPE_KHR*/, &v) == 0);
+        glEGLImageTargetTexture2DOES(gl::TEXTURE_2D, image);
+        glGetError();
+        glFinish();
+        CHECK(eglMakeCurrent(e.dpy, nullptr, nullptr, nullptr) != 0);
+        hostCallsWithoutContext();
+    }
+    alarm(0);
+}
+
+// G14 (round 3): eglInitialize / eglTerminate are counted (Android's semantics): a component that initializes the display and terminates
+// it again does not take the display from the one that still uses it. What the display owns goes with the last eglTerminate.
+void testAudit3EglRefs() {
+    G(eglTerminate, uint32_t (*)(void*));
+    G(eglDestroyContext, uint32_t (*)(void*, void*));
+    G(eglDestroySurface, uint32_t (*)(void*, void*));
+    G(eglInitialize, uint32_t (*)(void*, EGLint*, EGLint*));
+    G(eglCreateContext, void* (*)(void*, void*, void*, const EGLint*));
+    G(eglCreatePbufferSurface, void* (*)(void*, void*, const EGLint*));
+    G(eglMakeCurrent, uint32_t (*)(void*, void*, void*, void*));
+    G(eglGetError, EGLint (*)());
+    G(glFinish, void (*)());
+    G(glGetError, GLenum (*)());
+    watchdog(60);
+    Egl a;
+    CHECK(a.up());  // the game: initialize #1
+    const EGLint sattrs[] = {egl::WIDTH, 16, egl::HEIGHT, 16, egl::NONE};
+    const EGLint cattrs[] = {egl::CONTEXT_CLIENT_VERSION, 3, egl::NONE};
+    void* surfB = eglCreatePbufferSurface(a.dpy, a.config, sattrs);
+    void* ctxB = eglCreateContext(a.dpy, a.config, nullptr, cattrs);
+    CHECK(surfB && ctxB);
+    EGLint maj = 0, min = 0;
+    CHECK(eglInitialize(a.dpy, &maj, &min) != 0 && maj == 1 && min == 5);  // another component: #2
+    CHECK(eglInitialize(a.dpy, &maj, &min) != 0);                          // and #3
+    CHECK(eglTerminate(a.dpy) != 0);                                       // #3 leaves
+    CHECK(eglTerminate(a.dpy) != 0);                                       // #2 leaves
+    // Nothing of the game's was released.
+    CHECK(eglMakeCurrent(a.dpy, nullptr, nullptr, nullptr) != 0);
+    CHECK(eglMakeCurrent(a.dpy, surfB, surfB, ctxB) != 0);
+    CHECK(eglMakeCurrent(a.dpy, a.surface, a.surface, a.ctx) != 0);
+    glFinish();
+    CHECK(glGetError() == gl::NO_ERROR);
+    // The last one leaves: the context that is not current goes, the current one when it stops being current.
+    CHECK(eglTerminate(a.dpy) != 0);
+    eglGetError();
+    CHECK(eglMakeCurrent(a.dpy, surfB, surfB, ctxB) == 0);
+    CHECK(eglGetError() == 0x3006 /*EGL_BAD_CONTEXT*/);
+    CHECK(eglMakeCurrent(a.dpy, nullptr, nullptr, nullptr) != 0);
+    // A terminate with no initialize outstanding answers success and does nothing (what was made meanwhile stays); the display can be
+    // initialized again.
+    void* surfC = eglCreatePbufferSurface(a.dpy, a.config, sattrs);
+    void* ctxC = eglCreateContext(a.dpy, a.config, nullptr, cattrs);
+    CHECK(surfC && ctxC);
+    CHECK(eglTerminate(a.dpy) != 0);
+    CHECK(eglMakeCurrent(a.dpy, surfC, surfC, ctxC) != 0);
+    glFinish();
+    CHECK(glGetError() == gl::NO_ERROR);
+    CHECK(eglMakeCurrent(a.dpy, nullptr, nullptr, nullptr) != 0);
+    CHECK(eglDestroyContext(a.dpy, ctxC) != 0);
+    CHECK(eglDestroySurface(a.dpy, surfC) != 0);
+    Egl b;
+    CHECK(b.up());
+    glFinish();
+    CHECK(glGetError() == gl::NO_ERROR);
+    b.down();
+    CHECK(eglTerminate(b.dpy) != 0);
+    alarm(0);
+}
+
+// Round 3, glReadPixels into a pixel pack buffer: the direct copy needs a row length of at least the width (Vulkan's
+// bufferRowLength; a smaller PACK_ROW_LENGTH goes through the host), and reading the buffer waits for the submission that wrote it, not
+// for every submission in flight.
+void testAudit3Pbo() {
+    Egl e;
+    CHECK(e.up());
+    SteadyKit k;
+    k.up();
+    G(glDrawArrays, void (*)(GLenum, GLint, GLsizei));
+    G(glFlush, void (*)());
+    G(glFinish, void (*)());
+    G(glGenBuffers, void (*)(GLsizei, GLuint*));
+    G(glBindBuffer, void (*)(GLenum, GLuint));
+    G(glBufferData, void (*)(GLenum, GLsizeiptr, const void*, GLenum));
+    G(glMapBufferRange, void* (*)(GLenum, GLintptr, GLsizeiptr, GLbitfield));
+    G(glUnmapBuffer, GLboolean (*)(GLenum));
+    G(glReadPixels, void (*)(GLint, GLint, GLsizei, GLsizei, GLenum, GLenum, void*));
+    G(glPixelStorei, void (*)(GLenum, GLint));
+    watchdog(60);
+    settle();
+    GLuint pb;
+    glGenBuffers(1, &pb);
+    glBindBuffer(gl::PIXEL_PACK_BUFFER, pb);
+    glBufferData(gl::PIXEL_PACK_BUFFER, 64 * 64 * 4 + 64, nullptr, 0x88E1 /*STREAM_READ*/);
+    glDrawArrays(gl::TRIANGLES, 0, 3);
+    // PACK_ROW_LENGTH 4 < width 8: no copy may say bufferRowLength 4 for 8 texels (0 = tightly packed is fine).
+    glPixelStorei(gl::PACK_ALIGNMENT, 1);
+    glPixelStorei(0x0D02 /*PACK_ROW_LENGTH*/, 4);
+    resetCalls();
+    glReadPixels(0, 0, 8, 8, gl::RGBA, gl::UNSIGNED_BYTE, nullptr);
+    CHECK(err() == gl::NO_ERROR);
+    CHECK(counts.copiesToBuffer >= 1);
+    CHECK(calls.lastCopyRowLength == 0 || calls.lastCopyRowLength >= calls.lastCopyWidth);
+    glPixelStorei(0x0D02, 0);
+    glPixelStorei(gl::PACK_ALIGNMENT, 4);
+    settle();
+    // The copy is submitted (S1: not finished yet, finishes when waited for); later work is submitted after it (S2: never finishes).
+    glDrawArrays(gl::TRIANGLES, 0, 3);
+    resetCalls();
+    glReadPixels(0, 0, 64, 64, gl::RGBA, gl::UNSIGNED_BYTE, nullptr);
+    CHECK(counts.copiesToBuffer == 1);
+    markSubmit = 1;
+    glFlush();
+    glDrawArrays(gl::TRIANGLES, 0, 3);
+    markSubmit = 2;
+    glFlush();
+    CHECK(slowFence != VK_NULL_HANDLE && stuckFence != VK_NULL_HANDLE);
+    stuckWaits = 0;
+    void* p = glMapBufferRange(gl::PIXEL_PACK_BUFFER, 0, 64, gl::MAP_READ_BIT);
+    CHECK(p != nullptr);
+    CHECK(stuckWaits == 0);  // it waited for the copy's submission only
+    CHECK(slowFence == VK_NULL_HANDLE);  // ... and did wait for that one
+    glUnmapBuffer(gl::PIXEL_PACK_BUFFER);
+    stuckFence = slowFence = VK_NULL_HANDLE;
+    glFinish();
+    alarm(0);
+    e.down();
+}
+
+// Round 3 (review): the stamps a context makes while recording ("the serial this command buffer will get") are guesses: a submission
+// by someone else in between (a temporary context, another thread's context) takes that serial. What a readback wrote into a pixel
+// buffer, or what a draw reads, must still be treated as in the open command buffer.
+void testAudit3StaleStamp() {
+    Egl e;
+    CHECK(e.up());
+    SteadyKit k;
+    k.up();
+    G(glDrawArrays, void (*)(GLenum, GLint, GLsizei));
+    G(glFinish, void (*)());
+    G(glGenBuffers, void (*)(GLsizei, GLuint*));
+    G(glBindBuffer, void (*)(GLenum, GLuint));
+    G(glBufferData, void (*)(GLenum, GLsizeiptr, const void*, GLenum));
+    G(glBufferSubData, void (*)(GLenum, GLintptr, GLsizeiptr, const void*));
+    G(glMapBufferRange, void* (*)(GLenum, GLintptr, GLsizeiptr, GLbitfield));
+    G(glUnmapBuffer, GLboolean (*)(GLenum));
+    G(glReadPixels, void (*)(GLint, GLint, GLsizei, GLsizei, GLenum, GLenum, void*));
+    G(glGenTextures, void (*)(GLsizei, GLuint*));
+    G(glBindTexture, void (*)(GLenum, GLuint));
+    G(glTexImage2D, void (*)(GLenum, GLint, GLint, GLsizei, GLsizei, GLint, GLenum, GLenum, const void*));
+    G(eglCreatePbufferSurface, void* (*)(void*, void*, const EGLint*));
+    G(eglDestroySurface, uint32_t (*)(void*, void*));
+    watchdog(60);
+    settle();
+    GLuint pb;
+    glGenBuffers(1, &pb);
+    glBindBuffer(gl::PIXEL_PACK_BUFFER, pb);
+    glBufferData(gl::PIXEL_PACK_BUFFER, 64 * 64 * 4 + 64, nullptr, 0x88E1 /*STREAM_READ*/);
+    const EGLint sattrs[] = {egl::WIDTH, 8, egl::HEIGHT, 8, egl::NONE};
+    std::vector<void*> surfaces;
+    // A temporary context submits and waits (creating a surface zero-fills its images): a submission of someone else.
+    auto foreign = [&] {
+        void* s = eglCreatePbufferSurface(e.dpy, e.config, sattrs);
+        CHECK(s != nullptr);
+        surfaces.push_back(s);
+    };
+    // 1. Mapping the pixel buffer for reading sends the readback that is still in the open command buffer.
+    glDrawArrays(gl::TRIANGLES, 0, 3);
+    resetCalls();
+    glReadPixels(0, 0, 64, 64, gl::RGBA, gl::UNSIGNED_BYTE, nullptr);
+    CHECK(counts.copiesToBuffer == 1);
+    foreign();
+    int before = submits;
+    void* p = glMapBufferRange(gl::PIXEL_PACK_BUFFER, 0, 64, gl::MAP_READ_BIT);
+    CHECK(p != nullptr);
+    CHECK(submits == before + 1);
+    glUnmapBuffer(gl::PIXEL_PACK_BUFFER);
+    settle();
+    // 2. The same with another thread's context submitting meanwhile.
+    glDrawArrays(gl::TRIANGLES, 0, 3);
+    glReadPixels(0, 0, 64, 64, gl::RGBA, gl::UNSIGNED_BYTE, nullptr);
+    std::thread th([&] {
+        Egl f;
+        if (f.up()) {
+            SteadyKit kf;
+            kf.up();
+            glDrawArrays(gl::TRIANGLES, 0, 3);
+            glFinish();
+        }
+        f.down();
+    });
+    th.join();
+    before = submits;
+    p = glMapBufferRange(gl::PIXEL_PACK_BUFFER, 0, 64, gl::MAP_READ_BIT);
+    CHECK(p != nullptr);
+    CHECK(submits == before + 1);
+    glUnmapBuffer(gl::PIXEL_PACK_BUFFER);
+    settle();
+    // 3. A write over bytes the open command buffer's draw reads is not made in place.
+    glBindBuffer(gl::ARRAY_BUFFER, k.vb);
+    glDrawArrays(gl::TRIANGLES, 0, 3);
+    foreign();
+    resetCalls();
+    const float patch[4] = {1, 2, 3, 4};
+    glBufferSubData(gl::ARRAY_BUFFER, 0, 16, patch);
+    CHECK(calls.buffersCreated > 0);
+    settle();
+    // 4. Unpacking from a pixel buffer the readback wrote waits for it (submits what is in the open command buffer).
+    glDrawArrays(gl::TRIANGLES, 0, 3);
+    glReadPixels(0, 0, 8, 8, gl::RGBA, gl::UNSIGNED_BYTE, nullptr);
+    glBindBuffer(gl::PIXEL_PACK_BUFFER, 0);
+    foreign();
+    glBindBuffer(gl::PIXEL_UNPACK_BUFFER, pb);
+    GLuint t;
+    glGenTextures(1, &t);
+    glBindTexture(gl::TEXTURE_2D, t);
+    before = submits;
+    glTexImage2D(gl::TEXTURE_2D, 0, gl::RGBA, 8, 8, 0, gl::RGBA, gl::UNSIGNED_BYTE, nullptr);
+    CHECK(submits > before);
+    glBindBuffer(gl::PIXEL_UNPACK_BUFFER, 0);
+    settle();
+    for (void* s : surfaces) eglDestroySurface(e.dpy, s);
+    alarm(0);
+    e.down();
+}
+
+// Round 3, uploads queued in two contexts of one share group: one context recording its uploads does not make the other's forgotten (the
+// pending count of the image is per upload, not zeroed): the draw that samples the texture still records the other's upload first.
+void testAudit3XferShared() {
+    Egl a;
+    CHECK(a.up());
+    SteadyKit ka;
+    ka.up();
+    G(glDrawArrays, void (*)(GLenum, GLint, GLsizei));
+    G(glFlush, void (*)());
+    G(glFinish, void (*)());
+    G(glGenTextures, void (*)(GLsizei, GLuint*));
+    G(glBindTexture, void (*)(GLenum, GLuint));
+    G(glTexImage2D, void (*)(GLenum, GLint, GLint, GLsizei, GLsizei, GLint, GLenum, GLenum, const void*));
+    G(glTexSubImage2D, void (*)(GLenum, GLint, GLint, GLint, GLsizei, GLsizei, GLenum, GLenum, const void*));
+    G(eglCreateContext, void* (*)(void*, void*, void*, const EGLint*));
+    G(eglCreatePbufferSurface, void* (*)(void*, void*, const EGLint*));
+    G(eglMakeCurrent, uint32_t (*)(void*, void*, void*, void*));
+    G(eglDestroyContext, uint32_t (*)(void*, void*));
+    G(eglDestroySurface, uint32_t (*)(void*, void*));
+    watchdog(60);
+    const uint8_t white[4] = {255, 255, 255, 255};
+    GLuint shared = 0;
+    glGenTextures(1, &shared);
+    glBindTexture(gl::TEXTURE_2D, shared);
+    glTexImage2D(gl::TEXTURE_2D, 0, gl::RGBA, 1, 1, 0, gl::RGBA, gl::UNSIGNED_BYTE, white);
+    glBindTexture(gl::TEXTURE_2D, ka.tex);
+    settle();
+    const EGLint sattrs[] = {egl::WIDTH, 16, egl::HEIGHT, 16, egl::NONE};
+    const EGLint cattrs[] = {egl::CONTEXT_CLIENT_VERSION, 3, egl::NONE};
+    void* surfB = eglCreatePbufferSurface(a.dpy, a.config, sattrs);
+    void* ctxB = eglCreateContext(a.dpy, a.config, a.ctx, cattrs);  // shares A's textures
+    CHECK(surfB && ctxB);
+    std::atomic<int> step{0};
+    std::string traceB, traceB2;
+    std::thread th([&] {
+        eglMakeCurrent(a.dpy, surfB, surfB, ctxB);
+        SteadyKit kb;
+        kb.up();
+        settle();
+        glDrawArrays(gl::TRIANGLES, 0, 3);  // B's pass is open
+        glBindTexture(gl::TEXTURE_2D, shared);
+        glTexSubImage2D(gl::TEXTURE_2D, 0, 0, 0, 1, 1, gl::RGBA, gl::UNSIGNED_BYTE, white);  // B's upload waits for the pass to end
+        step = 1;
+        while (step != 2) std::this_thread::yield();
+        resetCalls();
+        glDrawArrays(gl::TRIANGLES, 0, 3);  // samples `shared`
+        traceB = gTrace;
+        glFinish();
+        step = 3;
+        while (step != 4) std::this_thread::yield();
+        // A has an upload of `shared` waiting now (its own to record): B's draw that samples it does not cut B's pass for it.
+        glDrawArrays(gl::TRIANGLES, 0, 3);
+        resetCalls();
+        glDrawArrays(gl::TRIANGLES, 0, 3);
+        traceB2 = gTrace;
+        glFinish();
+        eglMakeCurrent(a.dpy, nullptr, nullptr, nullptr);
+        step = 5;
+    });
+    // A: a pass open, an upload of the same texture waiting; B queues its own meanwhile; then A records its (flush).
+    glDrawArrays(gl::TRIANGLES, 0, 3);
+    glBindTexture(gl::TEXTURE_2D, shared);
+    glTexSubImage2D(gl::TEXTURE_2D, 0, 0, 0, 1, 1, gl::RGBA, gl::UNSIGNED_BYTE, white);
+    while (step != 1) std::this_thread::yield();
+    glFlush();
+    step = 2;
+    while (step != 3) std::this_thread::yield();
+    glDrawArrays(gl::TRIANGLES, 0, 3);
+    glBindTexture(gl::TEXTURE_2D, shared);
+    glTexSubImage2D(gl::TEXTURE_2D, 0, 0, 0, 1, 1, gl::RGBA, gl::UNSIGNED_BYTE, white);
+    step = 4;
+    while (step != 5) std::this_thread::yield();
+    glFlush();
+    th.join();
+    CHECK(traceB2 == "D");
+    // B's draw ended its pass and recorded its upload first: copy (U) before the draw (D).
+    const size_t u = traceB.find('U'), d = traceB.find('D');
+    CHECK(u != std::string::npos && d != std::string::npos && u < d);
+    alarm(0);
+    glFinish();
+    eglDestroyContext(a.dpy, ctxB);
+    eglDestroySurface(a.dpy, surfB);
+    a.down();
+}
+
 // G12: linking a program does not hold the global lock while the shaders are linked: another thread's GL calls go through.
 void testAudit2Link() {
     Egl e;
@@ -6331,6 +6773,7 @@ int main(int argc, char** argv) {
         {"audit_lost", testAuditLost}, {"audit_calls", testAuditCalls}, {"audit_compile", testAuditCompile}, {"audit_xfb", testAuditXfb},
         {"audit2_xfer", testAudit2Xfer}, {"audit2_dyn", testAudit2Dyn}, {"audit2_buf", testAudit2Buf}, {"audit2_pbo", testAudit2Pbo},
         {"audit2_upload", testAudit2Upload}, {"audit2_egl", testAudit2Egl}, {"audit2_link", testAudit2Link}, {"audit2_link2", testAudit2LinkShared},
+        {"audit3_egl_last", testAudit3EglLast}, {"audit3_egl_refs", testAudit3EglRefs}, {"audit3_pbo", testAudit3Pbo}, {"audit3_xfer_shared", testAudit3XferShared}, {"audit3_stale_stamp", testAudit3StaleStamp},
     };
     auto it = tests.find(argv[1]);
     if (ok && it != tests.end()) it->second();

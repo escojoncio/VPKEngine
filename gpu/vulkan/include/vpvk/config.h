@@ -173,7 +173,7 @@ void vpvk_dump_pending(void);
 // (graveyard). Pipeline states and the libraries/functions of live pipelines are never touched. level 1 = OS warning,
 // 2 = critical. Writes a short key=value report into out (NUL-terminated, cut at cap; may be NULL/0): libs= (MiB freed now),
 // msaa_live / args_live (MiB alive), msaa_freed_since_last / args_freed_since_last / *_freed_total, held, staging,
-// serialized_msaa / serialized_args (MiB moved to the graveyard now), retired_released / retired_mib (MiB returned), and
+// serialized_msaa / serialized_args / serialized_fov (MiB moved to the graveyard now), retired_released / retired_mib (MiB returned), and
 // submit_busy=1 when the submit mutex could not be taken in ~50 ms (the MSAA / args / graveyard part then waits for the
 // next submit). Returns the bytes freed (libraries + retired objects); 0 without a live device. Any thread; may wait up to
 // ~50 ms for the submit mutex (never blocks on it).
@@ -318,7 +318,11 @@ int vpvk_taa_native_encode(const vpvk_taa_native_frame* frame, void* mtl_command
 
 // Profundidad MSAA -> depth32Float de 1 muestra (2DArray, mismas capas), propiedad del motor y
 // reutilizada por `key` (p. ej. etapa de swapchain): mode 1 = la muestra más cercana, 0 = la muestra
-// 0. Se codifica en `mtl_command_buffer`. Devuelve la textura (unretained) o NULL.
+// 0. Se codifica en `mtl_command_buffer`. Devuelve la textura (unretained) o NULL. La textura NO vive hasta que muera
+// el TAA: el motor la suelta tras 5 s sin llamadas con esa `key` (TAA apagado) y a los 250 ms sin uso en un trim de
+// memoria (vpvk_trim_memory), y entonces una llamada posterior reserva otra. Quien llama no debe guardar el puntero
+// entre frames: pedirlo en cada frame a esta función y usarlo solo en los command buffers de ese frame (el command
+// buffer en el que se usa retiene la textura mientras corre).
 void* vpvk_depth_resolve_encode(void* mtl_command_buffer, void* depth_ms, int reversed_z, int mode, int key);
 
 // MoltenVK-compatible export (also through vkGetInstanceProcAddr / vkGetDeviceProcAddr): the

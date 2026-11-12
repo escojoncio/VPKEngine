@@ -217,6 +217,35 @@ int deadChain() {
     return 0;
 }
 
+// optimize() on a module put together by hand whose value ids reach past Function::valueTypes (the table verify() would
+// complain about): the dead-value sweep must not index its bookkeeping with them. A dead constant makes the sweep run; an
+// effectful instruction with a result id past the end (never counted, never dead) must survive it.
+int deadRange() {
+    Module m;
+    m.stage = Stage::Compute;
+    Function f;
+    f.name = "main";
+    f.valueTypes.assign(1, kU32);
+    Node dead;
+    dead.kind = NodeKind::Inst;
+    dead.inst.op = Op::Const;
+    dead.inst.type = kU32;
+    dead.inst.result = 0;
+    dead.inst.lits = {7};
+    Node call;
+    call.kind = NodeKind::Inst;
+    call.inst.op = Op::Call;
+    call.inst.type = kU32;
+    call.inst.result = 5000;  // (valueTypes has one entry)
+    call.inst.sym = 0;
+    f.body = {dead, call};
+    m.functions.push_back(f);
+    optimize(m);
+    const Block& body = m.functions[0].body;
+    if (body.size() != 1 || body[0].inst.op != Op::Call) return fail("the dead constant should go and the call stay");
+    return 0;
+}
+
 // 40000 nested ifs, each with a then and an else node: the builder finds the open block in O(1)
 // (it walked the whole path of open regions on every node: ~1e9 steps here). Run in a big stack:
 // destroying a nest that deep recurses.
@@ -282,6 +311,7 @@ int main(int argc, char** argv) {
     if (mode == "builder") return builder();
     if (mode == "dead_chain") return deadChain();
     if (mode == "deep_nest") return deepNest();
+    if (mode == "dead_range") return deadRange();
     if (argc == 3 && mode == "roundtrip") return roundtrip(argv[2]);
     if (argc == 3 && mode == "reject") return reject(argv[2]);
     if ((argc == 3 || argc == 4) && mode == "fbfetch") return fbfetch(argv[2], argc == 4 ? argv[3] : nullptr);

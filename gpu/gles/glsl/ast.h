@@ -159,6 +159,18 @@ struct Expr {
     bool hasConst = false;  // folded scalar (int/uint/bool/float) value
     double constF = 0;
     int64_t constI = 0;
+    // "a + a + ..." is a tree as deep as the chain: its operands are taken apart in a loop, not by one destructor call per level.
+    ~Expr() {
+        if (a.empty()) return;
+        std::vector<ExprP> work = std::move(a);
+        while (!work.empty()) {
+            ExprP e = std::move(work.back());
+            work.pop_back();
+            if (!e) continue;
+            for (ExprP& c : e->a) work.push_back(std::move(c));
+            e->a.clear();
+        }
+    }
 };
 
 enum class SK : uint8_t { Block, Decl, Expr, If, For, While, Do, Return, Break, Continue, Discard, Switch, Case, Default, Empty };
@@ -174,6 +186,13 @@ struct Stmt {
     std::vector<StmtP> list;    // Block / Switch body
     std::vector<std::pair<Symbol*, ExprP>> decls;  // Decl
     bool newScope = true;       // Block
+    // An `else if` ladder is a chain of `els`: unlinked here one by one, not by one destructor call per rung.
+    ~Stmt() {
+        for (StmtP cur = std::move(els); cur;) {
+            StmtP next = std::move(cur->els);
+            cur = std::move(next);
+        }
+    }
 };
 
 struct Function {

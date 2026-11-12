@@ -97,7 +97,8 @@ static inline double vp_bits_f64(uint64_t v) { double d; memcpy(&d, &v, 8); retu
  * from the registers (System V ABI), writes rax, and ends with `cpu->rip = vp_pop64(cpu)`: it
  * pops the return address that the translated `call` pushed, exactly as a guest `ret` would. */
 typedef void (*VpNative)(VpCpu* cpu);
-void vp_register_native(uint64_t guest, VpNative fn);
+/* Returns 0, or -1 (registering nothing) when the table of natives (262144 addresses) is full. */
+int vp_register_native(uint64_t guest, VpNative fn);
 void vp_call_native(VpCpu* cpu, uint64_t guest);
 
 /* runtime/vp_host.c: runs translated code from `entry` (0 = clean exit, else a fault). Nested

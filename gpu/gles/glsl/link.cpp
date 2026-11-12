@@ -397,7 +397,8 @@ LinkResult link(const std::shared_ptr<Shader>& vs, const std::shared_ptr<Shader>
             const int n = slots(s->type);
             for (int k = 0; k < n; ++k) {
                 if (loc + k >= 32) return error("attribute '" + s->name + "' location out of range");
-                if ((taken & (1u << (loc + k))) &&
+                // (GLSL ES 1.00 lets glBindAttribLocation alias attributes, ES 2.0 2.10.4: that is not a rule to enforce there.)
+                if ((taken & (1u << (loc + k))) && vs->version != 100 &&
                     strict("attribute_location_alias", "attribute '" + s->name + "' shares location " + std::to_string(loc + k) + " with another active attribute"))
                     return r;
                 taken |= 1u << (loc + k);

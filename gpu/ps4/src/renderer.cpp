@@ -55,10 +55,20 @@ constexpr uint64_t kRingBytes = 16ull << 20;
 constexpr uint64_t kPage = 16384;
 constexpr uint64_t kGdsBytes = 64 * 1024;
 constexpr uint64_t kDummyBytes = 64 * 1024;
-// Cached GPU objects (targets, textures, samplers, translated shaders) that no draw, sample or flip used for kEvictIdle submits
+// Cached GPU objects (textures, samplers, translated shaders) that no draw, sample or flip used for kEvictIdle submits
 // are released (checked every kSweepEvery submits): a game that loads levels or changes resolution would otherwise keep every
 // surface it ever made. The idle time is long: whatever the game still uses is touched far more often than that.
 constexpr uint64_t kEvictIdle = 2048, kSweepEvery = 128;
+// Render targets are the exception: what a target holds exists only on the GPU, so it is released only when the address now holds
+// another surface (a resolution change, a level load) and it has not been used for kEvictIdleFlips flips (calls of the host's present
+// path, Renderer::colorTargetAt / colorTargetSlice: it counts calls, not frames (a stereo present may count twice); the game's own
+// time runs in flips, submits are not). A host that never
+// calls them keeps its targets. The targets the last flips presented are never released (the host may hold their ids).
+constexpr uint64_t kEvictIdleFlips = 1200;
+// Memory budget of the render targets (bytes, multisample copies counted): past it the least recently used targets that no draw of the
+// last submit used go, oldest first, whatever the flips say (a long session on new addresses would otherwise end in the OS killing
+// the app). Never the ones the last flips presented. Unverified for visionOS: a guess of what leaves room for the rest.
+constexpr uint64_t kTargetBudget = 2048ull << 20;
 
 vpgpu::Primitive toPrimitive(PrimitiveType p) {
     switch (p) {
@@ -262,7 +272,11 @@ struct Renderer::Impl {
         void* memory = nullptr;
         BufferId id;
     } dummy;
-    bool dummyDirty = false;  // a draw bound it writable since it was cleared
+    // A draw bound it writable (at submit dummyWriteFrame): the GPU may write it until kFrames submits later, and what it wrote must
+    // not be read as zeros by a later binding. So it is cleared at each binding until one made kFrames after the last writable
+    // binding (the GPU is done by then).
+    bool dummyDirty = false;
+    uint64_t dummyWriteFrame = 0;
     bool dummyBuffer() {
         if (dummy.id) return true;
         if (!dummy.memory) dummy.memory = std::aligned_alloc(kPage, kDummyBytes);
@@ -643,9 +657,18 @@ struct Renderer::Impl {
         uint8_t samples = 1;
         uint16_t layers = 1;
         mutable uint64_t lastUse = 0;  // submit of the last draw, sample or flip that used it
+        mutable uint64_t flipUse = 0;  // flip count (Impl::flips) then: what eviction goes by
     };
+    static uint64_t targetSize(const Target& t) {
+        const vpgpu::FormatInfo& fi = vpgpu::formatInfo(t.format);
+        return uint64_t(t.width) * t.height * std::max<uint16_t>(t.layers, 1) * std::max<uint8_t>(t.samples, 1) *
+               std::max<uint32_t>(fi.bytesPerBlock, 1);
+    }
+    uint64_t targetBytes = 0;  // sum of targetSize over colorTargets and depthTargets
     std::map<uint64_t, std::vector<Target>> colorTargets, depthTargets;  // by guest address
     std::map<uint64_t, TextureId> latestColor;
+    uint64_t flips = 0;                           // calls of colorTargetAt / colorTargetSlice (see kEvictIdleFlips)
+    TextureId presentedAt, presentedSlice;        // what the last such calls returned: never released
 
     TextureId target(std::map<uint64_t, std::vector<Target>>& cache, uint64_t address, vpgpu::Format f, uint32_t w,
                      uint32_t h, uint8_t samples, uint16_t layers, bool depth) {
@@ -655,7 +678,7 @@ struct Renderer::Impl {
         // with at least the layers asked for (bigger arrays are kept in front).
         for (Target& t : cache[address])
             if (t.format == f && t.width == w && t.height == h && t.samples == samples && t.layers >= layers) {
-                t.lastUse = r.frame_;
+                t.lastUse = r.frame_, t.flipUse = flips;
                 return t.id;
             }
         vpgpu::TextureDesc d;
@@ -670,9 +693,10 @@ struct Renderer::Impl {
         if (!depth && samples == 1) d.usage |= vpgpu::usage::storage;
         d.persistent = true;  // a later frame may sample it or present it
         d.label = (depth ? "depth " : "color ") + hex(address);
-        Target t{r.device_.createTexture(d), f, w, h, samples, layers, r.frame_};
+        Target t{r.device_.createTexture(d), f, w, h, samples, layers, r.frame_, flips};
         if (!t.id) return {};
         ++r.stats_.targets;
+        targetBytes += targetSize(t);
         auto& list = cache[address];
         auto at = list.begin();
         while (at != list.end() && at->layers > layers) ++at;
@@ -801,12 +825,12 @@ struct Renderer::Impl {
             for (const Target& c : t->second)
                 if (c.width >= d.width && c.height >= d.height) {  // (CB width is the pitch)
                     if (c.format != f) note("render target sampled with another format (no view yet: its own format)");
-                    c.lastUse = r.frame_;
+                    c.lastUse = r.frame_, c.flipUse = flips;
                     return c.id;
                 }
         if (auto t = depthTargets.find(d.address); t != depthTargets.end())
             for (const Target& c : t->second)
-                if (c.width >= d.width && c.height >= d.height) return c.lastUse = r.frame_, c.id;
+                if (c.width >= d.width && c.height >= d.height) return c.lastUse = r.frame_, c.flipUse = flips, c.id;
         if (d.dstSel != std::array<uint8_t, 4>{4, 5, 6, 7}) note("texture component swizzle ignored");
         if (d.type == 14 || d.type == 15) note("MSAA texture read as single-sample");
 
@@ -1078,8 +1102,11 @@ struct Renderer::Impl {
                         // unmapped V# gets a zero buffer of our own instead of losing the whole draw.
                         if (!dummyBuffer()) return why = "buffer outside guest memory", false;
                         note(address ? "buffer outside guest memory bound as zeros" : "null buffer bound as zeros");
-                        if (dummyDirty) std::memset(dummy.memory, 0, kDummyBytes);  // only after a binding that writes it
-                        dummyDirty = a.write;
+                        if (dummyDirty) {
+                            std::memset(dummy.memory, 0, kDummyBytes);
+                            if (r.frame_ >= dummyWriteFrame + kFrames) dummyDirty = false;
+                        }
+                        if (a.write) dummyDirty = true, dummyWriteFrame = r.frame_;
                         a.range = ResourceRange::bytes(dummy.id, 0, kDummyBytes);
                         break;
                     }
@@ -1606,19 +1633,61 @@ struct Renderer::Impl {
             return true;
         });
         if (r.frame_ % kSweepEvery == 0) evictIdle();
+        if (targetBytes > kTargetBudget) enforceTargetBudget();
         return report;
+    }
+
+    // Over the memory budget: releases the least recently used targets (by flip, then by submit) that this submit's draws did not use,
+    // until under it. Called after submit like evictIdle (no pending draw holds a pointer into the caches); the retire lists keep
+    // the objects alive for the frames in flight. Never the presented ones. (A target whose contents only the GPU has is lost: the
+    // address is drawn from scratch if used again.)
+    void enforceTargetBudget() {
+        struct Victim {
+            std::map<uint64_t, std::vector<Target>>* cache;
+            uint64_t address;
+            TextureId id;
+            uint64_t flipUse, lastUse;
+        };
+        std::vector<Victim> victims;
+        for (auto* cache : {&colorTargets, &depthTargets})
+            for (auto& [address, list] : *cache)
+                for (const Target& t : list)
+                    if (t.lastUse < r.frame_ && !(t.id == presentedAt) && !(t.id == presentedSlice))
+                        victims.push_back({cache, address, t.id, t.flipUse, t.lastUse});
+        std::sort(victims.begin(), victims.end(), [](const Victim& a, const Victim& b) {
+            return a.flipUse != b.flipUse ? a.flipUse < b.flipUse : a.lastUse < b.lastUse;
+        });
+        std::vector<TextureId> gone;
+        for (const Victim& v : victims) {
+            if (targetBytes <= kTargetBudget) break;
+            auto it = v.cache->find(v.address);
+            auto& list = it->second;
+            auto at = std::find_if(list.begin(), list.end(), [&](const Target& t) { return t.id == v.id; });
+            targetBytes -= targetSize(*at);
+            retiredTextures.push_back({at->id, r.frame_ + kFrames});
+            gone.push_back(at->id);
+            list.erase(at);
+            if (list.empty()) v.cache->erase(it);
+        }
+        if (!gone.empty())
+            std::erase_if(latestColor, [&](const auto& e) { return std::find(gone.begin(), gone.end(), e.second) != gone.end(); });
     }
 
     // Releases what nothing used for kEvictIdle submits (see kEvictIdle). Called between frames, after submit: no pending draw
     // holds a pointer into these caches. GPU objects go through the retire lists (frames in flight may still read them).
-    // Kept: textures a shader wrote (the GPU copy is the only one), the registered-shader set (the backend cannot unregister).
+    // Kept: textures a shader wrote (the GPU copy is the only one), the registered-shader set (the backend cannot unregister);
+    // targets go by their own rule (kEvictIdleFlips).
     void evictIdle() {
         auto idle = [&](uint64_t last) { return r.frame_ > last && r.frame_ - last > kEvictIdle; };
         std::vector<TextureId> gone;  // ids released this sweep
         auto sweepTargets = [&](std::map<uint64_t, std::vector<Target>>& cache) {
             for (auto it = cache.begin(); it != cache.end();) {
+                uint64_t newest = 0;  // another surface at this address used more recently than a target: the address has been reused
+                for (const Target& t : it->second) newest = std::max(newest, t.flipUse);
                 std::erase_if(it->second, [&](const Target& t) {
-                    if (!idle(t.lastUse)) return false;
+                    if (flips <= t.flipUse || flips - t.flipUse <= kEvictIdleFlips || t.flipUse >= newest) return false;
+                    if (t.id == presentedAt || t.id == presentedSlice) return false;
+                    targetBytes -= targetSize(t);
                     retiredTextures.push_back({t.id, r.frame_ + kFrames});
                     gone.push_back(t.id);
                     return true;
@@ -1778,16 +1847,20 @@ std::string Renderer::describeAt(uint64_t address, uint64_t bytes) const { retur
 vpgpu::TextureId Renderer::colorTargetSlice(uint64_t address, uint32_t width, uint32_t height, uint16_t& layer) const {
     layer = 0;
     const Impl::Target* t = impl_->targetSlice(address, width, height, layer);
-    if (t) t->lastUse = frame_;  // a flip uses it: not idle
+    ++impl_->flips;
+    if (t) t->lastUse = frame_, t->flipUse = impl_->flips;  // a flip uses it: not idle
+    impl_->presentedSlice = t ? t->id : vpgpu::TextureId{};
     return t ? t->id : vpgpu::TextureId{};
 }
 
 vpgpu::TextureId Renderer::colorTargetAt(uint64_t address) const {
+    ++impl_->flips;
     auto it = impl_->latestColor.find(address);
+    impl_->presentedAt = it == impl_->latestColor.end() ? vpgpu::TextureId{} : it->second;
     if (it == impl_->latestColor.end()) return {};
     if (auto t = impl_->colorTargets.find(address); t != impl_->colorTargets.end())  // a flip uses it: not idle
         for (const Impl::Target& c : t->second)
-            if (c.id == it->second) c.lastUse = frame_;
+            if (c.id == it->second) c.lastUse = frame_, c.flipUse = impl_->flips;
     return it->second;
 }
 

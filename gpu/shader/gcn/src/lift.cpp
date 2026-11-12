@@ -3043,9 +3043,10 @@ struct Lifter {
         bool ok = true;
         int depth = 0;  // nesting of the walk (one level per open if / loop)
     };
-    // Deeper nesting than this is lifted as the dispatch loop: `walk` recurses once per level (a 512 KB thread stack ends
-    // at a few thousand) and the MSL indents every level.
-    static constexpr int kMaxWalkDepth = 200;
+    // Deeper nesting than this is lifted as the dispatch loop: every level is a nested brace of the MSL, and clang stops at 256
+    // nested brackets (braces and the parentheses of the condition and its operands count): 240 leaves room for those. `walk`
+    // recurses once per level too, but the bytes of stack left decide that (vpir::stackLow below), not this count.
+    static constexpr int kMaxWalkDepth = 240;
 
     // Leaves the current loop iteration if `k` is its header (continue) or exit (break).
     bool loopEdge(int k, Walk& w) {

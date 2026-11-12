@@ -9,6 +9,9 @@
     the same tag;
  4. no `${{ inputs.* }}` or `${{ github.event.* }}` text inside a `run:` script (shell injection through a dispatch input
     or a commit message): they go through `env:`.
+ 5. in gles-cts.yml a job with `cancel-in-progress: true` groups by ref (a newer manual run cancels the older one) and by
+    run_id otherwise (a push, whose jobs are mostly skipped, cancels nothing and is cancelled by nothing): a group made of
+    run_id alone cancels nothing;
 """
 import glob, os, re, sys
 
@@ -42,6 +45,11 @@ for f in sorted(glob.glob(os.path.join(DIR, "*.yml"))):
     if releases and conc is None:
         fail(f, "publishes a release without a concurrency group")
     for name, job in jobs.items():
+        jc = job.get("concurrency")
+        if os.path.basename(f) == "gles-cts.yml" and isinstance(jc, dict) and jc.get("cancel-in-progress") is True:
+            g = str(jc.get("group", ""))
+            if "github.ref" not in g or "github.run_id" not in g:
+                fail(f, f"job {name}: concurrency group {g!r} must use github.ref (manual runs) and github.run_id (the rest)")
         for step in job.get("steps", []):
             run = step.get("run")
             if run and INJECT.search(run):

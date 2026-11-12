@@ -20,7 +20,8 @@ final class SenseTracking: @unchecked Sendable {
     private var starting = false
     private var startingSet: Set<ObjectIdentifier> = [] // what the start under way is for
     private var pending: [GCController]? // the newest set asked for while a start was under way
-    private var epoch = 0 // raised by every stop(): a start that was under way when it came must not keep its session
+    private var epoch = 0 // raised by every halt (a stop(), or a start that replaces the tracking): a start that was under way when it came must not keep its session
+    private var startingEpoch = 0 // the epoch the start under way began in (set under the lock, with `starting`)
 
     private init() {}
 
@@ -32,7 +33,8 @@ final class SenseTracking: @unchecked Sendable {
         let wanted = Set(controllers.map(ObjectIdentifier.init))
         lock.lock()
         if starting {
-            pending = wanted == startingSet ? nil : controllers
+            // The start under way is the one asked for only if no stop() has come since it began.
+            pending = (wanted == startingSet && epoch == startingEpoch) ? nil : controllers
             lock.unlock()
             return
         }
@@ -42,14 +44,17 @@ final class SenseTracking: @unchecked Sendable {
         }
         starting = true
         startingSet = wanted
+        let old = takeAway()
+        let began = epoch // after takeAway, in the same lock hold: a stop() from here on makes the start stale
+        startingEpoch = began
         lock.unlock()
-        halt()
+        release(old)
         guard !controllers.isEmpty else {
             endStart()
             return
         }
         Task.detached(priority: .userInitiated) { [weak self] in
-            await self?.start(controllers, wanted: wanted)
+            await self?.start(controllers, wanted: wanted, began: began)
         }
     }
 
@@ -65,8 +70,7 @@ final class SenseTracking: @unchecked Sendable {
         if let next { track(next) }
     }
 
-    private func start(_ controllers: [GCController], wanted: Set<ObjectIdentifier>) async {
-        let startedAt = lock.withLock { epoch }
+    private func start(_ controllers: [GCController], wanted: Set<ObjectIdentifier>, began: Int) async {
         defer { endStart() }
         guard AccessoryTrackingProvider.isSupported else {
             LogFiles.log("Sense tracking: not supported here")
@@ -90,10 +94,18 @@ final class SenseTracking: @unchecked Sendable {
             LogFiles.log("Sense tracking: could not start (\(error.localizedDescription))")
             return
         }
+        // The session and its updates are kept together, under the lock that checks that no stop()
+        // came since the start began: a stop() can never find the session without its task.
         let stale = lock.withLock { () -> Bool in
-            if epoch != startedAt { return true }
+            if epoch != began { return true }
             self.session = session
             tracked = wanted
+            task = Task.detached(priority: .userInitiated) {
+                for await update in provider.anchorUpdates {
+                    if Task.isCancelled { break }
+                    Self.send(update.anchor)
+                }
+            }
             return false
         }
         if stale {
@@ -101,13 +113,6 @@ final class SenseTracking: @unchecked Sendable {
             return
         }
         LogFiles.log("Sense tracking: on for \(accessories.count) controller(s)")
-        let updates = Task.detached(priority: .userInitiated) {
-            for await update in provider.anchorUpdates {
-                if Task.isCancelled { break }
-                Self.send(update.anchor)
-            }
-        }
-        lock.withLock { task = updates }
     }
 
     func stop() {
@@ -117,16 +122,23 @@ final class SenseTracking: @unchecked Sendable {
 
     /// Stops the session and the updates; what was asked for during a start (pending) stays.
     private func halt() {
-        lock.lock()
-        let session = self.session
-        let task = self.task
-        self.session = nil
-        self.task = nil
+        release(lock.withLock { takeAway() })
+    }
+
+    /// Takes the session and the updates away and raises the epoch. The lock is held.
+    private func takeAway() -> (ARKitSession?, Task<Void, Never>?) {
+        let taken = (session, task)
+        session = nil
+        task = nil
         tracked = []
         epoch += 1
-        lock.unlock()
-        task?.cancel()
-        session?.stop()
+        return taken
+    }
+
+    /// Stops what takeAway took, and lets go of the aim of both hands. Not under the lock.
+    private func release(_ taken: (ARKitSession?, Task<Void, Never>?)) {
+        taken.1?.cancel()
+        taken.0?.stop()
         for hand in 0...1 {
             VPPlatform.aimSink(hand, false, .zero, SIMD4(0, 0, 0, 1))
         }

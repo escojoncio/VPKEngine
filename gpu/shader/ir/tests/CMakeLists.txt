@@ -5,6 +5,7 @@ target_compile_options(vpir_test PRIVATE -Wall -Wextra)
 add_test(NAME vpir.builder COMMAND vpir_test builder)
 add_test(NAME vpir.dead_chain COMMAND vpir_test dead_chain)
 add_test(NAME vpir.deep_nest COMMAND vpir_test deep_nest)
+add_test(NAME vpir.dead_range COMMAND vpir_test dead_range)
 
 # Canonical files (the MSL golden inputs): parse, verify clean, print back byte for byte.
 file(GLOB good CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/../../msl/tests/*.vpir)

@@ -357,26 +357,37 @@ struct MetalBackend::Impl {
   // resources are untracked, so a later command buffer could otherwise overlap an earlier one.
   id<MTLSharedEvent> order;
   uint64_t orderValue = 0;
-  std::mutex orderMutex;
   void ordered(id<MTLCommandBuffer> cb) {
     if (orderValue) [cb encodeWaitForEvent:order value:orderValue];
   }
   void signalled(id<MTLCommandBuffer> cb) { [cb encodeSignalEvent:order value:++orderValue]; }
-  // Command buffers whose place in the order is fixed but whose commit waits for the app to be foreground again; guarded by
-  // orderMutex. No thread ever parks in the background gate while holding orderMutex (the main thread, which the gate lets
-  // through, may need it to commit interop work, and it is the one that ends the pause): a thread that would park hands its
-  // command buffer over, and the next thread that may commit sends the whole batch in order.
-  vpgpu::DeferredCommits<id<MTLCommandBuffer>> deferred;
-  // orderMutex held: the command buffer joins the pending ones and every one of them is committed, oldest first, unless this
+  // The order lock (commits.lock) fixes the place of a command buffer in the queue's order. Command buffers whose place is fixed
+  // but whose commit waits for the app to be foreground again are held in commits.deferred. No thread ever parks in the
+  // background gate while holding the lock (the main thread, which the gate lets through, may need it to commit interop work, and
+  // it is the one that ends the pause): a thread that would park hands its command buffer over, and the next thread that may
+  // commit sends the whole batch in order. Also counts the threads inside submit / encodeInterop (~MetalBackend waits for them)
+  // and the teardown flag; the logic is in core (CommitQueue, tested there).
+  vpgpu::CommitQueue<id<MTLCommandBuffer>> commits{vpgpu::backgroundGate()};
+  static void sendCommit(id<MTLCommandBuffer> cb) { [cb commit]; }
+  // commits.lock held: the command buffer joins the pending ones and every one of them is committed, oldest first, unless this
   // thread would park in the gate.
-  void commitOrdered(id<MTLCommandBuffer> cb) {
-    deferred.push(cb);
-    for (id<MTLCommandBuffer> pending : deferred.take(vpgpu::backgroundGate())) [pending commit];
+  void commitOrdered(id<MTLCommandBuffer> cb) { commits.push(cb, sendCommit); }
+  // commits.lock held: commits what may be committed now.
+  void commitReady() { commits.commitReady(sendCommit); }
+  // Lock not held (or held by this thread: then false): see CommitQueue::flush. Called on flushQueue when the app is foreground
+  // again (resume hook, retried until true) and by whoever waits for command buffers (a pause that ends with no later commit
+  // would leave them, and the frames / interop callbacks that depend on them, pending for ever).
+  bool flushDeferred() { return commits.flush(sendCommit); }
+  // Waits for a frame slot; keeps sending held-back command buffers meanwhile (the slot may be held by one of them).
+  void waitSlot() {
+    while (dispatch_semaphore_wait(inFlight, dispatch_time(DISPATCH_TIME_NOW, 20 * NSEC_PER_MSEC)) != 0) flushDeferred();
   }
   id<MTLResidencySet> residency;  // M4: attached to the MTL4CommandQueue the same way
   bool residencyDirty = false;
   dispatch_semaphore_t inFlight;
   vpgpu::CompletionFrontier completion;  // frames below completion.completed() have finished (handlers ran)
+  dispatch_queue_t flushQueue = nil;  // serial: the resume hook (main thread, must not block) hands flushDeferred() to it
+  uint64_t resumeHook = 0;  // BackgroundGate resume hook id (0 = none): sends the held-back command buffers when the app is foreground again
   std::atomic<uint32_t> interopInFlight{0};  // encodeInterop command buffers committed whose handler has not finished (waitIdle)
   uint64_t submits = 0;
   std::vector<Slot> slots;
@@ -742,20 +753,22 @@ struct Open {
 }  // namespace
 
 void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const CompiledFrame& compiled) {
+  const vpgpu::CommitQueue<id<MTLCommandBuffer>>::Inside inside(commits);  // until this function returns (see below)
   if (compiled.encoders.empty()) {  // nothing for the GPU; keeps the frontier's fences out of reuse
     completion.submitted(frameIndex, false);  // done as soon as the frames before it are
     std::lock_guard lock(doneMutex);
     done.push_back({frameIndex, {}});
     return;
   }
-  // Parks here while the app is in the background, holding neither orderMutex nor a frame slot; once through, sends any
-  // command buffer that had to wait for the foreground (commitOrdered), so a slot it holds is free again.
+  // Parks here while the app is in the background, holding neither the order lock nor a frame slot; once through, sends any
+  // command buffer that had to wait for the foreground (commitOrdered), so a slot it holds is free again. Counted as inside
+  // before it can park: ~MetalBackend waits for the count, so the object is not destroyed under a thread the gate let go.
   vpgpu::backgroundGate().waitForeground();
   {
-    std::lock_guard lock(orderMutex);
-    for (id<MTLCommandBuffer> pending : deferred.take(vpgpu::backgroundGate())) [pending commit];
+    std::lock_guard lock(commits.lock);
+    commitReady();
   }
-  dispatch_semaphore_wait(inFlight, DISPATCH_TIME_FOREVER);
+  waitSlot();
   // Consecutive command buffers use different slots, so the frontier carried over from the
   // previous one never holds a fence this one updates.
   Slot& slot = slots[submits++ % slots.size()];
@@ -777,7 +790,7 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
   cbd.errorOptions = MTLCommandBufferErrorOptionEncoderExecutionStatus;  // per-encoder fault in the log
   id<MTLCommandBuffer> cb = [queue commandBufferWithDescriptor:cbd];
   cb.label = [NSString stringWithFormat:@"vpgpu.f%llu", (unsigned long long)frameIndex];
-  std::unique_lock orderLock(orderMutex);
+  std::unique_lock orderLock(commits.lock);
   ordered(cb);
 
   const auto& cmds = frame.commands();
@@ -1308,16 +1321,42 @@ MetalBackend::MetalBackend(const ShaderProvider& shaders, LogSink log, MetalOpti
   @autoreleasepool {
     impl_->init();
   }
+  if (ok()) {
+    impl_->flushQueue = dispatch_queue_create("vpgpu.flush", dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INITIATED, 0));
+    Impl* m = impl_.get();
+    impl_->resumeHook = vpgpu::backgroundGate().addResumeHook([m] {
+      if (m->commits.deferred.pending())  // never blocks the thread that ends the pause
+        dispatch_async(m->flushQueue, ^{
+          while (!m->flushDeferred()) usleep(1000);  // the order lock is busy: its holder may be about to finish, try again
+        });
+    });
+  }
 }
 
 MetalBackend::~MetalBackend() {
+  impl_->commits.closing.store(true, std::memory_order_release);  // before release(): the threads it wakes must not hand commits over
+  if (impl_->resumeHook) vpgpu::backgroundGate().removeResumeHook(impl_->resumeHook);  // waits for a running call
+  if (impl_->flushQueue) dispatch_sync(impl_->flushQueue, ^{});  // the flushes that call queued have run: none uses *impl_ later
   if (ok()) {
-    vpgpu::backgroundGate().release();  // a commit parked for the background holds a frame waitIdle() waits for
+    vpgpu::backgroundGate().release();  // wakes the threads parked in the gate inside submit / encodeInterop ...
     {
-      std::lock_guard lock(impl_->orderMutex);  // ... and so does one handed over for it: commit it now
-      for (id<MTLCommandBuffer> pending : impl_->deferred.takeAll()) [pending commit];
+      std::lock_guard lock(impl_->commits.lock);  // ... and a command buffer handed over for the background is committed now
+      impl_->commitReady();
     }
+    // A thread the gate let go has no frame slot yet (submit) or no interop count yet (encodeInterop), so waitIdle() alone could
+    // return while it still runs in *impl_. Wait for every thread inside those two calls (no limit: they end once their command
+    // buffers are committed, which `closing` makes immediate); a thread that reached the gate after the release is woken again.
+    impl_->commits.waitNoneInside([&] {
+      vpgpu::backgroundGate().release();
+      impl_->flushDeferred();
+    });
     waitIdle();
+    // waitIdle() gives up on interop work after 5 s; its handlers use *impl_, which dies with this object, so here the wait has
+    // no limit (a command buffer that never completes fails with an error status).
+    while (impl_->interopInFlight.load(std::memory_order_acquire)) {
+      impl_->flushDeferred();
+      usleep(1000);
+    }
   }
 }
 
@@ -1449,6 +1488,7 @@ void MetalBackend::submit(uint64_t frameIndex, const Frame& frame, const Compile
 }
 
 bool MetalBackend::takeTimings(uint64_t& frameIndex, GpuTimings& out) {
+  impl_->flushDeferred();  // the poller may be the only thread left that can send a held-back command buffer
   std::lock_guard lock(impl_->doneMutex);
   if (impl_->done.empty()) return false;
   frameIndex = impl_->done.front().frame;
@@ -1457,14 +1497,21 @@ bool MetalBackend::takeTimings(uint64_t& frameIndex, GpuTimings& out) {
   return true;
 }
 
-uint64_t MetalBackend::completedFrames() const { return impl_->completion.completed(); }
+uint64_t MetalBackend::completedFrames() const {
+  impl_->flushDeferred();  // see takeTimings
+  return impl_->completion.completed();
+}
 
 void MetalBackend::waitIdle() {
+  impl_->flushDeferred();
   // Holding every slot means every completion handler has run (not only that the GPU finished).
-  for (size_t i = 0; i < impl_->slots.size(); ++i) dispatch_semaphore_wait(impl_->inFlight, DISPATCH_TIME_FOREVER);
+  for (size_t i = 0; i < impl_->slots.size(); ++i) impl_->waitSlot();
   for (size_t i = 0; i < impl_->slots.size(); ++i) dispatch_semaphore_signal(impl_->inFlight);
   // Interop command buffers are not frames: their handlers use *impl_ too.
-  for (int i = 0; i < 5000 && impl_->interopInFlight.load(std::memory_order_acquire); ++i) usleep(1000);
+  for (int i = 0; i < 5000 && impl_->interopInFlight.load(std::memory_order_acquire); ++i) {
+    impl_->flushDeferred();
+    usleep(1000);
+  }
 }
 
 void* MetalBackend::contents(BufferId handle) const {
@@ -1479,10 +1526,14 @@ bool MetalBackend::encodeInterop(const std::function<void(void* commandBuffer)>&
                                  std::function<void()> completed) {
   if (!impl_->queue || !encode) return false;
   @autoreleasepool {
+    const vpgpu::CommitQueue<id<MTLCommandBuffer>>::Inside inside(impl_->commits);  // before the gate: ~MetalBackend waits for it
     vpgpu::backgroundGate().waitForeground();  // before the lock: a thread parked here holds nothing the main thread may need
-    std::lock_guard lock(impl_->orderMutex);
+    std::lock_guard lock(impl_->commits.lock);
     id<MTLCommandBuffer> cb = [impl_->queue commandBuffer];
-    if (!cb) return false;
+    if (!cb) {  // nothing to add, but this lock may have kept another thread from sending the ones held back
+      impl_->commitReady();
+      return false;
+    }
     cb.label = @(label ? label : "vpgpu.interop");
     impl_->ordered(cb);
     encode((__bridge void*)cb);

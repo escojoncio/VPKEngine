@@ -255,7 +255,7 @@ class MetalBackend final : public Backend {
   size_t drainRetired(uint32_t minIdleMs, std::string& report);
   // The submit-thread half of trimMemory done at once: MSAA backings not used by the last frame and idle slots' chained
   // argument buffers go to the graveyard (drainRetired then returns the part no frame reads). Same caller rules as
-  // drainRetired (under VPVulkan's submit mutex). Never waits. Returns the bytes moved; appends "serialized_msaa= serialized_args=" (MiB).
+  // drainRetired (under VPVulkan's submit mutex). Never waits. Returns the bytes moved; appends "serialized_msaa= serialized_args= serialized_fov=" (MiB).
   size_t trimSerialized(std::string& report);
   // Cumulative counters (key, value) of what the backend created and encoded, for the per-second diagnostics; keys
   // starting "g_" are gauges. Any thread, lock-free.

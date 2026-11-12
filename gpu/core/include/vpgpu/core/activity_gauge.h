@@ -4,6 +4,7 @@
 // neutral (the null platform tests it).
 #pragma once
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -27,8 +28,10 @@ class ActivityGauge {
       cv_.notify_all();
     }
   }
-  // Blocks until nothing is running or `timeout` passes (a leave() wakes it at once); true = nothing is running.
+  // Blocks until nothing is running or `timeout` passes (a leave() wakes it at once); true = nothing is running. A timeout is kept
+  // within [0, a year]: now + the largest duration would overflow the clock and end the wait at once, a negative one is a poll.
   bool waitInactive(std::chrono::nanoseconds timeout) {
+    timeout = std::clamp(timeout, std::chrono::nanoseconds::zero(), std::chrono::nanoseconds(std::chrono::hours(24 * 365)));
     std::unique_lock lock(mutex_);
     waiters_.fetch_add(1, std::memory_order_seq_cst);
     cv_.wait_for(lock, timeout, [this] { return active_.load(std::memory_order_seq_cst) == 0; });

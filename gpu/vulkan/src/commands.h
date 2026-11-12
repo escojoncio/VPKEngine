@@ -244,9 +244,21 @@ struct UploadArena {
     for (auto& c : chunks) c.used = 0;
     current = 0;
   }
+  size_t touched() const {  // chunks holding something (the recording that is being reset)
+    size_t n = 0;
+    for (const auto& c : chunks) n += c.used != 0;
+    return n;
+  }
   void release(Device* d);
-  void trim(Device* d);  // after reset(): keeps the first chunk, gives the others back
+  void trim(Device* d);  // after reset(): keeps the first (normal-sized) chunk, gives the others back; takes the submit mutex
+  // After reset(): keeps `keep` normal-sized chunks, hands the others to the device to free at its next submission (no submit mutex here).
+  void retireExcess(Device* d, size_t keep);
+  static constexpr VkDeviceSize kMaxKeptChunk = 1 << 20;  // a chunk made for one huge copy is not kept: the next one is a normal 64 KiB
+ private:
+  void shrink(Device* d, size_t keep, bool defer);
 };
+// Frees the chunks Recorder::releaseResources retired. Called with d->submitMutex held.
+void drainRetiredChunks(Device* d);
 
 // Draw state at the time of a vkCmd*.
 struct BoundState {
@@ -439,6 +451,8 @@ struct Recorder {
   // descriptors when it is recorded, so a later push does not reach it.
   std::array<std::array<std::unique_ptr<DescriptorSetObj>, 8>, 2> pushSets;
   void reset() {
+    lastOps = ops.size();
+    lastChunks = arena.touched();
     imageless.clear();
     for (auto& bp : pushSets)
       for (auto& s : bp) s.reset();
@@ -452,11 +466,29 @@ struct Recorder {
     bound = BoundState{};
     arena.reset();
   }
-  // Right after reset(): vkResetCommandBuffer / vkResetCommandPool with RELEASE_RESOURCES_BIT give the memory back (the arena's
-  // chunks, the capacity of `ops`); vkTrimCommandPool keeps one arena chunk.
+  // Right after reset(): vkResetCommandBuffer / vkResetCommandPool with RELEASE_RESOURCES_BIT. Engines pass the bit every frame, so
+  // freeing everything each time costs the next recording its allocations: it keeps what the last recording used (capacity of `ops`,
+  // arena chunks) and gives the excess back only after kReleaseFrames consecutive resets with the bit that find it. The chunks go to
+  // the device's retired list (freed at its next submission): a reset never waits for the submit mutex. A command buffer reset once
+  // and left alone keeps its memory until vkTrimCommandPool or its destruction.
+  static constexpr uint32_t kReleaseFrames = 8;
+  size_t lastOps = 0, lastChunks = 0;  // what the recording that was reset last used
+  uint32_t excessStreak = 0;
   void releaseResources() {
-    arena.release(device);
-    std::vector<Op>().swap(ops);
+    const size_t keepChunks = std::max<size_t>(lastChunks, 1);
+    const bool opsExcess = ops.capacity() > 2 * lastOps + 64;
+    if (!opsExcess && arena.chunks.size() <= keepChunks) {
+      excessStreak = 0;
+      return;
+    }
+    if (++excessStreak < kReleaseFrames) return;
+    excessStreak = 0;
+    if (opsExcess) {
+      std::vector<Op> fit;
+      fit.reserve(lastOps);
+      ops.swap(fit);
+    }
+    arena.retireExcess(device, keepChunks);
   }
   void trim() {
     arena.trim(device);

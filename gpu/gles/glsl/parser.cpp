@@ -11,6 +11,7 @@
 #include "ast.h"
 #include "builtins.h"
 #include "pp.h"
+#include "vpir/stack.h"
 
 namespace vpglsl {
 
@@ -49,6 +50,7 @@ public:
     }
 
     std::shared_ptr<Shader> run() {
+        vpir::StackGuard stackGuard;  // (see NestGuard)
         try {
             pushScope();
             declareBuiltins();
@@ -76,18 +78,25 @@ public:
 
 private:
     // Nesting of statements / expressions: "((((...", "- - - -x", "{{{{..." recurse once per level, so a hostile shader would overflow
-    // the stack. Real shaders nest a few dozen levels at most.
+    // the stack. A level is counted once; `else if` ladders are parsed in a loop and are not counted. Operator chains ("a + a + ...",
+    // "v.x.x.x", "a, b, c") do not recurse here but build a tree as deep as the chain, and the passes over the tree (type folding,
+    // the SPIR-V emitter, destruction) recurse: each link counts as a level too. The count bounds the passes; the real stack of the
+    // thread (vpir::StackGuard, set in run()) bounds the recursion of the parser itself and of its passes over the tree (the
+    // functions that recurse over an Expr check it too), the emitter checks it as well, and the tree is destroyed and walked in
+    // loops: a worker thread with a small stack gets an error instead of a crash.
     int nest_ = 0;
-    static constexpr int kMaxNest = 200;
+    static constexpr int kMaxNest = 1200;
     struct NestGuard {
         Parser& p;
-        explicit NestGuard(Parser& parser) : p(parser) {
-            if (++p.nest_ > kMaxNest) {
-                --p.nest_;
-                p.err("shader nests statements or expressions too deeply");
-            }
+        int levels = 0;
+        explicit NestGuard(Parser& parser, bool first = true) : p(parser) {
+            if (first) add();
         }
-        ~NestGuard() { --p.nest_; }
+        void add() {
+            if (p.nest_ >= kMaxNest || vpir::stackLow()) p.err("shader nests statements or expressions too deeply");
+            ++p.nest_, ++levels;
+        }
+        ~NestGuard() { p.nest_ -= levels; }
     };
     // Recursion (static, not even through a chain of calls) cannot be compiled: SPIR-V forbids it and the hardware has
     // no stack. Always an error, in lenient mode too.
@@ -1054,6 +1063,7 @@ private:
     }
 
     StmtP compound(bool scope = true) {
+        NestGuard nestGuard(*this);
         int line = peek().line;
         expectP("{");
         auto s = mk(SK::Block, line);
@@ -1088,23 +1098,34 @@ private:
     }
 
     StmtP statement() {
+        if (isP("{")) return compound();  // (counts itself)
         NestGuard nestGuard(*this);
         int line = peek().line;
-        if (isP("{")) return compound();
         if (acceptP(";")) return mk(SK::Empty, line);
         if (isId("if")) {
-            next();
-            expectP("(");
-            auto s = mk(SK::If, line);
-            s->e = expression();
-            if (s->e->type != Type::make(Base::Bool)) errAt(line, "if condition must be a scalar bool");
-            expectP(")");
-            s->then = scopedStatement();
-            if (isId("else")) {
+            // An `else if` ladder is parsed in a loop: each `if` becomes the `els` of the previous one (no recursion, no extra level).
+            StmtP head;
+            Stmt* tail = nullptr;
+            for (;;) {
+                const int ifLine = peek().line;
                 next();
-                s->els = scopedStatement();
+                expectP("(");
+                auto s = mk(SK::If, ifLine);
+                s->e = expression();
+                if (s->e->type != Type::make(Base::Bool)) errAt(ifLine, "if condition must be a scalar bool");
+                expectP(")");
+                s->then = scopedStatement();
+                Stmt* cur = s.get();
+                if (tail) tail->els = std::move(s);
+                else head = std::move(s);
+                tail = cur;
+                if (!isId("else")) break;
+                next();
+                if (isId("if")) continue;
+                tail->els = scopedStatement();
+                break;
             }
-            return s;
+            return head;
         }
         if (isId("while")) {
             next();
@@ -1319,8 +1340,10 @@ private:
     }
 
     ExprP expression() {
+        NestGuard chain(*this, false);
         ExprP e = assignment();
         while (isP(",")) {
+            chain.add();
             int line = next().line;
             ExprP r = assignment();
             ExprP c = mkE(EK::Comma, r->type, line);
@@ -1335,6 +1358,7 @@ private:
     // operators and built-in calls (but not texture / derivative / image / atomic functions) on constant operands.
     // Parameters, uniforms, user function calls, assignments and the comma operator are not.
     bool isConstExpr(const Expr& e) const {
+        if (vpir::stackLow()) err("shader nests statements or expressions too deeply");  // (an operator chain is deep without the parser being)
         switch (e.k) {
             case EK::IntLit: case EK::UintLit: case EK::FloatLit: case EK::BoolLit: return true;
             case EK::Var:
@@ -1372,6 +1396,7 @@ private:
         }
     }
     bool constComps(const Expr& e, std::vector<double>& out) const {
+        if (vpir::stackLow()) err("shader nests statements or expressions too deeply");
         out.clear();
         if (e.hasConst && e.type.isScalar() && !e.type.isArray()) {
             out.push_back(e.type.base == Base::Float ? e.constF : double(e.constI));
@@ -1466,6 +1491,7 @@ private:
     }
 
     bool isLValue(const Expr& e, std::string& why) {
+        if (vpir::stackLow()) err("shader nests statements or expressions too deeply");
         switch (e.k) {
             case EK::Var: {
                 const Symbol* s = e.sym;
@@ -1686,11 +1712,13 @@ private:
     }
 
     ExprP binary(int minPrec) {
+        NestGuard chain(*this, false);  // the left-deep tree of "a + a + ..." is one level per operator
         ExprP l = unary();
         for (;;) {
             if (peek().kind != Tok::Punct) break;
             int p = precedence(peek().text);
             if (p < 0 || p < minPrec) break;
+            chain.add();
             Token opTok = next();
             ExprP r = binary(p + 1);
             Type t = binaryType(opTok.text, l->type, r->type, opTok.line);
@@ -1705,7 +1733,8 @@ private:
     }
 
     ExprP unary() {
-        NestGuard nestGuard(*this);
+        // (Only a prefix operator recurses here; a parenthesis or call argument recurses through assignment(), which counts it.)
+        NestGuard nestGuard(*this, isP("++") || isP("--") || isP("+") || isP("-") || isP("!") || isP("~"));
         int line = peek().line;
         for (const char* op : {"++", "--"}) {
             if (!isP(op)) continue;
@@ -1758,8 +1787,10 @@ private:
     }
 
     ExprP postfix(ExprP e) {
+        NestGuard chain(*this, false);  // "v.x.x.x" / "a[0][0][0]": one level per link
         for (;;) {
             int line = peek().line;
+            if (isP("[") || isP(".") || isP("++") || isP("--")) chain.add();
             if (acceptP("[")) {
                 ExprP idx = expression();
                 expectP("]");

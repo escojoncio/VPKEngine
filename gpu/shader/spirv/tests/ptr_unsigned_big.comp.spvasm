@@ -1,0 +1,52 @@
+; Variable pointers: an OpPtrAccessChain whose element is the UNSIGNED constant 2^31 is a step of 2^33 bytes forward, not a step back:
+; the lowering refuses it ("byte offset overflows 32 bits") instead of wrapping.
+OpCapability Cap:Shader
+OpCapability Cap:VariablePointersStorageBuffer
+OpExtension "SPV_KHR_variable_pointers"
+OpMemoryModel AddrModel:Logical MemModel:GLSL450
+OpEntryPoint Model:GLCompute %main "main"
+OpExecutionMode %main ExecMode:LocalSize 1 1 1
+OpDecorate %arr Deco:ArrayStride 4
+OpDecorate %pu Deco:ArrayStride 4
+OpDecorate %blk Deco:Block
+OpMemberDecorate %blk 0 Deco:Offset 0
+OpDecorate %A Deco:DescriptorSet 0
+OpDecorate %A Deco:Binding 0
+OpDecorate %O Deco:DescriptorSet 0
+OpDecorate %O Deco:Binding 1
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%u32 = OpTypeInt 32 0
+%i32 = OpTypeInt 32 1
+%c0 = OpConstant %u32 0
+%c1 = OpConstant %u32 1
+%c2 = OpConstant %u32 2
+%c3 = OpConstant %u32 3
+%c4 = OpConstant %u32 4
+%m1 = OpConstant %u32 0x80000000
+%m3 = OpConstant %i32 -3
+%arr = OpTypeArray %u32 %c4
+%blk = OpTypeStruct %arr
+%pblk = OpTypePointer Storage:StorageBuffer %blk
+%pu = OpTypePointer Storage:StorageBuffer %u32
+%A = OpVariable %pblk Storage:StorageBuffer
+%O = OpVariable %pblk Storage:StorageBuffer
+%main = OpFunction %void 0 %fn
+%l = OpLabel
+%pa = OpAccessChain %pu %A %c0 %c3
+%pe = OpPtrAccessChain %pu %pa %m1
+%e = OpLoad %u32 %pe
+%o0 = OpAccessChain %pu %O %c0 %c0
+OpStore %o0 %e
+%pf = OpPtrAccessChain %pu %pa %m3
+%f = OpLoad %u32 %pf
+%o1 = OpAccessChain %pu %O %c0 %c1
+OpStore %o1 %f
+%p0 = OpAccessChain %pu %A %c0 %c0
+%pn = OpPtrAccessChain %pu %p0 %m1
+%pz = OpPtrAccessChain %pu %pn %c1
+%z = OpLoad %u32 %pz
+%o2 = OpAccessChain %pu %O %c0 %c2
+OpStore %o2 %z
+OpReturn
+OpFunctionEnd

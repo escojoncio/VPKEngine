@@ -186,7 +186,7 @@ final class VPConversion {
         try? FileManager.default.createDirectory(at: workDirectory(for: game), withIntermediateDirectories: true)
         setenv("VPKENGINE_MISSING_LOG", missingLog(for: game).path, 1)
         let started = Date()
-        let loaded = VPGamePack.loadFragments(in: onDemandFolder(for: game))
+        let loaded = VPGamePack.loadFragments(in: onDemandFolder(for: game), game: game.lastPathComponent)
         if loaded > 0 {
             ConversionLog.shared.line(String(format: "loaded %d libraries translated on demand before, in %.1f s", loaded, Date().timeIntervalSince(started)))
         }
@@ -237,7 +237,7 @@ final class VPConversion {
         }
         guard result == 0 else { return result }
         do {
-            try VPGamePack.loadFragment(URL(fileURLWithPath: String(cString: out)))
+            try VPGamePack.loadFragment(URL(fileURLWithPath: String(cString: out)), game: game.lastPathComponent)
         } catch {
             VPGamePack.log("VPKEngine: on demand: \(module)+0x\(String(offset, radix: 16)) translated but not loaded: \(error.localizedDescription)")
             return -20

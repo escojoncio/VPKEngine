@@ -1697,6 +1697,49 @@ void varPtr(const std::string& dir) {
     }
 }
 
+// OpPtrAccessChain with a negative constant element (ptr_negative.comp): the step back is modular in 32 bits, as the dynamic
+// index is; it used to be refused as "byte offset overflows 32 bits".
+void ptrNegative(const std::string& dir) {
+    spirv::SpirvLowerOptions o;
+    o.entry = "main";
+    o.stage = vpir::Stage::Compute;
+    o.layout = {bind(0, 0, vpgpu::BindKind::Buffer, 0), bind(0, 1, vpgpu::BindKind::Buffer, 1)};
+    Result r = run(dir + "/ptr_negative.comp.spv", o);
+    CHECK(r.ok);
+    if (!r.ok) return;
+    vpireval::Invocation inv;
+    const uint32_t a[4] = {10, 11, 12, 13};
+    inv.memory[0].resize(16), inv.memory[1].assign(12, 0);
+    std::memcpy(inv.memory[0].data(), a, 16);
+    std::string err;
+    CHECK(vpireval::run(r.module, inv, err));
+    if (!err.empty()) std::fprintf(stderr, "  eval: %s\n", err.c_str());
+    uint32_t go[3];
+    std::memcpy(go, inv.memory[1].data(), 12);
+    CHECK(go[0] == 12u);  // (&A[3]) - 1
+    CHECK(go[1] == 10u);  // (&A[3]) - 3
+    CHECK(go[2] == 10u);  // ((&A[0]) - 1) + 1: below zero for a moment
+}
+
+// The same chain with the UNSIGNED element 2^31 is a step forward of 2^33 bytes: refused, not taken for a step back.
+void ptrUnsignedBig(const std::string& dir) {
+    const std::vector<uint32_t> words = readWords(dir + "/ptr_unsigned_big.comp.spv");
+    std::string error;
+    spirv::SpirvModule* m = spirv::parse(words.data(), words.size(), error);
+    CHECK(m != nullptr);
+    if (!m) return;
+    spirv::SpirvLowerOptions o;
+    o.entry = "main";
+    o.stage = vpir::Stage::Compute;
+    o.layout = {bind(0, 0, vpgpu::BindKind::Buffer, 0), bind(0, 1, vpgpu::BindKind::Buffer, 1)};
+    vpir::Module mod;
+    spirv::SpirvInterface iface;
+    const bool ok = spirv::lower(*m, o, mod, iface, error);
+    spirv::release(m);
+    CHECK(!ok);
+    CHECK(error.find("overflows 32 bits") != std::string::npos);
+}
+
 // VK_KHR_buffer_device_address: a PhysicalStorageBuffer pointer read from a buffer is a {low, high}
 // address; loads / stores through it (and through chains into it) use the device target; pointers
 // convert to and from uvec2 (bda.comp). The interpreter maps address high word h to memory[0x10000 + h].
@@ -2699,6 +2742,8 @@ int main(int argc, char** argv) {
     else if (c == "membar") memBar(dir);
     else if (c == "bda") bda(dir);
     else if (c == "varptr") varPtr(dir);
+    else if (c == "ptr_negative") ptrNegative(dir);
+    else if (c == "ptr_unsigned_big") ptrUnsignedBig(dir);
     else if (c == "int8") int8(dir);
     else if (c == "dot") dotProduct(dir);
     else if (c == "zero_init") zeroInit(dir);

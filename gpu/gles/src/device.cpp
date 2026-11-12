@@ -1,5 +1,6 @@
 // Device, submission, streaming memory, images and samplers.
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstdarg>
 #include <cstdio>
@@ -14,6 +15,7 @@ namespace {
 Device* gDevice = nullptr;
 thread_local Context* tCurrent = nullptr;
 Context* gLastCurrent = nullptr;  // last context made current on any thread (guarded by Device::lock)
+std::atomic<uint64_t> gEpoch{0};
 }  // namespace
 
 void logf(const char* fmt, ...) {
@@ -425,6 +427,7 @@ VkImageView Texture::sampledView() {
 // ---- Context: recording -----------------------------------------------------------------------------
 Context::Context(Device* d, ShareGroup* s, int maj, int min) : dev(d), share(s), major(maj), minor(min) {
     ++share->refs;
+    epoch_ = ++gEpoch;
     vaos[0] = std::make_unique<VertexArray>();
     fbos[0] = std::make_unique<Framebuffer>();
     fbos[0]->drawBuffers[0] = gl::BACK;
@@ -610,7 +613,7 @@ void Context::recordTransfers() {
     std::vector<const Image*> written;
     for (Xfer& x : ops) {
         Image& img = *x.image;
-        img.xferPending = 0;
+        if (img.xferPending) --img.xferPending;  // this upload's; another context of the share group may have its own waiting
         const bool again = std::find(written.begin(), written.end(), &img) != written.end();
         if (x.init) {
             initBarrier(dev, c, img);
@@ -626,6 +629,9 @@ void Context::recordTransfers() {
 
 void Context::imageUsed(const Image& img) {
     if (!img.xferPending) return;
+    // Only this context's own waiting uploads matter here: another context of the share group records its own when it ends its pass
+    // or flushes (cutting this pass would gain nothing).
+    if (std::none_of(xfers_.begin(), xfers_.end(), [&](const Xfer& x) { return x.image.get() == &img; })) return;
     if (passOpen_) xferHazard_ = true;  // prepareDraw ends the pass and prepares the draw again
     else recordTransfers();
 }
@@ -667,12 +673,27 @@ bool BufferStorage::readsRange(uint64_t lo, uint64_t hi) const {
 
 void Context::useStorage(const StorageP& s, uint64_t lo, uint64_t hi) {
     if (!s) return;
-    if (s->lastUse != dev->submitted + 1) {
+    if (s->openEpoch != epoch_) {  // first use in this command buffer (a serial taken by another submission meanwhile does not fool it)
         if (s->lastUse <= dev->completed) s->reads.clear();  // the work those ranges were read by is done
-        s->lastUse = dev->submitted + 1;  // the serial the open command buffer will get
+        s->openEpoch = epoch_;
+        s->lastUse = dev->submitted + 1;  // the serial the open command buffer will get, if nothing is submitted first: flush sets the real one
         used_.push_back(s);
     }
     s->noteRead(lo, hi);
+}
+
+bool Context::storageBusy(const BufferStorage& s) const {
+    if (s.lastUse > dev->completed) return true;
+    for (const StorageP& u : used_)
+        if (u.get() == &s) return true;
+    return false;
+}
+
+bool Context::gpuWritePending(const BufferStorage& s) const {
+    if (s.gpuWrite > dev->completed) return true;
+    for (const StorageP& u : gpuWrites_)
+        if (u.get() == &s) return true;
+    return false;
 }
 
 uint64_t Context::flush(bool wait) {
@@ -700,11 +721,14 @@ uint64_t Context::flush(bool wait) {
     f.serial = ++dev->submitted;
     f.cb = cb_;
     f.descPool = descPool_;
-    for (auto& s : used_) f.keep.push_back(s);
+    for (auto& s : used_) s->lastUse = f.serial, f.keep.push_back(s);  // (the stamps made while recording guessed this serial)
+    for (auto& s : gpuWrites_) s->gpuWrite = f.serial;
     for (auto& c : chunks_) f.chunks.push_back(c.storage);
     for (auto& k : keep_) f.keep.push_back(std::move(k));
     dev->inFlight.push_back(std::move(f));
     used_.clear();
+    gpuWrites_.clear();
+    epoch_ = ++gEpoch;
     keep_.clear();
     // The chunks stay alive with the submission (f.chunks); once it retires they go to Device::spareChunks.
     chunks_.clear();
@@ -758,9 +782,9 @@ void Context::prepareWrite(Buffer& b, bool discard, uint64_t lo, uint64_t hi, bo
     if (!b.storage) return;
     // What the GPU has still to write (a readback into it) is in the host memory only when the work is done: the copy below, or the
     // application's write over it, would be made on bytes that are not there yet.
-    if (!discard && b.storage->gpuWrite > dev->completed) flush(true);
+    if (!discard && gpuWritePending(*b.storage)) flush(true);
     const uint64_t pending = b.storage->lastUse;
-    const bool gpuMayRead = pending && pending > dev->completed;
+    const bool gpuMayRead = pending && storageBusy(*b.storage);
     if (!gpuMayRead) return;
     // The GPU reads other bytes only (a game that fills a ring buffer a bit at a time): the write is made in place.
     if (!b.storage->readsRange(lo, hi)) return;

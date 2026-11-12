@@ -122,7 +122,10 @@ class MetalBackend final : public Backend {
   bool takeTimings(uint64_t& frameIndex, GpuTimings& out) override;
   uint64_t completedFrames() const override;
 
-  // Blocks until every submitted frame has finished on the GPU.
+  // Blocks until every submitted frame has finished on the GPU and its completion handler ran (no time limit: a command buffer
+  // held back for the background goes out when the app is foreground again, or when this thread may commit it), then waits for
+  // the encodeInterop command buffers still in flight for at most 5 s (an interop buffer that has not completed by then is not
+  // waited for; the destructor, which needs them gone, waits without limit).
   void waitIdle();
   // CPU pointer to a buffer's first byte (shared storage), or null.
   void* contents(BufferId) const;
@@ -134,7 +137,10 @@ class MetalBackend final : public Backend {
   void* nativeTexture(TextureId);
   // Encodes interop work (the visionOS compositor's frame, say) in a command buffer of VPKEngine's
   // queue, ordered after every frame submitted before it and before every frame after it.
-  // `encode` gets the id<MTLCommandBuffer> (unretained); it is committed when `encode` returns.
+  // `encode` gets the id<MTLCommandBuffer> (unretained); it is committed when `encode` returns, except while the app is in the
+  // background and the calling thread is not the one that ends the pause: the commit is then held back (its place in the order is
+  // fixed) and made when the app is foreground again, so `completed` can run much later. `encode` runs under the backend's order
+  // lock: it must not wait for another thread that submits or encodes interop work.
   // `completed` (optional) runs on Metal's completion thread once the GPU has finished it (also on
   // failure, which is logged as gpu.err what=command_buffer f=interop).
   bool encodeInterop(const std::function<void(void* commandBuffer)>& encode, const char* label = nullptr,

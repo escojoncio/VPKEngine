@@ -5,9 +5,13 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <chrono>
 #include <cstring>
 #include <functional>
 #include <map>
+#include <pthread.h>
+#include <random>
+#include <unistd.h>
 #include <string>
 #include <vector>
 
@@ -170,6 +174,7 @@ const vpglsl::Variable* uniform(const Program& p, const std::string& n) {
 }
 
 // ---------------------------------------------------------------------------------------------
+void testMacroRescan();
 void testPp() {
     std::string log;
     int version = 0;
@@ -220,6 +225,165 @@ void testPp() {
     log.clear();
     vpglsl::preprocess("int a;\n#version 300 es\n", Stage::Vertex, log, version);
     CHECK(log.find("#version must be the first") != std::string::npos);
+    testMacroRescan();
+}
+
+// The tokens of the preprocessed text, space separated, for comparisons.
+std::string ppTokens(const std::string& src, std::string& log) {
+    int version = 0;
+    std::string out = vpglsl::preprocess(src, Stage::Vertex, log, version);
+    std::string r;
+    for (size_t i = 0; i < out.size();) {
+        if (out[i] == ' ' || out[i] == '\n') { ++i; continue; }
+        size_t j = out.find_first_of(" \n", i);
+        if (j == std::string::npos) j = out.size();
+        r += (r.empty() ? "" : " ") + out.substr(i, j - i);
+        i = j;
+    }
+    return r;
+}
+
+// A macro whose expansion ends with the name of a function-like macro takes the "(" that follows as its call (C99 6.10.3.4: the rescan
+// goes on with the rest of the source). This holds for object-like and function-like macros, without copying the rest of the input
+// or recursing once per use, and every walk of the expansion counts against the step limit.
+void testMacroRescan() {
+    std::string log;
+    const std::string defs = "#define F(x) x\n#define G F\n#define ID(x) x\n#define H(x) F\n";
+    CHECK(ppTokens(defs + "G(1.0)\n", log) == "1.0" && log.empty());
+    CHECK(ppTokens(defs + "ID(F)(5)\n", log) == "5" && log.empty());
+    CHECK(ppTokens(defs + "H(9)(4)\n", log) == "4" && log.empty());
+    CHECK(ppTokens(defs + "H(9)\n", log) == "F" && log.empty());  // no "(" follows: the name stays
+    CHECK(ppTokens(defs + "ID(G)(7)\n", log) == "7" && log.empty());
+    // C99 6.10.3.4 example: f(2)(9) is 2*9*g or 2*f(9); the rescan continues with g(9), whose f is not painted.
+    CHECK(ppTokens("#define f(a) a*g\n#define g(a) f(a)\nf(2)(9)\n", log) == "2 * 9 * g" && log.empty());
+    // A macro never expands inside its own expansion, so the name it ends with is not a call.
+    CHECK(ppTokens("#define s(a) a*s\ns(1)(2)\n", log) == "1 * s ( 2 )" && log.empty());
+    CHECK(ppTokens("#define S S(1)\nS\n", log) == "S ( 1 )" && log.empty());
+    // The name that ends an expansion takes the "(" only if nothing follows it in the expansion, not even a macro that expands to nothing.
+    CHECK(ppTokens("#define E\n#define A()\n#define F(x) x A E\nF(1)(2)\n", log) == "1 A ( 2 )" && log.empty());
+    CHECK(ppTokens("#define E\n#define A()\n#define G 1 A E\nG(2)\n", log) == "1 A ( 2 )" && log.empty());
+    CHECK(ppTokens("#define E\n#define f(x) x\n#define VEC f E\nVEC (2.0)\n", log) == "f ( 2.0 )" && log.empty());
+    CHECK(ppTokens("#define A()\n#define F(x) x A\nF(1)()\n", log) == "1" && log.empty());  // nothing follows the name: it is called
+    // An empty argument next to ## is a placemarker (C99 6.10.3.3).
+    CHECK(ppTokens("#define CAT(a, b) a ## b\nCAT(, x) CAT(x, ) CAT(, ) CAT(x, y)\n", log) == "x x xy" && log.empty());
+    CHECK(ppTokens("#define P(a, b) [a ## b]\nP(, )\n", log) == "[ ]" && log.empty());
+    CHECK(ppTokens("#define C3(a, b, c) a ## b ## c\nC3(, x, ) C3(1, , 2) C3(, , )\n", log) == "x 12" && log.empty());
+    // Nested calls in arguments go deeper than 64 levels; a hostile depth is an error, not a crash.
+    {
+        std::string deep = "#define f(x) x\n", hostile = deep;
+        for (int i = 0; i < 300; ++i) deep += "f(";
+        deep += "1";
+        for (int i = 0; i < 300; ++i) deep += ")";
+        CHECK(ppTokens(deep + "\n", log) == "1" && log.empty());
+        for (int i = 0; i < 100000; ++i) hostile += "f(";
+        hostile += "1";
+        for (int i = 0; i < 100000; ++i) hostile += ")";
+        log.clear();
+        ppTokens(hostile + "\n", log);
+        CHECK(log.find("too deep") != std::string::npos || log.find("too large") != std::string::npos);
+    }
+    // 20000 uses on one line: linear time, no deep recursion, no memory blow-up.
+    log.clear();
+    std::string many = defs;
+    for (int i = 0; i < 20000; ++i) many += "G(1.0) ";
+    many += "\n";
+    const auto t0 = std::chrono::steady_clock::now();
+    const std::string r = ppTokens(many, log);
+    const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
+    CHECK(log.empty() && r.size() == 20000 * 4 - 1);
+    CHECK(ms < 2000);
+    // Walking the arguments of a call counts as expansion work, whether or not the body uses them.
+    std::string big = "#define Z(x) 0\n";
+    big += "int a = ";
+    for (int i = 0; i < 100; ++i) {
+        big += "Z(";
+        for (int k = 0; k < 20000; ++k) big += "1 ";
+        big += ")+";
+    }
+    big += "0;\n";
+    log.clear();
+    ppTokens(big, log);
+    CHECK(log.find("too large") != std::string::npos);
+}
+
+// Differential fuzz of the macro expansion against the system C preprocessor (small random programs of object-like, function-like and
+// empty macros called with nested arguments, fixed seed). Skipped when `cpp` is not installed. What cpp rejects is not compared; what cpp accepts the compiler must expand the same way.
+void testPpFuzz() {
+    char path[] = "/tmp/vpglsl_ppfuzz_XXXXXX";
+    const int fd = mkstemp(path);
+    if (fd < 0) return;
+    close(fd);
+    const std::string cmd = std::string("cpp -P -undef -nostdinc -w ") + path + " 2>/dev/null";
+    if (std::system("cpp --version >/dev/null 2>&1") != 0) {
+        std::printf("ppfuzz: no cpp, skipped\n");
+        std::remove(path);
+        return;
+    }
+    std::mt19937 rng(20241112u);
+    auto pick = [&](int n) { return int(rng() % unsigned(n)); };
+    const char* const names[] = {"A", "B", "C", "D", "E"};
+    std::function<std::string(int, const std::vector<std::string>&)> seq;
+    auto item = [&](int depth, const std::vector<std::string>& params) -> std::string {
+        const int c = pick(100);
+        if (c < 30) return names[pick(5)];
+        if (c < 45 && !params.empty()) return params[size_t(pick(int(params.size())))];
+        if (c < 60) return std::vector<std::string>{"x", "y", "1", "+"}[size_t(pick(4))];
+        if (c < 75 && depth < 2) return "(" + seq(depth + 1, params) + ")";
+        if (c < 90 && depth < 2) {
+            std::string r = std::string(names[pick(5)]) + "(";
+            for (int k = pick(3), i = 0; i < k; ++i) r += (i ? "," : "") + seq(depth + 1, params);
+            return r + ")";
+        }
+        return pick(2) ? "x" : "2";
+    };
+    seq = [&](int depth, const std::vector<std::string>& params) {
+        std::string r;
+        for (int k = pick(4), i = 0; i < k; ++i) r += (i ? " " : "") + item(depth, params);
+        return r;
+    };
+    int compared = 0, different = 0;
+    for (int n = 0; n < 300; ++n) {
+        std::string src;
+        for (const char* name : names) {
+            const int kind = name[0] == 'E' ? 0 : pick(6);  // 0 empty (E always: what follows a name that ends an expansion), 1-2 object, 3-5 function with 0-2 parameters
+            if (kind == 0) src += std::string("#define ") + name + "\n";
+            else if (kind < 3) src += std::string("#define ") + name + " " + seq(0, {}) + "\n";
+            else {
+                std::vector<std::string> ps = {"p", "q"};
+                ps.resize(size_t(kind - 3));
+                std::string list;
+                for (size_t i = 0; i < ps.size(); ++i) list += (i ? "," : "") + ps[i];
+                src += std::string("#define ") + name + "(" + list + ") " + seq(0, ps) + "\n";
+            }
+        }
+        for (int k = 1 + pick(5), i = 0; i < k; ++i) src += (i ? " " : "") + item(0, {});
+        src += "\n";
+        if (FILE* f = std::fopen(path, "w")) std::fputs(src.c_str(), f), std::fclose(f);
+        std::string want;
+        FILE* pipe = popen(cmd.c_str(), "r");
+        if (!pipe) continue;
+        for (int ch; (ch = std::fgetc(pipe)) != EOF;) want += char(ch);
+        if (pclose(pipe) != 0) continue;
+        std::string log;
+        const std::string got = ppTokens(src, log);
+        if (!log.empty()) {  // (cpp accepted it)
+            if (++different <= 3) std::fprintf(stderr, "  ppfuzz %d: cpp accepts, the compiler says:\n%s%s", n, log.c_str(), src.c_str());
+            continue;
+        }
+        auto squeeze = [](const std::string& t) {
+            std::string r;
+            for (char ch : t)
+                if (ch != ' ' && ch != '\n') r += ch;
+            return r;
+        };
+        ++compared;
+        if (squeeze(got) != squeeze(want)) {
+            if (++different <= 3) std::fprintf(stderr, "  ppfuzz %d differs from cpp:\n%s  cpp:  %s\n  ours: %s\n", n, src.c_str(), squeeze(want).c_str(), squeeze(got).c_str());
+        }
+    }
+    std::remove(path);
+    CHECK(compared > 100);
+    CHECK(different == 0);
 }
 
 void testParse() {
@@ -1940,15 +2104,137 @@ void testLimits() {
     CHECK(compileFails(Stage::Vertex, macros + "void main() { float x = 1.0; M40 }\n", "too large"));
 }
 
+// Deep but legitimate nesting (machine generated shaders: else-if ladders, chained ?:, nested calls) compiles on the small stack of
+// a worker thread; hostile nesting is an error, never a crash.
+namespace {
+size_t smallStackBytes() {
+#if defined(__SANITIZE_ADDRESS__) || defined(__SANITIZE_THREAD__)
+    return 8u << 20;  // (the sanitizer's frames are several times larger)
+#else
+    return 512u << 10;
+#endif
+}
+void onSmallStack(const std::function<void()>& fn, size_t bytes = 0) {
+    pthread_attr_t a;
+    pthread_attr_init(&a);
+    pthread_attr_setstacksize(&a, bytes ? bytes : smallStackBytes());
+    pthread_t t;
+    CHECK(pthread_create(&t, &a, [](void* p) -> void* { (*static_cast<const std::function<void()>*>(p))(); return nullptr; }, const_cast<std::function<void()>*>(&fn)) == 0);
+    pthread_join(t, nullptr);
+    pthread_attr_destroy(&a);
+}
+const char* const kFragHead = "#version 300 es\nprecision highp float;\nflat in int id; out vec4 o;\n";
+std::string elseIfChain(int n) {
+    std::string s = std::string(kFragHead) + "void main() { float c = 0.0;\nif (id == 0) c = 0.0;\n";
+    for (int i = 1; i < n; ++i) s += "else if (id == " + std::to_string(i) + ") c = " + std::to_string(i) + ".0;\n";
+    return s + "else c = -1.0;\no = vec4(c); }\n";
+}
+std::string ternaryChain(int n) {
+    std::string s = std::string(kFragHead) + "void main() { float c = ";
+    for (int i = 0; i < n; ++i) s += "id == " + std::to_string(i) + " ? " + std::to_string(i) + ".0 : ";
+    return s + "-1.0; o = vec4(c); }\n";
+}
+std::string nestedCalls(int n) {
+    std::string s = std::string(kFragHead) + "float f(float x) { return x + 1.0; }\nvoid main() { float c = ";
+    for (int i = 0; i < n; ++i) s += "f(";
+    s += "0.0";
+    for (int i = 0; i < n; ++i) s += ")";
+    return s + "; o = vec4(c); }\n";
+}
+std::string nestedParens(int n) {
+    return std::string(kFragHead) + "void main() { float c = " + std::string(size_t(n), '(') + "1.0" + std::string(size_t(n), ')') + "; o = vec4(c); }\n";
+}
+std::string nestedIfs(int n) {
+    std::string s = std::string(kFragHead) + "void main() { float c = 0.0;\n";
+    for (int i = 0; i < n; ++i) s += "if (id > " + std::to_string(i) + ") {\n";
+    s += "c = 1.0;\n";
+    for (int i = 0; i < n; ++i) s += "}\n";
+    return s + "o = vec4(c); }\n";
+}
+std::string longSum(int n) {
+    std::string s = std::string(kFragHead) + "void main() { float a = float(id); float c = a";
+    for (int i = 1; i < n; ++i) s += " + a";
+    return s + "; o = vec4(c); }\n";
+}
+}  // namespace
+
+void testNesting() {
+    const char* vs = "#version 300 es\nin vec4 p; void main() { gl_Position = p; }\n";
+    // Threads with far less stack than the 512 KB of a worker: an operator chain near the limit (the tree is 1199 levels deep, the
+    // parser is not) is parsed, linked, lowered, walked and destroyed there without a crash; it ends in a result or in an error.
+    for (size_t kb : {44, 47, 64, 128, 256}) {
+        onSmallStack([&] {
+            for (int sum : {1199, 1000}) {
+                auto r = vpglsl::parse(Stage::Fragment, longSum(sum));
+                CHECK(r.shader != nullptr || r.log.find("too deeply") != std::string::npos);
+                (void)build(vs, longSum(sum));  // (a result or an error; the point is that it returns)
+            }
+        }, (kb << 10) * (smallStackBytes() > (1u << 20) ? 16 : 1));
+    }
+    onSmallStack([&] {
+        struct Case { const char* name; std::string src; } cases[] = {
+            {"else-if 210", elseIfChain(210)}, {"else-if 400", elseIfChain(400)}, {"?: 250", ternaryChain(250)},
+            {"calls 150", nestedCalls(150)}, {"parens 105", nestedParens(105)}, {"ifs 100", nestedIfs(100)}, {"ifs 300", nestedIfs(300)},
+        };
+        for (auto& c : cases) {
+            auto r = vpglsl::parse(Stage::Fragment, c.src);
+            if (!r.shader) std::fprintf(stderr, "  %s: %s", c.name, r.log.c_str());
+            CHECK(r.shader != nullptr);
+        }
+        // Past any sane depth: a clean error (the same message as before), on this small stack too.
+        CHECK(compileFails(Stage::Fragment, nestedParens(20000), "too deeply"));
+        CHECK(compileFails(Stage::Fragment, nestedCalls(20000), "too deeply"));
+        CHECK(compileFails(Stage::Fragment, nestedIfs(20000), "too deeply"));
+        CHECK(compileFails(Stage::Fragment, ternaryChain(20000), "too deeply"));
+        // (An else-if ladder is parsed in a loop; the SPIR-V it becomes nests once per rung, which the lowering bounds.)
+        CHECK(vpglsl::parse(Stage::Fragment, elseIfChain(20000)).shader != nullptr);
+        CHECK(!build(vs, elseIfChain(20000)).ok);
+        // a + a + ... is a left-deep tree: every pass over it recurses once per term.
+        CHECK(vpglsl::parse(Stage::Fragment, longSum(500)).shader != nullptr);
+        CHECK(build(vs, longSum(500)).ok);
+        CHECK(compileFails(Stage::Fragment, longSum(4000), "too deeply"));
+        CHECK(compileFails(Stage::Fragment, longSum(200000), "too deeply"));
+        // A sum near the limit ends in a result or in an error, not in a crash: the emitter watches the stack too.
+        (void)build(vs, longSum(1100));
+        // The whole way (parse, link, SPIR-V, lowering, MSL) for the ladders that generators emit.
+        for (auto& c : {std::make_pair("else-if 330", elseIfChain(330)), std::make_pair("else-if 400", elseIfChain(400)),
+                        std::make_pair("?: 250", ternaryChain(250)), std::make_pair("ifs 100", nestedIfs(100)),
+                        std::make_pair("ifs 300", nestedIfs(300)), std::make_pair("calls 150", nestedCalls(150)),
+                        std::make_pair("parens 105", nestedParens(105))}) {
+            Program p = build(vs, c.second);
+            if (!p.ok) std::fprintf(stderr, "  %s: build failed\n", c.first);
+            CHECK(p.ok);
+        }
+        // The ladder stays flat in the MSL (clang stops at 256 nested braces): one do-block, not `else { if` 400 deep.
+        auto braces = [](const std::string& msl) {
+            int depth = 0, deepest = 0;
+            for (char ch : msl) {
+                if (ch == '{') deepest = std::max(deepest, ++depth);
+                else if (ch == '}') --depth;
+            }
+            return deepest;
+        };
+        // (A ?: chain is lowered to branches that each copy their result after the inner ones: not a pure ladder, so the MSL nests one
+        // level per link. clang refuses ~250 links; this is the limit that remains, see the note in msl.cpp ifChain.)
+        Program tern = build(vs, ternaryChain(100));
+        CHECK(tern.ok && braces(tern.fs.msl) < 256);
+        Program p = build(vs, elseIfChain(400));
+        const int deepest = braces(p.fs.msl);
+        if (!p.ok || deepest >= 32) std::fprintf(stderr, "  else-if 400: ok=%d, deepest brace %d\n", int(p.ok), deepest);
+        CHECK(p.ok && deepest < 32);
+        CHECK(p.fs.msl.find("} while (false);") != std::string::npos);  // (the code of each rung stays where it was: one do-block)
+    });
+}
+
 int main(int argc, char** argv) {
     if (argc < 2) return 2;
     const std::map<std::string, std::function<void()>> tests = {
-        {"pp", testPp}, {"parse", testParse}, {"errors", testErrors}, {"es100", testEs100}, {"es300", testEs300},
+        {"pp", testPp}, {"ppfuzz", testPpFuzz}, {"parse", testParse}, {"errors", testErrors}, {"es100", testEs100}, {"es300", testEs300},
         {"multiview", testMultiview}, {"blocks", testBlocks}, {"control", testControl}, {"builtins", testBuiltins},
         {"textures", testTextures}, {"external", testExternalSampler}, {"link", testLink},
         {"compute", testCompute}, {"ssbo", testStorageBlocks}, {"images", testImages}, {"atomics", testAtomics},
         {"gather", testGather}, {"fbfetch", testFramebufferFetch}, {"exts", testExtensions}, {"texbuffer", testTextureBuffers}, {"exec", testExecute}, {"packed", testPackedUniforms}, {"shlight", testShLighting},
-        {"lenient", testLenient}, {"xfb", testXfb}, {"invariant", testInvariant}, {"semantics", testSemantics}, {"limits", testLimits},
+        {"lenient", testLenient}, {"xfb", testXfb}, {"invariant", testInvariant}, {"semantics", testSemantics}, {"limits", testLimits}, {"nesting", testNesting},
     };
     auto it = tests.find(argv[1]);
     if (it == tests.end()) return 2;

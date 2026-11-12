@@ -1766,9 +1766,13 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkDestroyDevice(VkDevice dv, const VkAllo
     std::lock_guard<std::mutex> l(liveDeviceMutex());
     if (liveDevice() == d) liveDevice() = nullptr;
   }
-  // A vpvk_native_submit that found the device before it left the registry holds this mutex
-  // until its command buffer is committed.
-  { std::lock_guard<std::mutex> l(d->submitMutex); }
+  // Host calls that found the device before it left the registry and are still waiting for the submit mutex (liveDeviceSubmitLocked)
+  // get it first; whoever holds it (a vpvk_native_submit until its command buffer is committed) is waited for here.
+  while (d->hostUsers.load() > 0) std::this_thread::sleep_for(std::chrono::microseconds(100));
+  {
+    std::lock_guard<std::mutex> l(d->submitMutex);
+    drainRetiredChunks(d);  // (arena chunks a command buffer reset gave up)
+  }
   d->prewarmCancel = true;
   if (d->prewarmThread.joinable()) d->prewarmThread.join();
   joinCacheFlush(d);
@@ -2719,15 +2723,36 @@ void* imageNative(Device* d, const Image* img, bool submitHeld = false) {
   zeroNoteNative(*d, *img, n);
   return n;
 }
-// The live device with its submit mutex taken (or tried: `lock` stays unowned when it is busy). Registry -> submit order, as
-// vpvk_native_submit: vkDestroyDevice takes the device out of the registry and then drains the submit mutex, so a device
-// found here is not deleted while the caller holds `lock`. Null: no device.
+// The live device with its submit mutex taken (or tried: `lock` stays unowned when it is busy). Null: no device.
+// The submit mutex is never waited for WITH the registry: a frame held while its pipelines compile (gpu.hold) keeps it for as long as the
+// compile takes, and a thread waiting for it holding the registry would stop every per-frame call that takes the registry (and deadlock a
+// vpvk_native_submit callback, which holds the submit mutex and may call back into the driver). The device is pinned instead
+// (Device::hostUsers, counted under the registry; vkDestroyDevice waits for it after taking the device out of the registry), the registry
+// is released and the wait is an ordinary blocking lock: no polling, the mutex's own wake-up order.
+// Inside a vpvk_native_submit callback this thread already holds the submit mutex: a host call that needs it (not the try-only one, which
+// answers "busy") cannot be served and gets null, a clean failure instead of a self-deadlock.
 Device* liveDeviceSubmitLocked(std::unique_lock<std::mutex>& lock, bool tryOnly = false) {
-  std::lock_guard<std::mutex> live(liveDeviceMutex());
-  Device* d = liveDevice();
-  if (!d) return nullptr;
-  if (tryOnly) lock = std::unique_lock<std::mutex>(d->submitMutex, std::try_to_lock);
-  else lock = std::unique_lock<std::mutex>(d->submitMutex);
+  if (tInNativeSubmit) {
+    lock = std::unique_lock<std::mutex>();
+    if (!tryOnly) {
+      static std::atomic<unsigned> n{0};
+      if (n.fetch_add(1) < 4) logf("vk.err what=reentrant_host_call (vpvk_native_submit / vpvk_mark_eye_image from inside a native-submit callback: refused)");
+    }
+    return tryOnly ? tNativeDevice : nullptr;
+  }
+  Device* d;
+  {
+    std::lock_guard<std::mutex> live(liveDeviceMutex());
+    d = liveDevice();
+    if (!d) return nullptr;
+    if (tryOnly) {
+      lock = std::unique_lock<std::mutex>(d->submitMutex, std::try_to_lock);
+      return d;
+    }
+    d->hostUsers.fetch_add(1);
+  }
+  lock = std::unique_lock<std::mutex>(d->submitMutex);
+  d->hostUsers.fetch_sub(1);  // (holding the submit mutex now: vkDestroyDevice drains it before it deletes the device)
   return d;
 }
 }  // namespace
@@ -3545,6 +3570,7 @@ void perfTick(Device* d) {
 // signals, queries, events and fences with its frame.
 void runBatches(Device* d, std::vector<DeferredBatch>& list, size_t count) {
   const auto perfT0 = std::chrono::steady_clock::now();  // vk.perf
+  drainRetiredChunks(d);  // (submit mutex held: the arena chunks command buffer resets gave up since the last submission)
   vpgpu::Frame frame;
   TranslateStats st;
   uint32_t barriers = 0, cbs = 0;
@@ -3900,13 +3926,12 @@ VPVK_EXPORT int vpvk_native_submit(vpvk_native_encode_fn fn, void* user) {
   vpgpu::ScopedPool pool;  // guest thread: no autorelease pool of its own (see scoped_pool.h)
   if (!fn) return 0;
   vpgpu::backgroundGate().waitForeground();  // park before liveDeviceMutex/submitMutex: a parked thread must not hold them
-  // Lock order registry -> submit (as vkDestroyDevice): the registry is released before `fn` runs,
-  // so the callback may call vpvk_native_device; it must not call vkQueueSubmit (same mutex).
-  std::unique_lock<std::mutex> live(liveDeviceMutex());
-  Device* d = liveDevice();
+  // The submit mutex is waited for without the registry (liveDeviceSubmitLocked): a frame held for its pipelines (gpu.hold) must not
+  // stop the per-frame calls that take the registry. The callback may call vpvk_native_device (which then does not take it); it must not
+  // call vkQueueSubmit (same mutex), nor vpvk_native_submit / vpvk_mark_eye_image again (refused: 0).
+  std::unique_lock<std::mutex> lock;
+  Device* d = liveDeviceSubmitLocked(lock);
   if (!d || !d->platform) return 0;
-  std::lock_guard<std::mutex> lock(d->submitMutex);
-  live.unlock();
   tInNativeSubmit = true;
   tNativeDevice = d;
   const bool ok = d->platform->encodeNative(fn, user);
@@ -4321,8 +4346,16 @@ VPVK_EXPORT void* vpvk_ui_mask_texture(int eye, int* w, int* h, int* slice) {
   if (h) *h = 0;
   if (slice) *slice = 0;
   if (eye < 0 || eye > 1) return nullptr;
-  std::lock_guard<std::mutex> live(liveDeviceMutex());
-  Device* d = liveDevice();
+  // Inside a vpvk_native_submit callback this thread holds the submit mutex (registry -> submit order): the device cannot go and the
+  // registry must not be taken (a thread holding it may be waiting for that mutex).
+  std::unique_lock<std::mutex> live;
+  Device* d;
+  if (tInNativeSubmit) {
+    d = tNativeDevice;
+  } else {
+    live = std::unique_lock<std::mutex>(liveDeviceMutex());
+    d = liveDevice();
+  }
   if (!d || !d->platform) return nullptr;
   UiMaskState& u = d->uiMask;
   std::lock_guard<std::mutex> l(u.lastMu);
@@ -4338,8 +4371,14 @@ VPVK_EXPORT void* vpvk_ui_mask_texture(int eye, int* w, int* h, int* slice) {
 
 VPVK_EXPORT void* vpvk_native_device(void) {
   vpgpu::ScopedPool pool;  // guest thread: no autorelease pool of its own (see scoped_pool.h)
-  std::lock_guard<std::mutex> live(liveDeviceMutex());
-  Device* d = liveDevice();
+  std::unique_lock<std::mutex> live;
+  Device* d;
+  if (tInNativeSubmit) {  // in the callback (submit mutex held by this thread): no registry, see vpvk_ui_mask_texture
+    d = tNativeDevice;
+  } else {
+    live = std::unique_lock<std::mutex>(liveDeviceMutex());
+    d = liveDevice();
+  }
   return d && d->platform ? d->platform->nativeDevice() : nullptr;
 }
 

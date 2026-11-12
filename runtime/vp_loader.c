@@ -15,28 +15,273 @@
  * native). */
 static uint64_t vp_next_stub;
 
-/* Exactly at `at`, and only on free memory: MAP_FIXED would replace whatever is mapped there (the
- * app's own memory, another module). The address is a hint (plus MAP_FIXED_NOREPLACE where there
- * is one); a mapping the kernel put elsewhere, or that an older kernel placed by ignoring that
- * flag, is given back. */
-int vp_map_fixed(uint64_t at, uint64_t size) {
-    const uint64_t page = 65536; /* covers 4K, 16K and 64K hosts */
-    const uint64_t start = at & ~(page - 1), end = (at + size + page - 1) & ~(page - 1);
+/* The ranges the loader mapped itself, so that it can replace and release them (and only them):
+ * an image's own (owner: its VpModule), those vp_map_fixed made (OWNER_PLAIN) and the ones an
+ * embedder committed with vp_map_fixed_over (OWNER_OVER). All 64 KB aligned and disjoint. */
+typedef struct { uint64_t start, end; const void* owner; } Mapped;
+static Mapped* mapped;
+static size_t mapped_count, mapped_cap;
+static pthread_mutex_t mapped_lock = PTHREAD_MUTEX_INITIALIZER;
+static const char owner_plain_tag, owner_over_tag;
+#define OWNER_PLAIN ((const void*)&owner_plain_tag)
+#define OWNER_OVER ((const void*)&owner_over_tag)
+
+#define MAP_PAGE UINT64_C(65536) /* covers 4K, 16K and 64K hosts */
+static uint64_t round_down(uint64_t a) { return a & ~(MAP_PAGE - 1); }
+static uint64_t round_up(uint64_t a) { return (a + MAP_PAGE - 1) & ~(MAP_PAGE - 1); }
+
+/* All of these run with mapped_lock held. */
+static int mapped_reserve(size_t extra) {
+    if (mapped_count + extra <= mapped_cap) return 0;
+    size_t cap = mapped_cap ? mapped_cap * 2 : 16;
+    while (cap < mapped_count + extra) cap *= 2;
+    Mapped* m = realloc(mapped, cap * sizeof *m);
+    if (!m) return -1;
+    mapped = m;
+    mapped_cap = cap;
+    return 0;
+}
+
+/* Forgets [start,end) (needs room for one more entry: it may split one). A module that loses its
+ * image this way is detached: its code is no longer there. */
+static void mapped_forget(uint64_t start, uint64_t end) {
+    for (size_t i = 0; i < mapped_count;) {
+        Mapped* e = &mapped[i];
+        if (e->end <= start || e->start >= end) { ++i; continue; }
+        if (e->owner != OWNER_PLAIN && e->owner != OWNER_OVER) vp_detach_module((VpModule*)(uintptr_t)e->owner);
+        if (e->start < start && e->end > end) { /* the middle goes: two entries remain */
+            mapped[mapped_count++] = (Mapped){end, e->end, e->owner};
+            e->end = start;
+            ++i;
+        } else if (e->start < start) { e->end = start; ++i; }
+        else if (e->end > end) { e->start = end; ++i; }
+        else { *e = mapped[--mapped_count]; }
+    }
+}
+
+/* Whether the entry may be replaced when `owner` maps: an image replaces its own earlier image and
+ * the ranges an embedder prepared for it (OWNER_OVER); vp_map_fixed (OWNER_PLAIN) replaces nothing,
+ * not even a prepared range; nothing replaces anything else. */
+static int replaceable(const Mapped* e, const void* owner) {
+    return owner != OWNER_PLAIN && owner != OWNER_OVER && (e->owner == OWNER_OVER || e->owner == owner);
+}
+
+/* Rounds [at,at+size) out to 64 KB blocks; -1 for an empty range or one that wraps around. */
+static int range_of(uint64_t at, uint64_t size, uint64_t* start, uint64_t* end) {
+    if (size == 0 || size > UINT64_MAX - at || at + size > UINT64_MAX - (MAP_PAGE - 1)) return -1;
+    *start = round_down(at);
+    *end = round_up(at + size);
+    return 0;
+}
+
+/* Where prepared (vp_map_fixed_over) ranges were replaced by an image: a failed load or reload
+ * gives those parts back as prepared, instead of leaving a hole. Sorted by nothing, disjoint. All
+ * under mapped_lock. Losing an entry (out of memory) only costs that restoration. */
+typedef struct { uint64_t start, end; } Span;
+static Span* origin;
+static size_t origin_count, origin_cap;
+
+static void origin_sub(uint64_t start, uint64_t end) {
+    for (size_t i = 0; i < origin_count;) {
+        Span* o = &origin[i];
+        if (o->end <= start || o->start >= end) { ++i; continue; }
+        if (o->start < start && o->end > end) {
+            if (origin_count < origin_cap) origin[origin_count++] = (Span){end, o->end};
+            o->end = start;
+            ++i;
+        } else if (o->start < start) { o->end = start; ++i; }
+        else if (o->end > end) { o->start = end; ++i; }
+        else { *o = origin[--origin_count]; }
+    }
+}
+
+static void origin_add(uint64_t start, uint64_t end) {
+    origin_sub(start, end);
+    if (origin_count + 2 > origin_cap) {
+        const size_t cap = origin_cap ? origin_cap * 2 : 8;
+        Span* n = realloc(origin, cap * sizeof *n);
+        if (!n) return;
+        origin = n;
+        origin_cap = cap;
+    }
+    origin[origin_count++] = (Span){start, end};
+}
+
+/* The replaceable entry's part of [from,end) that starts first. */
+static int next_replaceable(const void* owner, uint64_t from, uint64_t end, uint64_t* s, uint64_t* e, const void** who) {
+    int found = 0;
+    for (size_t i = 0; i < mapped_count; ++i) {
+        if (!replaceable(&mapped[i], owner)) continue;
+        const uint64_t lo = mapped[i].start > from ? mapped[i].start : from, hi = mapped[i].end < end ? mapped[i].end : end;
+        if (lo >= hi || (found && lo >= *s)) continue;
+        *s = lo; *e = hi; *who = mapped[i].owner; found = 1;
+    }
+    return found;
+}
+
+/* Only on free memory: the address is a hint (plus MAP_FIXED_NOREPLACE where there is one); a
+ * mapping the kernel put elsewhere, or that an older kernel placed by ignoring that flag, is given
+ * back. */
+static int map_free(uint64_t start, uint64_t end) {
     int flags = MAP_PRIVATE | MAP_ANONYMOUS;
 #ifdef MAP_FIXED_NOREPLACE
     flags |= MAP_FIXED_NOREPLACE;
 #endif
     void* p = mmap((void*)(uintptr_t)start, end - start, PROT_READ | PROT_WRITE, flags, -1, 0);
     if (p == MAP_FAILED) return -1;
+    /* Without MAP_FIXED_NOREPLACE (Darwin, old kernels) the address is only a hint: whatever the
+     * kernel returned other than exactly `start` is not what was asked for, and goes back. */
     if ((uint64_t)(uintptr_t)p != start) { munmap(p, end - start); return -1; }
     return 0;
 }
 
-/* Gives back what vp_map_fixed mapped (a load that failed after it). */
-static void unmap_fixed(uint64_t at, uint64_t size) {
-    const uint64_t page = 65536;
-    const uint64_t start = at & ~(page - 1), end = (at + size + page - 1) & ~(page - 1);
+/* The parts of [start,end) no replaceable entry covers: mapped (free memory only) when `map`, else
+ * given back up to `stop`. Mapping stops at the first part that cannot be, which is returned in
+ * *failed_at (UINT64_MAX when none). */
+static void gaps(const void* owner, uint64_t start, uint64_t end, int map, uint64_t stop, uint64_t* failed_at) {
+    uint64_t cursor = start, s, e;
+    const void* who;
+    *failed_at = UINT64_MAX;
+    while (cursor < end && (map || cursor < stop)) {
+        const int more = next_replaceable(owner, cursor, end, &s, &e, &who);
+        const uint64_t gap_end = more ? s : end;
+        if (gap_end > cursor) {
+            if (map) { if (map_free(cursor, gap_end)) { *failed_at = cursor; return; } }
+            else munmap((void*)(uintptr_t)cursor, (gap_end < stop ? gap_end : stop) - cursor);
+        }
+        cursor = more ? e : end;
+    }
+}
+
+/* Maps [start,end) read/write for `owner` (a VpModule, OWNER_PLAIN or OWNER_OVER) and records it.
+ * Free memory is mapped without replacing anything; what the owner may replace (see `replaceable`)
+ * is replaced. Nothing is mapped on failure, except that a replaced range stays replaced. */
+static int map_range(uint64_t start, uint64_t end, const void* owner) {
+    int rc = -1;
+    if (start >= end) return -1;
+    pthread_mutex_lock(&mapped_lock);
+    if (mapped_reserve(2)) goto out;
+    uint64_t failed;
+    gaps(owner, start, end, 1, 0, &failed);
+    if (failed != UINT64_MAX) { gaps(owner, start, end, 0, failed, &failed); goto out; }
+    uint64_t cursor = start, s, e;
+    const void* who;
+    while (cursor < end && next_replaceable(owner, cursor, end, &s, &e, &who)) {
+        if (who != OWNER_OVER) vp_detach_module((VpModule*)(uintptr_t)who); /* its image is about to go */
+        else if (owner != OWNER_PLAIN) origin_add(s, e); /* a failed load puts it back as prepared */
+        if (mmap((void*)(uintptr_t)s, e - s, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0) == MAP_FAILED) {
+            gaps(owner, start, end, 0, UINT64_MAX, &failed); /* the free parts are given back */
+            goto out;
+        }
+        cursor = e;
+    }
+    mapped_forget(start, end);
+    mapped[mapped_count++] = (Mapped){start, end, owner};
+    if (owner != OWNER_PLAIN && owner != OWNER_OVER) { /* a module has one image: an earlier one elsewhere goes */
+        for (size_t i = 0; i < mapped_count;) {
+            if (mapped[i].owner == owner && mapped[i].start != start) {
+                vp_detach_module((VpModule*)(uintptr_t)owner);
+                munmap((void*)(uintptr_t)mapped[i].start, mapped[i].end - mapped[i].start);
+                origin_sub(mapped[i].start, mapped[i].end);
+                mapped[i] = mapped[--mapped_count];
+            } else ++i;
+        }
+    }
+    rc = 0;
+out:
+    pthread_mutex_unlock(&mapped_lock);
+    return rc;
+}
+
+int vp_map_fixed(uint64_t at, uint64_t size) {
+    uint64_t start, end;
+    if (range_of(at, size, &start, &end)) return -1;
+    return map_range(start, end, OWNER_PLAIN);
+}
+
+/* Maps over whatever is there (an embedder's reservation), unless it is an image or a
+ * vp_map_fixed mapping: those are refused. The range is recorded as the embedder's. */
+int vp_map_fixed_over(uint64_t at, uint64_t size) {
+    uint64_t start, end;
+    if (range_of(at, size, &start, &end)) return -1;
+    int rc = -1;
+    pthread_mutex_lock(&mapped_lock);
+    if (mapped_reserve(2)) goto out;
+    for (size_t i = 0; i < mapped_count; ++i) {
+        if (mapped[i].owner != OWNER_OVER && mapped[i].start < end && mapped[i].end > start) goto out;
+    }
+    if (mmap((void*)(uintptr_t)start, end - start, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0) == MAP_FAILED) goto out;
+    mapped_forget(start, end);
+    mapped[mapped_count++] = (Mapped){start, end, OWNER_OVER};
+    rc = 0;
+out:
+    pthread_mutex_unlock(&mapped_lock);
+    return rc;
+}
+
+/* With mapped_lock held and room for one more entry: unmaps [start,end) if all of it is the
+ * loader's. */
+static int unmap_locked(uint64_t start, uint64_t end) {
+    for (uint64_t cursor = start; cursor < end;) { /* all of it must be the loader's */
+        uint64_t next = cursor;
+        for (size_t i = 0; i < mapped_count; ++i) if (mapped[i].start <= cursor && cursor < mapped[i].end) next = mapped[i].end;
+        if (next == cursor) return -1;
+        cursor = next;
+    }
     munmap((void*)(uintptr_t)start, end - start);
+    mapped_forget(start, end);
+    origin_sub(start, end);
+    return 0;
+}
+
+int vp_unmap_fixed(uint64_t at, uint64_t size) {
+    uint64_t start, end;
+    if (range_of(at, size, &start, &end)) return -1;
+    int rc = -1;
+    pthread_mutex_lock(&mapped_lock);
+    if (mapped_reserve(1)) goto out;
+    rc = unmap_locked(start, end);
+out:
+    pthread_mutex_unlock(&mapped_lock);
+    return rc;
+}
+
+/* A load that failed after mapping: the image goes, and what an embedder had prepared there goes
+ * back to being prepared (registered as vp_map_fixed_over, but PROT_NONE: nothing committed), so
+ * that there is no hole and the load can be retried. One lock hold, so nothing can map in between.
+ * Best effort for the restoration (memory that is no longer free is left alone). */
+static void abandon_image(uint64_t start, uint64_t end) {
+    pthread_mutex_lock(&mapped_lock);
+    size_t n = 0;
+    for (size_t i = 0; i < origin_count; ++i) if (origin[i].start < end && origin[i].end > start) ++n;
+    if (mapped_reserve(1 + n)) {
+        n = 0;
+        if (mapped_reserve(1)) { pthread_mutex_unlock(&mapped_lock); return; }
+    }
+    Span* sp = n ? malloc(n * sizeof *sp) : NULL;
+    if (!sp) n = 0;
+    size_t k = 0;
+    for (size_t i = 0; i < origin_count && k < n; ++i) {
+        if (origin[i].start < end && origin[i].end > start) sp[k++] = (Span){origin[i].start > start ? origin[i].start : start, origin[i].end < end ? origin[i].end : end};
+    }
+    if (unmap_locked(start, end) == 0) {
+        for (size_t i = 0; i < k; ++i) {
+            int flags = MAP_PRIVATE | MAP_ANONYMOUS;
+#ifdef MAP_NORESERVE
+            flags |= MAP_NORESERVE;
+#endif
+#ifdef MAP_FIXED_NOREPLACE
+            flags |= MAP_FIXED_NOREPLACE;
+#endif
+            void* p = mmap((void*)(uintptr_t)sp[i].start, sp[i].end - sp[i].start, PROT_NONE, flags, -1, 0);
+            if (p == MAP_FAILED) continue;
+            if ((uint64_t)(uintptr_t)p != sp[i].start) { munmap(p, sp[i].end - sp[i].start); continue; }
+            mapped[mapped_count++] = (Mapped){sp[i].start, sp[i].end, OWNER_OVER};
+            origin_add(sp[i].start, sp[i].end);
+        }
+    }
+    free(sp);
+    pthread_mutex_unlock(&mapped_lock);
 }
 
 static int fail(VpLoadedImage* out, const char* what) {
@@ -88,6 +333,15 @@ static uint64_t vp_dyn_tag(const unsigned char* d, uint64_t size, uint64_t wante
     return 0;
 }
 
+/* What one load keeps about the stubs of its imports (fresh: made by this load, to be committed). */
+typedef struct {
+    const char* names[VP_MAX_IMPORT_STUBS];
+    uint64_t values[VP_MAX_IMPORT_STUBS];
+    VpNative natives[VP_MAX_IMPORT_STUBS];
+    unsigned char fresh[VP_MAX_IMPORT_STUBS];
+    uint16_t hash[STUB_HASH_SIZE]; /* stub index + 1 by the hash of the name; 0 is empty */
+} StubSet;
+
 /* The module's imports by slot: an open-addressing table of index + 1 (0 is empty), so that each
  * relocation finds its import without a pass over all of them. The first of equal slots wins. */
 static uint64_t slot_hash(uint64_t x) { x *= UINT64_C(0x9E3779B97F4A7C15); return x ^ (x >> 32); }
@@ -122,11 +376,33 @@ static size_t name_hash(const char* s) {
 
 /* The stubs handed out so far, by import name and native: the same import of another module (or of
  * this one loaded again) gets the stub it already has, so that the table of natives grows with the
- * distinct imports and not with the modules loaded. Never freed: a stub address stays valid. */
-#define STUB_REGISTRY 16384 /* a power of two; filled to three quarters, then every import gets a stub of its own */
-static struct { char* name; VpNative fn; uint64_t stub; } stub_registry[STUB_REGISTRY];
-static size_t stub_registry_count;
+ * distinct imports and not with the modules loaded. Never freed: a stub address stays valid. An
+ * open-addressing table that doubles when it is three quarters full. */
+typedef struct { char* name; VpNative fn; uint64_t stub; } StubEntry;
+static StubEntry* stub_registry;
+static size_t stub_registry_cap, stub_registry_count; /* cap: 0 or a power of two */
 static pthread_mutex_t stub_registry_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static size_t stub_slot(const StubEntry* table, size_t cap, const char* name, VpNative fn) {
+    size_t h = (name_hash(name) ^ ((uintptr_t)fn >> 4)) & (cap - 1);
+    while (table[h].name && (table[h].fn != fn || strcmp(table[h].name, name))) h = (h + 1) & (cap - 1);
+    return h;
+}
+
+/* Room for one more entry; 0 when there is none (the stub then simply is not shared). */
+static int stub_registry_room(void) {
+    if ((stub_registry_count + 1) * 4 <= stub_registry_cap * 3) return 1;
+    const size_t cap = stub_registry_cap ? stub_registry_cap * 2 : 1024;
+    StubEntry* table = calloc(cap, sizeof *table);
+    if (!table) return 0;
+    for (size_t i = 0; i < stub_registry_cap; ++i) {
+        if (stub_registry[i].name) table[stub_slot(table, cap, stub_registry[i].name, stub_registry[i].fn)] = stub_registry[i];
+    }
+    free(stub_registry);
+    stub_registry = table;
+    stub_registry_cap = cap;
+    return 1;
+}
 
 /* The stub for an import: the one the same (name, native) got before, else a new address. A new
  * stub is not registered here but by stub_commit, once the load cannot fail any more: a load that
@@ -135,31 +411,32 @@ static pthread_mutex_t stub_registry_lock = PTHREAD_MUTEX_INITIALIZER;
 static uint64_t stub_alloc(const char* name, VpNative fn) {
     uint64_t stub;
     pthread_mutex_lock(&stub_registry_lock);
-    size_t h = (name_hash(name) ^ ((uintptr_t)fn >> 4)) & (STUB_REGISTRY - 1);
-    while (stub_registry[h].name && (stub_registry[h].fn != fn || strcmp(stub_registry[h].name, name))) h = (h + 1) & (STUB_REGISTRY - 1);
-    stub = stub_registry[h].name ? stub_registry[h].stub : VP_IMPORT_STUB_BASE + vp_next_stub++ * VP_IMPORT_STUB_STRIDE;
+    const size_t h = stub_registry_cap ? stub_slot(stub_registry, stub_registry_cap, name, fn) : 0;
+    stub = stub_registry_cap && stub_registry[h].name ? stub_registry[h].stub : VP_IMPORT_STUB_BASE + vp_next_stub++ * VP_IMPORT_STUB_STRIDE;
     pthread_mutex_unlock(&stub_registry_lock);
     return stub;
 }
 
 /* Makes the stub stub_alloc gave a module real: its native registered and, if it is new, in the
  * registry. When another load committed the same (name, native) first, under another address, this
- * module's own stub still gets its native. */
-static void stub_commit(const char* name, VpNative fn, uint64_t stub) {
+ * module's own stub still gets its native. Returns -1 when the table of natives is full. */
+static int stub_commit(const char* name, VpNative fn, uint64_t stub) {
+    int rc = 0;
     pthread_mutex_lock(&stub_registry_lock);
-    size_t h = (name_hash(name) ^ ((uintptr_t)fn >> 4)) & (STUB_REGISTRY - 1);
-    while (stub_registry[h].name && (stub_registry[h].fn != fn || strcmp(stub_registry[h].name, name))) h = (h + 1) & (STUB_REGISTRY - 1);
-    if (!stub_registry[h].name) {
-        if (fn) vp_register_native(stub, fn);
-        if (stub_registry_count < STUB_REGISTRY / 4 * 3 && (stub_registry[h].name = strdup(name))) {
-            stub_registry[h].fn = fn;
-            stub_registry[h].stub = stub;
+    size_t h = stub_registry_cap ? stub_slot(stub_registry, stub_registry_cap, name, fn) : 0;
+    if (!stub_registry_cap || !stub_registry[h].name) {
+        if (fn) rc = vp_register_native(stub, fn);
+        char* copy = rc == 0 && stub_registry_room() ? strdup(name) : NULL;
+        if (copy) {
+            h = stub_slot(stub_registry, stub_registry_cap, name, fn); /* the table may have moved */
+            stub_registry[h] = (StubEntry){copy, fn, stub};
             stub_registry_count++;
         }
     } else if (stub_registry[h].stub != stub && fn) {
-        vp_register_native(stub, fn);
+        rc = vp_register_native(stub, fn);
     }
     pthread_mutex_unlock(&stub_registry_lock);
+    return rc;
 }
 
 int vp_load_image(const char* path, VpImportResolver resolve, void* user, VpLoadedImage* out) {
@@ -218,7 +495,8 @@ int vp_load_module(const char* path, VpModule* module, uint64_t load_at, VpImpor
     /* Everything that can be checked before touching memory: the image must be the one the
      * module was translated from (link base, size). */
     if (lo != module->link_base || hi - lo != module->size) { free(ph); free(file); return fail(out, "this image is not the one the module was translated from (link base or size differs)"); }
-    if (vp_map_fixed(AT(lo), hi - lo)) { free(ph); free(file); return fail(out, "cannot map the image"); }
+    uint64_t map_start, map_end;
+    if (range_of(AT(lo), hi - lo, &map_start, &map_end) || map_range(map_start, map_end, module)) { free(ph); free(file); return fail(out, "cannot map the image"); }
     for (uint16_t i = 0; i < phnum; ++i) {
         if ((ph[i].type == 1 || ph[i].type == 0x61000010) && ph[i].filesz && ph[i].offset + ph[i].filesz <= elf_size) {
             memcpy((void*)(uintptr_t)AT(ph[i].vaddr), elf + ph[i].offset, ph[i].filesz);
@@ -229,9 +507,8 @@ int vp_load_module(const char* path, VpModule* module, uint64_t load_at, VpImpor
 
     /* Relocations. The image is loaded at its link address, so RELATIVE slots hold the addend;
      * the symbolic ones against imports get a stub address registered as the native. */
-    /* The stubs the module's imports got (stub_fresh: made by this load, to be committed). */
-    const char* stub_names[VP_MAX_IMPORT_STUBS]; uint64_t stub_values[VP_MAX_IMPORT_STUBS]; VpNative stub_natives[VP_MAX_IMPORT_STUBS];
-    unsigned char stub_fresh[VP_MAX_IMPORT_STUBS]; size_t stubs = 0;
+    /* On the heap: ~118 KB are too much for the stack of a loader thread. */
+    StubSet* st = NULL; size_t stubs = 0;
     if (dyn && dyn->filesz <= elf_size && dyn->offset <= elf_size - dyn->filesz) {
         const unsigned char* dyn_data = elf + dyn->offset;
         const uint64_t dyn_size = dyn->filesz;
@@ -256,11 +533,10 @@ int vp_load_module(const char* path, VpModule* module, uint64_t load_at, VpImpor
         }
         #undef TAG
         /* One stub per imported symbol, whatever the number of relocations that name it. */
-        uint16_t stub_hash[STUB_HASH_SIZE]; /* stub index + 1 by the hash of the name; 0 is empty */
-        memset(stub_hash, 0, sizeof stub_hash);
         size_t slot_mask = 0;
-        uint32_t* const slot_index = build_slot_index(module, &slot_mask);
-        if (!slot_index) { free(ph); free(file); unmap_fixed(AT(lo), hi - lo); return fail(out, "out of memory"); }
+        st = calloc(1, sizeof *st);
+        uint32_t* const slot_index = st ? build_slot_index(module, &slot_mask) : NULL;
+        if (!slot_index) { free(st); free(ph); free(file); abandon_image(map_start, map_end); return fail(out, "out of memory"); }
         for (int t = 0; t < 2; ++t) {
             for (uint64_t pos = 0; tables[t] && pos + 24 <= sizes[t]; pos += 24) {
                 uint64_t target, info; int64_t addend;
@@ -286,23 +562,23 @@ int vp_load_module(const char* path, VpModule* module, uint64_t load_at, VpImpor
                         continue;
                     }
                     size_t hs = name_hash(im->name) & (STUB_HASH_SIZE - 1), k;
-                    while (stub_hash[hs] && strcmp(stub_names[stub_hash[hs] - 1], im->name)) hs = (hs + 1) & (STUB_HASH_SIZE - 1);
-                    k = stub_hash[hs] ? (size_t)stub_hash[hs] - 1 : stubs;
+                    while (st->hash[hs] && strcmp(st->names[st->hash[hs] - 1], im->name)) hs = (hs + 1) & (STUB_HASH_SIZE - 1);
+                    k = st->hash[hs] ? (size_t)st->hash[hs] - 1 : stubs;
                     if (k == stubs) {
-                        if (stubs == VP_MAX_IMPORT_STUBS) { free(slot_index); free(ph); free(file); unmap_fixed(AT(lo), hi - lo); return fail(out, "too many imports"); }
-                        stub_hash[hs] = (uint16_t)(stubs + 1);
+                        if (stubs == VP_MAX_IMPORT_STUBS) { free(slot_index); free(st); free(ph); free(file); abandon_image(map_start, map_end); return fail(out, "too many imports"); }
+                        st->hash[hs] = (uint16_t)(stubs + 1);
                         VpNative fn = NULL; uint64_t data = 0;
                         const int provided = resolve ? resolve(im->name, im->function, &fn, &data, user) : 0;
-                        stub_names[k] = im->name;
-                        stub_fresh[k] = 0;
+                        st->names[k] = im->name;
+                        st->fresh[k] = 0;
                         if (im->function && provided && !fn && data) {
-                            stub_values[k] = data; /* another guest module's function */
+                            st->values[k] = data; /* another guest module's function */
                         } else if (im->function) {
-                            stub_natives[k] = provided ? fn : NULL;
-                            stub_values[k] = stub_alloc(im->name, stub_natives[k]);
-                            stub_fresh[k] = 1;
+                            st->natives[k] = provided ? fn : NULL;
+                            st->values[k] = stub_alloc(im->name, st->natives[k]);
+                            st->fresh[k] = 1;
                         } else {
-                            stub_values[k] = provided ? data : 0;
+                            st->values[k] = provided ? data : 0;
                         }
                         if (provided) out->imports_resolved++;
                         else {
@@ -311,7 +587,7 @@ int vp_load_module(const char* path, VpModule* module, uint64_t load_at, VpImpor
                         }
                         stubs++;
                     }
-                    uint64_t value = stub_values[k] + (kind == 1 ? (uint64_t)addend : 0);
+                    uint64_t value = st->values[k] + (kind == 1 ? (uint64_t)addend : 0);
                     memcpy(slot, &value, 8);
                 }
             }
@@ -323,11 +599,18 @@ int vp_load_module(const char* path, VpModule* module, uint64_t load_at, VpImpor
     /* The code now in memory must be the code that was translated; only then does dispatch use
      * the module at its new place. */
     if (vp_fingerprint(AT(lo), module->code, module->code_count, module->reloc_sites, module->reloc_site_count) != module->fingerprint) {
-        unmap_fixed(AT(lo), hi - lo);
+        free(st);
+        abandon_image(map_start, map_end);
         return fail(out, "the code of this image differs from the translation (fingerprint)");
     }
-    for (size_t k = 0; k < stubs; ++k) {
-        if (stub_fresh[k]) stub_commit(stub_names[k], stub_natives[k], stub_values[k]);
+    int committed = 0;
+    for (size_t k = 0; k < stubs && committed == 0; ++k) {
+        if (st->fresh[k]) committed = stub_commit(st->names[k], st->natives[k], st->values[k]);
+    }
+    free(st);
+    if (committed) {
+        abandon_image(map_start, map_end);
+        return fail(out, "the table of natives is full");
     }
     vp_module_set_base(module, AT(lo));
     return 0;

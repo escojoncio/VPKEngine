@@ -88,6 +88,7 @@ struct BufferStorage {
     VkDeviceSize size = 0;
     uint64_t lastUse = 0;  // serial of the last submission that references it (0 = never)
     uint64_t gpuWrite = 0; // serial of the last submission that writes it with the GPU (glReadPixels into a pixel pack buffer)
+    uint64_t openEpoch = 0; // Context::epoch_ of the open command buffer that last recorded it (see Context::useStorage)
     // Byte ranges [lo, hi) the GPU reads in the submissions that have not completed (merged, at most a few; meaningful while
     // lastUse is past `completed`): a CPU write to bytes outside them can be made in place (Context::prepareWrite).
     std::vector<std::pair<uint64_t, uint64_t>> reads;
@@ -654,6 +655,13 @@ public:
     void keep(std::shared_ptr<void> p) { keep_.push_back(std::move(p)); }
     // Marks it used by the open command buffer, reading bytes [lo, hi) (the whole buffer when not told).
     void useStorage(const StorageP& s, uint64_t lo = 0, uint64_t hi = UINT64_MAX);
+    // The GPU may still use (read or write) `s`: a submission not completed, or this context's open command buffer (its stamps are
+    // provisional until flush gives the real serial: another submission may take the predicted one first).
+    bool storageBusy(const BufferStorage& s) const;
+    // The GPU has still to write `s` (a readback into it): submitted and not completed, or recorded in the open command buffer.
+    bool gpuWritePending(const BufferStorage& s) const;
+    // A readback is recorded into `s`: flush stamps its gpuWrite with the serial it gets.
+    void noteGpuWrite(const StorageP& s) { gpuWrites_.push_back(s); }
     // image2D bound to one slice of a 3D texture: Metal cannot view a 3D texture as 2D, so the dispatch works on a 2D
     // copy of the slice (copied in before, back after: syncSlicesBack).
     struct SliceSync {
@@ -806,6 +814,8 @@ private:
     VkCommandBuffer cb_ = VK_NULL_HANDLE;
     std::vector<std::shared_ptr<void>> keep_;
     std::vector<StorageP> used_;
+    std::vector<StorageP> gpuWrites_;  // storages the open command buffer writes with the GPU
+    uint64_t epoch_ = 0;               // identifies the open command buffer (unique across contexts), see BufferStorage::openEpoch
     VkDescriptorPool descPool_ = VK_NULL_HANDLE;
     bool passOpen_ = false;
     // Image initialisations and uploads made while a pass is open wait here (in call order) until it ends: a pass is not cut for
@@ -928,5 +938,6 @@ Context* current();
 void setCurrent(Context* c);
 Context* currentOrLast();
 void forgetContext(Context* c);
+void eglResetDisplay();  // egl.cpp: eglInitialize count back to 0 (vpgles_shutdown)
 
 }  // namespace vpgles

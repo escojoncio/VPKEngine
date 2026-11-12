@@ -52,25 +52,37 @@ int main(int argc, char** argv) {
         for (auto& a : answers) CHECK(a == "v3" || a == "t", "a thread got '%s'", a.c_str());
     }
 
-    // ---- patches
+    // ---- patches: by module file and name; the callback and its user data are not part of the key
+    // (convert, is_current and the translation on demand each pass their own)
     vpcache::Patches patches;
     int patched = 0;
     auto patch = [&] { ++patched; return std::string("patch") + std::to_string(patched); };
-    int cb1 = 0, cb2 = 0, user = 0;
-    CHECK(patches.get(file, "eboot", &cb1, &user, true, patch) == "patch1", "first patch");
-    CHECK(patches.get(file, "eboot", &cb1, &user, false, patch) == "patch1" && patched == 1, "a patch kept was worked out again (%d)", patched);
-    CHECK(patches.get(file, "eboot", &cb1, &user, true, patch) == "patch2", "a patch asked again kept the old one");
-    CHECK(patches.get(file, "eboot", &cb1, &user, false, patch) == "patch2", "the patch asked again was not kept");
-    CHECK(patches.get(file, "libc", &cb1, &user, false, patch) == "patch3", "another module shares a patch");
-    CHECK(patches.get(file, "eboot", &cb2, &user, false, patch) == "patch4", "another callback shares a patch");
-    CHECK(patches.get(file, "eboot", &cb1, &cb2, false, patch) == "patch5", "another user data shares a patch");
+    CHECK(patches.get(file, "eboot", true, patch) == "patch1", "first patch");
+    CHECK(patches.get(file, "eboot", false, patch) == "patch1" && patched == 1, "a patch kept was worked out again (%d)", patched);
+    CHECK(patches.get(file, "eboot", true, patch) == "patch2", "a patch asked again kept the old one");
+    CHECK(patches.get(file, "eboot", false, patch) == "patch2" && patched == 2, "the patch asked again was not kept (%d)", patched);
+    CHECK(patches.get(file, "libc", false, patch) == "patch3", "another module shares a patch");
+    // a conversion with settings that changed, then the translation on demand: it sees the new patch
+    std::string settings = "old";
+    auto by_settings = [&] { ++patched; return "patched with " + settings; };
+    CHECK(patches.get(file, "settings", true, by_settings) == "patched with old", "patch by settings");
+    settings = "new";
+    CHECK(patches.get(file, "settings", false, by_settings) == "patched with old", "a patch kept changed without being asked");
+    CHECK(patches.get(file, "settings", true, by_settings) == "patched with new", "changed settings were not seen by a conversion or the check whether the pack is current");
+    patched = 0;
+    CHECK(patches.get(file, "settings", false, by_settings) == "patched with new" && patched == 0, "the translation on demand did not use the patch of the last conversion (%d)", patched);
+    // many conversions: one entry per module, not one per conversion
+    const size_t before = patches.size();
+    for (int i = 0; i < 50; ++i) patches.get(file, "eboot", true, patch);
+    CHECK(patches.size() == before, "the patches grew from %zu to %zu entries over 50 conversions", before, patches.size());
     write(file, "a longer file now");
-    CHECK(patches.get(file, "eboot", &cb1, &user, false, patch) == "patch6", "a changed module file kept its patch");
+    patched = 0;
+    CHECK(patches.get(file, "eboot", false, patch) == "patch1" && patched == 1, "a changed module file kept its patch (%d)", patched);
     try {
-        patches.get(file, "boom", &cb1, &user, true, []() -> std::string { throw std::runtime_error("unreadable"); });
+        patches.get(file, "boom", true, []() -> std::string { throw std::runtime_error("unreadable"); });
         CHECK(false, "an error was swallowed");
     } catch (const std::runtime_error&) {}
-    CHECK(patches.get(file, "boom", &cb1, &user, false, [] { return std::string("fine"); }) == "fine", "an error left a value");
+    CHECK(patches.get(file, "boom", false, [] { return std::string("fine"); }) == "fine", "an error left a value");
 
     remove(file.c_str());
     printf(failures ? "vpconvert_cache: %d FAILED\n" : "vpconvert_cache: ok\n", failures);

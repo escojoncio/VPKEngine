@@ -145,7 +145,8 @@ class Platform {
     } mask[2];
   };
   virtual bool taaNativeEncode(const TaaNativeArgs&, void* /*commandBuffer*/) { return false; }
-  // Profundidad MSAA -> depth32Float de 1 muestra (vpvk_depth_resolve_encode). Null: sin Metal.
+  // Profundidad MSAA -> depth32Float de 1 muestra (vpvk_depth_resolve_encode). Null: sin Metal. La textura se suelta tras
+  // inactividad (ver config.h): quien llama no la guarda entre frames.
   virtual void* depthResolveEncode(void* /*commandBuffer*/, void* /*depthMS*/, bool /*reversedZ*/, int /*mode*/,
                                    int /*key*/) {
     return nullptr;

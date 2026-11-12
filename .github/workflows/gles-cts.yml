@@ -48,7 +48,7 @@ env:
 jobs:
   vpvulkan:
     concurrency:
-      group: gles-vpvulkan-${{ github.run_id }}
+      group: gles-vpvulkan-${{ github.event_name == 'workflow_dispatch' && github.ref || github.run_id }}
       cancel-in-progress: true
     if: github.event_name == 'workflow_dispatch' || contains(github.event.head_commit.message, '[gles')
     runs-on: macos-26
@@ -233,7 +233,7 @@ jobs:
     needs: [vpvulkan, shim, deqp-build]
     if: inputs.cases == ''
     concurrency:
-      group: gles-smoke-${{ github.run_id }}
+      group: gles-smoke-${{ github.event_name == 'workflow_dispatch' && github.ref || github.run_id }}
       cancel-in-progress: true
     runs-on: macos-26
     timeout-minutes: 40
@@ -288,7 +288,7 @@ jobs:
     needs: [vpvulkan, shim, deqp-build]
     if: inputs.cases != ''
     concurrency:
-      group: gles-focus-${{ github.run_id }}
+      group: gles-focus-${{ github.event_name == 'workflow_dispatch' && github.ref || github.run_id }}
       cancel-in-progress: true
     runs-on: macos-26
     timeout-minutes: 60

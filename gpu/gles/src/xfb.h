@@ -11,7 +11,7 @@ namespace vpgles {
 
 // The vertices of the primitives a draw of `drawMode` (GL_POINTS ... GL_TRIANGLE_FAN) makes from the vertex sequence v[0..n), in the
 // order GL writes them: points, lines (strips and loops as separate segments) or triangles (strip triangles keep their winding:
-// odd ones swap the first two; a fan's triangle is (v[i], v[i+1], v[0]), the centre last). `restart`: `restartValue` ends the primitive being assembled and starts a new sequence.
+// odd ones swap the first two; a fan's triangle is (v[0], v[i], v[i+1]), the centre first, the provoking vertex last). `restart`: `restartValue` ends the primitive being assembled and starts a new sequence.
 void xfbAssemble(uint32_t drawMode, const uint32_t* v, size_t n, bool restart, uint32_t restartValue, std::vector<uint32_t>& out);
 
 // A buffer binding that captures (part of) every vertex record: `room` bytes at `dst`, `used` already taken, one vertex taking

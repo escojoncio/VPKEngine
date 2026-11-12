@@ -29,7 +29,9 @@ void assembleSequence(uint32_t mode, const uint32_t* s, size_t m, std::vector<ui
                 else out.insert(out.end(), {s[i], s[i + 1], s[i + 2]});
             break;
         case kTriangleFan:
-            for (size_t i = 1; i + 1 < m; ++i) out.insert(out.end(), {s[i], s[i + 1], s[0]});  // triangle i-1: (v_i, v_i+1, v_0), as Vulkan and GL define the fan
+            // GL's fan: triangle i is (v_0, v_i, v_i+1), the provoking vertex (the last) last. (Vulkan's (v_i, v_i+1, v_0) puts the
+            // first-vertex provoking vertex first: it is not GL's.) Not checked against dEQP / CTS: their sources are not in the tree.
+            for (size_t i = 1; i + 1 < m; ++i) out.insert(out.end(), {s[0], s[i], s[i + 1]});
             break;
         default: break;
     }

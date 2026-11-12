@@ -197,8 +197,7 @@ std::string read_patch(const fs::path& file, const std::string& name, const VpCo
 vpcache::Patches g_patches;
 std::string module_patch(const fs::path& file, const std::string& name, const VpConvertCallbacks* cb, bool recompute = true) {
     if (!cb || !cb->patch_image) return {};
-    return g_patches.get(file.string(), name, (const void*)cb->patch_image, cb->user, recompute,
-                         [&] { return read_patch(file, name, cb); });
+    return g_patches.get(file.string(), name, recompute, [&] { return read_patch(file, name, cb); });
 }
 
 // What a module's translation depends on: if this is the same, its C (and objects) are current.

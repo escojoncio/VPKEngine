@@ -37,6 +37,7 @@
 #include <map>
 #include <condition_variable>
 #include <mutex>
+#include <optional>
 #include <set>
 #include <string>
 #include <thread>
@@ -483,6 +484,17 @@ std::atomic<double> gCompilerBackoffUntil{0.0};
 double steadySeconds() {
   return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
 }
+
+// True on the engine's own background compile threads (internal warm-up, shader prewarm, seed / foveation pipelines, knock
+// substitutes): what they compile is not time a game thread loses, so it stays out of vk.hitch lib_compile_ms.
+thread_local bool tlBackgroundCompile = false;
+struct BackgroundCompileScope {
+  bool prev;
+  BackgroundCompileScope() : prev(tlBackgroundCompile) { tlBackgroundCompile = true; }
+  ~BackgroundCompileScope() { tlBackgroundCompile = prev; }
+  BackgroundCompileScope(const BackgroundCompileScope&) = delete;
+  BackgroundCompileScope& operator=(const BackgroundCompileScope&) = delete;
+};
 
 template <class Make>
 id compileRetrying(NSError* __autoreleasing* e, Make make, int* retries = nullptr) {
@@ -2109,6 +2121,14 @@ void MetalBackend::Impl::releaseMsaaBackings(uint64_t frameIndex, bool bookkeepi
         ++f;
       }
     }
+    for (auto sv = sliceViews.begin(); sv != sliceViews.end();) {  // so do the cached slice views (they would keep the backing resident)
+      if (sv->first.base == t) {
+        retire(sv->second.view);
+        sv = sliceViews.erase(sv);
+      } else {
+        ++sv;
+      }
+    }
     for (auto& [vi, v] : views)  // explicit views keep the base alive
       if (v.base.index == *bi && v.texture) {
         retire(v.texture);
@@ -2362,7 +2382,8 @@ id<MTLFunction> MetalBackend::Impl::function(uint64_t shaderId, const FetchInput
   int retried = 0;
   const attr::Probe probe(device);
   id<MTLLibrary> lib = compileRetrying(&e, [&](NSError* __autoreleasing* pe) {
-    vpgpu::HitchSpan hitch(vpgpu::hitchPerf().libCompileUs, false);  // vk.hitch lib_compile_ms
+    std::optional<vpgpu::HitchSpan> hitch;  // vk.hitch lib_compile_ms, except on the background compile threads
+    if (!tlBackgroundCompile) hitch.emplace(vpgpu::hitchPerf().libCompileUs, false);
     return [device newLibraryWithSource:@(shader.source.c_str()) options:o error:pe];
   }, &retried);
   if (retried) err("what=compiler_unreachable site=msl retries=%d ok=%d", retried, lib ? 1 : 0);
@@ -2465,6 +2486,7 @@ void MetalBackend::prewarmShader(uint64_t shaderId) {
   dispatch_async(q, ^{
     @autoreleasepool {  // the compile's temporaries go at the end of each job, not when the queue's thread decides
       if (m->closing) return;
+      const BackgroundCompileScope background;
       MslShader shader;
       std::string error;
       // Most likely variant: no fetch inputs; vertex shaders without a PointSize write (non-point topology).
@@ -2633,7 +2655,8 @@ id<MTLRenderPipelineState> MetalBackend::Impl::clearPipelineFor(const ClearSig& 
     NSError* e = nil;
     const attr::Probe probe(device);  // covers the library and the pipeline (the delta goes to the pipeline's tag)
     id<MTLLibrary> lib = compileRetrying(&e, [&](NSError* __autoreleasing* pe) {
-      vpgpu::HitchSpan hitch(vpgpu::hitchPerf().libCompileUs, false);  // vk.hitch lib_compile_ms
+      std::optional<vpgpu::HitchSpan> hitch;  // vk.hitch lib_compile_ms, except for the warm job
+      if (!tlBackgroundCompile) hitch.emplace(vpgpu::hitchPerf().libCompileUs, false);
       return [device newLibraryWithSource:@(src.c_str()) options:o error:pe];
     });
     attr::trackCount("m2.lib.clear", lib);
@@ -2841,6 +2864,7 @@ id<MTLRenderPipelineState> MetalBackend::Impl::fovPipeline(int kind, MTLPixelFor
     return nil;
   }
   dispatch_async(compileQueue(), ^{
+    const BackgroundCompileScope background;
     if (!closing) buildFovPipeline(kind, pf, key);
     std::lock_guard<std::mutex> lock(fovMutex);
     fovPending.erase(key);
@@ -2908,13 +2932,16 @@ void MetalBackend::Impl::buildFovPipeline(int kind, MTLPixelFormat pf, uint64_t 
 // is ever skipped; anything outside the warm set is built on first use as before.
 void MetalBackend::Impl::startWarmInternal() {
   if (warmQueue) return;
-  warmQueue = dispatch_queue_create("vpgpu.internal.warm", dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_UTILITY, 0));
+  // USER_INITIATED like seedQueue: the submit thread waits for this job's OnceMap entries and d24Mutex / blitLibMutex, and a
+  // lower-QoS holder would not inherit the waiter's priority through them.
+  warmQueue = dispatch_queue_create("vpgpu.internal.warm", dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INITIATED, 0));
   dispatch_async(warmQueue, ^{
     warmInternal();
   });
 }
 
 void MetalBackend::Impl::warmInternal() {
+  const BackgroundCompileScope background;
   const auto t0 = std::chrono::steady_clock::now();
   uint32_t built = 0, failed = 0;
   auto one = [&](auto&& fn) {  // one item per autorelease pool; stops at teardown
@@ -2993,6 +3020,7 @@ id<MTLRenderPipelineState> MetalBackend::Impl::seedPipeline(MTLRenderPassDescrip
     return nil;
   }
   dispatch_async(compileQueue(), ^{
+    const BackgroundCompileScope background;
     if (!closing) buildSeedPipeline(sig);
     std::lock_guard<std::mutex> lock(seedMutex);
     seedPending.erase(sig.key);
@@ -5759,7 +5787,7 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
       // attachments, which are declined below with reason "msaa" anyway.)
       if (enc.pass.rateMap && enc.view < 0) {
         const RateMap& rm = *enc.pass.rateMap;
-        std::string why;
+        std::string why, perr;  // perr: fovPipeline's error
         do {
           if (dumping) {
             why = "dump";
@@ -5789,7 +5817,6 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
           }
           std::vector<FovAtt> atts;
           std::unordered_map<uint64_t, size_t> fovTaken;
-          std::string perr;
           auto add = [&](MTLRenderPassAttachmentDescriptor* a, const Attachment& src, bool depth) {
             id<MTLTexture> t = a.texture;
             if (!t) {
@@ -5835,7 +5862,9 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
           fovM = m;
           fovAtts = std::move(atts);
         } while (false);
-        if (!why.empty() && fovWarned.insert(why).second)
+        // A pipeline still compiling on seedQueue ("pending") or a backend shutting down ("closing") is not a reason to decline for
+        // good: not logged, not remembered.
+        if (!why.empty() && perr != "pending" && perr != "closing" && fovWarned.insert(why).second)
           info("gpu.fov decline reason=" + why + " label=" + token(enc.pass.label) + " logical=" + std::to_string(rm.width) +
                "x" + std::to_string(rm.height));
       }
@@ -6253,15 +6282,17 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
           id<MTLRenderPipelineState> ps = useC || useD ? seedPipeline(rp, passLayers > 1, useC, useD, false, perr) : nil;
           id<MTLRenderPipelineState> pss = useS ? seedPipeline(rp, passLayers > 1, false, false, true, serr) : nil;
           const bool pending = (useC || useD) && !ps && perr == "pending", pendingS = useS && !pss && serr == "pending";
+          // A backend shutting down ("closing") is no pipeline failure either: not counted, not logged.
+          const bool shutC = (useC || useD) && !ps && perr == "closing", shutS = useS && !pss && serr == "closing";
           if (pending || pendingS) {
             if (seedSkipped.fetch_add(1, std::memory_order_relaxed) < 8)
               info("gpu.seed pipeline_pending f=" + std::to_string(frameIndex) + " enc=" + std::to_string(e) + " (compiling off the submit thread; samples start undefined)");
           }
-          if ((useC || useD) && !ps && !pending) ++missingPipelines;
-          if (((useC || useD) && !ps && !pending && blitWarned.insert("seed_pipeline").second) ||
-              (useS && !pss && !pendingS && blitWarned.insert("seed_pipeline_stencil").second))
+          const bool failC = (useC || useD) && !ps && !pending && !shutC, failS = useS && !pss && !pendingS && !shutS;
+          if (failC) ++missingPipelines;
+          if ((failC && blitWarned.insert("seed_pipeline").second) || (failS && blitWarned.insert("seed_pipeline_stencil").second))
             err("what=seed_pipeline f=%llu enc=%u error=%s", (unsigned long long)frameIndex, e, (ps ? serr : perr).c_str());
-          if (useS && !pss && !pendingS) ++missingPipelines;
+          if (failS) ++missingPipelines;
           const bool anyDepthStencil = rp.depthAttachment.texture || rp.stencilAttachment.texture;
           if (ps || pss) {
             [open.render setCullMode:MTLCullModeNone];
@@ -7543,6 +7574,7 @@ id<MTLRenderPipelineState> MetalBackend::Impl::knockFsrPso(uint64_t pipelineKey)
 // every colour output the original wrote, no discard, no resource reads. The fragment function is one per output layout.
 void MetalBackend::Impl::knockFsrBuild(uint64_t pipelineKey, uint32_t gen) {
   if (closing) return;
+  const BackgroundCompileScope background;
   @autoreleasepool {
     MTLRenderPipelineDescriptor* d = nil;
     std::string kinds;
@@ -8212,7 +8244,7 @@ size_t MetalBackend::trimMemory(int level, std::string& report) {
 // submit mutex): the submit thread is not running, so the texture tables and the slots are ours. Releases the transient MSAA
 // backings that are not pinned and were not the last frame's tile work (a frame that needs one allocates it again), and the
 // chained argument buffers of the slots whose frame completed; both go to the graveyard, which drainRetired then empties for
-// the part no frame in flight reads. Never waits (tableMutex is try-locked). Appends "serialized_msaa=MiB serialized_args=MiB",
+// the part no frame in flight reads. Never waits (tableMutex is try-locked). Appends "serialized_msaa=MiB serialized_args=MiB serialized_fov=MiB",
 // returns the bytes moved to the graveyard (not yet returned to the OS until drainRetired runs).
 size_t MetalBackend::trimSerialized(std::string& report) {
   if (!ok()) return 0;
@@ -8220,7 +8252,7 @@ size_t MetalBackend::trimSerialized(std::string& report) {
   size_t moved = 0;
   @autoreleasepool {
     std::unique_lock<std::recursive_mutex> tables(m.tableMutex, std::try_to_lock);
-    if (!tables.owns_lock()) {  // distinct from "nothing to free" (that one reports serialized_msaa=0.0 serialized_args=0.0)
+    if (!tables.owns_lock()) {  // distinct from "nothing to free" (that one reports serialized_msaa=0.0 serialized_args=0.0 serialized_fov=0.0)
       if (!report.empty()) report += ' ';
       report += "table_busy=1";
       return 0;
@@ -8235,7 +8267,7 @@ size_t MetalBackend::trimSerialized(std::string& report) {
       report += "serialized_throttled=1";
       return 0;
     }
-    const uint64_t msaa0 = m.trimmedMsaaBytes.load();
+    const uint64_t msaa0 = m.trimmedMsaaBytes.load(), fov0 = m.fovShadowBytes.load();
     if (level) {
       m.releaseMsaaBackings(m.lastSubmitFrame.load(std::memory_order_relaxed), false, true);
       m.releaseFovShadows(m.lastSubmitFrame.load(std::memory_order_relaxed), 0, 0);
@@ -8265,10 +8297,11 @@ size_t MetalBackend::trimSerialized(std::string& report) {
       }
     }
     const uint64_t msaaFreed = m.trimmedMsaaBytes.load() - msaa0;
-    moved = size_t(msaaFreed + argsFreed);
-    char b[96];
-    std::snprintf(b, sizeof b, "serialized_msaa=%.1f serialized_args=%.1f", double(msaaFreed) / 1048576.0,
-                  double(argsFreed) / 1048576.0);
+    const uint64_t fovNow = m.fovShadowBytes.load(), fovFreed = fov0 > fovNow ? fov0 - fovNow : 0;
+    moved = size_t(msaaFreed + argsFreed + fovFreed);
+    char b[128];
+    std::snprintf(b, sizeof b, "serialized_msaa=%.1f serialized_args=%.1f serialized_fov=%.1f", double(msaaFreed) / 1048576.0,
+                  double(argsFreed) / 1048576.0, double(fovFreed) / 1048576.0);
     if (!report.empty()) report += ' ';
     report += b;
   }

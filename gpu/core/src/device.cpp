@@ -120,6 +120,11 @@ SamplerId Device::createSampler(SamplerDesc d) {
 
 // The backend destroy runs under resMutex_: once the slot is free another thread can create into the same index, and its
 // backend create must not reach the backend before this destroy (resMutex_ comes before every backend table lock).
+// Checked for every backend and platform in the tree (NullBackend, metal, metal2, vulkan platform_null / platform_metal):
+// destroy* takes at most the backend's own table locks (metal2: tableMutex, then the leaf addressMutex / rangesMutex /
+// doneMutex), logs nothing and calls nothing outside the backend, and no backend or platform holds a Device reference or
+// calls back into Device, so no thread takes one of those locks and then resMutex_ (the reverse order never happens).
+// A new backend must keep it that way: a destroy that calls out (log sink, callback) while resMutex_ is held can deadlock.
 void Device::destroy(BufferId id) {
   std::lock_guard lock(resMutex_);
   if (resources_.destroy(id)) backend_.destroyBuffer(id);

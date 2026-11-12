@@ -67,6 +67,7 @@ int main(int argc, char** argv) {
     const uint64_t s1 = load(argv[1], 0, UINT64_C(0x500000000), native_a);
     const uint64_t s2 = load(argv[1], 1, UINT64_C(0x510000000), native_a); /* another module, same import, same native */
     const uint64_t s3 = load(argv[1], 2, UINT64_C(0x520000000), native_b); /* same name, another native */
+    const uint64_t s1_again = load(argv[1], 0, UINT64_C(0x500000000), native_a); /* the first module loaded again, in its own range */
     int bad = 0;
     Job jobs[4];
     pthread_t th[4];
@@ -75,6 +76,7 @@ int main(int argc, char** argv) {
     for (unsigned i = 0; i < 4; ++i) {
         if (jobs[i].stub != s1) { printf("FAIL: module %u loaded on a thread got another stub\n", 3 + i); bad = 1; }
     }
+    if (s1_again != s1) { printf("FAIL: the module loaded again got another stub (%#llx, %#llx)\n", (unsigned long long)s1, (unsigned long long)s1_again); bad = 1; }
     if (s1 != s2) { printf("FAIL: the same import and native got two stubs (%#llx, %#llx)\n", (unsigned long long)s1, (unsigned long long)s2); bad = 1; }
     if (s3 == s1) { printf("FAIL: another native shares the first one's stub\n"); bad = 1; }
     if (call(s1) != 0xa || call(s2) != 0xa || call(s3) != 0xb) { printf("FAIL: a stub reaches the wrong native\n"); bad = 1; }

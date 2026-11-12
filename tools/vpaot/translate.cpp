@@ -2401,12 +2401,22 @@ struct Emitter {
             line(fmt("const uint64_t x = %s & VP_MASK(%d), y = %s & VP_MASK(%d);", rd(ops[0], bits, a).c_str(), bits, rd(ops[1], bits).c_str(), bits));
             line(fmt("const unsigned n = (unsigned)(%s) & %u;", rd(ops[2], 8).c_str(), bits == 64 ? 63u : 31u));
             line("if (n) {");
-            // A 16-bit count above 16 is undefined in the ISA; the count is masked to 5 bits, so (16 - n) can go negative.
-            const char* in = bits == 16 ? "n <= 16 ? " : "";
-            const char* out = bits == 16 ? " : 0" : "";
-            if (left) line(fmt("    const uint64_t r = ((x << n) | (%sy >> (%d - n)%s)) & VP_MASK(%d);", in, bits, out, bits));
-            else line(fmt("    const uint64_t r = ((x >> n) | (%sy << (%d - n)%s)) & VP_MASK(%d);", in, bits, out, bits));
-            line(fmt("    vp_flags_%s(VP_FC, %d, x, n, r);", left ? "shl" : "shrd", bits));
+            if (bits == 16) {
+                // A 16-bit count above 16 is undefined in the ISA. The Intel hardware (measured for counts 0..31) works on the 48
+                // bits x:y:x: shrd shifts x | y << 16 | x << 32 right, shld left, the result being the window of 16 bits and CF the
+                // last bit out of it. OF for a count above 1 is also undefined; Intel gives the formula of the 1-bit shift, whatever
+                // the count (other vendors differ).
+                line("    const uint64_t d = x | (y << 16) | (x << 32);");
+                line(left ? "    const uint64_t r = (d >> (32 - n)) & 0xFFFF;" : "    const uint64_t r = (d >> n) & 0xFFFF;");
+                line(fmt("    vp_flags_%s(VP_FC, 16, x, n, r);", left ? "shl" : "shrd"));
+                // (through VP_FLAG_MASK like the helpers, so that a flag nothing reads is not computed)
+                line(left ? "    if (VP_FLAG_MASK & VP_F_CF) VP_FC->cf = (uint8_t)((d >> (48 - n)) & 1);" : "    if (VP_FLAG_MASK & VP_F_CF) VP_FC->cf = (uint8_t)((d >> (n - 1)) & 1);");
+                line(left ? "    if ((VP_FLAG_MASK & VP_F_OF) && n > 1) VP_FC->of = (uint8_t)(((x >> 14) ^ (x >> 15)) & 1);" : "    if ((VP_FLAG_MASK & VP_F_OF) && n > 1) VP_FC->of = (uint8_t)(((x >> 15) ^ y) & 1);");
+            } else {
+                if (left) line(fmt("    const uint64_t r = ((x << n) | (y >> (%d - n))) & VP_MASK(%d);", bits, bits));
+                else line(fmt("    const uint64_t r = ((x >> n) | (y << (%d - n))) & VP_MASK(%d);", bits, bits));
+                line(fmt("    vp_flags_%s(VP_FC, %d, x, n, r);", left ? "shl" : "shrd", bits));
+            }
             line("    " + wr(ops[0], bits, "r", a));
             line("}");
             if (bits == 32) line("else { " + wr(ops[0], 32, "x", a) + " }");

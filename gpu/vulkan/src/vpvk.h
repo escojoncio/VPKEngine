@@ -1005,6 +1005,13 @@ struct Device : Dispatchable {
   Queue queues[kQueueCount];
   bool multiview = false, densityMap = false, metalObjects = false;
   std::mutex submitMutex;
+  // Host calls (vpvk_mark_eye_image, vpvk_native_submit...) that found this device in the registry and are waiting for submitMutex WITHOUT
+  // the registry (entry.cpp liveDeviceSubmitLocked): vkDestroyDevice waits for them to get it, so the device outlives the wait.
+  std::atomic<int> hostUsers{0};
+  // Upload-arena chunks a command buffer reset gave up (Recorder::releaseResources): that path takes no submitMutex, so the core buffer is
+  // destroyed and the host memory freed by the next submission (drainRetiredChunks) or the device's destruction.
+  std::mutex retiredChunksMutex;
+  std::vector<std::pair<vpgpu::BufferId, uint8_t*>> retiredChunks;
   std::mutex resourceMutex;  // gpu->create*/destroy from recording threads (upload arenas)
   // GPU indirect draws that need their arguments rewritten (multiview: instances x views; draw-count
   // buffers): a small compute kernel run before the render pass (pipelines.cpp indirectPatch).

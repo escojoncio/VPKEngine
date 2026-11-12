@@ -22,6 +22,7 @@
 #include "builtins.h"
 #include "emit.h"
 #include "../../shader/spirv/src/spv_enums.h"
+#include "vpir/stack.h"
 
 namespace vpglsl {
 
@@ -34,6 +35,10 @@ struct EmitError : std::runtime_error {
     using std::runtime_error::runtime_error;
 };
 [[noreturn]] void fail(const std::string& m) { throw EmitError(m); }
+// The recursion over statements and expressions stops before the stack of the thread does (see vpir::StackGuard in emitSpirv).
+void checkStack() {
+    if (vpir::stackLow()) fail("shader nests statements or expressions too deeply");
+}
 
 uint32_t floatBits(float f) {
     uint32_t b;
@@ -908,6 +913,7 @@ private:
 
     // ---- statements -----------------------------------------------------------------------------
     void stmt(const Stmt& s) {
+        checkStack();
         if (terminated_) return;  // dead code after break/continue/return/discard
         switch (s.k) {
             case SK::Empty: return;
@@ -925,19 +931,34 @@ private:
                 return;
             case SK::Expr: value(*s.e); return;
             case SK::If: {
-                uint32_t c = value(*s.e);
-                uint32_t t = id(), e = s.els ? id() : 0, m = id();
-                inst(body_, OpSelectionMerge, {m, 0});
-                inst(body_, OpBranchConditional, {c, t, e ? e : m});
-                label(t);
-                stmt(*s.then);
-                branch(m);
-                if (e) {
-                    label(e);
-                    stmt(*s.els);
+                // An else-if ladder nests one selection per rung in the SPIR-V (the `else` of a rung holds the next `if`); it is
+                // walked in a loop, so the stack of the compiler does not grow with the number of rungs.
+                std::vector<uint32_t> merges;
+                bool lastHasElse = false;
+                for (const Stmt* cur = &s;;) {
+                    uint32_t c = value(*cur->e);
+                    uint32_t t = id(), e = cur->els ? id() : 0, m = id();
+                    inst(body_, OpSelectionMerge, {m, 0});
+                    inst(body_, OpBranchConditional, {c, t, e ? e : m});
+                    label(t);
+                    stmt(*cur->then);
                     branch(m);
+                    merges.push_back(m);
+                    lastHasElse = e != 0;
+                    if (!e) break;
+                    label(e);
+                    if (cur->els->k == SK::If) {
+                        cur = cur->els.get();
+                        continue;
+                    }
+                    stmt(*cur->els);
+                    break;
                 }
-                label(m);
+                // Close the rungs, innermost first: the `else` of every rung but a last one without it ends with a branch to its merge.
+                for (size_t k = merges.size(); k-- > 0;) {
+                    if (k + 1 < merges.size() || lastHasElse) branch(merges[k]);
+                    label(merges[k]);
+                }
                 return;
             }
             case SK::While:
@@ -1121,6 +1142,7 @@ private:
     // Pointer to an addressable expression (Var/Index/Field chains over variables). Returns false
     // when the expression is not addressable (an r-value), so the caller spills it.
     bool pointer(const Expr& e, Ptr& out) {
+        checkStack();
         switch (e.k) {
             case EK::Var: {
                 const Symbol* s = e.sym;
@@ -1249,6 +1271,7 @@ private:
 
     // Stores `v` (of e.type) into the l-value `e`.
     void assignTo(const Expr& e, uint32_t v) {
+        checkStack();
         if (e.k == EK::Swizzle) {
             const Expr& base = *e.a[0];
             uint32_t cur = value(base);
@@ -1308,6 +1331,7 @@ private:
     }
 
     uint32_t value(const Expr& e) {
+        checkStack();
         if (!pinned_.empty()) {
             auto it = pinned_.find(&e);
             if (it != pinned_.end()) return it->second;
@@ -1322,7 +1346,17 @@ private:
             case EK::Field:
             case EK::Index: {
                 Ptr p;
-                if (pointer(e, p)) return loadPtr(p);
+                if (pointer(e, p)) {
+                    uint32_t v = loadPtr(p);
+                    if (e.k == EK::Var && e.sym->builtin == BuiltinVar::PointCoord) {
+                        // [[point_coord]] has t = 0 at the top of the point; the GLES layer keeps GL's row 0 (bottom) as memory row 0
+                        // (see glsl.h), so GL's t is 1 - t of the rasterizer. (SPIR-V of the Vulkan path is not touched.)
+                        const uint32_t f = typeId(Type::make(Base::Float));
+                        uint32_t x = op(OpCompositeExtract, f, {v, 0}), y = op(OpCompositeExtract, f, {v, 1});
+                        v = opV(OpCompositeConstruct, typeId(e.type), {x, op(OpFSub, f, {constF(1.0f), y})});
+                    }
+                    return v;
+                }
                 if (e.k == EK::Var) fail("cannot read '" + e.sym->name + "'");
                 const Type& bt = e.a[0]->type;
                 if (e.k == EK::Field) {
@@ -2103,6 +2137,7 @@ private:
 }  // namespace
 
 std::vector<uint32_t> emitSpirv(const Shader& sh, const ProgramLayout& layout, std::string& error) {
+    vpir::StackGuard stackGuard;
     try {
         Emitter e(sh, layout);
         return e.run();
@@ -2113,17 +2148,24 @@ std::vector<uint32_t> emitSpirv(const Shader& sh, const ProgramLayout& layout, s
 }
 
 static void walkExpr(const Expr& e, const std::function<void(const Expr&)>& fn) {
-    fn(e);
-    for (const ExprP& a : e.a) walkExpr(*a, fn);
+    std::vector<const Expr*> pending{&e};  // (a loop: an operator chain is as deep as it is long)
+    while (!pending.empty()) {
+        const Expr* x = pending.back();
+        pending.pop_back();
+        fn(*x);
+        for (auto it = x->a.rbegin(); it != x->a.rend(); ++it) pending.push_back(it->get());
+    }
 }
-static void walkStmt(const Stmt& s, const std::function<void(const Expr&)>& fn) {
-    if (s.e) walkExpr(*s.e, fn);
-    if (s.inc) walkExpr(*s.inc, fn);
-    for (const StmtP* c : {&s.init, &s.then, &s.els, &s.body})
-        if (*c) walkStmt(**c, fn);
-    for (const StmtP& c : s.list) walkStmt(*c, fn);
-    for (const auto& [sym, init] : s.decls)
-        if (init) walkExpr(*init, fn);
+static void walkStmt(const Stmt& first, const std::function<void(const Expr&)>& fn) {
+    for (const Stmt* s = &first; s; s = s->els.get()) {  // (an else-if ladder is a chain of els: a loop, not recursion)
+        if (s->e) walkExpr(*s->e, fn);
+        if (s->inc) walkExpr(*s->inc, fn);
+        for (const StmtP* c : {&s->init, &s->then, &s->body})
+            if (*c) walkStmt(**c, fn);
+        for (const StmtP& c : s->list) walkStmt(*c, fn);
+        for (const auto& [sym, init] : s->decls)
+            if (init) walkExpr(*init, fn);
+    }
 }
 
 void forEachExpr(const Shader& sh, const std::function<void(const Expr&)>& fn) {

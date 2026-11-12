@@ -262,14 +262,14 @@ void testXfb() {
     xfbAssemble(5, v.data(), v.size(), false, 0, out);  // strip
     CHECK((out == std::vector<uint32_t>{0, 1, 2, 2, 1, 3, 2, 3, 4}));
     out.clear();
-    xfbAssemble(6, v.data(), v.size(), false, 0, out);  // fan: triangle k is (v[k+1], v[k+2], v[0]) (Vulkan / GL primitive vertex order)
-    CHECK((out == std::vector<uint32_t>{1, 2, 0, 2, 3, 0, 3, 4, 0}));
+    xfbAssemble(6, v.data(), v.size(), false, 0, out);  // fan: triangle k is (v[0], v[k+1], v[k+2]) (GL's order; Vulkan's is (v[k+1], v[k+2], v[0]))
+    CHECK((out == std::vector<uint32_t>{0, 1, 2, 0, 2, 3, 0, 3, 4}));
     out.clear();
     xfbAssemble(6, v.data(), 2, false, 0, out);  // a fan of 2 vertices: no triangle
     CHECK(out.empty());
     out.clear();
     xfbAssemble(6, v.data(), 3, false, 0, out);
-    CHECK((out == std::vector<uint32_t>{1, 2, 0}));
+    CHECK((out == std::vector<uint32_t>{0, 1, 2}));
     out.clear();
     xfbAssemble(2, v.data(), 3, false, 0, out);  // line loop of 3: 0-1 1-2 2-0
     CHECK((out == std::vector<uint32_t>{0, 1, 1, 2, 2, 0}));

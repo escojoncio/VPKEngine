@@ -2,6 +2,7 @@
 # compiler (glsl/) emits SPIR-V that gpu/shader/spirv lowers like any Vulkan shader.
 add_library(vpglsl STATIC glsl/pp.cpp glsl/types.cpp glsl/builtins.cpp glsl/parser.cpp glsl/emit.cpp glsl/link.cpp)
 target_include_directories(vpglsl PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/glsl)
+target_link_libraries(vpglsl PUBLIC vpir)  # vpir::StackGuard / stackLow: the compiler stops before the stack of a small worker thread does
 target_compile_options(vpglsl PRIVATE -Wall -Wextra -Wno-missing-field-initializers)
 set_target_properties(vpglsl PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
@@ -12,7 +13,7 @@ if(BUILD_TESTING OR NOT DEFINED BUILD_TESTING)
     target_include_directories(vpglsl_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../shader/gcn/tests/diff)
     target_link_libraries(vpglsl_tests PRIVATE vpglsl vpspirv vpmsl)
     target_compile_options(vpglsl_tests PRIVATE -Wall -Wextra)
-    foreach(t pp parse errors es100 es300 multiview blocks control builtins textures external link compute ssbo images atomics gather fbfetch exts texbuffer exec packed shlight lenient xfb invariant semantics limits)
+    foreach(t pp ppfuzz parse errors es100 es300 multiview blocks control builtins textures external link compute ssbo images atomics gather fbfetch exts texbuffer exec packed shlight lenient xfb invariant semantics limits nesting)
       add_test(NAME gpu_gles.glsl.${t} COMMAND vpglsl_tests ${t})
     endforeach()
   endif()
@@ -35,7 +36,7 @@ if(BUILD_TESTING OR NOT DEFINED BUILD_TESTING)
     find_package(Threads REQUIRED)
     target_link_libraries(vpgles_tests PRIVATE ${CMAKE_DL_LIBS} Threads::Threads)
     target_include_directories(vpgles_tests PRIVATE include src ${CMAKE_CURRENT_SOURCE_DIR}/../vulkan/third_party/vulkan-headers/include)
-    foreach(t egl eglthreads formats buffers mapunsync textures fbo msrbo msrtt_depth program draw invalidate multiview errors ubo readback external es31 progbin recipe xfb uniform_raw uniform_strict audit_lost audit_calls audit_compile audit_xfb audit2_xfer audit2_dyn audit2_buf audit2_pbo audit2_upload audit2_egl audit2_link audit2_link2)
+    foreach(t egl eglthreads formats buffers mapunsync textures fbo msrbo msrtt_depth program draw invalidate multiview errors ubo readback external es31 progbin recipe xfb uniform_raw uniform_strict audit_lost audit_calls audit_compile audit_xfb audit2_xfer audit2_dyn audit2_buf audit2_pbo audit2_upload audit2_egl audit2_link audit2_link2 audit3_egl_last audit3_egl_refs audit3_pbo audit3_xfer_shared audit3_stale_stamp)
       add_test(NAME gpu_gles.gl.${t} COMMAND vpgles_tests ${t} $<TARGET_FILE:VPVulkan>)
     endforeach()
     # GL_RENDERER follows the Quest identity's GPU name (VPVK_QUEST_GPU_NAME, latched at the first query): its own run.

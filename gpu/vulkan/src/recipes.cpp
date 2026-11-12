@@ -421,10 +421,18 @@ std::shared_ptr<RecipeStore> RecipeStore::forDir(const std::string& dir) {
   static auto* open = new std::map<std::string, std::weak_ptr<RecipeStore>>;
   std::lock_guard<std::mutex> lock(*mutex);
   std::weak_ptr<RecipeStore>& slot = (*open)[dir];
-  if (std::shared_ptr<RecipeStore> live = slot.lock()) return live;
+  if (std::shared_ptr<RecipeStore> live = slot.lock()) {
+    live->setTranslator(translatorId());  // the host may have changed VPVK_AMPLIFY / VPVK_FETCH_NATIVE for this device (the mode is process-wide)
+    return live;
+  }
   std::shared_ptr<RecipeStore> made = std::make_shared<RecipeStore>(dir);
   slot = made;
   return made;
+}
+
+void RecipeStore::setTranslator(uint32_t id) {
+  std::lock_guard lock(mutex_);
+  translator_ = id;  // (the records already made keep their own id: they are stale for a lookup in the other mode, as after a bump)
 }
 
 RecipeStore::~RecipeStore() {
@@ -659,6 +667,7 @@ void RecipeStore::insertPipelineLocked(PipeRec p) {
 }
 
 bool RecipeStore::write(uint8_t tag, const std::vector<uint8_t>& payload, uint64_t* payloadOffset) {
+  if (!file_) return false;  // an earlier write of the same call failed and the reopen did too: the store is off
   const uint32_t len = uint32_t(payload.size());
   if (payloadOffset) *payloadOffset = size_ + kRecordHeader;
   bool ok = std::fwrite(&tag, 1, 1, file_) == 1 && std::fwrite(&len, sizeof len, 1, file_) == 1;
@@ -741,7 +750,10 @@ void RecipeStore::addStage(const StageInput& in, uint64_t h, const std::vector<u
     if (lines++ < 8)
       logf("gpu.pso.recipe drift input=%016llx old=%016llx new=%016llx (translator changed without kTranslatorVersion bump?)",
            (unsigned long long)h, (unsigned long long)it->second.msl, (unsigned long long)msl);
-    if (!driftWritten_) write(kTagDrift, {}), driftWritten_ = true;
+    if (!driftWritten_) {
+      if (!write(kTagDrift, {})) return;  // (the store may have lost its file: nothing more is written, and the drift is noted again)
+      driftWritten_ = true;
+    }
   }
   if (known) ++deadRecords_;
   Writer w;
@@ -857,15 +869,19 @@ RecipeStore::RefreshResult RecipeStore::refresh(unsigned threads) {
     ShaderBlob blob;
     StageIface iface;
     bool ok = false;
+    bool fileMoved = false;  // failed reading the module back: with a rewrite meanwhile, the offsets were those of the old file
   };
   std::vector<Job> jobs;
   std::vector<uint64_t> unbuildable;
   // What existed when the refresh started: the final clean-up drops only those. The game may be adding stages and
   // pipelines while the background prewarm refreshes (a stage is recorded before the pipeline that uses it).
   std::unordered_set<uint64_t> oldInputs, oldShaders, oldSpirv;
+  uint64_t genAtJobs = 0;
+  uint32_t idAtJobs = 0;
   {
     std::lock_guard lock(mutex_);
     if (!file_) return r;
+    genAtJobs = rewriteGen_, idAtJobs = translator_;
     for (const auto& kv : inputs_) oldInputs.insert(kv.first);
     for (const auto& kv : shaders_) oldShaders.insert(kv.first);
     for (const auto& kv : spirv_) oldSpirv.insert(kv.first);
@@ -891,6 +907,7 @@ RecipeStore::RefreshResult RecipeStore::refresh(unsigned threads) {
     if (jobs.empty() && unbuildable.empty() && !drift_ && !compactionDueLocked()) return r;
   }
 
+  if (translateGate) translateGate();
   // Translation runs unlocked, one SPIR-V module per job (parsed once for all its inputs).
   std::vector<std::vector<Out>> outs(jobs.size());
   std::atomic<size_t> next{0};
@@ -904,9 +921,11 @@ RecipeStore::RefreshResult RecipeStore::refresh(unsigned threads) {
       if (!readWords(job.rec, words)) error = "read";
       else if (spirvHash(words.data(), words.size()) != job.spirv) error = "spirv hash mismatch";
       else m = spirv::parse(words.data(), words.size(), error);
+      const bool unread = error == "read" || error == "spirv hash mismatch";
       for (const auto& [h, opt] : job.inputs) {
         Out o;
         o.input = h;
+        o.fileMoved = unread;
         std::string e = error;
         o.ok = m && translateRecipeStage(*m, opt, o.msl, o.blob, e, &o.iface);
         if (!o.ok && failLines++ < 16)
@@ -929,10 +948,17 @@ RecipeStore::RefreshResult RecipeStore::refresh(unsigned threads) {
   std::unique_lock lock(mutex_);
   if (!file_) return r;
   for (uint64_t h : unbuildable) inputs_.erase(h), ifaces_.erase(h), ++r.failed;
+  // The outputs were translated in the process-wide mode of the time; a host that changed it meanwhile (the store follows it: setTranslator)
+  // would get them labelled with an id they were not made for: they are dropped, the inputs stay stale for the next refresh.
+  if (translator_ != idAtJobs) {
+    logf("gpu.pso.recipe what=refresh_mode_changed (retranslation dropped; the inputs stay stale for the next refresh)");
+    return r;
+  }
   for (auto& job : outs)
     for (Out& o : job) {
       auto it = inputs_.find(o.input);
       if (it == inputs_.end()) continue;
+      if (!o.ok && o.fileMoved && rewriteGen_ != genAtJobs) continue;  // not a lost input: another rewrite moved the module (next refresh)
       if (!o.ok) {
         ifaces_.erase(it->first);
         inputs_.erase(it), ++r.failed;
@@ -1014,6 +1040,7 @@ bool RecipeStore::rewrite(std::unique_lock<std::mutex>& lock) {
 
   const uint64_t snapSize = size_;
   const size_t snapRecords = records_, snapDead = deadRecords_;
+  const bool driftSnap = drift_ || driftWritten_;  // a drift of this run (or of the file, not retranslated): its record goes into the new file
   const auto spirvS = spirv_;
   const auto shadersS = shaders_;
   const auto refsS = srcRef_;
@@ -1119,6 +1146,10 @@ bool RecipeStore::rewrite(std::unique_lock<std::mutex>& lock) {
     emit(kTagPipeline, w.b);
     if (!wrote) return fail("rewrite_failed");
   }
+  if (driftSnap) {  // (the compacted file would otherwise forget it: nothing here retranslated, and the next run must)
+    emit(kTagDrift, {});
+    if (!wrote) return fail("rewrite_failed");
+  }
   std::fclose(in);
   in = nullptr;
 
@@ -1172,14 +1203,17 @@ bool RecipeStore::rewrite(std::unique_lock<std::mutex>& lock) {
     if (srcRef_.count(it->first)) {
       std::string().swap(it->second.source);
       ++it;
-    } else {
+    } else if (shadersS.count(it->first)) {
       it = shaders_.erase(it);
+    } else {
+      ++it;  // added while the lock was released (a refresh's retranslation, text in memory only): its own rewrite writes it
     }
   }
   size_ = size + tail;
   records_ = records + (records_ - snapRecords);
   deadRecords_ = deadRecords_ > snapDead ? deadRecords_ - snapDead : 0;
-  driftWritten_ = false;
+  ++rewriteGen_;
+  if (driftSnap) driftWritten_ = true;  // (its record is in the new file; a drift found in the unlocked window is covered by it)
   openForAppend(false);
   return file_ != nullptr;
 }

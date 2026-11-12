@@ -423,7 +423,7 @@ void Context::texImage(GLenum target, GLint level, GLenum internalFormat, GLsize
             }
             if (at + last > size_t(pb->size)) return setError(gl::INVALID_OPERATION);
         }
-        if (pb->storage->lastUse > dev->completed) flush(true);
+        if (storageBusy(*pb->storage)) flush(true);
         src = pb->storage->host + reinterpret_cast<uintptr_t>(pixels);
     }
     if (!src) return;

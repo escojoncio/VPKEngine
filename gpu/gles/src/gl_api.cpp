@@ -1047,14 +1047,17 @@ void* MapBufferRange(GLenum target, GLintptr off, GLsizeiptr len, GLbitfield acc
         return nullptr;
     }
     if (access & gl::MAP_READ_BIT) {
-        if (b->storage->lastUse > c->dev->completed) c->flush(true);  // GPU writes visible
+        if (c->storageBusy(*b->storage)) {  // GPU writes visible: wait for the last submission that used it, not for all
+            c->flush(false);
+            c->dev->waitSerial(b->storage->lastUse);
+        }
     } else if (!(access & gl::MAP_UNSYNCHRONIZED_BIT)) {
         c->prepareWrite(*b, (access & gl::MAP_INVALIDATE_BUFFER_BIT) != 0, uint64_t(off), uint64_t(off + len));
     } else {
         // UNSYNCHRONIZED write: the caller promises the GPU is not reading the range, but a draw already sent and not completed
         // may still read this storage (the GPU here is further behind than the game's buffer ring expects): write to a new one.
         mapStats.unsync.fetch_add(1, std::memory_order_relaxed);
-        if (b->storage && b->storage->lastUse > c->dev->completed) {
+        if (b->storage && c->storageBusy(*b->storage)) {
             const BufferStorage* old = b->storage.get();
             const uint64_t oldSize = old->size;
             const bool discard = (access & gl::MAP_INVALIDATE_BUFFER_BIT) != 0;
@@ -4080,6 +4083,7 @@ extern "C" int vpgles_init(void* gipa) {
 
 extern "C" void vpgles_shutdown(void) {
     if (!gDev) return;
+    eglResetDisplay();
     gDev->shutdown();
     gInitResult = -1;
 }

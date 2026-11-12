@@ -54,9 +54,34 @@ Program load(const char* name) {
 // Guest memory: 1 MiB at guest address 0x10000000.
 constexpr uint64_t kBase = 0x10000000, kSize = 1 << 20;
 
+// NullBackend plus the host memory of the renderer's zero buffer (label "vpps4 zeros"), which tests write like the GPU would.
+class SpyBackend final : public vpgpu::Backend {
+ public:
+    vpgpu::NullBackend null;
+    std::vector<std::string>& calls = null.calls;
+    uint64_t& completedBelow = null.completedBelow;
+    void* zerosMemory = nullptr;
+    void createBuffer(vpgpu::BufferId id, const vpgpu::BufferDesc& d) override {
+        if (d.label == "vpps4 zeros") zerosMemory = d.guestMemory;
+        null.createBuffer(id, d);
+    }
+    void createTexture(vpgpu::TextureId id, const vpgpu::TextureDesc& d) override { null.createTexture(id, d); }
+    void createSampler(vpgpu::SamplerId id, const vpgpu::SamplerDesc& d) override { null.createSampler(id, d); }
+    void destroyBuffer(vpgpu::BufferId id) override { null.destroyBuffer(id); }
+    void destroyTexture(vpgpu::TextureId id) override { null.destroyTexture(id); }
+    void destroySampler(vpgpu::SamplerId id) override { null.destroySampler(id); }
+    uint64_t bufferAddress(vpgpu::BufferId id) const override { return null.bufferAddress(id); }
+    bool compilePipeline(const vpgpu::PipelineState& p, std::string& error) override { return null.compilePipeline(p, error); }
+    void destroyPipeline(vpgpu::PipelineKey k) override { null.destroyPipeline(k); }
+    void submit(uint64_t frame, const vpgpu::Frame& f, const vpgpu::CompiledFrame& c) override { null.submit(frame, f, c); }
+    bool takeTimings(uint64_t& frame, vpgpu::GpuTimings& out) override { return null.takeTimings(frame, out); }
+    uint64_t completedFrames() const override { return null.completedFrames(); }
+    vpgpu::ReadResult readTexture(const vpgpu::TextureSpan& s, std::vector<uint8_t>& out) override { return null.readTexture(s, out); }
+};
+
 struct Fixture {
     void* host = std::aligned_alloc(16384, kSize);
-    vpgpu::NullBackend backend;
+    SpyBackend backend;
     std::vector<std::string> log;
     vpgpu::Device device{backend, 0, [this](const std::string& s) { log.push_back(s); }};
     std::vector<std::pair<uint64_t, vpir::Stage>> shaders;
@@ -421,8 +446,9 @@ void busyRanges() {
     CHECK(!f.renderer.gpuMayAccess(kBase + 0x5000, 4));
 }
 
-// What the renderer caches on the device does not grow without end: targets nothing used for a long time are released (one a
-// draw samples every submit is not), and the renderer's teardown releases everything it made.
+// What the renderer caches on the device does not grow without end: a render target the game moved on from (another surface at its
+// address, unused for a long time in flips) is released, one a draw uses every submit is not, and the renderer's teardown releases
+// everything it made.
 void evictIdle() {
     Fixture f;
     vpps4::DrawState keep = f.state();  // renders to kBase + 0x40000 and samples the texture at +0x10000
@@ -431,23 +457,173 @@ void evictIdle() {
     constexpr int kSubmits = 3000;
     for (int i = 0; i < kSubmits; ++i) {
         vpps4::DrawState d = f.state();
-        d.color[0].address = kBase + 0x200000 + uint64_t(i) * 0x1000;  // a new surface each time (a level load, a resolution change)
+        d.color[0].address = kBase + 0x200000 + uint64_t(i % 4) * 0x1000;  // four addresses, a new size each time (a resolution change)
+        d.color[0].width = d.color[0].pitch = 64 + uint32_t(i);
         f.renderer.draw(d);
         if (i % 50 == 0) f.renderer.draw(keep);  // the first one stays in use
         f.renderer.submit();
+        f.renderer.colorTargetAt(kBase + 0x40000);  // the flip
     }
     const vpps4::Stats& s = f.renderer.stats();
     CHECK(s.targets == 1 + kSubmits);  // the kept target and the texture were made once: never released and made again
     CHECK(s.textures == 1);
     const size_t made = f.count("createTexture"), gone = f.count("destroyTexture");
-    CHECK(gone > 500);
-    CHECK(made - gone < 2500);  // bounded by what was used in the last ~2000 submits (it was 3002 live before)
+    CHECK(gone > 1000);
+    CHECK(made - gone < 1600);  // bounded by what was used in the last ~1200 flips (it was 3002 live before)
+    CHECK(bool(f.renderer.colorTargetAt(kBase + 0x40000)));
     // Teardown: every object the renderer made on the device is released.
     f.rendererOwner.reset();
     CHECK(f.count("createTexture") == f.count("destroyTexture"));
     CHECK(f.count("createBuffer") == f.count("destroyBuffer"));
     CHECK(f.count("createSampler") == f.count("destroySampler"));
     CHECK(f.count("createSampler") > 0);
+}
+
+// A target drawn once holds contents that exist only on the GPU: it is not released however long it stays unused while nothing else
+// takes its address (it used to vanish after ~2200 submits).
+void evictKeepsWritten() {
+    Fixture f;
+    vpps4::DrawState once = f.state();
+    once.color[0].address = kBase + 0x50000;
+    f.renderer.draw(once);
+    f.renderer.submit();
+    const vpgpu::TextureId first = f.renderer.colorTargetAt(kBase + 0x50000);
+    CHECK(bool(first));
+    vpps4::DrawState keep = f.state();
+    for (int i = 0; i < 5000; ++i) {
+        f.renderer.draw(keep);
+        f.renderer.submit();
+        f.renderer.colorTargetAt(kBase + 0x40000);
+    }
+    CHECK(f.renderer.colorTargetAt(kBase + 0x50000) == first);
+    CHECK(f.count("destroyTexture") == 0);
+}
+
+// The target the last flip presented is not released (the host may hold its id), even when its address was reused and it is idle;
+// one that no flip presents last is released then.
+void evictKeepsPresented() {
+    Fixture f;
+    auto destroyed = [&](const vpgpu::TextureId& id) {
+        for (const std::string& c : f.backend.calls)
+            if (c == "destroyTexture " + std::to_string(id.index)) return true;
+        return false;
+    };
+    vpps4::DrawState stereo = f.state();  // a two-slice target: the flips below go through its second slice
+    stereo.color[0].address = kBase + 0x60000;
+    stereo.color[0].sliceCount = 2;
+    f.renderer.draw(stereo);
+    f.renderer.submit();
+    uint16_t layer = 0;
+    CHECK(bool(f.renderer.colorTargetSlice(kBase + 0x70000, 128, 128, layer)) && layer == 1);
+    vpps4::DrawState a = f.state();
+    a.color[0].address = kBase + 0x50000;
+    f.renderer.draw(a);
+    f.renderer.submit();
+    const vpgpu::TextureId first = f.renderer.colorTargetAt(kBase + 0x50000);  // presented by the last colorTargetAt
+    CHECK(bool(first));
+    auto flips = [&](int n) {
+        for (int i = 0; i < n; ++i) {
+            f.renderer.draw(stereo);
+            f.renderer.submit();
+            f.renderer.colorTargetSlice(kBase + 0x70000, 128, 128, layer);
+        }
+    };
+    flips(1);  // (a later flip: the new surface is used more recently than the old one)
+    a.color[0].width = a.color[0].pitch = 96;  // the address now holds another surface
+    f.renderer.draw(a);
+    f.renderer.submit();
+    flips(3000);
+    CHECK(!destroyed(first));
+    // Another flip presents the new surface: the old one is only idle and superseded now.
+    const vpgpu::TextureId second = f.renderer.colorTargetAt(kBase + 0x50000);
+    CHECK(bool(second) && !(second == first));
+    flips(3000);
+    CHECK(destroyed(first));
+    CHECK(!destroyed(second));
+}
+
+// The zero buffer V#s that point nowhere get: what a GPU write left in it is cleared by the next binding, and when the write may
+// still run for kFrames submits, by every binding until one made after that.
+void dummyCleared() {
+    const Program cs = load("cs_bytes");
+    auto writeIt = [&](Fixture& f) {  // a dispatch whose buffer store goes to a null V#: bound writable
+        vpps4::DispatchState x;
+        x.cs.code = cs.code;
+        x.cs.fetch = cs.fetch;
+        x.cs.address = kBase + 0x82000;
+        x.cs.userSgprs = 4;
+        x.cs.ldsBytes = 64;
+        f.renderer.dispatch(x);
+    };
+    auto readIt = [&](Fixture& f) {  // a draw whose vertex fetch reads a null V#: bound read-only
+        vpps4::DrawState d = f.state();
+        uint32_t* vtable = f.at(kBase + 0x100);
+        vtable[0] = vtable[1] = 0;
+        f.renderer.draw(d);
+    };
+    auto zeros = [&](Fixture& f) {
+        const uint8_t* m = static_cast<const uint8_t*>(f.backend.zerosMemory);
+        if (!m) return false;
+        for (size_t i = 0; i < 64 * 1024; ++i)
+            if (m[i]) return false;
+        return true;
+    };
+    auto gpuWrites = [&](Fixture& f) { std::memset(f.backend.zerosMemory, 0xAB, 64 * 1024); };
+    {  // written at submit 0, not bound again for 8 submits: the next binding clears it
+        Fixture f;
+        writeIt(f);
+        CHECK(f.backend.zerosMemory != nullptr);
+        if (!f.backend.zerosMemory) {
+            for (const auto& [why, n] : f.renderer.stats().skipped) std::fprintf(stderr, "  skip %s x%d\n", why.c_str(), int(n));
+            for (const std::string& l : f.log) std::fprintf(stderr, "  %s\n", l.c_str());
+            return;
+        }
+        gpuWrites(f);
+        for (int i = 0; i < 8; ++i) {
+            f.renderer.draw(f.state());
+            f.renderer.submit();
+        }
+        readIt(f);
+        CHECK(zeros(f));
+    }
+    {  // the GPU executes the write after a binding cleared the memory: the next binding clears again
+        Fixture f;
+        writeIt(f);
+        CHECK(f.backend.zerosMemory != nullptr);
+        if (!f.backend.zerosMemory) return;
+        f.renderer.submit();
+        readIt(f);
+        CHECK(zeros(f));
+        gpuWrites(f);  // (the write of submit 0 ran only now)
+        f.renderer.submit();
+        readIt(f);
+        CHECK(zeros(f));
+    }
+}
+
+// Over the memory budget the oldest targets the last submit did not use go; the presented one and the latest stay.
+void evictBudget() {
+    Fixture f;
+    constexpr int kTargets = 40;  // 64 MiB each (4096x4096 RGBA8): 2.5 GiB
+    auto at = [](int i) { return kBase + 0x200000 + uint64_t(i) * 0x1000; };
+    for (int i = 0; i < kTargets; ++i) {
+        vpps4::DrawState d = f.state();
+        d.color[0].address = at(i);
+        d.color[0].width = d.color[0].height = d.color[0].pitch = 4096;
+        f.renderer.draw(d);
+        f.renderer.submit();
+        if (i == 0) CHECK(bool(f.renderer.colorTargetAt(at(0))));  // presented by the last flip
+    }
+    for (int i = 0; i < 10; ++i) {  // (what was released is destroyed kFrames submits later)
+        f.renderer.draw(f.state());
+        f.renderer.submit();
+    }
+    const size_t made = f.count("createTexture"), gone = f.count("destroyTexture");
+    CHECK(gone >= 8);
+    CHECK(made - gone <= 35);  // 32 targets fit in 2 GiB, plus the sampled texture, the small target of the extra draws and the last big one
+    CHECK(bool(f.renderer.colorTargetAt(at(0))));
+    CHECK(bool(f.renderer.colorTargetAt(at(kTargets - 1))));
+    CHECK(!bool(f.renderer.colorTargetAt(at(1))));
 }
 
 // A big texture source (a 1080p texture is 8 MiB) is staged in a buffer of its own, not in the draws' upload ring.
@@ -526,6 +702,10 @@ int main(int argc, char** argv) {
     else if (t == "busy_ranges") busyRanges();
     else if (t == "draw_bench") drawBench();
     else if (t == "evict_idle") evictIdle();
+    else if (t == "evict_keeps_written") evictKeepsWritten();
+    else if (t == "evict_keeps_presented") evictKeepsPresented();
+    else if (t == "evict_budget") evictBudget();
+    else if (t == "dummy_cleared") dummyCleared();
     else if (t == "big_staging") bigStaging();
     else if (t == "blend_factors") blendFactors();
     else return std::fprintf(stderr, "unknown test %s\n", t.c_str()), 2;

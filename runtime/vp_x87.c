@@ -848,11 +848,18 @@ static F128 tf_add(F128 a, F128 b) { return f128_add(a, b); }
 static F128 tf_sub(F128 a, F128 b) { return f128_sub(a, b); }
 static F128 tf_mul(F128 a, F128 b) { return f128_mul(a, b); }
 static F128 tf_div(F128 a, F128 b) { return f128_div(a, b); }
+static int tf_exp(F128 a) { return (int)((a.v[1] >> 48) & 0x7FFF); }
 static F128 tf_neg(F128 a) { a.v[1] ^= UINT64_C(0x8000000000000000); return a; }
 static F128 tf_abs(F128 a) { a.v[1] &= ~UINT64_C(0x8000000000000000); return a; }
-/* a * 2^n for a finite value far from the exponent limits (zero stays zero). */
+/* a * 2^n for a finite value whose scaled magnitude stays inside the normal range of binary128, |n| < 16000
+ * (zero stays zero; a subnormal a, e.g. an extended denormal, is scaled by a multiplication). */
 static F128 tf_scale(F128 a, int n) {
-    if (!(a.v[1] & UINT64_C(0x7FFF000000000000))) return a;
+    if (!(a.v[1] & UINT64_C(0x7FFF000000000000))) {
+        if (!a.v[0] && !(a.v[1] & UINT64_C(0x0000FFFFFFFFFFFF))) return a;
+        F128 p; /* 2^n by the exponent field alone */
+        p.v[0] = 0; p.v[1] = (uint64_t)(0x3FFF + n) << 48;
+        return f128_mul(a, p);
+    }
     a.v[1] += (uint64_t)(int64_t)n << 48;
     return a;
 }
@@ -870,7 +877,13 @@ static void tf_leave(TfSave s) { softfloat_exceptionFlags = s.flags; softfloat_r
 /* Rounds v to extended precision with the current mode (flags: inexact, underflow, overflow); C1 in
  * *extra when the magnitude was rounded up. */
 static extFloat80_t tf_round(F128 v, uint16_t* extra) {
-    const extFloat80_t r = f128_to_extF80(v);
+    extFloat80_t r = f128_to_extF80(v);
+    if ((v.v[1] & UINT64_C(0x7FFF000000000000)) == UINT64_C(0x7FFF000000000000)) {
+        /* The operands of every caller are finite: an infinite v is an overflow already in binary128, and the
+         * extended result overflows in the caller's rounding mode (infinity or the largest finite value). */
+        r = softfloat_roundPackToExtF80((bool)(v.v[1] >> 63), 0x7FFF, UINT64_C(0x8000000000000000), 0, 80);
+        if (is_inf(r) && extra) *extra |= FSW_C1;
+    } else if (is_inf(r)) softfloat_exceptionFlags |= softfloat_flag_overflow | softfloat_flag_inexact;
     /* The hardware flags every finite non-zero result inexact, an exact one (fyl2x of 2, 1) included,
      * and a denormal one also underflows. */
     if (!is_zero(r) && !is_inf(r) && !is_nan(r)) {
@@ -884,6 +897,17 @@ static extFloat80_t tf_round(F128 v, uint16_t* extra) {
     return r;
 }
 
+/* A result that underflowed to zero in binary128 itself (a true value too small even for it): inexact, and the rounding
+ * mode decides between a zero and the smallest denormal of the sign (RU positive, RD negative: rounded up in magnitude, C1). */
+static void tf_underflowed(extFloat80_t* r, uint16_t* extra) {
+    softfloat_exceptionFlags |= softfloat_flag_inexact;
+    const int neg = (r->signExp & 0x8000) != 0;
+    if ((softfloat_roundingMode == softfloat_round_max && !neg) || (softfloat_roundingMode == softfloat_round_min && neg)) {
+        r->signif = 1;
+        *extra |= FSW_C1;
+    }
+}
+
 /* sin and cos of r, |r| <= pi/4 (a little more is fine): Taylor series. */
 static void tf_sincos_kernel(F128 r, F128* s, F128* c) {
     const F128 r2 = tf_mul(r, r);
@@ -893,6 +917,9 @@ static void tf_sincos_kernel(F128 r, F128* s, F128* c) {
         ts = tf_div(tf_mul(ts, r2), tf_i((int64_t)(2 * k) * (2 * k + 1)));
         if (k & 1) { sc = tf_sub(sc, tc); ss = tf_sub(ss, ts); }
         else { sc = tf_add(sc, tc); ss = tf_add(ss, ts); }
+        /* The terms fall by more than half each step: once both are 2^-120 of their sums (7 bits beyond the 113 of binary128)
+         * the rest cannot change the result; a small |r| (the common case) needs 6 or so terms of the 18. */
+        if (tf_exp(tc) + 120 < tf_exp(sc) && tf_exp(ts) + 120 < tf_exp(ss)) break;
     }
     *s = ss;
     *c = sc;
@@ -967,6 +994,13 @@ static F128 tf_yl2x(extFloat80_t y, extFloat80_t x) {
 static F128 tf_yl2xp1(extFloat80_t y, extFloat80_t x) {
     const TfSave sv = tf_enter();
     const F128 xx = tf_f80(x), one = tf_i(1);
+    if (!(xx.v[1] & UINT64_C(0x7FFF000000000000))) { /* denormal x: log2(1 + x) = x log2(e) to far more than 64 bits, computed on 2^120 x
+                                                      * (binary128 is subnormal there) and scaled back with y */
+        const F128 l = tf_mul(tf_scale(xx, 120), TF_LOG2E);
+        const F128 v = tf_mul(tf_mul(tf_f80(y), tf_scale(one, -120)), l);
+        tf_leave(sv);
+        return v;
+    }
     /* |x| < 1/4: ln(1 + x) = 2 atanh(x / (2 + x)) keeps the relative precision of a small x */
     const F128 l = f128_lt(tf_abs(xx), tf_scale(one, -2)) ? tf_mul(tf_ln_series(tf_div(xx, tf_add(tf_i(2), xx))), TF_LOG2E) : tf_log2(tf_add(one, xx));
     const F128 v = tf_mul(tf_f80(y), l);
@@ -978,7 +1012,9 @@ static F128 tf_yl2xp1(extFloat80_t y, extFloat80_t x) {
 static F128 tf_exp2m1(extFloat80_t a) {
     const TfSave sv = tf_enter();
     const F128 x = tf_f80(a);
-    const int n = (int)f128_to_i32(x, softfloat_round_near_even, false);
+    int n = (int)f128_to_i32(x, softfloat_round_near_even, false);
+    if (n > 15000) n = 15000; /* the caller passes |x| <= 1; this only keeps tf_scale inside its range */
+    else if (n < -15000) n = -15000;
     const F128 y = tf_mul(tf_sub(x, tf_i(n)), TF_LN2);
     F128 sum = y, term = y;
     for (int k = 2; k <= 28; ++k) {
@@ -1075,10 +1111,10 @@ void vp_x87_transcendental(VpCpu* c, int op) {
         else if (ok && is_inf(a)) { if (a.signExp & 0x8000) { r.signif = UINT64_C(0x8000000000000000); r.signExp = 0xBFFF; } } /* -inf: -1 */
         else if (ok && !is_zero(a)) {
             if (is_denormal(a)) extra |= FSW_DE;
-            if ((a.signExp & 0x7FFF) >= 0x3FFF + 14) { /* |x| >= 16384: 2^x is out of the format (the instruction is defined for |x| <= 1) */
-                if (a.signExp & 0x8000) { r.signif = UINT64_C(0x8000000000000000); r.signExp = 0xBFFF; softfloat_exceptionFlags |= softfloat_flag_inexact; }
-                else r = extF80_add((extFloat80_t){UINT64_C(0xFFFFFFFFFFFFFFFF), 0x7FFE}, (extFloat80_t){UINT64_C(0xFFFFFFFFFFFFFFFF), 0x7FFE});
-            } else r = tf_round(tf_exp2m1(a), &extra);
+            /* The instruction is defined for |x| <= 1. Outside it the Intel hardware (measured from 1.5 to
+             * +-16383.6, and just above 1) returns the operand unchanged, flagging only inexact. */
+            if ((a.signExp & 0x7FFF) > 0x3FFF || ((a.signExp & 0x7FFF) == 0x3FFF && (a.signif << 1))) softfloat_exceptionFlags |= softfloat_flag_inexact;
+            else r = tf_round(tf_exp2m1(a), &extra);
         }
         st_set(c, 0, r);
         break;
@@ -1105,33 +1141,53 @@ void vp_x87_transcendental(VpCpu* c, int op) {
                     }
                     else r = tf_round(tf_atan2(b, a), &extra);
                 }
-                if (!is_zero(b) || (a.signExp & 0x8000)) softfloat_exceptionFlags |= softfloat_flag_inexact;
+                /* exact: zero y with a positive x, and a finite y with x = +inf (an exact 0) */
+                if ((!is_zero(b) || (a.signExp & 0x8000)) && !(is_inf(a) && !(a.signExp & 0x8000) && !is_inf(b))) softfloat_exceptionFlags |= softfloat_flag_inexact;
             } else if (op == VP_X87_YL2X) {
                 if (((a.signExp & 0x8000) && !is_zero(a)) || (is_zero(a) && is_zero(b)) || (is_inf(a) && is_zero(b)) ||
                     (a.signExp == 0x3FFF && a.signif == UINT64_C(0x8000000000000000) && is_inf(b))) {
                     softfloat_exceptionFlags |= softfloat_flag_invalid;
                     r = vp_f80_indefinite;
-                } else if (is_zero(a)) { /* log2(0) = -inf: y * -inf */
-                    softfloat_exceptionFlags |= softfloat_flag_infinite;
+                } else if (is_zero(a)) { /* log2(0) = -inf: y * -inf (zero-divide only for a finite y) */
+                    if (!is_inf(b)) softfloat_exceptionFlags |= softfloat_flag_infinite;
                     r.signif = UINT64_C(0x8000000000000000); r.signExp = (uint16_t)(ysign ? 0x7FFF : 0xFFFF);
                 } else if (is_inf(a)) {
                     r.signif = UINT64_C(0x8000000000000000); r.signExp = (uint16_t)(ysign ? 0xFFFF : 0x7FFF);
-                } else r = tf_round(tf_yl2x(b, a), &extra);
+                } else if (is_inf(b)) { /* infinite y, x neither 1 nor 0 nor infinite: the sign of y log2(x) */
+                    r.signif = UINT64_C(0x8000000000000000); r.signExp = (uint16_t)(0x7FFF | ((ysign ^ ((a.signExp & 0x7FFF) < 0x3FFF)) << 15));
+                } else {
+                    r = tf_round(tf_yl2x(b, a), &extra);
+                    /* y * log2(x) underflowed in binary128 itself: still a tiny inexact result (x = 1 gives an exact 0) */
+                    if (is_zero(r) && !is_zero(b) && !(a.signExp == 0x3FFF && a.signif == UINT64_C(0x8000000000000000))) tf_underflowed(&r, &extra);
+                }
             } else { /* fyl2xp1: y log2(1 + x) */
-                if (is_zero(a)) { r.signif = 0; r.signExp = (uint16_t)((a.signExp ^ b.signExp) & 0x8000); }
-                else if ((a.signExp & 0x8000) && (a.signExp & 0x7FFF) >= 0x3FFF) { /* x <= -1: outside the domain; the hardware gives x, inexact */
-                    r = a;
-                    softfloat_exceptionFlags |= softfloat_flag_inexact;
+                if (is_zero(a)) {
+                    if (is_inf(b)) { softfloat_exceptionFlags |= softfloat_flag_invalid; r = vp_f80_indefinite; }
+                    else { r.signif = 0; r.signExp = (uint16_t)((a.signExp ^ b.signExp) & 0x8000); }
                 } else if (is_inf(a)) {
-                    if (is_zero(b)) { softfloat_exceptionFlags |= softfloat_flag_invalid; r = vp_f80_indefinite; }
+                    if (is_zero(b) || (a.signExp & 0x8000)) { softfloat_exceptionFlags |= softfloat_flag_invalid; r = vp_f80_indefinite; } /* 0 * inf, and x = -inf */
                     else { r.signif = UINT64_C(0x8000000000000000); r.signExp = (uint16_t)(ysign ? 0xFFFF : 0x7FFF); }
-                } else r = tf_round(tf_yl2xp1(b, a), &extra);
+                } else if ((a.signExp & 0x8000) && (a.signExp & 0x7FFF) >= 0x3FFF) { /* x <= -1: outside the domain; the hardware gives x, inexact
+                                                                                      * (for a zero or infinite y: y with the sign flipped, exact) */
+                    if (is_zero(b) || is_inf(b)) { r = b; r.signExp ^= 0x8000; }
+                    else { r = a; softfloat_exceptionFlags |= softfloat_flag_inexact; }
+                } else if (is_inf(b)) { /* the sign of y log2(1 + x) (x is not 0 here) */
+                    r.signif = UINT64_C(0x8000000000000000); r.signExp = (uint16_t)(0x7FFF | (((a.signExp ^ b.signExp) & 0x8000)));
+                } else {
+                    r = tf_round(tf_yl2xp1(b, a), &extra);
+                    if (is_zero(r) && !is_zero(b)) tf_underflowed(&r, &extra); /* underflowed in binary128 itself */
+                }
             }
         }
         st_set(c, 1, r);
         st_pop(c);
         break;
     }
+    }
+    /* A tiny result (denormal or zero) that is inexact also underflows. */
+    if (softfloat_exceptionFlags & softfloat_flag_inexact) {
+        for (int i = 0; i < (op == VP_X87_SINCOS || op == VP_X87_PTAN ? 2 : 1); ++i)
+            if (!(c->st[phys(c, i)].se & 0x7FFF)) softfloat_exceptionFlags |= softfloat_flag_underflow;
     }
     vp_x87_end(c, extra);
 }

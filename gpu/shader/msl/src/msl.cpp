@@ -731,17 +731,82 @@ private:
         --depth_;
     }
 
+    // Whether `b` has a `break` or `continue` of the loop it belongs to (those inside a nested loop are that loop's).
+    static bool escapes(const Block& b) {
+        for (const Node& n : b) {
+            if (n.kind == NodeKind::Break || n.kind == NodeKind::Continue) return true;
+            if (n.kind == NodeKind::If && (escapes(n.body) || escapes(n.elseBody))) return true;
+        }
+        return false;
+    }
+
+    // An `if` whose else holds the next `if` is written as an `else if` ladder, in a loop: a ladder of N rungs nests N levels in the
+    // IR (and in the SPIR-V) but stays flat in the source (clang stops at 256 nested braces) and does not recurse here.
+    // The else of a rung from a shader compiler also holds the code that computes the condition of the next rung. From kFlatRungs
+    // rungs on that ladder is written as a block that runs once:
+    //     do { if (c0) { ...; break; }  <code of rung 1>  if (c1) { ...; break; }  ...  <final else> } while (false);
+    // Every instruction stays where the nested form runs it (nothing is moved ahead of a test that guards it), so any code may sit
+    // in the rungs. A `break` / `continue` of the enclosing loop inside a rung would leave the do-block instead, so a ladder with
+    // one stays nested, rung by rung, until fewer than kFlatRungs remain or the stretch left has none (a ladder of more than 256 rungs
+    // that has a `break` in its last ones is therefore refused by clang: its nesting is the number of rungs up to that `break`).
+    // Not covered: a chain of `?:` (the else of every link also holds code after the inner `if`, which copies the result) and a rung
+    // whose else has anything but instructions before the next `if`: those nest one level per link, and clang refuses about 250.
+    static constexpr size_t kFlatRungs = 64;
+    void ifChain(const Node& first) {
+        std::vector<const Node*> rungs{&first};
+        size_t plain = 1;  // rungs joined with no code in between
+        for (const Node* cur = &first;;) {
+            const Block& e = cur->elseBody;
+            if (e.empty() || e.back().kind != NodeKind::If) break;
+            const bool run = std::all_of(e.begin(), e.end() - 1, [](const Node& x) { return x.kind == NodeKind::Inst; });
+            if (!run) break;
+            if (e.size() == 1 && plain == rungs.size()) ++plain;
+            cur = &e.back();
+            rungs.push_back(cur);
+        }
+        if (rungs.size() >= kFlatRungs) {
+            bool out = escapes(rungs.back()->elseBody);
+            for (const Node* r : rungs) out = out || escapes(r->body);
+            if (!out) {
+                line("do {");
+                ++depth_;
+                for (size_t k = 0; k < rungs.size(); ++k) {
+                    if (k) {
+                        const Block& e = rungs[k - 1]->elseBody;
+                        for (auto it = e.begin(); it + 1 != e.end(); ++it) inst(it->inst);
+                    }
+                    line("if (", ex(rungs[k]->value), ") {");
+                    nested(rungs[k]->body);
+                    ++depth_;
+                    line("break;");
+                    --depth_;
+                    line("}");
+                }
+                block(rungs.back()->elseBody);
+                --depth_;
+                line("} while (false);");
+                return;
+            }
+        }
+        const size_t count = plain;
+        line("if (", ex(first.value), ") {");
+        nested(first.body);
+        for (size_t k = 1; k < count; ++k) {
+            line("} else if (", ex(rungs[k]->value), ") {");
+            nested(rungs[k]->body);
+        }
+        if (!rungs[count - 1]->elseBody.empty()) {
+            line("} else {");
+            nested(rungs[count - 1]->elseBody);
+        }
+        line("}");
+    }
+
     void node(const Node& n) {
         switch (n.kind) {
             case NodeKind::Inst: inst(n.inst); break;
             case NodeKind::If:
-                line("if (", ex(n.value), ") {");
-                nested(n.body);
-                if (!n.elseBody.empty()) {
-                    line("} else {");
-                    nested(n.elseBody);
-                }
-                line("}");
+                ifChain(n);
                 break;
             case NodeKind::Loop: {
                 // Hang guard: a loop whose exit depends on data the translation got wrong (an empty

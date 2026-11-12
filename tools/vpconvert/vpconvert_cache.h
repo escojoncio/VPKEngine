@@ -5,7 +5,7 @@
 #ifndef VPCONVERT_CACHE_H
 #define VPCONVERT_CACHE_H
 
-#include <cstdio>
+#include <cstddef>
 #include <map>
 #include <mutex>
 #include <string>
@@ -59,18 +59,19 @@ private:
 };
 
 // The embedder's patch of a module's image (read from the module and run through the embedder's
-// callback), by module file, name and callback. `recompute` asks for it to be worked out again (a
-// conversion, or the check whether the pack is current: the embedder's settings may have changed
-// since) and kept; without it, the value kept is used while the module file is the same (a
-// translation on demand while the game runs, one per code the game reaches: the game's patches do
-// not change meanwhile). A `compute` that throws keeps nothing. Any thread.
+// callback), by module file and name. The callback and its user data are not part of the key: the
+// conversion, the check whether the pack is current and a translation on demand each pass their
+// own copy of them, and the patch is the same for all of them. `recompute` asks for it to be worked
+// out again (a conversion, or the check whether the pack is current: the embedder's settings may
+// have changed since) and kept in place of the old one; without it, the value kept is used while
+// the module file is the same (a translation on demand while the game runs, one per code the game
+// reaches: the game's patches do not change meanwhile). A `compute` that throws keeps nothing. One
+// entry per module, however many times it is converted. Any thread.
 class Patches {
 public:
     template <class F>
-    std::string get(const std::string& file, const std::string& name, const void* callback, const void* user, bool recompute, F compute) {
-        char ids[48];
-        snprintf(ids, sizeof ids, "%p %p", callback, user);
-        const std::string key = file + '\n' + name + '\n' + ids;
+    std::string get(const std::string& file, const std::string& name, bool recompute, F compute) {
+        const std::string key = file + '\n' + name;
         Stamp now;
         const bool have_stamp = stamp_of(file, now);
         if (!recompute && have_stamp) {
@@ -84,6 +85,11 @@ public:
             values_[key] = {now, value};
         }
         return value;
+    }
+
+    size_t size() {
+        std::scoped_lock lock{mutex_};
+        return values_.size();
     }
 
 private:

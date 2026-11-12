@@ -51,7 +51,7 @@ static int run(const char* what, unsigned nslots, unsigned nsyms, int expect_ok)
     if (!mkdtemp(dir)) return 2;
     snprintf(path, sizeof path, "%s/image.elf", dir);
     FILE* o = fopen(path, "wb");
-    if (!o || fwrite(f, 1, IMG, o) != IMG) { rmdir(dir); return 2; }
+    if (!o || fwrite(f, 1, IMG, o) != IMG) { if (o) fclose(o); free(f); remove(path); rmdir(dir); return 2; }
     fclose(o);
     free(f);
 
@@ -89,7 +89,7 @@ static int run(const char* what, unsigned nslots, unsigned nsyms, int expect_ok)
             if (i < nsyms && i && slot[i] == slot[i - 1]) { printf("FAIL %s: symbols %u and %u share a stub\n", what, i - 1, i); bad = 1; }
         }
         if (!bad && resolved != nsyms) { printf("FAIL %s: %u symbols asked of the resolver, %u expected\n", what, resolved, nsyms); bad = 1; }
-        munmap((void*)(uintptr_t)BASE, IMG);
+        if (vp_unmap_fixed(BASE, IMG)) { printf("FAIL %s: vp_unmap_fixed of the image failed\n", what); bad = 1; }
     } else if (!bad && msync((void*)(uintptr_t)BASE, 4096, MS_ASYNC) == 0) {
         printf("FAIL %s: the refused image stays mapped\n", what);
         bad = 1;
