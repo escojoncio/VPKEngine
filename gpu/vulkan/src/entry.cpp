@@ -3662,6 +3662,7 @@ void runBatches(Device* d, std::vector<DeferredBatch>& list, size_t count) {
   }
   const uint64_t frames = d->gpu->submittedFrames();
   pendingFrames(*d, frames);
+  if (pdump.on) pdumpVisStamp(d, perfSent ? frames : UINT64_MAX), pdumpVisFlush(d);  // gpu.pdump.vis: this frame's counters, and the finished ones
   for (size_t i = 0; i < count; ++i)
     for (const auto& [s, v] : list[i].signals) {  // reached once this frame finishes
       std::lock_guard<std::mutex> l(s->m);

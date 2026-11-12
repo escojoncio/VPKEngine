@@ -645,6 +645,7 @@ GateResult gateFramePipelines(Device* dev, vpgpu::Frame& frame, uint64_t submitN
   size_t cursor = 0;
   r.skipped = uint32_t(frame.eraseDraws([&](const vpgpu::Draw& d) {
     const bool drop = pending(d.pipeline);
+    if (drop) pdumpVisDropped(dev, d);
     if (drop && cursor < classOfDraw.size()) ++r.skippedByClass[classOfDraw[cursor]];
     ++cursor;
     return drop;
@@ -3097,19 +3098,20 @@ uint8_t uiTintMode() {
 }  // namespace
 
 bool maskPipelineKey(Device* dev, const PipelineObj& p, PipelineObj::TexelVariant* tv, uint8_t passSamples, bool ui,
-                     vpgpu::PipelineKey& out) {
+                     vpgpu::PipelineKey& out, uint8_t diag) {
   if (!dev || p.compute || !p.ok) return false;
   const vpgpu::PipelineState& base = tv ? tv->state : p.state;
   const uint8_t samples = passSamples ? passSamples : base.samples;
   std::unique_lock<std::mutex> lock(p.variantMutex);
   for (const PipelineObj::MaskVariant& v : p.maskVariants)
-    if (v.tv == tv && v.samples == samples && v.ui == ui) {
+    if (v.tv == tv && v.samples == samples && v.ui == ui && v.diag == diag) {
       out = v.key;
       return v.ok;
     }
   constexpr int slot = taa::kUiMaskSlot;
   PipelineObj::MaskVariant mv;
-  mv.tv = tv, mv.samples = samples, mv.ui = ui;
+  mv.tv = tv, mv.samples = samples, mv.ui = ui, mv.diag = ui ? diag : uint8_t(0);
+  diag = mv.diag;
   vpgpu::PipelineState st = base;
   st.samples = samples;
   std::array<uint64_t, 3> inputs = tv ? tv->inputs : p.inputs;
@@ -3125,7 +3127,7 @@ bool maskPipelineKey(Device* dev, const PipelineObj& p, PipelineObj::TexelVarian
     for (const PipelineObj::StageSrc& src : p.sources) {
       if (src.stage != VK_SHADER_STAGE_FRAGMENT_BIT || src.synthetic) continue;  // (a depth-only draw does not mark the mask)
       StageOut o = translateStage(dev, src, *p.layout, p.viewCount, p.attrs, p.vertexBuffers, st.label + ".um", p.viewMask,
-                                  tv ? &tb : nullptr, p.colorIntKinds, slot, uiMaskUsesAlpha(base.blend[0]), p.a2cTest, p.sampleMask, p.d24Emul, -1, -1, -1,
+                                  tv ? &tb : nullptr, p.colorIntKinds, slot, uiMaskUsesAlpha(base.blend[0]), p.a2cTest || diag == 2, p.sampleMask, p.d24Emul, -1, -1, -1,
                                   tint);
       if (o.ok) st.fragmentShader = o.id, inputs[1] = o.input, translated = true, uiTinted = o.iface.uiTinted;
       break;
@@ -3145,6 +3147,11 @@ bool maskPipelineKey(Device* dev, const PipelineObj& p, PipelineObj::TexelVarian
     static std::atomic<unsigned> nTint{0};
     if (const unsigned n = nTint.fetch_add(1) + 1; n == 1 || n % 32 == 0) logf("vk.ui_tint mode=%u pipelines=%u", unsigned(tint), n);
   }
+  const bool diagVar = writes && diag != 0;
+  if (diagVar) {
+    if (diag == 1) st.depthTest = false, st.cull = vpgpu::CullMode::None;
+    st.label += ".diag" + std::to_string(diag);
+  }
   applyUiMaskTarget(st, writes);  // (the prewarm builds the '.ums' variant the same way)
   mv.key = st.key();
   mv.ok = true;
@@ -3156,7 +3163,7 @@ bool maskPipelineKey(Device* dev, const PipelineObj& p, PipelineObj::TexelVarian
     logf("vk.taa uimask pipeline_variant pipeline=%s ui=%d samples=%u", st.label.c_str(), writes ? 1 : 0, unsigned(samples));
   retainKey(dev, p, mv.key);
   dev->gpu->pipelines().request(st, mv.key, vpgpu::Priority::Blocking);
-  if (dev->recipes && !tinted) dev->recipes->addPipeline(st, inputs);
+  if (dev->recipes && !tinted && !diagVar) dev->recipes->addPipeline(st, inputs);
   // Built while a submission is translated (submitMutex held): in synchronous mode the key is only noted and runBatches
   // waits for all of them once (awaitFreshVariants), not one compile at a time under the mutex.
   if (!dev->translator) dev->uiMask.freshVariants.push_back(mv.key);
@@ -4630,9 +4637,16 @@ struct QueryStats {
   }
 } queryStats;
 
-uint32_t allocVisibility(Device* d, uint32_t count) {
+// Lock order: submitMutex, then visibility.m (pdumpVisAssign comes in with submitMutex held; the buffer is only created under it).
+uint32_t allocVisibility(Device* d, uint32_t count, bool submitLocked = false) {
   Device::Visibility& v = d->visibility;
-  std::lock_guard<std::mutex> l(v.m);
+  std::unique_lock<std::mutex> sub(d->submitMutex, std::defer_lock);
+  std::unique_lock<std::mutex> l(v.m);
+  if (!v.id && !submitLocked) {  // (first pool: the mutexes in order; the buffer is looked at again once both are held)
+    l.unlock();
+    sub.lock();
+    l.lock();
+  }
   if (!v.id) {
     const size_t bytes = size_t(kVisibilitySlots) * 8;
     v.host = static_cast<uint8_t*>(std::aligned_alloc(16384, bytes));
@@ -4642,10 +4656,7 @@ uint32_t allocVisibility(Device* d, uint32_t count) {
     bd.size = bytes;
     bd.guestMemory = v.host;
     bd.label = "vk.visibility";
-    {
-      std::lock_guard<std::mutex> lock(d->submitMutex);
-      v.id = d->gpu->createBuffer(bd);
-    }
+    v.id = d->gpu->createBuffer(bd);
     if (!v.id) {
       std::free(v.host);
       v.host = nullptr;
@@ -4664,13 +4675,86 @@ uint32_t allocVisibility(Device* d, uint32_t count) {
 }
 }  // namespace
 
+namespace {
+constexpr uint32_t kPdumpVisSlots = 256;      // ring of counters for the UI draws of the dump windows (a window is at most 8 frames of 32)
+constexpr uint32_t kPdumpVisPerSubmit = 32;   // counters given per submission
+constexpr unsigned kPdumpVisLines = 400;      // gpu.pdump.vis lines per process
+}  // namespace
+
+bool vpvk::pdumpVisAssign(Device* d, vpgpu::Draw& dr, const std::string& what) {
+  if (!d || !d->gpu || dr.visibility) return false;
+  Device::PdumpVis& pv = d->pdumpVis;
+  if (!pv.tried) {  // (called while a submission is translated, under the submit mutex)
+    pv.tried = true;
+    pv.base = allocVisibility(d, kPdumpVisSlots, true);
+  }
+  Device::Visibility& v = d->visibility;
+  if (pv.base == UINT32_MAX || !v.id || !v.host) return false;
+  std::lock_guard<std::mutex> l(pv.m);
+  if (pv.perSubmit != d->submits) pv.perSubmit = d->submits, pv.perCount = 0;
+  if (pv.perCount >= kPdumpVisPerSubmit || pv.items.size() >= kPdumpVisSlots) return false;
+  ++pv.perCount;
+  const uint32_t slot = pv.base + pv.next++ % kPdumpVisSlots;
+  std::memset(v.host + size_t(slot) * 8, 0, 8);  // (Metal adds to the counter)
+  dr.visibility = vpgpu::BufferSpan{v.id, uint64_t(slot) * 8, 8};
+  pv.items.push_back({slot, d->submits, UINT64_MAX, what});
+  return true;
+}
+
+void vpvk::pdumpVisStamp(Device* d, uint64_t doneAt) {
+  if (!d) return;
+  Device::PdumpVis& pv = d->pdumpVis;
+  std::lock_guard<std::mutex> l(pv.m);
+  size_t first = pv.items.size();  // the unstamped ones are the last handed out
+  while (first > 0 && pv.items[first - 1].done == UINT64_MAX) --first;
+  if (doneAt == UINT64_MAX) {  // never sent: take them back
+    pv.next -= uint32_t(pv.items.size() - first);
+    pv.items.resize(first);
+  } else {
+    for (size_t i = first; i < pv.items.size(); ++i) pv.items[i].done = doneAt;
+  }
+}
+
+void vpvk::pdumpVisDropped(Device* d, const vpgpu::Draw& dr) {
+  if (!d || !dr.visibility) return;
+  Device::PdumpVis& pv = d->pdumpVis;
+  std::lock_guard<std::mutex> l(pv.m);
+  if (pv.base == UINT32_MAX || dr.visibility->offset % 8) return;
+  const uint64_t slot = dr.visibility->offset / 8;
+  for (size_t i = pv.items.size(); i-- > 0 && pv.items[i].done == UINT64_MAX;)  // (only the not yet stamped: this submission's)
+    if (pv.items[i].slot == slot) {
+      pv.items[i].dropped = true;
+      return;
+    }
+}
+
+void vpvk::pdumpVisFlush(Device* d) {
+  if (!d || !d->gpu) return;
+  Device::PdumpVis& pv = d->pdumpVis;
+  std::lock_guard<std::mutex> l(pv.m);
+  if (pv.items.empty() || !d->visibility.host) return;
+  size_t done = 0;
+  for (; done < pv.items.size() && pv.items[done].done != UINT64_MAX; ++done) {
+    const Device::PdumpVis::Item& it = pv.items[done];
+    if (it.dropped) {
+      if (pv.lines++ < kPdumpVisLines) logf("gpu.pdump.vis submit=%llu dropped=1 %s", (unsigned long long)it.submit, it.what.c_str());
+      continue;
+    }
+    const Platform::WaitResult w = d->platform->waitFrames(it.done, 0);  // (the backend's completedFrames() may not be implemented)
+    if (w == Platform::WaitResult::Lost) continue;  // the device is gone: the item is dropped without reading it
+    if (w != Platform::WaitResult::Done) break;  // not finished: its slot is neither read nor reused yet
+    uint64_t samples = 0;
+    std::memcpy(&samples, d->visibility.host + size_t(it.slot) * 8, 8);
+    if (pv.lines++ < kPdumpVisLines) logf("gpu.pdump.vis submit=%llu samples=%llu %s", (unsigned long long)it.submit, (unsigned long long)samples, it.what.c_str());
+  }
+  pv.items.erase(pv.items.begin(), pv.items.begin() + done);
+}
+
 void vpvk::releaseVisibility(Device* d) {
   Device::Visibility& v = d->visibility;
+  std::lock_guard<std::mutex> sub(d->submitMutex);  // (before visibility.m: see allocVisibility)
   std::lock_guard<std::mutex> l(v.m);
-  if (v.id) {
-    std::lock_guard<std::mutex> lock(d->submitMutex);
-    d->gpu->destroy(v.id);
-  }
+  if (v.id) d->gpu->destroy(v.id);
   v.id = {};
   std::free(v.host);
   v.host = nullptr;

@@ -3661,6 +3661,15 @@ void testPassDump() {
     d.viewport = {0, 0, 128, 128, 0, 1};
     return d;
   };
+  PipelineState umu = ps;  // a UI-mask variant: listed by gpu.pdump.pipe with umu=
+  umu.fragmentShader = 0x123, umu.label = "ui.umu";
+  const PipelineKey umuKey = umu.key();
+  dev.pipelines().request(umu, umuKey, Priority::Blocking);
+  auto umuDraw = [&](std::vector<Access> b, uint32_t count, uint32_t inst) {
+    Draw d = draw(std::move(b), count, inst);
+    d.pipeline = umuKey;
+    return d;
+  };
   Frame f;
   f.setPassDump(true);
   f.dumpLine("vk.pdump.drop f=0 pass=0 from_the_client");
@@ -3676,6 +3685,7 @@ void testPassDump() {
   RenderPassDesc p2 = Scene::pass(late, {}, LoadAction::Load);        // p2: writes `late`, loading the previous frame's
   f.beginRenderPass(p2);
   f.draw(draw({}, 3, 1));
+  f.draw(umuDraw({Scene::sample(other)}, 6, 1));
   f.endRenderPass();
   dev.submit(f);
   auto find = [&](const std::string& prefix, const std::string& must = "") {
@@ -3691,6 +3701,9 @@ void testPassDump() {
   const std::string pipe = find("gpu.pdump.pipe f=0 pass=0 ", "status=ready");
   CHECK(pipe.find(" label=mat_x_1_z ") != std::string::npos && !find("vk.pdump.drop f=0 pass=0 from_the_client").empty());
   CHECK(pipe.find(" draws=2 count=36 inst=3 ") != std::string::npos && pipe.find(" vs=0000000000000abc fs=0000000000000def ") != std::string::npos);
+  const std::string umuLine = find("gpu.pdump.pipe f=0 pass=2 umu=0 ");
+  CHECK(umuLine.find(" draws=1 idx_draws=0 idx=0 count=6 inst=1 tex=[t3:RGBA8Unorm:128x128] ") != std::string::npos);
+  CHECK(umuLine.find(" label=ui.umu ") != std::string::npos && find("gpu.pdump.pipe f=0 pass=0 umu=").empty());
   CHECK(!find("gpu.pdump.res f=0 pass=1 dir=r n=3 tex=3 buf=0 shown=3 list=[t0:RGBA8Unorm:128x128x1:m1:s1:1,").empty());
   CHECK(find("gpu.pdump.res f=0 pass=0 dir=w").empty());  // attachments are not draw bindings
   const std::string lateLink = find("gpu.pdump.link f=0 tex=2 ");

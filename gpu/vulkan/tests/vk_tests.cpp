@@ -10522,6 +10522,14 @@ void testPassDump() {
     CHECK(passDumpNext(win, t) && passDumpNext(win, t + 1) && !passDumpNext(win, t + 2) && win.windows == w + 1);
   }
   CHECK(!passDumpNext(win, t0 + 1000 * sec) && win.windows == kPassDumpWindows && win.seen == 7 + 3 * (kPassDumpWindows - 1));
+  // passDumpWindow (read-only twin used while translating): -1 unless a window is really open; it never advances.
+  PassDump w2 = parsePassDump("2,2");
+  CHECK(passDumpWindow(w2) == -1);
+  passDumpNext(w2, t0), passDumpNext(w2, t0);  // scene frames 0 and 1: before `start`
+  CHECK(passDumpWindow(w2) == -1 && w2.seen == 2 && w2.windows == 0);
+  CHECK(passDumpNext(w2, t0) && passDumpWindow(w2) == 0 && passDumpWindow(w2) == 0 && w2.windows == 1);  // frame 2 opens window 0; frame 3 is in it
+  CHECK(passDumpNext(w2, t0) && passDumpWindow(w2) == -1 && passDumpWindow(w2) == -1);  // window over: not announced after the minute either
+  CHECK(w2.seen == 4 && w2.windows == 1 && passDumpWindow(PassDump{}) == -1);
   CHECK((parseSkipPasses("5,6") == std::vector<uint32_t>{5, 6}) && (parseSkipPasses("4-7") == std::vector<uint32_t>{4, 5, 6, 7}));
   CHECK((parseSkipPasses(" 3 , x, 9-8, 2,2") == std::vector<uint32_t>{2, 3}) && parseSkipPasses(nullptr).empty() && parseSkipPasses("a").empty());
   CHECK(parseSkipPasses("0-1000").size() == kMaxSkipPasses);
