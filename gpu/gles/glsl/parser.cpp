@@ -2,6 +2,7 @@
 // Produces the typed AST of ast.h; constant scalars are folded on the way (array sizes, const ints).
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <functional>
 #include <map>
 #include <optional>
@@ -80,15 +81,18 @@ private:
     // Nesting of statements / expressions: "((((...", "- - - -x", "{{{{..." recurse once per level, so a hostile shader would overflow
     // the stack. A level is counted once; `else if` ladders are parsed in a loop and are not counted. Operator chains ("a + a + ...",
     // "v.x.x.x", "a, b, c") do not recurse here but build a tree as deep as the chain, and the passes over the tree (type folding,
-    // the SPIR-V emitter, destruction) recurse: each link counts as a level too. The count bounds the passes; the real stack of the
-    // thread (vpir::StackGuard, set in run()) bounds the recursion of the parser itself and of its passes over the tree (the
-    // functions that recurse over an Expr check it too), the emitter checks it as well, and the tree is destroyed and walked in
-    // loops: a worker thread with a small stack gets an error instead of a crash.
-    int nest_ = 0;
+    // the SPIR-V emitter, destruction) recurse: each link counts against kMaxChain, which is far higher than kMaxNest because the
+    // bytes of stack that are really left decide (vpir::stackLow, from the StackGuard set in run()): the parser, its passes over the
+    // tree (the functions that recurse over an Expr check it) and the emitter stop with an error before the stack of the thread
+    // is used up, and the tree is destroyed and walked in loops. The emitter walks a left-deep chain in a loop too, so a valid sum of
+    // up to kMaxChain terms compiles even on a small worker stack; kMaxChain is the backstop for time and memory (the chain is
+    // linear) and for any pass without the stack check. kMaxNest bounds the recursion that is not a chain.
+    int nest_ = 0, chain_ = 0;
     static constexpr int kMaxNest = 1200;
+    static constexpr int kMaxChain = 20000;  // (a chain of 100000 terms took 330 MB through parser, emitter and lowering)
     struct NestGuard {
         Parser& p;
-        int levels = 0;
+        int levels = 0, links = 0;
         explicit NestGuard(Parser& parser, bool first = true) : p(parser) {
             if (first) add();
         }
@@ -96,7 +100,12 @@ private:
             if (p.nest_ >= kMaxNest || vpir::stackLow()) p.err("shader nests statements or expressions too deeply");
             ++p.nest_, ++levels;
         }
-        ~NestGuard() { p.nest_ -= levels; }
+        // One more link of an operator chain.
+        void link() {
+            if (p.chain_ >= kMaxChain || vpir::stackLow()) p.err("shader nests statements or expressions too deeply");
+            ++p.chain_, ++links;
+        }
+        ~NestGuard() { p.nest_ -= levels, p.chain_ -= links; }
     };
     // Recursion (static, not even through a chain of calls) cannot be compiled: SPIR-V forbids it and the hardware has
     // no stack. Always an error, in lenient mode too.
@@ -1343,7 +1352,7 @@ private:
         NestGuard chain(*this, false);
         ExprP e = assignment();
         while (isP(",")) {
-            chain.add();
+            chain.link();
             int line = next().line;
             ExprP r = assignment();
             ExprP c = mkE(EK::Comma, r->type, line);
@@ -1387,11 +1396,13 @@ private:
     // Components of a constant vector (or scalar) expression: constructors, swizzles, `const` variables and + - * / of constants.
     // hasConst only carries scalars; a swizzle or index of a constant vector is a scalar constant (array sizes, case labels).
     std::map<const Symbol*, std::vector<double>> constVec_;
+    // 32-bit operands (uint up to 4294967295) multiply past int64: wrap modulo 2^64 (the caller keeps the low 32 bits).
+    static int64_t wrapMul(int64_t a, int64_t b) { return int64_t(uint64_t(a) * uint64_t(b)); }
     static double convertConst(double v, Base from, Base to) {
         switch (to) {
-            case Base::Float: return double(float(v));
-            case Base::Int: return from == Base::Float ? double(int32_t(v)) : double(int32_t(uint32_t(int64_t(v))));
-            case Base::Uint: return from == Base::Float ? double(uint32_t(int64_t(v))) : double(uint32_t(int64_t(v)));
+            case Base::Float: return roundF32(v);
+            case Base::Int: return from == Base::Float ? double(satI32(v)) : double(int32_t(uint32_t(int64_t(v))));
+            case Base::Uint: return from == Base::Float ? double(satU32(v)) : double(uint32_t(int64_t(v)));
             default: return v != 0;
         }
     }
@@ -1452,11 +1463,11 @@ private:
                     double r;
                     if (e.type.base == Base::Float) {
                         r = e.op == "+" ? x + y : e.op == "-" ? x - y : e.op == "*" ? x * y : x / y;
-                        r = double(float(r));
+                        r = roundF32(r);
                     } else {
                         const int64_t p = int64_t(x), q = int64_t(y);
                         if (e.op == "/" && q == 0) return false;
-                        const int64_t v = e.op == "+" ? p + q : e.op == "-" ? p - q : e.op == "*" ? p * q : e.type.base == Base::Uint ? int64_t(uint32_t(p) / uint32_t(q)) : p / q;
+                        const int64_t v = e.op == "+" ? p + q : e.op == "-" ? p - q : e.op == "*" ? wrapMul(p, q) : e.type.base == Base::Uint ? int64_t(uint32_t(p) / uint32_t(q)) : p / q;
                         r = e.type.base == Base::Uint ? double(uint32_t(v)) : double(int32_t(v));
                     }
                     out.push_back(r);
@@ -1486,7 +1497,7 @@ private:
     void foldComponent(Expr& x, const Expr& vec, int index) const {
         std::vector<double> c;
         if (x.hasConst || !constComps(vec, c) || index < 0 || size_t(index) >= c.size()) return;
-        x.hasConst = true, x.constF = c[size_t(index)], x.constI = x.type.base == Base::Float ? int64_t(c[size_t(index)]) : int64_t(c[size_t(index)]);
+        x.hasConst = true, x.constF = c[size_t(index)], x.constI = satI64(c[size_t(index)]);
         if (x.type.base == Base::Bool) x.constI = c[size_t(index)] != 0;
     }
 
@@ -1684,12 +1695,12 @@ private:
             e.hasConst = true, e.constI = v, e.constF = double(v);
         };
         auto setF = [&](double v) {
-            e.hasConst = true, e.constF = double(float(v)), e.constI = int64_t(v);
+            e.hasConst = true, e.constF = roundF32(v), e.constI = satI64(v);
         };
         auto setB = [&](bool v) { e.hasConst = true, e.constI = v, e.constF = v; };
         if (op == "+") isF ? setF(a + b) : setI(x + y);
         else if (op == "-") isF ? setF(a - b) : setI(x - y);
-        else if (op == "*") isF ? setF(a * b) : setI(x * y);
+        else if (op == "*") isF ? setF(a * b) : setI(wrapMul(x, y));
         else if (op == "/") {
             if (isF) setF(a / b);
             else if (y != 0) setI(isU ? int64_t(uint32_t(x) / uint32_t(y)) : x / y);
@@ -1718,7 +1729,7 @@ private:
             if (peek().kind != Tok::Punct) break;
             int p = precedence(peek().text);
             if (p < 0 || p < minPrec) break;
-            chain.add();
+            chain.link();
             Token opTok = next();
             ExprP r = binary(p + 1);
             Type t = binaryType(opTok.text, l->type, r->type, opTok.line);
@@ -1763,7 +1774,7 @@ private:
                 u->hasConst = true;
                 if (o == "-") {
                     u->constF = -e->constF;
-                    u->constI = t.base == Base::Uint ? int64_t(uint32_t(-e->constI)) : int64_t(int32_t(-e->constI));
+                    u->constI = t.base == Base::Uint ? int64_t(uint32_t(0 - uint64_t(e->constI))) : int64_t(int32_t(uint32_t(0 - uint64_t(e->constI))));  // (unsigned: a saturated float constant may be INT64_MIN)
                     if (t.base != Base::Float) u->constF = double(u->constI);
                 } else if (o == "!") u->constI = !e->constI, u->constF = double(u->constI);
                 else u->constI = t.base == Base::Uint ? int64_t(uint32_t(~e->constI)) : int64_t(int32_t(~e->constI)), u->constF = double(u->constI);
@@ -1790,7 +1801,7 @@ private:
         NestGuard chain(*this, false);  // "v.x.x.x" / "a[0][0][0]": one level per link
         for (;;) {
             int line = peek().line;
-            if (isP("[") || isP(".") || isP("++") || isP("--")) chain.add();
+            if (isP("[") || isP(".") || isP("++") || isP("--")) chain.link();
             if (acceptP("[")) {
                 ExprP idx = expression();
                 expectP("]");
@@ -1940,8 +1951,8 @@ private:
             case Tok::FloatLit: {
                 next();
                 ExprP e = mkE(EK::FloatLit, Type::make(Base::Float), line);
-                e->f = double(float(t.fval));
-                e->hasConst = true, e->constF = e->f, e->constI = int64_t(e->f);
+                e->f = roundF32(t.fval);
+                e->hasConst = true, e->constF = e->f, e->constI = satI64(e->f);
                 return e;
             }
             case Tok::BoolLit: {
@@ -2055,9 +2066,9 @@ private:
             e->hasConst = true;
             const Expr& s = *args[0];
             switch (t.base) {
-                case Base::Float: e->constF = double(float(s.type.base == Base::Float ? s.constF : s.type.base == Base::Uint ? double(uint32_t(s.constI)) : double(s.constI))); e->constI = int64_t(e->constF); break;
-                case Base::Int: e->constI = s.type.base == Base::Float ? int64_t(int32_t(s.constF)) : int64_t(int32_t(s.constI)); e->constF = double(e->constI); break;
-                case Base::Uint: e->constI = s.type.base == Base::Float ? int64_t(uint32_t(int64_t(s.constF))) : int64_t(uint32_t(s.constI)); e->constF = double(e->constI); break;
+                case Base::Float: e->constF = roundF32(s.type.base == Base::Float ? s.constF : s.type.base == Base::Uint ? double(uint32_t(s.constI)) : double(s.constI)); e->constI = satI64(e->constF); break;
+                case Base::Int: e->constI = s.type.base == Base::Float ? int64_t(satI32(s.constF)) : int64_t(int32_t(s.constI)); e->constF = double(e->constI); break;
+                case Base::Uint: e->constI = s.type.base == Base::Float ? int64_t(satU32(s.constF)) : int64_t(uint32_t(s.constI)); e->constF = double(e->constI); break;
                 case Base::Bool: e->constI = s.type.base == Base::Float ? s.constF != 0 : s.constI != 0; e->constF = double(e->constI); break;
                 default: e->hasConst = false;
             }

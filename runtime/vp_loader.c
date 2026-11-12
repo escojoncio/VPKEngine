@@ -301,14 +301,23 @@ static unsigned char* unwrap_self(const unsigned char* self, size_t size, size_t
     uint64_t phoff; uint16_t phnum;
     memcpy(&phoff, self + base + 32, 8); memcpy(&phnum, self + base + 56, 2);
     if (phoff > size - base || (uint64_t)phnum * 56 > size - base - phoff) return NULL;
+    if (phnum == 0) return NULL; /* no program headers: nothing to rebuild (and calloc(1, 0) would be unspecified) */
     const size_t header_end = (size_t)phoff + (size_t)phnum * 56;
     size_t end = header_end;
     /* The same limit as tools/vpaot/image.cpp (vp_self.h): the end of a segment is in proportion to the file. */
+    unsigned char* backed = calloc(phnum, 1); /* program headers whose data a SELF segment carries, counted once */
+    if (!backed) return NULL;
+    for (uint16_t i = 0; i < count; ++i) {
+        uint64_t flags; memcpy(&flags, self + 32 + i * 32, 8);
+        const size_t index = (flags >> 20) & 4095;
+        if ((flags & 0x800) && index < phnum) backed[index] = 1;
+    }
     uint64_t pad_sum = 0;
     for (uint16_t i = 0; i < phnum; ++i) {
         Phdr p; memcpy(&p, self + base + phoff + i * 56, 56);
-        if (p.filesz) pad_sum += vp_self_pad(p.align);
+        if (backed[i] && p.filesz) pad_sum += vp_self_pad(p.align);
     }
+    free(backed);
     const uint64_t cap = vp_self_end_limit(size, pad_sum);
     for (uint16_t i = 0; i < phnum; ++i) {
         Phdr p; memcpy(&p, self + base + phoff + i * 56, 56);

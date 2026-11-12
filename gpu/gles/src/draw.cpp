@@ -1528,6 +1528,7 @@ bool Context::bindResources(Program& p, const StorageP& xfbScratch) {
                     return false;
                 }
                 keep(t->bufferView);
+                if (iu.access != gl::READ_ONLY) noteGpuWrite(t->bufferView->storage);  // (an image bound WRITE_ONLY / READ_WRITE may be stored to)
                 texelViews.push_back(v);
             }
             VkWriteDescriptorSet s{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
@@ -1652,11 +1653,12 @@ bool Context::bindResources(Program& p, const StorageP& xfbScratch) {
         writes.push_back(s);
     }
     // Shader storage blocks (GL_SHADER_STORAGE_BUFFER binding points) and atomic counter buffers.
-    auto storageWrite = [&](const IndexedBuffer& ib, uint32_t binding, uint32_t element, uint32_t minSize) {
+    auto storageWrite = [&](const IndexedBuffer& ib, uint32_t binding, uint32_t element, uint32_t minSize, bool readOnly) {
         Buffer* buf = buffer(ib.buffer);
         VkDescriptorBufferInfo bi{};
         if (buf && buf->storage && VkDeviceSize(ib.offset) < VkDeviceSize(buf->size)) {
             useStorage(buf->storage);
+            if (!readOnly) noteGpuWrite(buf->storage);  // (a block every stage declares readonly cannot be written: the CPU may go on)
             bi.buffer = buf->storage->buffer;
             bi.offset = VkDeviceSize(ib.offset);
             const VkDeviceSize avail = VkDeviceSize(buf->size) - VkDeviceSize(ib.offset);  // the buffer may have shrunk since the bind
@@ -1676,9 +1678,9 @@ bool Context::bindResources(Program& p, const StorageP& xfbScratch) {
     };
     for (size_t i = 0; i < p.refl.storageBlocks.size(); ++i) {
         const auto& b = p.refl.storageBlocks[i];
-        storageWrite(ssboBindings[p.storageBindings[i] % kMaxShaderStorageBindings], b.binding, b.element, b.size);
+        storageWrite(ssboBindings[p.storageBindings[i] % kMaxShaderStorageBindings], b.binding, b.element, b.size, b.readOnly);
     }
-    for (const auto& a : p.refl.atomicBuffers) storageWrite(atomicBindings[size_t(a.glBinding) % kMaxAtomicCounterBindings], a.binding, 0, a.size);
+    for (const auto& a : p.refl.atomicBuffers) storageWrite(atomicBindings[size_t(a.glBinding) % kMaxAtomicCounterBindings], a.binding, 0, a.size, false);
     if (xfbScratch) {  // the transform feedback capture buffer
         bufInfos.push_back({xfbScratch->buffer, 0, xfbScratch->size});
         VkWriteDescriptorSet s{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
@@ -2118,6 +2120,27 @@ bool Context::prepareDrawOnce(GLenum mode, VkPrimitiveTopology& topo, uint32_t v
     }
     // Vertex input: one binding per enabled attribute that the program reads.
     VertexArray* va = currentVao();
+    // The attributes the CPU has to read (conversions, unaligned or divisor > 1 ones) come from buffers the GPU may still have to write
+    // (a copy, transform feedback, a shader): wait for that now, before this draw records anything (a flush in the middle would leave the
+    // storages bound so far outside the command buffer that gets the draw).
+    for (const auto& av : p->refl.attributes) {
+        const int cols = av.glType >= 0x8B5A && av.glType <= 0x8B5C ? int(av.glType - 0x8B5A + 2)
+                         : (av.glType >= 0x8B65 && av.glType <= 0x8B6A) ? int((av.glType - 0x8B65) / 2 + 2) : 1;
+        for (int c = 0; c < cols * av.arraySize; ++c) {
+            const uint32_t loc = uint32_t(av.location + c);
+            if (loc >= kHwVertexAttribs) continue;
+            const VertexAttrib& a = va->attribs[loc];
+            if (!a.enabled) continue;
+            const VertexBinding& vbind = va->bindings[a.binding % kMaxVertexBindings];
+            Buffer* vbuf = vbind.buffer ? buffer(vbind.buffer) : nullptr;
+            if (!vbuf || !vbuf->storage || !gpuWritePending(*vbuf->storage)) continue;
+            const uintptr_t at = vbind.offset + a.relativeOffset;
+            if (needsCpuConversion(a, attribFormat(a)) || (vbind.divisor > 1 && vbind.divisor != 0) || (at & 3)) {
+                flush(true);
+                break;
+            }
+        }
+    }
     std::vector<VkVertexInputBindingDescription> binds;
     std::vector<VkVertexInputAttributeDescription> attrs;
     std::vector<VkBuffer> bufs;
@@ -2366,6 +2389,7 @@ bool Context::captureTransformFeedback(GLenum mode, uint32_t count, uint32_t fir
             const uint64_t bytes = fit * perPrim * o.stride;
             Buffer* buf = bufs[0];
             useStorage(buf->storage);
+            noteGpuWrite(buf->storage);
             barrier();  // the capture draw's records are visible to the copy
             const VkBufferCopy bc{vpglsl::kXfbHeaderWords * 4, VkDeviceSize(tf.buffers[0].offset) + o.used, bytes};
             dev->vk.vkCmdCopyBuffer(cmd(), scratch->buffer, buf->storage->buffer, 1, &bc);
@@ -2441,6 +2465,7 @@ void Context::drawElements(GLenum mode, GLsizei count, GLenum type, const void* 
         if (!eb->storage) return setError(gl::INVALID_OPERATION, mode);
         const uintptr_t off = reinterpret_cast<uintptr_t>(indices);
         if (off + size_t(count) * isz > size_t(eb->size)) return setError(gl::INVALID_OPERATION, mode);
+        if (gpuWritePending(*eb->storage)) flush(true);  // the indices are read on the CPU (the scan for the highest one)
         src = eb->storage->host + off;
     } else {
         src = static_cast<const uint8_t*>(indices);
@@ -2567,6 +2592,17 @@ void Context::drawElements(GLenum mode, GLsizei count, GLenum type, const void* 
 // Compute: common start of glDispatchCompute / glDispatchComputeIndirect. Ends the open pass, makes
 // earlier writes visible, binds the pipeline and the program's resources.
 bool Context::beginDispatch(Program*& pp) {
+    // The descriptor pool can run out while the resources are bound and allocSet then sends the command buffer: the barrier and pipeline it
+    // recorded are not in the new one, so the preparation is made again in it (as prepareDraw does).
+    for (int attempt = 0;; ++attempt) {
+        const uint64_t submitted = flushes_;
+        const bool ok = beginDispatchOnce(pp);
+        if (flushes_ == submitted || attempt) return ok;
+        sliceBack_.clear();
+    }
+}
+
+bool Context::beginDispatchOnce(Program*& pp) {
     Program* p = computeProgram();
     if (!p || !p->linked || !p->csModule) {
         setError(gl::INVALID_OPERATION);

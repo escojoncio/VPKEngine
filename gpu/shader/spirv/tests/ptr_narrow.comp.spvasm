@@ -1,0 +1,70 @@
+; Variable pointers: OpPtrAccessChain elements of 16 bits, constant and dynamic, are read the same way: a narrow UNSIGNED element is
+; zero-extended (0x8000 steps 32768 elements forward), a narrow SIGNED one sign-extended (-2 steps back). A[i] = 1000 + i is set by the test.
+; out[0] = *(&A[10] + u16 0x8000 constant), out[1] = *(&A[10] + i16 -2 constant),
+; out[2] = the same with the u16 produced at run time (from P[0] = 0x8000), out[3] = the i16 produced at run time (from P[1] = -2).
+OpCapability Cap:Shader
+OpCapability Cap:Int16
+OpCapability Cap:VariablePointersStorageBuffer
+OpExtension "SPV_KHR_variable_pointers"
+OpMemoryModel AddrModel:Logical MemModel:GLSL450
+OpEntryPoint Model:GLCompute %main "main"
+OpExecutionMode %main ExecMode:LocalSize 1 1 1
+OpDecorate %arr Deco:ArrayStride 4
+OpDecorate %pu Deco:ArrayStride 4
+OpDecorate %blk Deco:Block
+OpMemberDecorate %blk 0 Deco:Offset 0
+OpDecorate %A Deco:DescriptorSet 0
+OpDecorate %A Deco:Binding 0
+OpDecorate %O Deco:DescriptorSet 0
+OpDecorate %O Deco:Binding 1
+OpDecorate %P Deco:DescriptorSet 0
+OpDecorate %P Deco:Binding 2
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%u32 = OpTypeInt 32 0
+%i32 = OpTypeInt 32 1
+%u16 = OpTypeInt 16 0
+%i16 = OpTypeInt 16 1
+%c0 = OpConstant %u32 0
+%c1 = OpConstant %u32 1
+%c2 = OpConstant %u32 2
+%c3 = OpConstant %u32 3
+%c4 = OpConstant %u32 4
+%c10 = OpConstant %u32 10
+%k16u = OpConstant %u16 0x8000
+%k16s = OpConstant %i16 -2
+%arr = OpTypeArray %u32 %c4
+%blk = OpTypeStruct %arr
+%pblk = OpTypePointer Storage:StorageBuffer %blk
+%pu = OpTypePointer Storage:StorageBuffer %u32
+%A = OpVariable %pblk Storage:StorageBuffer
+%O = OpVariable %pblk Storage:StorageBuffer
+%P = OpVariable %pblk Storage:StorageBuffer
+%main = OpFunction %void 0 %fn
+%l = OpLabel
+%pa = OpAccessChain %pu %A %c0 %c10
+%pe = OpPtrAccessChain %pu %pa %k16u
+%e = OpLoad %u32 %pe
+%o0 = OpAccessChain %pu %O %c0 %c0
+OpStore %o0 %e
+%pf = OpPtrAccessChain %pu %pa %k16s
+%f = OpLoad %u32 %pf
+%o1 = OpAccessChain %pu %O %c0 %c1
+OpStore %o1 %f
+%q0 = OpAccessChain %pu %P %c0 %c0
+%x = OpLoad %u32 %q0
+%d = OpUConvert %u16 %x
+%pg = OpPtrAccessChain %pu %pa %d
+%g = OpLoad %u32 %pg
+%o2 = OpAccessChain %pu %O %c0 %c2
+OpStore %o2 %g
+%q1 = OpAccessChain %pu %P %c0 %c1
+%y = OpLoad %u32 %q1
+%yi = OpBitcast %i32 %y
+%d2 = OpSConvert %i16 %yi
+%ph = OpPtrAccessChain %pu %pa %d2
+%h = OpLoad %u32 %ph
+%o3 = OpAccessChain %pu %O %c0 %c3
+OpStore %o3 %h
+OpReturn
+OpFunctionEnd

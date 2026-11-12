@@ -14,9 +14,11 @@ namespace vpgles {
 namespace {
 Device* gDevice = nullptr;
 thread_local Context* tCurrent = nullptr;
+thread_local uint64_t tCurrentSession = 0;  // gSession when this thread's tCurrent was set
 Context* gLastCurrent = nullptr;  // last context made current on any thread (guarded by Device::lock)
-std::atomic<uint64_t> gEpoch{0};
 }  // namespace
+
+std::atomic<uint64_t> gSession{1}; // the display session: eglShutdownDisplay ends it (every thread's current context and surfaces with it)
 
 void logf(const char* fmt, ...) {
     char buf[1024];
@@ -33,14 +35,19 @@ void logLenient(const std::vector<std::string>& rules, const char* what, unsigne
 
 Device* device() { return gDevice; }
 void setDevice(Device* d) { gDevice = d; }
-Context* current() { return tCurrent; }
+Context* current() {
+    // A context made current in a session that vpgles_shutdown ended was deleted with it: the pointer this thread holds is not valid.
+    if (tCurrent && tCurrentSession != gSession.load(std::memory_order_acquire)) tCurrent = nullptr;
+    return tCurrent;
+}
 void setCurrent(Context* c) {
     tCurrent = c;
+    tCurrentSession = gSession.load(std::memory_order_acquire);
     if (c) gLastCurrent = c;
 }
 // For host calls (vpgles_wrap_image / vpgles_flush) from a thread that never made a context current
 // (the OVRPlugin entry points are not always called from the render thread). Call with Device::lock held.
-Context* currentOrLast() { return tCurrent ? tCurrent : gLastCurrent; }
+Context* currentOrLast() { return current() ? current() : gLastCurrent; }
 void forgetContext(Context* c) {
     if (gLastCurrent == c) gLastCurrent = nullptr;
 }
@@ -427,7 +434,6 @@ VkImageView Texture::sampledView() {
 // ---- Context: recording -----------------------------------------------------------------------------
 Context::Context(Device* d, ShareGroup* s, int maj, int min) : dev(d), share(s), major(maj), minor(min) {
     ++share->refs;
-    epoch_ = ++gEpoch;
     vaos[0] = std::make_unique<VertexArray>();
     fbos[0] = std::make_unique<Framebuffer>();
     fbos[0]->drawBuffers[0] = gl::BACK;
@@ -673,32 +679,37 @@ bool BufferStorage::readsRange(uint64_t lo, uint64_t hi) const {
 
 void Context::useStorage(const StorageP& s, uint64_t lo, uint64_t hi) {
     if (!s) return;
-    if (s->openEpoch != epoch_) {  // first use in this command buffer (a serial taken by another submission meanwhile does not fool it)
-        if (s->lastUse <= dev->completed) s->reads.clear();  // the work those ranges were read by is done
-        s->openEpoch = epoch_;
-        s->lastUse = dev->submitted + 1;  // the serial the open command buffer will get, if nothing is submitted first: flush sets the real one
-        used_.push_back(s);
+    if (used_.find(s.get()) == used_.end()) {  // first use in this command buffer (a serial taken by another submission meanwhile does not fool it)
+        // The ranges of the earlier readers are dropped only when none can still read: no unsent command buffer (of any context) records
+        // it and the work stamped on it is done (the stamp of an unsent one is a guess).
+        if (s->openRefs == 0 && s->lastUse <= dev->completed) s->reads.clear();
+        s->lastUse = std::max(s->lastUse, dev->submitted + 1);  // the serial the open command buffer will get, if nothing is submitted first: flush sets the real one
+        ++s->openRefs;
+        used_.emplace(s.get(), s);
     }
     s->noteRead(lo, hi);
 }
 
-bool Context::storageBusy(const BufferStorage& s) const {
-    if (s.lastUse > dev->completed) return true;
-    for (const StorageP& u : used_)
-        if (u.get() == &s) return true;
-    return false;
+void Context::noteGpuWrite(const StorageP& s) {
+    if (!s) return;
+    useStorage(s, 0, 0);  // (keeps it alive and counted as used; no read range)
+    gpuWrites_.insert(s.get());
 }
 
-bool Context::gpuWritePending(const BufferStorage& s) const {
-    if (s.gpuWrite > dev->completed) return true;
-    for (const StorageP& u : gpuWrites_)
-        if (u.get() == &s) return true;
-    return false;
-}
+// The CPU must not touch the bytes the GPU reads: a submission not yet complete is stamped on it, or an open command buffer (of any
+// context) records it.
+bool Context::storageBusy(const BufferStorage& s) const { return s.openRefs > 0 || s.lastUse > dev->completed; }
+
+bool Context::gpuWritePending(const BufferStorage& s) const { return s.gpuWrite > dev->completed || gpuWrites_.count(const_cast<BufferStorage*>(&s)) != 0; }
 
 uint64_t Context::flush(bool wait) {
     if (!cb_ && !xfers_.empty()) cmd();  // uploads that wait for a pass to end: they are recorded and submitted
     if (!cb_) {
+        // (nothing records them: no command buffer is open) Their stamps were guesses of a serial that never came: nothing newer than the
+        // last submission can be waiting for them.
+        for (auto& [p, s] : used_) --s->openRefs, s->lastUse = std::min(s->lastUse, dev->submitted);
+        used_.clear();
+        gpuWrites_.clear();
         // Nothing is recorded: what was kept alive (deleted objects an earlier submission may still use) goes with the newest
         // submission in flight (the queue is in order: it ends after all of them), or is released if none is.
         if (!keep_.empty()) {
@@ -721,14 +732,13 @@ uint64_t Context::flush(bool wait) {
     f.serial = ++dev->submitted;
     f.cb = cb_;
     f.descPool = descPool_;
-    for (auto& s : used_) s->lastUse = f.serial, f.keep.push_back(s);  // (the stamps made while recording guessed this serial)
-    for (auto& s : gpuWrites_) s->gpuWrite = f.serial;
+    for (auto& [p, s] : used_) s->lastUse = f.serial, --s->openRefs, f.keep.push_back(s);  // (the stamps made while recording guessed this serial)
+    for (BufferStorage* p : gpuWrites_) p->gpuWrite = f.serial;
     for (auto& c : chunks_) f.chunks.push_back(c.storage);
     for (auto& k : keep_) f.keep.push_back(std::move(k));
     dev->inFlight.push_back(std::move(f));
     used_.clear();
     gpuWrites_.clear();
-    epoch_ = ++gEpoch;
     keep_.clear();
     // The chunks stay alive with the submission (f.chunks); once it retires they go to Device::spareChunks.
     chunks_.clear();
@@ -786,8 +796,9 @@ void Context::prepareWrite(Buffer& b, bool discard, uint64_t lo, uint64_t hi, bo
     const uint64_t pending = b.storage->lastUse;
     const bool gpuMayRead = pending && storageBusy(*b.storage);
     if (!gpuMayRead) return;
-    // The GPU reads other bytes only (a game that fills a ring buffer a bit at a time): the write is made in place.
-    if (!b.storage->readsRange(lo, hi)) return;
+    // The GPU reads other bytes only (a game that fills a ring buffer a bit at a time): the write is made in place. Not if it also has
+    // a write into the storage to run (a discarding write gets new storage: the GPU's would land over the application's bytes).
+    if (!b.storage->readsRange(lo, hi) && !gpuWritePending(*b.storage)) return;
     // New storage (copy on write); the old one stays alive with the work that reads it.
     StorageP fresh = dev->newStorage(b.storage->size, b.storage->dev ? kAllUsage : 0);
     if (!fresh) return;
@@ -801,6 +812,19 @@ void Context::prepareWrite(Buffer& b, bool discard, uint64_t lo, uint64_t hi, bo
         }
     }
     b.storage = fresh;
+}
+
+bool Context::updateOrdered(const StorageP& s, uint64_t offset, uint64_t size, const void* data) {
+    constexpr uint64_t kMax = 1ull << 20;
+    if (!s || !size || size > kMax || offset + size > s->size) return false;
+    Alloc a = stream(size, 16);
+    std::memcpy(a.host, data, size_t(size));
+    noteGpuWrite(s);  // the copy writes it (and keeps it alive with the command buffer)
+    barrier();        // the work recorded so far is done before the copy
+    const VkBufferCopy bc{a.offset, offset, size};
+    dev->vk.vkCmdCopyBuffer(cmd(), a.buffer, s->buffer, 1, &bc);
+    barrier();        // ... and the copy before whatever follows
+    return true;
 }
 
 void Context::imageInit(Image& img) {

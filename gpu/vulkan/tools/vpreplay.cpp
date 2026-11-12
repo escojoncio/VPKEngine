@@ -247,6 +247,9 @@ struct R {
 
   // ---- objects ----
   std::unordered_map<uint64_t, uintptr_t> h;  // id -> the driver's handle
+  // Objects the file creates and never destroys (a capture ends where the application stops): destroyed at the end, newest first,
+  // before the device goes (id, name of the destroy call).
+  std::vector<std::pair<uint64_t, const char*>> made_;
   bool missing = false;                       // a nonzero id the call uses is unknown
   std::unordered_map<uint64_t, MemRec> mems;
   std::unordered_map<uint64_t, Need> need;
@@ -259,6 +262,7 @@ struct R {
   std::vector<std::shared_ptr<void>> keep;  // decoded create infos the records above point into
   std::map<std::string, VkResult> fmtCache;
   VkCommandPool internalPool{};
+  VkCommandPool recapturePool{};
   bool prescanned = false, instanceMade = false, recaptureArmed = false;
 
   // ---- progress / stats ----
@@ -734,8 +738,8 @@ struct R {
     if (!queue0) return;
     VkCommandPoolCreateInfo pi{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
     pi.queueFamilyIndex = family;
-    VkCommandPool pool{};
-    fn<id::vkCreateCommandPool>()(device, &pi, nullptr, &pool);
+    fn<id::vkCreateCommandPool>()(device, &pi, nullptr, &recapturePool);  // (destroyed at the end, outside the recapture)
+    VkCommandPool pool = recapturePool;
     VkCommandBufferAllocateInfo ai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
     ai.commandPool = pool, ai.commandBufferCount = 1, ai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
     VkCommandBuffer cb{};
@@ -834,6 +838,13 @@ struct R {
     return out;
   }
 
+  void releaseDumps(CbRec& rec) {  // the staging buffers of a command buffer's dumps (kept while it can still be submitted again)
+    for (DumpSlot& s : rec.dumps) {
+      if (s.buf) fn<id::vkDestroyBuffer>()(device, s.buf, nullptr);
+      if (s.mem) fn<id::vkFreeMemory>()(device, s.mem, nullptr);
+    }
+    rec.dumps.clear();
+  }
   // Records, after the pass (or the cut), the copy of every attachment to a staging buffer of its own.
   void recordDumps(VkCommandBuffer cb, CbRec& rec, bool forcedStore, uint32_t draw, const Call& c) {
     PassCtx& p = rec.pass;
@@ -999,7 +1010,7 @@ struct R {
   void track(const Call&, A& a) {
     if constexpr (ID == id::vkBeginCommandBuffer) {
       if (CbRec* cb = cbOfId(idOfFake(std::get<0>(a)))) {
-        cb->dumps.clear(), cb->passes = 0, cb->pipe = cb->ibuf = 0, cb->sets.fill(0), cb->vbufs.fill(0), cb->pass = PassCtx{}, cb->tainted = false;
+        releaseDumps(*cb), cb->passes = 0, cb->pipe = cb->ibuf = 0, cb->sets.fill(0), cb->vbufs.fill(0), cb->pass = PassCtx{}, cb->tainted = false;
       }
     } else if constexpr (ID == id::vkCmdBindPipeline) {
       if (CbRec* cb = cbOfId(idOfFake(std::get<0>(a))); cb && std::get<1>(a) == VK_PIPELINE_BIND_POINT_GRAPHICS) cb->pipe = idOfFake(std::get<2>(a));
@@ -1254,6 +1265,46 @@ struct R {
     }
   }
   template <uint16_t ID>
+  static constexpr const char* destroyName() {
+    if constexpr (ID == id::vkAllocateMemory) return "vkFreeMemory";
+    else if constexpr (ID == id::vkCreateBuffer) return "vkDestroyBuffer";
+    else if constexpr (ID == id::vkCreateBufferView) return "vkDestroyBufferView";
+    else if constexpr (ID == id::vkCreateImage) return "vkDestroyImage";
+    else if constexpr (ID == id::vkCreateImageView) return "vkDestroyImageView";
+    else if constexpr (ID == id::vkCreateSampler) return "vkDestroySampler";
+    else if constexpr (ID == id::vkCreateDescriptorSetLayout) return "vkDestroyDescriptorSetLayout";
+    else if constexpr (ID == id::vkCreatePipelineLayout) return "vkDestroyPipelineLayout";
+    else if constexpr (ID == id::vkCreateDescriptorPool) return "vkDestroyDescriptorPool";
+    else if constexpr (ID == id::vkCreateRenderPass || ID == id::vkCreateRenderPass2) return "vkDestroyRenderPass";
+    else if constexpr (ID == id::vkCreateFramebuffer) return "vkDestroyFramebuffer";
+    else if constexpr (ID == id::vkCreateShaderModule) return "vkDestroyShaderModule";
+    else if constexpr (ID == id::vkCreateGraphicsPipelines || ID == id::vkCreateComputePipelines) return "vkDestroyPipeline";
+    else if constexpr (ID == id::vkCreateCommandPool) return "vkDestroyCommandPool";
+    else if constexpr (ID == id::vkCreateFence) return "vkDestroyFence";
+    else if constexpr (ID == id::vkCreateSemaphore) return "vkDestroySemaphore";
+    else if constexpr (ID == id::vkCreateEvent) return "vkDestroyEvent";
+    else if constexpr (ID == id::vkCreateQueryPool) return "vkDestroyQueryPool";
+    else return nullptr;
+  }
+  // What is left of the objects the file made when it ends (the file's own destroy calls took theirs out of `h`).
+  void destroyLeftovers() {
+    if (!device) return;
+    for (auto& kv : cbs) releaseDumps(kv.second);
+    for (auto& kv : rps)
+      for (VkRenderPass& v : kv.second.variant)
+        if (v) fn<id::vkDestroyRenderPass>()(device, v, nullptr), v = VK_NULL_HANDLE;  // (the dump variants of the file's passes)
+    if (internalPool) fn<id::vkDestroyCommandPool>()(device, internalPool, nullptr), internalPool = VK_NULL_HANDLE;
+    if (recapturePool) fn<id::vkDestroyCommandPool>()(device, recapturePool, nullptr), recapturePool = VK_NULL_HANDLE;
+    for (size_t i = made_.size(); i-- > 0;) {
+      const auto it = h.find(made_[i].first);
+      if (it == h.end()) continue;
+      auto d = gdpa(device, made_[i].second);
+      if (d) reinterpret_cast<void (*)(VkDevice, uintptr_t, const void*)>(d)(device, it->second, nullptr);
+      h.erase(it);
+    }
+    made_.clear();
+  }
+  template <uint16_t ID>
   static constexpr bool kKeeps = ID == id::vkCreateRenderPass || ID == id::vkCreateRenderPass2;
   template <uint16_t ID>
   static constexpr bool kDestroys = ID == id::vkDestroyBuffer || ID == id::vkDestroyBufferView || ID == id::vkDestroyImage ||
@@ -1310,6 +1361,9 @@ struct R {
       if constexpr (kHasOut<Args>) {
         auto* out = std::get<std::tuple_size_v<Args> - 1>(a);
         for (size_t i = 0; i < ids.size(); ++i) reg(ids[i], out[i]);
+        if constexpr (destroyName<ID>() != nullptr)
+          for (size_t i = 0; i < ids.size(); ++i)
+            if (ids[i] && h.count(ids[i])) made_.emplace_back(ids[i], destroyName<ID>());
         if (!ids.empty()) made<ID>(c, a, ids);
       }
     }
@@ -1499,6 +1553,7 @@ void run<id::vkAllocateMemory>(R& r, const Call& c) {
   }
   r.mems[memId] = m;
   r.reg(memId, mem);
+  r.made_.emplace_back(memId, "vkFreeMemory");
 }
 
 template <>
@@ -1762,6 +1817,8 @@ int main(int argc, char** argv) {
   }
   if (r.device) {
     r.fn<id::vkDeviceWaitIdle>()(r.device);
+    if (r.vpvkTrack) r.vpvkTrack(0);  // (the clean-up is not part of a recapture)
+    r.destroyLeftovers();
     if (auto d = r.gdpa(r.device, "vkDestroyDevice")) reinterpret_cast<PFN_vkDestroyDevice>(d)(r.device, nullptr);
   }
   if (r.instance)

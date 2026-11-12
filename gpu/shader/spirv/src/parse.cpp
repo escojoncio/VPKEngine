@@ -403,7 +403,7 @@ struct Parser {
                     if (in.op != OpFunctionCall) continue;
                     auto callee = m.functions.find(w(in, 3));
                     if (in.count < 4 || callee == m.functions.end()) return fail("function " + m.nameOf(id) + " calls %" + std::to_string(w(in, 3)) + ", which is not a function");
-                    if (in.count - 4 != callee->second.params.size())
+                    if (size_t(in.count - 4) != callee->second.params.size())
                         return fail("call of " + m.nameOf(callee->first) + " passes " + std::to_string(in.count - 4) + " arguments, expected " + std::to_string(callee->second.params.size()));
                 }
             }

@@ -67,8 +67,10 @@ constexpr uint64_t kEvictIdle = 2048, kSweepEvery = 128;
 constexpr uint64_t kEvictIdleFlips = 1200;
 // Memory budget of the render targets (bytes, multisample copies counted): past it the least recently used targets that no draw of the
 // last submit used go, oldest first, whatever the flips say (a long session on new addresses would otherwise end in the OS killing
-// the app). Never the ones the last flips presented. Unverified for visionOS: a guess of what leaves room for the rest.
-constexpr uint64_t kTargetBudget = 2048ull << 20;
+// the app). Never the ones the last kPresentedKept flips presented. The budget is Hooks::targetBudgetBytes (0 = this default, unverified
+// for visionOS: a guess of what leaves room for the rest).
+constexpr uint64_t kDefaultTargetBudget = 2048ull << 20;
+constexpr size_t kPresentedKept = 8;
 
 vpgpu::Primitive toPrimitive(PrimitiveType p) {
     switch (p) {
@@ -267,23 +269,21 @@ struct Renderer::Impl {
         return bool(gds.id);
     }
 
-    // A buffer of zeros for V#s that point nowhere (writes to it are dropped: cleared each use).
+    // V#s that point nowhere: the hardware reads zeros past a buffer's records and drops writes. Two buffers of our own, so no state
+    // has to be kept in step with the GPU: `dummy` is zeros and is only ever bound read-only (nothing writes it, so it needs no
+    // clearing); `sink` is what write-only bindings get (their writes land there and nobody reads it). Read-write bindings get a block of
+    // fresh zeros from the upload ring (see bind).
     struct Dummy {
         void* memory = nullptr;
         BufferId id;
-    } dummy;
-    // A draw bound it writable (at submit dummyWriteFrame): the GPU may write it until kFrames submits later, and what it wrote must
-    // not be read as zeros by a later binding. So it is cleared at each binding until one made kFrames after the last writable
-    // binding (the GPU is done by then).
-    bool dummyDirty = false;
-    uint64_t dummyWriteFrame = 0;
-    bool dummyBuffer() {
-        if (dummy.id) return true;
-        if (!dummy.memory) dummy.memory = std::aligned_alloc(kPage, kDummyBytes);
-        if (!dummy.memory) return false;
-        std::memset(dummy.memory, 0, kDummyBytes);
-        dummy.id = r.device_.createBuffer({kDummyBytes, dummy.memory, "vpps4 zeros"});
-        return bool(dummy.id);
+    } dummy, sink;
+    bool makeDummy(Dummy& d, const char* label) {
+        if (d.id) return true;
+        if (!d.memory) d.memory = std::aligned_alloc(kPage, kDummyBytes);
+        if (!d.memory) return false;
+        std::memset(d.memory, 0, kDummyBytes);
+        d.id = r.device_.createBuffer({kDummyBytes, d.memory, label});
+        return bool(d.id);
     }
 
     // ---- Upload ring ----------------------------------------------------------------------------
@@ -668,7 +668,15 @@ struct Renderer::Impl {
     std::map<uint64_t, std::vector<Target>> colorTargets, depthTargets;  // by guest address
     std::map<uint64_t, TextureId> latestColor;
     uint64_t flips = 0;                           // calls of colorTargetAt / colorTargetSlice (see kEvictIdleFlips)
-    TextureId presentedAt, presentedSlice;        // what the last such calls returned: never released
+    std::vector<TextureId> presented;  // the last kPresentedKept distinct ids those calls returned (oldest first): never released
+    void notePresented(TextureId id) {
+        if (!id) return;
+        std::erase(presented, id);
+        presented.push_back(id);
+        if (presented.size() > kPresentedKept) presented.erase(presented.begin());
+    }
+    bool isPresented(TextureId id) const { return std::find(presented.begin(), presented.end(), id) != presented.end(); }
+    uint64_t targetBudget() const { return r.hooks_.targetBudgetBytes ? r.hooks_.targetBudgetBytes : kDefaultTargetBudget; }
 
     TextureId target(std::map<uint64_t, std::vector<Target>>& cache, uint64_t address, vpgpu::Format f, uint32_t w,
                      uint32_t h, uint8_t samples, uint16_t layers, bool depth) {
@@ -1098,16 +1106,22 @@ struct Renderer::Impl {
                     BufferId id;
                     uint64_t offset = 0, available = 0;
                     if (!address || !guestBuffer(address, size, id, offset, available)) {
-                        // The hardware reads zeros past a buffer's records and drops writes: an unset or
-                        // unmapped V# gets a zero buffer of our own instead of losing the whole draw.
-                        if (!dummyBuffer()) return why = "buffer outside guest memory", false;
+                        // The hardware reads zeros past a buffer's records and drops writes: an unset or unmapped V# gets a buffer of our
+                        // own instead of losing the whole draw. Read-only: the zeros nothing writes. Write-only: the sink nobody reads.
+                        // Read-write (atomics, load-modify-store): the reads must see zeros, not what an earlier draw wrote, so it is a
+                        // fresh block of zeros from the upload ring, which is the one memory the renderer already keeps in step with the GPU
+                        // (a ring is written again only kFrames submits later).
                         note(address ? "buffer outside guest memory bound as zeros" : "null buffer bound as zeros");
-                        if (dummyDirty) {
-                            std::memset(dummy.memory, 0, kDummyBytes);
-                            if (r.frame_ >= dummyWriteFrame + kFrames) dummyDirty = false;
+                        if (res.access == vpir::Access::ReadWrite) {
+                            if (!makeDummy(dummy, "vpps4 zeros")) return why = "buffer outside guest memory", false;
+                            auto at = upload(dummy.memory, kDummyBytes);
+                            if (!at) return why = "upload ring full", false;
+                            a.range = ResourceRange::bytes(rings[ringIndex].id, *at, kDummyBytes);
+                            break;
                         }
-                        if (a.write) dummyDirty = true, dummyWriteFrame = r.frame_;
-                        a.range = ResourceRange::bytes(dummy.id, 0, kDummyBytes);
+                        Dummy& d = a.write ? sink : dummy;
+                        if (!makeDummy(d, a.write ? "vpps4 sink" : "vpps4 zeros")) return why = "buffer outside guest memory", false;
+                        a.range = ResourceRange::bytes(d.id, 0, kDummyBytes);
                         break;
                     }
                     if (!size || size > available) size = available;
@@ -1633,7 +1647,7 @@ struct Renderer::Impl {
             return true;
         });
         if (r.frame_ % kSweepEvery == 0) evictIdle();
-        if (targetBytes > kTargetBudget) enforceTargetBudget();
+        if (targetBytes > targetBudget()) enforceTargetBudget();
         return report;
     }
 
@@ -1652,14 +1666,14 @@ struct Renderer::Impl {
         for (auto* cache : {&colorTargets, &depthTargets})
             for (auto& [address, list] : *cache)
                 for (const Target& t : list)
-                    if (t.lastUse < r.frame_ && !(t.id == presentedAt) && !(t.id == presentedSlice))
+                    if (t.lastUse < r.frame_ && !isPresented(t.id))
                         victims.push_back({cache, address, t.id, t.flipUse, t.lastUse});
         std::sort(victims.begin(), victims.end(), [](const Victim& a, const Victim& b) {
             return a.flipUse != b.flipUse ? a.flipUse < b.flipUse : a.lastUse < b.lastUse;
         });
         std::vector<TextureId> gone;
         for (const Victim& v : victims) {
-            if (targetBytes <= kTargetBudget) break;
+            if (targetBytes <= targetBudget()) break;
             auto it = v.cache->find(v.address);
             auto& list = it->second;
             auto at = std::find_if(list.begin(), list.end(), [&](const Target& t) { return t.id == v.id; });
@@ -1686,7 +1700,7 @@ struct Renderer::Impl {
                 for (const Target& t : it->second) newest = std::max(newest, t.flipUse);
                 std::erase_if(it->second, [&](const Target& t) {
                     if (flips <= t.flipUse || flips - t.flipUse <= kEvictIdleFlips || t.flipUse >= newest) return false;
-                    if (t.id == presentedAt || t.id == presentedSlice) return false;
+                    if (isPresented(t.id)) return false;
                     targetBytes -= targetSize(t);
                     retiredTextures.push_back({t.id, r.frame_ + kFrames});
                     gone.push_back(t.id);
@@ -1750,8 +1764,10 @@ struct Renderer::Impl {
         for (RetiredSampler& x : retiredSamplers) r.device_.destroy(x.id);
         if (gds.id) r.device_.destroy(gds.id);
         std::free(gds.memory);
-        if (dummy.id) r.device_.destroy(dummy.id);
-        std::free(dummy.memory);
+        for (Dummy* d : {&dummy, &sink}) {
+            if (d->id) r.device_.destroy(d->id);
+            std::free(d->memory);
+        }
         for (Staging& st : stagings) {
             r.device_.destroy(st.id);
             std::free(st.memory);
@@ -1849,15 +1865,15 @@ vpgpu::TextureId Renderer::colorTargetSlice(uint64_t address, uint32_t width, ui
     const Impl::Target* t = impl_->targetSlice(address, width, height, layer);
     ++impl_->flips;
     if (t) t->lastUse = frame_, t->flipUse = impl_->flips;  // a flip uses it: not idle
-    impl_->presentedSlice = t ? t->id : vpgpu::TextureId{};
+    if (t) impl_->notePresented(t->id);
     return t ? t->id : vpgpu::TextureId{};
 }
 
 vpgpu::TextureId Renderer::colorTargetAt(uint64_t address) const {
     ++impl_->flips;
     auto it = impl_->latestColor.find(address);
-    impl_->presentedAt = it == impl_->latestColor.end() ? vpgpu::TextureId{} : it->second;
     if (it == impl_->latestColor.end()) return {};
+    impl_->notePresented(it->second);
     if (auto t = impl_->colorTargets.find(address); t != impl_->colorTargets.end())  // a flip uses it: not idle
         for (const Impl::Target& c : t->second)
             if (c.id == it->second) c.lastUse = frame_, c.flipUse = impl_->flips;

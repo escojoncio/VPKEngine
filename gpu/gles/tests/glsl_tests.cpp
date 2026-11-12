@@ -5,17 +5,23 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <chrono>
 #include <cstring>
 #include <functional>
 #include <map>
 #include <pthread.h>
+#include <sys/resource.h>
+#include <sys/time.h>
 #include <random>
 #include <unistd.h>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
 #include "glsl.h"
+#include "vpir/passes.h"
+#include "vpir/stack.h"
 #include "vpir/text.h"
 #include "vpir/verify.h"
 #include "vpir_eval.h"
@@ -254,6 +260,30 @@ void testMacroRescan() {
     CHECK(ppTokens(defs + "H(9)(4)\n", log) == "4" && log.empty());
     CHECK(ppTokens(defs + "H(9)\n", log) == "F" && log.empty());  // no "(" follows: the name stays
     CHECK(ppTokens(defs + "ID(G)(7)\n", log) == "7" && log.empty());
+    // A call through an object-like alias may spread over lines, as it does for the function-like name itself (as cpp does).
+    {
+        const std::string al = "#define A(p, q) p+q\n#define B A\n#define C B\n";
+        for (const char* call : {"B(2,\n x)\n", "B(2, x\n)\n", "B\n(2, x)\n", "B(\n2, x)\n", "C(2,\n x)\n", "C\n(2,\nx\n)\n", "B(2,\n x) B(1, y)\n"}) {
+            log.clear();
+            const std::string got = ppTokens(al + call, log);
+            const bool two = std::string(call).find("B(1, y)") != std::string::npos;
+            if (log.size() || got != (two ? "2 + x 1 + y" : "2 + x")) std::fprintf(stderr, "  alias call [%s]: got '%s' %s\n", call, got.c_str(), log.c_str());
+            CHECK(log.empty() && got == (two ? "2 + x 1 + y" : "2 + x"));
+        }
+        // The call of a function-like macro that expands to the name of another one takes the "(" of the next line, as cpp does.
+        log.clear();
+        const std::string fn = "#define A(x) [x]\n#define F(y) A\n";
+        CHECK(ppTokens(fn + "F(0)\n(5)\n", log) == "[ 5 ]" && log.empty());
+        CHECK(ppTokens(fn + "F(0)\nx\n", log) == "A x" && log.empty());
+        CHECK(ppTokens(fn + "F(0) F(1)\n(5)\n", log) == "A [ 5 ]" && log.empty());
+        // An alias that is not called stays a name; an unterminated call through it is still an error.
+        log.clear();
+        CHECK(ppTokens(al + "B\nx\n", log) == "A x" && log.empty());
+        log.clear();
+        (void)ppTokens(al + "B(2,\n", log);
+        CHECK(log.find("unterminated") != std::string::npos);
+        log.clear();
+    }
     // C99 6.10.3.4 example: f(2)(9) is 2*9*g or 2*f(9); the rescan continues with g(9), whose f is not painted.
     CHECK(ppTokens("#define f(a) a*g\n#define g(a) f(a)\nf(2)(9)\n", log) == "2 * 9 * g" && log.empty());
     // A macro never expands inside its own expansion, so the name it ends with is not a call.
@@ -292,18 +322,56 @@ void testMacroRescan() {
     const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
     CHECK(log.empty() && r.size() == 20000 * 4 - 1);
     CHECK(ms < 2000);
-    // Walking the arguments of a call counts as expansion work, whether or not the body uses them.
-    std::string big = "#define Z(x) 0\n";
-    big += "int a = ";
-    for (int i = 0; i < 100; ++i) {
-        big += "Z(";
-        for (int k = 0; k < 20000; ++k) big += "1 ";
-        big += ")+";
+    // A call open over many lines is linear in the number of lines (the scan for the closing parenthesis resumed from the start with
+    // every line, which made 60000 lines take 46 s): the time for 4 times the lines stays well under the 16 times of a quadratic one.
+    {
+        auto openCall = [&](int lines) {
+            std::string src = "#define M(x) x\nM(\n";
+            for (int i = 0; i < lines; ++i) src += "1\n";
+            src += ")\n";
+            std::string l;
+            const auto t0 = std::chrono::steady_clock::now();
+            const std::string r = ppTokens(src, l);
+            const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+            CHECK(l.empty() && r.size() == size_t(lines) * 2 - 1);
+            return ms;
+        };
+        const double t1 = openCall(15000), t2 = openCall(60000);
+        if (std::getenv("VPGLSL_TIMES")) std::fprintf(stderr, "  open call: %.0f ms for 15000 lines, %.0f ms for 60000\n", t1, t2);
+        CHECK(t2 < 8 * t1 + 100);
+        log.clear();
     }
-    big += "0;\n";
-    log.clear();
-    ppTokens(big, log);
-    CHECK(log.find("too large") != std::string::npos);
+    // Walking the arguments of a call counts as expansion work, whether or not the body uses them.
+    {
+        std::string args;
+        for (int k = 0; k < 300000; ++k) args += "1 ";
+        // (a macro that passes its argument on is walked once more per level: 300000 tokens, four walks)
+        log.clear();
+        ppTokens("#define Z(x) 0\n#define Y(x) Z(x)\nint a = Y(" + args + ") + 0;\n", log);
+        CHECK(log.find("too large") != std::string::npos);
+        // Just under the source limit but under the step limit as well (one walk of each argument): fine, and linear.
+        std::string big = "#define Z(x) 0\nint a = ";
+        for (int i = 0; i < 40; ++i) {
+            big += "Z(";
+            for (int k = 0; k < 20000; ++k) big += "1 ";
+            big += ")+";
+        }
+        big += "0;\n";
+        log.clear();
+        ppTokens(big, log);
+        CHECK(log.empty());
+        // Past the limit of tokens in a source, the lexer stops: 2M tokens would take 530 MB of the preprocessor's vectors.
+        std::string huge = "#define Z(x) 0\nint a = ";
+        for (int i = 0; i < 100; ++i) {
+            huge += "Z(";
+            for (int k = 0; k < 20000; ++k) huge += "1 ";
+            huge += ")+";
+        }
+        huge += "0;\n";
+        log.clear();
+        ppTokens(huge, log);
+        CHECK(log.find("source too large") != std::string::npos);
+    }
 }
 
 // Differential fuzz of the macro expansion against the system C preprocessor (small random programs of object-like, function-like and
@@ -1820,13 +1888,6 @@ void testXfb() {
     putU(0, span), putU(1, base), putU(2, 0), putU(3, 0);
     vpireval::Invocation inv;
     inv.memory[uint32_t(res)] = mem;
-    auto vec4 = [](float a, float b, float c, float d) {
-        vpireval::Value x;
-        x.type = vpir::Type(vpir::Scalar::F32, 4);
-        const float fs[4] = {a, b, c, d};
-        std::memcpy(x.bits, fs, 16);
-        return x;
-    };
     auto u32 = [](uint32_t a) {
         vpireval::Value x;
         x.type = vpir::Type(vpir::Scalar::U32);
@@ -2164,14 +2225,17 @@ void testNesting() {
     // parser is not) is parsed, linked, lowered, walked and destroyed there without a crash; it ends in a result or in an error.
     for (size_t kb : {44, 47, 64, 128, 256}) {
         onSmallStack([&] {
-            for (int sum : {1199, 1000}) {
+            for (int sum : {19000, 1199, 1000}) {
                 auto r = vpglsl::parse(Stage::Fragment, longSum(sum));
                 CHECK(r.shader != nullptr || r.log.find("too deeply") != std::string::npos);
                 (void)build(vs, longSum(sum));  // (a result or an error; the point is that it returns)
             }
         }, (kb << 10) * (smallStackBytes() > (1u << 20) ? 16 : 1));
     }
-    onSmallStack([&] {
+    // How much nesting fits in a small stack depends on the frame sizes of the compiler and the sanitizers, so there the compile is
+    // required to give a result or a clean error; on the full stack of this thread (`strict`) it is required to succeed.
+    auto scenario = [&](bool strict) {
+        auto want = [&](bool v) { if (strict) CHECK(v); };
         struct Case { const char* name; std::string src; } cases[] = {
             {"else-if 210", elseIfChain(210)}, {"else-if 400", elseIfChain(400)}, {"?: 250", ternaryChain(250)},
             {"calls 150", nestedCalls(150)}, {"parens 105", nestedParens(105)}, {"ifs 100", nestedIfs(100)}, {"ifs 300", nestedIfs(300)},
@@ -2179,7 +2243,7 @@ void testNesting() {
         for (auto& c : cases) {
             auto r = vpglsl::parse(Stage::Fragment, c.src);
             if (!r.shader) std::fprintf(stderr, "  %s: %s", c.name, r.log.c_str());
-            CHECK(r.shader != nullptr);
+            CHECK(r.shader != nullptr || (!strict && r.log.find("too deeply") != std::string::npos));
         }
         // Past any sane depth: a clean error (the same message as before), on this small stack too.
         CHECK(compileFails(Stage::Fragment, nestedParens(20000), "too deeply"));
@@ -2187,15 +2251,23 @@ void testNesting() {
         CHECK(compileFails(Stage::Fragment, nestedIfs(20000), "too deeply"));
         CHECK(compileFails(Stage::Fragment, ternaryChain(20000), "too deeply"));
         // (An else-if ladder is parsed in a loop; the SPIR-V it becomes nests once per rung, which the lowering bounds.)
-        CHECK(vpglsl::parse(Stage::Fragment, elseIfChain(20000)).shader != nullptr);
+        want(vpglsl::parse(Stage::Fragment, elseIfChain(20000)).shader != nullptr);
         CHECK(!build(vs, elseIfChain(20000)).ok);
-        // a + a + ... is a left-deep tree: every pass over it recurses once per term.
-        CHECK(vpglsl::parse(Stage::Fragment, longSum(500)).shader != nullptr);
-        CHECK(build(vs, longSum(500)).ok);
-        CHECK(compileFails(Stage::Fragment, longSum(4000), "too deeply"));
+        // a + a + ... is a left-deep tree: the parser and the emitter walk it in loops, the other passes check the stack. Valid sums of
+        // thousands of terms compile (they were refused past 1200 terms, on any stack); past kMaxChain (20000) it is an error.
+        want(vpglsl::parse(Stage::Fragment, longSum(500)).shader != nullptr);
+        want(build(vs, longSum(500)).ok);
+        want(build(vs, longSum(3000)).ok);
+        CHECK(compileFails(Stage::Fragment, longSum(30000), "too deeply"));
         CHECK(compileFails(Stage::Fragment, longSum(200000), "too deeply"));
         // A sum near the limit ends in a result or in an error, not in a crash: the emitter watches the stack too.
-        (void)build(vs, longSum(1100));
+        (void)build(vs, longSum(19500));
+        // The same for the comma operator and for a chain of member accesses.
+        {
+            std::string comma = std::string(kFragHead) + "void main() { float a = float(id); float c = (a";
+            for (int i = 0; i < 3000; ++i) comma += ", a";
+            want(vpglsl::parse(Stage::Fragment, comma + "); o = vec4(c); }\n").shader != nullptr);
+        }
         // The whole way (parse, link, SPIR-V, lowering, MSL) for the ladders that generators emit.
         for (auto& c : {std::make_pair("else-if 330", elseIfChain(330)), std::make_pair("else-if 400", elseIfChain(400)),
                         std::make_pair("?: 250", ternaryChain(250)), std::make_pair("ifs 100", nestedIfs(100)),
@@ -2203,7 +2275,7 @@ void testNesting() {
                         std::make_pair("parens 105", nestedParens(105))}) {
             Program p = build(vs, c.second);
             if (!p.ok) std::fprintf(stderr, "  %s: build failed\n", c.first);
-            CHECK(p.ok);
+            want(p.ok);
         }
         // The ladder stays flat in the MSL (clang stops at 256 nested braces): one do-block, not `else { if` 400 deep.
         auto braces = [](const std::string& msl) {
@@ -2217,13 +2289,160 @@ void testNesting() {
         // (A ?: chain is lowered to branches that each copy their result after the inner ones: not a pure ladder, so the MSL nests one
         // level per link. clang refuses ~250 links; this is the limit that remains, see the note in msl.cpp ifChain.)
         Program tern = build(vs, ternaryChain(100));
-        CHECK(tern.ok && braces(tern.fs.msl) < 256);
+        want(tern.ok);
+        if (tern.ok) CHECK(braces(tern.fs.msl) < 256);
         Program p = build(vs, elseIfChain(400));
         const int deepest = braces(p.fs.msl);
         if (!p.ok || deepest >= 32) std::fprintf(stderr, "  else-if 400: ok=%d, deepest brace %d\n", int(p.ok), deepest);
-        CHECK(p.ok && deepest < 32);
-        CHECK(p.fs.msl.find("} while (false);") != std::string::npos);  // (the code of each rung stays where it was: one do-block)
-    });
+        want(p.ok);
+        if (p.ok) {
+            CHECK(deepest < 32);
+            CHECK(p.fs.msl.find("} while (false);") != std::string::npos);  // (the code of each rung stays where it was: one do-block)
+        }
+    };
+    onSmallStack([&] { scenario(false); });
+    scenario(true);
+    // The MSL emitter and the IR optimizer recurse over the nesting of the IR (blocks, loops, ladders): given a thread with little stack
+    // they end in an error instead of a crash. (The IR comes from the lowering of 300 nested ifs, made on this thread.)
+    {
+        const size_t scale = smallStackBytes() > (1u << 20) ? 16 : 1;
+        Program deep = build(vs, nestedIfs(300));
+        CHECK(deep.ok);
+        // emitMsl (verify, optimize and the emitter all check the stack): an error or a shader on every stack, never a crash.
+        for (size_t kb : {24, 32, 48, 64, 96, 144, 256, 1024}) {
+            std::string msg;
+            bool ok = false;
+            onSmallStack([&] {
+                vpmsl::EmitResult e = vpmsl::emitMsl(deep.fs.module, {});
+                ok = e.errors.empty() && !e.shader.source.empty();
+                if (!e.errors.empty()) msg = e.errors[0];
+            }, (kb << 10) * scale);
+            if (!ok) std::fprintf(stderr, "  emitMsl on %zu KB: %s\n", kb, msg.c_str());
+            CHECK(ok || msg.find("too deeply") != std::string::npos);
+        }
+        // optimize: std::length_error once the stack the caller's StackGuard allows is used up, never a crash.
+        int thrown = 0, done = 0;
+        for (size_t kb : {24, 32, 40, 48, 56, 64, 96, 192, 1024}) {
+            vpir::Module copy = deep.fs.module;
+            bool threw = false;
+            onSmallStack([&] {
+                vpir::StackGuard guard;
+                try {
+                    vpir::optimize(copy);
+                } catch (const std::length_error&) {
+                    threw = true;
+                }
+            }, (kb << 10) * scale);
+            threw ? ++thrown : ++done;
+        }
+        CHECK(done > 0);
+        if (scale == 1) CHECK(thrown > 0);  // (a thread of 24 KB cannot optimize 300 nested levels)
+    }
+}
+
+// Constants converted out of range (ivec2(1e20, 0.0), uint(-5.0), int(1e30), a float literal past the float range): no undefined
+// behaviour in the folding (run with -fsanitize=float-cast-overflow); the value saturates (NaN is 0), as Metal's conversion does.
+void testConstConv() {
+    // `cond` must be true for the array to have 1 element (it is 2 otherwise): a[1] is then an error and a[0] is not.
+    auto holds = [&](const std::string& decls, const std::string& cond) {
+        auto shader = [&](int idx) {
+            return "#version 300 es\nprecision highp float;\nout vec4 o;\n" + decls + "\nvoid main() { float arr[2 - int(" + cond +
+                   ")]; o = vec4(arr[" + std::to_string(idx) + "]); }\n";
+        };
+        const bool one = vpglsl::parse(Stage::Fragment, shader(0)).shader != nullptr;
+        auto r = vpglsl::parse(Stage::Fragment, shader(1));
+        const bool two = r.shader != nullptr;  // (size 2: arr[1] is valid)
+        if (!one || two) std::fprintf(stderr, "  not saturated: %s | %s\n", decls.c_str(), cond.c_str());
+        return one && !two;
+    };
+    CHECK(holds("const ivec2 a = ivec2(1e20, -1e20);", "a.x == 2147483647"));
+    CHECK(holds("const ivec2 a = ivec2(1e20, -1e20);", "a.y == -2147483647 - 1"));
+    CHECK(holds("const ivec3 a = ivec3(3e9, -3e9, 0.0);", "a.x == 2147483647 && a.y == -2147483647 - 1 && a.z == 0"));
+    CHECK(holds("const uint u = uint(-5.0);", "u == 0u"));
+    CHECK(holds("const uint u = uint(1e30);", "u == 4294967295u"));
+    CHECK(holds("const uvec2 u = uvec2(1e30, -1e30);", "u.x == 4294967295u && u.y == 0u"));
+    CHECK(holds("const int i = int(1e30);", "i == 2147483647"));
+    CHECK(holds("const int i = int(-1e30);", "i == -2147483647 - 1"));
+    CHECK(holds("const float big = 3.0e38 * 3.0e38; const int i = int(big);", "i == 2147483647"));
+    CHECK(holds("const float f = 1e39; const int i = int(f);", "i == 2147483647"));
+    CHECK(holds("const ivec2 a = ivec2(2.5, -2.5);", "a.x == 2 && a.y == -2"));  // (in range: truncation as before)
+    // uint / int products past 64 bits of intermediate: modulo 2^32, no overflow of the folding.
+    CHECK(holds("const uint a = 4294967295u * 4294967295u;", "a == 1u"));
+    CHECK(holds("const uvec2 a = uvec2(4294967295u) * uvec2(4294967295u);", "a.x == 1u && a.y == 1u"));
+    CHECK(holds("const int a = 65536 * 65536;", "a == 0"));
+    CHECK(holds("const ivec2 a = ivec2(65536) * ivec2(65537);", "a.x == 65536"));
+    // Floats out of range as such compile (an infinity), and so do their uses.
+    const std::string head = "#version 300 es\nprecision highp float;\nout vec4 o;\n";
+    for (const char* decl : {"const float f = 1e39;", "const float f = -1e39;", "const float f = 3.0e38 * 3.0e38;"})
+        CHECK(vpglsl::parse(Stage::Fragment, head + decl + "\nvoid main() { o = vec4(f); }\n").shader != nullptr);
+    CHECK(vpglsl::parse(Stage::Fragment, head + "const vec2 f = vec2(1e300, 1e-300);\nvoid main() { o = vec4(f.x, f.y, 0.0, 0.0); }\n").shader != nullptr);
+}
+
+// Memory: hostile sources (a huge token count, nesting, exploding macros, long chains) end in a clean error within a fixed budget. The
+// preprocessor used to take 530 MB for a 4 MB source (2M tokens, several copies of a 72-byte token each). The process is also put
+// under an address-space limit (the same 3 GB as `ulimit -v 3000000`, here 1 GiB) where the sanitizers allow one.
+namespace {
+// Peak resident set of this process in KB (getrusage: KB on Linux, bytes on macOS / visionOS).
+long peakKb() {
+    struct rusage ru;
+    if (getrusage(RUSAGE_SELF, &ru) != 0) return -1;
+#if defined(__APPLE__)
+    return long(ru.ru_maxrss / 1024);
+#else
+    return long(ru.ru_maxrss);
+#endif
+}
+}  // namespace
+
+void testMemory() {
+    const bool sanitized =
+#if defined(__SANITIZE_ADDRESS__) || defined(__SANITIZE_THREAD__)
+        true;
+#else
+        false;
+#endif
+#if defined(__linux__)
+    if (!sanitized) {  // (RLIMIT_AS does not limit the address space of a process on Darwin)
+        struct rlimit rl = {1ull << 30, 1ull << 30};
+        CHECK(setrlimit(RLIMIT_AS, &rl) == 0);
+    }
+#endif
+    const char* vs = "#version 300 es\nin vec4 p; void main() { gl_Position = p; }\n";
+    std::string log;
+    // 4 MB of tokens: refused when lexed.
+    {
+        std::string huge = "#define Z(x) 0\nint a = ";
+        for (int i = 0; i < 100; ++i) {
+            huge += "Z(";
+            for (int k = 0; k < 20000; ++k) huge += "1 ";
+            huge += ")+";
+        }
+        huge += "0;\n";
+        CHECK(compileFails(Stage::Vertex, huge, "source too large"));
+    }
+    // 100000 nested macro calls, and macros that double at each of 40 levels.
+    {
+        std::string deep = "#define f(x) x\n";
+        for (int i = 0; i < 100000; ++i) deep += "f(";
+        deep += "1";
+        for (int i = 0; i < 100000; ++i) deep += ")";
+        log.clear();
+        ppTokens(deep + "\n", log);
+        CHECK(log.find("too deep") != std::string::npos || log.find("too large") != std::string::npos);
+        std::string macros = "#define M0 x\n";
+        for (int i = 1; i <= 40; ++i) macros += "#define M" + std::to_string(i) + " M" + std::to_string(i - 1) + " M" + std::to_string(i - 1) + "\n";
+        CHECK(compileFails(Stage::Vertex, macros + "void main() { float x = 1.0; M40 }\n", "too large"));
+    }
+    // The whole pipeline on nesting and on chains.
+    CHECK(compileFails(Stage::Fragment, nestedParens(20000), "too deeply"));
+    CHECK(compileFails(Stage::Fragment, nestedCalls(20000), "too deeply"));
+    CHECK(compileFails(Stage::Fragment, nestedIfs(20000), "too deeply"));
+    CHECK(compileFails(Stage::Fragment, ternaryChain(20000), "too deeply"));
+    CHECK(compileFails(Stage::Fragment, longSum(200000), "too deeply"));
+    CHECK(!build(vs, elseIfChain(20000)).ok);
+    CHECK(build(vs, longSum(19000)).ok);
+    const long peak = peakKb();
+    if (!sanitized) CHECK(peak > 0 && peak < 400 * 1024);  // (measured about 260 MB: the largest are the chains of 19000 terms and 1M-token lines)
 }
 
 int main(int argc, char** argv) {
@@ -2234,7 +2453,7 @@ int main(int argc, char** argv) {
         {"textures", testTextures}, {"external", testExternalSampler}, {"link", testLink},
         {"compute", testCompute}, {"ssbo", testStorageBlocks}, {"images", testImages}, {"atomics", testAtomics},
         {"gather", testGather}, {"fbfetch", testFramebufferFetch}, {"exts", testExtensions}, {"texbuffer", testTextureBuffers}, {"exec", testExecute}, {"packed", testPackedUniforms}, {"shlight", testShLighting},
-        {"lenient", testLenient}, {"xfb", testXfb}, {"invariant", testInvariant}, {"semantics", testSemantics}, {"limits", testLimits}, {"nesting", testNesting},
+        {"lenient", testLenient}, {"xfb", testXfb}, {"invariant", testInvariant}, {"semantics", testSemantics}, {"limits", testLimits}, {"nesting", testNesting}, {"memory", testMemory}, {"constconv", testConstConv},
     };
     auto it = tests.find(argv[1]);
     if (it == tests.end()) return 2;

@@ -36,6 +36,11 @@ thread_local EGLint tError = SUCCESS;
 thread_local EGLenum tApi = OPENGL_ES_API;
 thread_local Surface* tDraw = nullptr;
 thread_local Surface* tRead = nullptr;
+thread_local uint64_t tSurfSession = 0;  // gSession when tDraw / tRead were set
+// The thread's current surfaces, or null if they belong to a session eglShutdownDisplay ended (they were freed with it).
+static void currentSurfaces() {
+    if ((tDraw || tRead) && tSurfSession != gSession.load(std::memory_order_acquire)) tDraw = tRead = nullptr;
+}
 
 vpgles_present_fn gPresent = nullptr;
 void* gPresentCtx = nullptr;
@@ -220,7 +225,7 @@ static EGLBoolean Terminate(EGLDisplay d) {
         // eglInitialize preceded it): Android's semantics. Every eglInitialize is matched by an eglTerminate and only the last one
         // releases the display (another component's initialize + terminate must not take it from the game). A terminate with none
         // outstanding succeeds and does nothing (releaseDisplay is not run), as EGL says for a display that is not initialized.
-        // vpgles_shutdown starts the count again (eglResetDisplay).
+        // vpgles_shutdown starts the count again (eglShutdownDisplay).
         if (gDisplay.refs > 1) {
             --gDisplay.refs;
             return TRUE_;
@@ -408,10 +413,8 @@ static EGLBoolean QuerySurface(EGLDisplay d, EGLSurface sv, EGLint attr, EGLint*
     if (d != kDisplay) return err(BAD_DISPLAY);
     auto* s = static_cast<Surface*>(sv);
     if (!s) return err(BAD_SURFACE);
-    {
-        std::lock_guard<std::recursive_mutex> l(device()->lock);
-        if (!gSurfaces.count(s)) return err(BAD_SURFACE);  // released (eglTerminate) or never made
-    }
+    std::lock_guard<std::recursive_mutex> l(device()->lock);  // (held while the surface is read: eglTerminate / eglDestroySurface free it)
+    if (!gSurfaces.count(s)) return err(BAD_SURFACE);  // released (eglTerminate) or never made
     switch (attr) {
         case WIDTH: *value = EGLint(s->width); return TRUE_;
         case HEIGHT: *value = EGLint(s->height); return TRUE_;
@@ -499,6 +502,7 @@ static EGLBoolean MakeCurrent(EGLDisplay d, EGLSurface draw, EGLSurface read, EG
     if (ctx && ctx->owned && ctx->owner != std::this_thread::get_id()) return err(BAD_ACCESS);  // actual en otro hilo
     if ((nd && (!gSurfaces.count(nd) || nd->dead)) || (nr && (!gSurfaces.count(nr) || nr->dead))) return err(BAD_SURFACE);
     Context* old = current();
+    currentSurfaces();
     Surface* oldDraw = tDraw;
     Surface* oldRead = tRead;
     if (ctx) ctx->owned = true, ctx->owner = std::this_thread::get_id();
@@ -508,6 +512,7 @@ static EGLBoolean MakeCurrent(EGLDisplay d, EGLSurface draw, EGLSurface read, EG
     setCurrent(ctx);
     tDraw = nd;
     tRead = nr;
+    tSurfSession = gSession.load(std::memory_order_acquire);
     unbindSurface(oldDraw);
     unbindSurface(oldRead);
     if (old && old != ctx && old->dead) forgetContext(old), gContexts.erase(old), delete old;  // destruido mientras era actual
@@ -524,7 +529,10 @@ static EGLBoolean MakeCurrent(EGLDisplay d, EGLSurface draw, EGLSurface read, EG
 }
 static EGLContext GetCurrentContext() { return current(); }
 static EGLDisplay GetCurrentDisplay() { return current() ? kDisplay : nullptr; }
-static EGLSurface GetCurrentSurface(EGLint which) { return which == DRAW ? tDraw : which == READ ? tRead : (err(BAD_PARAMETER), nullptr); }
+static EGLSurface GetCurrentSurface(EGLint which) {
+    currentSurfaces();
+    return which == DRAW ? tDraw : which == READ ? tRead : (err(BAD_PARAMETER), nullptr);
+}
 
 static EGLBoolean SwapBuffers(EGLDisplay d, EGLSurface sv) {
     if (d != kDisplay) return err(BAD_DISPLAY);
@@ -543,6 +551,7 @@ static EGLBoolean SwapBuffers(EGLDisplay d, EGLSurface sv) {
 }
 static EGLBoolean SwapInterval(EGLDisplay d, EGLint interval) {
     if (d != kDisplay) return err(BAD_DISPLAY);
+    currentSurfaces();
     if (tDraw) tDraw->swapInterval = interval;
     return TRUE_;
 }
@@ -667,9 +676,28 @@ static void releaseDisplay() {
     device()->trim();
 }
 
-// vpgles_shutdown: the initialize count starts again.
-void eglResetDisplay() {
+// vpgles_shutdown (before the Device is destroyed, so the objects can still release their Vulkan objects): everything the display
+// owns goes, current or not, and the initialize count starts again. Another thread may still have a context current: its pointers
+// are dropped by the session counter (gSession: current() and the current surfaces read as none for a thread whose session ended), so its
+// later calls (eglMakeCurrent(NO_CONTEXT), eglReleaseThread, vpgles_flush) find nothing and free nothing twice. A later vpgles_init starts from empty lists, never with objects of the dead Device in them.
+void eglShutdownDisplay() {
     std::lock_guard<std::recursive_mutex> l(device()->lock);
+    if (current()) setCurrent(nullptr);
+    tDraw = tRead = nullptr;
+    gSession.fetch_add(1, std::memory_order_release);  // every other thread's current context / surfaces die with this session
+    for (Context* c : std::vector<Context*>(gContexts.begin(), gContexts.end())) {
+        forgetContext(c);
+        gContexts.erase(c);
+        delete c;
+    }
+    for (Surface* s : std::vector<Surface*>(gSurfaces.begin(), gSurfaces.end())) {
+        s->bound = 0;
+        freeSurface(s);
+    }
+    for (void* y : gSyncs) delete static_cast<EglSync*>(y);
+    for (void* i : gImages) delete static_cast<EglImage*>(i);
+    gSyncs.clear(), gImages.clear();
+    device()->waitSerial(device()->submitted);
     gDisplay.refs = 0;
     gDisplay.initialized = false;
 }

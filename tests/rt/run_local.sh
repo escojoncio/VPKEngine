@@ -47,6 +47,7 @@ build vpconvert_cache $CXX -std=c++17 -O1 -g $AS "$D/vpconvert_cache.cpp" -lpthr
 build vpconvert_cache_tsan $CXX -std=c++17 -O1 -g $TS "$D/vpconvert_cache.cpp" -lpthread && step vpconvert_cache_tsan "$OUT/vpconvert_cache_tsan" "$OUT"
 step cpu_selfcontained sh "$D/cpu_selfcontained.sh" "$OUT/cpu_selfcontained"
 step check_workflows python3 -I "$D/../ci/check_workflows.py"
+step test_check_workflows python3 -I "$D/../ci/test_check_workflows.py"
 step pack_spaces sh "$D/pack_spaces.sh"
 step audit_scripts sh "$D/audit_scripts.sh"
 step pkcs12_secrets sh "$D/pkcs12_secrets.sh" "$OUT/pkcs12"

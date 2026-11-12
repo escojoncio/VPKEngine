@@ -2,6 +2,7 @@
 #pragma once
 
 #include <array>
+#include <cmath>
 #include <cstdint>
 #include <map>
 #include <memory>
@@ -11,6 +12,32 @@
 #include "glsl.h"
 
 namespace vpglsl {
+
+// Conversions of constants (double) that are undefined behaviour in C++ when the value does not fit: a float -> integer conversion out
+// of range (or NaN) is undefined in GLSL; here it saturates (NaN is 0), as the Metal conversion does. A double beyond the float range
+// becomes an infinity.
+inline int64_t satI64(double v) {
+    if (!(v == v)) return 0;
+    if (v >= 9223372036854775808.0) return INT64_MAX;
+    if (v <= -9223372036854775808.0) return INT64_MIN;
+    return int64_t(v);
+}
+inline int32_t satI32(double v) {
+    if (!(v == v)) return 0;
+    if (v >= 2147483647.0) return INT32_MAX;
+    if (v <= -2147483648.0) return INT32_MIN;
+    return int32_t(v);
+}
+inline uint32_t satU32(double v) {
+    if (!(v == v) || v <= 0.0) return 0;
+    if (v >= 4294967295.0) return UINT32_MAX;
+    return uint32_t(v);
+}
+inline double roundF32(double v) {
+    if (v >= 3.4028235677973366e38) return HUGE_VAL;    // (past the midpoint above FLT_MAX: rounds to infinity)
+    if (v <= -3.4028235677973366e38) return -HUGE_VAL;
+    return double(float(v));
+}
 
 enum class Base : uint8_t { Void, Bool, Int, Uint, Float, Sampler, Struct, Image, AtomicUint };
 enum class SDim : uint8_t { D2, D3, Cube, D2Array, External, CubeArray, Buffer };

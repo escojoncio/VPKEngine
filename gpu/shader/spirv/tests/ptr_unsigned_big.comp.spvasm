@@ -1,5 +1,6 @@
-; Variable pointers: an OpPtrAccessChain whose element is the UNSIGNED constant 2^31 is a step of 2^33 bytes forward, not a step back:
-; the lowering refuses it ("byte offset overflows 32 bits") instead of wrapping.
+; Variable pointers: an OpPtrAccessChain whose element is the UNSIGNED constant 2^31 is the signed -2^31: a step of -2^33 bytes, which
+; is 0 modulo 2^32 (the byte offset is 32-bit). A = {a0, a1, a2, a3}: out[0] = *(&A[3] + 2^31 elements) = a3; out[1] = *(&A[3] + -3) = a0;
+; out[2] = *(((&A[0] + 2^31 elements) + 1)) = a1.
 OpCapability Cap:Shader
 OpCapability Cap:VariablePointersStorageBuffer
 OpExtension "SPV_KHR_variable_pointers"

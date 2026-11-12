@@ -61,8 +61,10 @@ class SpyBackend final : public vpgpu::Backend {
     std::vector<std::string>& calls = null.calls;
     uint64_t& completedBelow = null.completedBelow;
     void* zerosMemory = nullptr;
+    void* sinkMemory = nullptr;  // (label "vpps4 sink": what writable null V#s are bound to)
     void createBuffer(vpgpu::BufferId id, const vpgpu::BufferDesc& d) override {
         if (d.label == "vpps4 zeros") zerosMemory = d.guestMemory;
+        if (d.label == "vpps4 sink") sinkMemory = d.guestMemory;
         null.createBuffer(id, d);
     }
     void createTexture(vpgpu::TextureId id, const vpgpu::TextureDesc& d) override { null.createTexture(id, d); }
@@ -80,6 +82,7 @@ class SpyBackend final : public vpgpu::Backend {
 };
 
 struct Fixture {
+    uint64_t budget;  // Hooks::targetBudgetBytes (0 = default)
     void* host = std::aligned_alloc(16384, kSize);
     SpyBackend backend;
     std::vector<std::string> log;
@@ -89,11 +92,12 @@ struct Fixture {
     vpps4::Renderer& renderer = *rendererOwner;
     Program vs = load("vs_fetch"), ps = load("ps_textured");
 
-    Fixture() { std::memset(host, 0, kSize); }
+    explicit Fixture(uint64_t targetBudget = 0) : budget(targetBudget) { std::memset(host, 0, kSize); }
     ~Fixture() { std::free(host); }
 
     vpps4::Hooks hooks() {
         vpps4::Hooks h;
+        h.targetBudgetBytes = budget;
         h.region = [this](uint64_t a, uint64_t s, vpps4::GuestRegion& g) {
             if (a < kBase || a + s > kBase + kSize) return false;
             g = {kBase, kSize, host};
@@ -538,15 +542,25 @@ void evictKeepsPresented() {
     const vpgpu::TextureId second = f.renderer.colorTargetAt(kBase + 0x50000);
     CHECK(bool(second) && !(second == first));
     flips(3000);
+    CHECK(!destroyed(first));  // (still among the last 8 distinct targets presented: the host may hold its id)
+    for (int i = 0; i < 8; ++i) {  // 8 other targets presented since: `first` is only idle and superseded now
+        vpps4::DrawState o = f.state();
+        o.color[0].address = kBase + 0x80000 + uint64_t(i) * 0x1000;
+        f.renderer.draw(o);
+        f.renderer.submit();
+        CHECK(bool(f.renderer.colorTargetAt(kBase + 0x80000 + uint64_t(i) * 0x1000)));
+    }
+    flips(3000);
     CHECK(destroyed(first));
     CHECK(!destroyed(second));
 }
 
-// The zero buffer V#s that point nowhere get: what a GPU write left in it is cleared by the next binding, and when the write may
-// still run for kFrames submits, by every binding until one made after that.
+// V#s that point nowhere: read-only bindings get a buffer of zeros nothing ever writes, write-only ones a separate sink, read-write ones (the
+// test dispatch loads and stores) a fresh block of zeros from the upload ring each time. Whatever the GPU writes there, whenever it runs the
+// dispatch, never shows in what a later draw reads: the zero buffer is not touched by the renderer, nor bound writable.
 void dummyCleared() {
     const Program cs = load("cs_bytes");
-    auto writeIt = [&](Fixture& f) {  // a dispatch whose buffer store goes to a null V#: bound writable
+    auto writeIt = [&](Fixture& f) {  // a dispatch whose buffer access goes to a null V#: bound writable
         vpps4::DispatchState x;
         x.cs.code = cs.code;
         x.cs.fetch = cs.fetch;
@@ -568,50 +582,49 @@ void dummyCleared() {
             if (m[i]) return false;
         return true;
     };
-    auto gpuWrites = [&](Fixture& f) { std::memset(f.backend.zerosMemory, 0xAB, 64 * 1024); };
-    {  // written at submit 0, not bound again for 8 submits: the next binding clears it
+    for (int gap : {0, 1, 7, 8, 20}) {  // submits between the writable binding and the read-only one
         Fixture f;
         writeIt(f);
+        const uint64_t uploads = f.renderer.stats().uploads;
+        f.renderer.submit();
+        for (int i = 0; i < gap; ++i) f.renderer.submit();
+        readIt(f);
         CHECK(f.backend.zerosMemory != nullptr);
         if (!f.backend.zerosMemory) {
             for (const auto& [why, n] : f.renderer.stats().skipped) std::fprintf(stderr, "  skip %s x%d\n", why.c_str(), int(n));
-            for (const std::string& l : f.log) std::fprintf(stderr, "  %s\n", l.c_str());
             return;
         }
-        gpuWrites(f);
-        for (int i = 0; i < 8; ++i) {
-            f.renderer.draw(f.state());
-            f.renderer.submit();
+        CHECK(f.backend.zerosMemory != f.backend.sinkMemory);
+        CHECK(zeros(f));
+        CHECK(uploads > 0);
+        if (gap == 0) {  // a second writable binding gets zeros again (its own block of the ring), the zero buffer stays as it is
+            writeIt(f);
+            CHECK(zeros(f));
         }
-        readIt(f);
-        CHECK(zeros(f));
     }
-    {  // the GPU executes the write after a binding cleared the memory: the next binding clears again
-        Fixture f;
-        writeIt(f);
-        CHECK(f.backend.zerosMemory != nullptr);
-        if (!f.backend.zerosMemory) return;
+}
+
+// The host sets the budget (Hooks::targetBudgetBytes), and the last 8 presented targets stay even over it, not only the latest one.
+void evictBudgetConfigured() {
+    Fixture f(256ull << 20);  // 4 targets of 64 MiB
+    auto at = [](int i) { return kBase + 0x200000 + uint64_t(i) * 0x1000; };
+    for (int i = 0; i < 12; ++i) {
+        vpps4::DrawState d = f.state();
+        d.color[0].address = at(i);
+        d.color[0].width = d.color[0].height = d.color[0].pitch = 4096;
+        f.renderer.draw(d);
         f.renderer.submit();
-        readIt(f);
-        CHECK(zeros(f));
-        gpuWrites(f);  // (the write of submit 0 ran only now)
-        f.renderer.submit();
-        readIt(f);
-        CHECK(zeros(f));
+        if (i < 6) CHECK(bool(f.renderer.colorTargetAt(at(i))));  // presented: 6 of them, over the budget
     }
-    {  // written at submit 0, read-bound at 1 (cleared), the GPU executes the write late; unused until submit 8: the binding there clears
-        Fixture f;
-        writeIt(f);
-        CHECK(f.backend.zerosMemory != nullptr);
-        if (!f.backend.zerosMemory) return;
+    for (int i = 0; i < 10; ++i) {
+        f.renderer.draw(f.state());
         f.renderer.submit();
-        readIt(f);
-        CHECK(zeros(f));
-        gpuWrites(f);
-        for (int i = 0; i < 7; ++i) f.renderer.submit();  // (submits 1..7: the dummy is not bound)
-        readIt(f);
-        CHECK(zeros(f));
     }
+    const size_t made = f.count("createTexture"), gone = f.count("destroyTexture");
+    CHECK(gone >= 4);
+    CHECK(made - gone <= 12);  // 6 presented + the not presented that fit + the small ones: far from the 12 big targets made
+    for (int i = 0; i < 6; ++i) CHECK(bool(f.renderer.colorTargetAt(at(i))));
+    CHECK(!bool(f.renderer.colorTargetAt(at(6))));
 }
 
 // Over the memory budget the oldest targets the last submit did not use go; the presented one and the latest stay.
@@ -717,6 +730,7 @@ int main(int argc, char** argv) {
     else if (t == "evict_idle") evictIdle();
     else if (t == "evict_keeps_written") evictKeepsWritten();
     else if (t == "evict_keeps_presented") evictKeepsPresented();
+    else if (t == "evict_budget_configured") evictBudgetConfigured();
     else if (t == "evict_budget") evictBudget();
     else if (t == "dummy_cleared") dummyCleared();
     else if (t == "big_staging") bigStaging();

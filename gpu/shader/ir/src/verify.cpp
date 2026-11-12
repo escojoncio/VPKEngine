@@ -3,9 +3,11 @@
 #include <algorithm>
 #include <map>
 #include <set>
+#include <stdexcept>
 #include <utility>
 
 #include "text_common.h"
+#include "vpir/stack.h"
 
 namespace vpir {
 
@@ -170,6 +172,7 @@ private:
     }
 
     void checkBlock(const Block& b) {
+        if (stackLow()) throw std::length_error("IR nests too deeply for the stack of this thread");
         scopes_.emplace_back();
         for (const Node& n : b) checkNode(n);
         for (ValueId id : scopes_.back()) visible_[id] = false;
@@ -761,6 +764,14 @@ private:
 
 }  // namespace
 
-std::vector<std::string> verify(const Module& module) { return Verifier(module).run(); }
+std::vector<std::string> verify(const Module& module) {
+    // checkBlock recurses once per nested region: a thread with a small stack gets an error instead of a crash.
+    StackGuard guard;
+    try {
+        return Verifier(module).run();
+    } catch (const std::length_error& e) {
+        return {std::string("verify: ") + e.what()};
+    }
+}
 
 }  // namespace vpir

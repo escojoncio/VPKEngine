@@ -1479,9 +1479,31 @@ private:
             label(m);
             return load(b, tmp);
         }
+        if (e.a[0]->k == EK::Binary) return binaryChain(e);
         uint32_t l = value(*e.a[0]);
         uint32_t r = value(*e.a[1]);
         return arith(o, l, e.a[0]->type, r, e.a[1]->type, e.type);
+    }
+
+    // A left-deep chain ("a + b + c + ...", a tree as deep as the chain is long) is evaluated in a loop from its left end, in the same
+    // order as the recursion would (the left operand, then the right one, level by level), so that a long valid sum does not need a
+    // stack frame per term. (A function of its own, not inlined: its locals must not grow the frame of binary(), which the recursion
+    // through nested expressions pays at every level.)
+    __attribute__((noinline)) uint32_t binaryChain(const Expr& e) {
+        std::vector<const Expr*> spine{&e};
+        const Expr* left = e.a[0].get();
+        while (left->k == EK::Binary && left->op != "&&" && left->op != "||" && !(left->hasConst && left->type.isScalar()) &&
+               (pinned_.empty() || !pinned_.count(left))) {
+            spine.push_back(left);
+            left = left->a[0].get();
+        }
+        uint32_t l = value(*left);
+        for (size_t k = spine.size(); k-- > 0;) {
+            const Expr& n = *spine[k];
+            uint32_t r = value(*n.a[1]);
+            l = arith(n.op, l, n.a[0]->type, r, n.a[1]->type, n.type);
+        }
+        return l;
     }
 
     uint32_t columnOf(uint32_t m, const Type& mt, int c) {

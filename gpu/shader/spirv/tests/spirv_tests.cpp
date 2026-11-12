@@ -1699,12 +1699,12 @@ void varPtr(const std::string& dir) {
 
 // OpPtrAccessChain with a negative constant element (ptr_negative.comp): the step back is modular in 32 bits, as the dynamic
 // index is; it used to be refused as "byte offset overflows 32 bits".
-void ptrNegative(const std::string& dir) {
+void ptrNegative(const std::string& dir, const char* file = "ptr_negative.comp.spv") {
     spirv::SpirvLowerOptions o;
     o.entry = "main";
     o.stage = vpir::Stage::Compute;
     o.layout = {bind(0, 0, vpgpu::BindKind::Buffer, 0), bind(0, 1, vpgpu::BindKind::Buffer, 1)};
-    Result r = run(dir + "/ptr_negative.comp.spv", o);
+    Result r = run(dir + "/" + file, o);
     CHECK(r.ok);
     if (!r.ok) return;
     vpireval::Invocation inv;
@@ -1721,23 +1721,58 @@ void ptrNegative(const std::string& dir) {
     CHECK(go[2] == 10u);  // ((&A[0]) - 1) + 1: below zero for a moment
 }
 
-// The same chain with the UNSIGNED element 2^31 is a step forward of 2^33 bytes: refused, not taken for a step back.
+// The same chains with UNSIGNED constants (0xFFFFFFFF, 0xFFFFFFFD): the element of an access chain is signed whatever its declared
+// type, so the result is the same as ptr_negative's. It used to be refused as "byte offset overflows 32 bits".
+void ptrUnsignedNeg(const std::string& dir) { ptrNegative(dir, "ptr_unsigned_neg.comp.spv"); }
+
+// 16-bit elements, constant and run-time (ptr_narrow.comp): unsigned ones are zero-extended, signed ones sign-extended, both ways alike.
+void ptrNarrow(const std::string& dir) {
+    spirv::SpirvLowerOptions o;
+    o.entry = "main";
+    o.stage = vpir::Stage::Compute;
+    o.layout = {bind(0, 0, vpgpu::BindKind::Buffer, 0), bind(0, 1, vpgpu::BindKind::Buffer, 1), bind(0, 2, vpgpu::BindKind::Buffer, 2)};
+    Result r = run(dir + "/ptr_narrow.comp.spv", o);
+    CHECK(r.ok);
+    if (!r.ok) return;
+    vpireval::Invocation inv;
+    std::vector<uint32_t> a(32768 + 16);
+    for (size_t i = 0; i < a.size(); ++i) a[i] = uint32_t(1000 + i);
+    inv.memory[0].resize(a.size() * 4), inv.memory[1].assign(16, 0), inv.memory[2].resize(8);
+    std::memcpy(inv.memory[0].data(), a.data(), a.size() * 4);
+    const uint32_t pv[2] = {0x8000u, 0xFFFFFFFEu};
+    std::memcpy(inv.memory[2].data(), pv, 8);
+    std::string err;
+    CHECK(vpireval::run(r.module, inv, err));
+    if (!err.empty()) std::fprintf(stderr, "  eval: %s\n", err.c_str());
+    uint32_t go[4];
+    std::memcpy(go, inv.memory[1].data(), 16);
+    CHECK(go[0] == 1000u + 10 + 32768);  // u16 0x8000, constant: forward
+    CHECK(go[1] == 1000u + 8);           // i16 -2, constant: back
+    CHECK(go[2] == go[0]);               // the same at run time
+    CHECK(go[3] == go[1]);
+}
+
+// The UNSIGNED element 2^31 is the signed -2^31: a step of -2^33 bytes, 0 modulo 2^32 (as the main branch computes it).
 void ptrUnsignedBig(const std::string& dir) {
-    const std::vector<uint32_t> words = readWords(dir + "/ptr_unsigned_big.comp.spv");
-    std::string error;
-    spirv::SpirvModule* m = spirv::parse(words.data(), words.size(), error);
-    CHECK(m != nullptr);
-    if (!m) return;
     spirv::SpirvLowerOptions o;
     o.entry = "main";
     o.stage = vpir::Stage::Compute;
     o.layout = {bind(0, 0, vpgpu::BindKind::Buffer, 0), bind(0, 1, vpgpu::BindKind::Buffer, 1)};
-    vpir::Module mod;
-    spirv::SpirvInterface iface;
-    const bool ok = spirv::lower(*m, o, mod, iface, error);
-    spirv::release(m);
-    CHECK(!ok);
-    CHECK(error.find("overflows 32 bits") != std::string::npos);
+    Result r = run(dir + "/ptr_unsigned_big.comp.spv", o);
+    CHECK(r.ok);
+    if (!r.ok) return;
+    vpireval::Invocation inv;
+    const uint32_t a[4] = {10, 11, 12, 13};
+    inv.memory[0].resize(16), inv.memory[1].assign(12, 0);
+    std::memcpy(inv.memory[0].data(), a, 16);
+    std::string err;
+    CHECK(vpireval::run(r.module, inv, err));
+    if (!err.empty()) std::fprintf(stderr, "  eval: %s\n", err.c_str());
+    uint32_t go[3];
+    std::memcpy(go, inv.memory[1].data(), 12);
+    CHECK(go[0] == 13u);  // &A[3] + 2^31 elements = &A[3]
+    CHECK(go[1] == 10u);  // &A[3] - 3
+    CHECK(go[2] == 11u);  // (&A[0] + 2^31 elements) + 1 = &A[1]
 }
 
 // VK_KHR_buffer_device_address: a PhysicalStorageBuffer pointer read from a buffer is a {low, high}
@@ -2544,23 +2579,28 @@ StackJob lowerOnStack(uint32_t levels, size_t kb) {
     return job;
 }
 
-// The lowering recurses once per nested region. The level cap (320) says nothing about the bytes that takes (about 0.85 KB a level
-// optimised, several times that under a sanitizer), so the recursion also measures the stack left in its thread and fails with a
-// message when it runs low: a worker thread of 512 KB or 64 KB gets a clean error from a 400-level ladder, never a SIGSEGV.
+// The lowering recurses once per nested region and also measures the stack left in its thread: a worker thread with a small stack gets
+// a clean error from a deep ladder, never a SIGSEGV. How many levels fit in a given stack depends on the frame sizes of the compiler
+// and the sanitizers, so no threshold is assumed: over a wide range of depths and stack sizes every job must either lower or fail with
+// a message (and the full stack of this thread lowers what a small one lowers).
 void stackLimit() {
-    for (size_t kb : {size_t(512), size_t(64)}) {
-        const StackJob j = lowerOnStack(400, kb);
-        CHECK(j.parsed);
-        CHECK(!j.lowered);
-        CHECK(!j.error.empty());
-        if (j.lowered || j.error.empty()) std::fprintf(stderr, "  400 levels on %zu KB: %s\n", kb, j.lowered ? "lowered" : "no message");
+    int lowered = 0, refused = 0;
+    for (size_t kb : {size_t(64), size_t(128), size_t(256), size_t(512)}) {
+        for (uint32_t levels : {20u, 100u, 300u, 1000u, 3000u, 20000u}) {
+            const StackJob j = lowerOnStack(levels, kb);
+            CHECK(j.parsed);
+            if (j.lowered) {
+                ++lowered;
+                continue;
+            }
+            ++refused;
+            CHECK(!j.error.empty());
+            if (j.error.empty()) std::fprintf(stderr, "  %u levels on %zu KB: refused without a message\n", levels, kb);
+        }
     }
-    // Under the 320-level cap: only the stack can refuse it, and it says so.
-    const StackJob small = lowerOnStack(300, 64);
-    CHECK(!small.lowered);
-    CHECK(small.error.find("stack") != std::string::npos);
-    if (small.error.find("stack") == std::string::npos) std::fprintf(stderr, "  300 levels on 64 KB: %s\n", small.error.c_str());
-    // On this thread (its full stack) the same ladder lowers as before.
+    // The ends of the range: a short ladder on the largest stack lowers (even under a sanitizer), a ladder past the level cap does not.
+    CHECK(lowered > 0 && refused > 0);
+    // A job that a small stack lowers lowers on the full stack of this thread too.
     const StackJob big = lowerOnStack(300, 0);
     CHECK(big.lowered);
     if (!big.lowered) std::fprintf(stderr, "  300 levels on the main thread: %s\n", big.error.c_str());
@@ -2743,6 +2783,8 @@ int main(int argc, char** argv) {
     else if (c == "bda") bda(dir);
     else if (c == "varptr") varPtr(dir);
     else if (c == "ptr_negative") ptrNegative(dir);
+    else if (c == "ptr_narrow") ptrNarrow(dir);
+    else if (c == "ptr_unsigned_neg") ptrUnsignedNeg(dir);
     else if (c == "ptr_unsigned_big") ptrUnsignedBig(dir);
     else if (c == "int8") int8(dir);
     else if (c == "dot") dotProduct(dir);

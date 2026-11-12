@@ -11,10 +11,12 @@
 #include <cstdlib>
 #include <map>
 #include <set>
+#include <stdexcept>
 #include <string_view>
 #include <unordered_map>
 
 #include "vpir/passes.h"
+#include "vpir/stack.h"
 #include "vpir/verify.h"
 
 namespace vpmsl {
@@ -24,6 +26,12 @@ using namespace vpir;
 namespace {
 
 constexpr const char* kSwizzle = "xyzw";
+
+// The emitter recurses over the nesting of the IR (blocks, ladders, loops): on a thread with a small stack it stops with an error
+// (caught in emitMsl) before the stack runs out. vpir::StackGuard is set by emitMsl.
+void checkStack() {
+    if (stackLow()) throw std::length_error("shader nests control flow too deeply for the stack of this thread");
+}
 
 std::string scalarName(Scalar s) {
     switch (s) {
@@ -430,6 +438,7 @@ private:
     // Inputs read through interp_* need an interpolant<> member; plain loads then interpolate too.
     // Fetched attachments become [[color(n)]] entry parameters.
     void scan(const Block& b) {
+        checkStack();
         for (const Node& n : b) {
             const Inst& in = n.inst;
             if (n.kind == NodeKind::Inst &&
@@ -442,6 +451,7 @@ private:
     }
 
     void countUses(const Block& b) {
+        checkStack();
         auto use = [&](ValueId v) {
             ++uses_[v];
             useBlock_[v] = &b;
@@ -526,6 +536,7 @@ private:
         std::map<uint32_t, std::vector<std::pair<uint32_t, Type>>> accesses;
         std::set<uint32_t> rejected;
         std::function<void(const Block&)> walk = [&](const Block& b) {
+            checkStack();
             for (const Node& n : b) {
                 const Inst& in = n.inst;
                 if (n.kind == NodeKind::Inst && isPrivateSlot(in.sym) &&
@@ -587,6 +598,7 @@ private:
         if (!useConstTables_) return;
         // Whether `b` (recursively) has an access of `target`: loads in `load`, anything else in `other`.
         auto touches = [](const Block& b, uint32_t target, bool& load, bool& other, auto&& self) -> void {
+            checkStack();
             for (const Node& n : b) {
                 if (n.kind == NodeKind::Inst && n.inst.sym == target) {
                     if (n.inst.op == Op::Load) load = true;
@@ -598,6 +610,7 @@ private:
         };
         // The block holding a Store of `target` as a direct instruction (the first found).
         auto storeBlock = [](const Block& b, uint32_t target, auto&& self) -> const Block* {
+            checkStack();
             for (const Node& n : b) {
                 if (n.kind == NodeKind::Inst && n.inst.sym == target && n.inst.op == Op::Store) return &b;
                 if (const Block* x = self(n.body, target, self)) return x;
@@ -659,6 +672,7 @@ private:
             // No access outside B: count B's own accesses and compare with the whole function's.
             uint32_t total = 0, inB = 0;
             auto count = [&](const Block& b, auto&& self) -> void {
+                checkStack();
                 for (const Node& n : b) {
                     if (n.kind == NodeKind::Inst && n.inst.sym == target) ++total;
                     self(n.body, self);
@@ -698,10 +712,12 @@ private:
     }
 
     void block(const Block& b) {
+        checkStack();
         for (const Node& n : b) node(n);
     }
 
     static bool hasLoop(const Block& b) {
+        checkStack();
         for (const Node& n : b)
             if (n.kind == NodeKind::Loop || hasLoop(n.body) || hasLoop(n.elseBody)) return true;
         return false;
@@ -709,6 +725,7 @@ private:
 
     // Whether `b` has a `continue` for the loop it belongs to (those inside a nested loop are that loop's).
     static bool continues(const Block& b) {
+        checkStack();
         for (const Node& n : b) {
             if (n.kind == NodeKind::Continue) return true;
             if (n.kind == NodeKind::If && (continues(n.body) || continues(n.elseBody))) return true;
@@ -718,6 +735,7 @@ private:
 
     // Whether every path through `b` ends in a `break` of the loop it belongs to or a `return`.
     static bool leaves(const Block& b) {
+        checkStack();
         for (const Node& n : b) {
             if (n.kind == NodeKind::Break || n.kind == NodeKind::Return) return true;
             if (n.kind == NodeKind::If && leaves(n.body) && leaves(n.elseBody)) return true;
@@ -733,6 +751,7 @@ private:
 
     // Whether `b` has a `break` or `continue` of the loop it belongs to (those inside a nested loop are that loop's).
     static bool escapes(const Block& b) {
+        checkStack();
         for (const Node& n : b) {
             if (n.kind == NodeKind::Break || n.kind == NodeKind::Continue) return true;
             if (n.kind == NodeKind::If && (escapes(n.body) || escapes(n.elseBody))) return true;
@@ -749,6 +768,11 @@ private:
     // in the rungs. A `break` / `continue` of the enclosing loop inside a rung would leave the do-block instead, so a ladder with
     // one stays nested, rung by rung, until fewer than kFlatRungs remain or the stretch left has none (a ladder of more than 256 rungs
     // that has a `break` in its last ones is therefore refused by clang: its nesting is the number of rungs up to that `break`).
+    // Why a ladder with a `break` / `continue` in its rungs is not flattened too (decided, not forgotten): MSL has no goto, so the
+    // escape would have to become a flag variable tested after every rung (and the loop-guard counters, the `continue` of a
+    // for-loop's update and the phi copies all interact with it); a rewrite of that size changes the code of every ladder inside a
+    // loop and cannot be checked here without a Metal compiler. The nested form is always correct; only a ladder of more than
+    // ~250 rungs that has an escape in its last 64 is refused by clang, and the shaders that do that are generated.
     // Not covered: a chain of `?:` (the else of every link also holds code after the inner `if`, which copies the result) and a rung
     // whose else has anything but instructions before the next `if`: those nest one level per link, and clang refuses about 250.
     static constexpr size_t kFlatRungs = 64;
@@ -1551,6 +1575,7 @@ private:
 };
 
 bool usesSubgroups(const Block& b) {
+    checkStack();
     return std::any_of(b.begin(), b.end(), [](const Node& n) {
         bool op = n.kind == NodeKind::Inst && n.inst.op >= Op::SubgroupBallot && n.inst.op <= Op::SubgroupArith;
         return op || usesSubgroups(n.body) || usesSubgroups(n.elseBody);
@@ -1559,6 +1584,7 @@ bool usesSubgroups(const Block& b) {
 
 // Ops that build the active mask (activeWord) and need the lane id.
 bool usesBallot(const Block& b) {
+    checkStack();
     return std::any_of(b.begin(), b.end(), [](const Node& n) {
         return (n.kind == NodeKind::Inst && (n.inst.op == Op::SubgroupBallot || n.inst.op == Op::SubgroupReadFirst)) ||
                usesBallot(n.body) || usesBallot(n.elseBody);
@@ -1576,7 +1602,20 @@ bool usesSubgroups(const Module& m) {
 
 }  // namespace
 
+static EmitResult emitMslImpl(const Module& module, const EmitOptions& options);
+
 EmitResult emitMsl(const Module& module, const EmitOptions& options) {
+    vpir::StackGuard stackGuard;  // (checkStack: a thread with a small stack gets an error instead of a crash)
+    try {
+        return emitMslImpl(module, options);
+    } catch (const std::length_error& e) {
+        EmitResult r;
+        r.errors.push_back(std::string("msl: ") + e.what());
+        return r;
+    }
+}
+
+static EmitResult emitMslImpl(const Module& module, const EmitOptions& options) {
     EmitResult r;
     r.errors = verify(module);
     if (module.waveSize != 32 && usesSubgroups(module))
@@ -1594,6 +1633,7 @@ EmitResult emitMsl(const Module& module, const EmitOptions& options) {
         // A BufferSize entry for every storage buffer the shader loads, stores or does atomics on.
         std::set<uint32_t> touched;
         std::function<void(const Block&)> walk = [&](const Block& b) {
+            checkStack();
             for (const Node& n : b) {
                 const Inst& in = n.inst;
                 if (n.kind == NodeKind::Inst && in.sym < m.resources.size() && m.resources[in.sym].kind == ResourceKind::Buffer &&
@@ -1621,6 +1661,7 @@ EmitResult emitMsl(const Module& module, const EmitOptions& options) {
         // A SamplerBias entry for every sampler a sample goes through.
         std::set<uint32_t> used;
         std::function<void(const Block&)> walk = [&](const Block& b) {
+            checkStack();
             for (const Node& n : b) {
                 const Inst& in = n.inst;
                 if (n.kind == NodeKind::Inst && in.op == Op::ImageSample && in.sampler < m.resources.size())

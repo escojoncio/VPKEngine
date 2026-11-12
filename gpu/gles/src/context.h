@@ -20,12 +20,14 @@
 
 #include <thread>
 #include <array>
+#include <atomic>
 #include <cstdint>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "formats.h"
@@ -88,7 +90,10 @@ struct BufferStorage {
     VkDeviceSize size = 0;
     uint64_t lastUse = 0;  // serial of the last submission that references it (0 = never)
     uint64_t gpuWrite = 0; // serial of the last submission that writes it with the GPU (glReadPixels into a pixel pack buffer)
-    uint64_t openEpoch = 0; // Context::epoch_ of the open command buffer that last recorded it (see Context::useStorage)
+    // Open (unsent) command buffers, of any context, that record a use of it / (count; Device::lock held). While
+    // either is non-zero the stamps `lastUse` / `gpuWrite` are only guesses (the serial the buffer will get if nothing is submitted first),
+    // so what the CPU may do with the bytes is decided with these, never with `lastUse <= completed` alone.
+    uint32_t openRefs = 0;
     // Byte ranges [lo, hi) the GPU reads in the submissions that have not completed (merged, at most a few; meaningful while
     // lastUse is past `completed`): a CPU write to bytes outside them can be made in place (Context::prepareWrite).
     std::vector<std::pair<uint64_t, uint64_t>> reads;
@@ -659,9 +664,14 @@ public:
     // provisional until flush gives the real serial: another submission may take the predicted one first).
     bool storageBusy(const BufferStorage& s) const;
     // The GPU has still to write `s` (a readback into it): submitted and not completed, or recorded in the open command buffer.
+    // This context's open command buffer writes `s` with the GPU, or a submission that does is not complete. (A write recorded in
+    // another context's unsent command buffer is not seen: only that context's flush can send it; GL leaves that ordering to the application.)
     bool gpuWritePending(const BufferStorage& s) const;
+    // glBufferSubData over a buffer the GPU has still to write: the bytes (copied to the stream) go in by a GPU copy recorded after the
+    // writes, in order, so the CPU does not wait. False if it cannot (too big for the stream); the caller waits then.
+    bool updateOrdered(const StorageP& s, uint64_t offset, uint64_t size, const void* data);
     // A readback is recorded into `s`: flush stamps its gpuWrite with the serial it gets.
-    void noteGpuWrite(const StorageP& s) { gpuWrites_.push_back(s); }
+    void noteGpuWrite(const StorageP& s);
     // image2D bound to one slice of a 3D texture: Metal cannot view a 3D texture as 2D, so the dispatch works on a 2D
     // copy of the slice (copied in before, back after: syncSlicesBack).
     struct SliceSync {
@@ -813,9 +823,8 @@ public:
 private:
     VkCommandBuffer cb_ = VK_NULL_HANDLE;
     std::vector<std::shared_ptr<void>> keep_;
-    std::vector<StorageP> used_;
-    std::vector<StorageP> gpuWrites_;  // storages the open command buffer writes with the GPU
-    uint64_t epoch_ = 0;               // identifies the open command buffer (unique across contexts), see BufferStorage::openEpoch
+    std::unordered_map<BufferStorage*, StorageP> used_;  // storages the open command buffer records (each counted once in openRefs)
+    std::unordered_set<BufferStorage*> gpuWrites_;       // ... of those, the ones it writes with the GPU
     VkDescriptorPool descPool_ = VK_NULL_HANDLE;
     bool passOpen_ = false;
     // Image initialisations and uploads made while a pass is open wait here (in call order) until it ends: a pass is not cut for
@@ -901,6 +910,7 @@ private:
                                   const std::vector<uint32_t>& indices, int32_t baseVertex);
     StorageP xfbScratch_;  // set while the capture draw is prepared
     bool beginDispatch(Program*& p);
+    bool beginDispatchOnce(Program*& p);
     bool dispatching_ = false;  // bindResources runs for a dispatch (copies may be recorded)
     // The 2D storage view for image2D bound to slice `layer` of a 3D texture (see SliceSync); null when it cannot be had.
     VkImageView sliceView(Texture& t, uint32_t level, GLint layer, GLenum access, VkFormat format);
@@ -936,8 +946,10 @@ GLint uniformLocation(const Program& p, const char* name);
 
 Context* current();
 void setCurrent(Context* c);
+extern std::atomic<uint64_t> gSession;  // see current()
+
 Context* currentOrLast();
 void forgetContext(Context* c);
-void eglResetDisplay();  // egl.cpp: eglInitialize count back to 0 (vpgles_shutdown)
+void eglShutdownDisplay();  // egl.cpp: releases all the display owns and zeroes the eglInitialize count (vpgles_shutdown, Device still alive)
 
 }  // namespace vpgles

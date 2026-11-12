@@ -3,14 +3,22 @@
 #include <cmath>
 #include <map>
 #include <optional>
+#include <stdexcept>
 #include <tuple>
 
 #include "pass_util.h"
 #include "vpir/passes.h"
+#include "vpir/stack.h"
 
 namespace vpir {
 
 namespace {
+
+// The passes recurse over the nesting of the IR: with a vpir::StackGuard set by the caller, a thread with a small stack gets a
+// std::length_error (the module is then half optimized: the caller drops it) instead of a crash.
+void checkStack() {
+    if (stackLow()) throw std::length_error("IR nests too deeply for the stack of this thread");
+}
 
 bool hasEffect(Op op) { return op == Op::Call || (op >= Op::AtomicAdd && op <= Op::ImageAtomicCompareExchange); }
 
@@ -65,6 +73,7 @@ private:
     }
 
     void block(Block& b) {
+        checkStack();
         for (Node& n : b) {
             if (n.value != kNoValue) n.value = resolve(n.value);
             if (n.kind == NodeKind::Inst) {
@@ -265,6 +274,7 @@ void removeDeadValues(Function& f) {
         return uses[v];
     };
     auto count = [&](const Block& b, auto& self) -> void {
+        checkStack();
         for (const Node& n : b) {
             if (n.value != kNoValue) ++slot(n.value);
             for (ValueId a : n.inst.args) ++slot(a);
@@ -276,6 +286,7 @@ void removeDeadValues(Function& f) {
     std::vector<char> dead(uses.size());
     bool any = false;
     auto walk = [&](const Block& b, auto& self) -> void {
+        checkStack();
         for (size_t i = b.size(); i-- > 0;) {
             const Node& n = b[i];
             self(n.elseBody, self);
@@ -290,6 +301,7 @@ void removeDeadValues(Function& f) {
     walk(f.body, walk);
     if (!any) return;
     auto sweep = [&](Block& b, auto& self) -> void {
+        checkStack();
         std::erase_if(b, [&](const Node& n) {
             return n.kind == NodeKind::Inst && n.inst.result != kNoValue && n.inst.result < dead.size() && dead[n.inst.result];
         });

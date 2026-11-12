@@ -1229,12 +1229,16 @@ private:
                 const uint32_t stride = d && d->has(Deco::ArrayStride) ? d->get(Deco::ArrayStride) : naturalSize(p.type);
                 const TypeInfo& et = T(typeOf(el));
                 const uint64_t raw = isConstant(el) ? constScalar(el) : 0;
-                if (isConstant(el) && et.sign && (et.width == 64 ? int64_t(raw) < 0 : int32_t(uint32_t(raw)) < 0)) {
-                    // A step back (a negative signed element): added to the dynamic part as a u32 constant, so the sum with the offset is
-                    // modular like a dynamic index's, and a constant offset added later (a member, a following element) can bring it back
-                    // into range without the constant part overflowing. (An unsigned element of 2^31 or more is a huge step forward:
-                    // addOffset refuses it.)
-                    const int64_t back = et.width == 64 ? int64_t(raw) : int64_t(int32_t(uint32_t(raw)));
+                // 32- and 64-bit elements are read as SIGNED numbers whatever type they are declared with (an unsigned 0xFFFFFFFF is -1; the
+                // 32-bit byte offset's modular arithmetic makes it the same either way). Narrower ones (8/16 bits) keep their declared
+                // signedness, as a run-time index of that type does (VPIR holds it zero- or sign-extended to 32 bits): an unsigned
+                // u16 0xFFFF steps 65535 elements forward, a signed i16 -1 one back.
+                const uint32_t w = et.width >= 8 && et.width <= 64 ? et.width : 32;
+                if (isConstant(el) && (w >= 32 || et.sign) && ((raw >> (w - 1)) & 1)) {
+                    // A step back (an element with the top bit of its width set): added to the dynamic part as a u32 constant, so the sum
+                    // with the offset is modular like a dynamic index's, and a constant offset added later (a member, a following
+                    // element) can bring it back into range without the constant part overflowing.
+                    const int64_t back = w == 64 ? int64_t(raw) : int64_t(raw | (~uint64_t(0) << w));
                     const ValueId k = u32(uint32_t(uint64_t(back) * stride));
                     p.dyn = p.dyn == kNoValue ? k : bin(Op::Add, p.dyn, k, vpir::kU32);
                 } else {

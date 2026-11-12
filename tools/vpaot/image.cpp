@@ -47,6 +47,7 @@ std::vector<uint8_t> unwrap_self(const std::vector<uint8_t>& self) {
     if (phoff > self.size() - base || uint64_t(phnum) * 56 > self.size() - base - phoff) {
         throw std::runtime_error("SELF program headers out of the file");
     }
+    if (phnum == 0) throw std::runtime_error("SELF without program headers");  // (also: no empty image to copy into)
     std::vector<Phdr> ph(phnum);
     for (uint16_t i = 0; i < phnum; ++i) {
         std::memcpy(&ph[i], self.data() + base + phoff + i * 56, 56);
@@ -56,9 +57,16 @@ std::vector<uint8_t> unwrap_self(const std::vector<uint8_t>& self) {
     // The image is reserved up to the end of its last segment, so that end must be in proportion to the file: a segment's data is
     // in the SELF (filesz <= its size), and the ELF inside has the SELF's data plus alignment padding (up to one page per segment,
     // vp_self_pad), so a segment may end at most at size + padding (vp_self_end_limit, shared with runtime/vp_loader.c).
+    // Only a program header whose data a SELF segment carries (once each) can have alignment padding counted; the sum is capped.
+    std::vector<bool> backed(ph.size(), false);
+    for (uint16_t i = 0; i < count; ++i) {
+        if (!(get<uint64_t>(self, 32 + i * 32) & 0x800)) continue;
+        const size_t index = (get<uint64_t>(self, 32 + i * 32) >> 20) & 4095;
+        if (index < ph.size()) backed[index] = true;
+    }
     uint64_t pad_sum = 0;
-    for (const auto& p : ph) {
-        if (p.filesz) pad_sum += vp_self_pad(p.align);
+    for (size_t i = 0; i < ph.size(); ++i) {
+        if (backed[i] && ph[i].filesz) pad_sum += vp_self_pad(ph[i].align);
     }
     const uint64_t cap = vp_self_end_limit(self.size(), pad_sum);
     for (const auto& p : ph) {

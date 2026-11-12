@@ -145,6 +145,216 @@ void testExports() {
   dlclose(h);
 }
 
+// ---- handles the tests leave undestroyed -----------------------------------------------------------------------------------
+// LSan (detect_leaks=1) must pass: the object-creating calls of the tests below go through these wrappers (macros after the block; regions that call through function pointers, `v.vkCreateX`, switch them off),
+// which remember what the call made; an explicit destroy forgets it, and vkDestroyDevice destroys what is left (newest first) before
+// the device goes.
+namespace trk {
+struct Obj {
+  VkDevice dev;
+  uint64_t h;
+  int type;
+  std::function<void()> del;
+};
+inline std::mutex& mu() { static std::mutex m; return m; }
+inline std::vector<Obj>& live() { static std::vector<Obj> v; return v; }
+template <class H> uint64_t key(H h) { uint64_t k = 0; std::memcpy(&k, &h, sizeof k < sizeof h ? sizeof k : sizeof h); return k; }
+inline void add(VkDevice d, uint64_t h, int type, std::function<void()> del) {
+  if (!h) return;
+  std::lock_guard<std::mutex> l(mu());
+  live().push_back({d, h, type, std::move(del)});
+}
+inline void drop(uint64_t h, int type) {
+  std::lock_guard<std::mutex> l(mu());
+  auto& v = live();
+  for (size_t i = v.size(); i-- > 0;)
+    if (v[i].h == h && v[i].type == type) {
+      v.erase(v.begin() + std::ptrdiff_t(i));
+      return;
+    }
+}
+inline void sweep(VkDevice d) {
+  std::vector<Obj> mine;
+  {
+    std::lock_guard<std::mutex> l(mu());
+    auto& v = live();
+    for (size_t i = 0; i < v.size();)
+      if (v[i].dev == d) mine.push_back(std::move(v[i])), v.erase(v.begin() + std::ptrdiff_t(i));
+      else ++i;
+  }
+  if (mine.empty()) return;
+  vkDeviceWaitIdle(d);
+  for (size_t i = mine.size(); i-- > 0;) mine[i].del();
+}
+inline VkResult createMemory(VkDevice dev, const VkMemoryAllocateInfo* ci, const VkAllocationCallbacks* a, VkDeviceMemory* out) {
+  const VkResult r = ::vkAllocateMemory(dev, ci, a, out);
+  if (r == VK_SUCCESS) add(dev, key(*out), 0, [dev, h = *out] { ::vkFreeMemory(dev, h, nullptr); });
+  return r;
+}
+inline void destroyMemory(VkDevice dev, VkDeviceMemory h, const VkAllocationCallbacks* a) { drop(key(h), 0); ::vkFreeMemory(dev, h, a); }
+inline VkResult createBuffer(VkDevice dev, const VkBufferCreateInfo* ci, const VkAllocationCallbacks* a, VkBuffer* out) {
+  const VkResult r = ::vkCreateBuffer(dev, ci, a, out);
+  if (r == VK_SUCCESS) add(dev, key(*out), 1, [dev, h = *out] { ::vkDestroyBuffer(dev, h, nullptr); });
+  return r;
+}
+inline void destroyBuffer(VkDevice dev, VkBuffer h, const VkAllocationCallbacks* a) { drop(key(h), 1); ::vkDestroyBuffer(dev, h, a); }
+inline VkResult createImage(VkDevice dev, const VkImageCreateInfo* ci, const VkAllocationCallbacks* a, VkImage* out) {
+  const VkResult r = ::vkCreateImage(dev, ci, a, out);
+  if (r == VK_SUCCESS) add(dev, key(*out), 2, [dev, h = *out] { ::vkDestroyImage(dev, h, nullptr); });
+  return r;
+}
+inline void destroyImage(VkDevice dev, VkImage h, const VkAllocationCallbacks* a) { drop(key(h), 2); ::vkDestroyImage(dev, h, a); }
+inline VkResult createImageView(VkDevice dev, const VkImageViewCreateInfo* ci, const VkAllocationCallbacks* a, VkImageView* out) {
+  const VkResult r = ::vkCreateImageView(dev, ci, a, out);
+  if (r == VK_SUCCESS) add(dev, key(*out), 3, [dev, h = *out] { ::vkDestroyImageView(dev, h, nullptr); });
+  return r;
+}
+inline void destroyImageView(VkDevice dev, VkImageView h, const VkAllocationCallbacks* a) { drop(key(h), 3); ::vkDestroyImageView(dev, h, a); }
+inline VkResult createSampler(VkDevice dev, const VkSamplerCreateInfo* ci, const VkAllocationCallbacks* a, VkSampler* out) {
+  const VkResult r = ::vkCreateSampler(dev, ci, a, out);
+  if (r == VK_SUCCESS) add(dev, key(*out), 4, [dev, h = *out] { ::vkDestroySampler(dev, h, nullptr); });
+  return r;
+}
+inline void destroySampler(VkDevice dev, VkSampler h, const VkAllocationCallbacks* a) { drop(key(h), 4); ::vkDestroySampler(dev, h, a); }
+inline VkResult createDescriptorSetLayout(VkDevice dev, const VkDescriptorSetLayoutCreateInfo* ci, const VkAllocationCallbacks* a, VkDescriptorSetLayout* out) {
+  const VkResult r = ::vkCreateDescriptorSetLayout(dev, ci, a, out);
+  if (r == VK_SUCCESS) add(dev, key(*out), 5, [dev, h = *out] { ::vkDestroyDescriptorSetLayout(dev, h, nullptr); });
+  return r;
+}
+inline void destroyDescriptorSetLayout(VkDevice dev, VkDescriptorSetLayout h, const VkAllocationCallbacks* a) { drop(key(h), 5); ::vkDestroyDescriptorSetLayout(dev, h, a); }
+inline VkResult createPipelineLayout(VkDevice dev, const VkPipelineLayoutCreateInfo* ci, const VkAllocationCallbacks* a, VkPipelineLayout* out) {
+  const VkResult r = ::vkCreatePipelineLayout(dev, ci, a, out);
+  if (r == VK_SUCCESS) add(dev, key(*out), 6, [dev, h = *out] { ::vkDestroyPipelineLayout(dev, h, nullptr); });
+  return r;
+}
+inline void destroyPipelineLayout(VkDevice dev, VkPipelineLayout h, const VkAllocationCallbacks* a) { drop(key(h), 6); ::vkDestroyPipelineLayout(dev, h, a); }
+inline VkResult createDescriptorPool(VkDevice dev, const VkDescriptorPoolCreateInfo* ci, const VkAllocationCallbacks* a, VkDescriptorPool* out) {
+  const VkResult r = ::vkCreateDescriptorPool(dev, ci, a, out);
+  if (r == VK_SUCCESS) add(dev, key(*out), 7, [dev, h = *out] { ::vkDestroyDescriptorPool(dev, h, nullptr); });
+  return r;
+}
+inline void destroyDescriptorPool(VkDevice dev, VkDescriptorPool h, const VkAllocationCallbacks* a) { drop(key(h), 7); ::vkDestroyDescriptorPool(dev, h, a); }
+inline VkResult createRenderPass(VkDevice dev, const VkRenderPassCreateInfo* ci, const VkAllocationCallbacks* a, VkRenderPass* out) {
+  const VkResult r = ::vkCreateRenderPass(dev, ci, a, out);
+  if (r == VK_SUCCESS) add(dev, key(*out), 8, [dev, h = *out] { ::vkDestroyRenderPass(dev, h, nullptr); });
+  return r;
+}
+inline void destroyRenderPass(VkDevice dev, VkRenderPass h, const VkAllocationCallbacks* a) { drop(key(h), 8); ::vkDestroyRenderPass(dev, h, a); }
+inline VkResult createFramebuffer(VkDevice dev, const VkFramebufferCreateInfo* ci, const VkAllocationCallbacks* a, VkFramebuffer* out) {
+  const VkResult r = ::vkCreateFramebuffer(dev, ci, a, out);
+  if (r == VK_SUCCESS) add(dev, key(*out), 9, [dev, h = *out] { ::vkDestroyFramebuffer(dev, h, nullptr); });
+  return r;
+}
+inline void destroyFramebuffer(VkDevice dev, VkFramebuffer h, const VkAllocationCallbacks* a) { drop(key(h), 9); ::vkDestroyFramebuffer(dev, h, a); }
+inline VkResult createShaderModule(VkDevice dev, const VkShaderModuleCreateInfo* ci, const VkAllocationCallbacks* a, VkShaderModule* out) {
+  const VkResult r = ::vkCreateShaderModule(dev, ci, a, out);
+  if (r == VK_SUCCESS) add(dev, key(*out), 10, [dev, h = *out] { ::vkDestroyShaderModule(dev, h, nullptr); });
+  return r;
+}
+inline void destroyShaderModule(VkDevice dev, VkShaderModule h, const VkAllocationCallbacks* a) { drop(key(h), 10); ::vkDestroyShaderModule(dev, h, a); }
+inline VkResult createCommandPool(VkDevice dev, const VkCommandPoolCreateInfo* ci, const VkAllocationCallbacks* a, VkCommandPool* out) {
+  const VkResult r = ::vkCreateCommandPool(dev, ci, a, out);
+  if (r == VK_SUCCESS) add(dev, key(*out), 11, [dev, h = *out] { ::vkDestroyCommandPool(dev, h, nullptr); });
+  return r;
+}
+inline void destroyCommandPool(VkDevice dev, VkCommandPool h, const VkAllocationCallbacks* a) { drop(key(h), 11); ::vkDestroyCommandPool(dev, h, a); }
+inline VkResult createQueryPool(VkDevice dev, const VkQueryPoolCreateInfo* ci, const VkAllocationCallbacks* a, VkQueryPool* out) {
+  const VkResult r = ::vkCreateQueryPool(dev, ci, a, out);
+  if (r == VK_SUCCESS) add(dev, key(*out), 12, [dev, h = *out] { ::vkDestroyQueryPool(dev, h, nullptr); });
+  return r;
+}
+inline void destroyQueryPool(VkDevice dev, VkQueryPool h, const VkAllocationCallbacks* a) { drop(key(h), 12); ::vkDestroyQueryPool(dev, h, a); }
+inline VkResult createSemaphore(VkDevice dev, const VkSemaphoreCreateInfo* ci, const VkAllocationCallbacks* a, VkSemaphore* out) {
+  const VkResult r = ::vkCreateSemaphore(dev, ci, a, out);
+  if (r == VK_SUCCESS) add(dev, key(*out), 13, [dev, h = *out] { ::vkDestroySemaphore(dev, h, nullptr); });
+  return r;
+}
+inline void destroySemaphore(VkDevice dev, VkSemaphore h, const VkAllocationCallbacks* a) { drop(key(h), 13); ::vkDestroySemaphore(dev, h, a); }
+inline VkResult createFence(VkDevice dev, const VkFenceCreateInfo* ci, const VkAllocationCallbacks* a, VkFence* out) {
+  const VkResult r = ::vkCreateFence(dev, ci, a, out);
+  if (r == VK_SUCCESS) add(dev, key(*out), 14, [dev, h = *out] { ::vkDestroyFence(dev, h, nullptr); });
+  return r;
+}
+inline void destroyFence(VkDevice dev, VkFence h, const VkAllocationCallbacks* a) { drop(key(h), 14); ::vkDestroyFence(dev, h, a); }
+inline VkResult createEvent(VkDevice dev, const VkEventCreateInfo* ci, const VkAllocationCallbacks* a, VkEvent* out) {
+  const VkResult r = ::vkCreateEvent(dev, ci, a, out);
+  if (r == VK_SUCCESS) add(dev, key(*out), 15, [dev, h = *out] { ::vkDestroyEvent(dev, h, nullptr); });
+  return r;
+}
+inline void destroyEvent(VkDevice dev, VkEvent h, const VkAllocationCallbacks* a) { drop(key(h), 15); ::vkDestroyEvent(dev, h, a); }
+inline VkResult createDescriptorUpdateTemplate(VkDevice dev, const VkDescriptorUpdateTemplateCreateInfo* ci, const VkAllocationCallbacks* a, VkDescriptorUpdateTemplate* out) {
+  const VkResult r = ::vkCreateDescriptorUpdateTemplate(dev, ci, a, out);
+  if (r == VK_SUCCESS) add(dev, key(*out), 16, [dev, h = *out] { ::vkDestroyDescriptorUpdateTemplate(dev, h, nullptr); });
+  return r;
+}
+inline void destroyDescriptorUpdateTemplate(VkDevice dev, VkDescriptorUpdateTemplate h, const VkAllocationCallbacks* a) { drop(key(h), 16); ::vkDestroyDescriptorUpdateTemplate(dev, h, a); }
+inline VkResult createBufferView(VkDevice dev, const VkBufferViewCreateInfo* ci, const VkAllocationCallbacks* a, VkBufferView* out) {
+  const VkResult r = ::vkCreateBufferView(dev, ci, a, out);
+  if (r == VK_SUCCESS) add(dev, key(*out), 101, [dev, h = *out] { ::vkDestroyBufferView(dev, h, nullptr); });
+  return r;
+}
+inline void destroyBufferView(VkDevice dev, VkBufferView h, const VkAllocationCallbacks* a) { drop(key(h), 101); ::vkDestroyBufferView(dev, h, a); }
+inline VkResult createGraphicsPipelines(VkDevice dev, VkPipelineCache c, uint32_t n, const VkGraphicsPipelineCreateInfo* ci,
+                                        const VkAllocationCallbacks* a, VkPipeline* out) {
+  const VkResult r = ::vkCreateGraphicsPipelines(dev, c, n, ci, a, out);
+  for (uint32_t i = 0; i < n; ++i)
+    if (out[i]) add(dev, key(out[i]), 100, [dev, h = out[i]] { ::vkDestroyPipeline(dev, h, nullptr); });
+  return r;
+}
+inline VkResult createComputePipelines(VkDevice dev, VkPipelineCache c, uint32_t n, const VkComputePipelineCreateInfo* ci,
+                                       const VkAllocationCallbacks* a, VkPipeline* out) {
+  const VkResult r = ::vkCreateComputePipelines(dev, c, n, ci, a, out);
+  for (uint32_t i = 0; i < n; ++i)
+    if (out[i]) add(dev, key(out[i]), 100, [dev, h = out[i]] { ::vkDestroyPipeline(dev, h, nullptr); });
+  return r;
+}
+inline void destroyPipeline(VkDevice dev, VkPipeline p, const VkAllocationCallbacks* a) { drop(key(p), 100); ::vkDestroyPipeline(dev, p, a); }
+inline void destroyDevice(VkDevice dev, const VkAllocationCallbacks* a) {
+  if (dev) sweep(dev);
+  ::vkDestroyDevice(dev, a);
+}
+}  // namespace trk
+#define vkAllocateMemory(...) trk::createMemory(__VA_ARGS__)
+#define vkCreateBuffer(...) trk::createBuffer(__VA_ARGS__)
+#define vkCreateImage(...) trk::createImage(__VA_ARGS__)
+#define vkCreateImageView(...) trk::createImageView(__VA_ARGS__)
+#define vkCreateSampler(...) trk::createSampler(__VA_ARGS__)
+#define vkCreateDescriptorSetLayout(...) trk::createDescriptorSetLayout(__VA_ARGS__)
+#define vkCreatePipelineLayout(...) trk::createPipelineLayout(__VA_ARGS__)
+#define vkCreateDescriptorPool(...) trk::createDescriptorPool(__VA_ARGS__)
+#define vkCreateRenderPass(...) trk::createRenderPass(__VA_ARGS__)
+#define vkCreateFramebuffer(...) trk::createFramebuffer(__VA_ARGS__)
+#define vkCreateShaderModule(...) trk::createShaderModule(__VA_ARGS__)
+#define vkCreateCommandPool(...) trk::createCommandPool(__VA_ARGS__)
+#define vkCreateQueryPool(...) trk::createQueryPool(__VA_ARGS__)
+#define vkCreateSemaphore(...) trk::createSemaphore(__VA_ARGS__)
+#define vkCreateFence(...) trk::createFence(__VA_ARGS__)
+#define vkCreateEvent(...) trk::createEvent(__VA_ARGS__)
+#define vkCreateDescriptorUpdateTemplate(...) trk::createDescriptorUpdateTemplate(__VA_ARGS__)
+#define vkFreeMemory(...) trk::destroyMemory(__VA_ARGS__)
+#define vkDestroyBuffer(...) trk::destroyBuffer(__VA_ARGS__)
+#define vkDestroyImage(...) trk::destroyImage(__VA_ARGS__)
+#define vkDestroyImageView(...) trk::destroyImageView(__VA_ARGS__)
+#define vkDestroySampler(...) trk::destroySampler(__VA_ARGS__)
+#define vkDestroyDescriptorSetLayout(...) trk::destroyDescriptorSetLayout(__VA_ARGS__)
+#define vkDestroyPipelineLayout(...) trk::destroyPipelineLayout(__VA_ARGS__)
+#define vkDestroyDescriptorPool(...) trk::destroyDescriptorPool(__VA_ARGS__)
+#define vkDestroyRenderPass(...) trk::destroyRenderPass(__VA_ARGS__)
+#define vkDestroyFramebuffer(...) trk::destroyFramebuffer(__VA_ARGS__)
+#define vkDestroyShaderModule(...) trk::destroyShaderModule(__VA_ARGS__)
+#define vkDestroyCommandPool(...) trk::destroyCommandPool(__VA_ARGS__)
+#define vkDestroyQueryPool(...) trk::destroyQueryPool(__VA_ARGS__)
+#define vkDestroySemaphore(...) trk::destroySemaphore(__VA_ARGS__)
+#define vkDestroyFence(...) trk::destroyFence(__VA_ARGS__)
+#define vkDestroyEvent(...) trk::destroyEvent(__VA_ARGS__)
+#define vkDestroyDescriptorUpdateTemplate(...) trk::destroyDescriptorUpdateTemplate(__VA_ARGS__)
+#define vkCreateGraphicsPipelines(...) trk::createGraphicsPipelines(__VA_ARGS__)
+#define vkCreateComputePipelines(...) trk::createComputePipelines(__VA_ARGS__)
+#define vkDestroyPipeline(...) trk::destroyPipeline(__VA_ARGS__)
+#define vkDestroyDevice(...) trk::destroyDevice(__VA_ARGS__)
+#define vkCreateBufferView(...) trk::createBufferView(__VA_ARGS__)
+#define vkDestroyBufferView(...) trk::destroyBufferView(__VA_ARGS__)
+
 struct Ctx {
   VkInstance inst = nullptr;
   VkPhysicalDevice pd = nullptr;
@@ -11758,6 +11968,47 @@ void testPhase1b() {
 // Everything goes through the hooked entry points (vkGetInstanceProcAddr), as a game or vpgles reaches them.
 #include "vpvk/vpcap_calls.h"
 
+// The calls of this region go through function pointers (v.vkCreateX): the tracker macros are off.
+#undef vkAllocateMemory
+#undef vkCreateBuffer
+#undef vkCreateImage
+#undef vkCreateImageView
+#undef vkCreateSampler
+#undef vkCreateDescriptorSetLayout
+#undef vkCreatePipelineLayout
+#undef vkCreateDescriptorPool
+#undef vkCreateRenderPass
+#undef vkCreateFramebuffer
+#undef vkCreateShaderModule
+#undef vkCreateCommandPool
+#undef vkCreateQueryPool
+#undef vkCreateSemaphore
+#undef vkCreateFence
+#undef vkCreateEvent
+#undef vkCreateDescriptorUpdateTemplate
+#undef vkFreeMemory
+#undef vkDestroyBuffer
+#undef vkDestroyImage
+#undef vkDestroyImageView
+#undef vkDestroySampler
+#undef vkDestroyDescriptorSetLayout
+#undef vkDestroyPipelineLayout
+#undef vkDestroyDescriptorPool
+#undef vkDestroyRenderPass
+#undef vkDestroyFramebuffer
+#undef vkDestroyShaderModule
+#undef vkDestroyCommandPool
+#undef vkDestroyQueryPool
+#undef vkDestroySemaphore
+#undef vkDestroyFence
+#undef vkDestroyEvent
+#undef vkDestroyDescriptorUpdateTemplate
+#undef vkCreateGraphicsPipelines
+#undef vkCreateComputePipelines
+#undef vkDestroyPipeline
+#undef vkDestroyDevice
+#undef vkCreateBufferView
+#undef vkDestroyBufferView
 #define CAP_FNS(X)                                                                                                    \
   X(vkCreateInstance) X(vkDestroyInstance) X(vkCreateDevice) X(vkDestroyDevice) X(vkGetDeviceQueue)                   \
   X(vkAllocateMemory) X(vkFreeMemory) X(vkMapMemory) X(vkCreateBuffer) X(vkDestroyBuffer) X(vkBindBufferMemory)       \
@@ -11775,6 +12026,115 @@ void testPhase1b() {
   X(vkCmdCopyBuffer2) X(vkCmdCopyImage2) X(vkCmdCopyBufferToImage2) X(vkCmdCopyImageToBuffer2) X(vkCmdBlitImage2)     \
   X(vkCmdBindVertexBuffers2) X(vkCmdDrawIndirectCount) X(vkCmdDrawIndexedIndirectCount)
 
+// CapApi calls the driver through function pointers (the capture hooks sit in between): the creating calls are wrapped here (the pointers
+// are replaced by CapApi::load) so that what a capture test leaves undestroyed is destroyed by CapRig / trk::sweep, like the Ctx tests'.
+static PFN_vkAllocateMemory real_vkAllocateMemory;
+static VkResult thunk_vkAllocateMemory(VkDevice dev, const VkMemoryAllocateInfo* ci, const VkAllocationCallbacks* a, VkDeviceMemory* out) {
+  const VkResult r = real_vkAllocateMemory(dev, ci, a, out);
+  if (r == VK_SUCCESS) trk::add(dev, trk::key(*out), 0, [dev, h = *out] { ::vkFreeMemory(dev, h, nullptr); });
+  return r;
+}
+static PFN_vkCreateBuffer real_vkCreateBuffer;
+static VkResult thunk_vkCreateBuffer(VkDevice dev, const VkBufferCreateInfo* ci, const VkAllocationCallbacks* a, VkBuffer* out) {
+  const VkResult r = real_vkCreateBuffer(dev, ci, a, out);
+  if (r == VK_SUCCESS) trk::add(dev, trk::key(*out), 1, [dev, h = *out] { ::vkDestroyBuffer(dev, h, nullptr); });
+  return r;
+}
+static PFN_vkCreateImage real_vkCreateImage;
+static VkResult thunk_vkCreateImage(VkDevice dev, const VkImageCreateInfo* ci, const VkAllocationCallbacks* a, VkImage* out) {
+  const VkResult r = real_vkCreateImage(dev, ci, a, out);
+  if (r == VK_SUCCESS) trk::add(dev, trk::key(*out), 2, [dev, h = *out] { ::vkDestroyImage(dev, h, nullptr); });
+  return r;
+}
+static PFN_vkCreateImageView real_vkCreateImageView;
+static VkResult thunk_vkCreateImageView(VkDevice dev, const VkImageViewCreateInfo* ci, const VkAllocationCallbacks* a, VkImageView* out) {
+  const VkResult r = real_vkCreateImageView(dev, ci, a, out);
+  if (r == VK_SUCCESS) trk::add(dev, trk::key(*out), 3, [dev, h = *out] { ::vkDestroyImageView(dev, h, nullptr); });
+  return r;
+}
+static PFN_vkCreateSampler real_vkCreateSampler;
+static VkResult thunk_vkCreateSampler(VkDevice dev, const VkSamplerCreateInfo* ci, const VkAllocationCallbacks* a, VkSampler* out) {
+  const VkResult r = real_vkCreateSampler(dev, ci, a, out);
+  if (r == VK_SUCCESS) trk::add(dev, trk::key(*out), 4, [dev, h = *out] { ::vkDestroySampler(dev, h, nullptr); });
+  return r;
+}
+static PFN_vkCreateDescriptorSetLayout real_vkCreateDescriptorSetLayout;
+static VkResult thunk_vkCreateDescriptorSetLayout(VkDevice dev, const VkDescriptorSetLayoutCreateInfo* ci, const VkAllocationCallbacks* a, VkDescriptorSetLayout* out) {
+  const VkResult r = real_vkCreateDescriptorSetLayout(dev, ci, a, out);
+  if (r == VK_SUCCESS) trk::add(dev, trk::key(*out), 5, [dev, h = *out] { ::vkDestroyDescriptorSetLayout(dev, h, nullptr); });
+  return r;
+}
+static PFN_vkCreatePipelineLayout real_vkCreatePipelineLayout;
+static VkResult thunk_vkCreatePipelineLayout(VkDevice dev, const VkPipelineLayoutCreateInfo* ci, const VkAllocationCallbacks* a, VkPipelineLayout* out) {
+  const VkResult r = real_vkCreatePipelineLayout(dev, ci, a, out);
+  if (r == VK_SUCCESS) trk::add(dev, trk::key(*out), 6, [dev, h = *out] { ::vkDestroyPipelineLayout(dev, h, nullptr); });
+  return r;
+}
+static PFN_vkCreateDescriptorPool real_vkCreateDescriptorPool;
+static VkResult thunk_vkCreateDescriptorPool(VkDevice dev, const VkDescriptorPoolCreateInfo* ci, const VkAllocationCallbacks* a, VkDescriptorPool* out) {
+  const VkResult r = real_vkCreateDescriptorPool(dev, ci, a, out);
+  if (r == VK_SUCCESS) trk::add(dev, trk::key(*out), 7, [dev, h = *out] { ::vkDestroyDescriptorPool(dev, h, nullptr); });
+  return r;
+}
+static PFN_vkCreateRenderPass real_vkCreateRenderPass;
+static VkResult thunk_vkCreateRenderPass(VkDevice dev, const VkRenderPassCreateInfo* ci, const VkAllocationCallbacks* a, VkRenderPass* out) {
+  const VkResult r = real_vkCreateRenderPass(dev, ci, a, out);
+  if (r == VK_SUCCESS) trk::add(dev, trk::key(*out), 8, [dev, h = *out] { ::vkDestroyRenderPass(dev, h, nullptr); });
+  return r;
+}
+static PFN_vkCreateFramebuffer real_vkCreateFramebuffer;
+static VkResult thunk_vkCreateFramebuffer(VkDevice dev, const VkFramebufferCreateInfo* ci, const VkAllocationCallbacks* a, VkFramebuffer* out) {
+  const VkResult r = real_vkCreateFramebuffer(dev, ci, a, out);
+  if (r == VK_SUCCESS) trk::add(dev, trk::key(*out), 9, [dev, h = *out] { ::vkDestroyFramebuffer(dev, h, nullptr); });
+  return r;
+}
+static PFN_vkCreateShaderModule real_vkCreateShaderModule;
+static VkResult thunk_vkCreateShaderModule(VkDevice dev, const VkShaderModuleCreateInfo* ci, const VkAllocationCallbacks* a, VkShaderModule* out) {
+  const VkResult r = real_vkCreateShaderModule(dev, ci, a, out);
+  if (r == VK_SUCCESS) trk::add(dev, trk::key(*out), 10, [dev, h = *out] { ::vkDestroyShaderModule(dev, h, nullptr); });
+  return r;
+}
+static PFN_vkCreateCommandPool real_vkCreateCommandPool;
+static VkResult thunk_vkCreateCommandPool(VkDevice dev, const VkCommandPoolCreateInfo* ci, const VkAllocationCallbacks* a, VkCommandPool* out) {
+  const VkResult r = real_vkCreateCommandPool(dev, ci, a, out);
+  if (r == VK_SUCCESS) trk::add(dev, trk::key(*out), 11, [dev, h = *out] { ::vkDestroyCommandPool(dev, h, nullptr); });
+  return r;
+}
+static PFN_vkCreateQueryPool real_vkCreateQueryPool;
+static VkResult thunk_vkCreateQueryPool(VkDevice dev, const VkQueryPoolCreateInfo* ci, const VkAllocationCallbacks* a, VkQueryPool* out) {
+  const VkResult r = real_vkCreateQueryPool(dev, ci, a, out);
+  if (r == VK_SUCCESS) trk::add(dev, trk::key(*out), 12, [dev, h = *out] { ::vkDestroyQueryPool(dev, h, nullptr); });
+  return r;
+}
+static PFN_vkCreateEvent real_vkCreateEvent;
+static VkResult thunk_vkCreateEvent(VkDevice dev, const VkEventCreateInfo* ci, const VkAllocationCallbacks* a, VkEvent* out) {
+  const VkResult r = real_vkCreateEvent(dev, ci, a, out);
+  if (r == VK_SUCCESS) trk::add(dev, trk::key(*out), 15, [dev, h = *out] { ::vkDestroyEvent(dev, h, nullptr); });
+  return r;
+}
+static PFN_vkCreateGraphicsPipelines real_vkCreateGraphicsPipelines;
+static VkResult thunk_vkCreateGraphicsPipelines(VkDevice dev, VkPipelineCache c, uint32_t n, const VkGraphicsPipelineCreateInfo* ci,
+                                                const VkAllocationCallbacks* a, VkPipeline* out) {
+  const VkResult r = real_vkCreateGraphicsPipelines(dev, c, n, ci, a, out);
+  for (uint32_t i = 0; i < n; ++i)
+    if (out[i]) trk::add(dev, trk::key(out[i]), 100, [dev, h = out[i]] { ::vkDestroyPipeline(dev, h, nullptr); });
+  return r;
+}
+static PFN_vkDestroyDevice real_vkDestroyDevice;
+static void thunk_vkDestroyDevice(VkDevice dev, const VkAllocationCallbacks* a) {
+  trk::sweep(dev);
+  real_vkDestroyDevice(dev, a);
+}
+static PFN_vkDestroyBuffer real_vkDestroyBuffer;
+static void thunk_vkDestroyBuffer(VkDevice dev, VkBuffer h, const VkAllocationCallbacks* a) { trk::drop(trk::key(h), 1); real_vkDestroyBuffer(dev, h, a); }
+static PFN_vkFreeMemory real_vkFreeMemory;
+static void thunk_vkFreeMemory(VkDevice dev, VkDeviceMemory h, const VkAllocationCallbacks* a) { trk::drop(trk::key(h), 0); real_vkFreeMemory(dev, h, a); }
+static PFN_vkDestroyShaderModule real_vkDestroyShaderModule;
+static void thunk_vkDestroyShaderModule(VkDevice dev, VkShaderModule h, const VkAllocationCallbacks* a) { trk::drop(trk::key(h), 10); real_vkDestroyShaderModule(dev, h, a); }
+static PFN_vkDestroyDescriptorSetLayout real_vkDestroyDescriptorSetLayout;
+static void thunk_vkDestroyDescriptorSetLayout(VkDevice dev, VkDescriptorSetLayout h, const VkAllocationCallbacks* a) { trk::drop(trk::key(h), 5); real_vkDestroyDescriptorSetLayout(dev, h, a); }
+#define TRK_WRAP(n) real_##n = n; n = thunk_##n;
+
 struct CapApi {
 #define X(n) PFN_##n n = nullptr;
   CAP_FNS(X)
@@ -11783,6 +12143,22 @@ struct CapApi {
 #define X(n) n = reinterpret_cast<PFN_##n>(vkGetInstanceProcAddr(inst, #n)); CHECK(n != nullptr);
     CAP_FNS(X)
 #undef X
+    TRK_WRAP(vkAllocateMemory)
+    TRK_WRAP(vkCreateBuffer)
+    TRK_WRAP(vkCreateImage)
+    TRK_WRAP(vkCreateImageView)
+    TRK_WRAP(vkCreateSampler)
+    TRK_WRAP(vkCreateDescriptorSetLayout)
+    TRK_WRAP(vkCreatePipelineLayout)
+    TRK_WRAP(vkCreateDescriptorPool)
+    TRK_WRAP(vkCreateRenderPass)
+    TRK_WRAP(vkCreateFramebuffer)
+    TRK_WRAP(vkCreateShaderModule)
+    TRK_WRAP(vkCreateCommandPool)
+    TRK_WRAP(vkCreateQueryPool)
+    TRK_WRAP(vkCreateEvent)
+    TRK_WRAP(vkDestroyDevice)
+    TRK_WRAP(vkCreateGraphicsPipelines) TRK_WRAP(vkDestroyBuffer) TRK_WRAP(vkFreeMemory) TRK_WRAP(vkDestroyShaderModule) TRK_WRAP(vkDestroyDescriptorSetLayout)
   }
 };
 
@@ -11987,6 +12363,7 @@ struct CapRig {
     for (int i = 0; i < 256; ++i) map[16384 + i] = uint8_t(i * 3 + seed);
   }
   ~CapRig() {
+    trk::sweep(dev);  // what the rig and its test left undestroyed (CapApi::load wraps the creating calls)
     v.vkDestroyDevice(dev, nullptr);
     v.vkDestroyInstance(inst, nullptr);
   }
@@ -13210,6 +13587,7 @@ void testCaptureUnhooked() {
     tci.descriptorUpdateEntryCount = 1, tci.pDescriptorUpdateEntries = &te, tci.templateType = VK_DESCRIPTOR_UPDATE_TEMPLATE_TYPE_DESCRIPTOR_SET;
     VkDescriptorUpdateTemplate tpl = nullptr;
     CHECK(createTpl(r.dev, &tci, nullptr, &tpl) == VK_SUCCESS);
+    trk::add(r.dev, trk::key(tpl), 16, [dev = r.dev, tpl] { ::vkDestroyDescriptorUpdateTemplate(dev, tpl, nullptr); });  // (found by name: not wrapped)
     VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
     bci.size = 512, bci.usage = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT;
     VkBuffer late = nullptr;  // bound inside the capture
@@ -13479,6 +13857,47 @@ void testCaptureLocks() {
   CHECK(f.ok && f.has("frames=3\n"));
   std::remove(path.c_str());
 }
+// (the tracker macros are on again)
+#define vkAllocateMemory(...) trk::createMemory(__VA_ARGS__)
+#define vkCreateBuffer(...) trk::createBuffer(__VA_ARGS__)
+#define vkCreateImage(...) trk::createImage(__VA_ARGS__)
+#define vkCreateImageView(...) trk::createImageView(__VA_ARGS__)
+#define vkCreateSampler(...) trk::createSampler(__VA_ARGS__)
+#define vkCreateDescriptorSetLayout(...) trk::createDescriptorSetLayout(__VA_ARGS__)
+#define vkCreatePipelineLayout(...) trk::createPipelineLayout(__VA_ARGS__)
+#define vkCreateDescriptorPool(...) trk::createDescriptorPool(__VA_ARGS__)
+#define vkCreateRenderPass(...) trk::createRenderPass(__VA_ARGS__)
+#define vkCreateFramebuffer(...) trk::createFramebuffer(__VA_ARGS__)
+#define vkCreateShaderModule(...) trk::createShaderModule(__VA_ARGS__)
+#define vkCreateCommandPool(...) trk::createCommandPool(__VA_ARGS__)
+#define vkCreateQueryPool(...) trk::createQueryPool(__VA_ARGS__)
+#define vkCreateSemaphore(...) trk::createSemaphore(__VA_ARGS__)
+#define vkCreateFence(...) trk::createFence(__VA_ARGS__)
+#define vkCreateEvent(...) trk::createEvent(__VA_ARGS__)
+#define vkCreateDescriptorUpdateTemplate(...) trk::createDescriptorUpdateTemplate(__VA_ARGS__)
+#define vkFreeMemory(...) trk::destroyMemory(__VA_ARGS__)
+#define vkDestroyBuffer(...) trk::destroyBuffer(__VA_ARGS__)
+#define vkDestroyImage(...) trk::destroyImage(__VA_ARGS__)
+#define vkDestroyImageView(...) trk::destroyImageView(__VA_ARGS__)
+#define vkDestroySampler(...) trk::destroySampler(__VA_ARGS__)
+#define vkDestroyDescriptorSetLayout(...) trk::destroyDescriptorSetLayout(__VA_ARGS__)
+#define vkDestroyPipelineLayout(...) trk::destroyPipelineLayout(__VA_ARGS__)
+#define vkDestroyDescriptorPool(...) trk::destroyDescriptorPool(__VA_ARGS__)
+#define vkDestroyRenderPass(...) trk::destroyRenderPass(__VA_ARGS__)
+#define vkDestroyFramebuffer(...) trk::destroyFramebuffer(__VA_ARGS__)
+#define vkDestroyShaderModule(...) trk::destroyShaderModule(__VA_ARGS__)
+#define vkDestroyCommandPool(...) trk::destroyCommandPool(__VA_ARGS__)
+#define vkDestroyQueryPool(...) trk::destroyQueryPool(__VA_ARGS__)
+#define vkDestroySemaphore(...) trk::destroySemaphore(__VA_ARGS__)
+#define vkDestroyFence(...) trk::destroyFence(__VA_ARGS__)
+#define vkDestroyEvent(...) trk::destroyEvent(__VA_ARGS__)
+#define vkDestroyDescriptorUpdateTemplate(...) trk::destroyDescriptorUpdateTemplate(__VA_ARGS__)
+#define vkCreateGraphicsPipelines(...) trk::createGraphicsPipelines(__VA_ARGS__)
+#define vkCreateComputePipelines(...) trk::createComputePipelines(__VA_ARGS__)
+#define vkDestroyPipeline(...) trk::destroyPipeline(__VA_ARGS__)
+#define vkDestroyDevice(...) trk::destroyDevice(__VA_ARGS__)
+#define vkCreateBufferView(...) trk::createBufferView(__VA_ARGS__)
+#define vkDestroyBufferView(...) trk::destroyBufferView(__VA_ARGS__)
 
 // The VPCAP call codec on structures the capture test above does not reach: encode, decode, compare. Handles are fake
 // addresses; the stored ids are those addresses.
@@ -14186,6 +14605,47 @@ void recordTriangle(CapRig& r, VkCommandBuffer c) {
 }
 
 // Captures the triangle frame into `cap`.
+// The calls of this region go through function pointers (v.vkCreateX): the tracker macros are off.
+#undef vkAllocateMemory
+#undef vkCreateBuffer
+#undef vkCreateImage
+#undef vkCreateImageView
+#undef vkCreateSampler
+#undef vkCreateDescriptorSetLayout
+#undef vkCreatePipelineLayout
+#undef vkCreateDescriptorPool
+#undef vkCreateRenderPass
+#undef vkCreateFramebuffer
+#undef vkCreateShaderModule
+#undef vkCreateCommandPool
+#undef vkCreateQueryPool
+#undef vkCreateSemaphore
+#undef vkCreateFence
+#undef vkCreateEvent
+#undef vkCreateDescriptorUpdateTemplate
+#undef vkFreeMemory
+#undef vkDestroyBuffer
+#undef vkDestroyImage
+#undef vkDestroyImageView
+#undef vkDestroySampler
+#undef vkDestroyDescriptorSetLayout
+#undef vkDestroyPipelineLayout
+#undef vkDestroyDescriptorPool
+#undef vkDestroyRenderPass
+#undef vkDestroyFramebuffer
+#undef vkDestroyShaderModule
+#undef vkDestroyCommandPool
+#undef vkDestroyQueryPool
+#undef vkDestroySemaphore
+#undef vkDestroyFence
+#undef vkDestroyEvent
+#undef vkDestroyDescriptorUpdateTemplate
+#undef vkCreateGraphicsPipelines
+#undef vkCreateComputePipelines
+#undef vkDestroyPipeline
+#undef vkDestroyDevice
+#undef vkCreateBufferView
+#undef vkDestroyBufferView
 void captureTriangle(const std::string& cap) {
   vpvk_capture_track(0);
   CHECK(vpvk_capture_track(1) == 0);
@@ -14719,6 +15179,47 @@ void testReplay() {
     std::filesystem::copy(tmp, keep, std::filesystem::copy_options::recursive | std::filesystem::copy_options::overwrite_existing);
   std::filesystem::remove_all(tmp);
 }
+// (the tracker macros are on again)
+#define vkAllocateMemory(...) trk::createMemory(__VA_ARGS__)
+#define vkCreateBuffer(...) trk::createBuffer(__VA_ARGS__)
+#define vkCreateImage(...) trk::createImage(__VA_ARGS__)
+#define vkCreateImageView(...) trk::createImageView(__VA_ARGS__)
+#define vkCreateSampler(...) trk::createSampler(__VA_ARGS__)
+#define vkCreateDescriptorSetLayout(...) trk::createDescriptorSetLayout(__VA_ARGS__)
+#define vkCreatePipelineLayout(...) trk::createPipelineLayout(__VA_ARGS__)
+#define vkCreateDescriptorPool(...) trk::createDescriptorPool(__VA_ARGS__)
+#define vkCreateRenderPass(...) trk::createRenderPass(__VA_ARGS__)
+#define vkCreateFramebuffer(...) trk::createFramebuffer(__VA_ARGS__)
+#define vkCreateShaderModule(...) trk::createShaderModule(__VA_ARGS__)
+#define vkCreateCommandPool(...) trk::createCommandPool(__VA_ARGS__)
+#define vkCreateQueryPool(...) trk::createQueryPool(__VA_ARGS__)
+#define vkCreateSemaphore(...) trk::createSemaphore(__VA_ARGS__)
+#define vkCreateFence(...) trk::createFence(__VA_ARGS__)
+#define vkCreateEvent(...) trk::createEvent(__VA_ARGS__)
+#define vkCreateDescriptorUpdateTemplate(...) trk::createDescriptorUpdateTemplate(__VA_ARGS__)
+#define vkFreeMemory(...) trk::destroyMemory(__VA_ARGS__)
+#define vkDestroyBuffer(...) trk::destroyBuffer(__VA_ARGS__)
+#define vkDestroyImage(...) trk::destroyImage(__VA_ARGS__)
+#define vkDestroyImageView(...) trk::destroyImageView(__VA_ARGS__)
+#define vkDestroySampler(...) trk::destroySampler(__VA_ARGS__)
+#define vkDestroyDescriptorSetLayout(...) trk::destroyDescriptorSetLayout(__VA_ARGS__)
+#define vkDestroyPipelineLayout(...) trk::destroyPipelineLayout(__VA_ARGS__)
+#define vkDestroyDescriptorPool(...) trk::destroyDescriptorPool(__VA_ARGS__)
+#define vkDestroyRenderPass(...) trk::destroyRenderPass(__VA_ARGS__)
+#define vkDestroyFramebuffer(...) trk::destroyFramebuffer(__VA_ARGS__)
+#define vkDestroyShaderModule(...) trk::destroyShaderModule(__VA_ARGS__)
+#define vkDestroyCommandPool(...) trk::destroyCommandPool(__VA_ARGS__)
+#define vkDestroyQueryPool(...) trk::destroyQueryPool(__VA_ARGS__)
+#define vkDestroySemaphore(...) trk::destroySemaphore(__VA_ARGS__)
+#define vkDestroyFence(...) trk::destroyFence(__VA_ARGS__)
+#define vkDestroyEvent(...) trk::destroyEvent(__VA_ARGS__)
+#define vkDestroyDescriptorUpdateTemplate(...) trk::destroyDescriptorUpdateTemplate(__VA_ARGS__)
+#define vkCreateGraphicsPipelines(...) trk::createGraphicsPipelines(__VA_ARGS__)
+#define vkCreateComputePipelines(...) trk::createComputePipelines(__VA_ARGS__)
+#define vkDestroyPipeline(...) trk::destroyPipeline(__VA_ARGS__)
+#define vkDestroyDevice(...) trk::destroyDevice(__VA_ARGS__)
+#define vkCreateBufferView(...) trk::createBufferView(__VA_ARGS__)
+#define vkDestroyBufferView(...) trk::destroyBufferView(__VA_ARGS__)
 
 // vpreplay on lavapipe through the Vulkan loader (registered by CMake only when lavapipe's ICD manifest exists): the triangle
 // capture must come out as a PNG with the triangle in it.
@@ -16285,6 +16786,47 @@ VkResult halfFailedBatch(VkDevice dv, VkPipelineCache c, uint32_t n, const VkCom
   for (uint32_t i = 1; i < n; ++i) out[i] = VK_NULL_HANDLE;           // the others fail
   return r == VK_SUCCESS ? VK_ERROR_OUT_OF_HOST_MEMORY : r;
 }
+// The calls of this region go through function pointers (v.vkCreateX): the tracker macros are off.
+#undef vkAllocateMemory
+#undef vkCreateBuffer
+#undef vkCreateImage
+#undef vkCreateImageView
+#undef vkCreateSampler
+#undef vkCreateDescriptorSetLayout
+#undef vkCreatePipelineLayout
+#undef vkCreateDescriptorPool
+#undef vkCreateRenderPass
+#undef vkCreateFramebuffer
+#undef vkCreateShaderModule
+#undef vkCreateCommandPool
+#undef vkCreateQueryPool
+#undef vkCreateSemaphore
+#undef vkCreateFence
+#undef vkCreateEvent
+#undef vkCreateDescriptorUpdateTemplate
+#undef vkFreeMemory
+#undef vkDestroyBuffer
+#undef vkDestroyImage
+#undef vkDestroyImageView
+#undef vkDestroySampler
+#undef vkDestroyDescriptorSetLayout
+#undef vkDestroyPipelineLayout
+#undef vkDestroyDescriptorPool
+#undef vkDestroyRenderPass
+#undef vkDestroyFramebuffer
+#undef vkDestroyShaderModule
+#undef vkDestroyCommandPool
+#undef vkDestroyQueryPool
+#undef vkDestroySemaphore
+#undef vkDestroyFence
+#undef vkDestroyEvent
+#undef vkDestroyDescriptorUpdateTemplate
+#undef vkCreateGraphicsPipelines
+#undef vkCreateComputePipelines
+#undef vkDestroyPipeline
+#undef vkDestroyDevice
+#undef vkCreateBufferView
+#undef vkDestroyBufferView
 void testAuditCapturePartialBatch() {
   const std::string path = (std::filesystem::temp_directory_path() / ("vpcap_batch_" + std::to_string(getpid()) + ".vpcap")).string();
   std::remove(path.c_str());
@@ -16314,7 +16856,7 @@ void testAuditCapturePartialBatch() {
     r.record(r.cb[1], true);
     r.submit({r.cb[1]});  // its one frame: the capture ends
     CHECK(vpvk_capture_state() == 0);
-    if (out[0]) vkDestroyPipeline(r.dev, out[0], nullptr);
+    if (out[0]) trk::destroyPipeline(r.dev, out[0], nullptr);
     r.v.vkDestroyShaderModule(r.dev, cs, nullptr);
   }
   vpvk_capture_track(0);
@@ -16328,6 +16870,47 @@ void testAuditCapturePartialBatch() {
   CHECK(created == 1);  // the one the batch made (it was not recorded when the batch's result was an error)
   std::remove(path.c_str());
 }
+// (the tracker macros are on again)
+#define vkAllocateMemory(...) trk::createMemory(__VA_ARGS__)
+#define vkCreateBuffer(...) trk::createBuffer(__VA_ARGS__)
+#define vkCreateImage(...) trk::createImage(__VA_ARGS__)
+#define vkCreateImageView(...) trk::createImageView(__VA_ARGS__)
+#define vkCreateSampler(...) trk::createSampler(__VA_ARGS__)
+#define vkCreateDescriptorSetLayout(...) trk::createDescriptorSetLayout(__VA_ARGS__)
+#define vkCreatePipelineLayout(...) trk::createPipelineLayout(__VA_ARGS__)
+#define vkCreateDescriptorPool(...) trk::createDescriptorPool(__VA_ARGS__)
+#define vkCreateRenderPass(...) trk::createRenderPass(__VA_ARGS__)
+#define vkCreateFramebuffer(...) trk::createFramebuffer(__VA_ARGS__)
+#define vkCreateShaderModule(...) trk::createShaderModule(__VA_ARGS__)
+#define vkCreateCommandPool(...) trk::createCommandPool(__VA_ARGS__)
+#define vkCreateQueryPool(...) trk::createQueryPool(__VA_ARGS__)
+#define vkCreateSemaphore(...) trk::createSemaphore(__VA_ARGS__)
+#define vkCreateFence(...) trk::createFence(__VA_ARGS__)
+#define vkCreateEvent(...) trk::createEvent(__VA_ARGS__)
+#define vkCreateDescriptorUpdateTemplate(...) trk::createDescriptorUpdateTemplate(__VA_ARGS__)
+#define vkFreeMemory(...) trk::destroyMemory(__VA_ARGS__)
+#define vkDestroyBuffer(...) trk::destroyBuffer(__VA_ARGS__)
+#define vkDestroyImage(...) trk::destroyImage(__VA_ARGS__)
+#define vkDestroyImageView(...) trk::destroyImageView(__VA_ARGS__)
+#define vkDestroySampler(...) trk::destroySampler(__VA_ARGS__)
+#define vkDestroyDescriptorSetLayout(...) trk::destroyDescriptorSetLayout(__VA_ARGS__)
+#define vkDestroyPipelineLayout(...) trk::destroyPipelineLayout(__VA_ARGS__)
+#define vkDestroyDescriptorPool(...) trk::destroyDescriptorPool(__VA_ARGS__)
+#define vkDestroyRenderPass(...) trk::destroyRenderPass(__VA_ARGS__)
+#define vkDestroyFramebuffer(...) trk::destroyFramebuffer(__VA_ARGS__)
+#define vkDestroyShaderModule(...) trk::destroyShaderModule(__VA_ARGS__)
+#define vkDestroyCommandPool(...) trk::destroyCommandPool(__VA_ARGS__)
+#define vkDestroyQueryPool(...) trk::destroyQueryPool(__VA_ARGS__)
+#define vkDestroySemaphore(...) trk::destroySemaphore(__VA_ARGS__)
+#define vkDestroyFence(...) trk::destroyFence(__VA_ARGS__)
+#define vkDestroyEvent(...) trk::destroyEvent(__VA_ARGS__)
+#define vkDestroyDescriptorUpdateTemplate(...) trk::destroyDescriptorUpdateTemplate(__VA_ARGS__)
+#define vkCreateGraphicsPipelines(...) trk::createGraphicsPipelines(__VA_ARGS__)
+#define vkCreateComputePipelines(...) trk::createComputePipelines(__VA_ARGS__)
+#define vkDestroyPipeline(...) trk::destroyPipeline(__VA_ARGS__)
+#define vkDestroyDevice(...) trk::destroyDevice(__VA_ARGS__)
+#define vkCreateBufferView(...) trk::createBufferView(__VA_ARGS__)
+#define vkDestroyBufferView(...) trk::destroyBufferView(__VA_ARGS__)
 
 int main(int argc, char** argv) {
   gLib = argc > 2 ? argv[2] : "libVPVulkan.so";

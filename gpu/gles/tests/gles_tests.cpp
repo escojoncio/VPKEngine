@@ -5525,8 +5525,8 @@ void testAuditCompile() {
         const GLuint sh = glCreateShader(gl::VERTEX_SHADER);
         const char* p = src.c_str();
         glShaderSource(sh, 1, &p, nullptr);
+        compiling = true;  // (before `ready`: the caller's loop starts on compiling)
         ready = true;
-        compiling = true;
         const auto t0 = std::chrono::steady_clock::now();
         glCompileShader(sh);
         compileUs = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count();
@@ -6527,8 +6527,9 @@ void testAudit3StaleStamp() {
     glReadPixels(0, 0, 8, 8, gl::RGBA, gl::UNSIGNED_BYTE, nullptr);
     foreign();
     before = submits;
+    resetCalls();
     glBufferSubData(gl::PIXEL_PACK_BUFFER, 0, 16, patch);
-    CHECK(submits > before);
+    CHECK(submits == before && calls.copyBuffer == 1);  // goes in by a GPU copy recorded after the readback (in order, the CPU does not wait)
     glBindBuffer(gl::PIXEL_PACK_BUFFER, 0);
     settle();
     for (void* s : surfaces) eglDestroySurface(e.dpy, s);
@@ -6701,6 +6702,530 @@ void testAudit4XferOwnPass() {
     a.down();
 }
 
+// Round 5 (review) repros: a foreign submission takes the predicted serial; GPU writes into buffers; vpgles_shutdown with live objects.
+void audit4ReadsImpl(bool withB) {
+    Egl a;
+    CHECK(a.up());
+    SteadyKit ka;
+    ka.up();
+    G(glDrawArrays, void (*)(GLenum, GLint, GLsizei));
+    G(glFinish, void (*)());
+    G(glBindBuffer, void (*)(GLenum, GLuint));
+    G(glBufferSubData, void (*)(GLenum, GLintptr, GLsizeiptr, const void*));
+    G(glGetAttribLocation, GLint (*)(GLuint, const char*));
+    G(glVertexAttribPointer, void (*)(GLuint, GLint, GLenum, GLboolean, GLsizei, const void*));
+    G(eglCreateContext, void* (*)(void*, void*, void*, const EGLint*));
+    G(eglCreatePbufferSurface, void* (*)(void*, void*, const EGLint*));
+    G(eglMakeCurrent, uint32_t (*)(void*, void*, void*, void*));
+    G(eglDestroyContext, uint32_t (*)(void*, void*));
+    G(eglDestroySurface, uint32_t (*)(void*, void*));
+    watchdog(60);
+    settle();
+    const EGLint sattrs[] = {egl::WIDTH, 16, egl::HEIGHT, 16, egl::NONE};
+    const EGLint cattrs[] = {egl::CONTEXT_CLIENT_VERSION, 3, egl::NONE};
+    void* surfB = eglCreatePbufferSurface(a.dpy, a.config, sattrs);
+    void* ctxB = eglCreateContext(a.dpy, a.config, a.ctx, cattrs);
+    CHECK(surfB && ctxB);
+    std::atomic<int> step{0};
+    std::thread th([&] {
+        eglMakeCurrent(a.dpy, surfB, surfB, ctxB);
+        SteadyKit kb;
+        kb.up();
+        settle();
+        step = 1;
+        while (step != 2) std::this_thread::yield();
+        if (withB) {
+            glBindBuffer(gl::ARRAY_BUFFER, ka.vb);  // the shared buffer, other vertices of it
+            const GLint pos = glGetAttribLocation(kb.prog, "a_pos"), uv = glGetAttribLocation(kb.prog, "a_uv"), col = glGetAttribLocation(kb.prog, "a_col");
+            glVertexAttribPointer(GLuint(pos), 4, gl::FLOAT, 0, 40, nullptr);
+            glVertexAttribPointer(GLuint(uv), 2, gl::FLOAT, 0, 40, reinterpret_cast<void*>(16));
+            glVertexAttribPointer(GLuint(col), 4, gl::FLOAT, 0, 40, reinterpret_cast<void*>(24));
+            glDrawArrays(gl::TRIANGLES, 3, 3);
+        }
+        step = 3;
+        while (step != 4) std::this_thread::yield();
+        glFinish();
+        eglMakeCurrent(a.dpy, nullptr, nullptr, nullptr);
+    });
+    while (step != 1) std::this_thread::yield();
+    glBindBuffer(gl::ARRAY_BUFFER, ka.vb);
+    glDrawArrays(gl::TRIANGLES, 0, 3);  // A's open command buffer reads vertices 0..2
+    void* s2 = eglCreatePbufferSurface(a.dpy, a.config, sattrs);  // a foreign submission takes the predicted serial and completes
+    step = 2;
+    while (step != 3) std::this_thread::yield();
+    const float patch[4] = {9, 9, 9, 9};
+    resetCalls();
+    glBufferSubData(gl::ARRAY_BUFFER, 0, 16, patch);  // over bytes A's unsent draw reads
+    std::printf("  withB=%d buffersCreated=%d (0 = written in place under A's unsent draw)\n", int(withB), int(calls.buffersCreated));
+    CHECK(calls.buffersCreated > 0);
+    step = 4;
+    th.join();
+    glFinish();
+    alarm(0);
+    eglDestroySurface(a.dpy, s2);
+    eglDestroyContext(a.dpy, ctxB);
+    eglDestroySurface(a.dpy, surfB);
+    a.down();
+}
+void testAudit4ReadsB() { audit4ReadsImpl(true); }
+void testAudit4ReadsCtl() { audit4ReadsImpl(false); }
+
+void testAudit4CopyGrow() {
+    Egl a;
+    CHECK(a.up());
+    SteadyKit ka;
+    ka.up();
+    G(glGenBuffers, void (*)(GLsizei, GLuint*));
+    G(glBindBuffer, void (*)(GLenum, GLuint));
+    G(glBufferData, void (*)(GLenum, GLsizeiptr, const void*, GLenum));
+    G(glBufferSubData, void (*)(GLenum, GLintptr, GLsizeiptr, const void*));
+    G(glCopyBufferSubData, void (*)(GLenum, GLenum, GLintptr, GLintptr, GLsizeiptr));
+    G(glMapBufferRange, void* (*)(GLenum, GLintptr, GLsizeiptr, GLbitfield));
+    G(glUnmapBuffer, GLboolean (*)(GLenum));
+    watchdog(60);
+    settle();
+    uint8_t oldData[64];
+    for (int i = 0; i < 64; ++i) oldData[i] = uint8_t(100 + i);
+    GLuint b[2];
+    glGenBuffers(2, b);
+    glBindBuffer(0x8F36 /*COPY_READ_BUFFER*/, b[0]);
+    glBufferData(0x8F36, 64, oldData, gl::STATIC_DRAW);
+    glBindBuffer(0x8F37 /*COPY_WRITE_BUFFER*/, b[1]);
+    glBufferData(0x8F37, 128, nullptr, gl::STATIC_DRAW);
+    glCopyBufferSubData(0x8F36, 0x8F37, 0, 0, 64);     // grow: the old contents go to the new buffer
+    const uint8_t more[16] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16};
+    // The copy is in the open command buffer: the append goes in by a GPU copy recorded after it (in order). (Copy on write first would
+    // take the host bytes before the GPU wrote them, and the copied bytes would be lost; the null platform does not run the GPU's copies,
+    // so the order is what is checked: no submission, no new storage.)
+    const int submitsBefore = submits;
+    resetCalls();
+    glBufferSubData(0x8F37, 64, 16, more);             // ... and the new data is appended
+    CHECK(submits == submitsBefore && calls.copyBuffer == 1);  // recorded in order after the copy, no wait
+    CHECK(calls.buffersCreated == 0);
+    const uint8_t* p = static_cast<const uint8_t*>(glMapBufferRange(0x8F37, 0, 128, gl::MAP_READ_BIT));
+    CHECK(p != nullptr);
+    if (p) {
+        std::printf("  dst[0..3]=%u %u %u %u (a real GPU: 100 101 102 103)  dst[64..67]=%u %u %u %u (a real GPU: 1 2 3 4)\n", p[0], p[1], p[2], p[3], p[64], p[65], p[66], p[67]);
+    }
+    glUnmapBuffer(0x8F37);
+    alarm(0);
+    a.down();
+}
+
+void testAudit4Reinit() {
+    G(eglTerminate, uint32_t (*)(void*));
+    G(eglInitialize, uint32_t (*)(void*, EGLint*, EGLint*));
+    G(eglMakeCurrent, uint32_t (*)(void*, void*, void*, void*));
+    G(glDrawArrays, void (*)(GLenum, GLint, GLsizei));
+    watchdog(60);
+    Egl a;
+    CHECK(a.up());
+    {
+        SteadyKit ka;
+        ka.up();
+        glDrawArrays(gl::TRIANGLES, 0, 3);
+    }
+    CHECK(eglMakeCurrent(a.dpy, nullptr, nullptr, nullptr) != 0);  // the session ends with its context and surface alive
+    auto shutdown = reinterpret_cast<void (*)()>(dlsym(gLib, "vpgles_shutdown"));
+    CHECK(shutdown != nullptr);
+    shutdown();
+    std::printf("  shutdown done\n"); std::fflush(stdout);
+    CHECK(vpgles_init(reinterpret_cast<void*>(&myGipa)) != 0);  // a new session in the same process
+    EGLint maj = 0, min = 0;
+    CHECK(eglInitialize(a.dpy, &maj, &min) != 0);
+    std::printf("  reinit done, terminating\n"); std::fflush(stdout);
+    CHECK(eglTerminate(a.dpy) != 0);  // releases the display: the old session's context and surface are still in its lists
+    std::printf("  terminate survived\n"); std::fflush(stdout);
+    alarm(0);
+}
+
+// ---- round 5 review repros -------------------------------------------------------------------------------
+GLuint audit5Compute(const char* src) {
+    G(glCreateShader, GLuint (*)(GLenum));
+    G(glShaderSource, void (*)(GLuint, GLsizei, const char* const*, const GLint*));
+    G(glCompileShader, void (*)(GLuint));
+    G(glGetShaderiv, void (*)(GLuint, GLenum, GLint*));
+    G(glGetShaderInfoLog, void (*)(GLuint, GLsizei, GLsizei*, char*));
+    G(glCreateProgram, GLuint (*)());
+    G(glAttachShader, void (*)(GLuint, GLuint));
+    G(glLinkProgram, void (*)(GLuint));
+    G(glGetProgramiv, void (*)(GLuint, GLenum, GLint*));
+    GLuint sh = glCreateShader(gl::COMPUTE_SHADER);
+    glShaderSource(sh, 1, &src, nullptr);
+    glCompileShader(sh);
+    GLint ok = 0;
+    glGetShaderiv(sh, gl::COMPILE_STATUS, &ok);
+    if (!ok) { char log[1024] = {}; glGetShaderInfoLog(sh, sizeof log, nullptr, log); std::printf("  compile log: %s\n", log); }
+    CHECK(ok);
+    GLuint cp = glCreateProgram();
+    glAttachShader(cp, sh);
+    glLinkProgram(cp);
+    glGetProgramiv(cp, gl::LINK_STATUS, &ok);
+    CHECK(ok);
+    return cp;
+}
+const GLenum kSSBO = 0x90D2, kUBO = 0x8A11;
+// Per-frame cost of updating a buffer a shader only READS: (A) readonly SSBO in a fragment shader, (B) UBO.
+void audit5PerfImpl(int kind, int how) {  // kind: 0 UBO, 1 readonly SSBO, 2 SSBO the fragment shader writes
+    const bool ssbo = kind != 0;
+    Egl a;
+    CHECK(a.up());
+    G(glGenBuffers, void (*)(GLsizei, GLuint*));
+    G(glBindBuffer, void (*)(GLenum, GLuint));
+    G(glBindBufferBase, void (*)(GLenum, GLuint, GLuint));
+    G(glBufferData, void (*)(GLenum, GLsizeiptr, const void*, GLenum));
+    G(glBufferSubData, void (*)(GLenum, GLintptr, GLsizeiptr, const void*));
+    G(glMapBufferRange, void* (*)(GLenum, GLintptr, GLsizeiptr, GLbitfield));
+    G(glUnmapBuffer, GLboolean (*)(GLenum));
+    G(glUseProgram, void (*)(GLuint));
+    G(glDrawArrays, void (*)(GLenum, GLint, GLsizei));
+    G(glUniformBlockBinding, void (*)(GLuint, GLuint, GLuint));
+    watchdog(60);
+    const char* vs = "#version 310 es\nvoid main(){ gl_Position = vec4(float(gl_VertexID)-1.0, 0.0, 0.0, 1.0); }\n";
+    const char* fsS = "#version 310 es\nprecision highp float;\nlayout(std430, binding = 0) readonly buffer B { vec4 c[16]; };\nout vec4 o;\nvoid main(){ o = c[3]; }\n";
+    const char* fsU = "#version 310 es\nprecision highp float;\nlayout(std140) uniform B { vec4 c[16]; };\nout vec4 o;\nvoid main(){ o = c[3]; }\n";
+    const char* fsW = "#version 310 es\nprecision highp float;\nlayout(std430, binding = 0) buffer B { vec4 c[16]; };\nout vec4 o;\nvoid main(){ c[1] = vec4(1.0); o = c[3]; }\n";
+    const GLuint p = program(vs, kind == 2 ? fsW : ssbo ? fsS : fsU);
+    glUseProgram(p);
+    const GLenum T = ssbo ? kSSBO : kUBO;
+    GLuint b;
+    glGenBuffers(1, &b);
+    glBindBuffer(T, b);
+    std::vector<float> data(64, 1.0f);
+    glBufferData(T, 256, data.data(), gl::DYNAMIC_DRAW);
+    glBindBufferBase(T, 0, b);
+    settle();
+    resetCalls();
+    const int s0 = submits;
+    const int frames = 100;
+    for (int f = 0; f < frames; ++f) {
+        for (int obj = 0; obj < 4; ++obj) {  // 4 objects per frame: update, draw
+            if (how == 0) glBufferSubData(T, 16, 64, data.data());          // partial
+            else if (how == 1) glBufferSubData(T, 0, 256, data.data());      // whole
+            else if (how == 2) { void* m = glMapBufferRange(T, 16, 64, gl::MAP_WRITE_BIT | gl::MAP_INVALIDATE_RANGE_BIT); CHECK(m); glUnmapBuffer(T); }
+            else if (how == 3) { void* m = glMapBufferRange(T, 16, 64, gl::MAP_WRITE_BIT | gl::MAP_UNSYNCHRONIZED_BIT); CHECK(m); glUnmapBuffer(T); }
+            else if (how == 4) { void* m = glMapBufferRange(T, 0, 256, gl::MAP_WRITE_BIT | gl::MAP_INVALIDATE_RANGE_BIT); CHECK(m); glUnmapBuffer(T); }
+            glDrawArrays(gl::TRIANGLES, 0, 3);
+        }
+        vpgles_flush(0);  // XR frame end: submit, no wait
+    }
+    std::printf("  kind=%d how=%d: frames=%d updates=%d submits=%d fenceWaits=%d buffersCreated=%d\n", kind, how, frames, frames * 4, submits - s0,
+                int(calls.waits), int(calls.buffersCreated));
+    // What a buffer a shader only reads costs per update is what a UBO costs: one submission per frame, no fence wait (main never waited).
+    // A buffer the shader writes takes the update in order on the GPU (partial) or new storage (whole): no wait either.
+    CHECK(calls.waits == 0);
+    CHECK(submits - s0 <= frames + 4);
+    settle();
+    alarm(0);
+    a.down();
+}
+void testAudit5Perf() {
+    for (int kind = 0; kind < 3; ++kind)
+        for (int how = 0; how < 5; ++how) {
+            // A buffer a shader writes cannot give a CPU pointer to some of its bytes (map WRITE over a range, INVALIDATE_RANGE or UNSYNCHRONIZED)
+            // before the GPU's writes land: those wait (and are not measured).
+            if (kind == 2 && (how == 2 || how == 3)) continue;
+            audit5PerfImpl(kind, how);
+        }
+}
+
+// imageBuffer / samplerBuffer: CPU write over a texture buffer's storage while an unsent dispatch uses it.
+void testAudit5TexBuf() {
+    Egl a;
+    CHECK(a.up());
+    G(glGenBuffers, void (*)(GLsizei, GLuint*));
+    G(glBindBuffer, void (*)(GLenum, GLuint));
+    G(glBufferData, void (*)(GLenum, GLsizeiptr, const void*, GLenum));
+    G(glBufferSubData, void (*)(GLenum, GLintptr, GLsizeiptr, const void*));
+    G(glMapBufferRange, void* (*)(GLenum, GLintptr, GLsizeiptr, GLbitfield));
+    G(glUnmapBuffer, GLboolean (*)(GLenum));
+    G(glGenTextures, void (*)(GLsizei, GLuint*));
+    G(glBindTexture, void (*)(GLenum, GLuint));
+    G(glTexBuffer, void (*)(GLenum, GLenum, GLuint));
+    G(glUseProgram, void (*)(GLuint));
+    G(glGetUniformLocation, GLint (*)(GLuint, const char*));
+    G(glUniform1i, void (*)(GLint, GLint));
+    G(glActiveTexture, void (*)(GLenum));
+    G(glBindImageTexture, void (*)(GLuint, GLuint, GLint, GLboolean, GLint, GLenum, GLenum));
+    G(glDispatchCompute, void (*)(GLuint, GLuint, GLuint));
+    watchdog(60);
+    const GLuint cp = audit5Compute(
+        "#version 310 es\n#extension GL_EXT_texture_buffer : require\nlayout(local_size_x = 4) in;\n"
+        "uniform highp samplerBuffer src;\nlayout(rgba32f, binding = 0) uniform highp imageBuffer dst;\n"
+        "void main() { int i = int(gl_GlobalInvocationID.x); imageStore(dst, i, texelFetch(src, i) + imageLoad(dst, i)); }\n");
+    GLuint tbuf[2], ttex[2];
+    glGenBuffers(2, tbuf);
+    glGenTextures(2, ttex);
+    const std::vector<float> data(16, 1.0f), two(16, 2.0f);
+    glBindBuffer(gl::TEXTURE_BUFFER, tbuf[0]);
+    glBufferData(gl::TEXTURE_BUFFER, 64, data.data(), gl::STATIC_DRAW);
+    glBindBuffer(gl::TEXTURE_BUFFER, tbuf[1]);
+    glBufferData(gl::TEXTURE_BUFFER, 64, data.data(), gl::DYNAMIC_DRAW);
+    glUseProgram(cp);
+    glActiveTexture(gl::TEXTURE0 + 2);
+    glBindTexture(gl::TEXTURE_BUFFER, ttex[1]);
+    glTexBuffer(gl::TEXTURE_BUFFER, gl::RGBA32F, tbuf[1]);
+    glBindImageTexture(0, ttex[1], 0, 0, 0, 0x88BA /*READ_WRITE*/, gl::RGBA32F);
+    glBindTexture(gl::TEXTURE_BUFFER, ttex[0]);
+    glTexBuffer(gl::TEXTURE_BUFFER, gl::RGBA32F, tbuf[0]);
+    glUniform1i(glGetUniformLocation(cp, "src"), 2);
+    settle();
+    CHECK(err() == gl::NO_ERROR);
+    // (1) samplerBuffer source, unsent dispatch reads it; whole and partial CPU writes.
+    for (int part = 0; part < 2; ++part) {
+        const int d0 = counts.dispatches;
+        glDispatchCompute(1, 1, 1);
+        CHECK(counts.dispatches == d0 + 1);
+        const int s0 = submits;
+        resetCalls();
+        glBindBuffer(gl::TEXTURE_BUFFER, tbuf[0]);
+        if (part) glBufferSubData(gl::TEXTURE_BUFFER, 0, 16, two.data());
+        else glBufferSubData(gl::TEXTURE_BUFFER, 0, 64, two.data());
+        std::printf("  samplerBuffer src, %s BufferSubData under an unsent dispatch: submits=%d buffersCreated=%d (0/0 = written in place: the dispatch reads the NEW bytes)\n",
+                    part ? "partial" : "whole", submits - s0, int(calls.buffersCreated));
+        CHECK(submits - s0 > 0 || calls.buffersCreated > 0);
+        settle();
+    }
+    // (2) imageBuffer destination (read + written by the unsent dispatch); whole CPU write (discard) and INVALIDATE_BUFFER map.
+    for (int how = 0; how < 3; ++how) {
+        const int d0 = counts.dispatches;
+        glDispatchCompute(1, 1, 1);
+        CHECK(counts.dispatches == d0 + 1);
+        const int s0 = submits;
+        resetCalls();
+        glBindBuffer(gl::TEXTURE_BUFFER, tbuf[1]);
+        if (how == 0) glBufferSubData(gl::TEXTURE_BUFFER, 0, 64, two.data());
+        else if (how == 1) { void* m = glMapBufferRange(gl::TEXTURE_BUFFER, 0, 64, gl::MAP_WRITE_BIT | gl::MAP_INVALIDATE_BUFFER_BIT); CHECK(m); glUnmapBuffer(gl::TEXTURE_BUFFER); }
+        else glBufferSubData(gl::TEXTURE_BUFFER, 0, 16, two.data());
+        std::printf("  imageBuffer dst, how=%d (0 whole SubData, 1 map INVALIDATE_BUFFER, 2 partial) under an unsent dispatch: submits=%d buffersCreated=%d copies=%d\n",
+                    how, submits - s0, int(calls.buffersCreated), int(calls.copyBuffer));
+        // (the partial one goes in by a GPU copy recorded after the dispatch, in order: nothing to wait for and no new storage)
+        CHECK(how == 2 ? calls.copyBuffer > 0 : (submits - s0 > 0 || calls.buffersCreated > 0));
+        settle();
+    }
+    alarm(0);
+    a.down();
+}
+
+// CPU readers of a buffer the GPU has still to write: the index scan of drawElements.
+void testAudit5IndexRead() {
+    Egl a;
+    CHECK(a.up());
+    SteadyKit ka;
+    ka.up();
+    G(glGenBuffers, void (*)(GLsizei, GLuint*));
+    G(glBindBuffer, void (*)(GLenum, GLuint));
+    G(glBufferData, void (*)(GLenum, GLsizeiptr, const void*, GLenum));
+    G(glCopyBufferSubData, void (*)(GLenum, GLenum, GLintptr, GLintptr, GLsizeiptr));
+    G(glDrawElements, void (*)(GLenum, GLsizei, GLenum, const void*));
+    watchdog(60);
+    settle();
+    const uint8_t idx[6] = {0, 1, 2, 2, 1, 3};
+    GLuint b[2];
+    glGenBuffers(2, b);
+    glBindBuffer(0x8F36, b[0]);
+    glBufferData(0x8F36, 6, idx, gl::STATIC_DRAW);
+    glBindBuffer(gl::ELEMENT_ARRAY_BUFFER, b[1]);
+    glBufferData(gl::ELEMENT_ARRAY_BUFFER, 6, nullptr, gl::STATIC_DRAW);
+    glBindBuffer(0x8F37, b[1]);
+    glCopyBufferSubData(0x8F36, 0x8F37, 0, 0, 6);  // the indices reach the element buffer when the GPU runs the copy
+    const int s0 = submits;
+    resetCalls();
+    glDrawElements(gl::TRIANGLES, 6, gl::UNSIGNED_BYTE, nullptr);  // 8-bit indices: read on the CPU (widened)
+    std::printf("  drawElements(UBYTE) from an element buffer with an unsent GPU copy into it: submits=%d waits=%d (0 = the CPU read the indices before the copy ran)\n",
+                submits - s0, int(calls.waits));
+    CHECK(submits - s0 > 0);
+    settle();
+    alarm(0);
+    a.down();
+}
+
+// Balance of the open-reference counts: after everything is finished, a partial write is made in place (no new storage, no submit).
+void testAudit5Balance() {
+    Egl a;
+    CHECK(a.up());
+    SteadyKit ka;
+    ka.up();
+    G(glDrawArrays, void (*)(GLenum, GLint, GLsizei));
+    G(glFinish, void (*)());
+    G(glFlush, void (*)());
+    G(glGenBuffers, void (*)(GLsizei, GLuint*));
+    G(glDeleteBuffers, void (*)(GLsizei, const GLuint*));
+    G(glBindBuffer, void (*)(GLenum, GLuint));
+    G(glBufferData, void (*)(GLenum, GLsizeiptr, const void*, GLenum));
+    G(glBufferSubData, void (*)(GLenum, GLintptr, GLsizeiptr, const void*));
+    G(glCopyBufferSubData, void (*)(GLenum, GLenum, GLintptr, GLintptr, GLsizeiptr));
+    G(glMapBufferRange, void* (*)(GLenum, GLintptr, GLsizeiptr, GLbitfield));
+    G(glUnmapBuffer, GLboolean (*)(GLenum));
+    G(glGetAttribLocation, GLint (*)(GLuint, const char*));
+    G(glVertexAttribPointer, void (*)(GLuint, GLint, GLenum, GLboolean, GLsizei, const void*));
+    G(eglCreateContext, void* (*)(void*, void*, void*, const EGLint*));
+    G(eglCreatePbufferSurface, void* (*)(void*, void*, const EGLint*));
+    G(eglMakeCurrent, uint32_t (*)(void*, void*, void*, void*));
+    G(eglDestroyContext, uint32_t (*)(void*, void*));
+    G(eglDestroySurface, uint32_t (*)(void*, void*));
+    watchdog(120);
+    settle();
+    const EGLint sattrs[] = {egl::WIDTH, 16, egl::HEIGHT, 16, egl::NONE};
+    const EGLint cattrs[] = {egl::CONTEXT_CLIENT_VERSION, 3, egl::NONE};
+    GLuint shared[2];
+    glGenBuffers(2, shared);
+    std::vector<uint8_t> blob(4096, 7);
+    for (GLuint s : shared) { glBindBuffer(0x8F36, s); glBufferData(0x8F36, 4096, blob.data(), gl::DYNAMIC_DRAW); }
+    glFinish();
+    std::atomic<bool> stop{false};
+    std::atomic<int> rounds{0};
+    auto worker = [&](unsigned seed, bool destroyOpen) {
+        for (int life = 0; life < 6 && !stop; ++life) {
+            void* surf = eglCreatePbufferSurface(a.dpy, a.config, sattrs);
+            void* ctx = eglCreateContext(a.dpy, a.config, a.ctx, cattrs);
+            eglMakeCurrent(a.dpy, surf, surf, ctx);
+            SteadyKit kb;
+            kb.up();
+            const GLint pos = glGetAttribLocation(kb.prog, "a_pos"), uv = glGetAttribLocation(kb.prog, "a_uv"), col = glGetAttribLocation(kb.prog, "a_col");
+            for (int i = 0; i < 300; ++i) {
+                seed = seed * 1664525u + 1013904223u;
+                const unsigned r = (seed >> 16) % 10;
+                const GLuint sb = shared[(seed >> 8) & 1];
+                switch (r) {
+                    case 0: case 1: {
+                        glBindBuffer(gl::ARRAY_BUFFER, sb);
+                        glVertexAttribPointer(GLuint(pos), 4, gl::FLOAT, 0, 40, nullptr);
+                        glVertexAttribPointer(GLuint(uv), 2, gl::FLOAT, 0, 40, reinterpret_cast<void*>(16));
+                        glVertexAttribPointer(GLuint(col), 4, gl::FLOAT, 0, 40, reinterpret_cast<void*>(24));
+                        glDrawArrays(gl::TRIANGLES, GLint((seed >> 20) % 30), 3);
+                        break;
+                    }
+                    case 2: glBindBuffer(0x8F37, sb); glBufferSubData(0x8F37, GLintptr((seed >> 20) % 4000), 64, blob.data()); break;
+                    case 3: glBindBuffer(0x8F37, sb); glBufferSubData(0x8F37, 0, 4096, blob.data()); break;
+                    case 4: {
+                        glBindBuffer(0x8F36, shared[0]); glBindBuffer(0x8F37, shared[1]);
+                        glCopyBufferSubData(0x8F36, 0x8F37, 0, 1024, 512);
+                        break;
+                    }
+                    case 5: { glBindBuffer(0x8F37, sb); void* m = glMapBufferRange(0x8F37, 0, 256, gl::MAP_READ_BIT); if (m) glUnmapBuffer(0x8F37); break; }
+                    case 6: { glBindBuffer(0x8F37, sb); void* m = glMapBufferRange(0x8F37, 128, 256, gl::MAP_WRITE_BIT | gl::MAP_UNSYNCHRONIZED_BIT); if (m) { std::memset(m, 1, 256); glUnmapBuffer(0x8F37); } break; }
+                    case 7: glFlush(); break;
+                    case 8: {  // a private buffer used and deleted while the command buffer is open
+                        GLuint t; glGenBuffers(1, &t); glBindBuffer(gl::ARRAY_BUFFER, t); glBufferData(gl::ARRAY_BUFFER, 4096, blob.data(), gl::STREAM_DRAW);
+                        glVertexAttribPointer(GLuint(pos), 4, gl::FLOAT, 0, 40, nullptr);
+                        glVertexAttribPointer(GLuint(uv), 2, gl::FLOAT, 0, 40, reinterpret_cast<void*>(16));
+                        glVertexAttribPointer(GLuint(col), 4, gl::FLOAT, 0, 40, reinterpret_cast<void*>(24));
+                        glDrawArrays(gl::TRIANGLES, 0, 3);
+                        glBindBuffer(0x8F36, t); glBindBuffer(0x8F37, sb);
+                        glCopyBufferSubData(0x8F36, 0x8F37, 0, 0, 128);
+                        glDeleteBuffers(1, &t);
+                        break;
+                    }
+                    case 9: glBindBuffer(0x8F37, sb); glBufferData(0x8F37, 4096, blob.data(), gl::DYNAMIC_DRAW); break;
+                }
+                ++rounds;
+            }
+            if (!destroyOpen) glFinish();
+            // (destroyOpen: the context goes away with its command buffer open and storages recorded in it)
+            if (destroyOpen && (life & 1)) { eglDestroyContext(a.dpy, ctx); eglMakeCurrent(a.dpy, nullptr, nullptr, nullptr); }
+            else { eglMakeCurrent(a.dpy, nullptr, nullptr, nullptr); eglDestroyContext(a.dpy, ctx); }
+            eglDestroySurface(a.dpy, surf);
+        }
+    };
+    std::thread t1(worker, 1u, true), t2(worker, 99u, false);
+    worker(7u, true);  // (this thread too; leaves no context current)
+    t1.join();
+    t2.join();
+    eglMakeCurrent(a.dpy, a.surface, a.surface, a.ctx);
+    glFinish();
+    for (GLuint s : shared) {
+        glBindBuffer(0x8F37, s);
+        const int s0 = submits;
+        resetCalls();
+        glBufferSubData(0x8F37, 100, 64, blob.data());
+        std::printf("  after all contexts are gone / finished: partial write submits=%d buffersCreated=%d waits=%d (all 0 = counts balanced)\n", submits - s0,
+                    int(calls.buffersCreated), int(calls.waits));
+        CHECK(submits == s0 && calls.buffersCreated == 0);
+    }
+    std::printf("  rounds=%d\n", int(rounds));
+    alarm(0);
+    a.down();
+}
+
+// vpgles_shutdown while another thread has a context current, then that thread releases it (thread teardown).
+void audit5ShutdownThread(int mode) {
+    G(eglMakeCurrent, uint32_t (*)(void*, void*, void*, void*));
+    G(eglCreateContext, void* (*)(void*, void*, void*, const EGLint*));
+    G(eglCreatePbufferSurface, void* (*)(void*, void*, const EGLint*));
+    watchdog(60);
+    Egl a;
+    CHECK(a.up());
+    const EGLint sattrs[] = {egl::WIDTH, 16, egl::HEIGHT, 16, egl::NONE};
+    const EGLint cattrs[] = {egl::CONTEXT_CLIENT_VERSION, 3, egl::NONE};
+    void* surfB = eglCreatePbufferSurface(a.dpy, a.config, sattrs);
+    void* ctxB = eglCreateContext(a.dpy, a.config, a.ctx, cattrs);
+    std::atomic<int> step{0};
+    std::thread th([&] {
+        eglMakeCurrent(a.dpy, surfB, surfB, ctxB);
+        step = 1;
+        while (step != 2) std::this_thread::yield();
+        if (mode == 0) eglMakeCurrent(a.dpy, nullptr, nullptr, nullptr);  // the thread's teardown, after the session ended
+        else vpgles_flush(0);                                              // a late host call from the render thread
+        step = 3;
+    });
+    while (step != 1) std::this_thread::yield();
+    CHECK(eglMakeCurrent(a.dpy, nullptr, nullptr, nullptr) != 0);
+    auto shutdown = reinterpret_cast<void (*)()>(dlsym(gLib, "vpgles_shutdown"));
+    shutdown();
+    std::printf("  shutdown done (thread B still has its context current)\n"); std::fflush(stdout);
+    step = 2;
+    th.join();
+    std::printf("  thread B's late call returned\n"); std::fflush(stdout);
+    alarm(0);
+}
+void testAudit5Shutdown0() { audit5ShutdownThread(0); }
+void testAudit5Shutdown1() { audit5ShutdownThread(1); }
+
+void testAudit5Readonly() {
+    Egl a;
+    CHECK(a.up());
+    G(glCreateShader, GLuint (*)(GLenum));
+    G(glShaderSource, void (*)(GLuint, GLsizei, const char* const*, const GLint*));
+    G(glCompileShader, void (*)(GLuint));
+    G(glGetShaderiv, void (*)(GLuint, GLenum, GLint*));
+    G(glGetShaderInfoLog, void (*)(GLuint, GLsizei, GLsizei*, char*));
+    const char* H = "#version 310 es\nlayout(local_size_x = 1) in;\n";
+    const char* cases[][2] = {
+        {"anon block, assign member", "layout(std430, binding=0) readonly buffer B { float a[]; };\nvoid main(){ a[0] = 1.0; }\n"},
+        {"anon block, member qualifier, assign", "layout(std430, binding=0) buffer B { readonly float a[]; };\nvoid main(){ a[0] = 1.0; }\n"},
+        {"instance, assign", "layout(std430, binding=0) readonly buffer B { float a[]; } b;\nvoid main(){ b.a[0] = 1.0; }\n"},
+        {"instance array, assign", "layout(std430, binding=0) readonly buffer B { float a[4]; } b[2];\nvoid main(){ b[1].a[0] = 1.0; }\n"},
+        {"anon, out argument", "layout(std430, binding=0) readonly buffer B { float a[]; };\nvoid f(out float x){ x = 1.0; }\nvoid main(){ f(a[0]); }\n"},
+        {"instance, inout argument", "layout(std430, binding=0) readonly buffer B { float a[]; } b;\nvoid f(inout float x){ x += 1.0; }\nvoid main(){ f(b.a[0]); }\n"},
+        {"anon, ++", "layout(std430, binding=0) readonly buffer B { int a[]; };\nvoid main(){ a[0]++; }\n"},
+        {"anon struct member, assign field", "struct S { vec4 v; };\nlayout(std430, binding=0) readonly buffer B { S s[]; };\nvoid main(){ s[0].v.x = 1.0; }\n"},
+        {"anon, swizzle assign", "layout(std430, binding=0) readonly buffer B { vec4 a[]; };\nvoid main(){ a[0].xy = vec2(1.0); }\n"},
+        {"CONTROL writable assign (must compile)", "layout(std430, binding=0) buffer B { float a[]; };\nvoid main(){ a[0] = 1.0; }\n"},
+        {"CONTROL readonly read (must compile)", "layout(std430, binding=0) readonly buffer B { float a[]; };\nlayout(std430, binding=1) buffer C { float c[]; };\nvoid main(){ c[0] = a[0]; }\n"},
+        {"readonly imageBuffer store", "#extension GL_EXT_texture_buffer : require\nlayout(rgba32f, binding=0) readonly uniform highp imageBuffer d;\nvoid main(){ imageStore(d, 0, vec4(1.0)); }\n"},
+    };
+    for (auto& c : cases) {
+        std::string src = std::string(H);
+        std::string body = c[1];
+        if (body.rfind("#extension", 0) == 0) { const size_t nl = body.find('\n'); src = "#version 310 es\n" + body.substr(0, nl + 1) + "layout(local_size_x = 1) in;\n"; body = body.substr(nl + 1); }
+        src += body;
+        GLuint sh = glCreateShader(gl::COMPUTE_SHADER);
+        const char* p = src.c_str();
+        glShaderSource(sh, 1, &p, nullptr);
+        glCompileShader(sh);
+        GLint ok = 0;
+        glGetShaderiv(sh, gl::COMPILE_STATUS, &ok);
+        char log[512] = {};
+        glGetShaderInfoLog(sh, sizeof log, nullptr, log);
+        std::printf("  %-42s compiled=%d %s\n", c[0], ok, ok ? "" : log);
+        const bool control = std::strncmp(c[0], "CONTROL", 7) == 0;
+        if (std::strncmp(c[0], "readonly imageBuffer", 20) != 0) CHECK((ok != 0) == control);  // a write to a readonly member is an error (the imageBuffer one is not checked: GL access rules it)
+    }
+    forbidLines.clear();
+    a.down();
+}
+
 // G12: linking a program does not hold the global lock while the shaders are linked: another thread's GL calls go through.
 void testAudit2Link() {
     Egl e;
@@ -6734,8 +7259,8 @@ void testAudit2Link() {
         const GLuint prog = glCreateProgram();
         glAttachShader(prog, sv);
         glAttachShader(prog, sf);
+        linking = true;  // (before `ready`: the caller's loop starts on linking)
         ready = true;
-        linking = true;
         const auto t0 = std::chrono::steady_clock::now();
         glLinkProgram(prog);
         linkUs = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count();
@@ -6864,7 +7389,7 @@ int main(int argc, char** argv) {
         {"audit_lost", testAuditLost}, {"audit_calls", testAuditCalls}, {"audit_compile", testAuditCompile}, {"audit_xfb", testAuditXfb},
         {"audit2_xfer", testAudit2Xfer}, {"audit2_dyn", testAudit2Dyn}, {"audit2_buf", testAudit2Buf}, {"audit2_pbo", testAudit2Pbo},
         {"audit2_upload", testAudit2Upload}, {"audit2_egl", testAudit2Egl}, {"audit2_link", testAudit2Link}, {"audit2_link2", testAudit2LinkShared},
-        {"audit3_egl_last", testAudit3EglLast}, {"audit3_egl_refs", testAudit3EglRefs}, {"audit3_pbo", testAudit3Pbo}, {"audit3_xfer_shared", testAudit3XferShared}, {"audit3_stale_stamp", testAudit3StaleStamp}, {"audit4_xfer_own_pass", testAudit4XferOwnPass},
+        {"audit3_egl_last", testAudit3EglLast}, {"audit3_egl_refs", testAudit3EglRefs}, {"audit3_pbo", testAudit3Pbo}, {"audit3_xfer_shared", testAudit3XferShared}, {"audit3_stale_stamp", testAudit3StaleStamp}, {"audit4_xfer_own_pass", testAudit4XferOwnPass}, {"audit4_reads_b", testAudit4ReadsB}, {"audit4_reads_ctl", testAudit4ReadsCtl}, {"audit4_copygrow", testAudit4CopyGrow}, {"audit4_reinit", testAudit4Reinit}, {"audit5_perf", testAudit5Perf}, {"audit5_readonly", testAudit5Readonly}, {"audit5_texbuf", testAudit5TexBuf}, {"audit5_index", testAudit5IndexRead}, {"audit5_balance", testAudit5Balance}, {"audit5_shutdown0", testAudit5Shutdown0}, {"audit5_shutdown1", testAudit5Shutdown1},
     };
     auto it = tests.find(argv[1]);
     if (ok && it != tests.end()) it->second();

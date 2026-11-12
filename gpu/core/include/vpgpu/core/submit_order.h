@@ -174,9 +174,10 @@ class CompletionFrontier {
         gaps_[end_] = index;  // [end_, index) is still to come
         // Indices that never come would make this grow without bound: past kMaxGaps pending ranges the oldest is given up (its
         // indices count as handed over, so the frontier moves on instead of freezing for good). A frame of a given-up range that
-        // does arrive later is taken for a repeat and ignored, including its work: the bound is for a caller that breaks the
-        // "every index is submitted" contract, which is not supposed to happen.
-        while (gaps_.size() > kMaxGaps) gaps_.erase(gaps_.begin());
+        // does arrive later is taken for a repeat and ignored, including its work, so completed() may then pass a command buffer
+        // that is still running (its frame is not tracked any more). The bound is for a caller that breaks the "every index is
+        // submitted" contract, which is not supposed to happen; a conforming caller never gets here.
+        trimGaps();
       }
       end_ = index + 1;
     } else if (!closeGap(index)) {
@@ -193,6 +194,12 @@ class CompletionFrontier {
     publish();
   }
   uint64_t completed() const { return completed_.load(std::memory_order_acquire); }
+  // For tests: how many ranges of not yet handed over indices are tracked (never more than kMaxGaps).
+  size_t pendingGaps() {
+    std::lock_guard lock(mutex_);
+    return gaps_.size();
+  }
+  static constexpr size_t kMaxGaps = 1024;  // ranges of indices not handed over yet that are tracked at once
 
  private:
   // Below the lowest frame not handed over yet or still in flight everything is done; with none, everything submitted is.
@@ -200,6 +207,10 @@ class CompletionFrontier {
     uint64_t now = gaps_.empty() ? end_ : gaps_.begin()->first;
     for (const uint64_t i : inFlight_) now = std::min(now, i);
     if (now > completed_.load(std::memory_order_relaxed)) completed_.store(now, std::memory_order_release);
+  }
+  // Past kMaxGaps ranges (a gap closed in its middle splits in two) the oldest is given up; see submitted().
+  void trimGaps() {
+    while (gaps_.size() > kMaxGaps) gaps_.erase(gaps_.begin());
   }
   // True if `index` was in a gap (a late frame), which is now closed at it.
   bool closeGap(uint64_t index) {
@@ -211,10 +222,9 @@ class CompletionFrontier {
     gaps_.erase(it);
     if (from < index) gaps_[from] = index;
     if (index + 1 < to) gaps_[index + 1] = to;
+    trimGaps();
     return true;
   }
-
-  static constexpr size_t kMaxGaps = 1024;  // ranges of indices not handed over yet that are tracked at once
 
   std::mutex mutex_;
   std::deque<uint64_t> inFlight_;           // frames with a command buffer not yet finished, in queue order

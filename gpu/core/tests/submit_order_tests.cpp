@@ -403,6 +403,7 @@ void testCompletionFrontier() {
     CHECK(f.completed() == 1);
     // every other index is missing: 1, 3, 5, ... never come
     for (uint64_t i = 2; i < 2 * 5000; i += 2) f.submitted(i, false);
+    CHECK(f.pendingGaps() == CompletionFrontier::kMaxGaps);  // the bound is really held
     CHECK(f.completed() > 1);       // not frozen at the first missing index
     CHECK(f.completed() < 2 * 5000);  // but not past the newest ranges still pending
     const uint64_t c = f.completed();
@@ -411,6 +412,19 @@ void testCompletionFrontier() {
     CHECK(f.completed() >= c);
     f.submitted(1, true);  // a frame of a given-up range: ignored (taken for a repeat), no stale entry in flight
     CHECK(f.completed() >= c);
+  }
+  {  // the partition path (a late frame closing a gap in its middle) is bounded too
+    CompletionFrontier f;
+    f.submitted(10000000, false);
+    CHECK(f.pendingGaps() == 1 && f.completed() == 0);
+    size_t most = 0;
+    for (uint64_t i = 2; i <= 200000; i += 2) {
+      f.submitted(i, false);
+      most = std::max(most, f.pendingGaps());
+    }
+    CHECK(most <= CompletionFrontier::kMaxGaps);
+    CHECK(most == CompletionFrontier::kMaxGaps);  // it did grow to the bound
+    CHECK(f.completed() > 0);  // and the frontier moved on instead of freezing
   }
   {  // against a model, random arrival order: completed() is the lowest frame not yet handed over or not yet finished
     uint64_t seed = 88172645463325252ull;

@@ -999,6 +999,9 @@ void BufferSubData(GLenum target, GLintptr off, GLsizeiptr size, const void* dat
     if (off < 0 || size < 0 || off + size > b->size) return c->setError(gl::INVALID_VALUE, target);
     if (b->mapped) return c->setError(gl::INVALID_OPERATION, target);
     if (!data || !size) return;
+    // A buffer the GPU has still to write (a readback, a copy, a shader's stores): the bytes go in by a GPU copy recorded after those writes,
+    // in order, instead of the CPU waiting for them (the old path flushed and waited at every partial update).
+    if (!(off == 0 && size == b->size) && c->gpuWritePending(*b->storage) && c->updateOrdered(b->storage, uint64_t(off), uint64_t(size), data)) return;
     c->prepareWrite(*b, off == 0 && size == b->size, uint64_t(off), uint64_t(off + size), true);
     std::memcpy(b->storage->host + off, data, size_t(size));
 }
@@ -1049,10 +1052,13 @@ void* MapBufferRange(GLenum target, GLintptr off, GLsizeiptr len, GLbitfield acc
     if (access & gl::MAP_READ_BIT) {
         if (c->storageBusy(*b->storage)) {  // GPU writes visible: wait for the last submission that used it, not for all
             c->flush(false);
-            c->dev->waitSerial(b->storage->lastUse);
+            // (a stamp past `submitted` is the guess of another context's unsent command buffer: nothing to wait for yet)
+            c->dev->waitSerial(std::min(b->storage->lastUse, c->dev->submitted));
         }
     } else if (!(access & gl::MAP_UNSYNCHRONIZED_BIT)) {
-        c->prepareWrite(*b, (access & gl::MAP_INVALIDATE_BUFFER_BIT) != 0, uint64_t(off), uint64_t(off + len));
+        // (INVALIDATE_RANGE over the whole buffer discards it too)
+        const bool whole = (access & gl::MAP_INVALIDATE_RANGE_BIT) && off == 0 && len == b->size;
+        c->prepareWrite(*b, (access & gl::MAP_INVALIDATE_BUFFER_BIT) != 0 || whole, uint64_t(off), uint64_t(off + len));
     } else {
         // UNSYNCHRONIZED write: the caller promises the GPU is not reading the range, but a draw already sent and not completed
         // may still read this storage (the GPU here is further behind than the game's buffer ring expects): write to a new one.
@@ -1128,6 +1134,7 @@ void CopyBufferSubData(GLenum rt, GLenum wt, GLintptr ro, GLintptr wo, GLsizeipt
     if (!size) return;
     c->useStorage(r->storage);
     c->useStorage(w->storage);
+    c->noteGpuWrite(w->storage);  // the destination holds the copy only when the GPU is done
     c->barrier();
     VkBufferCopy bc{VkDeviceSize(ro), VkDeviceSize(wo), VkDeviceSize(size)};
     c->dev->vk.vkCmdCopyBuffer(c->cmd(), r->storage->buffer, w->storage->buffer, 1, &bc);
@@ -4068,6 +4075,11 @@ int gInitResult = -1;
 
 extern "C" int vpgles_init(void* gipa) {
     if (gInitResult >= 0) return gInitResult;
+    if (gDev) {  // the Device of a session vpgles_shutdown ended: kept until now (late host calls find it shut down, not freed), freed here
+        setDevice(nullptr);
+        delete gDev;
+        gDev = nullptr;
+    }
     auto* d = new Device;
     if (!d->init(reinterpret_cast<PFN_vkGetInstanceProcAddr>(gipa))) {
         logf("gles.err what=init (Vulkan device)");
@@ -4083,7 +4095,7 @@ extern "C" int vpgles_init(void* gipa) {
 
 extern "C" void vpgles_shutdown(void) {
     if (!gDev) return;
-    eglResetDisplay();
+    eglShutdownDisplay();  // (objects released while the Device is alive)
     gDev->shutdown();
     gInitResult = -1;
 }

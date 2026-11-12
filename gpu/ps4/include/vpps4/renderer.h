@@ -44,6 +44,11 @@ struct Hooks {
     // A texture was filled from guest memory [address, address + bytes) (optional; informational:
     // CPU writes are found by the renderer itself, comparing the source's content).
     std::function<void(uint64_t address, uint64_t bytes)> uploaded;
+    // Memory budget of the render targets the renderer keeps (bytes; multisample copies counted). Past it the least recently used targets
+    // that the last submit did not use are released, whatever the flips say (see enforceTargetBudget). 0 = the default, 2 GiB (a guess for
+    // visionOS, unverified: the host that knows its memory limit should set it, e.g. a fraction of the app's footprint allowance). Read once
+    // at construction. The targets the last 8 present calls (colorTargetAt / colorTargetSlice) returned are never released.
+    uint64_t targetBudgetBytes = 0;
 };
 
 struct Stats {

@@ -24,6 +24,11 @@ jobs:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
+      - name: Workflow checks (modes of scripts run directly, concurrency groups, injection)
+        run: |
+          python3 -I -c 'import yaml' 2>/dev/null || sudo apt-get install -y --no-install-recommends python3-yaml
+          python3 -I tests/ci/check_workflows.py
+          python3 -I tests/ci/test_check_workflows.py
       - name: Tools
         run: sudo apt-get install -y --no-install-recommends ninja-build
       - name: Build cache (Zydis)
@@ -58,6 +63,14 @@ jobs:
         run: tests/aot/loader/run.sh
       - name: Malformed SELF containers are refused, never crash
         run: tests/aot/self_malformed/run.sh
+      - name: A valid SELF with alignment padding (2 MiB pages) is accepted
+        run: sh tests/aot/self_valid/run.sh
+      - name: SELF limits of the runtime loader (same as vpaot's)
+        run: |
+          mkdir -p build/loader_self
+          gcc -O1 -g -std=gnu11 -frounding-math -fsanitize=undefined -fno-sanitize-recover=all -Iruntime -Itests/rt \
+            tests/rt/loader_self.c runtime/vp_host.c runtime/vp_loader.c -lm -latomic -lpthread -o build/loader_self/loader_self
+          build/loader_self/loader_self build/loader_self
       - name: Two modules, attach by fingerprint
         run: tests/aot/modules/run.sh
       - name: Read-only data in the executable segment (PS4 layout) is not translated as code

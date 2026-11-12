@@ -454,6 +454,8 @@ struct Api {
     submitFn(queue, 1, &si, nullptr);
   }
   void destroy() {
+    if (dev && pool) fn<PFN_vkDestroyCommandPool>("vkDestroyCommandPool")(dev, pool, nullptr);  // (its command buffers go with it)
+    pool = nullptr;
     if (dev) fn<PFN_vkDestroyDevice>("vkDestroyDevice")(dev, nullptr);
     if (inst) fn<PFN_vkDestroyInstance>("vkDestroyInstance")(inst, nullptr);
     dev = nullptr, inst = nullptr;
@@ -644,6 +646,9 @@ void testCaptureResolve() {
   CHECK(state() == 0);
   CHECK(ms < 500);
   track(0);
+  a.fn<PFN_vkDestroyPipelineLayout>("vkDestroyPipelineLayout")(a.dev, pl, nullptr);
+  a.fn<PFN_vkDestroyDescriptorPool>("vkDestroyDescriptorPool")(a.dev, dpool, nullptr);  // (the set goes with it)
+  a.fn<PFN_vkDestroyDescriptorSetLayout>("vkDestroyDescriptorSetLayout")(a.dev, layout, nullptr);
   a.destroy();
   std::remove(path.c_str());
   dlclose(lib);

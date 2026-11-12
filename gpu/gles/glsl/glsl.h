@@ -80,6 +80,9 @@ struct UniformBlock {
     uint32_t element = 0;  // descriptor array element (block arrays: one GL block per element)
     std::vector<Variable> members;  // offsets within the block
     uint32_t stages = 0;
+    // Shader storage blocks: every member is `readonly` (the block qualifier reaches its members, and the compiler rejects a write to a
+    // readonly member) in every stage that uses the block: no shader can write the bound buffer. Uniform blocks: true.
+    bool readOnly = true;
 };
 
 inline constexpr uint32_t kDefaultBlockBinding = 0;
