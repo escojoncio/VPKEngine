@@ -1,0 +1,38 @@
+-- The CXX compiler identification is AppleClang 21.0.0.21000101
+-- Detecting CXX compiler ABI info
+-- Detecting CXX compiler ABI info - done
+-- Check for working CXX compiler: /usr/bin/c++ - skipped
+-- Detecting CXX compile features
+-- Detecting CXX compile features - done
+-- vpmsl translator fingerprint 07b2fbb3ef74a565
+-- Performing Test CMAKE_HAVE_LIBC_PTHREAD
+-- Performing Test CMAKE_HAVE_LIBC_PTHREAD - Success
+-- Found Threads: TRUE
+-- The OBJCXX compiler identification is AppleClang 21.0.0.21000101
+-- Detecting OBJCXX compiler ABI info
+-- Detecting OBJCXX compiler ABI info - done
+-- Check for working OBJCXX compiler: /usr/bin/clang++ - skipped
+-- Configuring done (7.3s)
+-- Generating done (0.1s)
+-- Build files have been written to: /Users/runner/work/VPKEngine/VPKEngine/build/gpu-host
+ninja: Entering directory `build/gpu-host'
+[0/2] Re-checking globbed directories...
+[1/20] Building CXX object shader/ir/CMakeFiles/vpir.dir/src/ir.cpp.o
+[2/20] Building CXX object shader/ir/CMakeFiles/vpir.dir/src/builder.cpp.o
+[3/20] Building CXX object shader/ir/CMakeFiles/vpir.dir/src/print.cpp.o
+[4/20] Building CXX object shader/ir/CMakeFiles/vpir.dir/src/parse.cpp.o
+[5/20] Building CXX object shader/ir/CMakeFiles/vpir.dir/src/verify.cpp.o
+[6/20] Building CXX object shader/ir/CMakeFiles/vpir.dir/src/optimize.cpp.o
+[7/20] Building CXX object shader/gcn/CMakeFiles/vpgcn.dir/src/gcn.cpp.o
+[8/20] Building CXX object shader/ir/CMakeFiles/vpir.dir/src/fbfetch.cpp.o
+[9/20] Linking CXX static library shader/ir/libvpir.a
+[10/20] Linking CXX static library shader/gcn/libvpgcn.a
+[11/20] Building CXX object shader/gcn/tests/CMakeFiles/vpgcn_ref.dir/ref/gcn_ref.cpp.o
+[12/20] Linking CXX static library shader/gcn/tests/libvpgcn_ref.a
+[13/20] Building CXX object shader/msl/CMakeFiles/vpmsl.dir/src/msl.cpp.o
+[14/20] Linking CXX static library shader/msl/libvpmsl.a
+[15/20] Building CXX object shader/gcn/CMakeFiles/vpgcn_lift.dir/src/lift.cpp.o
+[16/20] Linking CXX static library shader/gcn/libvpgcn_lift.a
+[17/20] Building CXX object shader/gcn/tests/CMakeFiles/vpgcn_diff.dir/diff/gcn_diff.cpp.o
+[18/20] Building CXX object shader/gcn/tests/CMakeFiles/vpgcn_diff.dir/diff/vpir_eval.cpp.o
+[19/20] Linking CXX executable shader/gcn/tests/vpgcn_diff

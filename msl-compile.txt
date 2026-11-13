@@ -1,0 +1,55 @@
+ok    compute_loop.metal
+ok    deferred_light_fetched_fs.metal
+ok    deferred_light_fs.metal
+ok    else_if_break.metal
+ok    else_if_deep.metal
+ok    else_if.metal
+ok    heavy_lighting_fs.metal
+ok    image_atomics.metal
+ok    int_varying_fs.metal
+ok    mesh_stage.metal
+ok    nested_loop.metal
+ok    object_stage.metal
+ok    passthrough_vs.metal
+ok    precise_fma.metal
+ok    precise_minmax.metal
+ok    private_memory.metal
+ok    private_slots.metal
+ok    quad_ops.metal
+ok    query_lod.metal
+ok    rate_map_fs.metal
+ok    rate_map_vs.metal
+ok    robust_vec.metal
+ok    sampler_bias_fs.metal
+ok    subgroup_arith.metal
+ok    subgroup.metal
+ok    syntax_tour.metal
+ok    textured_fs.metal
+ok    unpack.metal
+ok    lift_cs_bytes.metal
+ok    lift_cs_image_atomic.metal
+ok    lift_cs_loop.metal
+ok    lift_cs_padding.metal
+ok    lift_cs_partial_store.metal
+/Users/runner/work/VPKEngine/VPKEngine/gpu/shader/msl/tests/../../gcn/tests/lift/cs_resinfo.metal:594:36: warning: self-comparison always evaluates to false [-Wtautological-compare]
+            const bool v606 = v573 < v573;
+                                   ^
+/Users/runner/work/VPKEngine/VPKEngine/gpu/shader/msl/tests/../../gcn/tests/lift/cs_resinfo.metal:598:36: warning: self-comparison always evaluates to false [-Wtautological-compare]
+            const bool v613 = v602 < v602;
+                                   ^
+2 warnings generated.
+ok    lift_cs_resinfo.metal
+ok    lift_cs_small_float.metal
+ok    lift_cs_typed_store.metal
+ok    lift_ps_branch.metal
+ok    lift_ps_get_lod.metal
+ok    lift_ps_lds_spill.metal
+ok    lift_ps_loop_break.metal
+ok    lift_ps_textured.metal
+ok    lift_vs_cbuf_dword.metal
+ok    lift_vs_cbuf_x16.metal
+ok    lift_vs_fetch.metal
+ok    lift_vs_transform.metal
+ok    vpktaa_native.metal
+ok    vpktaa.metal
+ok    goldens.metallib (47 shaders)
