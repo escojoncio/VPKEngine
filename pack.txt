@@ -1,0 +1,33 @@
+== attempt 1
+ld: warning: /home/runner/work/VPKEngine/VPKEngine/tests/aot/pack/../../../build/pack/start.o: missing .note.GNU-stack section implies executable stack
+ld: NOTE: This behaviour is deprecated and will be removed in a future version of the linker
+vpaot: image 8589934592..8589946880, 1 executable ranges, 1 code pointers, 0 .eh_frame starts, 1 imports, 1 functions
+vpaot: 22 instructions, 0 unsupported (100.00% supported), 2 indirect calls, 0 indirect jumps, 0 jump tables resolved, 0 landing pads, 0 candidates rejected as data
+vpaot: image 8858370048..8858382344, 1 executable ranges, 2 code pointers, 0 .eh_frame starts, 1 imports, 4 functions
+vpaot: 25 instructions, 0 unsupported (100.00% supported), 2 indirect calls, 1 indirect jumps, 0 jump tables resolved, 0 landing pads, 0 candidates rejected as data
+vpaot: registry of 2 modules in /home/runner/work/VPKEngine/VPKEngine/tests/aot/pack/../../../build/pack/registry.c (game pack)
+pack TEST00001: 2 modules, abi 1
+modules from the pack: translated daf9d1f9c4722476 native daf9d1f9c4722476 OK
+embedder hooks: OK
+== attempt 2
+ld: warning: /home/runner/work/VPKEngine/VPKEngine/tests/aot/pack/../../../build/pack/start.o: missing .note.GNU-stack section implies executable stack
+ld: NOTE: This behaviour is deprecated and will be removed in a future version of the linker
+vpaot: image 8589934592..8589946880, 1 executable ranges, 1 code pointers, 0 .eh_frame starts, 1 imports, 1 functions
+vpaot: 22 instructions, 0 unsupported (100.00% supported), 2 indirect calls, 0 indirect jumps, 0 jump tables resolved, 0 landing pads, 0 candidates rejected as data
+vpaot: image 8858370048..8858382344, 1 executable ranges, 2 code pointers, 0 .eh_frame starts, 1 imports, 4 functions
+vpaot: 25 instructions, 0 unsupported (100.00% supported), 2 indirect calls, 1 indirect jumps, 0 jump tables resolved, 0 landing pads, 0 candidates rejected as data
+vpaot: registry of 2 modules in /home/runner/work/VPKEngine/VPKEngine/tests/aot/pack/../../../build/pack/registry.c (game pack)
+pack TEST00001: 2 modules, abi 1
+modules from the pack: translated daf9d1f9c4722476 native daf9d1f9c4722476 OK
+embedder hooks: OK
+== attempt 3
+ld: warning: /home/runner/work/VPKEngine/VPKEngine/tests/aot/pack/../../../build/pack/start.o: missing .note.GNU-stack section implies executable stack
+ld: NOTE: This behaviour is deprecated and will be removed in a future version of the linker
+vpaot: image 8589934592..8589946880, 1 executable ranges, 1 code pointers, 0 .eh_frame starts, 1 imports, 1 functions
+vpaot: 22 instructions, 0 unsupported (100.00% supported), 2 indirect calls, 0 indirect jumps, 0 jump tables resolved, 0 landing pads, 0 candidates rejected as data
+vpaot: image 8858370048..8858382344, 1 executable ranges, 2 code pointers, 0 .eh_frame starts, 1 imports, 4 functions
+vpaot: 25 instructions, 0 unsupported (100.00% supported), 2 indirect calls, 1 indirect jumps, 0 jump tables resolved, 0 landing pads, 0 candidates rejected as data
+vpaot: registry of 2 modules in /home/runner/work/VPKEngine/VPKEngine/tests/aot/pack/../../../build/pack/registry.c (game pack)
+pack TEST00001: 2 modules, abi 1
+modules from the pack: translated daf9d1f9c4722476 native daf9d1f9c4722476 OK
+embedder hooks: OK

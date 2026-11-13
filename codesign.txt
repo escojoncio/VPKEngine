@@ -1,0 +1,73 @@
+LD64=/usr/bin/ld64.lld-18
+COPYING
+rcodesign
++ set -e
++ dirname tests/codesign/run.sh
++ cd tests/codesign
++ pwd
++ D=/home/runner/work/VPKEngine/VPKEngine/tests/codesign
++ R=/home/runner/work/VPKEngine/VPKEngine/tests/codesign/../..
++ B=/home/runner/work/VPKEngine/VPKEngine/tests/codesign/../../build/codesign
++ mkdir -p /home/runner/work/VPKEngine/VPKEngine/tests/codesign/../../build/codesign
++ CC=cc
++ CLANG=clang
++ LD64=/usr/bin/ld64.lld-18
++ cd /home/runner/work/VPKEngine/VPKEngine/tests/codesign/../../build/codesign
++ cat
++ openssl req -x509 -newkey rsa:2048 -nodes -keyout root.key -out root.pem -days 30 -subj /CN=Test Root CA/O=VPKEngine test -addext basicConstraints=critical,CA:TRUE
++ openssl req -newkey rsa:2048 -nodes -keyout int.key -out int.csr -subj /CN=Test Intermediate/OU=G3/O=VPKEngine test
++ openssl x509 -req -in int.csr -CA root.pem -CAkey root.key -CAcreateserial -out int.pem -days 30 -extfile ext.cnf -extensions ca
++ openssl req -newkey rsa:2048 -nodes -keyout leaf.key -out leaf.csr -subj /UID=ABCDE12345/CN=Apple Development: test (XYZ)/OU=TEAM123456/O=test/C=US
++ openssl x509 -req -in leaf.csr -CA int.pem -CAkey int.key -CAcreateserial -out leaf.pem -days 30 -extfile ext.cnf -extensions leaf
++ cat
++ clang -target arm64-apple-macos11 -O1 -c -o lib.o lib.c
++ /usr/bin/ld64.lld-18 -arch arm64 -platform_version macos 11.0 11.0 -dylib -adhoc_codesign -install_name @rpath/lib.dylib -o lib.dylib lib.o /home/runner/work/VPKEngine/VPKEngine/tests/codesign/../../tools/sdk/libSystem.tbd
++ cc -O2 -I /home/runner/work/VPKEngine/VPKEngine/tests/codesign/../../runtime -o sign /home/runner/work/VPKEngine/VPKEngine/tests/codesign/sign.c /home/runner/work/VPKEngine/VPKEngine/tests/codesign/../../runtime/vp_codesign.c -lcrypto
++ cp lib.dylib signed.dylib
++ ./sign signed.dylib com.vpkengine.test leaf.pem leaf.key int.pem root.pem
+signed signed.dylib, team TEAM123456
++ python3 /home/runner/work/VPKEngine/VPKEngine/tests/codesign/verify.py signed.dylib /home/runner/work/VPKEngine/VPKEngine/tests/codesign/../../build/codesign TEAM123456 com.vpkengine.test
+signed.dylib: 57 pages, cdhash 33910c14d04a8b590413c2adb3bdcd1e9c418cca, team TEAM123456: structure OK
++ openssl cms -verify -inform DER -in cms.der -binary -content cd.bin -CAfile root.pem -purpose any -out /dev/null
+CMS Verification successful
++ ./sign signed.dylib com.vpkengine.test leaf.pem leaf.key int.pem root.pem
+signed signed.dylib, team TEAM123456
++ python3 /home/runner/work/VPKEngine/VPKEngine/tests/codesign/verify.py signed.dylib /home/runner/work/VPKEngine/VPKEngine/tests/codesign/../../build/codesign TEAM123456 com.vpkengine.test
+signed.dylib: 57 pages, cdhash 33910c14d04a8b590413c2adb3bdcd1e9c418cca, team TEAM123456: structure OK
++ openssl cms -verify -inform DER -in cms.der -binary -content cd.bin -CAfile root.pem -purpose any -out /dev/null
+CMS Verification successful
++ python3 - req.bin
++ cp lib.dylib req4k.dylib
++ VP_REQ_FILE=req.bin ./sign req4k.dylib com.example.app leaf.pem leaf.key int.pem root.pem
+signed req4k.dylib, team TEAM123456
++ VP_REQ_BLOB=req.bin python3 /home/runner/work/VPKEngine/VPKEngine/tests/codesign/verify.py req4k.dylib /home/runner/work/VPKEngine/VPKEngine/tests/codesign/../../build/codesign TEAM123456 com.example.app
+req4k.dylib: 57 pages, cdhash e25de8b37e50631f096e678a09f10a3b0bcd1b22, team TEAM123456: structure OK
++ openssl cms -verify -inform DER -in cms.der -binary -content cd.bin -CAfile root.pem -purpose any -out /dev/null
+CMS Verification successful
++ cp lib.dylib req16k.dylib
++ VP_REQ_FROM=req4k.dylib VP_PAGE_SHIFT=14 ./sign req16k.dylib com.example.app leaf.pem leaf.key int.pem root.pem
+signed req16k.dylib, team TEAM123456
++ VP_REQ_BLOB=req.bin VP_PAGE_SHIFT=14 python3 /home/runner/work/VPKEngine/VPKEngine/tests/codesign/verify.py req16k.dylib /home/runner/work/VPKEngine/VPKEngine/tests/codesign/../../build/codesign TEAM123456 com.example.app
+req16k.dylib: 15 pages, cdhash 252cbf31aa06f88886c97d08d35970bd447d5e3b, team TEAM123456: structure OK
++ openssl cms -verify -inform DER -in cms.der -binary -content cd.bin -CAfile root.pem -purpose any -out /dev/null
+CMS Verification successful
++ echo app-like signatures (requirement set carried, 16 KiB pages): OK
+app-like signatures (requirement set carried, 16 KiB pages): OK
++ cp signed.dylib bad.dylib
++ printf X
++ dd of=bad.dylib bs=1 seek=5000 conv=notrunc
++ python3 /home/runner/work/VPKEngine/VPKEngine/tests/codesign/verify.py bad.dylib /home/runner/work/VPKEngine/VPKEngine/tests/codesign/../../build/codesign TEAM123456 com.vpkengine.test
++ echo tampered page: rejected OK
+tampered page: rejected OK
++ [ -n /tmp/apple-codesign-0.29.0-x86_64-unknown-linux-musl/rcodesign ]
++ /tmp/apple-codesign-0.29.0-x86_64-unknown-linux-musl/rcodesign print-signature-info signed.dylib
++ grep -q signature_verifies: true rcodesign.txt
++ grep -q team_name: TEAM123456 rcodesign.txt
++ /tmp/apple-codesign-0.29.0-x86_64-unknown-linux-musl/rcodesign verify signed.dylib
++ grep -q no problems detected
++ /tmp/apple-codesign-0.29.0-x86_64-unknown-linux-musl/rcodesign verify req4k.dylib
++ grep -q no problems detected
++ /tmp/apple-codesign-0.29.0-x86_64-unknown-linux-musl/rcodesign verify req16k.dylib
++ grep -q no problems detected
++ echo rcodesign: signature verifies OK
+rcodesign: signature verifies OK
