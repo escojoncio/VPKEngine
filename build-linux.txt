@@ -1,0 +1,186 @@
+-- The CXX compiler identification is GNU 13.3.0
+-- Detecting CXX compiler ABI info
+-- Detecting CXX compiler ABI info - done
+-- Check for working CXX compiler: /usr/bin/c++ - skipped
+-- Detecting CXX compile features
+-- Detecting CXX compile features - done
+-- vpmsl translator fingerprint 07b2fbb3ef74a565
+-- Performing Test CMAKE_HAVE_LIBC_PTHREAD
+-- Performing Test CMAKE_HAVE_LIBC_PTHREAD - Success
+-- Found Threads: TRUE
+-- Configuring done (0.6s)
+-- Generating done (0.0s)
+-- Build files have been written to: /home/runner/work/VPKEngine/VPKEngine/build/gpu
+ninja: Entering directory `build/gpu'
+[0/2] Re-checking globbed directories...
+[1/172] Building CXX object shader/ir/CMakeFiles/vpir.dir/src/ir.cpp.o
+[2/172] Building CXX object shader/ir/CMakeFiles/vpir.dir/src/builder.cpp.o
+[3/172] Building CXX object shader/ir/CMakeFiles/vpir.dir/src/optimize.cpp.o
+[4/172] Building CXX object shader/ir/CMakeFiles/vpir.dir/src/fbfetch.cpp.o
+[5/172] Building CXX object shader/ir/CMakeFiles/vpir.dir/src/print.cpp.o
+[6/172] Building CXX object shader/ir/CMakeFiles/vpir.dir/src/verify.cpp.o
+[7/172] Building CXX object shader/ir/CMakeFiles/vpir.dir/src/parse.cpp.o
+[8/172] Building CXX object core/CMakeFiles/vpgpu_core.dir/src/resources.cpp.o
+[9/172] Linking CXX static library shader/ir/libvpir.a
+[10/172] Building CXX object shader/gcn/CMakeFiles/vpgcn.dir/src/gcn.cpp.o
+[11/172] Building CXX object core/CMakeFiles/vpgpu_core.dir/src/commands.cpp.o
+[12/172] Building CXX object core/CMakeFiles/vpgpu_core.dir/src/background.cpp.o
+[13/172] Building CXX object core/CMakeFiles/vpgpu_core.dir/src/null_backend.cpp.o
+[14/172] Building CXX object core/CMakeFiles/vpgpu_core.dir/src/pipeline_cache.cpp.o
+[15/172] Building CXX object gles/CMakeFiles/vpglsl.dir/glsl/types.cpp.o
+[16/172] Building CXX object core/CMakeFiles/vpgpu_core.dir/src/diagnostics.cpp.o
+[17/172] Building CXX object core/CMakeFiles/vpgpu_core.dir/src/device.cpp.o
+[18/172] Building CXX object gles/CMakeFiles/vpglsl.dir/glsl/pp.cpp.o
+[19/172] Building CXX object core/CMakeFiles/vpgpu_core.dir/src/frame_compiler.cpp.o
+[20/172] Linking CXX static library shader/gcn/libvpgcn.a
+[21/172] Building CXX object gles/CMakeFiles/vpglsl.dir/glsl/builtins.cpp.o
+[22/172] Building CXX object shader/spirv/CMakeFiles/vpspirv.dir/src/parse.cpp.o
+[23/172] Building CXX object gles/CMakeFiles/vpglsl.dir/glsl/link.cpp.o
+[24/172] Linking CXX static library core/libvpgpu_core.a
+[25/172] Building CXX object gles/CMakeFiles/vpgles.dir/src/vk.cpp.o
+[26/172] Building CXX object gles/CMakeFiles/vpgles.dir/src/formats.cpp.o
+[27/172] Building CXX object shader/msl/CMakeFiles/vpmsl.dir/src/msl.cpp.o
+[28/172] Building CXX object gles/CMakeFiles/vpglsl.dir/glsl/parser.cpp.o
+[29/172] Building CXX object gles/CMakeFiles/vpglsl.dir/glsl/emit.cpp.o
+[30/172] Linking CXX static library gles/libvpglsl.a
+[31/172] Building CXX object gles/CMakeFiles/vpgles.dir/src/xfb.cpp.o
+[32/172] Building CXX object shader/gcn/CMakeFiles/vpgcn_lift.dir/src/lift.cpp.o
+[33/172] Building CXX object gles/CMakeFiles/vpgles.dir/src/textures.cpp.o
+[34/172] Building CXX object gles/CMakeFiles/vpgles.dir/src/egl.cpp.o
+[35/172] Building CXX object gles/CMakeFiles/vpgles_test.dir/src/vk.cpp.o
+[36/172] Building CXX object gles/CMakeFiles/vpgles_test.dir/src/formats.cpp.o
+[37/172] Building CXX object gles/CMakeFiles/vpgles.dir/src/device.cpp.o
+[38/172] Building CXX object gles/CMakeFiles/vpgles_test.dir/src/textures.cpp.o
+[39/172] Building CXX object gles/CMakeFiles/vpgles_test.dir/src/xfb.cpp.o
+[40/172] Building CXX object gles/CMakeFiles/vpgles_test.dir/src/device.cpp.o
+[41/172] Building CXX object gles/CMakeFiles/vpgles_test.dir/src/egl.cpp.o
+[42/172] Building CXX object gles/CMakeFiles/vpgles.dir/src/draw.cpp.o
+[43/172] Building CXX object gles/CMakeFiles/vpgles.dir/src/gl_api.cpp.o
+[44/172] Linking CXX static library shader/msl/libvpmsl.a
+[45/172] Building CXX object shader/spirv/CMakeFiles/vpspirv.dir/src/lower.cpp.o
+[46/172] Linking CXX static library shader/gcn/libvpgcn_lift.a
+[47/172] Linking CXX static library shader/spirv/libvpspirv.a
+[48/172] Linking CXX static library gles/libvpgles.a
+[49/172] Building CXX object vulkan/CMakeFiles/vpreplay.dir/src/vpcap.cpp.o
+[50/172] Building CXX object shader/gcn/tests/CMakeFiles/vpgcn_ref.dir/ref/gcn_ref.cpp.o
+[51/172] Building CXX object vulkan/CMakeFiles/VPVulkan.dir/src/physical_device.cpp.o
+[52/172] Building CXX object gles/CMakeFiles/vpgles_test.dir/src/draw.cpp.o
+[53/172] Building CXX object vulkan/CMakeFiles/VPVulkan.dir/src/config.cpp.o
+[54/172] Building CXX object gles/CMakeFiles/vpgles_test.dir/src/gl_api.cpp.o
+[55/172] Linking CXX static library gles/libvpgles_test.a
+[56/172] Building CXX object vulkan/CMakeFiles/VPVulkan.dir/src/entry.cpp.o
+[57/172] Building CXX object vulkan/CMakeFiles/VPVulkan.dir/src/commands.cpp.o
+[58/172] Building CXX object vulkan/CMakeFiles/VPVulkan.dir/src/taa_native.cpp.o
+[59/172] Building CXX object vulkan/CMakeFiles/VPVulkan.dir/src/precompile.cpp.o
+[60/172] Building CXX object vulkan/CMakeFiles/VPVulkan.dir/src/foveation.cpp.o
+[61/172] Building CXX object vulkan/CMakeFiles/VPVulkan.dir/src/recipes.cpp.o
+[62/172] Building CXX object vulkan/CMakeFiles/VPVulkan.dir/src/vpcap.cpp.o
+[63/172] Building CXX object vulkan/CMakeFiles/VPVulkan.dir/src/texdecode.cpp.o
+[64/172] Building CXX object vulkan/CMakeFiles/VPVulkan.dir/src/ext.cpp.o
+[65/172] Building CXX object vulkan/CMakeFiles/VPVulkan.dir/src/platform_null.cpp.o
+[66/172] Building CXX object vulkan/CMakeFiles/VPVulkan.dir/src/pending.cpp.o
+[67/172] Building CXX object vulkan/CMakeFiles/VPVulkan.dir/src/passdump.cpp.o
+[68/172] Building CXX object vulkan/CMakeFiles/VPVulkan.dir/src/pipelines.cpp.o
+[69/172] Building CXX object vulkan/CMakeFiles/VPVulkanTest.dir/src/physical_device.cpp.o
+[70/172] Building CXX object vulkan/CMakeFiles/vpreplay.dir/tools/vpreplay.cpp.o
+[71/172] Linking CXX executable vulkan/vpreplay
+[72/172] Building CXX object vulkan/CMakeFiles/VPVulkanTest.dir/src/config.cpp.o
+[73/172] Building CXX object vulkan/CMakeFiles/VPVulkanTest.dir/src/entry.cpp.o
+[74/172] Building CXX object vulkan/CMakeFiles/VPVulkan.dir/src/capture.cpp.o
+[75/172] Building CXX object vulkan/CMakeFiles/VPVulkanTest.dir/src/taa_native.cpp.o
+[76/172] Building CXX object vulkan/CMakeFiles/VPVulkanTest.dir/src/precompile.cpp.o
+[77/172] Building CXX object vulkan/CMakeFiles/VPVulkanTest.dir/src/foveation.cpp.o
+[78/172] Building CXX object vulkan/CMakeFiles/VPVulkanTest.dir/src/commands.cpp.o
+[79/172] Building CXX object vulkan/CMakeFiles/VPVulkanTest.dir/src/vpcap.cpp.o
+[80/172] Building CXX object vulkan/CMakeFiles/VPVulkanTest.dir/src/texdecode.cpp.o
+[81/172] Building CXX object vulkan/CMakeFiles/VPVulkanTest.dir/src/recipes.cpp.o
+[82/172] Building CXX object vulkan/CMakeFiles/VPVulkanTest.dir/src/platform_null.cpp.o
+[83/172] Building CXX object vulkan/CMakeFiles/VPVulkanTest.dir/src/ext.cpp.o
+[84/172] Building CXX object ps4/CMakeFiles/vpps4.dir/src/formats.cpp.o
+[85/172] Building CXX object vulkan/CMakeFiles/VPVulkanTest.dir/src/pending.cpp.o
+[86/172] Building CXX object ps4/CMakeFiles/vpps4.dir/src/tiling.cpp.o
+[87/172] Building CXX object ps4/CMakeFiles/vpps4.dir/src/fetch.cpp.o
+[88/172] Building CXX object vulkan/CMakeFiles/VPVulkanTest.dir/src/passdump.cpp.o
+[89/172] Building CXX object shader/msl/tests/CMakeFiles/vpmsl_golden.dir/golden.cpp.o
+[90/172] Building CXX object shader/gcn/tests/CMakeFiles/vpgcn_test.dir/gcn_test.cpp.o
+[91/172] Building CXX object shader/gcn/CMakeFiles/vpgcn_lift_batch.dir/tools/lift_batch.cpp.o
+[92/172] Building CXX object vulkan/CMakeFiles/VPVulkanTest.dir/src/pipelines.cpp.o
+[93/172] Linking CXX static library shader/gcn/tests/libvpgcn_ref.a
+[94/172] Building CXX object shader/gcn/tests/CMakeFiles/vpgcn_lift_test.dir/lift_test.cpp.o
+[95/172] Building CXX object shader/ir/tests/CMakeFiles/vpir_test.dir/vpir_test.cpp.o
+[96/172] Building CXX object shader/gcn/tests/CMakeFiles/vpgcn_ref_selftest.dir/ref/gcn_ref_test.cpp.o
+[97/172] Building CXX object shader/gcn/tests/CMakeFiles/vpgcn_diff.dir/diff/gcn_diff.cpp.o
+[98/172] Building CXX object shader/gcn/tests/CMakeFiles/vpgcn_lift_scale_test.dir/lift_scale_test.cpp.o
+[99/172] Building CXX object shader/gcn/tests/CMakeFiles/vpgcn_diff.dir/diff/vpir_eval.cpp.o
+[100/172] Building CXX object ps4/CMakeFiles/vpps4.dir/src/renderer.cpp.o
+[101/172] Building CXX object core/CMakeFiles/vpgpu_core_bgtest.dir/src/background.cpp.o
+[102/172] Building CXX object shader/spirv/CMakeFiles/vpspirv_tests.dir/__/gcn/tests/diff/vpir_eval.cpp.o
+[103/172] Building CXX object vulkan/CMakeFiles/VPVulkanTest.dir/src/capture.cpp.o
+[104/172] Building CXX object core/CMakeFiles/vpgpu_submit_order_tests.dir/tests/submit_order_tests.cpp.o
+[105/172] Building CXX object core/CMakeFiles/vpgpu_core_audit_tests.dir/tests/audit_misc_tests.cpp.o
+[106/172] Building CXX object gles/CMakeFiles/vpgles_tests.dir/src/formats.cpp.o
+[107/172] Building CXX object gles/CMakeFiles/vpgles_tests.dir/src/xfb.cpp.o
+[108/172] Building CXX object gles/CMakeFiles/vpgles_audit_formats_tests.dir/tests/audit_formats_tests.cpp.o
+[109/172] Building CXX object gles/CMakeFiles/vpglsl_tests.dir/__/shader/gcn/tests/diff/vpir_eval.cpp.o
+[110/172] Building CXX object gles/CMakeFiles/vpgles_audit_formats_tests.dir/src/xfb.cpp.o
+[111/172] Building CXX object gles/CMakeFiles/vpgles_audit_formats_tests.dir/src/formats.cpp.o
+[112/172] Building CXX object gles/CMakeFiles/vpgles_audit_vk_tests.dir/tests/audit_vk_tests.cpp.o
+[113/172] Building CXX object gles/CMakeFiles/vpgles_audit_vk_tests.dir/src/vk.cpp.o
+[114/172] Building CXX object shader/spirv/CMakeFiles/vpspirv_tests.dir/tests/spirv_tests.cpp.o
+[115/172] Linking CXX shared library vulkan/libVPVulkan.so
+[116/172] Building CXX object gles/CMakeFiles/vpglsl_tests.dir/tests/glsl_tests.cpp.o
+[117/172] Building CXX object gles/CMakeFiles/vpglsl_audit_tests.dir/__/shader/gcn/tests/diff/vpir_eval.cpp.o
+[118/172] Building CXX object gles/CMakeFiles/vpglsl_audit_tests.dir/tests/audit_glsl_tests.cpp.o
+[119/172] Building CXX object vulkan/CMakeFiles/vpvk_tests.dir/src/physical_device.cpp.o
+[120/172] Building CXX object core/CMakeFiles/vpgpu_core_tests.dir/tests/core_tests.cpp.o
+[121/172] Building CXX object vulkan/CMakeFiles/vpvk_tests.dir/src/config.cpp.o
+[122/172] Building CXX object gles/CMakeFiles/vpgles_tests.dir/tests/gles_tests.cpp.o
+[123/172] Building CXX object vulkan/CMakeFiles/vpvk_tests.dir/src/commands.cpp.o
+[124/172] Building CXX object vulkan/CMakeFiles/vpvk_tests.dir/src/entry.cpp.o
+[125/172] Building CXX object vulkan/CMakeFiles/vpvk_tests.dir/src/precompile.cpp.o
+[126/172] Building CXX object vulkan/CMakeFiles/vpvk_tests.dir/src/recipes.cpp.o
+[127/172] Building CXX object vulkan/CMakeFiles/vpvk_tests.dir/src/taa_native.cpp.o
+[128/172] Building CXX object vulkan/CMakeFiles/vpvk_tests.dir/src/vpcap.cpp.o
+[129/172] Building CXX object vulkan/CMakeFiles/vpvk_tests.dir/src/foveation.cpp.o
+[130/172] Building CXX object vulkan/CMakeFiles/vpvk_tests.dir/src/ext.cpp.o
+[131/172] Building CXX object vulkan/CMakeFiles/vpvk_tests.dir/src/texdecode.cpp.o
+[132/172] Building CXX object vulkan/CMakeFiles/vpvk_tests.dir/src/platform_null.cpp.o
+[133/172] Building CXX object vulkan/CMakeFiles/vpvk_tests.dir/src/pipelines.cpp.o
+[134/172] Building CXX object vulkan/CMakeFiles/vpcap_dump.dir/tools/vpcap_dump.cpp.o
+[135/172] Building CXX object vulkan/CMakeFiles/vpcap_dump.dir/src/vpcap.cpp.o
+[136/172] Linking CXX shared library vulkan/libVPVulkanTest.so
+[137/172] Building CXX object vulkan/CMakeFiles/vpvk_tests.dir/src/passdump.cpp.o
+[138/172] Building CXX object vulkan/CMakeFiles/vpvk_tests.dir/src/pending.cpp.o
+[139/172] Building CXX object vulkan/CMakeFiles/vpvk_audit2.dir/src/foveation.cpp.o
+[140/172] Building CXX object vulkan/CMakeFiles/vpimgdiff.dir/tools/vpimgdiff.cpp.o
+[141/172] Linking CXX static library ps4/libvpps4.a
+[142/172] Building CXX object vulkan/CMakeFiles/vpvk_audit2.dir/src/vpcap.cpp.o
+[143/172] Building CXX object ps4/CMakeFiles/vpps4_tiling_tests.dir/tests/tiling_tests.cpp.o
+[144/172] Linking CXX executable shader/ir/tests/vpir_test
+[145/172] Linking CXX executable shader/msl/tests/vpmsl_golden
+[146/172] Linking CXX executable shader/gcn/vpgcn_lift_batch
+[147/172] Linking CXX executable shader/gcn/tests/vpgcn_test
+[148/172] Linking CXX executable shader/gcn/tests/vpgcn_lift_test
+[149/172] Linking CXX executable shader/gcn/tests/vpgcn_lift_scale_test
+[150/172] Linking CXX executable shader/gcn/tests/vpgcn_ref_selftest
+[151/172] Linking CXX executable shader/gcn/tests/vpgcn_diff
+[152/172] Linking CXX executable shader/spirv/vpspirv_tests
+[153/172] Linking CXX executable core/vpgpu_core_tests
+[154/172] Linking CXX executable core/vpgpu_submit_order_tests
+[155/172] Linking CXX executable core/vpgpu_core_audit_tests
+[156/172] Linking CXX executable gles/vpglsl_tests
+[157/172] Building CXX object vulkan/CMakeFiles/vpvk_audit2.dir/src/passdump.cpp.o
+[158/172] Linking CXX executable gles/vpgles_tests
+[159/172] Linking CXX executable gles/vpgles_audit_vk_tests
+[160/172] Linking CXX executable gles/vpgles_audit_formats_tests
+[161/172] Linking CXX executable vulkan/vpcap_dump
+[162/172] Linking CXX executable gles/vpglsl_audit_tests
+[163/172] Linking CXX executable vulkan/vpimgdiff
+[164/172] Linking CXX executable ps4/vpps4_tiling_tests
+[165/172] Building CXX object vulkan/CMakeFiles/vpvk_audit2.dir/tests/audit_vk2_tests.cpp.o
+[166/172] Linking CXX executable vulkan/vpvk_audit2
+[167/172] Building CXX object ps4/CMakeFiles/vpps4_tests.dir/tests/renderer_tests.cpp.o
+[168/172] Linking CXX executable ps4/vpps4_tests
+[169/172] Building CXX object vulkan/CMakeFiles/vpvk_tests.dir/src/capture.cpp.o
+[170/172] Building CXX object vulkan/CMakeFiles/vpvk_tests.dir/tests/vk_tests.cpp.o
+[171/172] Linking CXX executable vulkan/vpvk_tests
