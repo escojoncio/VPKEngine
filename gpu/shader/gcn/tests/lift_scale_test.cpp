@@ -110,7 +110,7 @@ const vpir::Block* dispatchTree(const vpir::Block& body) {
 }
 int dispatchSearch() {
     int dispatched = 0;
-    for (int n : {5, 9, 13, 20, 37, 64, 100, 150, 300}) {
+    for (int n : {5, 9, 13, 20, 37, 64, 100, 150, 300, 500, 1000}) {  // (500 and 1000 nest past kMaxWalkDepth on any architecture; the smaller ones depend on the frame sizes)
         std::vector<uint32_t> code;
         for (int i = 0; i < n; ++i) {
             code.push_back(0xBF000000);  // s_cmp_eq_i32 s0, s0

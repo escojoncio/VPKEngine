@@ -72,6 +72,13 @@ Clientes: VisionQuestPro (foco), AVP, AstroVisionPro. Licencia PolyForm Noncomme
 - `VPVK_UI_TINT=1` hace fallar `gpu_vulkan.taa_uimask` (esperado: fuerza alfa 1). El bucle `umu` de `diagnostics.cpp` duplica pipelines entre las 3 más usadas (cubierto por `gpu_core.passdump`; comentario de la línea 467 inexacto).
 - Sin ejecutar nunca: `textProbe`, `gles.r8_upload`, `gpu.pdump.vis`, `VPVK_UI_TINT` con datos reales ni en visor.
 
+## Primera CI en GitHub (fdcd03a, 2026-11-13): fallos y arreglos
+- Ningún workflow había corrido antes; los fallos son de primera ejecución, no regresiones.
+- AOT `shd16_defined`: el hash de memoria incluía el residuo de `pushfq` (AF/OF indefinidos, distintos en AMD/Intel). El caso borra `-8(%rsp)` tras cada `pop`; golden regenerado. `shd16_of.s` y `shrd16_wide_count.s` tienen el mismo patrón (hoy sin fallo en AMD).
+- Metal: `gcn.lift.dispatch_search` (añadidos n=500/1000), `glsl.memory` (límite RSS Apple 1536 MB, **provisional**: leer el pico impreso por stderr y ajustar; ya no cubre en Darwin la regresión de ~530 MB), `audit5_pass_split` (≤216 buffers), `audit_vk` (`RecipeStore::rewrite` escribe los SPIR-V ordenados por hash; el formato no cambia, el orden de registros del fichero compactado sí; test pasa a `stage(w,200,…)`).
+- **Sigue roto**: `replay-compare` en simulador visionOS: SIGTRAP `_xpc_api_misuse` en `MTLSimDevice newBufferWithBytesNoCopy` desde `MetalBackend::createBuffer` (rama `guestMemory`) ← `UploadArena::put` (`gpu/vulkan/src/pipelines.cpp:1090`). Hipótesis sin confirmar: el simulador exige memoria `mmap` y el chunk usa `aligned_alloc(16384,65536)` (igual en `ext.cpp:215`, `pipelines.cpp:4742`, `entry.cpp` hostAlloc <1 MiB). Código previo a la auditoría. Probar con `mmap` anónimo para el arena.
+- `vpconvert-visionos.yml` quedó colgado (>31 min) en el run de fdcd03a y se canceló; relanzado con el siguiente `[build]`.
+
 ## Menores aceptados (con motivo) y no verificado
 - pp: macro objeto cuyo cuerpo acaba en `F (` con la llamada partida en varias líneas da «unterminated» donde cpp acepta (ya en `main`); `#define`/`#undef` dentro de una llamada abierta se aplica al cerrarla (UB C99 6.10.3p11, difiere de gcc); lexer de CI: falsos negativos exóticos (`pv -L 5`, `&>file`, `bash <<EOF >log`, `sh -sc /dev/stdin`, anidamiento muy profundo → WARN).
 - GLES: 8 MiB enteros enlazados = 65 pases (mejora futura: CoW sin espera si todas las escrituras pendientes son copias ordenadas `!unknownWrite`, con heurística por pase). El backend nulo no valida los bytes de las copias ordenadas, solo regiones/offsets. Tests `audit9_presents`: dos CHECK casi tautológicos (`lateHits==0`, `gTwoParked==1`) y `reserve(presents+1)` con +1 de margen conservador: inocuos, aceptados.

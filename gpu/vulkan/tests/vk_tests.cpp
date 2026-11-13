@@ -17030,7 +17030,7 @@ void testAuditRefreshFileMoved() {
       RecipeStore w(dir, other);  // an older translator wrote everything: all of it is stale for the store below
       for (uint64_t k = 0; k < 300; ++k) {  // dead records in front of the live ones: a compaction moves the offsets
         w.setTranslator(other + uint32_t((k + 1) % 2));
-        stage(w, 99, 0x9000);
+        stage(w, 200, 0x9000);  // (the highest hash of the four: the compaction writes the modules by hash, so every one of them moves)
       }
       w.setTranslator(other);
       for (uint64_t n = 0; n < 3; ++n) stage(w, n, 0x5000 + n);

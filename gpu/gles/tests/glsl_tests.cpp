@@ -2894,7 +2894,15 @@ void testMemory() {
     CHECK(!build(vs, elseIfChain(20000)).ok);
     CHECK(build(vs, longSum(19000)).ok);
     const long peak = peakKb();
-    if (!sanitized) CHECK(peak > 0 && peak < 400 * 1024);  // (measured about 260 MB: the largest are the chains of 19000 terms and 1M-token lines)
+    // (measured about 260 MB on Linux, where the RLIMIT_AS above also holds the allocations back: the largest are the chains of 19000 terms and 1M-token
+    // lines. Darwin has no RLIMIT_AS and its malloc keeps the freed pages in the process's peak: the limit is a bound against unbounded growth there.)
+#if defined(__APPLE__)
+    constexpr long kPeakLimitKb = 1536 * 1024;
+#else
+    constexpr long kPeakLimitKb = 400 * 1024;
+#endif
+    std::fprintf(stderr, "  peak resident set: %ld MB (limit %ld MB)\n", peak / 1024, kPeakLimitKb / 1024);
+    if (!sanitized) CHECK(peak > 0 && peak < kPeakLimitKb);
 }
 
 int main(int argc, char** argv) {

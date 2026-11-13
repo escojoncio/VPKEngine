@@ -1130,7 +1130,14 @@ bool RecipeStore::rewrite(std::unique_lock<std::mutex>& lock) {
   size = kHeaderBytes;
   std::unordered_map<uint64_t, SpirvRec> spirv;
   std::vector<uint32_t> words;
-  for (const auto& [h, s] : spirvS) {
+  // In the order of their hashes: the same compacted file whatever the standard library's hash map order (the offsets a refresh took
+  // before a rewrite then land on the same records on every platform; the tests of a moved file rely on it).
+  std::vector<uint64_t> spirvOrder;
+  spirvOrder.reserve(spirvS.size());
+  for (const auto& kv : spirvS) spirvOrder.push_back(kv.first);
+  std::sort(spirvOrder.begin(), spirvOrder.end());
+  for (const uint64_t h : spirvOrder) {
+    const SpirvRec& s = spirvS.find(h)->second;
     words.resize(s.count);
     if (std::fseek(in, long(s.offset), SEEK_SET) != 0 || std::fread(words.data(), 4, words.size(), in) != words.size())
       continue;  // unreadable: its inputs stay usable while the version matches

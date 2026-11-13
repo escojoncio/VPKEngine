@@ -14,6 +14,7 @@ _start:
     shrd %cl, %dx, %ax
     pushfq
     pop %r8
+    movq $0, -8(%rsp)   # scrub the pushed rflags (AF, OF are undefined here and differ between vendors)
     and $0xc5, %r8d
     mov %ax, (%r10)
     mov %r8w, 2(%r10)
@@ -24,6 +25,7 @@ _start:
     shld %cl, %dx, %ax
     pushfq
     pop %r8
+    movq $0, -8(%rsp)   # scrub the pushed rflags (AF, OF are undefined here and differ between vendors)
     and $0xc5, %r8d
     mov %ax, (%r10)
     mov %r8w, 2(%r10)
@@ -34,6 +36,7 @@ _start:
     shrd %cl, %dx, %ax
     pushfq
     pop %r8
+    movq $0, -8(%rsp)   # scrub the pushed rflags (AF, OF are undefined here and differ between vendors)
     and $0xc5, %r8d
     mov %ax, (%r10)
     mov %r8w, 2(%r10)
@@ -44,6 +47,7 @@ _start:
     shld %cl, %dx, %ax
     pushfq
     pop %r8
+    movq $0, -8(%rsp)   # scrub the pushed rflags (AF, OF are undefined here and differ between vendors)
     and $0xc5, %r8d
     mov %ax, (%r10)
     mov %r8w, 2(%r10)
@@ -54,6 +58,7 @@ _start:
     shrd %cl, %dx, %ax
     pushfq
     pop %r8
+    movq $0, -8(%rsp)   # scrub the pushed rflags (AF, OF are undefined here and differ between vendors)
     and $0xc5, %r8d
     mov %ax, (%r10)
     mov %r8w, 2(%r10)
@@ -64,6 +69,7 @@ _start:
     shld %cl, %dx, %ax
     pushfq
     pop %r8
+    movq $0, -8(%rsp)   # scrub the pushed rflags (AF, OF are undefined here and differ between vendors)
     and $0xc5, %r8d
     mov %ax, (%r10)
     mov %r8w, 2(%r10)
