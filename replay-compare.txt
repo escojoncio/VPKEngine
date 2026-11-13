@@ -1,0 +1,113 @@
+=== scene
+vpk.version sha=0e2e28207f12
+vk.instance app=vpcap-test engine= api=1.1 exts=0
+vk.caps identity=native vendor=0x106b device="Apple xrOS simulator GPU"
+vk.caps limits apiVersion=1.3.0 maxVertexOutputComponents=124 maxFragmentInputComponents=124 maxColorAttachments=8 maxComputeWorkGroupInvocations=1024 maxComputeSharedMemorySize=32768 maxImageDimension2D=16384 maxImageArrayLayers=2048 maxPerStageDescriptorStorageBuffers=24 maxPerStageDescriptorStorageImages=8 maxBoundDescriptorSets=7 maxSamplerAnisotropy=16 framebufferColorSampleCounts=0x7 sampledImageColorSampleCounts=0x7
+vk.mem_seen heaps=1 heap0=6442450944 heap0_flags=0x1 types=4
+vpreplay: driver: Apple xrOS simulator GPU (api 1.3.0), queue family 0, 4 memory types
+vk.format device bc_texture_compression=1
+vk.caps features geometryShader=0 tessellationShader=0 imageCubeArray=1 sampleRateShading=1 fragmentStoresAndAtomics=1 vertexPipelineStoresAndAtomics=1 shaderInt16=1 shaderFloat64=0 shaderStorageImageMultisample=0 shaderClipDistance=1 multiViewport=0 astc=1 etc2=1 bc=1 depthClamp=1 independentBlend=1 dualSrcBlend=1 logicOp=0 multiDrawIndirect=1
+vk.device_req exts=0 names=
+vk.device_req features struct=features2 on=none unsupported=none
+vk.device_req features struct=vulkan12 on=timelineSemaphore unsupported=none
+vk.robust app=0 mode=default effective=1
+gpu.cfg frames_in_flight=3
+gpu.metal.info what=no_residency_set fallback=use_resource error=unknown_error
+gpu.state elide on=1
+gpu.state buf_immutable on=1
+gpu.state full_barriers on=0
+gpu.metal device=Apple_xrOS_simulator_GPU simulator=1 metal3=0 apple4=0 apple7=0 argument_buffers_tier=1 bindless=0 stage_timestamps=0 residency=0 archive=0 tile_memory=0
+gpu.msaa dead_store=1
+gpu.frame_opt enabled=1
+gpu.hold armed max_ms=1500
+gpu.msaa resolve_on_tile=colour
+gpu.tile heavy_max_draws=2000 heavy_max_vertices=3000000 heavy_mode=on
+vk.translator mode=0 native_fetch=0 amplify=0 unpack_fetch=0 kill_exit=1 amplify_clip=0 id=39
+gpu.shaderfx invariant_pos=1 math=fast
+vk.device exts=0 multiview=0 fdm=0 metal_objects=0
+vk.cfg VPVK_FORCE_ANISO=0 -> anisotropy override off (game's own)
+vk.msaa device_max=4 (supportsTextureSampleCount 8=0 4=1 2=0)
+vk.cfg effective gen=0 fov=off sharp=0.35 periphery=0.50 vpktaa=0 50% sharp=0.50 scale=1.00 taa_native=0 taa_ui_mask=0 rcas=0.00 asw_off=1 quest3=1 anisotropy=0 prewarm=1 force_1x=0 msaa_override=0 msaa_device_max=4 fov_apply=0 fov_active=0 set_by_app=no(defaults)
+vk.msaa_tile memoryless image=64x64x1 samples=1 format=37 usage=0x13 (0.0 MiB if resident)
+vk.memreq fmt=37 64x64x1 mips=1 layers=1 samples=1 usage=0x13 size=16384 align=256
+vk.memreq fmt=37 8x8x1 mips=1 layers=1 samples=1 usage=0x7 size=256 align=256
+vk.msaa_tile memoryless image=64x64x1 samples=4 format=37 usage=0x13 (0.1 MiB if resident)
+vk.memreq fmt=37 64x64x1 mips=1 layers=1 samples=4 usage=0x13 size=65536 align=256
+vk.msaa_tile memoryless image=64x64x1 samples=4 format=126 usage=0x23 (0.1 MiB if resident)
+vk.memreq fmt=126 64x64x1 mips=1 layers=1 samples=4 usage=0x23 size=65536 align=256
+vk.msaa_tile memoryless image=64x64x1 samples=1 format=37 usage=0x13 (0.0 MiB if resident)
+vk.msaa_tile memoryless image=64x64x1 samples=1 format=37 usage=0x13 (0.0 MiB if resident)
+vk.sampler aniso level=0 forced=0/1 last: min=0 mag=0 mip=0 lod=0.0..0.0 addr=0,0,0 cmp=0 game_aniso=0 -> 1
+vk.pso.census created=1 compiled=0 failed=0 timed_out=0 archived=0 not_archived_depth_only=0 not_archived_other=0 archive_hits=0 compiled_in_session=0 archive_dup=0 archive_pending=0 archive_spilled=0 archive_trim_dropped=0 compile_required=0 drawn=0 dispatched=0 modules_created=2 modules_used=2 modules_unused=0 prewarmed_unused=0 requested_not_prewarmed=0 requested=0
+vk.msaa_tile memoryless image=64x64x1 samples=4 format=37 usage=0x13 (0.1 MiB if resident)
+vk.msaa_tile memoryless image=64x64x1 samples=4 format=126 usage=0x23 (0.1 MiB if resident)
+vk.msaa_tile memoryless image=64x64x1 samples=1 format=37 usage=0x13 (0.0 MiB if resident)
+vk.sampler aniso level=0 forced=0/2 last: min=0 mag=0 mip=0 lod=0.0..0.0 addr=2,2,2 cmp=0 game_aniso=0 -> 1
+vk.pipeline_wait what=translate pipeline=vk.pipe1 timeout_ms=2000
+vk.skip what=translate_timeout pipeline=vk.pipe1
+gpu.shader.lib compiled=1 dedup=0 prewarmed=0 ms_total=2947 ms_max=2947 last_ms=2947 bytes=790 wait_ms=0 src=demand invariant=0 invariant_retries=0
+gpu.pso.hot label=vk.indirect_patch ms=685
+gpu.pso.miss n=1 kind=compute label=vk.indirect_patch key=5739658356830076479 ms=685
+gpu.pso.miss_detail key=4fa75cdd92f57e3f label=vk.indirect_patch samples=1 colorFormats=none depthFormat=Undefined primitive=triangles vs=0000000000000000 fs=0000000000000000 extra{cs=7650564b49505431 depth=00:7 cull=0 a2c=0 fetch=0 src=metal kind=compute key_dec=5739658356830076479}
+gpu.pso.aot archived=0 hot=1 hot_ms_total=685 hot_ms_max=685
+vk.pipeline_wait what=translate pipeline=vk.pipe1 timeout_ms=2000
+vk.skip what=translate_timeout pipeline=vk.pipe1
+validateWithDevice:5044: failed assertion `Render Pipeline Descriptor Validation
+Pipeline rasterSampleCount (4) is greater than 1 but the pipeline vertex function is writing to render_target_array_index.
+'
+Child process terminated with signal 6: Abort trap
+compare.sh: vpvk replay of scene.vpcap failed (exit 134, /Users/runner/work/VPKEngine/VPKEngine/build/replay-ref/vpvk/scene/replay.log)
+=== tri
+vpk.version sha=0e2e28207f12
+vk.instance app=vpcap-test engine= api=1.1 exts=0
+vk.caps identity=native vendor=0x106b device="Apple xrOS simulator GPU"
+vk.caps limits apiVersion=1.3.0 maxVertexOutputComponents=124 maxFragmentInputComponents=124 maxColorAttachments=8 maxComputeWorkGroupInvocations=1024 maxComputeSharedMemorySize=32768 maxImageDimension2D=16384 maxImageArrayLayers=2048 maxPerStageDescriptorStorageBuffers=24 maxPerStageDescriptorStorageImages=8 maxBoundDescriptorSets=7 maxSamplerAnisotropy=16 framebufferColorSampleCounts=0x7 sampledImageColorSampleCounts=0x7
+vk.mem_seen heaps=1 heap0=6442450944 heap0_flags=0x1 types=4
+vpreplay: driver: Apple xrOS simulator GPU (api 1.3.0), queue family 0, 4 memory types
+vk.format device bc_texture_compression=1
+vk.caps features geometryShader=0 tessellationShader=0 imageCubeArray=1 sampleRateShading=1 fragmentStoresAndAtomics=1 vertexPipelineStoresAndAtomics=1 shaderInt16=1 shaderFloat64=0 shaderStorageImageMultisample=0 shaderClipDistance=1 multiViewport=0 astc=1 etc2=1 bc=1 depthClamp=1 independentBlend=1 dualSrcBlend=1 logicOp=0 multiDrawIndirect=1
+vk.device_req exts=0 names=
+vk.device_req features struct=features2 on=none unsupported=none
+vk.device_req features struct=vulkan12 on=timelineSemaphore unsupported=none
+vk.robust app=0 mode=default effective=1
+gpu.cfg frames_in_flight=3
+gpu.metal.info what=no_residency_set fallback=use_resource error=unknown_error
+gpu.state elide on=1
+gpu.state buf_immutable on=1
+gpu.state full_barriers on=0
+gpu.metal device=Apple_xrOS_simulator_GPU simulator=1 metal3=0 apple4=0 apple7=0 argument_buffers_tier=1 bindless=0 stage_timestamps=0 residency=0 archive=0 tile_memory=0
+gpu.msaa dead_store=1
+gpu.frame_opt enabled=1
+gpu.hold armed max_ms=1500
+gpu.msaa resolve_on_tile=colour
+gpu.tile heavy_max_draws=2000 heavy_max_vertices=3000000 heavy_mode=on
+vk.translator mode=0 native_fetch=0 amplify=0 unpack_fetch=0 kill_exit=1 amplify_clip=0 id=39
+gpu.shaderfx invariant_pos=1 math=fast
+vk.device exts=0 multiview=0 fdm=0 metal_objects=0
+vk.cfg VPVK_FORCE_ANISO=0 -> anisotropy override off (game's own)
+vk.msaa device_max=4 (supportsTextureSampleCount 8=0 4=1 2=0)
+vk.cfg effective gen=0 fov=off sharp=0.35 periphery=0.50 vpktaa=0 50% sharp=0.50 scale=1.00 taa_native=0 taa_ui_mask=0 rcas=0.00 asw_off=1 quest3=1 anisotropy=0 prewarm=1 force_1x=0 msaa_override=0 msaa_device_max=4 fov_apply=0 fov_active=0 set_by_app=no(defaults)
+vk.msaa_tile memoryless image=64x64x1 samples=1 format=37 usage=0x13 (0.0 MiB if resident)
+vk.memreq fmt=37 64x64x1 mips=1 layers=1 samples=1 usage=0x13 size=16384 align=256
+gpu.shader.lib compiled=1 dedup=0 prewarmed=0 ms_total=2 ms_max=2 last_ms=2 bytes=790 wait_ms=0 src=demand invariant=0 invariant_retries=0
+vk.msaa_tile memoryless image=64x64x1 samples=1 format=37 usage=0x13 (0.0 MiB if resident)
+vk.sampler aniso level=0 forced=0/1 last: min=0 mag=0 mip=0 lod=0.0..0.0 addr=0,0,0 cmp=0 game_aniso=0 -> 1
+vk.pso.census created=1 compiled=0 failed=0 timed_out=0 archived=0 not_archived_depth_only=0 not_archived_other=0 archive_hits=0 compiled_in_session=0 archive_dup=0 archive_pending=0 archive_spilled=0 archive_trim_dropped=0 compile_required=0 drawn=0 dispatched=0 modules_created=2 modules_used=2 modules_unused=0 prewarmed_unused=0 requested_not_prewarmed=0 requested=0
+gpu.shader.lib index=0
+gpu.shader.lib miss id=c604d6682bd2063f
+gpu.shader.lib hit=0 miss=1 recipe_hit=0
+gpu.shader.key stage=vertex views=1 specs=0 slots=1 src=c604d6682bd2063f bytes=1111 args=b0,bs0 wg=1,1,1 colors=0x0
+gpu.shader.msl translated=1 ms_total=26 ms_max=26.0
+gpu.shader.lib miss id=ff13c1c07104ff4c
+gpu.shader.lib hit=0 miss=2 recipe_hit=0
+gpu.shader.key stage=fragment views=1 specs=0 slots=1 src=ff13c1c07104ff4c bytes=375 args=none wg=1,1,1 colors=0x1
+gpu.shader.msl translated=2 ms_total=26 ms_max=26.0
+gpu.pso.hot label=vk.indirect_patch ms=35
+gpu.pso.miss n=1 kind=compute label=vk.indirect_patch key=5739658356830076479 ms=34
+gpu.pso.miss_detail key=4fa75cdd92f57e3f label=vk.indirect_patch samples=1 colorFormats=none depthFormat=Undefined primitive=triangles vs=0000000000000000 fs=0000000000000000 extra{cs=7650564b49505431 depth=00:7 cull=0 a2c=0 fetch=0 src=metal kind=compute key_dec=5739658356830076479}
+gpu.pso.aot archived=0 hot=1 hot_ms_total=35 hot_ms_max=35
+validateWithDevice:5044: failed assertion `Render Pipeline Descriptor Validation
+Pipeline rasterSampleCount (4) is greater than 1 but the pipeline vertex function is writing to render_target_array_index.
+'
+Child process terminated with signal 6: Abort trap
+compare.sh: vpvk replay of tri.vpcap failed (exit 134, /Users/runner/work/VPKEngine/VPKEngine/build/replay-ref/vpvk/tri/replay.log)
