@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
  *
  * vp_loader.c when an allocation fails at any point of a load that is refused afterwards (the code is not the translated one):
- * whatever fails, the refused image must not stay mapped (abandon_image / release_image_locked unmap it even without memory to
+ * whatever fails, the refused image must not stay mapped (abandon_image / release_part_locked unmap it even without memory to
  * restore the embedder's reservation) and nothing may crash. Each run arms the failure of the K-th malloc/calloc/realloc of the
  * load, for K = 1.. until a load no longer reaches it.   loader_oom DIR   (GNU ld: -Wl,--wrap=malloc,--wrap=calloc,--wrap=realloc)
  */

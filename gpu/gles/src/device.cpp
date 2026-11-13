@@ -12,7 +12,7 @@
 namespace vpgles {
 
 namespace {
-Device* gDevice = nullptr;
+std::atomic<Device*> gDevice{nullptr};
 thread_local Context* tCurrent = nullptr;
 thread_local uint64_t tCurrentSession = 0;  // gSession when this thread's tCurrent was set
 Context* gLastCurrent = nullptr;  // last context made current on any thread (guarded by Device::lock)
@@ -33,8 +33,12 @@ void logLenient(const std::vector<std::string>& rules, const char* what, unsigne
     for (const std::string& r : rules) logf("gles.glsl.lenient rule=%s %s=%u", r.c_str(), what, name);
 }
 
-Device* device() { return gDevice; }
-void setDevice(Device* d) { gDevice = d; }
+Device* device() { return gDevice.load(std::memory_order_acquire); }
+void setDevice(Device* d) { gDevice.store(d, std::memory_order_release); }
+std::recursive_mutex& Device::lock() {
+    static auto* m = new std::recursive_mutex;  // (never destroyed: see the declaration)
+    return *m;
+}
 Context* current() {
     // A context made current in a session that vpgles_shutdown ended was deleted with it: the pointer this thread holds is not valid.
     if (tCurrent && tCurrentSession != gSession.load(std::memory_order_acquire)) tCurrent = nullptr;
@@ -124,7 +128,8 @@ bool Device::init(PFN_vkGetInstanceProcAddr gipa) {
 }
 
 void Device::shutdown() {
-    if (!device) return;
+    if (!device || dead) return;
+    dead = true;  // (Device::lock held by the caller: every entry sees the session ended from here on)
     texStatsTick(true);
     recipeStatsTick(true);
     mapStatsTick(true);
@@ -134,10 +139,73 @@ void Device::shutdown() {
     freePools.clear();
     spareChunks.clear();
     vk.vkDestroyCommandPool(device, pool, nullptr);
+    if (presents > 0) finalPending = true;  // a present callback is still using an image: the last one to return destroys the device
+    else finalDestroy();
+}
+
+void Device::finalDestroy() {
+    finalPending = false;
+    if (!device) return;
     vk.vkDestroyDevice(device, nullptr);
     vk.vkDestroyInstance(instance, nullptr);
     device = VK_NULL_HANDLE;
 }
+
+void Device::presentReturned(ImageP& keep, std::unique_lock<std::recursive_mutex>& l) {
+    if (finalPending && presents > 1) {  // others are still in the callback: the last one waits for the GPU, then these images can go
+        lateImages.push_back(std::move(keep));  // (cannot allocate: eglSwapBuffers reserved room for every present in flight; this runs in a noexcept destructor)
+        --presents;
+        return;
+    }
+    // Work the host's callback queued on the shared queue may still run: vpgles_shutdown's wait came before it, and covers none of it. Waited
+    // for without the lock (the host's work can depend on a thread that is waiting for it; this Device stays standing: `presents` still counts
+    // this callback, and no new present starts on an ended session).
+    if (finalPending && device) {
+        l.unlock();
+        vk.vkDeviceWaitIdle(device);
+        l.lock();
+    }
+    lateImages.clear();
+    keep.reset();
+    if (--presents == 0 && finalPending) {
+        finalDestroy();
+        if (this != gDevice.load(std::memory_order_acquire)) freeRetiredDevices();  // a session started meanwhile: nothing will free this one later
+    }
+}
+
+namespace {
+std::vector<Device*>& retiredDevices() {
+    static auto* v = new std::vector<Device*>;
+    return *v;
+}
+#ifdef VPGLES_TESTING
+std::atomic<int> gDevicesFreed{0};
+#endif
+}  // namespace
+
+void retireDevice(Device* old) { retiredDevices().push_back(old); }
+
+void freeRetiredDevices() {
+    std::vector<Device*>& v = retiredDevices();
+    for (size_t i = 0; i < v.size();) {
+        Device* o = v[i];
+        if (o->presents == 0 && !o->finalPending) {
+            delete o;
+#ifdef VPGLES_TESTING
+            ++gDevicesFreed;
+#endif
+            v[i] = v.back();
+            v.pop_back();
+        } else {
+            ++i;
+        }
+    }
+}
+
+#ifdef VPGLES_TESTING
+int devicesFreedCount() { return gDevicesFreed.load(); }
+int devicesRetiredCount() { return int(retiredDevices().size()); }
+#endif
 
 int Device::memoryType(uint32_t bits, VkMemoryPropertyFlags want) const {
     for (uint32_t i = 0; i < memProps.memoryTypeCount; ++i)
@@ -650,24 +718,26 @@ void Context::deferImageInit(const ImageP& img) {
     ++img->xferPending;
 }
 
-void BufferStorage::noteRead(uint64_t lo, uint64_t hi) {
-    hi = std::min<uint64_t>(hi, size);
+// Adds [lo, hi) to a short list of byte ranges: merged with the ones it touches, and the whole list becomes one range if it grows past 8.
+static void mergeRange(std::vector<std::pair<uint64_t, uint64_t>>& v, uint64_t lo, uint64_t hi) {
     if (lo >= hi) return;
-    for (auto it = reads.begin(); it != reads.end();) {  // merge with what it touches
+    for (auto it = v.begin(); it != v.end();) {  // merge with what it touches
         if (it->second < lo || hi < it->first) {
             ++it;
             continue;
         }
         lo = std::min(lo, it->first), hi = std::max(hi, it->second);
-        it = reads.erase(it);
+        it = v.erase(it);
     }
-    reads.emplace_back(lo, hi);
-    if (reads.size() > 8) {  // too many: one range that holds them all
+    v.emplace_back(lo, hi);
+    if (v.size() > 8) {  // too many: one range that holds them all
         uint64_t a = UINT64_MAX, b = 0;
-        for (const auto& r : reads) a = std::min(a, r.first), b = std::max(b, r.second);
-        reads.assign(1, {a, b});
+        for (const auto& r : v) a = std::min(a, r.first), b = std::max(b, r.second);
+        v.assign(1, {a, b});
     }
 }
+
+void BufferStorage::noteRead(uint64_t lo, uint64_t hi) { mergeRange(reads, lo, std::min<uint64_t>(hi, size)); }
 
 bool BufferStorage::readsRange(uint64_t lo, uint64_t hi) const {
     hi = std::min<uint64_t>(hi, size);
@@ -690,10 +760,22 @@ void Context::useStorage(const StorageP& s, uint64_t lo, uint64_t hi) {
     s->noteRead(lo, hi);
 }
 
-void Context::noteGpuWrite(const StorageP& s) {
+void Context::noteGpuWrite(const StorageP& s, uint64_t lo, uint64_t hi) {
     if (!s) return;
+    // What an earlier write left is forgotten once that is complete (and no open command buffer, of any context, has its own note on it).
+    if (!gpuWritePending(*s) && s->openRefs == 0) s->orderedWrites.clear(), s->unknownWrite = false;
     useStorage(s, 0, 0);  // (keeps it alive and counted as used; no read range)
     gpuWrites_.insert(s.get());
+    if (hi == UINT64_MAX) s->unknownWrite = true;
+    else mergeRange(s->orderedWrites, lo, hi);
+}
+
+bool Context::gpuWriteOverlaps(const BufferStorage& s, uint64_t lo, uint64_t hi) const {
+    if (!gpuWritePending(s)) return false;
+    if (s.unknownWrite) return true;
+    for (const auto& r : s.orderedWrites)
+        if (r.first < hi && lo < r.second) return true;
+    return false;
 }
 
 // The CPU must not touch the bytes the GPU reads: a submission not yet complete is stamped on it, or an open command buffer (of any
@@ -750,6 +832,14 @@ uint64_t Context::flush(bool wait) {
     if (wait) dev->waitSerial(serial);
     else dev->retire(false);
     return serial;
+}
+
+uint64_t Context::stagingBytes() const {
+    uint64_t n = 0;
+    for (const Chunk& c : chunks_) n += c.storage->size;
+    for (const Device::InFlight& f : dev->inFlight)
+        for (const StorageP& c : f.chunks) n += c->size;
+    return n;
 }
 
 Context::Alloc Context::stream(VkDeviceSize size, VkDeviceSize align) {
@@ -815,15 +905,34 @@ void Context::prepareWrite(Buffer& b, bool discard, uint64_t lo, uint64_t hi, bo
 }
 
 bool Context::updateOrdered(const StorageP& s, uint64_t offset, uint64_t size, const void* data) {
-    constexpr uint64_t kMax = 1ull << 20;
-    if (!s || !size || size > kMax || offset + size > s->size) return false;
-    Alloc a = stream(size, 16);
-    std::memcpy(a.host, data, size_t(size));
-    noteGpuWrite(s);  // the copy writes it (and keeps it alive with the command buffer)
-    barrier();        // the work recorded so far is done before the copy
-    const VkBufferCopy bc{a.offset, offset, size};
-    dev->vk.vkCmdCopyBuffer(cmd(), a.buffer, s->buffer, 1, &bc);
-    barrier();        // ... and the copy before whatever follows
+    // A bigger update is several copies of at most kOrderedPiece, each from its own staging bytes (a refusal would send the caller to wait
+    // for the GPU, which is what this path exists to avoid).
+    constexpr uint64_t kMax = kOrderedPiece;
+    if (!s || !size || offset + size > s->size) return false;
+    noteGpuWrite(s, offset, offset + size);  // the copies write it (and keep it alive with the command buffer)
+    barrier();                               // the work recorded so far is done before the copies
+    for (uint64_t done = 0; done < size; done += kMax) {
+        const uint64_t n = std::min(kMax, size - done);
+        // The staging in use is over the cap: what is recorded goes to the GPU (the queue runs it in order, the copies after it), and its chunks
+        // come back as it completes; if what is in flight is over the cap by itself, wait for the oldest submission (an update of any size
+        // takes at most kMaxStaging of host memory).
+        while (stagingBytes() >= kMaxStaging) {
+            if (!chunks_.empty()) {
+                barrier();
+                flush(false);
+                noteGpuWrite(s, offset, offset + size);  // the rest of the copies are recorded in the next command buffer
+            } else if (!dev->inFlight.empty()) {
+                dev->waitSerial(dev->inFlight.front().serial);
+            } else {
+                break;
+            }
+        }
+        Alloc a = stream(n, 16);
+        std::memcpy(a.host, static_cast<const uint8_t*>(data) + done, size_t(n));
+        const VkBufferCopy bc{a.offset, offset + done, n};
+        dev->vk.vkCmdCopyBuffer(cmd(), a.buffer, s->buffer, 1, &bc);
+    }
+    barrier();        // ... and the copies before whatever follows
     return true;
 }
 

@@ -165,8 +165,8 @@ std::string textureType(const Resource& r) {
 
 class Emitter {
 public:
-    Emitter(const Module& m, uint32_t loopGuard, bool robust, bool constTables)
-        : m_(m), loopGuard_(loopGuard), useConstTables_(constTables) {
+    Emitter(const Module& m, uint32_t loopGuard, bool robust, bool robustPerWord, bool constTables)
+        : m_(m), loopGuard_(loopGuard), useConstTables_(constTables), perWord_(robustPerWord) {
         // robustBufferAccess: each storage buffer read/written through Load/Store/atomics is checked
         // against the BufferSize entry of its slot (emitMsl adds it). Out of range (or no buffer
         // bound: size 0) reads give 0, writes and atomics are dropped.
@@ -1296,6 +1296,15 @@ private:
                     if (!uses_.contains(in.result)) return;
                     line(typeName(t), " ", name(in.result), " = ", typeName(t), "(0);");
                     line("if (", g, ") ", name(in.result), " = ", e, ";");
+                    if (perWordCount(in.sym, t)) {  // crosses the end of the range: the words inside it are read, the rest stay 0
+                        line("else {");
+                        ++depth_;
+                        for (unsigned k = 0; k < t.width; ++k)
+                            line("if (", guard(in.sym, in.args[0], 4 * (k + 1)), ") ", name(in.result), ".", std::string(1, kSwizzle[k]), " = ",
+                                 wordAccess(in.sym, in.args[0], t, k), ";");
+                        --depth_;
+                        line("}");
+                    }
                     expr_[in.result] = name(in.result);
                     return;
                 }
@@ -1313,7 +1322,17 @@ private:
                 bool packed = false;
                 const Type st = fn_->typeOf(in.args[1]);
                 std::string g = guard(in.sym, in.args[0], st.byteSize());
-                return line(g.empty() ? "" : "if (" + g + ") ", access(in.sym, in.args[0], st, packed), " = ", a(1), ";");
+                line(g.empty() ? "" : "if (" + g + ") ", access(in.sym, in.args[0], st, packed), " = ", a(1), ";");
+                if (!g.empty() && perWordCount(in.sym, st)) {  // crosses the end of the range: the words inside it are written
+                    line("else {");
+                    ++depth_;
+                    for (unsigned k = 0; k < st.width; ++k)
+                        line("if (", guard(in.sym, in.args[0], 4 * (k + 1)), ") ", wordAccess(in.sym, in.args[0], st, k), " = (", a(1), ").",
+                             std::string(1, kSwizzle[k]), ";");
+                    --depth_;
+                    line("}");
+                }
+                return;
             }
             case Op::AtomicAdd: return atomicDefine(in, atomicOp("add", in));
             case Op::AtomicSub: return atomicDefine(in, atomicOp("sub", in));
@@ -1520,6 +1539,12 @@ private:
         define(in, t.width > 1 ? typeName(t) + "(" + results + ")" : results);
     }
 
+    // Known deviations from GCN in the robust checks (the PS4 renderer sets robustBuffers + robustPerWord): the check is a byte compare against the
+    // size of the bound range, rounded up to a word. (1) A buffer with a stride is checked by the hardware per record index, not per byte: an
+    // element larger than the stride (offset + size past stride * num_records) in the last record is read whole there and comes out partly
+    // zero here, one dword at a time (the renderer's size is stride * num_records; see Renderer::bind). Rare: the format does not fit its stride.
+    // (2) No 16-bit vector reaches the per-dword code: the IR verifier rejects F16 loads / stores (16-bit data goes through whole words), so the
+    // 8-byte half4 access that would cross the end does not exist.
     // Bounds condition of a storage-buffer access of `bytes` at `addr` (robust mode), "" when the
     // target is not checked. 64-bit compare: addr + bytes cannot wrap.
     std::string guard(uint32_t target, ValueId addr, unsigned bytes) const {
@@ -1529,6 +1554,19 @@ private:
         // end of a buffer of an odd size are read and merged as whole words (spirv lower.cpp load16 / store16).
         return "ulong(" + ex(addr) + ") + " + std::to_string(bytes ? bytes : 4) + "ul <= ((" + texture(it->second) +
                " + 3ul) & ~3ul)";
+    }
+    // Robust per word (EmitOptions::robustPerWord): the vectors of 32-bit words whose access is checked word by word, 0 for the rest (scalars,
+    // targets that are not checked): their width. There is no 16-bit case to handle: the IR verifier rejects a load or store of an F16 scalar or
+    // vector on every target (verify.cpp, "loads 32-bit scalars or vectors"), 16-bit data reaches memory as whole words (SPIR-V load16 / store16
+    // in the lowering, GCN dwords), so no 8-byte half4 access that could cross the end of a range gets here. If the IR ever allows one, it would
+    // be dropped whole at the end of a range (Vulkan's robustBufferAccess allows it) and this function is where to split it by dwords.
+    unsigned perWordCount(uint32_t target, Type t) const {
+        return perWord_ && sizeOf_.count(target) && t.width >= 2 && (t.scalar == Scalar::I32 || t.scalar == Scalar::U32 || t.scalar == Scalar::F32) ? t.width : 0;
+    }
+    // Word k of a vector access at `addr` as an lvalue of the scalar type.
+    std::string wordAccess(uint32_t target, ValueId addr, Type t, unsigned k) const {
+        Memory mem = memory(target);
+        return "*(" + mem.space + " " + scalarName(t.scalar) + "*)(" + address(mem, addr) + " + " + std::to_string(4 * k) + "u)";
     }
     // An atomic's result (or the bare statement when unused), under the bounds guard when robust.
     void atomicDefine(const Inst& in, const std::string& e) {
@@ -1571,6 +1609,7 @@ private:
     std::map<uint32_t, std::vector<uint32_t>> constTables_;   // slot -> its words
     size_t entryPos_ = 0;                                     // where the entry function starts in out_
     bool useConstTables_ = true;                              // EmitOptions::constTables
+    bool perWord_ = false;                                    // EmitOptions::robustPerWord
     std::unordered_map<uint32_t, uint32_t> sizeOf_;  // robust: Buffer resource -> its BufferSize resource
 };
 
@@ -1701,7 +1740,7 @@ static EmitResult emitMslImpl(const Module& module, const EmitOptions& options) 
     bool constTables = options.constTables;
     static const bool noTables = [] { const char* e = std::getenv("VPMSL_CONST_TABLES"); return e && *e == '0'; }();
     if (noTables) constTables = false;
-    r.shader = Emitter(m, options.loopGuard, options.robustBuffers, constTables).run();
+    r.shader = Emitter(m, options.loopGuard, options.robustBuffers, options.robustPerWord, constTables).run();
     return r;
 }
 

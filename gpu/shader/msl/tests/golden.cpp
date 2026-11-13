@@ -28,7 +28,8 @@ int main(int argc, char** argv) {
     const bool maxSource = argc == 4 && std::string(argv[2]) == "--max-source";
     const bool rateMap = argc == 4 && std::string(argv[3]) == "--rate-map";
     const bool samplerBias = argc == 4 && std::string(argv[3]) == "--sampler-bias";
-    if (argc != 3 && !reject && !maxSource && !mask && !rateMap && !samplerBias) {
+    const bool robustWord = argc == 4 && std::string(argv[3]) == "--robust-word";
+    if (argc != 3 && !reject && !maxSource && !mask && !rateMap && !samplerBias && !robustWord) {
         std::fprintf(stderr, "usage: vpmsl_golden IN.vpir (EXPECTED.metal [--color-outputs MASK] | --reject SUBSTRING)\n");
         return 2;
     }
@@ -40,6 +41,7 @@ int main(int argc, char** argv) {
     if (rateMap) p.module->rateMapPosition = true;
     vpmsl::EmitOptions options;
     options.samplerBias = samplerBias;
+    options.robustBuffers = options.robustPerWord = robustWord;
     vpmsl::EmitResult r = vpmsl::emitMsl(*p.module, options);
     if (reject) {
         for (const std::string& e : r.errors)

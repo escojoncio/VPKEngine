@@ -236,7 +236,9 @@ size_t vpvk_mem_brief(char* out, size_t cap);
 int vpvk_image_zero_pending(void* mtl_texture);
 // La limpia ya, en la cola del motor (ordenada tras lo aceptado y antes de lo posterior); solo si sigue
 // pendiente. 1 = resuelta (o ya no hacía falta), 0 = desconocida, -1 = un submit tiene el cerrojo
-// (no espera: reintentar el siguiente frame).
+// (no espera: reintentar el siguiente frame). Dentro del callback de vpvk_native_submit no puede ordenarse (no se
+// envía ningún frame desde ahí): queda anotada y responde -1 (sin limpiar: no la leas en ese callback); el siguiente
+// vpvk_native_submit la limpia antes de llamar a su callback, y entonces vpvk_image_zero_pending dice 0.
 int vpvk_image_zero_clear(void* mtl_texture);
 
 // Marca un VkImage como imagen de la capa de ojo (las del swapchain que el juego redibuja cada frame). La puerta de

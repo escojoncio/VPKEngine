@@ -61,10 +61,17 @@ class SpyBackend final : public vpgpu::Backend {
     std::vector<std::string>& calls = null.calls;
     uint64_t& completedBelow = null.completedBelow;
     void* zerosMemory = nullptr;
-    void* sinkMemory = nullptr;  // (label "vpps4 sink": what writable null V#s are bound to)
+    std::vector<uint64_t> dispatchBufferBytes;  // size of every Buffer range bound by a dispatch that reached the backend (0: a null V#)
+    struct Bound {
+        vpgpu::BindKind kind;
+        bool zeros;      // the renderer's block of zeros
+        uint64_t bytes;  // size of the range
+    };
+    std::vector<Bound> drawBindings;  // Buffer / ConstantBuffer ranges bound by every draw that reached the backend
+    uint32_t zerosIndex = ~0u;
+    std::vector<std::string> shaderSources;      // MSL of every shader registered
     void createBuffer(vpgpu::BufferId id, const vpgpu::BufferDesc& d) override {
-        if (d.label == "vpps4 zeros") zerosMemory = d.guestMemory;
-        if (d.label == "vpps4 sink") sinkMemory = d.guestMemory;
+        if (d.label == "vpps4 zeros") zerosMemory = d.guestMemory, zerosIndex = id.index;
         null.createBuffer(id, d);
     }
     void createTexture(vpgpu::TextureId id, const vpgpu::TextureDesc& d) override { null.createTexture(id, d); }
@@ -75,7 +82,22 @@ class SpyBackend final : public vpgpu::Backend {
     uint64_t bufferAddress(vpgpu::BufferId id) const override { return null.bufferAddress(id); }
     bool compilePipeline(const vpgpu::PipelineState& p, std::string& error) override { return null.compilePipeline(p, error); }
     void destroyPipeline(vpgpu::PipelineKey k) override { null.destroyPipeline(k); }
-    void submit(uint64_t frame, const vpgpu::Frame& f, const vpgpu::CompiledFrame& c) override { null.submit(frame, f, c); }
+    void submit(uint64_t frame, const vpgpu::Frame& f, const vpgpu::CompiledFrame& c) override {
+        for (const vpgpu::Command& cmd : f.commands()) {
+            if (const auto* dp = std::get_if<vpgpu::Dispatch>(&cmd)) {
+                for (const vpgpu::Access& a : dp->bindings)
+                    if (a.kind == vpgpu::BindKind::Buffer && a.range.kind == vpgpu::ResourceRange::Kind::Buffer)
+                        dispatchBufferBytes.push_back(a.range.end - a.range.begin);
+            } else if (const auto* rp = std::get_if<vpgpu::RenderPass>(&cmd)) {
+                for (const vpgpu::Draw& dr : rp->draws)
+                    for (const vpgpu::Access& a : dr.bindings)
+                        if ((a.kind == vpgpu::BindKind::Buffer || a.kind == vpgpu::BindKind::ConstantBuffer) &&
+                            a.range.kind == vpgpu::ResourceRange::Kind::Buffer)
+                            drawBindings.push_back({a.kind, a.range.index == zerosIndex, a.range.end - a.range.begin});
+            }
+        }
+        null.submit(frame, f, c);
+    }
     bool takeTimings(uint64_t& frame, vpgpu::GpuTimings& out) override { return null.takeTimings(frame, out); }
     uint64_t completedFrames() const override { return null.completedFrames(); }
     vpgpu::ReadResult readTexture(const vpgpu::TextureSpan& s, std::vector<uint8_t>& out) override { return null.readTexture(s, out); }
@@ -103,7 +125,10 @@ struct Fixture {
             g = {kBase, kSize, host};
             return true;
         };
-        h.shader = [this](uint64_t id, vpir::Stage st, const vpmsl::MslShader&) { shaders.push_back({id, st}); };
+        h.shader = [this](uint64_t id, vpir::Stage st, const vpmsl::MslShader& m) {
+            shaders.push_back({id, st});
+            backend.shaderSources.push_back(m.source);
+        };
         h.log = [this](const std::string& s) { log.push_back(s); };
         return h;
     }
@@ -555,9 +580,9 @@ void evictKeepsPresented() {
     CHECK(!destroyed(second));
 }
 
-// V#s that point nowhere: read-only bindings get a buffer of zeros nothing ever writes, write-only ones a separate sink, read-write ones (the
-// test dispatch loads and stores) a fresh block of zeros from the upload ring each time. Whatever the GPU writes there, whenever it runs the
-// dispatch, never shows in what a later draw reads: the zero buffer is not touched by the renderer, nor bound writable.
+// V#s that point nowhere: bound as an empty range of a buffer of zeros that nothing writes (the robust shaders drop writes and read 0 past the
+// range). Whatever a dispatch does there, whenever it runs, never shows in what a later draw reads; the draw's null vertex buffer is that same
+// block of zeros, as a range of size 0.
 void dummyCleared() {
     const Program cs = load("cs_bytes");
     auto writeIt = [&](Fixture& f) {  // a dispatch whose buffer access goes to a null V#: bound writable
@@ -585,27 +610,33 @@ void dummyCleared() {
     for (int gap : {0, 1, 7, 8, 20}) {  // submits between the writable binding and the read-only one
         Fixture f;
         writeIt(f);
-        const uint64_t uploads = f.renderer.stats().uploads;
         f.renderer.submit();
         for (int i = 0; i < gap; ++i) f.renderer.submit();
         readIt(f);
+        f.renderer.submit();
         CHECK(f.backend.zerosMemory != nullptr);
         if (!f.backend.zerosMemory) {
             for (const auto& [why, n] : f.renderer.stats().skipped) std::fprintf(stderr, "  skip %s x%d\n", why.c_str(), int(n));
             return;
         }
-        CHECK(f.backend.zerosMemory != f.backend.sinkMemory);
         CHECK(zeros(f));
-        CHECK(uploads > 0);
-        if (gap == 0) {  // a second writable binding gets zeros again (its own block of the ring), the zero buffer stays as it is
+        // The dispatch's buffer is the empty range of the zeros, and so is the draw's vertex buffer (a Buffer resource of the vertex fetch).
+        CHECK(f.backend.dispatchBufferBytes.size() == 1 && f.backend.dispatchBufferBytes[0] == 0);
+        bool drawZeros = false;
+        for (const auto& b : f.backend.drawBindings) drawZeros = drawZeros || (b.zeros && b.kind == vpgpu::BindKind::Buffer && b.bytes == 0);
+        CHECK(drawZeros);
+        if (gap == 0) {  // a second writable binding is the same empty range, the zero buffer stays as it is
             writeIt(f);
+            f.renderer.submit();
             CHECK(zeros(f));
+            CHECK(f.backend.dispatchBufferBytes.size() == 2 && f.backend.dispatchBufferBytes[1] == 0);
         }
     }
 }
 
-// Many dispatches of null read-write bindings in one frame: each takes only its addressable bytes of the upload ring, so none is lost to a
-// full ring.
+// Null V#s need no memory at all: many dispatches of null read-write bindings in one frame take nothing from the upload ring, each one reaches
+// the backend with a Buffer range of size 0, and the shaders are robust (bounds-checked against the bound size), so an access past 64 KiB, a
+// big dispatch or an atomic cannot reach other data.
 void nullRwRing() {
     const Program cs = load("cs_bytes");
     Fixture f;
@@ -623,8 +654,151 @@ void nullRwRing() {
     const auto& st = f.renderer.stats();
     CHECK(st.dispatched == 600);
     CHECK(st.drawn == 50);
+    const auto nullNote = st.notes.find("null buffer bound as an empty range");
+    CHECK(nullNote != st.notes.end() && nullNote->second == 600);
+    // Nothing was copied for them: a few uploads (the user data, repeated so reused, and the draws'), not a block of zeros per dispatch.
+    CHECK(st.uploads < 20);  // (measured: 3)
+    CHECK(f.backend.zerosMemory != nullptr);
+    size_t empty = 0;
+    for (uint64_t n : f.backend.dispatchBufferBytes) empty += n == 0;
+    CHECK(empty >= 600);  // every null V# is a size-0 range: nothing to read or overwrite, in any order the GPU runs them
+    bool robust = false;  // (the draws' shaders have no storage buffer: it is the compute shader that has the size checks)
+    for (const std::string& src : f.backend.shaderSources) robust = robust || src.find("vp_args.bs") != std::string::npos;
+    CHECK(robust);  // the MSL has the BufferSize checks (vp_args.bs<N>)
     for (const auto& [why, n] : st.skipped) std::fprintf(stderr, "  skip %s x%d\n", why.c_str(), int(n));
     CHECK(st.skipped.empty());
+}
+
+// The range a V# binds, as the backend gets it (the robust shaders check every access against it): num_records 0 is an empty range (the hardware
+// reads zeros and drops writes), not "the rest of the mapping"; a null V# or one outside guest memory is empty too; a V# bigger than its
+// mapping is cut to the mapping.
+void robustRanges() {
+    const Program cs = load("cs_bytes");
+    Fixture f;
+    struct Case {
+        const char* what;
+        uint64_t address;
+        uint32_t stride, records;
+        uint64_t want;
+    };
+    const uint64_t at = kBase + 0x2000;
+    const Case cases[] = {
+        {"16 records of stride 0 (bytes)", at, 0, 16, 16},
+        {"no records", at, 0, 0, 0},
+        {"no records, stride 4", at, 4, 0, 0},
+        {"null V#", 0, 0, 0, 0},
+        {"null address with records", 0, 4, 64, 0},
+        {"outside guest memory", kBase + kSize + 0x1000, 4, 64, 0},
+        {"stride 4 x 8 records", at, 4, 8, 32},
+        {"bigger than the mapping", at, 0, 0x7fffffffu, kSize - 0x2000},
+    };
+    for (const Case& c : cases) {
+        vpps4::DispatchState x;
+        x.cs.code = cs.code;
+        x.cs.fetch = cs.fetch;
+        x.cs.address = kBase + 0x82000;
+        x.cs.userSgprs = 4;
+        x.cs.ldsBytes = 64;
+        x.cs.userData[0] = uint32_t(c.address);
+        x.cs.userData[1] = uint32_t(c.address >> 32) | (c.stride << 16);
+        x.cs.userData[2] = c.records;
+        x.cs.userData[3] = (7u << 12) | (14u << 15);
+        f.renderer.dispatch(x);
+    }
+    f.renderer.submit();
+    const auto& got = f.backend.dispatchBufferBytes;
+    CHECK(got.size() == sizeof cases / sizeof cases[0]);
+    for (size_t i = 0; i < got.size() && i < sizeof cases / sizeof cases[0]; ++i) {
+        if (got[i] != cases[i].want) std::fprintf(stderr, "  %s: range %llu, want %llu\n", cases[i].what, (unsigned long long)got[i], (unsigned long long)cases[i].want);
+        CHECK(got[i] == cases[i].want);
+    }
+    const auto& notes = f.renderer.stats().notes;
+    auto count = [&](const char* n) { auto it = notes.find(n); return it == notes.end() ? uint64_t(0) : uint64_t(it->second); };
+    CHECK(count("buffer with no records bound as an empty range") == 2);
+    CHECK(count("null buffer bound as an empty range") == 2);
+    CHECK(count("buffer outside guest memory bound as an empty range") == 1);
+    CHECK(f.renderer.stats().skipped.empty());
+}
+
+// Per-dword checks of buffer accesses that cross the end of a range (the hardware checks each dword of a buffer_load / store_dwordx2..x4).
+// The GCN lifter emits every buffer access as scalar dwords (cs_small_float's buffer_store_dwordx3 is three stores of one word), so each one is
+// guarded alone, whatever EmitOptions::robustPerWord says: robustPerWord (set by translate) only matters if the lifter starts to emit vector
+// accesses, and then the check below fails unless their MSL has the per-dword code. The test therefore pins (1) the three separate guarded word
+// stores and (2) that no vector access of a buffer in the registered MSL lacks the per-dword `else {` right after it.
+// KNOWN LIMIT: with the lifter as it is today, (2) has nothing to find, so flipping robustPerWord to false in translate does not fail this test;
+// the vector code itself is covered by the vpmsl.golden.robust_vec golden (gpu/shader/msl/tests).
+void robustPerWordShader() {
+    const Program cs = load("cs_small_float");
+    Fixture f;
+    vpps4::DispatchState x;
+    x.cs.code = cs.code;
+    x.cs.fetch = cs.fetch;
+    x.cs.address = kBase + 0x82000;
+    x.cs.userSgprs = 4;
+    x.cs.ldsBytes = 64;
+    x.cs.userData[0] = uint32_t(kBase + 0x2000);
+    x.cs.userData[1] = uint32_t((kBase + 0x2000) >> 32);
+    x.cs.userData[2] = 64;
+    x.cs.userData[3] = (7u << 12) | (14u << 15);
+    f.renderer.dispatch(x);
+    f.renderer.submit();
+    CHECK(f.renderer.stats().skipped.empty());
+    CHECK(!f.backend.shaderSources.empty());
+    bool words = false;
+    for (const std::string& src : f.backend.shaderSources) {
+        // (1) the dwordx3 store: three guards of 4 bytes, each on its own store of a uint at buf0 + offset (the offsets 4 apart)
+        // (2) a vector access of a buffer is followed by the per-dword `else {`
+        std::istringstream in(src);
+        std::string line;
+        size_t n = 0;
+        while (std::getline(in, line)) {
+            if (line.find("if (ulong(") != std::string::npos && line.find("+ 4ul <= ") != std::string::npos &&
+                line.find("*(device uint*)(vp_args.buf0 + ") != std::string::npos && line.find(") = ") != std::string::npos)
+                ++n;
+            const bool vecAccess = line.find("ul <= ") != std::string::npos && line.find("device packed_") != std::string::npos;
+            if (vecAccess) {
+                std::string next;
+                CHECK(std::getline(in, next) && next.find("else {") != std::string::npos);
+            }
+        }
+        words = words || n == 3;
+    }
+    CHECK(words);
+}
+
+// Constant buffers of a null V# / a V# with no records: the shader reads them with vector loads (no bounds check), so they are bound to the whole
+// block of zeros (64 KiB), not to an empty range of it.
+void nullConstantBuffer() {
+    Fixture f;
+    const Program vs = load("vs_cbuf_dword");
+    vpps4::DrawState d = f.state();
+    d.vs.code = vs.code;
+    d.vs.fetch = vs.fetch;
+    d.vs.userSgprs = 14;
+    for (unsigned i = 0; i < 16; ++i) d.vs.userData[i] = 0;
+    d.vs.userData[2] = uint32_t(kBase + 0x3000);   // s[2:3]: memory (descriptors read as zeros: null V#s)
+    d.vs.userData[12] = uint32_t(kBase + 0x3100);  // s[12:13]
+    d.vs.userData[4] = uint32_t(kBase + 0x4000);   // s4: a V# with an address and no records
+    d.vs.userData[5] = 0;
+    d.vs.userData[6] = 0;
+    d.vs.userData[7] = (7u << 12) | (14u << 15);
+    f.renderer.draw(d);
+    f.renderer.submit();
+    for (const auto& [why, n] : f.renderer.stats().skipped) std::fprintf(stderr, "  skip %s x%d\n", why.c_str(), int(n));
+    CHECK(f.renderer.stats().drawn == 1);
+    size_t zeroCbs = 0;
+    bool cbWhole = true, bufferEmpty = true;
+    for (const auto& b : f.backend.drawBindings) {
+        if (!b.zeros) continue;
+        if (b.kind == vpgpu::BindKind::ConstantBuffer) ++zeroCbs, cbWhole = cbWhole && b.bytes == 64 * 1024;
+        else bufferEmpty = bufferEmpty && b.bytes == 0;
+    }
+    CHECK(zeroCbs >= 2);   // the null one (s8) and the one with no records (s4), among others
+    CHECK(cbWhole);        // a constant buffer has no bounds check: the whole block of zeros, never an empty range
+    CHECK(bufferEmpty);    // the Buffer resources (checked by the shader) are empty ranges
+    const auto& notes = f.renderer.stats().notes;
+    CHECK(notes.find("buffer with no records bound as an empty range") != notes.end());
+    CHECK(notes.find("null buffer bound as an empty range") != notes.end());
 }
 
 // The host sets the budget (Hooks::targetBudgetBytes), and the last 8 presented targets stay even over it, not only the latest one.
@@ -757,6 +931,9 @@ int main(int argc, char** argv) {
     else if (t == "null_rw_ring") nullRwRing();
     else if (t == "evict_budget") evictBudget();
     else if (t == "dummy_cleared") dummyCleared();
+    else if (t == "robust_ranges") robustRanges();
+    else if (t == "robust_word") robustPerWordShader();
+    else if (t == "null_cb") nullConstantBuffer();
     else if (t == "big_staging") bigStaging();
     else if (t == "blend_factors") blendFactors();
     else return std::fprintf(stderr, "unknown test %s\n", t.c_str()), 2;

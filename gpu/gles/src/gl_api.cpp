@@ -31,10 +31,26 @@ using S = int64_t;  // stack-passed integer argument (see the header comment)
 
 struct Lock {
     std::unique_lock<std::recursive_mutex> l;
-    Lock() : l(device()->lock) {}
+    Lock() : l(Device::lock()) {}
 };
 // (current() is read again with the lock held: vpgles_shutdown deletes the contexts under it, so a thread that read `c` and then waited
 // for the lock must not use it; the second read sees the ended session.)
+// Test hook (vpgles_test_unlocked_hook): called, if set, on the calling thread at the point where CompileShader / LinkProgram have just released
+// the lock for the parse / link, so a test can run the worst interleaving (vpgles_shutdown) there on purpose instead of by timing.
+#ifdef VPGLES_TESTING  // (defined only in the test builds: the production library has no hook)
+static std::atomic<void (*)()> gUnlockedHook{nullptr};
+extern "C" VPGLES_API void vpgles_test_unlocked_hook(void (*f)()) { gUnlockedHook = f; }
+static inline void unlockedPoint() {
+    if (auto* h = gUnlockedHook.load()) h();
+}
+// Counters for the tests: 0 = Devices freed so far, 1 = Devices of ended sessions still waiting for a present callback to return.
+extern "C" VPGLES_API int vpgles_test_stat(int which) {
+    std::lock_guard<std::recursive_mutex> l(Device::lock());
+    return which == 0 ? devicesFreedCount() : devicesRetiredCount();
+}
+#else
+static inline void unlockedPoint() {}
+#endif
 #define CTX(...)                 \
     Context* c = current();      \
     if (!c) return __VA_ARGS__;  \
@@ -1003,9 +1019,55 @@ void BufferSubData(GLenum target, GLintptr off, GLsizeiptr size, const void* dat
     if (off < 0 || size < 0 || off + size > b->size) return c->setError(gl::INVALID_VALUE, target);
     if (b->mapped) return c->setError(gl::INVALID_OPERATION, target);
     if (!data || !size) return;
+    const bool whole = off == 0 && size == b->size;
+    const uint64_t lo = uint64_t(off), hi = uint64_t(off + size);
     // A buffer the GPU has still to write (a readback, a copy, a shader's stores): the bytes go in by a GPU copy recorded after those writes,
-    // in order, instead of the CPU waiting for them (the old path flushed and waited at every partial update).
-    if (!(off == 0 && size == b->size) && c->gpuWritePending(*b->storage) && c->updateOrdered(b->storage, uint64_t(off), uint64_t(size), data)) return;
+    // in order, instead of the CPU waiting for them (the old path flushed and waited at every partial update). Not when the GPU neither writes
+    // nor reads these bytes (the writes pending are ordered copies of other ranges): then the write is made in place, as for a buffer with no
+    // write pending - the next update of a ring buffer must not follow the previous one's cut of the pass.
+    if (!whole && c->gpuWritePending(*b->storage)) {
+        if (!c->gpuWriteOverlaps(*b->storage, lo, hi) && !(c->storageBusy(*b->storage) && b->storage->readsRange(lo, hi))) {
+            std::memcpy(b->storage->host + off, data, size_t(size));
+            return;
+        }
+        if (c->updateOrdered(b->storage, lo, uint64_t(size), data)) return;
+    }
+    // A big buffer the GPU still reads where the write lands: copy on write would allocate and copy the whole buffer for every partial update
+    // (O(buffer) per call). A GPU copy of just the bytes, in order after the reads, costs no CPU copy of the buffer, but it ends the render pass
+    // (a copy cannot be recorded inside one). (Another context that shares the buffer and has an unsent command buffer reading it sees the bytes
+    // when that one runs: as for the in-place writes of prepareWrite, a GL application has to synchronise two contexts itself - glFinish / a
+    // fence / a barrier before the other reads - and without that the result is undefined by the spec; no copy of the old bytes is kept for it.)
+    //
+    // Which of the two: the CPU cost of the copy on write is the buffer minus the update (memcpy), the ordered update's is the update (memcpy
+    // to the staging) and the GPU copies it again, so they are equal at an update of half the buffer: up to there the GPU copy, above it
+    // the new storage - the cost is continuous in the size of the update (it was a cliff at 1 MiB: 1 MiB = a GPU copy, 1 MiB + 1 byte = a
+    // copy of the whole buffer). Below 4 MiB a copy on write is cheap and keeps the pass.
+    //
+    // The cut is paid only by an update the pass reads (BufferStorage::readsRange: a shader storage block reads its own bytes, up to its size
+    // for a fixed one, within the bound range; the others are written in place). Once the GPU has a copy of this buffer pending, the later
+    // updates cannot turn into a copy on write without a wait for it (the new storage would miss the bytes the GPU has yet to write), so the
+    // cuts of one command buffer are not capped: a cap would be a CPU<->GPU wait, which costs more than the cut. Measured (null backend, 8 MiB
+    // buffer bound for the pass, 64 x (256 B update, draw); tests audit9_ring_narrow, audit8_mixed_subdata, audit7_big_subdata):
+    //                                          HEAD (reported by the review)  before this change       now
+    //                                          passes  8 MiB storages          passes  GPU copies       passes  GPU copies  8 MiB storages
+    //   fixed 256 B block, updates outside it  1       64                      65      64               1       0           0
+    //   fixed 256 B block, first update inside 1       64                      65      64               2       1           0
+    //   unsized array, 256 B range binding     1       64                      65      64               1       0           0
+    //   unsized array, whole 8 MiB bound       1       64                      65      64               65      64          0
+    // (waits: 0 in every cell; the per-frame 256 B + 2 MiB pattern of audit8_mixed_subdata keeps waits 0 - it was 5 in 5 frames before.)
+    // The last row is a ring read as a whole by an unsized array: one cut per update (on a tile renderer, a store and reload of the attachments)
+    // against a CPU copy of 8 MiB per update; the cut was kept because it takes no CPU time, no memory and no wait.
+    // Accepted residual case (the same shape ANGLE has): an unsized array with the whole 8 MiB bound, 65 passes / 64 GPU copies. Future
+    // alternative, not done: a copy on write without a wait when every pending write of the buffer is an ordered copy (`!unknownWrite`: the
+    // GPU writes only the ranges updateOrdered recorded, so the new storage could take those ranges from the old one by a copy ordered
+    // before the pass, instead of waiting), switched on per pass by a heuristic once N cuts of the pass were paid. Not done because it is a
+    // second path through prepareWrite / storageBusy (a new storage that depends on the GPU's pending copies, an order of copies to prove
+    // right against readbacks and mapped buffers), for a pattern (a whole multi-MiB buffer rewritten in small pieces and read whole every
+    // draw) none of the measured hosts produce, and the cut it would save is paid only on tile GPUs.
+    constexpr uint64_t kBigStorage = 4ull << 20;
+    if (!whole && b->storage->size >= kBigStorage && uint64_t(size) * 2 <= b->storage->size && c->storageBusy(*b->storage) &&
+        b->storage->readsRange(lo, hi) && c->updateOrdered(b->storage, lo, uint64_t(size), data))
+        return;
     c->prepareWrite(*b, off == 0 && size == b->size, uint64_t(off), uint64_t(off + size), true);
     std::memcpy(b->storage->host + off, data, size_t(size));
 }
@@ -2475,8 +2537,12 @@ void CompileShader(GLuint n) {
     const std::shared_ptr<const std::string> text = s->source;
     static const std::string none;
     lock_.l.unlock();
+    unlockedPoint();
     vpglsl::ParseResult r = vpglsl::parse(st, text ? *text : none);
     lock_.l.lock();
+    // (vpgles_shutdown can have ended the session while the lock was off: its contexts are gone, `c` too)
+    c = current();
+    if (!c) return;
     s = c->shader(n);
     if (!s || s->source != text) return;  // deleted or given another source meanwhile (the application raced itself)
     s->parsed = r.shader;
@@ -2630,8 +2696,11 @@ void LinkProgram(GLuint pn) {
     bool haveAhead = c->linkInputs(*p, in);
     if (haveAhead) {
         lock_.l.unlock();
+        unlockedPoint();
         ahead = Context::linkAhead(in);
         lock_.l.lock();
+        c = current();  // (see CompileShader)
+        if (!c) return;
         p = c->prog(pn);
         if (!p) return;  // deleted meanwhile
         haveAhead = c->linkInputs(*p, again) && again == in;
@@ -4073,17 +4142,12 @@ size_t glEntryCount() { return sizeof kEntries / sizeof kEntries[0]; }
 using namespace vpgles;
 
 namespace {
-Device* gDev = nullptr;
-int gInitResult = -1;
+std::atomic<int> gInitResult{-1};
 }  // namespace
 
 extern "C" int vpgles_init(void* gipa) {
+    std::lock_guard<std::recursive_mutex> l(Device::lock());  // (a Device is replaced under the same lock every entry point takes)
     if (gInitResult >= 0) return gInitResult;
-    if (gDev) {  // the Device of a session vpgles_shutdown ended: kept until now (late host calls find it shut down, not freed), freed here
-        setDevice(nullptr);
-        delete gDev;
-        gDev = nullptr;
-    }
     auto* d = new Device;
     if (!d->init(reinterpret_cast<PFN_vkGetInstanceProcAddr>(gipa))) {
         logf("gles.err what=init (Vulkan device)");
@@ -4091,19 +4155,25 @@ extern "C" int vpgles_init(void* gipa) {
         gInitResult = 0;
         return 0;
     }
-    gDev = d;
+    // The Devices of sessions vpgles_shutdown ended are freed here (the lock is process-wide and never destroyed, so no thread waits on a
+    // freed mutex; every entry reads device() again under it). One whose Vulkan device a present callback still uses is freed by the last
+    // such callback to return (Device::presentReturned).
+    if (Device* old = device()) retireDevice(old);
     setDevice(d);
+    freeRetiredDevices();
     gInitResult = 1;
     return 1;
 }
 
 extern "C" void vpgles_shutdown(void) {
-    if (!gDev) return;
     // Under the device lock from the first release to the last Vulkan call: another thread's GL / EGL call either finished before or
-    // finds the session ended (no context, no surface) when it gets the lock.
-    std::lock_guard<std::recursive_mutex> l(gDev->lock);
+    // finds the session ended (no context, no surface) when it gets the lock. It does not wait for host present callbacks: if one is
+    // still running, the Vulkan device is destroyed by the last one to return (Device::presents).
+    std::lock_guard<std::recursive_mutex> l(Device::lock());
+    Device* d = device();
+    if (!d || d->dead) return;
     eglShutdownDisplay();  // (objects released while the Device is alive)
-    gDev->shutdown();
+    d->shutdown();
     gInitResult = -1;
 }
 
@@ -4115,7 +4185,9 @@ extern "C" void* vpgles_proc(const char* name) {
 }
 
 extern "C" void vpgles_device(void** instance, void** phys, void** dev, void** queue) {
+    std::lock_guard<std::recursive_mutex> l(Device::lock());  // (vpgles_shutdown / vpgles_init change these under it)
     Device* d = device();
+    if (d && d->dead && !d->finalPending) d = nullptr;  // (ended: null, except while a present callback still uses the standing device)
     if (instance) *instance = d ? d->instance : nullptr;
     if (phys) *phys = d ? d->phys : nullptr;
     if (dev) *dev = d ? d->device : nullptr;
@@ -4125,7 +4197,7 @@ extern "C" void vpgles_device(void** instance, void** phys, void** dev, void** q
 static uint32_t wrapImageAs(uint32_t forceName, void* vkImage, uint32_t vkFormat, uint32_t target, uint32_t w, uint32_t h,
                             uint32_t layers, uint32_t levels) {
     if (!device() || !vkImage) return 0;
-    std::lock_guard<std::recursive_mutex> l(device()->lock);
+    std::lock_guard<std::recursive_mutex> l(Device::lock());
     Context* c = currentOrLast();
     if (!c) return 0;
     const FormatInfo* f = formatByVk(VkFormat(vkFormat));
@@ -4170,7 +4242,7 @@ extern "C" uint32_t vpgles_wrap_image_as(uint32_t name, void* vkImage, uint32_t 
 
 extern "C" void vpgles_flush(int wait) {
     if (!device()) return;
-    std::lock_guard<std::recursive_mutex> l(device()->lock);
+    std::lock_guard<std::recursive_mutex> l(Device::lock());
     texStatsTick(false);
     recipeStatsTick(false);
     Context* c = currentOrLast();

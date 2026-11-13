@@ -11,6 +11,7 @@
 #include "elfgen.h"
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <sys/mman.h>
 #include <unistd.h>
 
@@ -59,10 +60,51 @@ static int load(unsigned idx, uint64_t base, uint64_t load_at, uint64_t fingerpr
     return rc;
 }
 
+
+/* Like load(), but the image is `blocks` 64 KB blocks long (the segment's memsz; the file stays 4 KB) and relocatable. */
+static int load_big(unsigned idx, uint64_t base, uint64_t load_at, uint64_t blocks, VpLoadedImage* out) {
+    char path[512];
+    snprintf(path, sizeof path, "%s/big%u.elf", dir, idx);
+    const TestRela r = {base + 0x600, ((uint64_t)1 << 32) | 6, 0};
+    if (elfgen(path, base, &r, 1, sizeof r, NULL, 0)) exit(2);
+    const uint64_t memsz = blocks * 0x10000;
+    FILE* f = fopen(path, "r+b");
+    if (!f || fseek(f, 64 + 40, SEEK_SET) || fwrite(&memsz, 8, 1, f) != 1) exit(2); /* program header 0: p_memsz */
+    fclose(f);
+    VpModule* m = &mods[idx];
+    if (!m->name) {
+        snprintf(names[idx], 16, "big%u", idx);
+        imps[idx] = (VpImport){"sym", 0x600, 1};
+        m->name = names[idx]; m->imports = &imps[idx]; m->import_count = 1; m->link_base = base; m->size = memsz; m->relative = 1;
+        m->fingerprint = vp_fingerprint(0, NULL, 0, NULL, 0);
+        vp_register_module(m);
+    }
+    m->link_base = base; m->size = memsz; /* the same module can come with another size and base */
+    const int rc = vp_load_module(path, m, load_at, resolve, NULL, out);
+    remove(path);
+    return rc;
+}
+
 static int pipefd[2];
 static int readable(uint64_t at) { return write(pipefd[1], (const void*)(uintptr_t)at, 1) == 1 && read(pipefd[0], &(char){0}, 1) == 1; }
 static void mark(uint64_t at) { *(volatile unsigned char*)(uintptr_t)at = 0x77; }
 static int marked(uint64_t at) { return *(volatile unsigned char*)(uintptr_t)at == 0x77; }
+
+#ifdef __linux__
+/* The number of PROT_NONE mappings that start inside [lo,hi), from /proc/self/maps (those separated by a gap do not merge). */
+static unsigned prot_none_in(uint64_t lo, uint64_t hi) {
+    FILE* f = fopen("/proc/self/maps", "r");
+    unsigned n = 0;
+    char line[512];
+    while (f && fgets(line, sizeof line, f)) {
+        unsigned long long a, b;
+        char perms[8];
+        if (sscanf(line, "%llx-%llx %7s", &a, &b, perms) == 3 && a >= lo && a < hi && !strncmp(perms, "---", 3)) ++n;
+    }
+    if (f) fclose(f);
+    return n;
+}
+#endif
 
 int main(int argc, char** argv) {
     if (argc < 2 || pipe(pipefd)) return 2;
@@ -147,6 +189,52 @@ int main(int argc, char** argv) {
     if (hole != MAP_FAILED) munmap(hole, 0x10000);
     CHECK(vp_map_fixed_over(V + 0x10000, TEST_IMG) == 0, "the first place is not the embedder's range again");
     CHECK(load(5, A + 0x300000, V + 0x10000, 0, &out) == 0, "pic load back into the first range: %s", out.error);
+
+    /* 8. a very fragmented image (2050 pieces, after the embedder unmapped every other 64 KB block) reloaded somewhere else leaves
+     * nothing behind: every piece is released (no bound on the number of entries), and a neighbour that is not the module's
+     * (a vp_map_fixed mapping between two of the pieces) is not touched */
+    {
+        const uint64_t F1 = UINT64_C(0x6c0000000), F2 = UINT64_C(0x6e0000000), blocks = 4100;
+        CHECK(load_big(6, F1, F1, blocks, &out) == 0, "big pic load: %s", out.error);
+        for (uint64_t b = 1; b < blocks; b += 2) CHECK(vp_unmap_fixed(F1 + b * 0x10000, 0x10000) == 0, "unmap of block %llu", (unsigned long long)b);
+        CHECK(vp_map_fixed(F1 + 1 * 0x10000, 0x10000) == 0, "vp_map_fixed in a gap of the image");
+        mark(F1 + 0x10000);
+        CHECK(load_big(6, F1, F2, blocks, &out) == 0, "big pic load elsewhere: %s", out.error);
+        unsigned left = 0;
+        for (uint64_t b = 0; b < blocks; b += 2) left += readable(F1 + b * 0x10000);
+        CHECK(left == 0, "%u pieces of the earlier image stay mapped", left);
+        CHECK(readable(F2) && readable(F2 + (blocks - 1) * 0x10000), "the new image is not all there");
+        CHECK(marked(F1 + 0x10000), "the release touched a mapping that is not the module's");
+        CHECK(vp_unmap_fixed(F1 + 0x10000, 0x10000) == 0, "unmap of the neighbour");
+        CHECK(vp_unmap_fixed(F2, blocks * 0x10000) == 0, "unmap of the new image");
+    }
+
+    /* 9. an image loaded into a prepared range, fragmented by the embedder (every other block unmapped with vp_unmap_fixed), and
+     * reloaded somewhere else: the prepared range comes back as exactly one PROT_NONE mapping per remaining piece (n+1 for n
+     * unmapped blocks; no piece of the reservation is lost however many there are), and nothing stale stays registered */
+    {
+        static const unsigned counts[] = {1, 7, 8, 20, 2000};
+        for (unsigned t = 0; t < sizeof counts / sizeof *counts; ++t) {
+            const uint64_t n = counts[t], blocks = 2 * n + 1, len = blocks * 0x10000;
+            const uint64_t R = UINT64_C(0x7000000000) + (uint64_t)t * UINT64_C(0x100000000), F2 = R + UINT64_C(0x80000000);
+            CHECK(mmap((void*)(uintptr_t)R, len, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_FIXED, -1, 0) != MAP_FAILED, "n=%llu: cannot reserve", (unsigned long long)n);
+            CHECK(vp_map_fixed_over(R, len) == 0, "n=%llu: prepare", (unsigned long long)n);
+            CHECK(load_big(7, R, R, blocks, &out) == 0, "n=%llu: load into the prepared range: %s", (unsigned long long)n, out.error);
+            for (uint64_t b = 1; b < blocks; b += 2) CHECK(vp_unmap_fixed(R + b * 0x10000, 0x10000) == 0, "n=%llu: unmap of block %llu", (unsigned long long)n, (unsigned long long)b);
+            CHECK(load_big(7, R, F2, blocks, &out) == 0, "n=%llu: reload elsewhere: %s", (unsigned long long)n, out.error);
+#ifdef __linux__
+            const unsigned none = prot_none_in(R, R + len);
+            CHECK(none == n + 1, "n=%llu: %u PROT_NONE mappings came back, %llu expected", (unsigned long long)n, none, (unsigned long long)(n + 1));
+#endif
+            /* no entry is stale: a gap block takes a vp_map_fixed, a restored block can be unmapped and mapped again */
+            CHECK(vp_map_fixed(R + 0x10000, 0x10000) == 0, "n=%llu: vp_map_fixed in a gap", (unsigned long long)n);
+            CHECK(vp_unmap_fixed(R + 0x10000, 0x10000) == 0, "n=%llu: unmap of it", (unsigned long long)n);
+            CHECK(vp_unmap_fixed(R, 0x10000) == 0 && vp_map_fixed(R, 0x10000) == 0, "n=%llu: the first restored block is not the loader's", (unsigned long long)n);
+            CHECK(vp_unmap_fixed(R, 0x10000) == 0, "n=%llu: unmap of it", (unsigned long long)n);
+            for (uint64_t b = 2; b < blocks; b += 2) CHECK(vp_unmap_fixed(R + b * 0x10000, 0x10000) == 0, "n=%llu: unmap of restored block %llu", (unsigned long long)n, (unsigned long long)b);
+            CHECK(vp_unmap_fixed(F2, len) == 0, "n=%llu: unmap of the new image", (unsigned long long)n);
+        }
+    }
 
     printf(failures ? "loader_reload: %d FAILED\n" : "loader_reload: ok\n", failures);
     return failures != 0;

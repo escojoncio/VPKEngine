@@ -82,13 +82,30 @@ typedef struct { uint64_t start, end; } Span;
 static Span* origin;
 static size_t origin_count, origin_cap;
 
+/* Room for `extra` more spans; 0 if there is not (out of memory). */
+static int origin_room(size_t extra) {
+    if (origin_count + extra <= origin_cap) return 1;
+    size_t cap = origin_cap ? origin_cap : 8;
+    while (cap < origin_count + extra) cap *= 2;
+    Span* n = realloc(origin, cap * sizeof *n);
+    if (!n) return 0;
+    origin = n;
+    origin_cap = cap;
+    return 1;
+}
+
+/* Takes [start,end) out of the spans. A span that [start,end) splits in two needs room for the second
+ * half: if there is none (out of memory) the span is kept whole, so the range stays recorded as
+ * prepared: the worst that costs is a PROT_NONE reservation that is restored where the embedder had
+ * unmapped, never (as far as origin_sub goes) a span lost: a hole in the reservation, which a MAP_FIXED could overwrite. Without memory,
+ * release_part_locked may still leave parts of a released image unrestored (see there). */
 static void origin_sub(uint64_t start, uint64_t end) {
     for (size_t i = 0; i < origin_count;) {
         Span* o = &origin[i];
         if (o->end <= start || o->start >= end) { ++i; continue; }
         if (o->start < start && o->end > end) {
-            if (origin_count < origin_cap) origin[origin_count++] = (Span){end, o->end};
-            o->end = start;
+            const Span tail = {end, o->end};
+            if (origin_room(1)) { o = &origin[i]; origin[origin_count++] = tail; o->end = start; } /* realloc moved the array: o is taken again */
             ++i;
         } else if (o->start < start) { o->end = start; ++i; }
         else if (o->end > end) { o->start = end; ++i; }
@@ -98,13 +115,7 @@ static void origin_sub(uint64_t start, uint64_t end) {
 
 static void origin_add(uint64_t start, uint64_t end) {
     origin_sub(start, end);
-    if (origin_count + 2 > origin_cap) {
-        const size_t cap = origin_cap ? origin_cap * 2 : 8;
-        Span* n = realloc(origin, cap * sizeof *n);
-        if (!n) return;
-        origin = n;
-        origin_cap = cap;
-    }
+    if (!origin_room(1)) return;
     origin[origin_count++] = (Span){start, end};
 }
 
@@ -154,7 +165,7 @@ static void gaps(const void* owner, uint64_t start, uint64_t end, int map, uint6
     }
 }
 
-static void release_image_locked(uint64_t start, uint64_t end);
+static int release_part_locked(uint64_t start, uint64_t end, const void* owner);
 
 /* Maps [start,end) read/write for `owner` (a VpModule, OWNER_PLAIN or OWNER_OVER) and records it.
  * Free memory is mapped without replacing anything; what the owner may replace (see `replaceable`)
@@ -181,15 +192,15 @@ static int map_range(uint64_t start, uint64_t end, const void* owner) {
     mapped_forget(start, end);
     mapped[mapped_count++] = (Mapped){start, end, owner};
     if (owner != OWNER_PLAIN && owner != OWNER_OVER) { /* a module has one image: an earlier one elsewhere goes, a prepared range comes back as prepared */
-        unsigned guard = 0; /* (each release removes its entry; the bound only keeps a bug from looping for ever) */
-        for (size_t i = 0; i < mapped_count && guard < 1024;) {
-            if (mapped[i].owner == owner && mapped[i].start != start) {
-                const uint64_t os = mapped[i].start, oe = mapped[i].end;
-                vp_detach_module((VpModule*)(uintptr_t)owner);
-                release_image_locked(os, oe);
-                i = 0; /* the table changed */
-                ++guard;
-            } else ++i;
+        for (;;) { /* each pass releases one of its entries (progress is guaranteed); it stops only when none is left or the release could not run (out of memory) */
+            size_t i = 0;
+            while (i < mapped_count && !(mapped[i].owner == owner && mapped[i].start != start)) ++i;
+            if (i == mapped_count) break;
+            const uint64_t os = mapped[i].start, oe = mapped[i].end;
+            vp_detach_module((VpModule*)(uintptr_t)owner);
+            /* [os,oe) is a whole entry of the owner: releasing it splits nothing, so the "no room to split" return of
+             * release_part_locked cannot happen here; the other 0 return is "nothing of the owner left". */
+            if (!release_part_locked(os, oe, owner)) break;
         }
     }
     rc = 0;
@@ -249,34 +260,37 @@ int vp_unmap_fixed(uint64_t at, uint64_t size) {
     if (range_of(at, size, &start, &end)) return -1;
     int rc = -1;
     pthread_mutex_lock(&mapped_lock);
-    if (mapped_reserve(1)) goto out;
+    if (mapped_reserve(1) || !origin_room(1)) goto out; /* the room for the splits is taken before anything is unmapped */
     rc = unmap_locked(start, end);
 out:
     pthread_mutex_unlock(&mapped_lock);
     return rc;
 }
 
-/* With mapped_lock held: the image at [start,end) goes, and what an embedder had prepared there goes
- * back to being prepared (registered as vp_map_fixed_over, but PROT_NONE: nothing committed), so
- * that there is no hole. One lock hold, so nothing can map in between. Best effort for the
- * restoration (memory that is no longer free is left alone; out of memory costs the restoration,
- * never the release itself: the image is unmapped whatever happens). */
-static void release_image_locked(uint64_t start, uint64_t end) {
-    if (!all_loaders(start, end)) return; /* not (all) the loader's any more (unmapped by vp_unmap_fixed meanwhile): never touch memory that is someone else's */
+/* With mapped_lock held: the first part of [start,end) that belongs to `owner` (a module: only its own entries, never another
+ * owner's, never the embedder's) goes, and what an embedder had prepared there goes back to being prepared (registered as
+ * vp_map_fixed_over, but PROT_NONE: nothing committed), so that there is no hole. One lock hold, so nothing can map in
+ * between. Returns 0 if nothing of the owner is there (or a split needed room that is not available). Best effort for the
+ * restoration (memory that is no longer free is left alone; out of memory costs the restoration, never the release itself). */
+static int release_part_locked(uint64_t start, uint64_t end, const void* owner) {
+    size_t idx = 0;
+    while (idx < mapped_count && !(mapped[idx].owner == owner && mapped[idx].start < end && mapped[idx].end > start)) ++idx;
+    if (idx == mapped_count) return 0;
+    const uint64_t s = mapped[idx].start > start ? mapped[idx].start : start, e = mapped[idx].end < end ? mapped[idx].end : end;
+    if (mapped[idx].start < s && mapped[idx].end > e && mapped_reserve(1)) return 0; /* a part in the middle splits the entry: it needs room */
     size_t n = 0;
-    for (size_t i = 0; i < origin_count; ++i) if (origin[i].start < end && origin[i].end > start) ++n;
+    for (size_t i = 0; i < origin_count; ++i) if (origin[i].start < e && origin[i].end > s) ++n;
+    if (!origin_room(n + 1)) n = 0; /* room for the spans that come back and for one split: without it, no restoration (origin_sub then keeps a split span whole) */
     if (mapped_reserve(1 + n)) n = 0;
     Span* sp = n ? malloc(n * sizeof *sp) : NULL;
     if (!sp) n = 0;
     size_t k = 0;
     for (size_t i = 0; i < origin_count && k < n; ++i) {
-        if (origin[i].start < end && origin[i].end > start) sp[k++] = (Span){origin[i].start > start ? origin[i].start : start, origin[i].end < end ? origin[i].end : end};
+        if (origin[i].start < e && origin[i].end > s) sp[k++] = (Span){origin[i].start > s ? origin[i].start : s, origin[i].end < e ? origin[i].end : e};
     }
-    /* The image is exactly the entry map_range recorded, so forgetting it only shrinks or deletes entries: no room is needed
-     * (unmap_locked's check of a possible split is for the general case). */
-    munmap((void*)(uintptr_t)start, end - start);
-    mapped_forget(start, end);
-    origin_sub(start, end);
+    munmap((void*)(uintptr_t)s, e - s);
+    mapped_forget(s, e);
+    origin_sub(s, e);
     for (size_t i = 0; i < k && mapped_count < mapped_cap; ++i) {
         int flags = MAP_PRIVATE | MAP_ANONYMOUS;
 #ifdef MAP_NORESERVE
@@ -292,12 +306,13 @@ static void release_image_locked(uint64_t start, uint64_t end) {
         origin_add(sp[i].start, sp[i].end);
     }
     free(sp);
+    return 1;
 }
 
-/* A load that failed after mapping: the image goes (see release_image_locked) and the load can be retried. */
-static void abandon_image(uint64_t start, uint64_t end) {
+/* A load that failed after mapping: the module's image in [start,end) goes (see release_part_locked) and the load can be retried. */
+static void abandon_image(uint64_t start, uint64_t end, const void* owner) {
     pthread_mutex_lock(&mapped_lock);
-    release_image_locked(start, end);
+    while (release_part_locked(start, end, owner)) {}
     pthread_mutex_unlock(&mapped_lock);
 }
 
@@ -569,7 +584,7 @@ int vp_load_module(const char* path, VpModule* module, uint64_t load_at, VpImpor
         size_t slot_mask = 0;
         st = calloc(1, sizeof *st);
         uint32_t* const slot_index = st ? build_slot_index(module, &slot_mask) : NULL;
-        if (!slot_index) { free(st); free(ph); free(file); abandon_image(map_start, map_end); return fail(out, "out of memory"); }
+        if (!slot_index) { free(st); free(ph); free(file); abandon_image(map_start, map_end, module); return fail(out, "out of memory"); }
         for (int t = 0; t < 2; ++t) {
             for (uint64_t pos = 0; tables[t] && pos + 24 <= sizes[t]; pos += 24) {
                 uint64_t target, info; int64_t addend;
@@ -598,7 +613,7 @@ int vp_load_module(const char* path, VpModule* module, uint64_t load_at, VpImpor
                     while (st->hash[hs] && strcmp(st->names[st->hash[hs] - 1], im->name)) hs = (hs + 1) & (STUB_HASH_SIZE - 1);
                     k = st->hash[hs] ? (size_t)st->hash[hs] - 1 : stubs;
                     if (k == stubs) {
-                        if (stubs == VP_MAX_IMPORT_STUBS) { free(slot_index); free(st); free(ph); free(file); abandon_image(map_start, map_end); return fail(out, "too many imports"); }
+                        if (stubs == VP_MAX_IMPORT_STUBS) { free(slot_index); free(st); free(ph); free(file); abandon_image(map_start, map_end, module); return fail(out, "too many imports"); }
                         st->hash[hs] = (uint16_t)(stubs + 1);
                         VpNative fn = NULL; uint64_t data = 0;
                         const int provided = resolve ? resolve(im->name, im->function, &fn, &data, user) : 0;
@@ -633,7 +648,7 @@ int vp_load_module(const char* path, VpModule* module, uint64_t load_at, VpImpor
      * the module at its new place. */
     if (vp_fingerprint(AT(lo), module->code, module->code_count, module->reloc_sites, module->reloc_site_count) != module->fingerprint) {
         free(st);
-        abandon_image(map_start, map_end);
+        abandon_image(map_start, map_end, module);
         return fail(out, "the code of this image differs from the translation (fingerprint)");
     }
     int committed = 0;
@@ -642,7 +657,7 @@ int vp_load_module(const char* path, VpModule* module, uint64_t load_at, VpImpor
     }
     free(st);
     if (committed) {
-        abandon_image(map_start, map_end);
+        abandon_image(map_start, map_end, module);
         return fail(out, "the table of natives is full");
     }
     vp_module_set_base(module, AT(lo));

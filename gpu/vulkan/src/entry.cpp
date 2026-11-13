@@ -1766,11 +1766,37 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkDestroyDevice(VkDevice dv, const VkAllo
     std::lock_guard<std::mutex> l(liveDeviceMutex());
     if (liveDevice() == d) liveDevice() = nullptr;
   }
-  // Host calls that found the device before it left the registry and are still waiting for the submit mutex (liveDeviceSubmitLocked)
-  // get it first; whoever holds it (a vpvk_native_submit until its command buffer is committed) is waited for here.
-  while (d->hostUsers.load() > 0) std::this_thread::sleep_for(std::chrono::microseconds(100));
+  // Contract: the host calls that find the device through the registry (vpvk_native_submit, liveDeviceSubmitLocked) may race this call:
+  // they are pinned in hostUsers, get the submit mutex first, and whoever holds it (a vpvk_native_submit until its command buffer is
+  // committed) is waited for here. Calls that take the device from their own handle (vkQueueSubmit through the queue, submitDeferred
+  // through the device handle it is given) are NOT pinned and nothing here waits for them: parked for `d` (parkWhileBackground(d)) they are
+  // woken by the release below and go on to take d->submitMutex, so one that is still running when `d` is deleted uses freed memory.
+  // Vulkan requires the app to stop using the device's queues and semaphores before vkDestroyDevice (external synchronisation):
+  // calling them concurrently with it is a misuse, not something this function defends against.
+  vpgpu::backgroundGate().release(d);  // host threads parked for this device (app in the background) go on and find no device (registry
+                                       // calls) / only wake instead of hanging (a misusing handle call, see above)
+  // In the background a thread can be parked INSIDE the backend (a commit under the submit mutex, owner = the backend, not `d`), and
+  // the host calls pinned in hostUsers go on to park there once they have the mutex: this thread would wait for the app to come
+  // back, which it may be the one to signal. So whoever is still to get the mutex is released again while it is waited for.
+  auto wakeParked = [&] { if (vpgpu::backgroundGate().active()) d->platform->releaseBackground(); };
+  while (d->hostUsers.load() > 0) {
+    wakeParked();
+    std::this_thread::sleep_for(std::chrono::microseconds(100));
+  }
+  auto lockSubmit = [&] {
+    // Never a blocking lock: whoever holds the mutex can park in the backend if the app goes to the background while this waits (the gate
+    // changes on the host's thread, whatever thread is destroying), and a blocked lock is not woken by that. So poll, waking whatever
+    // parks in the backend (wakeParked looks at the gate each turn). Cold path; uncontended it is one try_lock.
+    std::unique_lock<std::mutex> l(d->submitMutex, std::try_to_lock);
+    while (!l.owns_lock()) {
+      wakeParked();
+      std::this_thread::sleep_for(std::chrono::microseconds(100));
+      static_cast<void>(l.try_lock());
+    }
+    return l;
+  };
   {
-    std::lock_guard<std::mutex> l(d->submitMutex);
+    std::unique_lock<std::mutex> l = lockSubmit();
     drainRetiredChunks(d);  // (arena chunks a command buffer reset gave up)
   }
   d->prewarmCancel = true;
@@ -1781,7 +1807,7 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkDestroyDevice(VkDevice dv, const VkAllo
   d->platform->waitIdle(UINT64_MAX);  // bounded by a lost device (Platform::waitIdle)
   releaseVisibility(d);
   {
-    std::lock_guard<std::mutex> l(d->submitMutex);  // uiMask lo usa vpvk_taa_native_encode bajo este mutex
+    std::unique_lock<std::mutex> l = lockSubmit();  // uiMask lo usa vpvk_taa_native_encode bajo este mutex
     d->uiMask.release();
     d->msaaTwins.release(d);
     if (d->zeroBuffer) d->gpu->destroy(d->zeroBuffer);
@@ -2722,6 +2748,21 @@ void* imageNative(Device* d, const Image* img, bool submitHeld = false) {
   void* n = d->platform->nativeTexture(img->id);
   zeroNoteNative(*d, *img, n);
   return n;
+}
+// Parks the calling host thread while the app is in the background, as the device it will use (the owner vkDestroyDevice releases:
+// a thread parked for a device that is being destroyed is woken, not left for ever). Before any lock is taken.
+// `d`: the device the call is about (vkQueueSubmit: the queue's, which need not be the live one); null: the live device
+// (vpvk_native_submit), read under the registry, which stays held until the gate has the wait registered (BackgroundGate::
+// waitForeground with a registry): a vkDestroyDevice that takes the device out of the registry and releases it can no longer slip
+// in between the read and the park. No live device: nothing to park for, the call that follows finds none and answers at once.
+void parkWhileBackground(const Device* d = nullptr) {
+  vpgpu::BackgroundGate& gate = vpgpu::backgroundGate();
+  if (!gate.active()) return;  // (lock free: the foreground does not touch the registry)
+  if (d) return gate.waitForeground(d);
+  std::unique_lock<std::mutex> live(liveDeviceMutex());
+  const Device* owner = liveDevice();
+  if (!owner) return;
+  gate.waitForeground(owner, live);
 }
 // The live device with its submit mutex taken (or tried: `lock` stays unowned when it is busy). Null: no device.
 // The submit mutex is never waited for WITH the registry: a frame held while its pipelines compile (gpu.hold) keeps it for as long as the
@@ -3779,9 +3820,26 @@ void drainDeferred(Device* d) {
 }  // namespace
 
 void submitDeferred(Device* d) {
-  vpgpu::backgroundGate().waitForeground();  // park before the lock: a parked thread must not hold submitMutex
+  parkWhileBackground(d);  // park before the lock: a parked thread must not hold submitMutex
   std::lock_guard<std::mutex> lock(d->submitMutex);
   if (!d->deferred.empty() && !d->platform->lost()) drainDeferred(d);
+}
+
+// submitMutex held, and NOT inside an encodeNative callback: settles the pending image `key` now, with a frame of its own that goes in
+// the engine queue in order (before anything submitted later, and so before the head of a native submit). False: not pending (any more).
+bool zeroClearPending(Device* d, uint64_t key) {
+  auto it = d->zeroPending.find(key);
+  if (it == d->zeroPending.end()) return false;
+  ZeroLog zl;
+  zl.dev = d;
+  ZeroTouch t;  // a read first: settles it, with a clear unless a full overwrite already covered it
+  t.tex = it->second.id;
+  zl.touches.push_back(t);
+  vpgpu::Frame zeros;
+  const size_t n = zeroInitResolve(*d, zl, zeros);
+  if (n) d->gpu->submit(zeros);
+  if (d->zeroLogLines++ < 64) logf("vk.zeroinit host images=%zu pending=%zu", n, d->zeroPending.size());
+  return true;
 }
 }  // namespace vpvk
 
@@ -3841,13 +3899,19 @@ VPVK_EXPORT int vpvk_mark_eye_image(void* image) {
 // Never blocks: if a submit (or a native submit) holds the mutex it returns -1 and the caller retries
 // next frame. Under submitMutex a game write is either already translated (then the image is no longer
 // pending and nothing is cleared) or still to come, behind the clear in the queue (so it overwrites it).
+// Inside a vpvk_native_submit callback (this thread holds the mutex) the clear cannot be ordered: the callback is encoding the native
+// command buffer that follows a head already fenced on the frames, so a frame submitted from there would run unordered against what the
+// callback encodes (and would use up the "native work since the last frame" mark of the backend). Nothing is submitted there: the image
+// is queued, -1 is answered (not cleared: do not read it in this callback) and the next vpvk_native_submit clears it before it makes its
+// own command buffers; it then reads as not pending. 0 for a texture that is unknown or no longer pending, as everywhere.
 VPVK_EXPORT int vpvk_image_zero_clear(void* mtl) {
   vpgpu::ScopedPool pool;  // guest thread: no autorelease pool of its own (see scoped_pool.h)
   if (!mtl) return 0;
   std::unique_lock<std::mutex> lock;
   vpvk::Device* d = liveDeviceSubmitLocked(lock, true);
   if (!d) return 0;
-  if (!lock.owns_lock() && !tInNativeSubmit) return -1;  // (inside a vpvk_native_submit callback this thread holds the submit mutex)
+  const bool inNative = tInNativeSubmit;
+  if (!lock.owns_lock() && !inNative) return -1;  // (inside a vpvk_native_submit callback this thread holds the submit mutex)
   uint64_t key;
   {
     std::lock_guard<std::mutex> l(d->zeroNativeMutex);
@@ -3855,18 +3919,13 @@ VPVK_EXPORT int vpvk_image_zero_clear(void* mtl) {
     if (it == d->zeroNative.end()) return 0;
     key = it->second;
   }
-  auto it = d->zeroPending.find(key);
-  if (it == d->zeroPending.end()) return 0;
-  ZeroLog zl;
-  zl.dev = d;
-  ZeroTouch t;  // a read first: settles it, with a clear unless a full overwrite already covered it
-  t.tex = it->second.id;
-  zl.touches.push_back(t);
-  vpgpu::Frame zeros;
-  const size_t n = zeroInitResolve(*d, zl, zeros);
-  if (n) d->gpu->submit(zeros);
-  if (d->zeroLogLines++ < 64) logf("vk.zeroinit host images=%zu pending=%zu", n, d->zeroPending.size());
-  return 1;
+  if (inNative) {
+    if (!d->zeroPending.count(key)) return 0;
+    if (std::find(d->zeroClearDeferred.begin(), d->zeroClearDeferred.end(), key) == d->zeroClearDeferred.end())
+      d->zeroClearDeferred.push_back(key);
+    return -1;
+  }
+  return vpvk::zeroClearPending(d, key) ? 1 : 0;
 }
 
 
@@ -3875,7 +3934,7 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkQueueSubmit(VkQueue q, uint32_t n, 
   vpgpu::ScopedPool pool;  // guest thread: no autorelease pool of its own (see scoped_pool.h)
   Device* d = from<Queue>(q)->device;
   const auto hitchLock0 = std::chrono::steady_clock::now();  // vk.hitch lock_ms: the gate park + the submit lock
-  vpgpu::backgroundGate().waitForeground();  // park before the lock: a parked thread must not hold submitMutex
+  parkWhileBackground(d);  // park before the lock (a parked thread must not hold submitMutex), for the queue's device, not the live one
   std::lock_guard<std::mutex> lock(d->submitMutex);
   {
     const uint64_t us = perfUsSince(hitchLock0);
@@ -3925,13 +3984,19 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkQueueSubmit(VkQueue q, uint32_t n, 
 VPVK_EXPORT int vpvk_native_submit(vpvk_native_encode_fn fn, void* user) {
   vpgpu::ScopedPool pool;  // guest thread: no autorelease pool of its own (see scoped_pool.h)
   if (!fn) return 0;
-  vpgpu::backgroundGate().waitForeground();  // park before liveDeviceMutex/submitMutex: a parked thread must not hold them
+  parkWhileBackground();  // park before liveDeviceMutex/submitMutex: a parked thread must not hold them
   // The submit mutex is waited for without the registry (liveDeviceSubmitLocked): a frame held for its pipelines (gpu.hold) must not
   // stop the per-frame calls that take the registry. The callback may call vpvk_native_device (which then does not take it); it must not
   // call vkQueueSubmit (same mutex), nor vpvk_native_submit / vpvk_mark_eye_image again (refused: 0).
   std::unique_lock<std::mutex> lock;
   Device* d = liveDeviceSubmitLocked(lock);
   if (!d || !d->platform) return 0;
+  // Clears the callbacks of earlier native submits asked for (vpvk_image_zero_clear): frames of the queue, so before this one's head.
+  if (!d->zeroClearDeferred.empty()) {
+    std::vector<uint64_t> keys;
+    keys.swap(d->zeroClearDeferred);
+    for (uint64_t key : keys) vpvk::zeroClearPending(d, key);
+  }
   bool ok;
   {
     // Restored whichever way the callback leaves (an exception through the platform's encode, a longjmp-free unwind): a flag left set

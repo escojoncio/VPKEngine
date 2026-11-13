@@ -342,16 +342,25 @@ private:
     }
 
     // True when `name` is a function-like macro, or an object-like macro whose expansion ends with such a name (`#define B A` with
-    // `#define A(p, q) ...`): a "(" after it starts a call, which may continue on the next lines.
-    bool namesFunction(const std::string& name) const {
+    // `#define A(p, q) ...`): a "(" after it starts a call, which may continue on the next lines. The last name of a body is the one
+    // that its ## makes (`#define F A ## D` ends with the name `AD`, not `D`).
+    // `endsInCall` (if given) is set when the body of an object-like macro ends with ")" (`#define K A(1)`): the expansion may end with the
+    // name that the call generates, and a "(" after K may call it.
+    bool namesFunction(const std::string& name, bool* endsInCall = nullptr) const {
         const std::string* cur = &name;
+        std::string pasted;
         for (int k = 0; k < 64; ++k) {
             auto it = defines_.find(*cur);
             if (it == defines_.end()) return false;
             if (it->second.function) return true;
             const auto& b = it->second.body;
-            if (b.empty() || b.back().kind != Tok::Ident) return false;
-            cur = &b.back().text;
+            if (b.empty()) return false;
+            if (endsInCall && b.back().kind == Tok::Punct && b.back().text == ")") *endsInCall = true;
+            std::string last = b.back().text;
+            bool join = false;
+            for (size_t n = b.size(); n >= 3 && b[n - 2].text == "##" && last.size() < 1024; n -= 2) last = b[n - 3].text + last, join = true;
+            if (last.size() >= 1024 || (!join && b.back().kind != Tok::Ident)) return false;  // (no name is that long)
+            pasted = std::move(last), cur = &pasted;
         }
         return false;
     }
@@ -364,7 +373,22 @@ private:
     // such lines costs each line its own share.
     size_t scanned_ = 0;
     int scanDepth_ = 0, rawDepth_ = 0;  // rawDepth_: every "(" not yet closed, call or not
-    bool scanAfterFn_ = false;
+    bool scanAfterFn_ = false, scanAfterClose_ = false;
+    // One flag per "(" not yet closed: set when it follows the ")" of a call (it may be the call of a macro name that an earlier expansion
+    // generates, `A() (1` with `#define A(p) D`) or a function-like macro name. suspect_ counts the flags set.
+    std::vector<char> parenSusp_;
+    std::vector<size_t> parenPos_;  // where in pending_ each of them is
+    int suspect_ = 0;
+    bool confirmed_ = false;  // a "(" flagged by a ")" is the call of a name that an expansion generates (see releaseForDirective)
+    // What releaseForDirective has found out about the "(" still open: the first tested_ of them are no call (tested together with the
+    // text from testFrom_ on), confirmedAt_ is the one that was confirmed. When it closes, the wait is over (confirmed_ is false again)
+    // and the tests go on from there: each token is expanded by a test once, not once per directive. The name that the confirmed "("
+    // calls is kept (carry_, for as long as hasCarry_): the "(" that follows the ")" of that call is tested with that name and the call
+    // (testFrom_ is where the call begins), not with all the text before it: a chain of calls, each generating the name of the next
+    // one (`A() (1` / ... / `) (2` / ... / `) (3` with A(p) D and D(p) A), costs its length, not its square.
+    size_t tested_ = 0, testFrom_ = 0, confirmedAt_ = 0;
+    Token carry_;
+    bool hasCarry_ = false;
 
     void flushPending(bool final) {
         if (pending_.empty()) return;
@@ -372,37 +396,54 @@ private:
             for (; scanned_ < pending_.size(); ++scanned_) {
                 const Token& t = pending_[scanned_];
                 if (t.kind == Tok::Ident) {
-                    scanAfterFn_ = namesFunction(t.text);
+                    bool endsInCall = false;
+                    scanAfterFn_ = namesFunction(t.text, &endsInCall);
+                    scanAfterClose_ = endsInCall;  // (flagged like the "(" after a ")": tested before a directive ends the wait for it)
                     continue;
                 }
+                const bool wasClose = scanAfterClose_;
+                scanAfterClose_ = false;
                 if (t.kind == Tok::Punct && t.text == "(") {
                     ++rawDepth_;
+                    const bool call = scanAfterFn_ || scanDepth_ > 0, susp = call || wasClose;
+                    parenSusp_.push_back(char(susp | (call << 1)));
+                    parenPos_.push_back(scanned_);
+                    suspect_ += susp;
                     if (scanAfterFn_ || scanDepth_ > 0) ++scanDepth_;
                 } else if (t.kind == Tok::Punct && t.text == ")") {
-                    if (rawDepth_ > 0) --rawDepth_;
+                    if (rawDepth_ > 0) {
+                        --rawDepth_, suspect_ -= parenSusp_.back() & 1;
+                        // (only the end of a call, or of a "(" that follows one, can be followed by the "(" of a generated name:
+                        // `F(A)() (Z` with F(p) p and A(p) D is the call of A, then of D)
+                        scanAfterClose_ = parenSusp_.back() != 0;
+                        parenSusp_.pop_back(), parenPos_.pop_back();
+                        if (confirmed_ && parenSusp_.size() == confirmedAt_) confirmed_ = false, tested_ = confirmedAt_;
+                        tested_ = std::min(tested_, parenSusp_.size());
+                    }
                     if (scanDepth_ > 0) --scanDepth_;
                 }
                 scanAfterFn_ = false;
             }
             // (a "(" left open after the expansion of an earlier call, `A() (1` with `#define A(p) D`, is no call to the scan: the text
-            // waits for its ")" all the same; waiting only delays the expansion, which cannot differ for text without a call)
+            // waits for its ")" all the same. Waiting changes what is expanded together, so the budget of that expansion grows with the
+            // text it covers (see expand()), and directives that arrive meanwhile are processed without ending the wait.)
             if (scanDepth_ > 0 || rawDepth_ > 0) return;
         }
         std::vector<Token> outv;
         std::set<std::string> hide;
         const size_t logBefore = log_.size();
-        expand(pending_, outv, hide);
+        if (!outputOverflow_) expand(pending_, outv, hide);  // (after an overflow the rest of the text is not expanded: one error, not one per line)
+        if (expandOverflow_) outputOverflow_ = true;
         pending_.clear();
-        scanned_ = 0, scanDepth_ = rawDepth_ = 0, scanAfterFn_ = false;
-        if (!final && log_.size() == logBefore && endsWithName_ && !outv.empty() && outv.back().kind == Tok::Ident && !outv.back().painted) {
-            auto fm = defines_.find(outv.back().text);
-            if (fm != defines_.end() && fm->second.function) {
-                pending_.push_back(std::move(outv.back()));
-                outv.pop_back();
-            }
+        scanned_ = 0, scanDepth_ = rawDepth_ = suspect_ = 0, scanAfterFn_ = scanAfterClose_ = confirmed_ = false;
+        tested_ = testFrom_ = confirmedAt_ = 0, hasCarry_ = false;
+        parenSusp_.clear(), parenPos_.clear();
+        if (!final && log_.size() == logBefore && endsInFunctionName(outv)) {
+            pending_.push_back(std::move(outv.back()));
+            outv.pop_back();
         }
         if (res_.tokens.size() + outv.size() > kMaxOutputTokens) {
-            if (!outputOverflow_) error(outv.empty() ? 0 : outv.front().line, "macro expansion too large");
+            if (!outputOverflow_ && !expandOverflow_) error(topLine_ ? topLine_ : outv.empty() ? 0 : outv.front().line, "macro expansion too large");
             outputOverflow_ = true;
             return;
         }
@@ -410,8 +451,57 @@ private:
     }
     // The expansion budget is per flush; the tokens that all of them leave are limited too (a line of 260000 tokens, 300 times over,
     // took 3 GB). Same order as the limit on the source.
-    static constexpr size_t kMaxOutputTokens = 2'000'000;
+    static constexpr size_t kMaxOutputTokens = 1'000'000;
     bool outputOverflow_ = false;
+
+    // True when the last expansion (by expand()) ends with the NAME of a function-like macro that nothing follows: a "(" that comes next
+    // calls it.
+    bool endsInFunctionName(const std::vector<Token>& v) const {
+        if (!endsWithName_ || v.empty() || v.back().kind != Tok::Ident || v.back().painted) return false;
+        auto fm = defines_.find(v.back().text);
+        return fm != defines_.end() && fm->second.function;
+    }
+
+    // A directive that arrives while a call is open (a "(" after a function-like macro name, or inside one) neither ends the wait nor
+    // expands anything: cpp processes `#if`/`#else`/`#define`/`#undef`/`#pragma` inside the arguments and the call goes on. The same
+    // holds for a "(" that follows the ")" of a call when the text before it expands to the name of a function-like macro (`A() (1`
+    // with `#define A(p) D`: the "(" calls D). Everything else is released first (the text with plain parentheses, `max(S,` / `#undef S`,
+    // `(Z +` / `#define Z 7`, `F(1) (` / `A` / `#if 1` / `()` with F(p) p, or a lone macro name waiting for its "("), so that the
+    // directive sees the macros as they are now and the text before it is expanded with the macros before it, as cpp does. Whether
+    // the "(" after a ")" is a call is found by expanding the text before each of them (a trial: its errors are dropped, the real
+    // expansion reports them), once for as long as the text is held back.
+    // Differences from gcc for #define / #undef inside a call that is open, which we do not copy (gcc records the definition seen at the
+    // macro's name; we expand when the call closes, with the definitions of that moment): `F(` / `#undef F` / `1)` is `[1]` in gcc and
+    // `F ( 1 )` here (no error: F has no "(" after it when the call is expanded); `#define Z 1` / `Z F(` / `#undef Z` / `#define Z 2` /
+    // `Z)` is `1 [2]` in gcc and `2 [ 2 ]` here; the same holds for `A() (Z` / `#define Z 7` / `)` when A() generates a function-like
+    // name. The wait lasts as long as that "(" is open: when its ")" arrives the next directive ends the text after it as usual (`A() (1`
+    // / `#if 1` / `) (Z` / `#endif` / `#define Z 7` / `Z)` is `[1] (Z 7)` as in cpp). None of them is valid portable GLSL (a directive inside the arguments of a macro call is undefined behaviour in C99
+    // 6.10.3p11); plain parentheses, even after a call, are not affected.
+    void releaseForDirective() {
+        if (pending_.empty() || scanDepth_ > 0 || confirmed_) return;
+        if (suspect_ > 0) {
+            const size_t logBefore = log_.size();
+            const bool okBefore = ok_, overflowBefore = expandOverflow_;
+            size_t from = testFrom_;
+            bool carry = hasCarry_;
+            for (size_t e = tested_; e < parenSusp_.size() && !confirmed_; ++e) {
+                if (!(parenSusp_[e] & 1)) continue;
+                from = std::min(from, parenPos_[e]);
+                const size_t segLog = log_.size();
+                std::vector<Token> seg, outv;
+                if (carry) seg.push_back(carry_);
+                seg.insert(seg.end(), pending_.begin() + std::ptrdiff_t(from), pending_.begin() + std::ptrdiff_t(parenPos_[e]));
+                std::set<std::string> hide;
+                expand(seg, outv, hide);
+                if (log_.size() == segLog && endsInFunctionName(outv)) confirmed_ = true, confirmedAt_ = e, carry_ = outv.back();
+                else from = parenPos_[e], carry = false;
+            }
+            if (confirmed_) tested_ = confirmedAt_, testFrom_ = parenPos_[confirmedAt_], hasCarry_ = true;
+            log_.resize(logBefore), ok_ = okBefore, expandOverflow_ = overflowBefore;
+            if (confirmed_) return;
+        }
+        flushPending(true);
+    }
 
     // Collects the arguments of a function-like call starting at `in[i]` == "(". Returns false when
     // the call is unterminated.
@@ -440,11 +530,12 @@ private:
     bool expandOverflow_ = false;
     int topLine_ = 0;  // line of the macro name that the expansion in progress started from (where its errors are reported)
     static constexpr size_t kMaxExpandSteps = 1'000'000;
+    size_t stepLimit_ = kMaxExpandSteps;  // kMaxExpandSteps plus a share per token of the text (a call open over many lines is one expansion)
     // Counts `n` tokens of work (walked, copied, collected or pasted) against kMaxExpandSteps. True once past it: the error is
     // reported once and every caller unwinds.
     bool charge(size_t n, int line) {
         expandSteps_ += n;
-        if (expandSteps_ <= kMaxExpandSteps) return false;
+        if (expandSteps_ <= stepLimit_) return false;
         if (!expandOverflow_) error(topLine_ ? topLine_ : line, "macro expansion too large");
         expandOverflow_ = true;
         return true;
@@ -466,11 +557,16 @@ private:
             error(in.empty() ? 0 : in[0].line, "macro expansion too deep");
             return;
         }
-        if (depth == 0) expandSteps_ = 0, expandOverflow_ = false;
+        if (depth == 0) expandSteps_ = 0, expandOverflow_ = false, stepLimit_ = kMaxExpandSteps + 4 * in.size();
         for (size_t i = 0; i < in.size();) {
             ends.v = false;
             if (depth == 0) topLine_ = in[i].line;
             if (charge(1, in[i].line)) return;
+            if (out.size() > kMaxOutputTokens) {  // (the extra budget of a long text must not let the output grow past what is kept)
+                if (!expandOverflow_) error(topLine_ ? topLine_ : in[i].line, "macro expansion too large");
+                expandOverflow_ = true;
+                return;
+            }
             const Token& t = in[i];
             if (t.kind != Tok::Ident) {
                 out.push_back(t), ++i;
@@ -598,6 +694,11 @@ private:
         }
     }
 
+    // The text of a pasted token that is not a name (a name is appended without lexing it again) is limited: it is lexed again at each ##
+    // of a chain, which costs the square of its length (a body of 5000 ## used on 200 lines took 13.7 s). No number or punctuator of a
+    // shader is that long.
+    static constexpr size_t kMaxPastedToken = 256;
+
     std::vector<Token> paste(const std::vector<Token>& in) {
         std::vector<Token> out;
         for (size_t i = 0; i < in.size(); ++i) {
@@ -606,6 +707,26 @@ private:
                     if (out.back().placemarker) out.back() = in[i + 1];
                     ++i;
                     continue;
+                }
+                const Token& rhs = in[i + 1];
+                // A name followed by a name or an integer (`a ## b ## 1`; `true` and `false` are names too) is always a name: appended in
+                // place, no lexing (a chain of N costs N, not N^2). `true` / `false` are the only names that are another kind of token.
+                auto word = [](const std::string& x) {
+                    return !x.empty() && std::all_of(x.begin(), x.end(), [](char ch) { return identChar(ch); });
+                };
+                Token& lhs = out.back();
+                const bool rhsWord = rhs.kind == Tok::Ident || rhs.kind == Tok::BoolLit || rhs.kind == Tok::IntLit || rhs.kind == Tok::UintLit;
+                // (a name painted by its own expansion, or `true` / `false`, makes a new name that is neither: as the lexer would make it)
+                if ((lhs.kind == Tok::Ident || lhs.kind == Tok::BoolLit) && rhsWord && word(rhs.text)) {
+                    lhs.text += rhs.text, lhs.spaceBefore = false, lhs.painted = false, lhs.kind = Tok::Ident;
+                    if (lhs.text == "true" || lhs.text == "false") lhs.kind = Tok::BoolLit, lhs.ival = lhs.text == "true";
+                    ++i;
+                    continue;
+                }
+                if (lhs.text.size() + rhs.text.size() > kMaxPastedToken) {
+                    // (the rest of the body is dropped: the expansion has failed, and one error per body is enough)
+                    error(lhs.line, "pasted token is too long (more than " + std::to_string(kMaxPastedToken) + " characters)");
+                    break;
                 }
                 std::string text = out.back().text + in[i + 1].text;
                 std::string l;
@@ -756,8 +877,10 @@ private:
         const int ln = line[0].line;
         if (line.size() == 1) return;  // null directive
         const std::string d = line[1].text;
-        // A conditional ends the wait for the "(" of a call, as every other directive does (cpp: `F(0)` / `#if 1` / `(1)` leaves `A (1)`).
-        if (d == "if" || d == "ifdef" || d == "ifndef" || d == "elif" || d == "else" || d == "endif") flushPending(true);
+        // A directive ends the wait for the "(" of a macro name that ends the text (cpp: `F(0)` / `#if 1` / `(1)` leaves `A (1)`), but not
+        // a call that is already open: its arguments go on after the directive, whose inactive branches are skipped (`SAMPLE(t,` / `#ifdef X`
+        // ... `#else` ... `#endif` / `)`).
+        if (d == "if" || d == "ifdef" || d == "ifndef" || d == "elif" || d == "else" || d == "endif") releaseForDirective();
         if (d == "if" || d == "ifdef" || d == "ifndef") {
             bool parent = active();
             bool v = false;
@@ -807,7 +930,7 @@ private:
             return;
         }
         if (!active()) return;
-        flushPending(true);
+        releaseForDirective();
         if (d == "version") {
             if (!first) strict("version_position", ln, "#version must be the first directive");
             if (line.size() < 3 || line[2].kind != Tok::IntLit) return error(ln, "bad #version");

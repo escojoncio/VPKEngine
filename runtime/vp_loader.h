@@ -87,7 +87,9 @@ int vp_map_fixed(uint64_t at, uint64_t size);
 int vp_map_fixed_over(uint64_t at, uint64_t size);
 /* Unmaps a range given by vp_map_fixed, vp_map_fixed_over or a load (all of it, in whole or in
  * parts; it may be a part of one). Returns -1, unmapping nothing, when any of it is not the
- * loader's, or when the range is empty (size 0) or wraps around. */
+ * loader's, or when the range is empty (size 0) or wraps around, or when there is no memory for
+ * the loader's bookkeeping (the room for splitting its tables is taken first): then the range may
+ * be the loader's all the same, and nothing was changed, so the call can be repeated later. */
 int vp_unmap_fixed(uint64_t at, uint64_t size);
 
 #ifdef __cplusplus

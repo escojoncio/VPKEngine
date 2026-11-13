@@ -52,6 +52,7 @@ class MetalPlatform final : public Platform {
     return map(backend_.waitFrames(frames, timeoutNs));
   }
   bool lost() const override { return backend_.lost(); }
+  void releaseBackground() override { backend_.releaseBackground(); }
   void dumpInFlight(const char* why) override { backend_.dumpInFlight(why); }
   uint32_t gpuBacklogMs() const override { return backend_.gpuBacklogMs(); }
   uint32_t lastFrameChunks() const override { return backend_.lastFrameHangSplits(); }

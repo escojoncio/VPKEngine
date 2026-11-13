@@ -50,6 +50,11 @@ class BackgroundGate {
   // until foreground, release() (all owners), release(owner) for the same `owner`, or shutdown(). `owner`: whoever will call
   // release(owner) for it (a backend passes itself); nullptr = only the global release() and shutdown() wake it.
   void waitForeground(const void* owner = nullptr);
+  // Same, for a caller that picked `owner` under a lock of its own (`registry`, held on entry: a backend's device registry) and
+  // whose owner may be released by another thread as soon as that lock is dropped (release(owner) finds nobody parked and is
+  // forgotten, the caller then parks for ever). The gate's lock is taken while `registry` is held (registry -> gate; the gate
+  // never takes it), the wait is registered, and only then is `registry` unlocked: always, parked or not, before this returns.
+  void waitForeground(const void* owner, std::unique_lock<std::mutex>& registry);
   // True when waitForeground() on this thread would park right now (it does not park).
   bool wouldPark() const;
   // Wakes the threads parked now (a backend being destroyed waits for their command buffers); a later pause parks again.
@@ -75,6 +80,7 @@ class BackgroundGate {
 
  private:
   void log(const std::string&) const;
+  void park(const void* owner, std::unique_lock<std::mutex>* registry);
 
   mutable std::mutex mutex_;
   std::condition_variable cv_;

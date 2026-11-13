@@ -1653,16 +1653,19 @@ bool Context::bindResources(Program& p, const StorageP& xfbScratch) {
         writes.push_back(s);
     }
     // Shader storage blocks (GL_SHADER_STORAGE_BUFFER binding points) and atomic counter buffers.
-    auto storageWrite = [&](const IndexedBuffer& ib, uint32_t binding, uint32_t element, uint32_t minSize, bool readOnly) {
+    // `reach`: how many bytes from the start of the bound range the shader can address (a block with an unsized array: all of it).
+    auto storageWrite = [&](const IndexedBuffer& ib, uint32_t binding, uint32_t element, uint32_t minSize, bool readOnly, uint64_t reach) {
         Buffer* buf = buffer(ib.buffer);
         VkDescriptorBufferInfo bi{};
         if (buf && buf->storage && VkDeviceSize(ib.offset) < VkDeviceSize(buf->size)) {
-            useStorage(buf->storage);
-            if (!readOnly) noteGpuWrite(buf->storage);  // (a block every stage declares readonly cannot be written: the CPU may go on)
             bi.buffer = buf->storage->buffer;
             bi.offset = VkDeviceSize(ib.offset);
             const VkDeviceSize avail = VkDeviceSize(buf->size) - VkDeviceSize(ib.offset);  // the buffer may have shrunk since the bind
             bi.range = ib.size ? std::min<VkDeviceSize>(VkDeviceSize(ib.size), avail) : avail;
+            // The bytes the GPU can read are the bound range up to what the block reaches: a CPU write outside them (a ring buffer updated
+            // a piece at a time) is made in place, without ending this pass or copying the buffer.
+            useStorage(buf->storage, bi.offset, bi.offset + std::min<VkDeviceSize>(bi.range, reach));
+            if (!readOnly) noteGpuWrite(buf->storage);  // (a block every stage declares readonly cannot be written: the CPU may go on)
         } else {  // nothing bound: a zeroed scratch range, so the shader reads 0 and its writes go nowhere
             const uint32_t n = std::max<uint32_t>(16, minSize);
             Alloc z = stream(n, 256);
@@ -1678,9 +1681,12 @@ bool Context::bindResources(Program& p, const StorageP& xfbScratch) {
     };
     for (size_t i = 0; i < p.refl.storageBlocks.size(); ++i) {
         const auto& b = p.refl.storageBlocks[i];
-        storageWrite(ssboBindings[p.storageBindings[i] % kMaxShaderStorageBindings], b.binding, b.element, b.size, b.readOnly);
+        // (b.size leaves the unsized array out: a block that has one reaches the end of the range; the others, their size, rounded up to a std430 vec4)
+        const bool unsized = std::any_of(b.members.begin(), b.members.end(), [](const vpglsl::Variable& m) { return m.arraySize == 0 || m.topLevelArraySize == 0; });
+        storageWrite(ssboBindings[p.storageBindings[i] % kMaxShaderStorageBindings], b.binding, b.element, b.size, b.readOnly,
+                     unsized ? UINT64_MAX : (uint64_t(b.size) + 15) & ~uint64_t(15));
     }
-    for (const auto& a : p.refl.atomicBuffers) storageWrite(atomicBindings[size_t(a.glBinding) % kMaxAtomicCounterBindings], a.binding, 0, a.size, false);
+    for (const auto& a : p.refl.atomicBuffers) storageWrite(atomicBindings[size_t(a.glBinding) % kMaxAtomicCounterBindings], a.binding, 0, a.size, false, UINT64_MAX);
     if (xfbScratch) {  // the transform feedback capture buffer
         bufInfos.push_back({xfbScratch->buffer, 0, xfbScratch->size});
         VkWriteDescriptorSet s{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
@@ -2049,6 +2055,34 @@ Program* Context::computeProgram() {
     return it == programPipelines.end() ? nullptr : prog(it->second->cs);
 }
 
+// `flat` varyings: whether this draw is rotated to a list whose primitives have the last vertex first (see prepareDrawOnce).
+bool Context::wantsProvoke(const Program& p, GLenum mode, bool indexed) const {
+    if (!p.refl.flatVaryings) return false;
+    const bool strip = mode == gl::TRIANGLE_STRIP || mode == gl::TRIANGLE_FAN || mode == gl::LINE_STRIP || mode == gl::LINE_LOOP;
+    if (indexed && strip && primitiveRestart) return false;  // (the restart cannot be rotated)
+    return mode == gl::TRIANGLES || mode == gl::TRIANGLE_STRIP || mode == gl::TRIANGLE_FAN || mode == gl::LINES || mode == gl::LINE_STRIP ||
+           mode == gl::LINE_LOOP;
+}
+
+// Whether a restart index splits this mode into a plain list on the CPU (Vulkan ignores primitiveRestartEnable on list topologies).
+bool Context::splitsOnRestart(GLenum mode) const {
+    return primitiveRestart && (mode == gl::POINTS || mode == gl::LINES || mode == gl::TRIANGLES || mode == gl::LINE_LOOP);
+}
+
+// How an indexed draw uses its indices. `scan`: the highest index must be found on the CPU (client arrays and converted vertex data need
+// it); `gpuInPlace`: the GPU reads 16 / 32-bit indices from the element buffer itself and no CPU path reads them (no scan, transform
+// feedback, restart split, provoking-vertex rotation, 8-bit widening or line loop), so a GPU write into the buffer needs no wait.
+Context::IndexPlan Context::planIndices(GLenum mode, uintptr_t off, uint32_t isz, bool inBuffer, VertexArray* va) {
+    IndexPlan plan;
+    Program* gp = graphicsProgram();
+    const bool linked = gp && gp->linked && gp->vsModule;
+    plan.scan = !(inBuffer && isz >= 2 && linked && attribsDirect(*gp, va));
+    const TransformFeedback& tf = curTf();
+    plan.gpuInPlace = inBuffer && isz >= 2 && mode != gl::LINE_LOOP && off % isz == 0 && linked && !plan.scan &&
+                      !(tf.active && !tf.paused && mode <= gl::TRIANGLE_FAN) && !splitsOnRestart(mode) && !wantsProvoke(*gp, mode, true);
+    return plan;
+}
+
 bool Context::prepareDraw(GLenum mode, VkPrimitiveTopology& topo, uint32_t vertexCount, uint32_t firstVertex,
                           uint32_t instances, bool indexed, VkBuffer& vbufs0) {
     if (!passOpen_) recordTransfers();  // no pass to wait for
@@ -2105,14 +2139,10 @@ bool Context::prepareDrawOnce(GLenum mode, VkPrimitiveTopology& topo, uint32_t v
     // triangle/line list whose primitives are rotated so the last vertex comes first (a cyclic rotation keeps the winding).
     // (An indexed strip with primitive restart keeps its topology: the restart cannot be rotated here.)
     provoke_ = false;
-    if (provokeOk && p->refl.flatVaryings) {
-        const bool strip = mode == gl::TRIANGLE_STRIP || mode == gl::TRIANGLE_FAN || mode == gl::LINE_STRIP || mode == gl::LINE_LOOP;
-        if (!(indexed && strip && primitiveRestart)) {
-            if (mode == gl::TRIANGLES || mode == gl::TRIANGLE_STRIP || mode == gl::TRIANGLE_FAN)
-                provoke_ = true, topo = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
-            else if (mode == gl::LINES || mode == gl::LINE_STRIP || mode == gl::LINE_LOOP)
-                provoke_ = true, topo = VK_PRIMITIVE_TOPOLOGY_LINE_LIST;
-        }
+    if (provokeOk && wantsProvoke(*p, mode, indexed)) {
+        provoke_ = true;
+        topo = mode == gl::TRIANGLES || mode == gl::TRIANGLE_STRIP || mode == gl::TRIANGLE_FAN ? VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST
+                                                                                                 : VK_PRIMITIVE_TOPOLOGY_LINE_LIST;
     }
     if (drawFb_.viewCount && drawFb_.viewCount != std::max(1u, p->refl.numViews) && p->refl.numViews > 1) {
         setError(gl::INVALID_OPERATION);  // OVR_multiview: num_views must match the framebuffer
@@ -2468,17 +2498,8 @@ void Context::drawElements(GLenum mode, GLsizei count, GLenum type, const void* 
         if (!eb->storage) return setError(gl::INVALID_OPERATION, mode);
         const uintptr_t off = reinterpret_cast<uintptr_t>(indices);
         if (off + size_t(count) * isz > size_t(eb->size)) return setError(gl::INVALID_OPERATION, mode);
-        // The indices are read on the CPU (the scan for the highest one, transform feedback, restart splitting, provoking-vertex rotation,
-        // widening of 8-bit ones, line loops) unless the draw reads them in place on the GPU, in order after whatever writes them.
-        if (gpuWritePending(*eb->storage)) {
-            const TransformFeedback& tf0 = curTf();
-            Program* gp0 = graphicsProgram();
-            const bool direct = eb && isz >= 2 && mode != gl::LINE_LOOP && off % isz == 0 && gp0 && gp0->linked && gp0->vsModule &&
-                                attribsDirect(*gp0, va) && !(tf0.active && !tf0.paused && mode <= gl::TRIANGLE_FAN) &&
-                                !(primitiveRestart && (mode == gl::POINTS || mode == gl::LINES || mode == gl::TRIANGLES)) &&
-                                !gp0->refl.flatVaryings;
-            if (!direct) flush(true);
-        }
+        // The indices are read on the CPU unless the draw reads them in place on the GPU (see planIndices), in order after whatever writes them.
+        if (gpuWritePending(*eb->storage) && !planIndices(mode, off, isz, true, va).gpuInPlace) flush(true);
         src = eb->storage->host + off;
     } else {
         src = static_cast<const uint8_t*>(indices);
@@ -2500,11 +2521,7 @@ void Context::drawElements(GLenum mode, GLsizei count, GLenum type, const void* 
     };
     // The highest index only matters to vertex data that is copied (client arrays, converted formats): with every attribute read
     // in place from its buffer and the indices read in place too, the scan is skipped.
-    bool needMax = true;
-    if (eb && isz >= 2) {
-        Program* gp = graphicsProgram();
-        needMax = !(gp && gp->linked && gp->vsModule && attribsDirect(*gp, va));
-    }
+    const bool needMax = planIndices(mode, reinterpret_cast<uintptr_t>(indices), isz, eb != nullptr, va).scan;
     if (needMax)
         for (GLsizei i = 0; i < count; ++i) {
             uint32_t v = at(i);
@@ -2528,7 +2545,7 @@ void Context::drawElements(GLenum mode, GLsizei count, GLenum type, const void* 
     provokeOk_ = true;
     // Vulkan ignores primitiveRestartEnable on list topologies (and line loops are strips closed by the caller): with restart
     // on, those modes are split at the restart index here and drawn as a plain list.
-    const bool splitRestart = primitiveRestart && (mode == gl::POINTS || mode == gl::LINES || mode == gl::TRIANGLES || mode == gl::LINE_LOOP);
+    const bool splitRestart = splitsOnRestart(mode);
     const GLenum dm = splitRestart && mode == gl::LINE_LOOP ? GLenum(gl::LINES) : mode;
     vertexRowsUnknown_ = !needMax;  // (the indices were not scanned: the rows they reach are not known)
     if (!prepareDraw(dm, topo, 0, 0, uint32_t(instances), true, unused)) return;

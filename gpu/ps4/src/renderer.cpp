@@ -269,14 +269,12 @@ struct Renderer::Impl {
         return bool(gds.id);
     }
 
-    // V#s that point nowhere: the hardware reads zeros past a buffer's records and drops writes. Two buffers of our own, so no state
-    // has to be kept in step with the GPU: `dummy` is zeros and is only ever bound read-only (nothing writes it, so it needs no
-    // clearing); `sink` is what write-only bindings get (their writes land there and nobody reads it). Read-write bindings get a block of
-    // fresh zeros from the upload ring (see bind).
+    // V#s that point nowhere (or have no records) are bound to this block of zeros (see bind): as a range of size 0 for a Buffer resource
+    // (robust shaders: never read or written), as a whole block for a constant buffer (read, as zeros). Nothing ever writes it.
     struct Dummy {
         void* memory = nullptr;
         BufferId id;
-    } dummy, sink;
+    } dummy;
     bool makeDummy(Dummy& d, const char* label) {
         if (d.id) return true;
         if (!d.memory) d.memory = std::aligned_alloc(kPage, kDummyBytes);
@@ -620,7 +618,17 @@ struct Renderer::Impl {
         if (!lifted.errors.empty()) {
             t.error = lifted.errors.front();
         } else {
-            vpmsl::EmitResult msl = vpmsl::emitMsl(lifted.module);
+            // robustBuffers: every Load / Store / atomic on a Buffer is checked against the size of the range bound to its slot (a V#'s
+            // records, or 0 for a null one): past it reads give 0 and writes / atomics are dropped, as on the hardware. The lifted code does
+            // not check offsets itself. Cost: one unsigned compare and a select (store: a predicated store) per access, plus one 8-byte
+            // size argument per used Buffer slot; the Metal compiler folds nothing since sizes come from the argument buffer.
+            // robustPerWord: a vector load / store (dwordx2..x4) that crosses the end of the range is checked dword by dword, as the hardware does
+            // (the dwords inside the range are read / written, the rest read 0): the code for that is in the else of the same compare, so an
+            // access inside the range costs what it did (emitted text: a vec4 load 2 lines -> 8, a vec4 store 1 -> 7).
+            vpmsl::EmitOptions eo;
+            eo.robustBuffers = true;
+            eo.robustPerWord = true;
+            vpmsl::EmitResult msl = vpmsl::emitMsl(lifted.module, eo);
             if (!msl.errors.empty()) {
                 t.error = "msl: " + msl.errors.front();
             } else {
@@ -1093,6 +1101,7 @@ struct Renderer::Impl {
                         break;
                     }
                     uint64_t address = 0, size = 0;
+                    bool sized = false;  // a V# gave the size (num_records 0 is an empty range, not "the rest of the mapping")
                     if (b.dwords == 0 || b.source.kind == vpgcn::DescriptorSource::Code) {
                         // (Code: the base is an address in the program image; its size/format words are
                         // set by the program, so there is no descriptor to read.)
@@ -1102,31 +1111,28 @@ struct Renderer::Impl {
                         const BufferDesc d = decodeBuffer(words);
                         address = d.address;
                         size = d.bytes();
+                        // Known deviation (stride != 0, from the adversarial review; not measured on hardware): the range is stride * num_records
+                        // bytes and the robust shaders compare BYTES against it, while the hardware with a stride checks the record INDEX. They
+                        // differ only for an element whose offset + size is larger than the stride, in the LAST record (a 16-byte format at
+                        // offset 8 of a 12-byte stride): the hardware reads it whole, here the dwords past stride * num_records read 0 (a store
+                        // drops them), so the element comes out partly zero. A layout where the format does not fit the stride is malformed
+                        // and rare; fixing it would take the index check in the lifted code (the lifter knows only the byte offset).
+                        sized = true;
                     }
                     BufferId id;
                     uint64_t offset = 0, available = 0;
-                    if (!address || !guestBuffer(address, size, id, offset, available)) {
-                        // The hardware reads zeros past a buffer's records and drops writes: an unset or unmapped V# gets a buffer of our
-                        // own instead of losing the whole draw. Read-only: the zeros nothing writes. Write-only: the sink nobody reads.
-                        // Read-write (atomics, load-modify-store): the reads must see zeros, not what an earlier draw wrote, so it is a
-                        // fresh block of zeros from the upload ring, which is the one memory the renderer already keeps in step with the GPU
-                        // (a ring is written again only kFrames submits later).
-                        note(address ? "buffer outside guest memory bound as zeros" : "null buffer bound as zeros");
-                        if (res.access == vpir::Access::ReadWrite) {
-                            // Only the addressable bytes (the V#'s size, 256 at least, kDummyBytes at most): a dispatch full of null RW bindings
-                            // must not use the ring up. A ring too full for even that falls through to the sink (writes dropped, reads
-                            // unspecified) rather than losing the dispatch.
-                            if (!makeDummy(dummy, "vpps4 zeros")) return why = "buffer outside guest memory", false;
-                            const uint64_t slice = size ? std::min<uint64_t>((size + 255) / 256 * 256, kDummyBytes) : 256;
-                            if (auto at = upload(dummy.memory, slice)) {
-                                a.range = ResourceRange::bytes(rings[ringIndex].id, *at, slice);
-                                break;
-                            }
-                            note("null read-write buffer bound to the sink (upload ring full)");
-                        }
-                        Dummy& d = a.write ? sink : dummy;
-                        if (!makeDummy(d, a.write ? "vpps4 sink" : "vpps4 zeros")) return why = "buffer outside guest memory", false;
-                        a.range = ResourceRange::bytes(d.id, 0, kDummyBytes);
+                    if (!address || (sized && !size) || !guestBuffer(address, size, id, offset, available)) {
+                        // The hardware reads zeros past a buffer's records and drops writes and atomics: an unset or unmapped V#, or one with no
+                        // records, is a range of size 0. A Buffer resource is emitted with robustBuffers (see translate), which checks every access
+                        // against the size of the range bound to its slot: reads give 0, writes and atomics do nothing, whatever the access
+                        // (read, write, read-write, any offset or thread count). So nothing is written or read there. A constant buffer is NOT
+                        // checked that way (it is read with vector loads from `constant` memory): it is bound to the whole block of zeros
+                        // (kDummyBytes, the size of the biggest constant buffer), which nothing ever writes, so it reads 0 at every offset.
+                        note(!address ? "null buffer bound as an empty range"
+                             : (sized && !size) ? "buffer with no records bound as an empty range"
+                                                : "buffer outside guest memory bound as an empty range");
+                        if (!makeDummy(dummy, "vpps4 zeros")) return why = "buffer outside guest memory", false;
+                        a.range = ResourceRange::bytes(dummy.id, 0, res.kind == vpir::ResourceKind::ConstantBuffer ? kDummyBytes : 0);
                         break;
                     }
                     if (!size || size > available) size = available;
@@ -1769,7 +1775,7 @@ struct Renderer::Impl {
         for (RetiredSampler& x : retiredSamplers) r.device_.destroy(x.id);
         if (gds.id) r.device_.destroy(gds.id);
         std::free(gds.memory);
-        for (Dummy* d : {&dummy, &sink}) {
+        for (Dummy* d : {&dummy}) {
             if (d->id) r.device_.destroy(d->id);
             std::free(d->memory);
         }

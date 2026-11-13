@@ -11,6 +11,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
+#include <new>
 #include <set>
 
 #include "egl_internal.h"
@@ -200,11 +201,19 @@ static void installCrashTrace() {
 static EGLDisplay GetDisplay(void*) { return kDisplay; }
 static EGLDisplay GetPlatformDisplay(EGLenum, void*, const intptr_t*) { return kDisplay; }
 
+// The Device exists and vpgles_shutdown has not ended it (Device::lock held). After a shutdown nothing may be created on it until the host
+// calls vpgles_init again: the entries that create or make current answer EGL_NOT_INITIALIZED.
+static bool deviceLive() {
+    Device* dv = device();
+    return dv && dv->device && !dv->dead;
+}
+
 static EGLBoolean Initialize(EGLDisplay d, EGLint* major, EGLint* minor) {
     if (d != kDisplay) return err(BAD_DISPLAY);
-    if (!device() || !device()->device) return err(NOT_INITIALIZED);  // (no Device, or the one vpgles_shutdown ended)
+    if (!device()) return err(NOT_INITIALIZED);
     {
-        std::lock_guard<std::recursive_mutex> l(device()->lock);
+        std::lock_guard<std::recursive_mutex> l(Device::lock());
+        if (!deviceLive()) return err(NOT_INITIALIZED);  // the Device vpgles_shutdown ended (checked with the lock: shutdown holds it)
         ++gDisplay.refs;
         gDisplay.initialized = true;
     }
@@ -217,8 +226,8 @@ static EGLBoolean Initialize(EGLDisplay d, EGLint* major, EGLint* minor) {
 static void releaseDisplay();
 static EGLBoolean Terminate(EGLDisplay d) {
     if (d != kDisplay) return err(BAD_DISPLAY);
-    if (Device* dv = device()) {
-        std::lock_guard<std::recursive_mutex> l(dv->lock);
+    if (device()) {
+        std::lock_guard<std::recursive_mutex> l(Device::lock());
         // DELIBERATE deviation from EGL 1.5 3.2 (there every eglTerminate releases the display's resources, however many
         // eglInitialize preceded it): Android's semantics. Every eglInitialize is matched by an eglTerminate and only the last one
         // releases the display (another component's initialize + terminate must not take it from the game). A terminate with none
@@ -345,7 +354,11 @@ static EGLSurface CreateSurface(EGLConfig c, Surface::Kind kind, void* window, c
     }
     if (!s->width) s->width = 1;
     if (!s->height) s->height = 1;
-    std::lock_guard<std::recursive_mutex> l(device()->lock);
+    std::lock_guard<std::recursive_mutex> l(Device::lock());
+    if (!deviceLive()) {
+        delete s;
+        return err(NOT_INITIALIZED), nullptr;
+    }
     if (!createSurfaceImages(device(), *s)) {
         delete s;
         return err(BAD_ALLOC), nullptr;
@@ -381,7 +394,7 @@ static EGLSurface CreatePbufferSurface(EGLDisplay d, EGLConfig c, const EGLint* 
 static void freeSurface(Surface* s) {
     Context* c = current();
     if (c) c->flush(true);
-    else device()->waitSerial(device()->submitted);
+    else if (Device* dv = device()) dv->waitSerial(dv->submitted);
     gSurfaces.erase(s);
     for (Context* other : gContexts) {  // a context that is not current keeps the surfaces it last had: not any more
         if (other->draw == s) other->draw = nullptr;
@@ -396,7 +409,7 @@ static void unbindSurface(Surface* s) {
 static EGLBoolean DestroySurface(EGLDisplay d, EGLSurface s) {
     if (d != kDisplay) return err(BAD_DISPLAY);
     if (!s) return err(BAD_SURFACE);
-    std::lock_guard<std::recursive_mutex> l(device()->lock);
+    std::lock_guard<std::recursive_mutex> l(Device::lock());
     auto* surf = static_cast<Surface*>(s);
     if (!gSurfaces.count(surf)) return err(BAD_SURFACE);  // released (eglTerminate) or never made
     // EGL 1.5: una superficie actual en algún hilo se destruye cuando deja de serlo (unbindSurface).
@@ -411,7 +424,7 @@ static EGLBoolean QuerySurface(EGLDisplay d, EGLSurface sv, EGLint attr, EGLint*
     if (d != kDisplay) return err(BAD_DISPLAY);
     auto* s = static_cast<Surface*>(sv);
     if (!s) return err(BAD_SURFACE);
-    std::lock_guard<std::recursive_mutex> l(device()->lock);  // (held while the surface is read: eglTerminate / eglDestroySurface free it)
+    std::lock_guard<std::recursive_mutex> l(Device::lock());  // (held while the surface is read: eglTerminate / eglDestroySurface free it)
     if (!gSurfaces.count(s)) return err(BAD_SURFACE);  // released (eglTerminate) or never made
     switch (attr) {
         case WIDTH: *value = EGLint(s->width); return TRUE_;
@@ -454,7 +467,8 @@ static EGLContext CreateContext(EGLDisplay d, EGLConfig, EGLContext shareCtx, co
     if (major == 3 && minor > 2) return err(BAD_MATCH), nullptr;
     // Strict (conformance) mode: only what is advertised; a 3.2 request fails so the caller falls back to 3.1.
     if (major == 3 && minor > gl::kAdvertisedMinor && vpglsl::strictMode()) return err(BAD_MATCH), nullptr;
-    std::lock_guard<std::recursive_mutex> l(device()->lock);
+    std::lock_guard<std::recursive_mutex> l(Device::lock());
+    if (!deviceLive()) return err(NOT_INITIALIZED), nullptr;
     if (shareCtx && (!gContexts.count(static_cast<Context*>(shareCtx)) || static_cast<Context*>(shareCtx)->dead))
         return err(BAD_CONTEXT), nullptr;
     ShareGroup* sg = shareCtx ? static_cast<Context*>(shareCtx)->share : new ShareGroup;
@@ -465,7 +479,7 @@ static EGLContext CreateContext(EGLDisplay d, EGLConfig, EGLContext shareCtx, co
 static EGLBoolean DestroyContext(EGLDisplay d, EGLContext c) {
     if (d != kDisplay) return err(BAD_DISPLAY);
     if (!c) return err(BAD_CONTEXT);
-    std::lock_guard<std::recursive_mutex> l(device()->lock);
+    std::lock_guard<std::recursive_mutex> l(Device::lock());
     auto* ctx = static_cast<Context*>(c);
     if (!gContexts.count(ctx)) return err(BAD_CONTEXT);  // released (eglTerminate) or never made
     forgetContext(ctx);
@@ -492,7 +506,8 @@ static EGLBoolean QueryContext(EGLDisplay d, EGLContext c, EGLint attr, EGLint* 
 
 static EGLBoolean MakeCurrent(EGLDisplay d, EGLSurface draw, EGLSurface read, EGLContext c) {
     if (d != kDisplay && !(d == nullptr && !c)) return err(BAD_DISPLAY);
-    std::lock_guard<std::recursive_mutex> l(device()->lock);
+    std::lock_guard<std::recursive_mutex> l(Device::lock());
+    if ((c || draw || read) && !deviceLive()) return err(NOT_INITIALIZED);  // (releasing the current context is always allowed)
     auto* ctx = static_cast<Context*>(c);
     auto* nd = static_cast<Surface*>(draw);
     auto* nr = static_cast<Surface*>(read);
@@ -536,21 +551,58 @@ static EGLBoolean SwapBuffers(EGLDisplay d, EGLSurface sv) {
     if (d != kDisplay) return err(BAD_DISPLAY);
     auto* s = static_cast<Surface*>(sv);
     if (!s) return err(BAD_SURFACE);
-    std::lock_guard<std::recursive_mutex> l(device()->lock);
-    if (!gSurfaces.count(s)) return err(BAD_SURFACE);
-    Context* c = current();
-    if (c) c->flush(true);
-    ++s->presented;
-    texStatsTick(false);
-    recipeStatsTick(false);
-    if (s->kind == Surface::Window && gPresent && s->color)
-        gPresent(gPresentCtx, s->window, s->color->image, s->width, s->height, uint32_t(s->config->color));
+    // What the host's present callback needs is copied under the lock and the callback runs without it: it may wait for a thread that
+    // is inside vpgles_shutdown (which holds the lock), or call back into the layer. The colour image is held alive across the call.
+    vpgles_present_fn present = nullptr;
+    void* presentCtx = nullptr;
+    void* window = nullptr;
+    ImageP keep;
+    Device* dv = nullptr;
+    uint32_t w = 0, h = 0, colorFormat = 0;
+    {
+        std::lock_guard<std::recursive_mutex> l(Device::lock());
+        if (!gSurfaces.count(s)) return err(BAD_SURFACE);
+        if (!deviceLive()) return err(NOT_INITIALIZED);
+        Context* c = current();
+        if (c) c->flush(true);
+        ++s->presented;
+        texStatsTick(false);
+        recipeStatsTick(false);
+        if (s->kind == Surface::Window && gPresent && s->color) {
+            // Room for every present in flight to park its image in Device::lateImages, taken here where an allocation failure can be
+            // reported: ~Presented is noexcept and must not allocate (presentReturned only moves into the reserved vector).
+            try {
+                device()->lateImages.reserve(size_t(device()->presents) + 1);
+            } catch (const std::bad_alloc&) {
+                return err(BAD_ALLOC);
+            }
+            present = gPresent, presentCtx = gPresentCtx, window = s->window, keep = s->color, w = s->width, h = s->height,
+            colorFormat = uint32_t(s->config->color);
+            dv = device();
+            ++dv->presents;  // vpgles_shutdown leaves the Vulkan device standing until this present returns
+        }
+    }
+    if (!present) return TRUE_;
+    // Whatever way the callback ends (it may throw), the image is released under the lock (its destructor uses the Vulkan device), the
+    // present count goes down, and the last present to return after a vpgles_shutdown waits for the GPU (without the lock) and finishes the
+    // destruction that shutdown left pending. The image is destroyed here when the callback returns, unless a shutdown has the last present
+    // wait for the GPU first (vpgles.h: the host's work on the image must be done, or synchronised, before the callback returns).
+    struct Presented {
+        Device* dv;
+        ImageP& keep;
+        ~Presented() {
+            std::unique_lock<std::recursive_mutex> l(Device::lock());
+            dv->presentReturned(keep, l);  // (may free *dv; releases the lock while it waits for the GPU)
+        }
+    } returned{dv, keep};
+    present(presentCtx, window, keep->image, w, h, colorFormat);
     return TRUE_;
 }
 static EGLBoolean SwapInterval(EGLDisplay d, EGLint interval) {
     if (d != kDisplay) return err(BAD_DISPLAY);
+    std::lock_guard<std::recursive_mutex> l(Device::lock());  // (the surface may be freed by another thread's eglDestroySurface / shutdown)
     currentSurfaces();
-    if (tDraw) tDraw->swapInterval = interval;
+    if (tDraw && gSurfaces.count(tDraw)) tDraw->swapInterval = interval;
     return TRUE_;
 }
 static EGLint GetError() {
@@ -560,7 +612,7 @@ static EGLint GetError() {
 }
 static EGLBoolean WaitGL() {
     if (current()) {
-        std::lock_guard<std::recursive_mutex> l(device()->lock);
+        std::lock_guard<std::recursive_mutex> l(Device::lock());
         if (Context* c = current()) c->flush(true);  // (read again under the lock: see CTX)
     }
     return TRUE_;
@@ -578,7 +630,8 @@ struct EglSync {
 static EGLSync CreateSyncKHR(EGLDisplay d, EGLenum type, const EGLint*) {
     if (d != kDisplay) return err(BAD_DISPLAY), nullptr;
     if (type != SYNC_FENCE_KHR && type != SYNC_NATIVE_FENCE_ANDROID) return err(BAD_ATTRIBUTE), nullptr;
-    std::lock_guard<std::recursive_mutex> l(device()->lock);
+    std::lock_guard<std::recursive_mutex> l(Device::lock());
+    if (!deviceLive()) return err(NOT_INITIALIZED), nullptr;
     Context* c = current();
     uint64_t serial = c ? c->flush(false) : 0;
     if (!serial) serial = device()->submitted;
@@ -587,14 +640,14 @@ static EGLSync CreateSyncKHR(EGLDisplay d, EGLenum type, const EGLint*) {
     return y;
 }
 static EGLBoolean DestroySyncKHR(EGLDisplay, EGLSync s) {
-    std::lock_guard<std::recursive_mutex> l(device()->lock);
+    std::lock_guard<std::recursive_mutex> l(Device::lock());
     if (!gSyncs.erase(s)) return err(BAD_PARAMETER);  // released (eglTerminate) or never made
     delete static_cast<EglSync*>(s);
     return TRUE_;
 }
 static EGLint ClientWaitSyncKHR(EGLDisplay, EGLSync s, EGLint, uint64_t timeout) {
     if (!s) return err(BAD_PARAMETER), FALSE_;
-    std::lock_guard<std::recursive_mutex> l(device()->lock);
+    std::lock_guard<std::recursive_mutex> l(Device::lock());
     if (!gSyncs.count(s)) return err(BAD_PARAMETER), FALSE_;
     auto* y = static_cast<EglSync*>(s);
     device()->retire(false);
@@ -606,7 +659,7 @@ static EGLint ClientWaitSyncKHR(EGLDisplay, EGLSync s, EGLint, uint64_t timeout)
 static EGLint WaitSyncKHR(EGLDisplay, EGLSync, EGLint) { return TRUE_; }  // one queue: already ordered
 static EGLBoolean GetSyncAttribKHR(EGLDisplay, EGLSync s, EGLint attr, EGLint* value) {
     if (!s) return err(BAD_PARAMETER);
-    std::lock_guard<std::recursive_mutex> l(device()->lock);
+    std::lock_guard<std::recursive_mutex> l(Device::lock());
     if (!gSyncs.count(s)) return err(BAD_PARAMETER);
     device()->retire(false);
     auto* y = static_cast<EglSync*>(s);
@@ -626,7 +679,8 @@ struct EglImage {
 };
 static EGLImage CreateImageKHR(EGLDisplay d, EGLContext c, EGLenum target, void* buffer, const EGLint*) {
     if (d != kDisplay) return err(BAD_DISPLAY), nullptr;
-    std::lock_guard<std::recursive_mutex> l(device()->lock);
+    std::lock_guard<std::recursive_mutex> l(Device::lock());
+    if (!deviceLive()) return err(NOT_INITIALIZED), nullptr;
     if (target == 0x30B1 /* EGL_GL_TEXTURE_2D_KHR */) {
         auto* ctx = static_cast<Context*>(c);
         if (!ctx || !gContexts.count(ctx)) return err(BAD_CONTEXT), nullptr;
@@ -641,7 +695,7 @@ static EGLImage CreateImageKHR(EGLDisplay d, EGLContext c, EGLenum target, void*
     return err(BAD_PARAMETER), nullptr;
 }
 static EGLBoolean DestroyImageKHR(EGLDisplay, EGLImage i) {
-    std::lock_guard<std::recursive_mutex> l(device()->lock);
+    std::lock_guard<std::recursive_mutex> l(Device::lock());
     if (!gImages.erase(i)) return err(BAD_PARAMETER);  // released (eglTerminate) or never made (the host's own: it answers those)
     delete static_cast<EglImage*>(i);
     return TRUE_;
@@ -670,8 +724,7 @@ static void releaseDisplay() {
     for (void* y : gSyncs) delete static_cast<EglSync*>(y);
     for (void* i : gImages) delete static_cast<EglImage*>(i);
     gSyncs.clear(), gImages.clear();
-    device()->waitSerial(device()->submitted);
-    device()->trim();
+    if (Device* dv = device()) dv->waitSerial(dv->submitted), dv->trim();  // (eglTerminate before vpgles_init: nothing to wait for)
 }
 
 // vpgles_shutdown (before the Device is destroyed, so the objects can still release their Vulkan objects): everything the display
@@ -679,7 +732,7 @@ static void releaseDisplay() {
 // are dropped by the session counter (gSession: current() and the current surfaces read as none for a thread whose session ended), so its
 // later calls (eglMakeCurrent(NO_CONTEXT), eglReleaseThread, vpgles_flush) find nothing and free nothing twice. A later vpgles_init starts from empty lists, never with objects of the dead Device in them.
 void eglShutdownDisplay() {
-    std::lock_guard<std::recursive_mutex> l(device()->lock);
+    std::lock_guard<std::recursive_mutex> l(Device::lock());
     if (current()) setCurrent(nullptr);
     tDraw = tRead = nullptr;
     gSession.fetch_add(1, std::memory_order_release);  // every other thread's current context / surfaces die with this session

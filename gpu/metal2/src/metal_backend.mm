@@ -8380,6 +8380,10 @@ std::string MetalBackend::lostReason() const {
   return impl_->lostWhy;
 }
 
+void MetalBackend::releaseBackground() {
+  if (impl_) vpgpu::backgroundGate().release(impl_.get());
+}
+
 // Age of the oldest frame command buffer still in flight (committed, completion handler not yet run).
 uint32_t MetalBackend::gpuBacklogMs() const {
   if (!impl_) return 0;

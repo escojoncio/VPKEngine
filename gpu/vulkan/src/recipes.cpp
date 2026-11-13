@@ -15,6 +15,11 @@
 #include "vpmsl/msl.h"
 #include "vpvk/config.h"
 
+#ifdef VPVK_TESTING  // (defined only for vpvk_tests, which compiles these sources itself: the VPVulkan that ships has no hook)
+static std::atomic<void (*)()> gForDirHook{nullptr};
+extern "C" void vpvk_test_fordir_hook(void (*f)()) { gForDirHook = f; }
+#endif
+
 namespace vpvk {
 namespace {
 
@@ -438,14 +443,24 @@ void RecipeStore::retargetLive(uint32_t id) {
 
 std::shared_ptr<RecipeStore> RecipeStore::forDir(const std::string& dir) {
   if (dir.empty()) return std::make_shared<RecipeStore>(dir);
+  // First read before the registry lock: the first translatorMode() may run refreshTranslatorMode, and another thread's refresh that raced
+  // it ends in retargetLive, which takes this same (non-recursive) lock.
+  translatorId();
+#ifdef VPVK_TESTING
+  if (auto* h = gForDirHook.load()) h();  // (test hook: the mode may change right here, between that read and the lock)
+#endif
   OpenStores& os = openStores();
   std::lock_guard<std::mutex> lock(os.mutex);
+  // The mode is read again under the lock, as the plain atomic (it is set by now, and no refresh nor retargetLive may run from here: the
+  // lock is not recursive): a refresh that changed it after the read above has its retargetLive wait for this lock, and a stale id written
+  // into a live store here would stay for good.
+  const uint32_t id = kTranslatorVersion | gTranslatorMode.load() << 16;
   std::weak_ptr<RecipeStore>& slot = os.open[dir];
   if (std::shared_ptr<RecipeStore> live = slot.lock()) {
-    live->setTranslator(translatorId());  // the host may have changed VPVK_AMPLIFY / VPVK_FETCH_NATIVE for this device (the mode is process-wide)
+    live->setTranslator(id);  // the host may have changed VPVK_AMPLIFY / VPVK_FETCH_NATIVE for this device (the mode is process-wide)
     return live;
   }
-  std::shared_ptr<RecipeStore> made = std::make_shared<RecipeStore>(dir);
+  std::shared_ptr<RecipeStore> made = std::make_shared<RecipeStore>(dir, id);
   slot = made;
   return made;
 }

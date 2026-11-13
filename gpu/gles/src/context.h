@@ -80,6 +80,7 @@ static_assert(kMaxTextureUnits == vpglsl::kBindingSamplers && kMaxImageUnits == 
 
 // ---- device ---------------------------------------------------------------------------------------
 struct Device;
+struct Image;
 
 // Host-visible memory + buffer (one allocation per object: unified memory, cheap).
 struct BufferStorage {
@@ -99,6 +100,11 @@ struct BufferStorage {
     std::vector<std::pair<uint64_t, uint64_t>> reads;
     void noteRead(uint64_t lo, uint64_t hi);
     bool readsRange(uint64_t lo, uint64_t hi) const;
+    // What the GPU has still to write (meaningful while Context::gpuWritePending): the byte ranges of ordered copies (Context::updateOrdered,
+    // merged, at most a few) and whether some other GPU write (a readback, a shader's stores, a buffer copy) of unknown bytes is among them. A CPU
+    // write outside all of these, and outside what the GPU reads, can be made in place although a GPU write is pending.
+    std::vector<std::pair<uint64_t, uint64_t>> orderedWrites;
+    bool unknownWrite = false;
     ~BufferStorage();
 };
 using StorageP = std::shared_ptr<BufferStorage>;
@@ -119,7 +125,23 @@ struct Device {
     VkPhysicalDeviceMemoryProperties memProps{};
     VkPhysicalDeviceProperties props{};
     VkCommandPool pool = VK_NULL_HANDLE;
-    std::recursive_mutex lock;  // the global GL lock (every entry point holds it)
+    // The global GL lock (every entry point holds it). One for the whole process and never destroyed: a thread can be waiting on it while
+    // vpgles_shutdown / vpgles_init replace the Device, and a destroyed mutex (or one being constructed) is undefined behaviour. Built at
+    // the first call (function-local, so no static initialisation order matters) and leaked on purpose.
+    static std::recursive_mutex& lock();
+    // vpgles_shutdown ended the session (Device::lock). With `presents` > 0 the Vulkan device is not destroyed yet: a host present callback
+    // is still using an image of it (SwapBuffers calls it without the lock); the last one to return destroys it (`finalDestroy`).
+    bool dead = false, finalPending = false;
+    int presents = 0;  // present callbacks in flight (Device::lock)
+    void finalDestroy();
+    // A present callback of this Device returned (Device::lock held; `keep` is the colour image it held, released here, before the device
+    // can go): if the session ended meanwhile the GPU is idle before any such image goes (the host may have queued work inside the callback;
+    // one wait, made by the last callback to return), and that one finishes the destruction vpgles_shutdown left pending. May free `this`
+    // (see retireDevice).
+    // `l` is the lock guard of the caller: the wait for the GPU runs with it released (the host's work may need a thread that needs the lock).
+    void presentReturned(std::shared_ptr<Image>& keep, std::unique_lock<std::recursive_mutex>& l);
+    // Colour images of presents that returned while others of the ended session were still running: released by the last one, after the wait.
+    std::vector<std::shared_ptr<Image>> lateImages;
 
     // Submission serials: the n-th vkQueueSubmit has serial n; `completed` is the highest one whose
     // fence signalled.
@@ -156,6 +178,14 @@ struct Device {
 };
 
 Device* device();  // the process device (null before vpgles_init)
+// Devices of sessions vpgles_shutdown ended, once vpgles_init made another current: freed as soon as no present callback uses them (at
+// vpgles_init, or when the last such callback returns). Device::lock held.
+void retireDevice(Device* old);
+void freeRetiredDevices();
+#ifdef VPGLES_TESTING  // (test builds only: counters for vpgles_test_stat, Device::lock held)
+int devicesFreedCount();
+int devicesRetiredCount();
+#endif
 
 // ---- objects --------------------------------------------------------------------------------------
 struct Buffer {
@@ -668,10 +698,17 @@ public:
     // another context's unsent command buffer is not seen: only that context's flush can send it; GL leaves that ordering to the application.)
     bool gpuWritePending(const BufferStorage& s) const;
     // glBufferSubData over a buffer the GPU has still to write: the bytes (copied to the stream) go in by a GPU copy recorded after the
-    // writes, in order, so the CPU does not wait. False if it cannot (too big for the stream); the caller waits then.
+    // writes, in order, so the CPU does not wait. Done in pieces of kOrderedPiece; false only for a range outside the storage. The staging
+    // of the pieces (this context's command buffer and its submissions in flight) is capped at kMaxStaging: the work recorded so far is
+    // submitted, and the CPU waits for the oldest submission only when what is in flight is still over the cap.
+    static constexpr uint64_t kOrderedPiece = 1ull << 20;
+    static constexpr uint64_t kMaxStaging = 64ull << 20;
     bool updateOrdered(const StorageP& s, uint64_t offset, uint64_t size, const void* data);
-    // A readback is recorded into `s`: flush stamps its gpuWrite with the serial it gets.
-    void noteGpuWrite(const StorageP& s);
+    // A GPU write into `s` is recorded: flush stamps its gpuWrite with the serial it gets. [lo, hi): the bytes of an ordered copy; no range
+    // (a readback, a shader's stores, a buffer copy): any byte.
+    void noteGpuWrite(const StorageP& s, uint64_t lo = 0, uint64_t hi = UINT64_MAX);
+    // A GPU write into `s` that is not complete may write bytes of [lo, hi) (see BufferStorage::orderedWrites).
+    bool gpuWriteOverlaps(const BufferStorage& s, uint64_t lo, uint64_t hi) const;
     // image2D bound to one slice of a 3D texture: Metal cannot view a 3D texture as 2D, so the dispatch works on a 2D
     // copy of the slice (copied in before, back after: syncSlicesBack).
     struct SliceSync {
@@ -893,6 +930,7 @@ private:
         VkDeviceSize used = 0;
     };
     std::vector<Chunk> chunks_;
+    uint64_t stagingBytes() const;  // bytes of stream chunks held by this command buffer and by the submissions in flight (of every context)
     std::vector<std::pair<SamplerParams, VkSampler>> samplerCache_;
     std::vector<bool> samplerCacheMip_;
     std::vector<VkSampler> samplerCacheList_;
@@ -915,6 +953,12 @@ private:
     // The 2D storage view for image2D bound to slice `layer` of a 3D texture (see SliceSync); null when it cannot be had.
     VkImageView sliceView(Texture& t, uint32_t level, GLint layer, GLenum access, VkFormat format);
     bool attribsDirect(Program& p, VertexArray* va);
+    bool wantsProvoke(const Program& p, GLenum mode, bool indexed) const;
+    bool splitsOnRestart(GLenum mode) const;
+    struct IndexPlan {
+        bool scan = true, gpuInPlace = false;
+    };
+    IndexPlan planIndices(GLenum mode, uintptr_t off, uint32_t isz, bool inBuffer, VertexArray* va);
     // glClear / glClearBuffer with a colour or stencil write mask: vkCmdClearAttachments cannot mask channels or bits, so
     // those are a full-target triangle drawn with the mask as the pipeline's write mask (what ANGLE does). `forcedProgram_`
     // is the program graphicsProgram() answers with while that draw is recorded.

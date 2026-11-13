@@ -33,6 +33,7 @@
 
 #include "texdecode.h"
 #include "vpvk.h"
+#include "vpgpu/core/background.h"
 
 using namespace vpvk;
 
@@ -9394,24 +9395,32 @@ void testAsyncPipelines() {
   }
   // 7. vkDestroyPipeline of a pipeline whose job still waits in a busy pool does not deadlock.
   {
-    std::atomic<unsigned> st2{0};
-    std::atomic<bool> rel2{false};
+    // The pool's tasks outlive the vkDestroyPipeline below (they end when `release` is set): their state is shared, not on this stack, and the
+    // section waits for all of them to end.
+    struct Spin {
+      std::atomic<unsigned> started{0}, finished{0};
+      std::atomic<bool> release{false};
+    };
+    const auto spin = std::make_shared<Spin>();
     for (unsigned i = 0; i < nThreads; ++i)
       d->translator->submit(
-          [&] {
-            ++st2;
-            while (!rel2) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+          [spin] {
+            ++spin->started;
+            while (!spin->release) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            ++spin->finished;
           },
           0);
-    for (int i = 0; i < 2000 && st2 < nThreads; ++i) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    for (int i = 0; i < 2000 && spin->started < nThreads; ++i) std::this_thread::sleep_for(std::chrono::milliseconds(1));
     VkPipeline extra = VK_NULL_HANDLE;
     vkCreateGraphicsPipelines(c.dev, VK_NULL_HANDLE, 1, &gp, nullptr, &extra);
-    std::thread opener([&] {
+    std::thread opener([spin] {
       std::this_thread::sleep_for(std::chrono::milliseconds(30));
-      rel2 = true;
+      spin->release = true;
     });
     vkDestroyPipeline(c.dev, extra, nullptr);
     opener.join();
+    for (int i = 0; i < 5000 && spin->finished < nThreads; ++i) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    CHECK(spin->finished == nThreads);
   }
   c.gpu().destroy(soft);
   c.gpu().destroy(hard);
@@ -16288,6 +16297,8 @@ void testAuditRecipeDriftWindow() {
   }
 }
 
+extern "C" void vpvk_test_fordir_hook(void (*)());  // (recipes.cpp, VPVK_TESTING)
+
 // V22: forDir hands the one store of a directory to every device of the process; a device created after the host changed the
 // translator mode (VPVK_AMPLIFY / VPVK_FETCH_NATIVE) translates in the new mode, so what it records is labelled with the new id.
 void testAuditStoreTranslatorMode() {
@@ -16330,6 +16341,25 @@ void testAuditStoreTranslatorMode() {
     RecipeStore reload(dir);  // in the new mode
     CHECK(reload.enabled() && !reload.needsRefresh());
   }
+  {
+    // The mode changes between forDir's first read of it and its lock (a refresh on another thread; the hook runs it right there, on this one).
+    // A stale id written into the live store then stays: what it records is labelled with the old mode and reads as stale in the new one.
+    setenv("VPVK_AMPLIFY", "0", 1);
+    refreshTranslatorMode();
+    std::filesystem::remove(dir + "/recipes.bin");
+    std::shared_ptr<RecipeStore> live = RecipeStore::forDir(dir);
+    vpvk_test_fordir_hook([] {
+      setenv("VPVK_AMPLIFY", "1", 1);
+      refreshTranslatorMode();
+    });
+    std::shared_ptr<RecipeStore> again = RecipeStore::forDir(dir);
+    vpvk_test_fordir_hook(nullptr);
+    CHECK(again == live);
+    CHECK((translatorMode() & 2) != 0);  // (the mode is amplify now)
+    auditAddStage(*again, 9, 100);
+    RecipeStore reload(dir);  // in the new mode
+    CHECK(reload.enabled() && !reload.needsRefresh());
+  }
   if (oldAmp) setenv("VPVK_AMPLIFY", saved.c_str(), 1);
   else unsetenv("VPVK_AMPLIFY");
   refreshTranslatorMode();
@@ -16340,7 +16370,7 @@ void testAuditStoreTranslatorMode() {
 // (VPVK_PIPELINE_DRAW_WAIT_MS, one absolute deadline for the call), so none reaches the backend still compiling while they fit in it. Whole path: vkQueueSubmit -> translate
 // (forceMsaa, pipelineFor) -> runBatches -> awaitFreshVariants. The compiles are slowed (the variants overlap on the workers).
 void testAuditForcedVariantsAwait() {
-  setenv("VPVK_PIPELINE_DRAW_WAIT_MS", "5000", 1);  // (one budget for all the variants of the call: 24 x 200 ms of compiles on the workers fit)
+  setenv("VPVK_PIPELINE_DRAW_WAIT_MS", "5000", 1);  // (one budget for all the variants of the call: the 24 compiles of 200 ms overlap on the workers and fit in 5 s; the default 2 s would send the rest still compiling, draws skipped)
   resetDrawWaitMs();
   vpvk_taa_jitter eyeOnly{0, 64, 64, 0, 0, 0};  // the eye's size: the 64x64 pass of the rig is an eye pass
   vpvk_taa_set_jitter(&eyeOnly);
@@ -16356,7 +16386,7 @@ void testAuditForcedVariantsAwait() {
     VkPipelineLayoutCreateInfo plci{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
     VkPipelineLayout pl;
     vkCreatePipelineLayout(c.dev, &plci, nullptr, &pl);
-    constexpr int kN = 24;  // (more than the workers can compile in one budget at 200 ms each)
+    constexpr int kN = 24;  // (24 x 200 ms = 4.8 s of compile work: the 5 s budget holds it only because the workers overlap the compiles)
     VkPipeline pipes[kN];
     std::set<uint64_t> keys;
     for (int i = 0; i < kN; ++i) {
@@ -16496,6 +16526,296 @@ void testAuditForcedVariantsCap() {
   vpvk_taa_set_jitter(&off);
   unsetenv("VPVK_PIPELINE_DRAW_WAIT_MS");
   resetDrawWaitMs();
+}
+
+// State of the park-window hook (BackgroundGate test build, gpu/core): `action` runs on its own thread when `owner` parks.
+extern "C" void vpgpu_test_park_hook(void (*)(const void*));
+struct ParkWindow {
+  const void* owner = nullptr;
+  std::function<void()> action;
+  std::atomic<bool> ran{false}, done{false};
+  std::thread th;
+} gParkWindow;
+void parkWindowHook(const void* owner) {
+  if (owner != gParkWindow.owner || gParkWindow.ran.exchange(true)) return;
+  gParkWindow.th = std::thread([] { gParkWindow.action(), gParkWindow.done = true; });
+  for (int i = 0; i < 300 && !gParkWindow.done.load(); ++i) std::this_thread::sleep_for(std::chrono::milliseconds(1));  // (with the registry held it cannot finish)
+}
+
+// V25: a host call parked because the app is in the background (BackgroundGate) is parked for the device it will use, and vkDestroyDevice
+// wakes it: it returns (no device) instead of hanging for ever.
+void testAuditParkedHostCall() {
+  // 1. The live device is destroyed while a vpvk_native_submit is parked for it.
+  {
+    std::future<int> result;
+    std::atomic<bool> started{false};
+    {
+      Ctx c;
+      vpgpu::backgroundGate().set(true);
+      result = std::async(std::launch::async, [&] {
+        started = true;
+        const int r = vpvk_native_submit([](void*, void*) {}, nullptr);  // (no native queue on the null platform: it answers 0 either way) parks: the app is in the background
+        return r;
+      });
+      while (!started) std::this_thread::yield();
+      CHECK(result.wait_for(std::chrono::milliseconds(300)) == std::future_status::timeout);  // parked
+    }  // vkDestroyDevice releases the threads parked for this device
+    const bool woke = result.wait_for(std::chrono::seconds(10)) == std::future_status::ready;
+    vpgpu::backgroundGate().set(false);
+    CHECK(woke);
+    if (!woke) dieOnDeadlock("host call parked for a destroyed device");
+    CHECK(result.get() == 0);
+  }
+  // 2. The window between "the thread read the live device" and "it parked": vkDestroyDevice used to release the device in it and nobody woke
+  // the thread afterwards (it parked for a device that was gone, for ever). The call now registers its wait while it still holds the
+  // registry (BackgroundGate::waitForeground with a registry). 2a is deterministic: the gate's park hook (only in the test build of the gate,
+  // linked into this executable) runs vkDestroyDevice in that window, on another thread, and waits for it: with the registry held across
+  // the window the destroy cannot finish until the wait is registered, and the call returns; a driver that dropped the registry first
+  // lets the destroy (and its release) finish inside the window and the call then parks for a device that is gone, for ever (a registry dropped
+  // anywhere before the gate takes its own lock, in the driver or in the gate, fails this every time; the hook is in that lock's statement).
+  {
+    std::future<int> result;
+    std::atomic<bool> started{false};
+    auto c = std::make_unique<Ctx>();
+    gParkWindow.owner = from<Device>(c->dev);
+    gParkWindow.action = [&] { c.reset(); };
+    gParkWindow.ran = false, gParkWindow.done = false;
+    vpgpu_test_park_hook(parkWindowHook);
+    vpgpu::backgroundGate().set(true);
+    result = std::async(std::launch::async, [&] {
+      started = true;
+      return vpvk_native_submit([](void*, void*) {}, nullptr);
+    });
+    while (!started) std::this_thread::yield();
+    const bool woke = result.wait_for(std::chrono::seconds(10)) == std::future_status::ready;
+    vpgpu::backgroundGate().set(false);
+    CHECK(woke);
+    if (!woke) dieOnDeadlock("host call parked for a device destroyed in the park window");
+    CHECK(result.get() == 0);
+    vpgpu_test_park_hook(nullptr);
+    if (gParkWindow.th.joinable()) gParkWindow.th.join();
+    CHECK(gParkWindow.ran.load() && gParkWindow.done.load() && !c);  // (the hook ran and the device is gone: the test is not vacuous)
+  }
+  // 2b. Stress (not deterministic: the interleavings come from the varying spin; 1-4 in 200 lost before the fix). The guarantee is 2a and
+  // the BackgroundGate test in core_tests.
+  for (int i = 0; i < 40; ++i) {
+    std::future<int> result;
+    std::atomic<bool> started{false};
+    bool woke;
+    {
+      Ctx c;
+      vpgpu::backgroundGate().set(true);
+      result = std::async(std::launch::async, [&] {
+        started = true;
+        return vpvk_native_submit([](void*, void*) {}, nullptr);
+      });
+      while (!started) std::this_thread::yield();
+      for (int k = 0, spin = (i * 7919) % 3000; k < spin; ++k) asm volatile("");
+    }
+    woke = result.wait_for(std::chrono::seconds(10)) == std::future_status::ready;
+    vpgpu::backgroundGate().set(false);
+    CHECK(woke);
+    if (!woke) dieOnDeadlock("host call that raced vkDestroyDevice");
+    CHECK(result.get() == 0);
+  }
+  // 3. vkQueueSubmit parks for ITS device (the queue's), not for the live one: destroying another device (the live one) leaves it parked.
+  {
+    Ctx a;
+    std::future<VkResult> result;
+    std::atomic<bool> started{false};
+    {
+      Ctx b;  // the last created: the live device
+      vpgpu::backgroundGate().set(true);
+      result = std::async(std::launch::async, [&] {
+        started = true;
+        return vkQueueSubmit(a.queue, 0, nullptr, VK_NULL_HANDLE);
+      });
+      while (!started) std::this_thread::yield();
+      CHECK(result.wait_for(std::chrono::milliseconds(300)) == std::future_status::timeout);  // parked
+    }  // destroys b
+    const bool early = result.wait_for(std::chrono::milliseconds(300)) == std::future_status::ready;
+    CHECK(!early && vpgpu::backgroundGate().active());  // still parked: another device's destroy did not wake it
+    vpgpu::backgroundGate().set(false);
+    const bool woke = result.wait_for(std::chrono::seconds(10)) == std::future_status::ready;
+    CHECK(woke);
+    if (!woke) dieOnDeadlock("vkQueueSubmit parked for its device");
+    CHECK(result.get() == VK_SUCCESS);
+  }
+}
+
+// A Platform whose backend parks in the background gate holding the submit mutex (gpu/metal2 does in its commit, owner = the backend,
+// not the Device): releaseBackground wakes it, like MetalPlatform's.
+class ParkedBackendPlatform final : public Platform {
+ public:
+  explicit ParkedBackendPlatform(std::unique_ptr<Platform> inner) : inner_(std::move(inner)) {}
+  vpgpu::Backend& backend() override { return inner_->backend(); }
+  void releaseBackground() override {
+    ++released;
+    vpgpu::backgroundGate().release(&token);
+  }
+  int token = 0;
+  std::atomic<unsigned> released{0};
+
+ private:
+  std::unique_ptr<Platform> inner_;
+};
+
+// M3: in the background vkDestroyDevice used to block on the submit mutex for as long as a thread parked inside the backend held it (the
+// app's main thread, which resumes the gate, can be the one destroying). It wakes the backend's parked threads (Platform::releaseBackground)
+// while it waits for the mutex.
+void testAuditDestroyWhileBackendParked() {
+  auto c = std::make_unique<Ctx>();
+  Device* d = from<Device>(c->dev);
+  auto plat = std::make_unique<ParkedBackendPlatform>(std::move(d->platform));
+  ParkedBackendPlatform* p = plat.get();
+  d->platform = std::move(plat);
+  vpgpu::backgroundGate().set(true);
+  const uint64_t blocked0 = vpgpu::backgroundGate().blockedTotal();
+  std::atomic<bool> parkerDone{false};
+  std::thread parker([&] {
+    std::lock_guard<std::mutex> submit(d->submitMutex);  // a submit in progress...
+    vpgpu::backgroundGate().waitForeground(&p->token);   // ...whose commit parks
+    parkerDone = true;
+  });
+  for (int i = 0; i < 5000 && vpgpu::backgroundGate().blockedTotal() == blocked0; ++i) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  CHECK(vpgpu::backgroundGate().blockedTotal() == blocked0 + 1);
+  std::future<void> destroyed = std::async(std::launch::async, [&] { c.reset(); });
+  const bool ok = readyWithin(destroyed, 10000);
+  CHECK(ok);
+  if (!ok) dieOnDeadlock("vkDestroyDevice behind a thread parked in the backend");
+  parker.join();
+  CHECK(parkerDone && vpgpu::backgroundGate().active());  // woken by the destroy, not by the resume
+  vpgpu::backgroundGate().set(false);
+}
+
+// R5: the gate can change WHILE vkDestroyDevice waits for the submit mutex. A vpvk_native_submit holds it; the destroy (from another thread than
+// the one that resumes the app) finds the app in the foreground and waits; then the app goes to the background and the holder's commit parks in
+// the backend with the mutex still taken. The wait for the mutex must follow the gate (wake the backend's parked threads) instead of
+// being a blocking lock decided on the gate's state at its start.
+void testAuditDestroyLockTransition() {
+  auto c = std::make_unique<Ctx>();
+  Device* d = from<Device>(c->dev);
+  auto plat = std::make_unique<ParkedBackendPlatform>(std::move(d->platform));
+  ParkedBackendPlatform* p = plat.get();
+  d->platform = std::move(plat);
+  CHECK(!vpgpu::backgroundGate().active());
+  const uint64_t blocked0 = vpgpu::backgroundGate().blockedTotal();
+  std::atomic<bool> holding{false}, go{false}, parkerDone{false};
+  std::thread parker([&] {
+    std::lock_guard<std::mutex> submit(d->submitMutex);  // a submit in progress, in the foreground...
+    holding = true;
+    while (!go) std::this_thread::yield();
+    vpgpu::backgroundGate().waitForeground(&p->token);   // ...whose commit parks once the app went to the background
+    parkerDone = true;
+  });
+  while (!holding) std::this_thread::yield();
+  std::future<void> destroyed = std::async(std::launch::async, [&] { c.reset(); });
+  CHECK(!readyWithin(destroyed, 300));  // waiting for the mutex, the gate in the foreground
+  vpgpu::backgroundGate().set(true);
+  go = true;
+  const bool ok = readyWithin(destroyed, 10000);
+  vpgpu::backgroundGate().set(false);
+  CHECK(ok);
+  if (!ok) dieOnDeadlock("vkDestroyDevice waiting for the submit mutex when the app went to the background");
+  parker.join();
+  CHECK(parkerDone && vpgpu::backgroundGate().blockedTotal() == blocked0 + 1);
+}
+
+// A Platform with a native queue stand-in (the callback runs at once, like the Metal one under the submit mutex) that also knows the images'
+// textures (vpvk_image_zero_clear needs the host-visible MTLTexture of the pending image).
+class NativeZeroPlatform final : public Platform {
+ public:
+  explicit NativeZeroPlatform(std::unique_ptr<Platform> inner) : inner_(std::move(inner)) {}
+  vpgpu::Backend& backend() override { return inner_->backend(); }
+  void* nativeTexture(vpgpu::TextureId t) override { return reinterpret_cast<void*>(uintptr_t{0x2000} + uintptr_t{t.index} * 16); }
+  bool encodeNative(void (*fn)(void*, void*), void* user) override {
+    submitsAtEncode = backendSubmits();
+    fn(nullptr, user);
+    submitsAfterEncode = backendSubmits();
+    return true;
+  }
+  size_t backendSubmits() {
+    size_t n = 0;
+    for (const std::string& call : static_cast<vpgpu::NullBackend&>(inner_->backend()).calls) n += call.rfind("submit ", 0) == 0;
+    return n;
+  }
+  size_t submitsAtEncode = 0, submitsAfterEncode = 0;
+
+ private:
+  std::unique_ptr<Platform> inner_;
+};
+
+// I3: vpvk_image_zero_clear inside a vpvk_native_submit callback submits nothing (a frame submitted there would run unordered against
+// what the callback encodes, after a head already fenced, and would use up the backend's native-work mark): it queues the image and answers
+// -1; the next vpvk_native_submit clears it in a frame of the queue BEFORE its callback (and so before its native command buffers).
+void testAuditZeroClearInNative() {
+  Ctx c;
+  Device* d = from<Device>(c.dev);
+  auto owner = std::make_unique<NativeZeroPlatform>(std::move(d->platform));
+  NativeZeroPlatform* plat = owner.get();
+  d->platform = std::move(owner);
+  const VkImageUsageFlags usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+  VkImageCreateInfo ii{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+  ii.imageType = VK_IMAGE_TYPE_2D, ii.format = VK_FORMAT_R8G8B8A8_UNORM, ii.extent = {16, 16, 1}, ii.mipLevels = 1, ii.arrayLayers = 2;
+  ii.samples = VK_SAMPLE_COUNT_1_BIT, ii.tiling = VK_IMAGE_TILING_OPTIMAL, ii.usage = usage;
+  VkImage eye = VK_NULL_HANDLE;
+  CHECK(vkCreateImage(c.dev, &ii, nullptr, &eye) == VK_SUCCESS);
+  CHECK(vkBindImageMemory(c.dev, eye, alloc(c, 1 << 20, 1), 0) == VK_SUCCESS);
+  CHECK(vpvk_mark_eye_image(eye) == 1);
+  void* mtl = from<Image>(eye)->native;
+  CHECK(mtl && vpvk_image_zero_pending(mtl) == 1);
+  struct Seen {
+    void* mtl;
+    int clear = -9, pendingIn = -9;
+    size_t submitsIn = 0, submitsFirst = 0;
+    NativeZeroPlatform* plat;
+  } seen{mtl};
+  seen.plat = plat;
+  const uint64_t cleared0 = d->zeroCleared;
+  // 1. Asked for inside a callback: nothing submitted, not cleared, answered -1.
+  CHECK(vpvk_native_submit([](void*, void* user) {
+    Seen& s = *static_cast<Seen*>(user);
+    s.submitsFirst = s.plat->backendSubmits();
+    s.clear = vpvk_image_zero_clear(s.mtl);
+    s.pendingIn = vpvk_image_zero_pending(s.mtl);
+    s.submitsIn = s.plat->backendSubmits();
+  }, &seen) == 1);
+  CHECK(seen.clear == -1 && seen.pendingIn == 1 && seen.submitsIn == seen.submitsFirst);  // no frame submitted from the callback
+  CHECK(plat->submitsAfterEncode == plat->submitsAtEncode);
+  CHECK(d->zeroCleared == cleared0 && vpvk_image_zero_pending(mtl) == 1 && d->zeroClearDeferred.size() == 1);
+  CHECK(vpvk_image_zero_clear(reinterpret_cast<void*>(uintptr_t(0x1234))) == 0);  // unknown, as before
+  // 2. The next native submit clears it first: its callback already sees the image settled, and exactly one frame (the clear) went in
+  // before the callback ran.
+  Seen next{mtl};
+  next.plat = plat;
+  const size_t before = plat->backendSubmits();
+  CHECK(vpvk_native_submit([](void*, void* user) {
+    Seen& s = *static_cast<Seen*>(user);
+    s.pendingIn = vpvk_image_zero_pending(s.mtl);
+    s.submitsIn = s.plat->backendSubmits();
+  }, &next) == 1);
+  CHECK(next.pendingIn == 0 && next.submitsIn == before + 1 && plat->submitsAfterEncode == plat->submitsAtEncode);
+  CHECK(d->zeroCleared == cleared0 + 1 && d->zeroClearDeferred.empty() && d->zeroPending.empty());
+  CHECK(vpvk_image_zero_clear(mtl) == 0);  // settled
+  // 3. The image is settled by a plain call outside a callback as before (returns 1), a request made twice in a callback is queued once, and a queued key whose image went meanwhile is skipped.
+  VkImage eye2 = VK_NULL_HANDLE;
+  CHECK(vkCreateImage(c.dev, &ii, nullptr, &eye2) == VK_SUCCESS);
+  CHECK(vkBindImageMemory(c.dev, eye2, alloc(c, 1 << 20, 1), 0) == VK_SUCCESS);
+  CHECK(vpvk_mark_eye_image(eye2) == 1);
+  void* mtl2 = from<Image>(eye2)->native;
+  CHECK(mtl2 && vpvk_image_zero_pending(mtl2) == 1);
+  Seen twice{mtl2};
+  twice.plat = plat;
+  CHECK(vpvk_native_submit([](void*, void* user) {
+    Seen& s = *static_cast<Seen*>(user);
+    s.clear = vpvk_image_zero_clear(s.mtl);
+    s.pendingIn = vpvk_image_zero_clear(s.mtl);
+  }, &twice) == 1);
+  CHECK(twice.clear == -1 && twice.pendingIn == -1 && d->zeroClearDeferred.size() == 1);  // (queued once)
+  CHECK(vpvk_image_zero_clear(mtl2) == 1);  // cleared outside the callback: the queued key is left stale
+  const size_t submits = plat->backendSubmits();
+  CHECK(vpvk_native_submit([](void*, void*) {}, nullptr) == 1);
+  CHECK(d->zeroClearDeferred.empty() && plat->submitsAtEncode == submits);  // nothing left to clear: no frame before the callback
 }
 
 // V24: RELEASE_RESOURCES every frame costs next to nothing (engines pass the bit on each reset), a reset never waits for the submit mutex
@@ -17023,7 +17343,7 @@ int main(int argc, char** argv) {
       {"quest_gpu_name", testQuestGpuName}, {"native_identity", testNativeIdentity}, {"inline_uniform", testInlineUniformBlock}, {"bda", testBufferDeviceAddress}, {"ycbcr", testYcbcr},
       {"taa_native", testTaaNative}, {"taa_eye_depth", testTaaEyeDepth}, {"taa_uimask", testTaaUiMask}, {"msaa_force", testMsaaForce}, {"depth_tile", testDepthTile}, {"depth_tile_off", testDepthTileOff}, {"d24_emul", testD24Emul}, {"prewarm_variants", testPrewarmVariants}, {"msaa_force_marked", testMsaaForceMarkedEye}, {"aot", testAot}, {"aniso", testAniso}, {"zeroinit", testZeroInit}, {"archive_index", testArchiveIndex}, {"foveation", testFoveation},
       {"stage_keys", testStageKeys}, {"async_pipelines", testAsyncPipelines}, {"sync_pipelines", testSyncPipelines}, {"create_default", testCreateDefault}, {"pso_census", testPsoCensus}, {"cache_state", testCacheState}, {"hide_mesh", testHideMesh}, {"pass_drop", testPassDrop}, {"skip_reasons", testSkipReasons}, {"diag_census", testDiagCensus}, {"pass_dump", testPassDump}, {"indirect_patch", testIndirectPatch}, {"astc3d", testAstc3d},
-      {"perf", testPerf}, {"phase1b", testPhase1b}, {"suspend_resume", testSuspendResume}, {"translator_modes", testTranslatorModes}, {"capture", testCapture}, {"capture_images", testCaptureImages}, {"capture_hooks", testCaptureHooks}, {"capture_codec", testCaptureCodec}, {"capture_env", testCaptureEnv}, {"capture_pools", testCapturePools}, {"capture_host_frames", testCaptureHostFrames}, {"capture_corrupt", testCaptureCorrupt}, {"capture_env_host", testCaptureEnvHost}, {"capture_env_dir", testCaptureEnvDir}, {"capture_devices", testCaptureDevices}, {"capture_unhooked", testCaptureUnhooked}, {"capture_budget", testCaptureBudget}, {"capture_locks", testCaptureLocks}, {"audit_vk_timeline", testAuditTimelinePending}, {"audit_vk_live", testAuditLiveDevice}, {"audit_vk_recipes", testAuditRecipes}, {"audit_vk_devices", testAuditTwoDevices}, {"audit_vk_arena", testAuditArena}, {"audit_vk_variant", testAuditForcedVariant}, {"audit_vk_submitlog", testAuditSubmitLog}, {"audit_vk_sources", testAuditSources}, {"audit_vk_free", testAuditFreeOrder}, {"audit_vk_sets", testAuditSetStorage}, {"audit_vk_rewrite", testAuditRecipeRewrite}, {"audit_vk_reserve", testAuditArenaReserve}, {"audit_vk_lockorder", testAuditLockOrder}, {"audit_vk_nofile", testAuditRecipeNoFile}, {"audit_vk_drift", testAuditRecipeDriftWindow}, {"audit_vk_mode", testAuditStoreTranslatorMode}, {"audit_vk_await", testAuditForcedVariantsAwait}, {"audit_vk_moved", testAuditRefreshFileMoved}, {"audit_vk_awaitcap", testAuditForcedVariantsCap}, {"audit_vk_release", testAuditReleaseCost}, {"audit_vk_fov", testAuditFovMapCache}, {"audit_vk_linear", testAuditLinearSync}, {"audit_vk_inputs", testAuditInputsResident}, {"audit_vk_classes", testAuditClassCache}, {"audit_vk_batch", testAuditCapturePartialBatch}, {"audit_vk", [] { testAuditTimelinePending(); testAuditLiveDevice(); testAuditRecipes(); testAuditTwoDevices(); testAuditArena(); testAuditForcedVariant(); testAuditSubmitLog(); testAuditSources(); testAuditFreeOrder(); testAuditSetStorage(); testAuditRecipeRewrite(); testAuditArenaReserve(); testAuditLockOrder(); testAuditRecipeNoFile(); testAuditRecipeDriftWindow(); testAuditStoreTranslatorMode(); testAuditForcedVariantsAwait(); testAuditRefreshFileMoved(); testAuditForcedVariantsCap(); testAuditReleaseCost(); testAuditFovMapCache(); testAuditLinearSync(); testAuditInputsResident(); testAuditClassCache(); testAuditCapturePartialBatch(); }}, {"png", testPng}, {"imgdiff", testImgDiff}, {"replay", testReplay}, {"replay_lvp", testReplayLvp}, {"refcaps", testRefCaps}};
+      {"perf", testPerf}, {"phase1b", testPhase1b}, {"suspend_resume", testSuspendResume}, {"translator_modes", testTranslatorModes}, {"capture", testCapture}, {"capture_images", testCaptureImages}, {"capture_hooks", testCaptureHooks}, {"capture_codec", testCaptureCodec}, {"capture_env", testCaptureEnv}, {"capture_pools", testCapturePools}, {"capture_host_frames", testCaptureHostFrames}, {"capture_corrupt", testCaptureCorrupt}, {"capture_env_host", testCaptureEnvHost}, {"capture_env_dir", testCaptureEnvDir}, {"capture_devices", testCaptureDevices}, {"capture_unhooked", testCaptureUnhooked}, {"capture_budget", testCaptureBudget}, {"capture_locks", testCaptureLocks}, {"audit_vk_timeline", testAuditTimelinePending}, {"audit_vk_live", testAuditLiveDevice}, {"audit_vk_recipes", testAuditRecipes}, {"audit_vk_devices", testAuditTwoDevices}, {"audit_vk_arena", testAuditArena}, {"audit_vk_variant", testAuditForcedVariant}, {"audit_vk_submitlog", testAuditSubmitLog}, {"audit_vk_sources", testAuditSources}, {"audit_vk_free", testAuditFreeOrder}, {"audit_vk_sets", testAuditSetStorage}, {"audit_vk_rewrite", testAuditRecipeRewrite}, {"audit_vk_reserve", testAuditArenaReserve}, {"audit_vk_lockorder", testAuditLockOrder}, {"audit_vk_nofile", testAuditRecipeNoFile}, {"audit_vk_drift", testAuditRecipeDriftWindow}, {"audit_vk_mode", testAuditStoreTranslatorMode}, {"audit_vk_await", testAuditForcedVariantsAwait}, {"audit_vk_moved", testAuditRefreshFileMoved}, {"audit_vk_awaitcap", testAuditForcedVariantsCap}, {"audit_vk_release", testAuditReleaseCost}, {"audit_vk_park", testAuditParkedHostCall}, {"audit_vk_destroyparked", testAuditDestroyWhileBackendParked}, {"audit_vk_locktrans", testAuditDestroyLockTransition}, {"audit_vk_zeroclear", testAuditZeroClearInNative}, {"audit_vk_fov", testAuditFovMapCache}, {"audit_vk_linear", testAuditLinearSync}, {"audit_vk_inputs", testAuditInputsResident}, {"audit_vk_classes", testAuditClassCache}, {"audit_vk_batch", testAuditCapturePartialBatch}, {"audit_vk", [] { testAuditTimelinePending(); testAuditLiveDevice(); testAuditRecipes(); testAuditTwoDevices(); testAuditArena(); testAuditForcedVariant(); testAuditSubmitLog(); testAuditSources(); testAuditFreeOrder(); testAuditSetStorage(); testAuditRecipeRewrite(); testAuditArenaReserve(); testAuditLockOrder(); testAuditRecipeNoFile(); testAuditRecipeDriftWindow(); testAuditStoreTranslatorMode(); testAuditForcedVariantsAwait(); testAuditRefreshFileMoved(); testAuditForcedVariantsCap(); testAuditReleaseCost(); testAuditParkedHostCall(); testAuditDestroyWhileBackendParked(); testAuditDestroyLockTransition(); testAuditZeroClearInNative(); testAuditFovMapCache(); testAuditLinearSync(); testAuditInputsResident(); testAuditClassCache(); testAuditCapturePartialBatch(); }}, {"png", testPng}, {"imgdiff", testImgDiff}, {"replay", testReplay}, {"replay_lvp", testReplayLvp}, {"refcaps", testRefCaps}};
   bool ran = false;
   for (const auto& [name, fn] : groups) {
     if (argc > 1 && std::strcmp(argv[1], name) != 0) continue;

@@ -20,7 +20,18 @@ if(NOT MSVC)
 endif()
 
 if(BUILD_TESTING OR NOT DEFINED BUILD_TESTING)
-  add_executable(vpgpu_core_tests tests/core_tests.cpp)
+  # The test hook of BackgroundGate::park (vpgpu_test_park_hook) exists only in this build of background.cpp (VPGPU_BACKGROUND_TESTING). Its
+  # objects go on the link line of the test executables (core, gpu/vulkan), so they win over the same symbols in vpgpu_core; the library
+  # that ships is built without the define.
+  add_library(vpgpu_core_bgtest OBJECT src/background.cpp)
+  target_include_directories(vpgpu_core_bgtest PUBLIC include)
+  target_compile_features(vpgpu_core_bgtest PUBLIC cxx_std_20)
+  target_compile_definitions(vpgpu_core_bgtest PRIVATE VPGPU_BACKGROUND_TESTING)
+  set_target_properties(vpgpu_core_bgtest PROPERTIES POSITION_INDEPENDENT_CODE ON)
+  if(NOT MSVC)
+    target_compile_options(vpgpu_core_bgtest PRIVATE -Wall -Wextra)
+  endif()
+  add_executable(vpgpu_core_tests tests/core_tests.cpp $<TARGET_OBJECTS:vpgpu_core_bgtest>)
   target_link_libraries(vpgpu_core_tests PRIVATE vpgpu_core)
   if(NOT MSVC)
     target_compile_options(vpgpu_core_tests PRIVATE -Wall -Wextra)

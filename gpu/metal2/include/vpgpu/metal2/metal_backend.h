@@ -159,6 +159,9 @@ class MetalBackend final : public Backend {
   std::string lostReason() const;
   // Age in ms of the oldest in-flight frame command buffer (0 when idle): the GPU's backlog. Any thread.
   uint32_t gpuBacklogMs() const;
+  // Wakes the threads of this backend parked in the background gate (a commit under the caller's submit mutex): vkDestroyDevice needs
+  // that mutex before it destroys the backend. Any thread, repeatable; a later pause parks again.
+  void releaseBackground();
   // Hang-split cuts (attachments stored and reloaded mid-encoder) in the newest submitted frame. Any thread.
   uint32_t lastFrameHangSplits() const;
   // Client work outside the frame model (VPVulkan's vpvk_native_submit: the VPKTAA resolve). Makes

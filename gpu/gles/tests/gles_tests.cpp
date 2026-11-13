@@ -8,6 +8,7 @@
 #include <dlfcn.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <atomic>
 #include <filesystem>
 #include <cstdio>
@@ -19,6 +20,7 @@
 #include <fstream>
 #include <functional>
 #include <map>
+#include <mutex>
 #include <set>
 #include <sstream>
 #include <string>
@@ -41,6 +43,7 @@ void (*vpgles_flush)(int);
 
 size_t gBigNews = 0;  // allocations of 64 KiB or more while armed (the replacement operator new at the end; testAudit2Upload)
 bool gBigNewArmed = false;
+thread_local bool gFailLateNew = false;  // audit9_presents: the next 16-byte operator new of this thread throws bad_alloc (one shared_ptr, as a lateImages push_back would make)
 
 namespace {
 
@@ -331,7 +334,9 @@ VKAPI_ATTR VkResult VKAPI_CALL myWaitForFences(VkDevice d, uint32_t n, const VkF
     if (n == 1 && f[0] != VK_NULL_HANDLE && f[0] == slowFence) slowFence = VK_NULL_HANDLE;  // it finishes when waited for
     return realWaitForFences(d, n, f, all, timeout);
 }
+void orderNote(char c);
 VKAPI_ATTR VkResult VKAPI_CALL myQueueSubmit(VkQueue q, uint32_t n, const VkSubmitInfo* si, VkFence f) {
+    orderNote('Q');
     ++submits;
     if (markSubmit == 1) slowFence = f;
     else if (markSubmit == 2) stuckFence = f;
@@ -344,9 +349,10 @@ VKAPI_ATTR void VKAPI_CALL myBindIndexBuffer(VkCommandBuffer c, VkBuffer b, VkDe
 }
 std::map<VkBuffer, VkDeviceSize> bufferSizes;  // size of every buffer the layer created
 int bigBuffersDestroyed = 0;                    // ... of the 4 MiB ones (streaming chunks) destroyed
+uint64_t gLiveBufferBytes = 0, gPeakBufferBytes = 0;  // bytes of the buffers alive now / at most since the test reset the peak
 VKAPI_ATTR void VKAPI_CALL myDestroyBuffer(VkDevice d, VkBuffer b, const VkAllocationCallbacks* a) {
     ++buffersDestroyed;
-    if (auto it = bufferSizes.find(b); it != bufferSizes.end()) bigBuffersDestroyed += it->second >= (4u << 20), bufferSizes.erase(it);
+    if (auto it = bufferSizes.find(b); it != bufferSizes.end()) gLiveBufferBytes -= it->second, bigBuffersDestroyed += it->second >= (4u << 20), bufferSizes.erase(it);
     bufferUsages.erase(b);
     realDestroyBuffer(d, b, a);
 }
@@ -356,7 +362,10 @@ VKAPI_ATTR VkResult VKAPI_CALL myCreateBuffer(VkDevice d, const VkBufferCreateIn
     ++calls.buffersCreated;
     if (ci->size >= (4u << 20)) ++bigBuffersCreated;
     const VkResult r = realCreateBuffer(d, ci, a, out);
-    if (r == VK_SUCCESS) bufferUsages[*out] = ci->usage, bufferSizes[*out] = ci->size;
+    if (r == VK_SUCCESS) {
+        bufferUsages[*out] = ci->usage, bufferSizes[*out] = ci->size;
+        gLiveBufferBytes += ci->size, gPeakBufferBytes = std::max(gPeakBufferBytes, gLiveBufferBytes);
+    }
     return r;
 }
 
@@ -413,9 +422,65 @@ VKAPI_ATTR VkResult VKAPI_CALL myAllocSets(VkDevice d, const VkDescriptorSetAllo
     ++calls.allocSets;
     return realAllocSets(d, ai, out);
 }
+// (dstOffset, size) of every vkCmdCopyBuffer region while gCopyLog is on. Known limit: the null backend does not execute the copies, so the
+// tests using this check which regions were recorded (offsets, sizes, order), NOT that the bytes the ordered copies move are the right ones.
+std::vector<std::pair<VkDeviceSize, VkDeviceSize>> gCopyRegions;
+bool gCopyLog = false;
 VKAPI_ATTR void VKAPI_CALL myCopyBuffer(VkCommandBuffer c, VkBuffer s, VkBuffer d, uint32_t n, const VkBufferCopy* r) {
     ++calls.copyBuffer;
+    if (gCopyLog)
+        for (uint32_t i = 0; i < n; ++i) gCopyRegions.push_back({r[i].dstOffset, r[i].size});
     realCopyBuffer(c, s, d, n, r);
+}
+// Destruction order seen by the driver (audit8): W = vkDeviceWaitIdle, I = vkDestroyImage, M = vkFreeMemory, D = vkDestroyDevice (logged while
+// gOrderOn; the calls come from several threads). gDeviceDestroys counts vkDestroyDevice always.
+PFN_vkDeviceWaitIdle realWaitIdle;
+PFN_vkDestroyImage realDestroyImage;
+PFN_vkFreeMemory realFreeMemory;
+PFN_vkDestroyDevice realDestroyDevice;
+std::mutex gOrderMu;
+std::string gOrder;
+std::atomic<bool> gOrderOn{false};
+std::atomic<int> gDeviceDestroys{0};
+void orderNote(char c) {
+    if (!gOrderOn) return;
+    std::lock_guard<std::mutex> l(gOrderMu);
+    if (gOrder.size() < (1u << 16)) gOrder.push_back(c);
+}
+// audit9_presents: while set, a vkDeviceWaitIdle starts a thread that takes the layer's global lock (vpgles_device) and reports whether it got it
+// within 300 ms: the wait for the GPU must not hold the lock a host thread (or the callback of another present) may need.
+std::atomic<bool> gProbeIdleLock{false};
+std::shared_ptr<std::atomic<int>> gIdleProbe;
+std::atomic<int> gIdleLockFree{-1};  // 1: the other thread got the lock while the wait ran, 0: it did not, -1: no wait probed
+void (*gProbeFn)(void**, void**, void**, void**) = nullptr;
+VKAPI_ATTR VkResult VKAPI_CALL myWaitIdle(VkDevice d) {
+    orderNote('W');
+    if (gProbeIdleLock.exchange(false)) {
+        auto done = std::make_shared<std::atomic<int>>(0);
+        gIdleProbe = done;
+        auto fn = gProbeFn;
+        std::thread([done, fn] {
+            void* dev = nullptr;
+            fn(nullptr, nullptr, &dev, nullptr);
+            *done = 1;
+        }).detach();  // (not joined: with the lock held by this very thread it would never finish)
+        for (int i = 0; i < 300 && !*done; ++i) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        gIdleLockFree = *done ? 1 : 0;
+    }
+    return realWaitIdle(d);
+}
+VKAPI_ATTR void VKAPI_CALL myDestroyImage(VkDevice d, VkImage i, const VkAllocationCallbacks* a) {
+    orderNote('I');
+    realDestroyImage(d, i, a);
+}
+VKAPI_ATTR void VKAPI_CALL myFreeMemory(VkDevice d, VkDeviceMemory m, const VkAllocationCallbacks* a) {
+    orderNote('M');
+    realFreeMemory(d, m, a);
+}
+VKAPI_ATTR void VKAPI_CALL myDestroyDevice(VkDevice d, const VkAllocationCallbacks* a) {
+    orderNote('D');
+    ++gDeviceDestroys;
+    realDestroyDevice(d, a);
 }
 
 PFN_vkVoidFunction intercept(const char* name, PFN_vkVoidFunction real) {
@@ -464,6 +529,10 @@ PFN_vkVoidFunction intercept(const char* name, PFN_vkVoidFunction real) {
     I("vkCmdBindVertexBuffers", myBindVertex, realBindVertex)
     I("vkAllocateDescriptorSets", myAllocSets, realAllocSets)
     I("vkCmdCopyBuffer", myCopyBuffer, realCopyBuffer)
+    I("vkDeviceWaitIdle", myWaitIdle, realWaitIdle)
+    I("vkDestroyImage", myDestroyImage, realDestroyImage)
+    I("vkFreeMemory", myFreeMemory, realFreeMemory)
+    I("vkDestroyDevice", myDestroyDevice, realDestroyDevice)
 #undef I
     return real;
 }
@@ -3661,7 +3730,6 @@ void testEs31() {
         G(glCreateShader, GLuint (*)(GLenum));
         G(glShaderSource, void (*)(GLuint, GLsizei, const char* const*, const GLint*));
         G(glCompileShader, void (*)(GLuint));
-        G(glGetShaderiv, void (*)(GLuint, GLenum, GLint*));
         G(glCreateProgram, GLuint (*)());
         G(glAttachShader, void (*)(GLuint, GLuint));
         G(glLinkProgram, void (*)(GLuint));
@@ -4569,7 +4637,6 @@ void testUbo() {
     G(glUseProgram, void (*)(GLuint));
     G(glVertexAttribPointer, void (*)(GLuint, GLint, GLenum, GLboolean, GLsizei, const void*));
     G(glEnableVertexAttribArray, void (*)(GLuint));
-    G(glBindAttribLocation, void (*)(GLuint, GLuint, const char*));
     G(glDrawArrays, void (*)(GLenum, GLint, GLsizei));
     GLuint vb;
     glGenBuffers(1, &vb);
@@ -5291,7 +5358,6 @@ void testAuditCalls() {
     G(glDeleteProgram, void (*)(GLuint));
     G(glReadPixels, void (*)(GLint, GLint, GLsizei, GLsizei, GLenum, GLenum, void*));
     G(glUseProgram, void (*)(GLuint));
-    G(eglWaitGL, uint32_t (*)());
     watchdog(60);
     settle();
 
@@ -5507,7 +5573,8 @@ void testAuditCompile() {
     Egl e;
     CHECK(e.up());
     G(glGetError, GLenum (*)());
-    watchdog(60);
+    watchdog(120);
+    for (int depth = 40;; depth += 2) {
     std::atomic<bool> ready{false}, compiling{false}, done{false};
     std::atomic<long> during{0};
     std::atomic<long> compileUs{0};
@@ -5520,8 +5587,8 @@ void testAuditCompile() {
         if (!f.up()) return void(done = true);
         // A macro that doubles at each of 40 levels: the preprocessor walks a million tokens, then the compile fails (a slow one).
         std::string src = "#define M0 x\n";
-        for (int i = 1; i <= 40; ++i) src += "#define M" + std::to_string(i) + " M" + std::to_string(i - 1) + " M" + std::to_string(i - 1) + "\n";
-        src += "void main() { float x = 1.0; M40 }\n";
+        for (int i = 1; i <= depth; ++i) src += "#define M" + std::to_string(i) + " M" + std::to_string(i - 1) + " M" + std::to_string(i - 1) + "\n";
+        src += "void main() { float x = 1.0; M" + std::to_string(depth) + " }\n";
         const GLuint sh = glCreateShader(gl::VERTEX_SHADER);
         const char* p = src.c_str();
         glShaderSource(sh, 1, &p, nullptr);
@@ -5544,8 +5611,14 @@ void testAuditCompile() {
         std::this_thread::sleep_for(std::chrono::microseconds(100));  // (a spinning caller would starve the compile of the lock)
     }
     t.join();
-    CHECK(compileUs > 20000);  // (a compile too short to tell)
-    CHECK(during > std::max<long>(20, compileUs / 100 / 5));  // (a compile that held the lock lets through only the call that was waiting)
+    // `during` counts calls that returned while the compile was still running: a compile that held the lock lets through at most the one call
+    // already past the lock check. A compile too short for even a free lock to show 5 calls is inconclusive (not a failure): it is repeated
+    // with a longer one (macro depth), and only a long compile with few calls through fails.
+    if (during < 5 && compileUs < 30000 && depth < 46) continue;
+    CHECK(compileUs >= 30000);
+    CHECK(during >= 5);
+    break;
+    }
     alarm(0);
     e.down();
 }
@@ -5997,7 +6070,6 @@ void testAudit2Pbo() {
     SteadyKit k;
     k.up();
     G(glDrawArrays, void (*)(GLenum, GLint, GLsizei));
-    G(glFlush, void (*)());
     G(glFinish, void (*)());
     G(glGenBuffers, void (*)(GLsizei, GLuint*));
     G(glBindBuffer, void (*)(GLenum, GLuint));
@@ -6120,7 +6192,6 @@ void testAudit2Egl() {
     G(eglCreatePbufferSurface, void* (*)(void*, void*, const EGLint*));
     G(eglMakeCurrent, uint32_t (*)(void*, void*, void*, void*));
     G(eglTerminate, uint32_t (*)(void*));
-    G(eglInitialize, uint32_t (*)(void*, EGLint*, EGLint*));
     G(eglGetError, EGLint (*)());
     G(eglCreateSyncKHR, void* (*)(void*, uint32_t, const EGLint*));
     G(eglDestroySyncKHR, uint32_t (*)(void*, void*));
@@ -6631,7 +6702,6 @@ void testAudit4XferOwnPass() {
     SteadyKit ka;
     ka.up();
     G(glDrawArrays, void (*)(GLenum, GLint, GLsizei));
-    G(glFlush, void (*)());
     G(glFinish, void (*)());
     G(glGenTextures, void (*)(GLsizei, GLuint*));
     G(glBindTexture, void (*)(GLenum, GLuint));
@@ -6879,7 +6949,6 @@ void audit5PerfImpl(int kind, int how) {  // kind: 0 UBO, 1 readonly SSBO, 2 SSB
     G(glUnmapBuffer, GLboolean (*)(GLenum));
     G(glUseProgram, void (*)(GLuint));
     G(glDrawArrays, void (*)(GLenum, GLint, GLsizei));
-    G(glUniformBlockBinding, void (*)(GLuint, GLuint, GLuint));
     watchdog(60);
     const char* vs = "#version 310 es\nvoid main(){ gl_Position = vec4(float(gl_VertexID)-1.0, 0.0, 0.0, 1.0); }\n";
     const char* fsS = "#version 310 es\nprecision highp float;\nlayout(std430, binding = 0) readonly buffer B { vec4 c[16]; };\nout vec4 o;\nvoid main(){ o = c[3]; }\n";
@@ -7309,7 +7378,6 @@ void audit5IndexInPlace() {
     G(glGenBuffers, void (*)(GLsizei, GLuint*));
     G(glBindBuffer, void (*)(GLenum, GLuint));
     G(glBufferData, void (*)(GLenum, GLsizeiptr, const void*, GLenum));
-    G(glBufferSubData, void (*)(GLenum, GLintptr, GLsizeiptr, const void*));
     G(glCopyBufferSubData, void (*)(GLenum, GLenum, GLintptr, GLintptr, GLsizeiptr));
     G(glDrawElements, void (*)(GLenum, GLsizei, GLenum, const void*));
     G(glDrawArrays, void (*)(GLenum, GLint, GLsizei));
@@ -7345,9 +7413,12 @@ void audit5PassSplit() {
     G(glDrawArrays, void (*)(GLenum, GLint, GLsizei));
     watchdog(60);
     const char* vs = "#version 310 es\nvoid main(){ gl_Position = vec4(float(gl_VertexID)-1.0, 0.0, 0.0, 1.0); }\n";
-    for (int ro = 0; ro < 2; ++ro) {
-        const char* fsS = ro ? "#version 310 es\nprecision highp float;\nlayout(std430, binding = 0) readonly buffer B { vec4 c[16]; };\nout vec4 o;\nvoid main(){ o = c[3]; }\n"
-                             : "#version 310 es\nprecision highp float;\nlayout(std430, binding = 0) buffer B { vec4 c[16]; };\nout vec4 o;\nvoid main(){ o = c[3]; }\n";
+    // mode 0: declared readonly; 1: not declared but only read (no l-value on it); 2: written by the shader (it must still cut the pass).
+    int passesByMode[3] = {}, buffersByMode[3] = {};
+    for (int mode = 0; mode < 3; ++mode) {
+        const char* fsS = mode == 0 ? "#version 310 es\nprecision highp float;\nlayout(std430, binding = 0) readonly buffer B { vec4 c[16]; };\nout vec4 o;\nvoid main(){ o = c[3]; }\n"
+                        : mode == 1 ? "#version 310 es\nprecision highp float;\nlayout(std430, binding = 0) buffer B { vec4 c[16]; };\nout vec4 o;\nvoid main(){ o = c[3]; }\n"
+                                    : "#version 310 es\nprecision highp float;\nlayout(std430, binding = 0) buffer B { vec4 c[16]; };\nout vec4 o;\nvoid main(){ c[2] = vec4(1.0); o = c[3]; }\n";
         const GLuint p = program(vs, fsS);
         glUseProgram(p);
         GLuint b;
@@ -7363,12 +7434,16 @@ void audit5PassSplit() {
             for (int obj = 0; obj < 20; ++obj) { glBufferSubData(kSSBO, 16, 64, data.data()); glDrawArrays(gl::TRIANGLES, 0, 3); }
             vpgles_flush(0);
         }
-        std::printf("  SSBO only READ by the shader, %s: 10 frames x 20 (partial update + draw): passes=%d copies=%d submits=%d waits=%d buffersCreated=%d trace[0..60]=%s\n",
-                    ro ? "declared readonly" : "NOT declared readonly", counts.passes, int(calls.copyBuffer), submits - s0, int(calls.waits), int(calls.buffersCreated), gTrace.substr(0, 60).c_str());
-        if (ro) CHECK(counts.passes <= 12);
-        else CHECK(counts.passes <= 12);  // a block the shader only reads (no l-value on it) is as readonly as a declared one: updates do not cut the pass
+        passesByMode[mode] = counts.passes;
+        buffersByMode[mode] = int(calls.buffersCreated);
+        std::printf("  mode %d (%s): 10 frames x 20 (partial update + draw): passes=%d copies=%d submits=%d waits=%d buffersCreated=%d\n", mode,
+                    mode == 0 ? "readonly" : mode == 1 ? "undeclared, only read" : "WRITTEN by the shader", counts.passes, int(calls.copyBuffer), submits - s0, int(calls.waits), int(calls.buffersCreated));
         settle();
     }
+    CHECK(buffersByMode[0] <= 200 && buffersByMode[1] <= 200);  // at most one new storage per partial update (small buffers rename: no pass cut, 256 B each)
+    CHECK(passesByMode[0] <= 12);
+    CHECK(passesByMode[1] <= 12);  // a block the shader only reads is as readonly as a declared one: updates do not cut the pass
+    CHECK(passesByMode[2] > 3 * passesByMode[1] && passesByMode[2] >= 100);  // a block the shader writes: each update after a draw still cuts it
     alarm(0);
     a.down();
 }
@@ -7387,6 +7462,430 @@ void audit5AfterShutdown() {
     const EGLint ierr = eglGetError();
     std::printf("  eglInitialize after vpgles_shutdown (no vpgles_init) = %u err=%#x\n", i, ierr); std::fflush(stdout);
     CHECK(i == 0 && ierr == 0x3001 /*EGL_NOT_INITIALIZED*/);  // the Device is dead: nothing may be made on it
+    alarm(0);
+}
+
+// A big buffer (>= 4 MiB) read by earlier draws of the open pass: a partial update does not allocate and copy the whole buffer each time.
+void audit7BigSubData() {
+    Egl a; CHECK(a.up());
+    G(glGenBuffers, void (*)(GLsizei, GLuint*));
+    G(glBindBuffer, void (*)(GLenum, GLuint));
+    G(glBindBufferBase, void (*)(GLenum, GLuint, GLuint));
+    G(glBufferData, void (*)(GLenum, GLsizeiptr, const void*, GLenum));
+    G(glBufferSubData, void (*)(GLenum, GLintptr, GLsizeiptr, const void*));
+    G(glUseProgram, void (*)(GLuint));
+    G(glDrawArrays, void (*)(GLenum, GLint, GLsizei));
+    watchdog(60);
+    const char* vs = "#version 310 es\nvoid main(){ gl_Position = vec4(float(gl_VertexID)-1.0, 0.0, 0.0, 1.0); }\n";
+    const char* fs = "#version 310 es\nprecision highp float;\nlayout(std430, binding = 0) readonly buffer B { vec4 c[16]; };\nout vec4 o;\nvoid main(){ o = c[3]; }\n";
+    glUseProgram(program(vs, fs));
+    GLuint b;
+    glGenBuffers(1, &b);
+    glBindBuffer(kSSBO, b);
+    std::vector<float> big(2u << 20, 1.0f);  // 8 MiB
+    glBufferData(kSSBO, GLsizeiptr(big.size() * 4), big.data(), gl::DYNAMIC_DRAW);
+    glBindBufferBase(kSSBO, 0, b);
+    settle();
+    resetCalls();
+    for (int i = 0; i < 20; ++i) { glBufferSubData(kSSBO, 16, 64, big.data()); glDrawArrays(gl::TRIANGLES, 0, 3); }
+    std::printf("  8 MiB SSBO, 20 x (partial update + draw): buffersCreated=%d copies=%d\n", int(calls.buffersCreated), int(calls.copyBuffer));
+    CHECK(calls.buffersCreated <= 1);  // (one stream chunk; copy on write would have allocated and copied 8 MiB, 19 times)
+    CHECK(calls.copyBuffer >= 19);
+    vpgles_flush(0);
+    settle();
+    alarm(0);
+    a.down();
+}
+
+// The same big buffer with a small partial update first and a >1 MiB one after it, every frame: the big one goes in by GPU copies too (pieces of
+// at most 1 MiB, in order), the CPU never waits for the GPU (it used to flush and wait at every frame once a small update had left a GPU write
+// pending, and the 2 MiB one was refused by the ordered path).
+void audit8MixedSubData() {
+    Egl a; CHECK(a.up());
+    G(glGenBuffers, void (*)(GLsizei, GLuint*));
+    G(glBindBuffer, void (*)(GLenum, GLuint));
+    G(glBindBufferBase, void (*)(GLenum, GLuint, GLuint));
+    G(glBufferData, void (*)(GLenum, GLsizeiptr, const void*, GLenum));
+    G(glBufferSubData, void (*)(GLenum, GLintptr, GLsizeiptr, const void*));
+    G(glUseProgram, void (*)(GLuint));
+    G(glDrawArrays, void (*)(GLenum, GLint, GLsizei));
+    watchdog(60);
+    const char* vs = "#version 310 es\nvoid main(){ gl_Position = vec4(float(gl_VertexID)-1.0, 0.0, 0.0, 1.0); }\n";
+    // (an unsized array: the shader may read any byte of the buffer, so every update lands on bytes the open pass reads)
+    const char* fs = "#version 310 es\nprecision highp float;\nlayout(std430, binding = 0) readonly buffer B { vec4 c[]; };\nout vec4 o;\nvoid main(){ o = c[3]; }\n";
+    glUseProgram(program(vs, fs));
+    GLuint b;
+    glGenBuffers(1, &b);
+    glBindBuffer(kSSBO, b);
+    std::vector<float> big(2u << 20, 1.0f);  // 8 MiB
+    glBufferData(kSSBO, GLsizeiptr(big.size() * 4), big.data(), gl::DYNAMIC_DRAW);
+    glBindBufferBase(kSSBO, 0, b);
+    settle();
+    resetCalls();
+    gCopyRegions.clear();
+    gCopyLog = true;
+    constexpr int kFrames = 5;
+    constexpr GLintptr kBigOff = 4096;
+    constexpr GLsizeiptr kBig = 2 << 20;
+    for (int f = 0; f < kFrames; ++f) {
+        glDrawArrays(gl::TRIANGLES, 0, 3);
+        glBufferSubData(kSSBO, 16, 256, big.data());
+        glDrawArrays(gl::TRIANGLES, 0, 3);
+        glBufferSubData(kSSBO, kBigOff, kBig, big.data());
+    }
+    gCopyLog = false;
+    std::printf("  8 MiB SSBO, %d x (draw, 256 B update, draw, 2 MiB update): waits=%d passes=%d copies=%d buffersCreated=%d\n", kFrames,
+                int(calls.waits), counts.passes, int(calls.copyBuffer), int(calls.buffersCreated));
+    CHECK(calls.waits == 0);  // (without the small update it was 0 as well; with it, 5)
+    // The bytes of each update reach the buffer exactly once, in pieces of at most 1 MiB.
+    uint64_t small = 0, bigBytes = 0;
+    bool pieces = true, inRange = true;
+    for (const auto& [dst, size] : gCopyRegions) {
+        pieces = pieces && size <= (1u << 20);
+        if (dst == 16) small += size;
+        else if (dst >= uint64_t(kBigOff) && dst + size <= uint64_t(kBigOff + kBig)) bigBytes += size;
+        else inRange = false;
+    }
+    CHECK(pieces && inRange);
+    CHECK(small == uint64_t(kFrames) * 256);
+    CHECK(bigBytes == uint64_t(kFrames) * uint64_t(kBig));
+    // The last frame's big update is two consecutive halves.
+    const size_t n = gCopyRegions.size();
+    const bool halves = n >= 2 && gCopyRegions[n - 2].first == uint64_t(kBigOff) && gCopyRegions[n - 2].second == (1u << 20) &&
+                        gCopyRegions[n - 1].first == uint64_t(kBigOff) + (1u << 20) && gCopyRegions[n - 1].second == (1u << 20);
+    CHECK(halves);
+    vpgles_flush(0);
+    settle();
+    alarm(0);
+    a.down();
+}
+
+// ---- round 7 (review of round 6): partial updates of a big buffer the open pass reads ----
+// An 8 MiB shader storage buffer bound for the draws of the open pass; n x (draw, 256 B update at step * i + firstOff). `fs` decides what the
+// shader can read (a fixed-size block: its own bytes only; an unsized array: the whole range), `range` how much of the buffer the binding
+// covers (0 = BindBufferBase, the whole buffer).
+struct RingRun {
+    int passes = 0, copies = 0, buffersCreated = 0, waits = 0, submits = 0;
+    bool bytesOk = true;
+};
+RingRun ringRun(const char* fs, GLsizeiptr range, GLintptr firstOff, GLintptr step, int n) {
+    G(glGenBuffers, void (*)(GLsizei, GLuint*));
+    G(glBindBuffer, void (*)(GLenum, GLuint));
+    G(glBindBufferBase, void (*)(GLenum, GLuint, GLuint));
+    G(glBindBufferRange, void (*)(GLenum, GLuint, GLuint, GLintptr, GLsizeiptr));
+    G(glBufferData, void (*)(GLenum, GLsizeiptr, const void*, GLenum));
+    G(glBufferSubData, void (*)(GLenum, GLintptr, GLsizeiptr, const void*));
+    G(glUseProgram, void (*)(GLuint));
+    G(glDrawArrays, void (*)(GLenum, GLint, GLsizei));
+    G(glMapBufferRange, void* (*)(GLenum, GLintptr, GLsizeiptr, GLbitfield));
+    G(glUnmapBuffer, GLboolean (*)(GLenum));
+    const char* vs = "#version 310 es\nvoid main(){ gl_Position = vec4(float(gl_VertexID)-1.0, 0.0, 0.0, 1.0); }\n";
+    glUseProgram(program(vs, fs));
+    GLuint b;
+    glGenBuffers(1, &b);
+    glBindBuffer(kSSBO, b);
+    std::vector<float> big(2u << 20, 1.0f);  // 8 MiB
+    glBufferData(kSSBO, GLsizeiptr(big.size() * 4), big.data(), gl::DYNAMIC_DRAW);
+    if (range) glBindBufferRange(kSSBO, 0, b, 0, range);
+    else glBindBufferBase(kSSBO, 0, b);
+    settle();
+    resetCalls();
+    const int s0 = submits;
+    std::vector<uint8_t> data(256);
+    glDrawArrays(gl::TRIANGLES, 0, 3);  // the pass the updates land in
+    for (int i = 0; i < n; ++i) {
+        std::memset(data.data(), 1 + i, data.size());
+        glBufferSubData(kSSBO, firstOff + step * i, 256, data.data());
+        glDrawArrays(gl::TRIANGLES, 0, 3);
+    }
+    RingRun r;
+    r.passes = counts.passes, r.copies = int(calls.copyBuffer), r.buffersCreated = int(calls.buffersCreated), r.waits = int(calls.waits), r.submits = submits - s0;
+    vpgles_flush(0);
+    settle();
+    // Whichever way each update went (in place, a GPU copy, a new storage), the buffer holds every update's bytes (the null backend executes
+    // no copies: a GPU copy shows as the bytes missing, so only the in-place / copy-on-write ones are read back).
+    if (r.copies == 0) {
+        const uint8_t* m = static_cast<const uint8_t*>(glMapBufferRange(kSSBO, 0, 8 << 20, gl::MAP_READ_BIT));
+        for (int i = 0; i < n && m; ++i)
+            for (int k = 0; k < 256; ++k) r.bytesOk = r.bytesOk && m[firstOff + step * i + k] == uint8_t(1 + i);
+        r.bytesOk = r.bytesOk && m;
+        glUnmapBuffer(kSSBO);
+    }
+    return r;
+}
+// The ring of 256 B updates over a big buffer: a pass is cut (or the buffer copied) only for an update the open pass can read.
+void audit9RingNarrow() {
+    Egl a; CHECK(a.up());
+    watchdog(120);
+    const char* fixedFs = "#version 310 es\nprecision highp float;\nlayout(std430, binding = 0) readonly buffer B { vec4 c[16]; };\nout vec4 o;\nvoid main(){ o = c[3]; }\n";
+    const char* unsizedFs = "#version 310 es\nprecision highp float;\nlayout(std430, binding = 0) readonly buffer B { vec4 c[]; };\nout vec4 o;\nvoid main(){ o = c[3]; }\n";
+    constexpr int kN = 64;
+    // A fixed-size block reads its 256 bytes only: the ring (from 256 on) never touches them, in place, one pass.
+    RingRun r = ringRun(fixedFs, 0, 256, 256, kN);
+    std::printf("  fixed 256 B block, whole 8 MiB binding, %d updates outside it: passes=%d copies=%d buffersCreated=%d waits=%d\n", kN, r.passes, r.copies, r.buffersCreated, r.waits);
+    CHECK(r.passes <= 2 && r.copies == 0 && r.buffersCreated <= 1 && r.waits == 0 && r.bytesOk);  // (buffersCreated: the draws' stream chunk; a copy on write would be 64 x 8 MiB)
+    // The ring starts on the bytes the block reads: that one update is ordered after the draws (one cut), the rest, outside them, are in place
+    // although the buffer has a GPU write pending (they used to follow it: one cut for every update).
+    r = ringRun(fixedFs, 0, 0, 256, kN);
+    std::printf("  fixed 256 B block, ring from offset 0: passes=%d copies=%d buffersCreated=%d waits=%d\n", r.passes, r.copies, r.buffersCreated, r.waits);
+    CHECK(r.passes <= 3 && r.copies <= 1 && r.buffersCreated <= 1 && r.waits == 0);
+    // An unsized array bound with BindBufferRange reads that range only.
+    r = ringRun(unsizedFs, 256, 256, 256, kN);
+    std::printf("  unsized array, 256 B range binding, %d updates outside it: passes=%d copies=%d buffersCreated=%d waits=%d\n", kN, r.passes, r.copies, r.buffersCreated, r.waits);
+    CHECK(r.passes <= 2 && r.copies == 0 && r.buffersCreated <= 1 && r.waits == 0 && r.bytesOk);
+    // An unsized array over the whole buffer can read every update: each one is ordered after the draws (a cut, no copy of the 8 MiB, no wait).
+    r = ringRun(unsizedFs, 0, 256, 256, kN);
+    std::printf("  unsized array, whole binding: passes=%d copies=%d buffersCreated=%d waits=%d\n", r.passes, r.copies, r.buffersCreated, r.waits);
+    CHECK(r.buffersCreated <= 1 && r.waits == 0 && r.copies >= kN - 1);
+    alarm(0);
+    a.down();
+}
+
+// One update of `size` bytes at 4096 of an 8 MiB buffer the open pass reads whole: a GPU copy (in pieces) up to half the buffer, where it
+// costs what a copy on write does, a new storage above it. No cliff at 1 MiB.
+void audit9Threshold() {
+    Egl a; CHECK(a.up());
+    G(glGenBuffers, void (*)(GLsizei, GLuint*));
+    G(glBindBuffer, void (*)(GLenum, GLuint));
+    G(glBindBufferBase, void (*)(GLenum, GLuint, GLuint));
+    G(glBufferData, void (*)(GLenum, GLsizeiptr, const void*, GLenum));
+    G(glBufferSubData, void (*)(GLenum, GLintptr, GLsizeiptr, const void*));
+    G(glUseProgram, void (*)(GLuint));
+    G(glDrawArrays, void (*)(GLenum, GLint, GLsizei));
+    watchdog(120);
+    const char* vs = "#version 310 es\nvoid main(){ gl_Position = vec4(float(gl_VertexID)-1.0, 0.0, 0.0, 1.0); }\n";
+    const char* fs = "#version 310 es\nprecision highp float;\nlayout(std430, binding = 0) readonly buffer B { vec4 c[]; };\nout vec4 o;\nvoid main(){ o = c[3]; }\n";
+    glUseProgram(program(vs, fs));
+    std::vector<float> big(2u << 20, 1.0f);  // 8 MiB
+    struct Case { GLsizeiptr size; bool ordered; };
+    const Case cases[] = {{1 << 20, true}, {(1 << 20) + 1, true}, {3 << 20, true}, {(4 << 20) - 4096, true}, {(4 << 20) + 4, false}, {6 << 20, false}};
+    for (const Case& c : cases) {
+        GLuint b;
+        glGenBuffers(1, &b);
+        glBindBuffer(kSSBO, b);
+        glBufferData(kSSBO, GLsizeiptr(big.size() * 4), big.data(), gl::DYNAMIC_DRAW);
+        glBindBufferBase(kSSBO, 0, b);
+        settle();
+        resetCalls();
+        glDrawArrays(gl::TRIANGLES, 0, 3);
+        glBufferSubData(kSSBO, 4096, c.size, big.data());
+        glDrawArrays(gl::TRIANGLES, 0, 3);
+        std::printf("  8 MiB buffer read by the pass, update of %lld bytes: copies=%d buffersCreated=%d waits=%d\n", (long long)c.size, int(calls.copyBuffer), int(calls.buffersCreated), int(calls.waits));
+        CHECK(calls.waits == 0);
+        if (c.ordered) CHECK(calls.copyBuffer == int((c.size + (1 << 20) - 1) >> 20) && calls.buffersCreated <= 1);  // pieces of 1 MiB in one stream chunk
+        else CHECK(calls.copyBuffer == 0 && calls.buffersCreated == 1);  // the new storage (the old one stays with the draw)
+        vpgles_flush(0);
+        settle();
+    }
+    alarm(0);
+    a.down();
+}
+
+// An update with no size limit staged in host memory all at once: with a GPU write pending (the ordered path takes every partial update)
+// 96 MiB of update used to hold 24 stream chunks (96 MiB) until the command buffer was submitted. The staging in use is capped (the work
+// recorded so far is submitted and the chunks come back as it completes).
+void audit9Staging() {
+    Egl a; CHECK(a.up());
+    G(glGenBuffers, void (*)(GLsizei, GLuint*));
+    G(glBindBuffer, void (*)(GLenum, GLuint));
+    G(glBindBufferBase, void (*)(GLenum, GLuint, GLuint));
+    G(glBufferData, void (*)(GLenum, GLsizeiptr, const void*, GLenum));
+    G(glBufferSubData, void (*)(GLenum, GLintptr, GLsizeiptr, const void*));
+    G(glUseProgram, void (*)(GLuint));
+    G(glDrawArrays, void (*)(GLenum, GLint, GLsizei));
+    watchdog(120);
+    const char* vs = "#version 310 es\nvoid main(){ gl_Position = vec4(float(gl_VertexID)-1.0, 0.0, 0.0, 1.0); }\n";
+    const char* fs = "#version 310 es\nprecision highp float;\nlayout(std430, binding = 0) readonly buffer B { vec4 c[]; };\nout vec4 o;\nvoid main(){ o = c[3]; }\n";
+    glUseProgram(program(vs, fs));
+    constexpr GLsizeiptr kBuf = 128 << 20, kUpdate = 96 << 20, kOff = 4096;
+    std::vector<uint8_t> data(size_t(kUpdate), 7);
+    GLuint b;
+    glGenBuffers(1, &b);
+    glBindBuffer(kSSBO, b);
+    glBufferData(kSSBO, kBuf, nullptr, gl::DYNAMIC_DRAW);
+    glBindBufferBase(kSSBO, 0, b);
+    settle();
+    glDrawArrays(gl::TRIANGLES, 0, 3);
+    glBufferSubData(kSSBO, 16, 256, data.data());  // a GPU write is pending from here
+    glDrawArrays(gl::TRIANGLES, 0, 3);
+    resetCalls();
+    gCopyRegions.clear();
+    gCopyLog = true;
+    const uint64_t live0 = gLiveBufferBytes;
+    gPeakBufferBytes = live0;
+    glBufferSubData(kSSBO, kOff, kUpdate, data.data());
+    gCopyLog = false;
+    const uint64_t peak = gPeakBufferBytes - live0;
+    uint64_t bytes = 0, next = uint64_t(kOff);
+    bool pieces = true, inOrder = true;
+    for (const auto& [dst, size] : gCopyRegions) {
+        if (dst == 16) continue;
+        pieces = pieces && size <= (1u << 20);
+        inOrder = inOrder && dst == next;
+        next = dst + size, bytes += size;
+    }
+    std::printf("  96 MiB update with a GPU write pending: staging at most %llu MiB, copied %llu MiB, waits=%d copies=%d\n", (unsigned long long)(peak >> 20),
+                (unsigned long long)(bytes >> 20), int(calls.waits), int(calls.copyBuffer));
+    CHECK(peak <= (72u << 20));  // the cap is 64 MiB of chunks (+ the one being filled)
+    CHECK(bytes == uint64_t(kUpdate) && pieces && inOrder);
+    vpgles_flush(0);
+    settle();
+    alarm(0);
+    a.down();
+}
+
+// ---- round 6 (review of round 5): vpgles_shutdown between the unlock and the re-lock of CompileShader / LinkProgram ----
+static std::atomic<int> gR4Fired{0};
+void r4Shutdown() {
+    static auto sd = reinterpret_cast<void (*)()>(dlsym(gLib, "vpgles_shutdown"));
+    static std::atomic<int> once{0};
+    if (once.exchange(1) == 0) {
+        sd();  // (on the calling thread, at the point where the lock is off: the worst interleaving, on purpose)
+        gR4Fired = 1;
+    }
+}
+void r4HookSet(void (*f)()) { reinterpret_cast<void (*)(void (*)())>(dlsym(gLib, "vpgles_test_unlocked_hook"))(f); }
+// The session ends exactly while the lock is off in glCompileShader (hook): the call must return without touching the deleted context.
+void r4CompileHook() {
+    G(glCreateShader, GLuint (*)(GLenum));
+    G(glShaderSource, void (*)(GLuint, GLsizei, const char* const*, const GLint*));
+    G(glCompileShader, void (*)(GLuint));
+    G(glGetError, GLenum (*)());
+    watchdog(60);
+    Egl a; CHECK(a.up());
+    const GLuint sh = glCreateShader(gl::VERTEX_SHADER);
+    const char* src = "void main() { gl_Position = vec4(0.0); }\n";
+    glShaderSource(sh, 1, &src, nullptr);
+    r4HookSet(r4Shutdown);
+    glCompileShader(sh);  // ASan (without the fix): heap-use-after-free in Context::shader
+    r4HookSet(nullptr);
+    std::printf("  glCompileShader returned after the session ended in the middle of it; glGetError=%u\n", glGetError());
+    G(eglGetCurrentContext, void* (*)());
+    G(eglCreateContext, void* (*)(void*, void*, void*, const EGLint*));
+    G(eglGetError, EGLint (*)());
+    CHECK(gR4Fired == 1);                    // the shutdown really ran inside the call
+    CHECK(eglGetCurrentContext() == nullptr);  // the context died with the session: nothing is current any more
+    const EGLint cattrs[] = {egl::CONTEXT_CLIENT_VERSION, 3, egl::NONE};
+    CHECK(eglCreateContext(a.dpy, a.config, nullptr, cattrs) == nullptr && eglGetError() == 0x3001);  // and the Device is dead
+    alarm(0);
+}
+void r4LinkHook() {
+    G(glCreateShader, GLuint (*)(GLenum));
+    G(glShaderSource, void (*)(GLuint, GLsizei, const char* const*, const GLint*));
+    G(glCompileShader, void (*)(GLuint));
+    G(glCreateProgram, GLuint (*)());
+    G(glAttachShader, void (*)(GLuint, GLuint));
+    G(glLinkProgram, void (*)(GLuint));
+    G(glGetError, GLenum (*)());
+    watchdog(60);
+    Egl a; CHECK(a.up());
+    const char* vs = "attribute vec4 a; void main() { gl_Position = a; }\n";
+    const char* fs = "precision mediump float; void main() { gl_FragColor = vec4(1.0); }\n";
+    const GLuint sv = glCreateShader(gl::VERTEX_SHADER), sf = glCreateShader(gl::FRAGMENT_SHADER);
+    glShaderSource(sv, 1, &vs, nullptr);
+    glShaderSource(sf, 1, &fs, nullptr);
+    glCompileShader(sv);
+    glCompileShader(sf);
+    const GLuint prog = glCreateProgram();
+    glAttachShader(prog, sv);
+    glAttachShader(prog, sf);
+    r4HookSet(r4Shutdown);
+    glLinkProgram(prog);
+    r4HookSet(nullptr);
+    std::printf("  glLinkProgram returned after the session ended in the middle of it; glGetError=%u\n", glGetError());
+    G(eglGetCurrentContext, void* (*)());
+    G(eglCreateContext, void* (*)(void*, void*, void*, const EGLint*));
+    G(eglGetError, EGLint (*)());
+    CHECK(gR4Fired == 1);
+    CHECK(eglGetCurrentContext() == nullptr);
+    const EGLint cattrs[] = {egl::CONTEXT_CLIENT_VERSION, 3, egl::NONE};
+    CHECK(eglCreateContext(a.dpy, a.config, nullptr, cattrs) == nullptr && eglGetError() == 0x3001);
+    alarm(0);
+}
+// A long compile + link in one thread, vpgles_shutdown from the main one while the compile thread is parked at the unlocked point (hook
+// barrier, no timing): the thread must finish its calls without touching anything of the dead session.
+static std::atomic<int> gR4AtPoint{0}, gR4ShutDone{0};
+static void r4Barrier() {
+    static std::atomic<int> once{0};
+    if (once.exchange(1)) return;
+    gR4AtPoint = 1;
+    while (!gR4ShutDone) std::this_thread::yield();
+}
+void r4CompileShutdown() {
+    G(glCreateShader, GLuint (*)(GLenum));
+    G(glShaderSource, void (*)(GLuint, GLsizei, const char* const*, const GLint*));
+    G(glCompileShader, void (*)(GLuint));
+    G(glCreateProgram, GLuint (*)());
+    G(glAttachShader, void (*)(GLuint, GLuint));
+    G(glLinkProgram, void (*)(GLuint));
+    G(glGetError, GLenum (*)());
+    G(eglGetCurrentContext, void* (*)());
+    G(eglMakeCurrent, uint32_t (*)(void*, void*, void*, void*));
+    G(eglCreateContext, void* (*)(void*, void*, void*, const EGLint*));
+    G(eglCreatePbufferSurface, void* (*)(void*, void*, const EGLint*));
+    watchdog(120);
+    Egl a; CHECK(a.up());
+    const EGLint sattrs[] = {egl::WIDTH, 16, egl::HEIGHT, 16, egl::NONE};
+    const EGLint cattrs[] = {egl::CONTEXT_CLIENT_VERSION, 3, egl::NONE};
+    void* surfB = eglCreatePbufferSurface(a.dpy, a.config, sattrs);
+    void* ctxB = eglCreateContext(a.dpy, a.config, a.ctx, cattrs);
+    eglMakeCurrent(a.dpy, nullptr, nullptr, nullptr);
+    std::atomic<int> state{0}, ctxAfter{-1}, errAfter{-1};
+    r4HookSet(r4Barrier);
+    std::thread t([&] {
+        eglMakeCurrent(a.dpy, surfB, surfB, ctxB);
+        std::string vs = "attribute vec4 a; uniform vec4 u[16]; varying vec4 v;\nvoid main() {\n vec4 x = a;\n";
+        for (int i = 0; i < 20000; ++i) vs += " x = x * u[" + std::to_string(i % 16) + "] + vec4(" + std::to_string(i % 7) + ".5);\n";
+        vs += " v = x; gl_Position = x;\n}\n";
+        const char* fs = "precision mediump float; varying vec4 v; void main() { gl_FragColor = v; }\n";
+        const GLuint sv = glCreateShader(gl::VERTEX_SHADER), sf = glCreateShader(gl::FRAGMENT_SHADER);
+        const char* p = vs.c_str();
+        glShaderSource(sv, 1, &p, nullptr);
+        glShaderSource(sf, 1, &fs, nullptr);
+        state = 1;
+        glCompileShader(sv);  // parked at the unlocked point until the main thread has shut the session down
+        glCompileShader(sf);
+        const GLuint prog = glCreateProgram();
+        glAttachShader(prog, sv);
+        glAttachShader(prog, sf);
+        glLinkProgram(prog);
+        errAfter = int(glGetError());
+        ctxAfter = eglGetCurrentContext() ? 1 : 0;
+        state = 2;
+    });
+    while (!gR4AtPoint) std::this_thread::yield();
+    reinterpret_cast<void (*)()>(dlsym(gLib, "vpgles_shutdown"))();
+    gR4ShutDone = 1;
+    t.join();
+    r4HookSet(nullptr);
+    std::printf("  compile + link in a thread survived vpgles_shutdown (state=%d ctxAfter=%d err=%d)\n", int(state), int(ctxAfter), int(errAfter));
+    CHECK(state == 2);
+    CHECK(ctxAfter == 0);  // its context died with the session
+    CHECK(errAfter == 0);  // and no GL error is made up on a dead one
+    alarm(0);
+}
+// After vpgles_shutdown no EGL entry creates anything on the dead Device.
+void r4AfterCreate() {
+    G(eglGetError, EGLint (*)());
+    G(eglMakeCurrent, uint32_t (*)(void*, void*, void*, void*));
+    G(eglCreateContext, void* (*)(void*, void*, void*, const EGLint*));
+    G(eglCreatePbufferSurface, void* (*)(void*, void*, const EGLint*));
+    watchdog(30);
+    Egl a; CHECK(a.up());
+    eglMakeCurrent(a.dpy, nullptr, nullptr, nullptr);
+    reinterpret_cast<void (*)()>(dlsym(gLib, "vpgles_shutdown"))();
+    const EGLint sattrs[] = {egl::WIDTH, 16, egl::HEIGHT, 16, egl::NONE};
+    const EGLint cattrs[] = {egl::CONTEXT_CLIENT_VERSION, 3, egl::NONE};
+    void* s = eglCreatePbufferSurface(a.dpy, a.config, sattrs);
+    const EGLint e1 = eglGetError();
+    void* c = eglCreateContext(a.dpy, a.config, nullptr, cattrs);
+    const EGLint e2 = eglGetError();
+    const uint32_t m = eglMakeCurrent(a.dpy, a.surface, a.surface, a.ctx);
+    const EGLint e3 = eglGetError();
+    std::printf("  after vpgles_shutdown: CreatePbufferSurface=%p err=%#x CreateContext=%p err=%#x MakeCurrent=%u err=%#x\n", s, e1, c, e2, m, e3);
+    CHECK(!s && e1 == 0x3001);
+    CHECK(!c && e2 == 0x3001);
+    CHECK(!m && e3 == 0x3001);
     alarm(0);
 }
 
@@ -7442,7 +7941,7 @@ void testAudit2Link() {
         while (!ready && !done) std::this_thread::yield();
         while (linking && !done) {
             glGetError();
-            if (linking) ++during;
+            if (linking) ++during;  // (returned while the link is still running)
             std::this_thread::sleep_for(std::chrono::microseconds(100));
         }
         t.join();
@@ -7450,8 +7949,9 @@ void testAudit2Link() {
         CHECK(linked == 1);
         if (linkUs < 30000 && attemptNo < 3) continue;  // too short to tell: a longer shader
         CHECK(linkUs >= 30000);
-        // (>= a fifth of the 100 us polls that fit in the link: the loop's own time per call and the sleep's overshoot take the rest)
-        CHECK(during > std::max<long>(20, linkUs / 100 / 5));
+        // `during` only counts calls that returned while the link was still running. A link that held the lock lets through at most the one call
+        // that was already past the lock check; 5 calls cannot come from that, however fast or slow the machine and whatever the sleep overshoots.
+        CHECK(during >= 5);
         break;
     }
     alarm(0);
@@ -7469,7 +7969,6 @@ void testAudit2LinkShared() {
     G(glAttachShader, void (*)(GLuint, GLuint));
     G(glLinkProgram, void (*)(GLuint));
     G(glGetProgramiv, void (*)(GLuint, GLenum, GLint*));
-    G(glDeleteProgram, void (*)(GLuint));
     G(eglCreateContext, void* (*)(void*, void*, void*, const EGLint*));
     G(eglCreatePbufferSurface, void* (*)(void*, void*, const EGLint*));
     G(eglMakeCurrent, uint32_t (*)(void*, void*, void*, void*));
@@ -7527,6 +8026,277 @@ void testAudit2LinkShared() {
     e.down();
 }
 
+// ---- reviewer repros (round 4) ----
+static long revRssKb() {
+    FILE* f = std::fopen("/proc/self/status", "r");
+    char line[256]; long kb = -1;
+    while (f && std::fgets(line, sizeof line, f)) if (!std::strncmp(line, "VmRSS:", 6)) kb = std::atol(line + 6);
+    if (f) std::fclose(f);
+    return kb;
+}
+static std::atomic<int> gRevPresentIn{0}, gRevShutdownDone{0}, gRevCbChecked{0}, gRevInitDone{0};
+static void* gRevDev = nullptr;
+static std::atomic<void*> gRevQueue{nullptr}, gRevDuring{nullptr};
+// Test-only counters of the layer (vpgles_test_stat, present only in the library the tests load): 0 = Devices freed so far, 1 = Devices that
+// vpgles_init left waiting for a present callback to return. -1: the library has no such counter.
+static int testStat(int which) {
+    auto f = reinterpret_cast<int (*)(int)>(dlsym(gLib, "vpgles_test_stat"));
+    return f ? f(which) : -1;
+}
+static void revPresent(void*, void*, void* image, uint32_t, uint32_t, uint32_t) {
+    gRevPresentIn = 1;
+    for (int i = 0; i < 2000 && !gRevShutdownDone; ++i) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    // vpgles.h: the shared VkDevice is valid while a present callback is running, also after vpgles_shutdown.
+    void* during = nullptr;
+    vpgles_device(nullptr, nullptr, &during, nullptr);
+    gRevDuring = during;
+    // The host uses the image it was given (its documented contract): a query on the shared device.
+    auto gdpa = reinterpret_cast<PFN_vkGetDeviceProcAddr>(dlsym(gLib, "vkGetDeviceProcAddr"));
+    auto gisl = reinterpret_cast<PFN_vkGetImageMemoryRequirements>(gdpa(VkDevice(gRevDev), "vkGetImageMemoryRequirements"));
+    VkMemoryRequirements mr{};
+    std::printf("  present: shutdown done=%d, using image %p on device %p\n", int(gRevShutdownDone), image, gRevDev); std::fflush(stdout);
+    if (gisl) gisl(VkDevice(gRevDev), VkImage(image), &mr);
+    auto gq = reinterpret_cast<PFN_vkGetDeviceQueue>(gdpa(VkDevice(gRevDev), "vkGetDeviceQueue"));
+    VkQueue q = VK_NULL_HANDLE;
+    if (gq) gq(VkDevice(gRevDev), 0, 0, &q);  // what a host blit does first (then vkQueueSubmit on it)
+    gRevQueue = q;
+    std::printf("  present: queue=%p\n", (void*)q); std::fflush(stdout);
+    std::printf("  present: image size=%llu\n", (unsigned long long)mr.size); std::fflush(stdout);
+    // From here on the order of the driver calls is logged: the host's blit (a submission on the shared queue, Q), then what the layer does
+    // after the callback returns. vpgles_init runs while this callback is still in flight.
+    {
+        std::lock_guard<std::mutex> l(gOrderMu);
+        gOrder.clear();
+    }
+    gOrderOn = true;
+    auto gsub = reinterpret_cast<PFN_vkQueueSubmit>(myGdpa(VkDevice(gRevDev), "vkQueueSubmit"));  // (through the interceptor: the submission is logged)
+    VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+    if (gsub && q) gsub(q, 1, &si, VK_NULL_HANDLE);  // the host's work, still to run when the callback returns
+    gRevCbChecked = 1;
+    for (int i = 0; i < 4000 && !gRevInitDone; ++i) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+}
+void revPresentShutdown() {
+    G(eglCreateWindowSurface, void* (*)(void*, void*, void*, const EGLint*));
+    G(eglCreateContext, void* (*)(void*, void*, void*, const EGLint*));
+    G(eglMakeCurrent, uint32_t (*)(void*, void*, void*, void*));
+    G(eglSwapBuffers, uint32_t (*)(void*, void*));
+    watchdog(60);
+    Egl a; CHECK(a.up());
+    vpgles_device(nullptr, nullptr, &gRevDev, nullptr);
+    reinterpret_cast<void (*)(void (*)(void*, void*, void*, uint32_t, uint32_t, uint32_t), void*)>(dlsym(gLib, "vpgles_set_present"))(revPresent, nullptr);
+    const EGLint wattrs[] = {egl::WIDTH, 64, egl::HEIGHT, 64, egl::NONE};
+    void* ws = eglCreateWindowSurface(a.dpy, a.config, reinterpret_cast<void*>(0x1000), wattrs);
+    const EGLint cattrs[] = {egl::CONTEXT_CLIENT_VERSION, 3, egl::NONE};
+    void* ctx2 = eglCreateContext(a.dpy, a.config, a.ctx, cattrs);
+    CHECK(ws && ctx2);
+    eglMakeCurrent(a.dpy, nullptr, nullptr, nullptr);
+    const int destroys0 = gDeviceDestroys;
+    const int freed0 = testStat(0);
+    std::thread t([&] {
+        eglMakeCurrent(a.dpy, ws, ws, ctx2);
+        eglSwapBuffers(a.dpy, ws);
+    });
+    while (!gRevPresentIn) std::this_thread::yield();
+    reinterpret_cast<void (*)()>(dlsym(gLib, "vpgles_shutdown"))();  // the render thread is inside the present callback
+    gRevShutdownDone = 1;
+    while (!gRevCbChecked) std::this_thread::yield();
+    CHECK(gDeviceDestroys == destroys0);  // the callback is in flight: the device is still standing
+    // A new session while the old session's callback is still running.
+    CHECK(vpgles_init(reinterpret_cast<void*>(&myGipa)) != 0);
+    void* fresh = nullptr;
+    vpgles_device(nullptr, nullptr, &fresh, nullptr);
+    CHECK(fresh != nullptr && fresh != gRevDev);
+    CHECK(testStat(1) == 1);  // the old Device waits for its callback
+    gRevInitDone = 1;
+    t.join();
+    gOrderOn = false;
+    CHECK(gRevQueue != nullptr);  // the callback used the shared device after vpgles_shutdown returned: it was still standing
+    CHECK(gRevDuring == gRevDev);  // vpgles_device answers the standing device while the callback runs
+    // The last present to return finishes the destruction (finalDestroy): once, after the GPU is idle, images before the device.
+    CHECK(gDeviceDestroys == destroys0 + 1);
+    {
+        std::lock_guard<std::mutex> l(gOrderMu);
+        const size_t q = gOrder.find('Q'), w = gOrder.find('W'), i = gOrder.find('I'), d = gOrder.find('D');
+        std::printf("  order of the host's submission and the destruction after the callback returned: %s\n", gOrder.c_str());
+        CHECK(q != std::string::npos && w != std::string::npos && i != std::string::npos && d != std::string::npos);
+        CHECK(q < w && w < i && i < d);  // the submission the callback made is waited for (W) before its image is destroyed and before vkDestroyDevice
+        CHECK(gOrder.rfind('D') == gOrder.size() - 1 && gOrder.find('D') == gOrder.rfind('D'));
+    }
+    // ... and the Device left behind by the new session is freed then, not at the next vpgles_init.
+    CHECK(testStat(1) == 0);
+    CHECK(testStat(0) == freed0 + 1);
+    std::printf("  swap returned after vpgles_shutdown ran during present\n");
+    alarm(0);
+}
+// Two presents in flight when vpgles_shutdown runs: the GPU is waited for once (by the last callback to return, outside the global lock), and
+// both colour images go after that wait, before the device.
+static std::atomic<int> gTwoIn{0}, gTwoShutdown{0};
+static void twoPresent(void*, void*, void*, uint32_t, uint32_t, uint32_t) {
+    ++gTwoIn;
+    for (int i = 0; i < 4000 && !gTwoShutdown; ++i) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    // Once this callback has returned, the layer must not allocate to park the image (~Presented is noexcept: a bad_alloc there would end the process).
+    gFailLateNew = true;
+}
+void audit9Presents() {
+    G(eglCreateWindowSurface, void* (*)(void*, void*, void*, const EGLint*));
+    G(eglCreateContext, void* (*)(void*, void*, void*, const EGLint*));
+    G(eglMakeCurrent, uint32_t (*)(void*, void*, void*, void*));
+    G(eglSwapBuffers, uint32_t (*)(void*, void*));
+    watchdog(60);
+    Egl a; CHECK(a.up());
+    reinterpret_cast<void (*)(void (*)(void*, void*, void*, uint32_t, uint32_t, uint32_t), void*)>(dlsym(gLib, "vpgles_set_present"))(twoPresent, nullptr);
+    gProbeFn = vpgles_device;
+    const EGLint wattrs[] = {egl::WIDTH, 64, egl::HEIGHT, 64, egl::NONE};
+    const EGLint cattrs[] = {egl::CONTEXT_CLIENT_VERSION, 3, egl::NONE};
+    void* ws[2];
+    void* cx[2];
+    for (int i = 0; i < 2; ++i) {
+        ws[i] = eglCreateWindowSurface(a.dpy, a.config, reinterpret_cast<void*>(0x1000 + i), wattrs);
+        cx[i] = eglCreateContext(a.dpy, a.config, a.ctx, cattrs);
+        CHECK(ws[i] && cx[i]);
+    }
+    eglMakeCurrent(a.dpy, nullptr, nullptr, nullptr);
+    const int destroys0 = gDeviceDestroys;
+    std::thread t[2];
+    for (int i = 0; i < 2; ++i)
+        t[i] = std::thread([&, i] {
+            eglMakeCurrent(a.dpy, ws[i], ws[i], cx[i]);
+            eglSwapBuffers(a.dpy, ws[i]);
+        });
+    while (gTwoIn < 2) std::this_thread::yield();
+    reinterpret_cast<void (*)()>(dlsym(gLib, "vpgles_shutdown"))();  // both render threads are inside the present callback
+    {
+        std::lock_guard<std::mutex> l(gOrderMu);
+        gOrder.clear();
+    }
+    gOrderOn = true;
+    gProbeIdleLock = true;
+    gTwoShutdown = 1;
+    t[0].join();
+    t[1].join();
+    gOrderOn = false;
+    CHECK(gDeviceDestroys == destroys0 + 1);  // (and the process is still here: no allocation failed inside the noexcept destructor)
+    {
+        std::lock_guard<std::mutex> l(gOrderMu);
+        std::printf("  driver calls after the callbacks were released: %s\n", gOrder.c_str());
+        const size_t w = gOrder.find('W'), i = gOrder.find('I'), d = gOrder.find('D');
+        CHECK(std::count(gOrder.begin(), gOrder.end(), 'W') == 1);  // one wait for the GPU, not one per present
+        CHECK(std::count(gOrder.begin(), gOrder.end(), 'I') >= 2);  // both colour images
+        CHECK(w != std::string::npos && i != std::string::npos && d != std::string::npos && w < i && i < d);
+    }
+    // The wait ran without the layer's global lock: another thread got it (vpgles_device) while the wait was running.
+    CHECK(gIdleLockFree == 1);
+    if (gIdleProbe)
+        for (int i = 0; i < 1000 && !*gIdleProbe; ++i) std::this_thread::sleep_for(std::chrono::milliseconds(1));  // (so the thread is over before the test is)
+    alarm(0);
+}
+// A present callback that throws: the present count and the colour image are released all the same (the device is not left standing).
+static void revPresentThrows(void*, void*, void*, uint32_t, uint32_t, uint32_t) { throw 42; }
+void revPresentThrow() {
+    G(eglCreateWindowSurface, void* (*)(void*, void*, void*, const EGLint*));
+    G(eglCreateContext, void* (*)(void*, void*, void*, const EGLint*));
+    G(eglMakeCurrent, uint32_t (*)(void*, void*, void*, void*));
+    G(eglSwapBuffers, uint32_t (*)(void*, void*));
+    watchdog(60);
+    Egl a; CHECK(a.up());
+    reinterpret_cast<void (*)(void (*)(void*, void*, void*, uint32_t, uint32_t, uint32_t), void*)>(dlsym(gLib, "vpgles_set_present"))(revPresentThrows, nullptr);
+    const EGLint wattrs[] = {egl::WIDTH, 64, egl::HEIGHT, 64, egl::NONE};
+    void* ws = eglCreateWindowSurface(a.dpy, a.config, reinterpret_cast<void*>(0x1000), wattrs);
+    const EGLint cattrs[] = {egl::CONTEXT_CLIENT_VERSION, 3, egl::NONE};
+    void* ctx2 = eglCreateContext(a.dpy, a.config, a.ctx, cattrs);
+    CHECK(ws && ctx2);
+    eglMakeCurrent(a.dpy, nullptr, nullptr, nullptr);
+    int caught = 0;
+    std::thread t([&] {
+        eglMakeCurrent(a.dpy, ws, ws, ctx2);
+        try {
+            eglSwapBuffers(a.dpy, ws);
+        } catch (int) {
+            caught = 1;
+        }
+    });
+    t.join();
+    CHECK(caught == 1);
+    const int destroys0 = gDeviceDestroys;
+    reinterpret_cast<void (*)()>(dlsym(gLib, "vpgles_shutdown"))();
+    CHECK(gDeviceDestroys == destroys0 + 1);  // no present is counted as still running: shutdown destroys the device itself
+    alarm(0);
+}
+// SwapBuffers of a surface destroyed by another thread during present: the colour image is released outside the lock.
+static std::atomic<int> gRevP2{0};
+static void revPresent2(void*, void*, void*, uint32_t, uint32_t, uint32_t) {
+    gRevP2 = 1;
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+}
+void revSwapDestroy() {
+    G(eglCreateWindowSurface, void* (*)(void*, void*, void*, const EGLint*));
+    G(eglDestroySurface, uint32_t (*)(void*, void*));
+    G(eglSwapBuffers, uint32_t (*)(void*, void*));
+    G(glDrawArrays, void (*)(GLenum, GLint, GLsizei));
+    G(glFlush, void (*)());
+    watchdog(60);
+    Egl a; CHECK(a.up());
+    reinterpret_cast<void (*)(void (*)(void*, void*, void*, uint32_t, uint32_t, uint32_t), void*)>(dlsym(gLib, "vpgles_set_present"))(revPresent2, nullptr);
+    for (int round = 0; round < 20; ++round) {
+        const EGLint wattrs[] = {egl::WIDTH, 64, egl::HEIGHT, 64, egl::NONE};
+        void* ws = eglCreateWindowSurface(a.dpy, a.config, reinterpret_cast<void*>(0x1000), wattrs);
+        gRevP2 = 0;
+        std::thread t([&] { eglSwapBuffers(a.dpy, ws); });  // (no context current on this thread: present only)
+        while (!gRevP2) std::this_thread::yield();
+        CHECK(eglDestroySurface(a.dpy, ws));  // freed while the present runs: the image is released by the swapping thread, without the lock
+        for (int i = 0; i < 50; ++i) { glDrawArrays(gl::TRIANGLES, 0, 3); glFlush(); }  // the GL thread keeps using the device
+        t.join();
+    }
+    a.down();
+    alarm(0);
+}
+
+// A host thread (vpgles_flush, vpgles_device) while another re-inits the layer.
+void revInitRace() {
+    watchdog(120);
+    auto shutdown = reinterpret_cast<void (*)()>(dlsym(gLib, "vpgles_shutdown"));
+    std::atomic<int> stop{0};
+    std::thread t([&] {
+        while (!stop) { vpgles_flush(0); void* d = nullptr; vpgles_device(nullptr, nullptr, &d, nullptr); }
+    });
+    for (int i = 0; i < 20; ++i) {
+        Egl a; CHECK(a.up(16, 16));
+        a.down();
+        shutdown();
+        CHECK(vpgles_init(reinterpret_cast<void*>(&myGipa)) != 0);
+    }
+    stop = 1;
+    t.join();
+    alarm(0);
+}
+// init / shutdown cycles: what the retired Devices cost.
+void revReinitCycles() {
+    G(glDrawArrays, void (*)(GLenum, GLint, GLsizei));
+    watchdog(300);
+    auto shutdown = reinterpret_cast<void (*)()>(dlsym(gLib, "vpgles_shutdown"));
+    long first = 0;
+    const int n = std::getenv("REV_CYCLES") ? std::atoi(std::getenv("REV_CYCLES")) : 200;
+    const int freed0 = testStat(0);
+    for (int i = 0; i < n; ++i) {
+        Egl a; CHECK(a.up(16, 16));
+        glDrawArrays(gl::TRIANGLES, 0, 3);
+        a.down();
+        shutdown();
+        CHECK(vpgles_init(reinterpret_cast<void*>(&myGipa)) != 0);
+        if (i == 9) first = revRssKb();
+        if (i % 50 == 49) std::printf("  cycle %d rss=%ld KiB\n", i + 1, revRssKb());
+    }
+    std::printf("  rss growth over %d cycles after warmup: %ld KiB (%.1f KiB/cycle)\n", n - 10, revRssKb() - first, double(revRssKb() - first) / (n - 10));
+    // Every session's Device is freed by the next vpgles_init (none waits for a present callback here), and the process does not grow with
+    // the cycles: a Device (its Vulkan function table, pools, caches) or a Vulkan device left behind would show in either.
+    CHECK(testStat(0) == freed0 + n);
+    CHECK(testStat(1) == 0);
+#ifndef __SANITIZE_ADDRESS__  // (AddressSanitizer keeps what is freed in a quarantine: the resident size grows by design until it is full)
+    CHECK(n > 10 && revRssKb() - first <= 64L * (n - 10));  // KiB: 64 KiB per cycle at most (measured: ~0.1)
+#endif
+    alarm(0);
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -7561,7 +8331,7 @@ int main(int argc, char** argv) {
         {"audit_lost", testAuditLost}, {"audit_calls", testAuditCalls}, {"audit_compile", testAuditCompile}, {"audit_xfb", testAuditXfb},
         {"audit2_xfer", testAudit2Xfer}, {"audit2_dyn", testAudit2Dyn}, {"audit2_buf", testAudit2Buf}, {"audit2_pbo", testAudit2Pbo},
         {"audit2_upload", testAudit2Upload}, {"audit2_egl", testAudit2Egl}, {"audit2_link", testAudit2Link}, {"audit2_link2", testAudit2LinkShared},
-        {"audit3_egl_last", testAudit3EglLast}, {"audit3_egl_refs", testAudit3EglRefs}, {"audit3_pbo", testAudit3Pbo}, {"audit3_xfer_shared", testAudit3XferShared}, {"audit3_stale_stamp", testAudit3StaleStamp}, {"audit4_xfer_own_pass", testAudit4XferOwnPass}, {"audit4_reads_b", testAudit4ReadsB}, {"audit4_reads_ctl", testAudit4ReadsCtl}, {"audit4_copygrow", testAudit4CopyGrow}, {"audit4_reinit", testAudit4Reinit}, {"audit5_perf", testAudit5Perf}, {"audit5_race", audit5ShutdownRace}, {"audit5_atomic_ro", audit5AtomicRO}, {"audit5_index_inplace", audit5IndexInPlace}, {"audit5_pass_split", audit5PassSplit}, {"audit5_after_shutdown", audit5AfterShutdown}, {"audit5_readonly", testAudit5Readonly}, {"audit5_texbuf", testAudit5TexBuf}, {"audit5_index", testAudit5IndexRead}, {"audit5_balance", testAudit5Balance}, {"audit5_shutdown0", testAudit5Shutdown0}, {"audit5_shutdown1", testAudit5Shutdown1},
+        {"audit3_egl_last", testAudit3EglLast}, {"audit3_egl_refs", testAudit3EglRefs}, {"audit3_pbo", testAudit3Pbo}, {"audit3_xfer_shared", testAudit3XferShared}, {"audit3_stale_stamp", testAudit3StaleStamp}, {"audit4_xfer_own_pass", testAudit4XferOwnPass}, {"audit4_reads_b", testAudit4ReadsB}, {"audit4_reads_ctl", testAudit4ReadsCtl}, {"audit4_copygrow", testAudit4CopyGrow}, {"audit4_reinit", testAudit4Reinit}, {"audit5_perf", testAudit5Perf}, {"audit5_race", audit5ShutdownRace}, {"audit5_atomic_ro", audit5AtomicRO}, {"audit5_index_inplace", audit5IndexInPlace}, {"audit5_pass_split", audit5PassSplit}, {"audit5_after_shutdown", audit5AfterShutdown}, {"audit7_big_subdata", audit7BigSubData}, {"audit8_mixed_subdata", audit8MixedSubData}, {"audit9_ring_narrow", audit9RingNarrow}, {"audit9_threshold", audit9Threshold}, {"audit9_staging", audit9Staging}, {"audit9_presents", audit9Presents}, {"audit8_present_throw", revPresentThrow}, {"audit6_compile_hook", r4CompileHook}, {"audit6_link_hook", r4LinkHook}, {"audit6_compile_shutdown", r4CompileShutdown}, {"audit6_after_create", r4AfterCreate}, {"audit7_present_shutdown", revPresentShutdown}, {"audit7_swap_destroy", revSwapDestroy}, {"audit7_reinit", revReinitCycles}, {"audit7_init_race", revInitRace}, {"audit5_readonly", testAudit5Readonly}, {"audit5_texbuf", testAudit5TexBuf}, {"audit5_index", testAudit5IndexRead}, {"audit5_balance", testAudit5Balance}, {"audit5_shutdown0", testAudit5Shutdown0}, {"audit5_shutdown1", testAudit5Shutdown1},
     };
     auto it = tests.find(argv[1]);
     if (ok && it != tests.end()) it->second();
@@ -7600,6 +8370,10 @@ int main(int argc, char** argv) {
 namespace {
 void* bigNew(size_t n, size_t align, bool nothrow) {
     if (n >= (64u << 10) && gBigNewArmed) ++gBigNews;
+    if (gFailLateNew && n == 16 && !nothrow) {
+        gFailLateNew = false;
+        throw std::bad_alloc();
+    }
     void* p = align > alignof(std::max_align_t) ? std::aligned_alloc(align, (n + align - 1) / align * align) : std::malloc(n ? n : 1);
     if (!p && !nothrow) throw std::bad_alloc();
     return p;

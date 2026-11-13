@@ -2682,6 +2682,25 @@ void testScopedPool() {
   CHECK(true);
 }
 
+// State of the park-window hook of testBackground (a plain function pointer: the state is global).
+extern "C" void vpgpu_test_park_hook(void (*)(const void*));  // (background.cpp, test build only)
+struct ParkRace {
+  BackgroundGate* gate = nullptr;
+  std::mutex* registry = nullptr;
+  const void* owner = nullptr;
+  std::atomic<bool> ran{false}, released{false};
+  std::thread releaser;
+} gParkRace;
+void parkWindowHook(const void* owner) {
+  if (owner != gParkRace.owner || gParkRace.ran.exchange(true)) return;
+  gParkRace.releaser = std::thread([] {
+    std::lock_guard lock(*gParkRace.registry);
+    gParkRace.gate->release(gParkRace.owner);
+    gParkRace.released = true;
+  });
+  for (int i = 0; i < 300 && !gParkRace.released.load(); ++i) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+}
+
 // Background gate: commits park while the app is in the background, resume on foreground / release / shutdown.
 void testBackground() {
   using namespace std::chrono_literals;
@@ -2761,6 +2780,50 @@ void testBackground() {
     g.set(false);
     CHECK(until([&] { return done.load() == 2; }));
     b.join();
+  }
+  {  // waitForeground(owner, registry): the registry is dropped only once the wait is registered, so a release(owner) issued the moment
+     // the registry is free (a device being destroyed) always finds the parked thread (lost wake-up: it used to park for ever).
+     // Deterministic: the park hook (only in the test build of the gate) runs in the window between "the registry is held" and "the wait is
+     // registered", starts the releasing thread there (registry, then release(owner)) and waits for it to finish. With the registry held
+     // across the window it cannot get past the registry until the wait is registered (the hook gives up after 300 ms and goes on), so the
+     // release finds the parked thread; a gate that dropped the registry before the window lets it finish inside the hook and the parked
+     // thread then waits for ever. The hook runs in the same statement that takes the gate's lock, so a mutant of park() that unlocks the
+     // registry in any statement before that lock (before the hook's old place or between it and the lock alike) fails this every time;
+     // only a drop after the lock is taken is not caught, and it is harmless (release(owner) then waits for the gate's lock).
+    BackgroundGate g;
+    capture(g);
+    g.set(true);
+    int owner = 0;
+    std::mutex registry;
+    std::atomic<bool> held{false}, done{false};
+    gParkRace.gate = &g, gParkRace.registry = &registry, gParkRace.owner = &owner;
+    gParkRace.ran = false, gParkRace.released = false;
+    vpgpu_test_park_hook(parkWindowHook);
+    std::thread t([&] {
+      std::unique_lock lock(registry);
+      held = true;
+      g.waitForeground(&owner, lock);
+      CHECK(!lock.owns_lock());
+      done = true;
+    });
+    CHECK(until([&] { return held.load(); }));
+    const bool woke = until([&] { return done.load(); });
+    CHECK(woke);
+    CHECK(gParkRace.ran.load());  // (the hook ran: the test is not vacuous)
+    if (!woke) g.set(false);      // (a lost wake-up: let the thread go, the failure is already counted)
+    t.join();
+    vpgpu_test_park_hook(nullptr);
+    if (gParkRace.releaser.joinable()) gParkRace.releaser.join();
+    CHECK(gParkRace.released.load());
+    CHECK(woke && g.active());  // woken by the release, not by the resume
+    // foreground and the main thread: the registry is dropped as well, nothing parks
+    std::unique_lock lock(registry);
+    g.waitForeground(&owner, lock);  // (this thread is main)
+    CHECK(!lock.owns_lock());
+    g.set(false);
+    lock.lock();
+    g.waitForeground(&owner, lock);
+    CHECK(!lock.owns_lock());
   }
   {  // the main thread is never parked: it passes and is counted
     BackgroundGate g;

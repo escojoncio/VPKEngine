@@ -81,6 +81,9 @@ class Platform {
   // Every vpgpu::Device frame with an index below `frames` finished (fences). 0 ns polls.
   virtual WaitResult waitFrames(uint64_t /*frames*/, uint64_t /*timeoutNs*/) { return WaitResult::Done; }
   virtual bool lost() const { return false; }
+  // vkDestroyDevice: wakes the threads this platform's backend parked in the background gate (vpgpu::BackgroundGate, owner = the
+  // backend) while they hold the submit mutex, so that the destroy can take it; they commit and go on. Any thread, repeatable.
+  virtual void releaseBackground() {}
   // vpvk_dump_pending: logs the command buffers in flight (names, age, pipelines); nothing where there is no queue.
   virtual void dumpInFlight(const char* /*why*/) {}
   // Bytes the process may still allocate before the OS ends it (visionOS: os_proc_available_memory), 0 = unknown.

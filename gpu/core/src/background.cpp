@@ -2,6 +2,13 @@
 
 #include <cstdio>
 
+#ifdef VPGPU_BACKGROUND_TESTING  // (defined only by the vpgpu_core_bgtest object library the test executables link: the shipped library has no hook)
+namespace {
+std::atomic<void (*)(const void*)> gParkHook{nullptr};
+}
+extern "C" void vpgpu_test_park_hook(void (*f)(const void*)) { gParkHook = f; }
+#endif
+
 namespace vpgpu {
 
 void BackgroundGate::log(const std::string& line) const {
@@ -64,19 +71,36 @@ void BackgroundGate::removeResumeHook(uint64_t id) {
   resumeHooks_.erase(id);
 }
 
-void BackgroundGate::waitForeground(const void* owner) {
-  if (!active()) return;
+void BackgroundGate::waitForeground(const void* owner) { park(owner, nullptr); }
+
+void BackgroundGate::waitForeground(const void* owner, std::unique_lock<std::mutex>& registry) { park(owner, &registry); }
+
+void BackgroundGate::park(const void* owner, std::unique_lock<std::mutex>* registry) {
+  // Lock order: the caller's registry, then the gate's lock (nothing takes them the other way round). The registry goes before the
+  // wait starts, but only once the wait is registered under the gate's lock: a release(owner) issued after the registry was
+  // dropped (a device being destroyed) then finds this thread among the waiters instead of passing before it.
+  auto dropRegistry = [&] { if (registry && registry->owns_lock()) registry->unlock(); };
+  if (!active()) return dropRegistry();
+#ifdef VPGPU_BACKGROUND_TESTING
+  // Test hook: called with the caller's registry still held, as part of taking the gate's lock (the window the registry closes), so a test
+  // can run the worst interleaving (another thread releasing `owner` the moment the registry is free) there on purpose, not by timing.
+  // It is in the same statement as the lock, not before it: a registry dropped by any statement before the lock is then dropped before
+  // the hook too, there is no gap between the hook and the lock where a drop would go unseen.
+  std::unique_lock lock = ([&] { if (auto* h = gParkHook.load()) h(owner); }(), std::unique_lock(mutex_));
+#else
   std::unique_lock lock(mutex_);
-  if (!background_ || shutdown_) return;
+#endif
+  if (!background_ || shutdown_) return dropRegistry();
   if (std::this_thread::get_id() == main_) {
     ++mainPassed_;
-    return;
+    return dropRegistry();
   }
   ++episodeBlocked_, ++blockedTotal_;
   const uint64_t epoch = epoch_;
   OwnerState* st = owner ? &owners_[owner] : nullptr;  // (std::map nodes are stable while waiters > 0 keeps the entry)
   const uint64_t ownerEpoch = st ? st->epoch : 0;
   if (st) ++st->waiters;
+  dropRegistry();
   cv_.wait(lock, [&] { return !background_ || shutdown_ || epoch_ != epoch || (st && st->epoch != ownerEpoch); });
   if (st && --st->waiters == 0) owners_.erase(owner);
 }

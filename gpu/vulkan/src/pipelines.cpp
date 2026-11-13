@@ -3309,7 +3309,9 @@ void awaitFreshVariants(Device* dev) {
   keys.swap(dev->uiMask.freshVariants);
   // One budget for the whole call, however many variants: they compile in parallel on the core's workers and the wait has one absolute
   // deadline (the submit mutex is held meanwhile, and vpvk_native_submit / vpvk_mark_eye_image / vkGetMTLTextureMVK wait behind it). A
-  // frame with more new variants than the workers finish in one budget sends the rest still compiling: the draw gate covers them.
+  // frame with more new variants than the workers finish in one budget (2 s by default) sends the rest still compiling, and the draw
+  // gate then SKIPS the draws that use them in that frame (they draw from the frame their variant is ready). Intended: the submit
+  // (under submitMutex) stays bounded instead of waiting for every compile; the skipped draws are counted (vk.pipeline_skip).
   awaitPipelines(dev, keys, drawWaitMs(), "uimask_variant");
 }
 

@@ -249,7 +249,16 @@ struct R {
   std::unordered_map<uint64_t, uintptr_t> h;  // id -> the driver's handle
   // Objects the file creates and never destroys (a capture ends where the application stops): destroyed at the end, newest first,
   // before the device goes (id, name of the destroy call).
+  // An entry the file destroyed itself (forget) keeps its place with a null name; madeAt_ finds the entries of an id (forget was O(n)
+  // per destroy: a capture that creates and destroys many objects was quadratic). When those tombstones (deadMade_) outnumber the live
+  // entries the vector is compacted (order kept) and madeAt_ rebuilt, so a long capture does not keep one entry per object it ever made.
   std::vector<std::pair<uint64_t, const char*>> made_;
+  std::unordered_map<uint64_t, std::vector<size_t>> madeAt_;
+  size_t deadMade_ = 0;
+  void addMade(uint64_t id, const char* destroy) {
+    madeAt_[id].push_back(made_.size());
+    made_.emplace_back(id, destroy);
+  }
   bool missing = false;                       // a nonzero id the call uses is unknown
   std::unordered_map<uint64_t, MemRec> mems;
   std::unordered_map<uint64_t, Need> need;
@@ -1287,7 +1296,22 @@ struct R {
     else return nullptr;
   }
   void forget(uint64_t id) {  // the file destroyed it itself: nothing to clean up at the end
-    made_.erase(std::remove_if(made_.begin(), made_.end(), [&](const auto& m) { return m.first == id; }), made_.end());
+    const auto it = madeAt_.find(id);
+    if (it == madeAt_.end()) return;
+    for (size_t at : it->second) made_[at].second = nullptr;
+    deadMade_ += it->second.size();
+    madeAt_.erase(it);
+    if (deadMade_ * 2 > made_.size()) {
+      size_t out = 0;
+      madeAt_.clear();
+      for (size_t i = 0; i < made_.size(); ++i) {
+        if (!made_[i].second) continue;
+        madeAt_[made_[i].first].push_back(out);
+        made_[out++] = made_[i];
+      }
+      made_.resize(out);
+      deadMade_ = 0;
+    }
   }
   // What is left of the objects the file made when it ends (the file's own destroy calls took theirs out of `h`).
   void destroyLeftovers() {
@@ -1299,6 +1323,7 @@ struct R {
     if (internalPool) fn<id::vkDestroyCommandPool>()(device, internalPool, nullptr), internalPool = VK_NULL_HANDLE;
     if (recapturePool) fn<id::vkDestroyCommandPool>()(device, recapturePool, nullptr), recapturePool = VK_NULL_HANDLE;
     for (size_t i = made_.size(); i-- > 0;) {
+      if (!made_[i].second) continue;
       const auto it = h.find(made_[i].first);
       if (it == h.end()) continue;
       auto d = gdpa(device, made_[i].second);
@@ -1306,6 +1331,8 @@ struct R {
       h.erase(it);
     }
     made_.clear();
+    madeAt_.clear();
+    deadMade_ = 0;
   }
   template <uint16_t ID>
   static constexpr bool kKeeps = ID == id::vkCreateRenderPass || ID == id::vkCreateRenderPass2;
@@ -1366,7 +1393,7 @@ struct R {
         for (size_t i = 0; i < ids.size(); ++i) reg(ids[i], out[i]);
         if constexpr (destroyName<ID>() != nullptr)
           for (size_t i = 0; i < ids.size(); ++i)
-            if (ids[i] && h.count(ids[i])) made_.emplace_back(ids[i], destroyName<ID>());
+            if (ids[i] && h.count(ids[i])) addMade(ids[i], destroyName<ID>());
         if (!ids.empty()) made<ID>(c, a, ids);
       }
     }
@@ -1556,7 +1583,7 @@ void run<id::vkAllocateMemory>(R& r, const Call& c) {
   }
   r.mems[memId] = m;
   r.reg(memId, mem);
-  r.made_.emplace_back(memId, "vkFreeMemory");
+  r.addMade(memId, "vkFreeMemory");
 }
 
 template <>

@@ -138,6 +138,12 @@ struct EmitOptions {
     // for each such slot; a null or missing buffer has size 0). Out of range: loads give 0,
     // stores and atomics do nothing (atomics return 0). Constant buffers are not checked.
     bool robustBuffers = false;
+    // With robustBuffers: a load or store of a vector of 32-bit words (2 to 4) that crosses the end of the range is checked word by word, as GCN
+    // checks each dword of a buffer_load_dwordx4: the words inside the range are read / written, the others read 0 / are dropped. Without it
+    // (Vulkan's robustBufferAccess allows either) the whole access is dropped. In-range accesses run the same code in both modes (one compare,
+    // one access); the per-word code sits in the `else` of that compare, 4 more compares and accesses for a vec4 that are not executed unless the
+    // access crosses the end.
+    bool robustPerWord = false;
     // A SamplerBias argument (float, written by the backend) for every sampler used by a sample, added to
     // its lod: level(l + bias), bias(b + bias), gradients scaled by exp2(bias). Fragment-stage implicit
     // sampling only; gather and query_lod are unaffected.

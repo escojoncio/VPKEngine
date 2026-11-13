@@ -10,6 +10,8 @@ foreach(f ${cases})
     add_test(NAME vpmsl.golden.${n} COMMAND vpmsl_golden ${f} ${CMAKE_CURRENT_SOURCE_DIR}/${n}.metal --rate-map)
   elseif(n STREQUAL "sampler_bias_fs")  # emitted with EmitOptions::samplerBias
     add_test(NAME vpmsl.golden.${n} COMMAND vpmsl_golden ${f} ${CMAKE_CURRENT_SOURCE_DIR}/${n}.metal --sampler-bias)
+  elseif(n STREQUAL "robust_vec")  # emitted with EmitOptions::robustBuffers + robustPerWord
+    add_test(NAME vpmsl.golden.${n} COMMAND vpmsl_golden ${f} ${CMAKE_CURRENT_SOURCE_DIR}/${n}.metal --robust-word)
   else()
     add_test(NAME vpmsl.golden.${n} COMMAND vpmsl_golden ${f} ${CMAKE_CURRENT_SOURCE_DIR}/${n}.metal)
   endif()

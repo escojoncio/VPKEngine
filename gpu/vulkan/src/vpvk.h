@@ -1098,6 +1098,9 @@ struct Device : Dispatchable {
   uint64_t nextSummaryMs = 20000;
   uint64_t zeroCleared = 0;  // images cleared so far
   uint32_t zeroLogLines = 0;
+  // Images vpvk_image_zero_clear was asked to clear from inside a vpvk_native_submit callback (zeroPending keys; submitMutex): cleared
+  // by the next vpvk_native_submit, in the frame queue before its native command buffers.
+  std::vector<uint64_t> zeroClearDeferred;
   // Occlusion query counters (Metal visibility result buffer, pipelines.cpp): one host-aliased
   // buffer per device, `used` = (first slot, count) ranges of live pools, sorted.
   struct Visibility {
