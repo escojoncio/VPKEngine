@@ -1281,6 +1281,44 @@ void sampleMask(const std::string& dir) {
     if (failures || std::getenv("VP_PRINT")) std::fprintf(stderr, "%s\n", r.msl.source.c_str());
 }
 
+// VPVK_UI_TINT diagnostic (SpirvLowerOptions::uiTint): colour output 0 becomes constant magenta (1, 2) or its own rgb with alpha 1 (3);
+// 0 leaves the MSL untouched. tex_tint.frag writes texture * tint at location 0 (non-constant alpha).
+void uiTint(const std::string& dir) {
+    spirv::SpirvLowerOptions o;
+    o.entry = "main";
+    o.stage = vpir::Stage::Fragment;
+    o.layout = {bind(0, 0, vpgpu::BindKind::Texture, 0, 0)};
+    o.pushConstantSlot = 2;
+    const std::string path = dir + "/tex_tint.frag.spv";
+    Result plain = run(path, o);
+    CHECK(plain.ok);
+    if (!plain.ok) return;
+    CHECK(plain.msl.source.find("float4(1.0f, 0.0f, 1.0f, 1.0f)") == std::string::npos);
+    CHECK(!plain.iface.uiTinted);
+    spirv::SpirvLowerOptions z = o;
+    z.uiTint = 0;
+    Result again = run(path, z);
+    CHECK(again.ok && again.msl.source == plain.msl.source && vpmsl::shaderId(again.msl) == vpmsl::shaderId(plain.msl));
+    for (uint8_t mode : {uint8_t(1), uint8_t(2)}) {
+        o.uiTint = mode;
+        Result r = run(path, o);
+        CHECK(r.ok && r.iface.colorOutputs == plain.iface.colorOutputs);
+        if (!r.ok) continue;
+        CHECK(r.iface.uiTinted);
+        CHECK(r.msl.source.find("float4(1.0f, 0.0f, 1.0f, 1.0f)") != std::string::npos);
+        CHECK(r.msl.source != plain.msl.source && vpmsl::shaderId(r.msl) != vpmsl::shaderId(plain.msl));
+        if (failures || std::getenv("VP_PRINT")) std::fprintf(stderr, "---- tint %u\n%s\n", unsigned(mode), r.msl.source.c_str());
+    }
+    o.uiTint = 3;
+    Result a1 = run(path, o);
+    CHECK(a1.ok);
+    if (!a1.ok) return;
+    CHECK(a1.iface.uiTinted);
+    CHECK(a1.msl.source != plain.msl.source && a1.msl.source.find("float4(1.0f, 0.0f, 1.0f, 1.0f)") == std::string::npos);
+    CHECK(a1.msl.source.find(", 1.0f);") != std::string::npos);
+    if (failures || std::getenv("VP_PRINT")) std::fprintf(stderr, "---- tint 3\n%s\n", a1.msl.source.c_str());
+}
+
 // D24 emulation (SpirvLowerOptions::d24Emul): the fragment shader writes its depth rounded to 24 bits UNORM. solid.frag writes none: it
 // gets [[depth(any)]] = FragCoord.z + the draw's bias (vp_dbias), rounded; depth_write.frag writes 0.001: the value is rounded, no bias.
 // Without the option the MSL is exactly what it was (no depth output, no bias parameter).
@@ -2816,6 +2854,7 @@ int main(int argc, char** argv) {
     else if (c == "f16_insert") f16Insert(dir);
     else if (c == "submask") subgroupMasks(dir);
     else if (c == "sample_mask") sampleMask(dir);
+    else if (c == "ui_tint") uiTint(dir);
     else if (c == "d24_emul") d24Emul(dir);
     else if (c == "depth_tile") depthTile(dir);
     else if (c == "ycbcr") ycbcr(dir);

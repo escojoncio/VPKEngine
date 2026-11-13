@@ -555,8 +555,20 @@ void recordInPassBarrier(Recorder&);
 // mask (retranslated from the SPIR-V kept by the pipeline); otherwise the slot is bound with write mask
 // 0. A UI variant that cannot be translated falls back to the plain one. False: no variant (failed
 // pipeline); the draw is then left out of the mask pass logic by the caller.
+// `diag` (only with `ui`; VPVK_PASS_DUMP windows, gpu.pdump.vis): 0 = the '.umu' as always, 1 = the same without depth test and cull, 2 = the
+// same with alphaTest (coverage alpha >= 0.5); the diag 2 fragment stage (alphaTest forced) is not recorded in the recipes.
 bool maskPipelineKey(Device*, const PipelineObj& p, PipelineObj::TexelVariant* tv, uint8_t passSamples, bool ui,
-                     vpgpu::PipelineKey& out);
+                     vpgpu::PipelineKey& out, uint8_t diag = 0);
+// gpu.pdump.vis (VPVK_PASS_DUMP): gives `dr` a visibility counter from the device's ring and notes `what` for the log line; false when
+// the ring, the per-submission cap or the buffer is exhausted or `dr` already counts (the game's own occlusion query).
+bool pdumpVisAssign(Device*, vpgpu::Draw& dr, const std::string& what);
+// After the frame that translated the draws: `doneAt` = Device::submittedFrames() once it was sent, UINT64_MAX when it was not (the
+// counters it handed out are taken back).
+void pdumpVisStamp(Device*, uint64_t doneAt);
+// The draw `dr` (counted by pdumpVisAssign in the submission being translated) was removed before reaching the GPU: its log line says dropped=1.
+void pdumpVisDropped(Device*, const vpgpu::Draw& dr);
+// Logs "gpu.pdump.vis samples=N <what>" for the counters whose frame the GPU has finished (Device::completedFrames).
+void pdumpVisFlush(Device*);
 // Depth in tile (pipelines.cpp): the key of pipeline `p` (or its texel variant `tv`) for a draw of a pass that keeps the depth in
 // colour attachment kDepthTileSlot. kind: kDepthTileWrite (fragment shader retranslated to also write the depth), kDepthTileFetch
 // (retranslated to read the multisampled depth input attachment at texture slot `texSlot` from it), kDepthTileState (the plain

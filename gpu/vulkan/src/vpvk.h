@@ -680,6 +680,7 @@ struct PipelineObj {
     const TexelVariant* tv = nullptr;
     uint8_t samples = 0;
     bool ui = false, ok = false;
+    uint8_t diag = 0;  // gpu.pdump.vis experiment (VPVK_PASS_DUMP windows only): 0 = the plain '.umu', 1 = no depth test / cull, 2 = alphaTest
     vpgpu::PipelineKey key{};
     uint64_t fragment = 0;  // fragment shader id of the variant (tests)
   };
@@ -1109,6 +1110,24 @@ struct Device : Dispatchable {
     vpgpu::BufferId id;
     std::vector<std::pair<uint32_t, uint32_t>> used;
   } visibility;
+  // "gpu.pdump.vis" (pipelines.cpp pdumpVis*): UI draws of the VPVK_PASS_DUMP windows get one visibility counter each from a ring of
+  // slots in the buffer above; the samples they passed are logged once the GPU has finished their frame (a slot is not reused before).
+  struct PdumpVis {
+    std::mutex m;
+    uint32_t base = UINT32_MAX, next = 0;
+    bool tried = false;
+    uint64_t perSubmit = UINT64_MAX;  // the submission `perCount` draws were given counters in
+    uint32_t perCount = 0;
+    unsigned lines = 0;
+    struct Item {
+      uint32_t slot;
+      uint64_t submit;
+      uint64_t done;  // UINT64_MAX until its frame is sent; then the vpgpu frame count that includes it (the GPU is done once completedFrames() reaches it)
+      std::string what;
+      bool dropped = false;  // the draw never reached the GPU (the pipeline gate or VPVK_SKIP_PASS removed it): its counter says nothing
+    };
+    std::vector<Item> items;
+  } pdumpVis;
 };
 void releaseVisibility(Device*);  // vkDestroyDevice
 inline uint64_t markedEyeOf(const Device* d) { return d ? d->eyeSize.load(std::memory_order_relaxed) : 0; }  // (packEyeSize)

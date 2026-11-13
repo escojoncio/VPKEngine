@@ -5,6 +5,7 @@
 #include <atomic>
 
 #include <bit>
+#include <cctype>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -760,6 +761,7 @@ struct Translator {
   UiMaskState* um = nullptr;
   taa::DrawClassifier ownClassifier;  // when there is no device state (tests)
   bool maskPass = false;              // the open pass has the mask attachment: every draw uses a mask variant
+  int pdWin = -2;                     // passDumpWindow of this translation (-2: not asked yet); only read with VPVK_PASS_DUMP
   UiMaskState::EyePass* eyeRec = nullptr;  // the open eye pass's record (depth the host did not give)
   // Foveation (foveation.h): `fovs` non-null = rate maps may apply. fovPass: the open pass carries a rate map.
   // fovSuppressed: the eye pass already went on unfoveated (UI split), a reopen must not foveate it again.
@@ -1737,12 +1739,48 @@ struct Translator {
     // EDS is only exposed behind VPVK_EXTRA_EXTENSIONS (CTS), where the native TAA is forced off, so the
     // two never meet in practice; if they do, the draw keeps its EDS key (Metal may then reject the
     // attachment mismatch with slot 7 - logged by the backend).
+    // gpu.pdump.vis: inside a VPVK_PASS_DUMP window the UI draws of an eye pass rotate, window by window, through three '.umu' variants
+    // (0 plain, 1 without depth test and cull, 2 alphaTest) and count their own samples. Outside the windows `win` stays -1 and
+    // nothing below differs from a run without VPVK_PASS_DUMP.
+    int win = -1;
+    if (cls == taa::DrawClass::Ui && eyeScene && um && passDump().on) {
+      if (pdWin == -2) pdWin = passDumpWindow(passDump());
+      win = pdWin;
+    }
+    bool diagApplied = false;  // win >= 0: the draw really got the '.umu' variant win % 3 (else var=0 is logged, and the draw is the plain one or '.umu')
     if (maskPass && um && d.pipe && !d.edsVariant) {
       vpgpu::PipelineKey k;
-      if (maskPipelineKey(um->dev, *d.pipe, d.texelVariant, forceN ? forceN : d.passSamples, cls == taa::DrawClass::Ui, k)) dr.pipeline = k;
+      const uint8_t diag = win >= 0 ? uint8_t(win % 3) : uint8_t(0);
+      const uint8_t samplesN = forceN ? forceN : d.passSamples;
+      if (win >= 0 && um->dev->translator) {  // (asynchronous: the diag variants are only requested now, never drawn; later windows apply them once Ready)
+        vpgpu::PipelineKey pre;
+        maskPipelineKey(um->dev, *d.pipe, d.texelVariant, samplesN, true, pre, 1);
+        maskPipelineKey(um->dev, *d.pipe, d.texelVariant, samplesN, true, pre, 2);
+      }
+      bool ok = maskPipelineKey(um->dev, *d.pipe, d.texelVariant, samplesN, cls == taa::DrawClass::Ui, k, diag);
+      diagApplied = ok;
+      // Asynchronous device: nobody waits for a diagnostic variant and the pipeline gate drops the draws of one still compiling, which
+      // would delete UI from the eye. Until it is ready the draw uses the normal variant.
+      if (ok && diag && um->dev->translator && um->dev->gpu->pipelines().status(k) != vpgpu::PipelineCache::Status::Ready) {
+        ok = maskPipelineKey(um->dev, *d.pipe, d.texelVariant, samplesN, true, k, 0);
+        diagApplied = false;
+      }
+      if (ok) dr.pipeline = k;
       else if (passDump().on) ++passNote().fallbackMask;  // no mask variant: the draw keeps its plain pipeline
     }
     if (cls == taa::DrawClass::Ui) {  // 2D drawn into the eye buffer: no jitter, the mask marks it
+      if (win >= 0 && d.pipe) {
+        char what[256];
+        std::string lbl = d.pipe->state.label.substr(0, 40);
+        for (char& c : lbl)
+          if (!(std::isalnum(static_cast<unsigned char>(c)) || c == '.' || c == '_' || c == '-')) c = '_';
+        std::snprintf(what, sizeof what, "pass=%u var=%d applied=%d pipe=%s depth=%d wr=%d blend=%d count=%u inst=%u idx=%d vp=%gx%g",
+                      passOpen ? unsigned(frame.commands().size() - 1) : kNoPass, diagApplied ? win % 3 : 0, int(diagApplied),
+                      lbl.empty() ? "-" : lbl.c_str(),
+                      int(d.depthTested), int(d.depthWrite), int(d.blended), dr.count, dr.instances, int(bool(dr.index)),
+                      double(dr.viewport.width), double(dr.viewport.height));
+        pdumpVisAssign(um->dev, dr, what);
+      }
       ++st.taaSkipped;
       return;
     }
@@ -2397,7 +2435,10 @@ struct Translator {
   // The last step of a draw: into the frame, or (VPVK_SKIP_PASS) dropped here, after everything else the draw does (pass splits, zero-init
   // touches, jitter and census counters), so the pass numbering is the same with and without the skip.
   void emit(const OpDraw& d, vpgpu::Draw dr) {
-    if (skippedPass()) return skipDraw(SkipReason::Experiment);
+    if (skippedPass()) {
+      if (dr.visibility) pdumpVisDropped(devForce(), dr);  // (gpu.pdump.vis: a counted draw that never reaches the GPU)
+      return skipDraw(SkipReason::Experiment);
+    }
     if (passDump().on) {
       PassNote& n = passNote();
       ++n.draws;

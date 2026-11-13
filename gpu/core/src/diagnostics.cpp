@@ -315,7 +315,7 @@ struct TexEv {
 
 std::vector<std::string> formatPassDump(uint64_t frame, const Frame& f, const CompiledFrame& c, const ResourceTable* res,
                                         const PipelineCache* pipes) {
-  constexpr size_t kMaxLinks = 40, kMaxList = 24, kMaxPipes = 3;
+  constexpr size_t kMaxLinks = 40, kMaxList = 24, kMaxPipes = 3, kMaxUmuPipes = 12, kMaxUmuFrame = 48;  // (umu lines: their own quota, the dump's 300-line cap must still hold the drop / tex / enc lines after them)
   const std::vector<Command>& cmds = f.commands();
   const unsigned long long fr = frame;
   std::vector<int> encOf(cmds.size(), -1), enc2Of(cmds.size(), -1);
@@ -342,6 +342,7 @@ std::vector<std::string> formatPassDump(uint64_t frame, const Frame& f, const Co
 
   std::vector<std::string> passLines;
   uint32_t renderPasses = 0;  // render passes before command i: the `rp=` of its line
+  size_t umuFrame = 0;        // '.umu' pipeline lines of the frame so far
   for (uint32_t i = 0; i < cmds.size(); ++i) {
     if (const auto* dp = std::get_if<Dispatch>(&cmds[i])) {
       for (const Access& a : dp->bindings) accessEv(a, i);
@@ -365,8 +366,9 @@ std::vector<std::string> formatPassDump(uint64_t frame, const Frame& f, const Co
       if (resolved && a.resolve) add(&TexEv::w, a.resolve, i, true);
     }
     struct PipeUse {
-      uint32_t draws = 0, inst = 0;
-      uint64_t count = 0;
+      uint32_t draws = 0, inst = 0, idxDraws = 0;
+      uint64_t count = 0, idxCount = 0;
+      std::vector<TextureId> tex;  // distinct sampled textures (at most 16 kept)
     };
     struct ResUse {
       uint32_t reads = 0, writes = 0;
@@ -393,6 +395,7 @@ std::vector<std::string> formatPassDump(uint64_t frame, const Frame& f, const Co
         inst += d.instances, instMax = std::max(instMax, d.instances);
         work += uint64_t{d.count} * d.instances;
         pu.count += d.count, pu.inst += d.instances;
+        if (d.index) ++pu.idxDraws, pu.idxCount += d.count;
       }
       ++vps[{d.viewport.x, d.viewport.y, d.viewport.width, d.viewport.height}];
       ++scs[{d.scissor.x, d.scissor.y, d.scissor.width, d.scissor.height}];
@@ -406,6 +409,11 @@ std::vector<std::string> formatPassDump(uint64_t frame, const Frame& f, const Co
       for (const Access& b : d.bindings) {
         accessEv(b, i);
         if (b.range.kind == ResourceRange::Kind::Sampler || b.pixelLocal) continue;
+        if (b.range.kind == ResourceRange::Kind::Texture && pu.tex.size() < 16) {
+          bool seen = false;
+          for (const TextureId& t : pu.tex) seen = seen || (t.index == b.range.index && t.generation == b.range.generation);
+          if (!seen) pu.tex.push_back(TextureId{b.range.index, b.range.generation});
+        }
         ResUse& u = resUse[{b.range.kind == ResourceRange::Kind::Texture ? 0 : 1, b.range.index, b.range.generation}];
         ++(b.write ? u.writes : u.reads);
       }
@@ -455,6 +463,27 @@ std::vector<std::string> formatPassDump(uint64_t frame, const Frame& f, const Co
       }
       else kv(pl, " key=%016llx state=unknown", (unsigned long long)busiest[k].second);
       passLines.push_back(std::move(pl));
+    }
+    // The UI-mask variants ('.umu' in the label) of the pass, beyond the 3 busiest: draws, indexed draws / indices and the textures they sample.
+    if (pipes) {
+      size_t shown = 0;
+      for (size_t k = 0; k < busiest.size() && shown < kMaxUmuPipes && umuFrame < kMaxUmuFrame; ++k) {
+        PipelineState ps;
+        if (!pipes->stateOf(PipelineKey{busiest[k].second}, ps) || ps.label.find(".umu") == std::string::npos) continue;
+        const PipeUse& u = pipeUse[busiest[k].second];
+        ps.label = clean(ps.label, 40);
+        std::string pl = "gpu.pdump.pipe";
+        kv(pl, " f=%llu pass=%u umu=%zu draws=%u idx_draws=%u idx=%llu count=%llu inst=%u tex=[", fr, i, shown, u.draws, u.idxDraws,
+           (unsigned long long)u.idxCount, (unsigned long long)u.count, u.inst);
+        for (size_t t = 0; t < u.tex.size() && t < 6; ++t) {
+          const TextureDesc* d = res ? res->get(u.tex[t]) : nullptr;
+          kv(pl, "%st%u:%s:%ux%u", t ? "," : "", u.tex[t].index, d ? formatInfo(d->format).name : "?", d ? d->width : 0u, d ? d->height : 0u);
+        }
+        if (u.tex.size() > 6) kv(pl, ",+%zu", u.tex.size() - 6);
+        pl += "] " + describePipelineState(ps);
+        passLines.push_back(std::move(pl));
+        ++shown, ++umuFrame;
+      }
     }
 
     for (int dir = 0; dir < 2; ++dir) {  // 0 read, 1 written

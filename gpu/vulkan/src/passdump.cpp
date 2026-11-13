@@ -113,6 +113,11 @@ bool passDumpNext(PassDump& p, int64_t nowNs) {
   return true;
 }
 
+int passDumpWindow(const PassDump& p) {
+  if (!p.on || !p.windows || p.seen < p.start || p.seen >= p.windowEnd) return -1;
+  return int(p.windows) - 1;
+}
+
 uint8_t texCensusFlags(const Image& im) {
   uint8_t f = 0;
   if (std::max(im.desc.width, im.desc.height) <= 64) f |= kTexLe64;

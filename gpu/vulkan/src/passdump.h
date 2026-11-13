@@ -95,6 +95,12 @@ bool passDumpScene(const vpgpu::Frame&, vpgpu::Device&);
 // the previous one opened, kPassDumpWindows in all). nowNs < 0 = the steady clock.
 bool passDumpNext(PassDump&, int64_t nowNs = -1);
 
+// Read-only twin of passDumpNext for a submission that is being translated (whether it is a scene frame is only known after):
+// the ordinal (0 for the first) of the dump window that is open now, so a scene frame translated now falls inside it; -1 when none
+// is open. A window that has not been opened yet (the minute passed, or `start` not reached) is not announced: it opens on a scene
+// frame, which passDumpNext decides after the translation.
+int passDumpWindow(const PassDump&);
+
 // TexFlag bits of a sampled image.
 uint8_t texCensusFlags(const Image&);
 // Draws per command of a frame (0 for what is not a render pass): taken before and after the pipeline gate to see what it dropped.

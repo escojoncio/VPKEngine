@@ -159,6 +159,10 @@ struct SpirvLowerOptions {
   // against the buffer's size. Not a lowering input, but it changes the MSL, so it is part of a recipe input: VPVK_ROBUST
   // (config.cpp) decides it per translation. true = the MSL is byte-identical to before. Recipes: trailing, if false.
   bool robustBuffers = true;
+  // Fragment, diagnostic (VPVK_UI_TINT, pipelines.cpp maskPipelineKey): colour output 0 (float vec4, location 0) is replaced at the end of
+  // main: 1 and 2 = constant magenta (1, 0, 1, 1), 3 = its own rgb with alpha 1. 0 = the MSL is byte-identical to before. A tinted stage
+  // is never recorded in the recipes (translateStage skips the store); the serialisation (emit flags bit 5) keeps the hash apart anyway.
+  uint8_t uiTint = 0;
 };
 
 struct SpirvInterface {
@@ -169,6 +173,8 @@ struct SpirvInterface {
   // Vertex: multiview through vertex amplification (SpirvLowerOptions::amplify accepted for this shader): the draw must
   // NOT multiply instances by the view count, and the backend sets the amplification count.
   bool amplified = false;
+  // Fragment: SpirvLowerOptions::uiTint was set and colour output 0 (float vec4) was replaced. Not stored in the recipes (a tinted stage is never recorded).
+  bool uiTinted = false;
 };
 
 // D24 emulation (SpirvLowerOptions::d24Emul) leaves a fragment shader as it is when it has early fragment tests and may write

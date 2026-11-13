@@ -22,6 +22,7 @@
 #include <array>
 #include <atomic>
 #include <cstdint>
+#include <cstdlib>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -246,6 +247,16 @@ struct Image {  // a VkImage with its memory
 using ImageP = std::shared_ptr<Image>;
 // The sample count a request of `n` (> 1) samples is rendered with: 2 or 4 (MAX_SAMPLES).
 inline uint32_t renderSamples(uint32_t n) { return n <= 2 ? 2u : 4u; }
+// Diagnostic probes (gles.text_probe, gles.r8_upload): on with VPVK_PASS_DUMP defined or VPVK_GLES_PROBE=1; otherwise the hot paths do nothing.
+inline bool diagProbeOn() {
+    static const bool on = [] {
+        const char* p = std::getenv("VPVK_GLES_PROBE");
+        if (p && *p) return p[0] == '1';
+        const char* d = std::getenv("VPVK_PASS_DUMP");  // (same rule as vpvk::parsePassDump: unset, empty or "0" is off)
+        return d && *d && !(d[0] == '0' && !d[1]);
+    }();
+    return on;
+}
 // A 2D (array) image of `samples` samples with its device-local memory bound; null when Vulkan refuses it. The caller
 // records Context::imageInit.
 ImageP createImage2D(Device* dev, const FormatInfo* f, uint32_t w, uint32_t h, uint32_t layers, uint32_t samples,
@@ -457,6 +468,8 @@ struct Program {
     std::vector<GLuint> storageBindings;            // per reflection.storageBlocks entry: GL binding point
     std::unordered_map<uint64_t, VkPipeline> pipelines;
     uint64_t serial = 0;  // unique id (pipeline cache keys)
+    bool textProbed = false;  // gles.text_probe already looked at this program (diagnostics only)
+    uint8_t textProbeMisses = 0;  // draws gles.text_probe looked at without finding a texture to probe; textProbed is set after 3
     ~Program();
 };
 
@@ -979,6 +992,11 @@ private:
     FbInfo drawFb_;
     uint32_t indexMax_ = 0;
     bool vertexRowsUnknown_ = false;  // set by the draws whose vertex rows are not told to prepareDraw (indirect, indices not scanned)
+    // Diagnostics (gles.text_probe): the first indices of the current indexed draw (+ baseVertex), set by drawElements while
+    // the probe budget lasts; the probe itself runs at the end of prepareDraw.
+    uint32_t probeIdx_[4] = {0, 0, 0, 0};
+    uint32_t probeIdxN_ = 0;
+    void textProbe(Program& p, uint32_t firstVertex, uint32_t vertexCount, bool indexed);
     bool provokeOk_ = false;  // set by drawArrays/drawElements, the draws that can run as a rotated list; read once by prepareDraw
     bool provoke_ = false;  // this draw runs as an index list with each primitive's last vertex first (flat varyings, see prepareDraw)
     std::unique_ptr<Texture> black_;

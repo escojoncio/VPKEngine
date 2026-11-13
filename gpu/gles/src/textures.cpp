@@ -229,6 +229,21 @@ void Context::copyBufferToImage(const ImageP& img, uint32_t level, uint32_t laye
                                 uint32_t w, uint32_t h, uint32_t d, const uint8_t* data, size_t bytes, bool stencilPlane) {
     Alloc a = stream(bytes, 16);
     std::memcpy(a.host, data, bytes);
+    // Diagnostics (gles.r8_upload): uploads to 1-channel textures of 256 px or more, 64 lines per process.
+    if (diagProbeOn() && img->format && img->format->texelBytes == 1 && !img->format->compressed && !img->format->depth && !img->format->stencil &&
+        (img->width >= 256 || img->height >= 256)) {
+        static std::atomic<int> said{0};
+        if (said.load(std::memory_order_relaxed) < 64 && said.fetch_add(1) < 64) {
+            size_t nz = 0;
+            uint8_t mx = 0;
+            for (size_t i = 0; i < bytes; ++i) {
+                nz += data[i] != 0;
+                mx = std::max(mx, data[i]);
+            }
+            logf("gles.r8_upload img=%ux%u level=%u layer=%u rect=%d,%d,%d %ux%ux%u bytes=%zu nonzero=%zu max=%u internal=0x%x", img->width, img->height,
+                 level, layer, x, y, z, w, h, d, bytes, nz, unsigned(mx), unsigned(img->format->internal));
+        }
+    }
     queueUpload(img, level, layer, x, y, z, w, h, d, a, stencilPlane);
 }
 

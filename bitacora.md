@@ -65,6 +65,13 @@ Clientes: VisionQuestPro (foco), AVP, AstroVisionPro. Licencia PolyForm Noncomme
 - **AstroVisionPro (PS4)**: `robustBuffers` (V# fuera de rango lee 0; comprobar que ningún shader dependía de leer más allá de `num_records`); evicción de targets (`Hooks::targetBudgetBytes`, 0 = 2 GiB, sin verificar en visionOS; protege los últimos 8 presentados; solo si el host llama a `colorTargetAt/Slice`); `rcp/rsqrt` con tablas Intel (`VP_RCP_MODEL`; Jaguar usa otras, sin medir); `CompletionFrontier` congela `completed()` si un índice nunca llega (el renderer degrada a «todo ocupado» tras 64 frames).
 - **Todos**: tras actualizar el submódulo recompilar; las copias firmadas OnDemand cambian de nombre (hash) y las viejas se borran solas.
 
+## Integración con origin/main (2026-11-13) y últimos cambios de contrato
+- Se fusionaron 3 commits de origin/main (sondas GLES de texto `gles.text_probe`/`gles.r8_upload`, diagnósticos de texto UI `gpu.pdump.vis`, `VPVK_UI_TINT`). Todos solo actúan con su variable de entorno. Conflictos resueltos en `gpu/gles/src/{context.h,draw.cpp,textures.cpp}` conservando `planIndices`/`queueUpload`/`vertexRowsUnknown_`. Orden de locks en visibilidad: `submitMutex` → `visibility.m`.
+- `VPVK_PASS_DUMP` vacío o `0` apaga también las sondas de GLES (`diagProbeOn`). `textProbe` omite lecturas con escritura GPU pendiente (índices, vértices, UBO).
+- `translateStage(..., bool noRecord=false)` (pipelines.cpp): parámetro nuevo al final; `diag==2` sin `a2cTest` no se graba en recetas.
+- `VPVK_UI_TINT=1` hace fallar `gpu_vulkan.taa_uimask` (esperado: fuerza alfa 1). El bucle `umu` de `diagnostics.cpp` duplica pipelines entre las 3 más usadas (cubierto por `gpu_core.passdump`; comentario de la línea 467 inexacto).
+- Sin ejecutar nunca: `textProbe`, `gles.r8_upload`, `gpu.pdump.vis`, `VPVK_UI_TINT` con datos reales ni en visor.
+
 ## Menores aceptados (con motivo) y no verificado
 - pp: macro objeto cuyo cuerpo acaba en `F (` con la llamada partida en varias líneas da «unterminated» donde cpp acepta (ya en `main`); `#define`/`#undef` dentro de una llamada abierta se aplica al cerrarla (UB C99 6.10.3p11, difiere de gcc); lexer de CI: falsos negativos exóticos (`pv -L 5`, `&>file`, `bash <<EOF >log`, `sh -sc /dev/stdin`, anidamiento muy profundo → WARN).
 - GLES: 8 MiB enteros enlazados = 65 pases (mejora futura: CoW sin espera si todas las escrituras pendientes son copias ordenadas `!unknownWrite`, con heurística por pase). El backend nulo no valida los bytes de las copias ordenadas, solo regiones/offsets. Tests `audit9_presents`: dos CHECK casi tautológicos (`lateHits==0`, `gTwoParked==1`) y `reserve(presents+1)` con +1 de margen conservador: inocuos, aceptados.

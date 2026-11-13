@@ -1,6 +1,7 @@
 // Framebuffers, render passes, programs, pipelines and draws: GL state -> cached Vulkan objects.
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -2083,6 +2084,248 @@ Context::IndexPlan Context::planIndices(GLenum mode, uintptr_t off, uint32_t isz
     return plan;
 }
 
+// Diagnostics (gles.text_probe). Active only with VPVK_PASS_DUMP defined or VPVK_GLES_PROBE=1 (diagProbeOn; the draw hot path
+// does nothing otherwise). At most kTextProbeMax programs are probed per process; the first draw of each program that samples
+// a texture whose alpha reads the red channel (texture swizzle, or the luminance / alpha emulation of a 1-channel format) -- or
+// a "priority" program that has a bound texture replaced by the 1x1 fallback -- logs its default-block uniforms, bound UBOs,
+// attribute layout, first vertices and EVERY texture bound to its samplers. Only the first kTextProbeFullMax probes also
+// dump the GLSL (VS + FS). Priority (a generic heuristic, no game names): the program has >= 2 fragment samplers, or a vertex
+// input pair colour + uv0 both vec4 (UI text / sprite shaders). Non-priority programs stop at kTextProbeMax - kTextProbePrio
+// probes and at kTextProbeFullMax - kTextProbePrioFull full dumps, so the rest stays for priority ones (R8 cookie quads of
+// a render pipeline used to exhaust the old budget of 8).
+static std::atomic<int> gTextProbe{0};
+static std::atomic<int> gTextProbeFull{0};
+constexpr int kTextProbeMax = 24;      // programs probed per process
+constexpr int kTextProbePrio = 8;      // of those, kept for priority programs
+constexpr int kTextProbeFullMax = 6;   // probes with the full GLSL dump
+constexpr int kTextProbePrioFull = 3;  // of those, kept for priority programs
+
+// Takes one slot of `ctr` if it is below `limit` (a plain fetch_add would let refused callers eat the slots kept for others).
+static bool takeProbeSlot(std::atomic<int>& ctr, int limit) {
+    int n = ctr.load(std::memory_order_relaxed);
+    while (n < limit)
+        if (ctr.compare_exchange_weak(n, n + 1)) return true;
+    return false;
+}
+
+void Context::textProbe(Program& p, uint32_t firstVertex, uint32_t vertexCount, bool indexed) {
+    // Every sampler texture of the draw (what bindResources binds): the texture (null: none bound), the sampling parameters in
+    // use and whether the engine replaces it with the 1x1 black fallback (null / incomplete texture).
+    struct Hit {
+        const vpglsl::Variable* u;
+        int unit;
+        int elem;
+        Texture* t;
+        SamplerParams sp;
+        bool substituted;
+        const char* why;
+    };
+    std::vector<Hit> hits;
+    bool any = false, anySubst = false;
+    int fsSamplers = 0;
+    for (size_t i = 0; i < p.refl.uniforms.size() && hits.size() < 32; ++i) {
+        const auto& u = p.refl.uniforms[i];
+        if (u.binding < 0 || isImageType(u.glType) || isBufferSampler(u.glType) || i >= p.samplerUnits.size()) continue;
+        if (u.stages == 0 || (u.stages & 2)) fsSamplers += u.arraySize;
+        for (size_t e = 0; e < p.samplerUnits[i].size() && hits.size() < 32; ++e) {
+            const int unit = p.samplerUnits[i][e];
+            if (unit < 0 || unit >= int(units.size())) continue;
+            const Unit& un = units[size_t(unit)];
+            const GLuint name = unitTexture(un, u);
+            Texture* t = name ? texture(name) : defaultTexture(samplerTarget(u));
+            Hit h{&u, unit, int(e), t, SamplerParams{}, true, "no_texture"};
+            if (t) {
+                h.sp = t->sampler;
+                if (un.sampler)
+                    if (auto it = share->samplers.find(un.sampler); it != share->samplers.end()) h.sp = it->second->params;
+                Incomplete why;
+                h.substituted = !complete(*t, h.sp, &why);
+                h.why = h.substituted ? why.reason : "";
+            }
+            if (h.substituted && t) anySubst = true;  // a bound texture that is incomplete / substituted (not an empty unit)
+            if (t && t->image && t->image->format && (t->swizzle[3] == gl::RED || t->image->format->swz[3] == VK_COMPONENT_SWIZZLE_R)) any = true;
+            hits.push_back(h);
+        }
+    }
+    // Priority: >= 2 fragment samplers, or a vec4 colour + vec4 uv0 vertex input.
+    bool hasColor = false, hasUv0 = false;
+    for (const auto& av : p.refl.attributes) {
+        if (av.glType != 0x8B52) continue;  // GL_FLOAT_VEC4
+        std::string n = av.name;
+        for (char& c : n) c = char(std::tolower(static_cast<unsigned char>(c)));
+        if (n.find("color") != std::string::npos) hasColor = true;
+        if (n.find("uv0") != std::string::npos || n.find("texcoord0") != std::string::npos) hasUv0 = true;
+    }
+    const bool prio = fsSamplers >= 2 || (hasColor && hasUv0);
+    if (!any && !(prio && anySubst)) {  // (the program is looked at again by its next draws, up to 3 times)
+        if (++p.textProbeMisses >= 3) p.textProbed = true;
+        return;
+    }
+    p.textProbed = true;
+    if (!takeProbeSlot(gTextProbe, prio ? kTextProbeMax : kTextProbeMax - kTextProbePrio)) return;
+    const bool full = takeProbeSlot(gTextProbeFull, prio ? kTextProbeFullMax : kTextProbeFullMax - kTextProbePrioFull);
+
+    int budget = 1200;  // log lines of this probe
+#define TP_LINE(...) \
+    do {             \
+        if (budget-- > 0) logf(__VA_ARGS__); \
+    } while (0)
+    TP_LINE("gles.text_probe begin prog=%u serial=%llu vs=%u fs=%u fb=%ux%u draw=%s first=%u prio=%d full=%d fs_samplers=%d red_alpha=%d substituted=%d",
+         unsigned(p.name), (unsigned long long)p.serial, unsigned(p.vs), unsigned(p.fs), unsigned(drawFb_.width), unsigned(drawFb_.height),
+         indexed ? "elements" : "arrays", firstVertex, int(prio), int(full), fsSamplers, int(any), int(anySubst));
+    // (Dumped before the GLSL: the 1200-line budget must never cut the textures.)
+    // Every texture bound to the draw's samplers, with what bindResources really samples (substituted = the 1x1 black fallback).
+    for (const Hit& h : hits) {
+        if (!h.t || !h.t->image || !h.t->image->format) {
+            TP_LINE("gles.text_probe tex sampler=%s[%d] unit=%d id=%u <%s> substituted=1", h.u->name.c_str(), h.elem, h.unit,
+                 h.t ? unsigned(h.t->name) : 0u, h.t ? "no_image" : "no_texture");
+            continue;
+        }
+        const Texture& t = *h.t;
+        const Image& im = *t.image;
+        TP_LINE("gles.text_probe tex sampler=%s[%d] unit=%d id=%u target=0x%x size=%ux%ux%u levels=%u layers=%u internal=0x%x vk=%d texel=%u "
+             "fmtSwz=%d,%d,%d,%d texSwz=0x%x,0x%x,0x%x,0x%x base=%d max=%d complete=%d substituted=%d why=%s "
+             "min=0x%x mag=0x%x wrap=0x%x,0x%x,0x%x aniso=%g lod=%g..%g",
+             h.u->name.c_str(), h.elem, h.unit, unsigned(t.name), unsigned(t.target), im.width, im.height, im.depth, im.levels, im.layers,
+             unsigned(im.format->internal), int(im.format->vk), unsigned(im.format->texelBytes), int(im.format->swz[0]), int(im.format->swz[1]),
+             int(im.format->swz[2]), int(im.format->swz[3]), unsigned(t.swizzle[0]), unsigned(t.swizzle[1]), unsigned(t.swizzle[2]),
+             unsigned(t.swizzle[3]), int(t.baseLevel), int(t.maxLevel), int(!h.substituted), int(h.substituted), h.why, unsigned(h.sp.minFilter),
+             unsigned(h.sp.magFilter), unsigned(h.sp.wrapS), unsigned(h.sp.wrapT), unsigned(h.sp.wrapR), double(h.sp.maxAnisotropy),
+             double(h.sp.minLod), double(h.sp.maxLod));
+    }
+    // GLSL, split in log lines (the log buffer is 1024 bytes: chunks of 700 characters, at most 400 lines per stage).
+    for (int st = 0; st < 2 && full; ++st) {
+        std::shared_ptr<const std::string> src = p.bin.sources[st];
+        if (!src) {
+            Shader* sh = shader(st == 0 ? p.vs : p.fs);
+            if (sh) src = sh->source;
+        }
+        if (!src) {
+            TP_LINE("gles.text_probe %s <no source>", st == 0 ? "vs" : "fs");
+            continue;
+        }
+        size_t pos = 0;
+        int ln = 0;
+        while (pos < src->size() && ln < 400) {
+            size_t end = src->find('\n', pos);
+            if (end == std::string::npos) end = src->size();
+            std::string l = src->substr(pos, end - pos);
+            pos = end + 1;
+            ++ln;
+            for (size_t c = 0; c < std::max<size_t>(1, l.size()); c += 700)
+                TP_LINE("gles.text_probe %s L%d: %s", st == 0 ? "vs" : "fs", ln, l.substr(c, 700).c_str());
+        }
+        if (pos < src->size()) TP_LINE("gles.text_probe %s <truncated at 400 lines>", st == 0 ? "vs" : "fs");
+    }
+    // Default uniform block, by name (first 16 words of each uniform: a vec4 / mat4 is dumped whole; the value is the one the
+    // program holds now, e.g. _FaceTex_ST, _FaceColor, _OutlineColor, _ClipRect, _MaskSoftnessX/Y, _ScaleRatio*).
+    int nu = 0;
+    for (const auto& u : p.refl.uniforms) {
+        if (u.binding >= 0 || u.atomicBinding >= 0 || u.offset >= p.defaultBlock.size() || nu >= 160) continue;
+        ++nu;
+        const size_t words = std::min<size_t>(16, std::min<size_t>(uniformBytes(u), p.defaultBlock.size() - u.offset) / 4);
+        const uint32_t t = u.glType;
+        const bool asInt = t == 0x1404 || t == 0x1405 || (t >= 0x8B53 && t <= 0x8B59) || (t >= 0x8DC6 && t <= 0x8DC8);
+        std::string v;
+        char b[40];
+        for (size_t w = 0; w < words; ++w) {
+            uint32_t raw;
+            std::memcpy(&raw, p.defaultBlock.data() + u.offset + 4 * w, 4);
+            float f;
+            std::memcpy(&f, &raw, 4);
+            if (asInt) std::snprintf(b, sizeof b, " %d", int(raw));
+            else std::snprintf(b, sizeof b, " %g", double(f));
+            v += b;
+        }
+        TP_LINE("gles.text_probe uniform %s %s[%d] off=%u stride=%u:%s", uniformTypeName(t).c_str(), u.name.c_str(), u.arraySize, u.offset,
+             u.arrayStride, v.c_str());
+    }
+    // Bound uniform buffers: the first 160 floats each (covers the stereo VP / matrix block at floats 96-127 of UnityStereoGlobals);
+    // 512 for a block whose name contains "Stereo" (the whole of UnityStereoGlobals).
+    for (size_t i = 0; i < p.refl.blocks.size() && i < 8; ++i) {
+        const auto& blk = p.refl.blocks[i];
+        const IndexedBuffer& ib = uniformBindings[p.blockBindings[i] % kMaxUniformBufferBindings];
+        Buffer* buf = buffer(ib.buffer);
+        if (!buf || !buf->storage || ib.offset >= buf->size) {
+            TP_LINE("gles.text_probe ubo %s bind=%u size=%u <unbound>", blk.name.c_str(), unsigned(p.blockBindings[i]), blk.size);
+            continue;
+        }
+        const size_t avail = size_t(buf->size - ib.offset);
+        const bool stereo = blk.name.find("Stereo") != std::string::npos;
+        const size_t n = std::min<size_t>(stereo ? 512 : 160, avail / 4);
+        TP_LINE("gles.text_probe ubo %s bind=%u buf=%u off=%lld size=%u avail=%zu", blk.name.c_str(), unsigned(p.blockBindings[i]),
+             unsigned(ib.buffer), (long long)ib.offset, blk.size, avail);
+        if (gpuWritePending(*buf->storage)) {  // (the host copy is stale while a GPU write is pending)
+            TP_LINE("gles.text_probe ubo %s <gpu write pending>", blk.name.c_str());
+            continue;
+        }
+        for (size_t r = 0; r < n; r += 16) {
+            std::string v;
+            char b[40];
+            for (size_t w = r; w < std::min(n, r + 16); ++w) {
+                float f;
+                std::memcpy(&f, buf->storage->host + ib.offset + 4 * w, 4);
+                std::snprintf(b, sizeof b, " %g", double(f));
+                v += b;
+            }
+            TP_LINE("gles.text_probe ubo %s [%zu]:%s", blk.name.c_str(), r, v.c_str());
+        }
+    }
+    // Attribute layout and the first 4 vertices.
+    VertexArray* va = currentVao();
+    for (const auto& av : p.refl.attributes) {
+        const uint32_t loc = uint32_t(av.location);
+        if (loc >= kHwVertexAttribs) continue;
+        const VertexAttrib& a = va->attribs[loc];
+        const VertexBinding& vb = va->bindings[a.binding % kMaxVertexBindings];
+        TP_LINE("gles.text_probe attr loc=%u name=%s shader=%s en=%d size=%d type=0x%x norm=%d int=%d buf=%u off=%llu rel=%u stride=%d div=%u",
+             loc, av.name.c_str(), uniformTypeName(av.glType).c_str(), int(a.enabled), int(a.size), unsigned(a.type), int(a.normalized),
+             int(a.integer), unsigned(vb.buffer), (unsigned long long)vb.offset, unsigned(a.relativeOffset), int(vb.stride), unsigned(vb.divisor));
+        std::string v;
+        char b[96];
+        for (uint32_t r = 0; r < 4; ++r) {
+            float c[4] = {0, 0, 0, 1};
+            if (!a.enabled) {
+                std::memcpy(c, currentAttrib[loc].data(), 16);
+            } else {
+                // Only rows the draw itself reads: the first indices of an indexed draw (none for an indirect one), the first
+                // vertices up to the draw's count (client-memory arrays are not bounds-checked below).
+                uint32_t row;
+                if (indexed) {
+                    if (r >= probeIdxN_) break;
+                    row = probeIdx_[r];
+                    if (row == UINT32_MAX || row > indexMax_) {  // restart index, negative after baseVertex, or past the range
+                        v += " <skip>";
+                        continue;
+                    }
+                } else {
+                    if (r >= vertexCount) break;
+                    row = firstVertex + r;
+                }
+                if (vb.divisor > 0) row = 0;
+                const uint8_t* src = nullptr;
+                const uintptr_t where = vb.offset + a.relativeOffset + uintptr_t(row) * uintptr_t(vb.stride);
+                const uint32_t esize = vertexAttribBytes(a);
+                if (Buffer* bf = vb.buffer ? buffer(vb.buffer) : nullptr) {
+                    if (bf->storage && !gpuWritePending(*bf->storage) && where + esize <= size_t(bf->size)) src = bf->storage->host + where;
+                } else if (vb.buffer == 0 && vb.offset) {
+                    src = reinterpret_cast<const uint8_t*>(where);
+                }
+                if (!src) {
+                    v += " <oob>";
+                    continue;
+                }
+                for (int k = 0; k < a.size && k < 4; ++k) c[k] = readComponent(a, src, k);
+            }
+            std::snprintf(b, sizeof b, " v%u=(%g,%g,%g,%g)", r, double(c[0]), double(c[1]), double(c[2]), double(c[3]));
+            v += b;
+        }
+        TP_LINE("gles.text_probe verts loc=%u:%s", loc, v.c_str());
+    }
+    TP_LINE("gles.text_probe end prog=%u", unsigned(p.name));
+#undef TP_LINE
+}
+
 bool Context::prepareDraw(GLenum mode, VkPrimitiveTopology& topo, uint32_t vertexCount, uint32_t firstVertex,
                           uint32_t instances, bool indexed, VkBuffer& vbufs0) {
     if (!passOpen_) recordTransfers();  // no pass to wait for
@@ -2287,6 +2530,8 @@ bool Context::prepareDrawOnce(GLenum mode, VkPrimitiveTopology& topo, uint32_t v
     if (!bindResources(*p, xfbScratch_)) return false;
     setDynamicState(drawFb_);
     if (!rasterizerDiscard && !xfbScratch_) ++drawCount;  // occlusion queries (see Query)
+    if (diagProbeOn() && !p->textProbed && !xfbScratch_ && p->refl.samplerCount && gTextProbe.load(std::memory_order_relaxed) < kTextProbeMax)
+        textProbe(*p, firstVertex, vertexCount, indexed);
     return true;
 }
 
@@ -2543,6 +2788,16 @@ void Context::drawElements(GLenum mode, GLsizei count, GLenum type, const void* 
     VkPrimitiveTopology topo;
     VkBuffer unused;
     provokeOk_ = true;
+    probeIdxN_ = 0;
+    // (an index buffer the GPU is still writing is not read here: the draw reads it in place, see planIndices)
+    if (diagProbeOn() && gTextProbe.load(std::memory_order_relaxed) < kTextProbeMax && !(eb && gpuWritePending(*eb->storage))) {
+        probeIdxN_ = uint32_t(std::min<GLsizei>(4, count));
+        for (uint32_t i = 0; i < probeIdxN_; ++i) {
+            const uint32_t v = at(GLsizei(i));
+            const int64_t row = int64_t(v) + baseVertex;
+            probeIdx_[i] = (primitiveRestart && v == restart) || row < 0 || row >= int64_t(UINT32_MAX) ? UINT32_MAX : uint32_t(row);
+        }
+    }
     // Vulkan ignores primitiveRestartEnable on list topologies (and line loops are strips closed by the caller): with restart
     // on, those modes are split at the restart index here and drawn as a plain list.
     const bool splitRestart = splitsOnRestart(mode);
@@ -2739,6 +2994,7 @@ void Context::drawIndirect(GLenum mode, GLenum indexType, const void* indirect) 
         VkBuffer unused;
         indexMax_ = 0;
         vertexRowsUnknown_ = true;
+        probeIdxN_ = 0;  // (gles.text_probe: the indices are on the GPU; those of an earlier draw do not apply)
         if (!prepareDraw(mode, topo, 0, 0, 1, indexType != 0, unused)) return;
         useStorage(ib->storage);
         if (indexType) {

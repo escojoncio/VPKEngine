@@ -58,6 +58,8 @@ std::string formatBigFrame(uint64_t frame, const Frame&, const CompiledFrame&, c
 //   gpu.pdump.pass  f= pass= rp= enc= [enc2=] label= layers= area= att{c0=t<id>/<fmt>/s<samples>/<w>x<h>x<layers>/m<mip>/l<layer>/<load><store>/u<usage>[->t<resolve>]/<label>,d=..}
 //                   draws= clears= indirect= idx= verts= inst= inst_max= work= pipes= pipe_state{ready= pending= failed= missing=} vp{x,y,wxh:n;..} sc{..}
 //   gpu.pdump.pipe  f= pass= draws= count= inst= status= + describePipelineState (shader hashes, blend, depth, cull); the 3 busiest of a pass
+//                   plus, for the pipelines whose label holds '.umu' (UI-mask variants), up to 12 more per pass and 48 per frame:
+//                   gpu.pdump.pipe f= pass= umu=<n> draws= idx_draws= idx= count= inst= tex=[t<id>:<fmt>:<w>x<h>,..] + describePipelineState
 //   gpu.pdump.res   f= pass= dir=r|w n= tex= buf= shown= list=[t<id>:<fmt>:<w>x<h>x<layers>:m<mips>:s<samples>:<draws>,b<id>:<bytes>:<draws>]
 //   gpu.pdump.link  f= tex= kind=color|depth fmt= s= size= label= w=[..] wdc=[..] r=[..] stale_read=[..] stale_load=[..] self=[..]
 //                   (w: passes that store it, wdc: render into it without storing, stale_*: read / loaded before any stored write of the
