@@ -604,7 +604,10 @@ void testPpFuzz() {
     close(fd);
     const std::string cmd = std::string("cpp -P -undef -nostdinc -w ") + path + " 2>/dev/null";
     // GNU cpp only (macOS's `cpp` is clang's: it prints other spacing and has other rules for some calls).
-    if (std::system("cpp --version 2>&1 | grep -qi 'free software foundation'") != 0) {
+    // (popen, not system(): system() is unavailable on visionOS, where this file is only compiled)
+    FILE* probe = popen("cpp --version 2>&1 | grep -qi 'free software foundation'", "r");
+    const int probeStatus = probe ? pclose(probe) : -1;
+    if (probeStatus != 0) {
         std::printf("ppfuzz: no GNU cpp, skipped\n");
         std::remove(path);
         return;

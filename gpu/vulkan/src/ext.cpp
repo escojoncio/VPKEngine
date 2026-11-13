@@ -14,6 +14,7 @@
 #include <vector>
 
 #include "commands.h"
+#include "host_pages.h"
 #include "vpvk.h"
 
 #define VPVK_EXPORT extern "C" __attribute__((visibility("default")))
@@ -208,11 +209,12 @@ namespace {
 
 struct Staging {
   uint8_t* host = nullptr;
+  uint64_t size = 0;
   vpgpu::BufferId id;
   Device* d = nullptr;
   Staging(Device& dev, uint64_t bytes) : d(&dev) {
-    const uint64_t size = (std::max<uint64_t>(bytes, 1) + 16383) & ~uint64_t(16383);  // Apple page: no-copy buffers
-    host = static_cast<uint8_t*>(std::aligned_alloc(16384, size));
+    size = (std::max<uint64_t>(bytes, 1) + 16383) & ~uint64_t(16383);  // Apple page: no-copy buffers
+    host = pageAlloc(size);  // own mapping: the simulator's Metal rejects malloc-heap memory (host_pages.h)
     if (!host) return;
     vpgpu::BufferDesc bd;
     bd.size = size, bd.guestMemory = host, bd.label = "vk.host_image_copy";
@@ -224,7 +226,7 @@ struct Staging {
       std::lock_guard<std::mutex> lock(d->submitMutex);
       if (id) d->gpu->destroy(id);
     }
-    std::free(host);
+    pageFree(host, size);
   }
   Staging(const Staging&) = delete;
   Staging& operator=(const Staging&) = delete;

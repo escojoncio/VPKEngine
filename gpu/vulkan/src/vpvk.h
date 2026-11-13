@@ -16,6 +16,7 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <tuple>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -1012,7 +1013,7 @@ struct Device : Dispatchable {
   // Upload-arena chunks a command buffer reset gave up (Recorder::releaseResources): that path takes no submitMutex, so the core buffer is
   // destroyed and the host memory freed by the next submission (drainRetiredChunks) or the device's destruction.
   std::mutex retiredChunksMutex;
-  std::vector<std::pair<vpgpu::BufferId, uint8_t*>> retiredChunks;
+  std::vector<std::tuple<vpgpu::BufferId, uint8_t*, size_t>> retiredChunks;  // (buffer, host block, its length for pageFree)
   std::mutex resourceMutex;  // gpu->create*/destroy from recording threads (upload arenas)
   // GPU indirect draws that need their arguments rewritten (multiview: instances x views; draw-count
   // buffers): a small compute kernel run before the render pass (pipelines.cpp indirectPatch).

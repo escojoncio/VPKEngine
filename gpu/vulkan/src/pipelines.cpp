@@ -20,6 +20,7 @@
 #include <unordered_set>
 
 #include "commands.h"
+#include "host_pages.h"
 #include "taa_native.h"
 #include "vpir/passes.h"
 #include "vpgpu/core/archive_harvest.h"
@@ -1093,7 +1094,7 @@ vpgpu::BufferId UploadArena::put(Device* d, const void* data, VkDeviceSize size,
   if (current == chunks.size()) {
     Chunk c;
     c.size = std::max<VkDeviceSize>(65536, (need + 16383) & ~VkDeviceSize(16383));
-    c.host = static_cast<uint8_t*>(std::aligned_alloc(16384, c.size));
+    c.host = pageAlloc(c.size);  // own mapping: the simulator's Metal rejects malloc-heap memory (host_pages.h)
     if (!c.host) {  // there is no way to hand the failure back to vkCmd*: stop with the reason instead of a null memcpy
       logf("vk.err what=upload_arena_alloc_failed bytes=%llu", static_cast<unsigned long long>(c.size));
       std::abort();
@@ -1124,7 +1125,7 @@ static void freeChunk(Device* d, UploadArena::Chunk& c) {
     std::lock_guard<std::mutex> lock(d->submitMutex);
     d->gpu->destroy(c.id);
   }
-  std::free(c.host);
+  pageFree(c.host, c.size);
 }
 
 void UploadArena::release(Device* d) {
@@ -1143,7 +1144,7 @@ void UploadArena::shrink(Device* d, size_t keep, bool defer) {
       kept.push_back(c);
     } else if (defer && d && c.id) {  // (no submit mutex on this path: the device destroys the buffer at its next submission)
       std::lock_guard<std::mutex> lock(d->retiredChunksMutex);
-      d->retiredChunks.emplace_back(c.id, c.host);
+      d->retiredChunks.emplace_back(c.id, c.host, size_t(c.size));
     } else {
       freeChunk(d, c);
     }
@@ -1160,14 +1161,14 @@ bool tryDrainRetiredChunks(Device* d) {
 }
 
 void drainRetiredChunks(Device* d) {
-  std::vector<std::pair<vpgpu::BufferId, uint8_t*>> list;
+  std::vector<std::tuple<vpgpu::BufferId, uint8_t*, size_t>> list;
   {
     std::lock_guard<std::mutex> lock(d->retiredChunksMutex);
     list.swap(d->retiredChunks);
   }
-  for (auto& [id, host] : list) {
+  for (auto& [id, host, bytes] : list) {
     d->gpu->destroy(id);  // (submit mutex held by the caller, as in freeChunk)
-    std::free(host);
+    pageFree(host, bytes);
   }
 }
 
@@ -4739,7 +4740,7 @@ uint32_t allocVisibility(Device* d, uint32_t count, bool submitLocked = false) {
   }
   if (!v.id) {
     const size_t bytes = size_t(kVisibilitySlots) * 8;
-    v.host = static_cast<uint8_t*>(std::aligned_alloc(16384, bytes));
+    v.host = pageAlloc(bytes);  // zero-filled by the mapping; own mapping for the simulator (host_pages.h)
     if (!v.host) return UINT32_MAX;
     std::memset(v.host, 0, bytes);
     vpgpu::BufferDesc bd;
@@ -4748,7 +4749,7 @@ uint32_t allocVisibility(Device* d, uint32_t count, bool submitLocked = false) {
     bd.label = "vk.visibility";
     v.id = d->gpu->createBuffer(bd);
     if (!v.id) {
-      std::free(v.host);
+      pageFree(v.host, bytes);
       v.host = nullptr;
       return UINT32_MAX;
     }
@@ -4846,7 +4847,7 @@ void vpvk::releaseVisibility(Device* d) {
   std::lock_guard<std::mutex> l(v.m);
   if (v.id) d->gpu->destroy(v.id);
   v.id = {};
-  std::free(v.host);
+  pageFree(v.host, size_t(kVisibilitySlots) * 8);
   v.host = nullptr;
   v.used.clear();
 }

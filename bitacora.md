@@ -23,7 +23,7 @@ Clientes: VisionQuestPro (foco), AVP, AstroVisionPro. Licencia PolyForm Noncomme
   6. Sin int64 en VPIR; `shaderInt64=0` anunciado. Quest 3 real: unverified (perfil marca "1?"); aparcado hasta confirmar.
   7. `textureCompressionBC` con identidad Quest = `platformSupportsBC()` (código/tests) vs `perfil-adreno740.md:59` = 0: discrepancia unverified (no hay vulkaninfo real de Quest 3).
   8. El backend no elimina el resolve de adjuntos `Resolve` al invalidar (solo `Store`).
-  9. `vpconvert-visionos.yml` sin relanzar tras el cambio de `tools/vpaot` del 2026-11-11.
+  9. `vpconvert-visionos.yml`: ejecutado en 9a95164 con éxito.
   10. Auditoría (`notas/auditoria.md`): cerrada el 2026-11-13, incluidos los lotes `gpu/shader`, `runtime`, `tools`, `platform`. Quedan solo los «Menores aceptados» de abajo. Primer `[build]` en CI macOS tras la auditoría: arreglar lo que falle (nunca compilado: `.mm`, Swift, `vpconvert`, rama APPLE de `gpu/vulkan/CMakeLists.txt`).
 - Riesgos: seed restaura depth de la muestra 0 en todas las muestras (halos en siluetas); un draw que supere solo los límites de tile no se puede partir.
 
@@ -78,6 +78,13 @@ Clientes: VisionQuestPro (foco), AVP, AstroVisionPro. Licencia PolyForm Noncomme
 - Metal: `gcn.lift.dispatch_search` (añadidos n=500/1000), `glsl.memory` (límite RSS Apple 1536 MB, **provisional**: leer el pico impreso por stderr y ajustar; ya no cubre en Darwin la regresión de ~530 MB), `audit5_pass_split` (≤216 buffers), `audit_vk` (`RecipeStore::rewrite` escribe los SPIR-V ordenados por hash; el formato no cambia, el orden de registros del fichero compactado sí; test pasa a `stage(w,200,…)`).
 - **Sigue roto**: `replay-compare` en simulador visionOS: SIGTRAP `_xpc_api_misuse` en `MTLSimDevice newBufferWithBytesNoCopy` desde `MetalBackend::createBuffer` (rama `guestMemory`) ← `UploadArena::put` (`gpu/vulkan/src/pipelines.cpp:1090`). Hipótesis sin confirmar: el simulador exige memoria `mmap` y el chunk usa `aligned_alloc(16384,65536)` (igual en `ext.cpp:215`, `pipelines.cpp:4742`, `entry.cpp` hostAlloc <1 MiB). Código previo a la auditoría. Probar con `mmap` anónimo para el arena.
 - `vpconvert-visionos.yml` quedó colgado (>31 min) en el run de fdcd03a y se canceló; relanzado con el siguiente `[build]`.
+
+## Replay en simulador y arreglos visionOS (2026-11-13, `[build]` posterior a 9a95164; sin verificar en macOS)
+- Causa del SIGTRAP `_xpc_api_misuse` en `newBufferWithBytesNoCopy`: memoria de `vkAllocateMemory` (<1 MiB, `aligned_alloc`) por `vkBindBufferMemory` (vpreplay). Hipótesis (sin confirmar hasta la CI): el simulador exige memoria mmap.
+- Nuevo `gpu/vulkan/src/host_pages.h` (`pageAlloc/pageFree`, mmap anónimo 16 KiB, VM tag 241 en Apple). Usado por `entry.cpp` `hostAlloc/hostFree` (en Apple todo tamaño usa mmap), `UploadArena` + `retiredChunks` (ahora `tuple<BufferId,uint8_t*,size_t>`, **liberar siempre con la misma longitud**), buffer de visibilidad y `Staging` (`ext.cpp`). `gpu/ps4/src/renderer.cpp` sigue con `aligned_alloc`.
+- Compilación visionOS: `metal_tests.cpp` (`clear.color` double), `glsl_tests.cpp` (`popen` en vez de `std::system`), `metal_backend.mm:7722` (inicializador `Res`).
+- Menores aceptados (sin tiempo / sin medir): coste mmap+munmap por `vkAllocateMemory` pequeño en Apple y churn de chunks del arena (mejorable mapeando sin la cola extra si página ≥16 KiB; no medido); `pageAlloc` con `bytes` ≈ 2^64 desborda (ya pasaba antes); etiqueta VM 241 no aplicada a staging/arena/visibilidad; comentario «zero-filled» de `pipelines.cpp:4743` impreciso; sin test de `pageAlloc` (el fallo real solo se ve en simulador).
+- `vpconvert-visionos.yml` en 9a95164: success (compila LLVM en frío, 1-2 h; no cancelar). Primera CI: Metal GPU tests y AOT en verde; GPU translator (replay) pendiente de este build.
 
 ## Menores aceptados (con motivo) y no verificado
 - pp: macro objeto cuyo cuerpo acaba en `F (` con la llamada partida en varias líneas da «unterminated» donde cpp acepta (ya en `main`); `#define`/`#undef` dentro de una llamada abierta se aplica al cerrarla (UB C99 6.10.3p11, difiere de gcc); lexer de CI: falsos negativos exóticos (`pv -L 5`, `&>file`, `bash <<EOF >log`, `sh -sc /dev/stdin`, anidamiento muy profundo → WARN).

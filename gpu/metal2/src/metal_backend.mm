@@ -7719,7 +7719,7 @@ void MetalBackend::Impl::knockReportLocked() {
     return std::string(v);
   };
   for (size_t c = 0; c < cands; ++c) {
-    Res r{c, 0, 0, 0, 0, 0, false};
+    Res r{c, 0, 0, 0, 0, 0, false, {}};
     uint32_t n = 0;
     for (uint32_t p = 0; p < kKnockPasses; ++p) {
       const int64_t ib = at[(c * passes + p) * 2], ik = at[(c * passes + p) * 2 + 1];

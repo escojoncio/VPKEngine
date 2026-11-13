@@ -197,7 +197,7 @@ int compare(const std::vector<uint8_t>& px, uint32_t size, const std::function<s
 
 uint8_t unorm(float v) { return static_cast<uint8_t>(std::lround(v * 255.0f)); }
 
-RenderPassDesc pass(TextureId color, LoadAction load, std::array<float, 4> clear = {}) {
+RenderPassDesc pass(TextureId color, LoadAction load, std::array<double, 4> clear = {}) {
   RenderPassDesc d;
   d.colors[0].texture = color;
   d.colors[0].load = load;
@@ -394,7 +394,7 @@ void testDeferred(Rig& r) {
 
   RenderPassDesc gb;
   const TextureId g[] = {albedo, normal, material};
-  const std::array<float, 4> clears[] = {{0.2f, 0.4f, 0.6f, 1}, {0, 0, 0, 0}, {1, 0, 0, 0}};
+  const std::array<double, 4> clears[] = {{0.2f, 0.4f, 0.6f, 1}, {0, 0, 0, 0}, {1, 0, 0, 0}};
   for (int i = 0; i < 3; ++i) {
     gb.colors[i].texture = g[i];
     gb.colors[i].load = LoadAction::Clear;

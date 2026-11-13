@@ -16,12 +16,8 @@
 #include <thread>
 #include <unordered_map>
 
-#if defined(__APPLE__) || defined(__linux__)
-#include <sys/mman.h>
-#define VPVK_HOST_MMAP 1
-#endif
-
 #include "commands.h"
+#include "host_pages.h"
 #include "perf.h"
 #include "vpgpu/core/background.h"
 #include "vpgpu/core/scoped_pool.h"
@@ -1878,35 +1874,23 @@ namespace {
 // reused block, they go back to the system at vkFreeMemory, and on Apple the region map names them (VM tag 241, "[hb] vm
 // tag241/...": resident = staging and buffer contents).
 constexpr uint64_t kHostMapBytes = 1u << 20;
-uint8_t* hostAlloc(uint64_t bytes) {
-#ifdef VPVK_HOST_MMAP
-  if (bytes >= kHostMapBytes) {
+// Apple: every size is a mapping of its own (the simulator's Metal shares no-copy buffers through xpc_shmem, which traps on
+// malloc-heap memory; see host_pages.h). Elsewhere only from kHostMapBytes up.
 #ifdef __APPLE__
-    const int tag = int(241u << 24);  // VM_MAKE_TAG: Darwin reads an anonymous mapping's tag from the fd argument
+constexpr bool kAlwaysMap = true;
 #else
-    const int tag = -1;
+constexpr bool kAlwaysMap = false;
 #endif
-    // kPage-aligned whatever the system's page size (4 KiB hosts): map one kPage more and give the ends back.
-    void* p = mmap(nullptr, bytes + kPage, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, tag, 0);
-    if (p == MAP_FAILED) return nullptr;
-    uint8_t* raw = static_cast<uint8_t*>(p);
-    uint8_t* out = raw + (kPage - reinterpret_cast<uintptr_t>(raw) % kPage) % kPage;
-    if (out > raw) munmap(raw, size_t(out - raw));
-    if (const size_t tail = size_t((raw + bytes + kPage) - (out + bytes))) munmap(out + bytes, tail);
-    return out;
-  }
-#endif
+uint8_t* hostAlloc(uint64_t bytes) {
+  if (kAlwaysMap || bytes >= kHostMapBytes) return pageAlloc(bytes, true);
   return static_cast<uint8_t*>(std::aligned_alloc(kPage, bytes));
 }
 void hostFree(uint8_t* p, uint64_t bytes) {
   if (!p) return;
-#ifdef VPVK_HOST_MMAP
-  if (bytes >= kHostMapBytes) {
-    munmap(p, bytes);
+  if (kAlwaysMap || bytes >= kHostMapBytes) {
+    pageFree(p, bytes);
     return;
   }
-#endif
-  (void)bytes;
   std::free(p);
 }
 }  // namespace
