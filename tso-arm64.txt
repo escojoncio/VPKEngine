@@ -1,0 +1,5 @@
+vpaot: image 4194304..4194355, 1 executable ranges, 0 code pointers, 0 .eh_frame starts, 0 imports, 1 functions
+vpaot: 20 instructions, 0 unsupported (100.00% supported), 0 indirect calls, 0 indirect jumps, 0 jump tables resolved, 0 landing pads, 0 candidates rejected as data
+built with: cc -march=armv8.3-a+rcpc
+message passing, 20000000 rounds (VP_TSO=1): flag seen ahead of data 0 times: OK
+arm64-apple codegen: guest loads LDAPR, stores STLR
