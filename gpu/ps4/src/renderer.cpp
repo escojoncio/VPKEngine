@@ -622,9 +622,11 @@ struct Renderer::Impl {
             // records, or 0 for a null one): past it reads give 0 and writes / atomics are dropped, as on the hardware. The lifted code does
             // not check offsets itself. Cost: one unsigned compare and a select (store: a predicated store) per access, plus one 8-byte
             // size argument per used Buffer slot; the Metal compiler folds nothing since sizes come from the argument buffer.
-            // robustPerWord: a vector load / store (dwordx2..x4) that crosses the end of the range is checked dword by dword, as the hardware does
-            // (the dwords inside the range are read / written, the rest read 0): the code for that is in the else of the same compare, so an
-            // access inside the range costs what it did (emitted text: a vec4 load 2 lines -> 8, a vec4 store 1 -> 7).
+            // robustPerWord: has no effect on PS4 today: the GCN lifter emits every buffer access as a single dword, each one guarded alone (see
+            // vpps4.robust_word). It only protects against a future lifter that emits vector accesses (dwordx2..x4): then one that crosses the end
+            // of the range is checked dword by dword, as the hardware does (the dwords inside the range are read / written, the rest read 0), in
+            // the else of the same compare, so an access inside the range costs what it did. The emitted-text cost (a vec4 load 2 lines -> 8, a
+            // vec4 store 1 -> 7) is that of the vpmsl.golden.robust_vec golden, not of the PS4 shaders as they are lifted now.
             vpmsl::EmitOptions eo;
             eo.robustBuffers = true;
             eo.robustPerWord = true;

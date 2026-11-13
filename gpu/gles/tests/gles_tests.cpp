@@ -43,7 +43,8 @@ void (*vpgles_flush)(int);
 
 size_t gBigNews = 0;  // allocations of 64 KiB or more while armed (the replacement operator new at the end; testAudit2Upload)
 bool gBigNewArmed = false;
-thread_local bool gFailLateNew = false;  // audit9_presents: the next 16-byte operator new of this thread throws bad_alloc (one shared_ptr, as a lateImages push_back would make)
+thread_local bool gFailLateNew = false;  // audit9_presents / audit9_swap_alloc: while set, every throwing operator new of this thread throws bad_alloc (whatever the size)
+thread_local int gLateNewHits = 0;       // how many requests it refused (a refusal inside a noexcept destructor ends the process; the count is for the paths that survive)
 
 namespace {
 
@@ -8130,13 +8131,30 @@ void revPresentShutdown() {
 }
 // Two presents in flight when vpgles_shutdown runs: the GPU is waited for once (by the last callback to return, outside the global lock), and
 // both colour images go after that wait, before the device.
-static std::atomic<int> gTwoIn{0}, gTwoShutdown{0};
-static void twoPresent(void*, void*, void*, uint32_t, uint32_t, uint32_t) {
+static std::atomic<int> gTwoIn{0}, gTwoShutdown{0}, gTwoParked{0};
+static void twoPresent(void*, void* window, void*, uint32_t, uint32_t, uint32_t) {
     ++gTwoIn;
     for (int i = 0; i < 4000 && !gTwoShutdown; ++i) std::this_thread::sleep_for(std::chrono::milliseconds(1));
-    // Once this callback has returned, the layer must not allocate to park the image (~Presented is noexcept: a bad_alloc there would end the process).
-    gFailLateNew = true;
+    if (window == reinterpret_cast<void*>(0x1000)) {
+        // This one returns first, while the other present is still in flight: the layer parks its image (Device::lateImages) and must not
+        // allocate to do it (~Presented is noexcept: a bad_alloc there would end the process). Every allocation of this thread fails from here on,
+        // whatever its size or count; the render thread disarms it (LateNewGuard) as soon as eglSwapBuffers is back.
+        gFailLateNew = true;
+    } else {
+        // The other one returns last, after the first has parked: it is the one that waits for the GPU and destroys the images (the driver
+        // allocates doing that, so it must not be armed).
+        for (int i = 0; i < 4000 && !gTwoParked; ++i) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
 }
+// Disarms the failing operator new of the thread on every way out of its scope and keeps the number of requests it refused.
+struct LateNewGuard {
+    int& hits;
+    explicit LateNewGuard(int& h) : hits(h) { gLateNewHits = 0; }
+    ~LateNewGuard() {
+        gFailLateNew = false;
+        hits = gLateNewHits;
+    }
+};
 void audit9Presents() {
     G(eglCreateWindowSurface, void* (*)(void*, void*, void*, const EGLint*));
     G(eglCreateContext, void* (*)(void*, void*, void*, const EGLint*));
@@ -8158,10 +8176,14 @@ void audit9Presents() {
     eglMakeCurrent(a.dpy, nullptr, nullptr, nullptr);
     const int destroys0 = gDeviceDestroys;
     std::thread t[2];
+    int lateHits[2] = {-1, -1};
     for (int i = 0; i < 2; ++i)
         t[i] = std::thread([&, i] {
+            LateNewGuard guard(lateHits[i]);
             eglMakeCurrent(a.dpy, ws[i], ws[i], cx[i]);
             eglSwapBuffers(a.dpy, ws[i]);
+            gFailLateNew = false;
+            if (i == 0) gTwoParked = 1;
         });
     while (gTwoIn < 2) std::this_thread::yield();
     reinterpret_cast<void (*)()>(dlsym(gLib, "vpgles_shutdown"))();  // both render threads are inside the present callback
@@ -8175,6 +8197,8 @@ void audit9Presents() {
     t[0].join();
     t[1].join();
     gOrderOn = false;
+    CHECK(lateHits[0] == 0 && lateHits[1] == 0);  // nothing asked for memory after the first callback returned (armed to fail, of any size)
+    CHECK(gTwoParked == 1);
     CHECK(gDeviceDestroys == destroys0 + 1);  // (and the process is still here: no allocation failed inside the noexcept destructor)
     {
         std::lock_guard<std::mutex> l(gOrderMu);
@@ -8188,6 +8212,49 @@ void audit9Presents() {
     CHECK(gIdleLockFree == 1);
     if (gIdleProbe)
         for (int i = 0; i < 1000 && !*gIdleProbe; ++i) std::this_thread::sleep_for(std::chrono::milliseconds(1));  // (so the thread is over before the test is)
+    alarm(0);
+}
+// eglSwapBuffers reserves room in Device::lateImages for every present in flight before it starts one; when the reservation fails it reports
+// EGL_BAD_ALLOC, calls nothing and leaves the count of presents as it was (an inflated count would keep vpgles_shutdown from ever finishing).
+static std::atomic<int> gAllocCalls{0};
+static void allocPresent(void*, void*, void*, uint32_t, uint32_t, uint32_t) { ++gAllocCalls; }
+void audit9SwapAlloc() {
+    G(eglCreateWindowSurface, void* (*)(void*, void*, void*, const EGLint*));
+    G(eglCreateContext, void* (*)(void*, void*, void*, const EGLint*));
+    G(eglMakeCurrent, uint32_t (*)(void*, void*, void*, void*));
+    G(eglSwapBuffers, uint32_t (*)(void*, void*));
+    G(eglGetError, EGLint (*)());
+    watchdog(60);
+    Egl a; CHECK(a.up());
+    reinterpret_cast<void (*)(void (*)(void*, void*, void*, uint32_t, uint32_t, uint32_t), void*)>(dlsym(gLib, "vpgles_set_present"))(allocPresent, nullptr);
+    const EGLint wattrs[] = {egl::WIDTH, 64, egl::HEIGHT, 64, egl::NONE};
+    const EGLint cattrs[] = {egl::CONTEXT_CLIENT_VERSION, 3, egl::NONE};
+    void* ws = eglCreateWindowSurface(a.dpy, a.config, reinterpret_cast<void*>(0x1000), wattrs);
+    void* cx = eglCreateContext(a.dpy, a.config, a.ctx, cattrs);
+    CHECK(ws && cx);
+    CHECK(eglMakeCurrent(a.dpy, ws, ws, cx));
+    const int destroys0 = gDeviceDestroys;
+    eglGetError();
+    // The first swap of the session: lateImages has no room yet, so the reservation allocates. Every allocation of this thread fails for the call
+    // (whatever its size), so that the reservation is the one that fails, wherever it falls in the call.
+    int hits = -1;
+    uint32_t r = 1;
+    {
+        LateNewGuard guard(hits);
+        gFailLateNew = true;
+        r = eglSwapBuffers(a.dpy, ws);
+    }
+    CHECK(r == 0);
+    CHECK(eglGetError() == egl::BAD_ALLOC);
+    CHECK(hits >= 1);
+    CHECK(gAllocCalls == 0);  // the host never saw the present
+    // The session is intact: the next swap presents, and the shutdown does not wait for a present that never started.
+    CHECK(eglSwapBuffers(a.dpy, ws) != 0);
+    CHECK(eglGetError() == 0x3000 /*SUCCESS*/);
+    CHECK(gAllocCalls == 1);
+    eglMakeCurrent(a.dpy, nullptr, nullptr, nullptr);
+    reinterpret_cast<void (*)()>(dlsym(gLib, "vpgles_shutdown"))();
+    CHECK(gDeviceDestroys == destroys0 + 1);  // (finished by vpgles_shutdown itself: no present in flight)
     alarm(0);
 }
 // A present callback that throws: the present count and the colour image are released all the same (the device is not left standing).
@@ -8331,7 +8398,7 @@ int main(int argc, char** argv) {
         {"audit_lost", testAuditLost}, {"audit_calls", testAuditCalls}, {"audit_compile", testAuditCompile}, {"audit_xfb", testAuditXfb},
         {"audit2_xfer", testAudit2Xfer}, {"audit2_dyn", testAudit2Dyn}, {"audit2_buf", testAudit2Buf}, {"audit2_pbo", testAudit2Pbo},
         {"audit2_upload", testAudit2Upload}, {"audit2_egl", testAudit2Egl}, {"audit2_link", testAudit2Link}, {"audit2_link2", testAudit2LinkShared},
-        {"audit3_egl_last", testAudit3EglLast}, {"audit3_egl_refs", testAudit3EglRefs}, {"audit3_pbo", testAudit3Pbo}, {"audit3_xfer_shared", testAudit3XferShared}, {"audit3_stale_stamp", testAudit3StaleStamp}, {"audit4_xfer_own_pass", testAudit4XferOwnPass}, {"audit4_reads_b", testAudit4ReadsB}, {"audit4_reads_ctl", testAudit4ReadsCtl}, {"audit4_copygrow", testAudit4CopyGrow}, {"audit4_reinit", testAudit4Reinit}, {"audit5_perf", testAudit5Perf}, {"audit5_race", audit5ShutdownRace}, {"audit5_atomic_ro", audit5AtomicRO}, {"audit5_index_inplace", audit5IndexInPlace}, {"audit5_pass_split", audit5PassSplit}, {"audit5_after_shutdown", audit5AfterShutdown}, {"audit7_big_subdata", audit7BigSubData}, {"audit8_mixed_subdata", audit8MixedSubData}, {"audit9_ring_narrow", audit9RingNarrow}, {"audit9_threshold", audit9Threshold}, {"audit9_staging", audit9Staging}, {"audit9_presents", audit9Presents}, {"audit8_present_throw", revPresentThrow}, {"audit6_compile_hook", r4CompileHook}, {"audit6_link_hook", r4LinkHook}, {"audit6_compile_shutdown", r4CompileShutdown}, {"audit6_after_create", r4AfterCreate}, {"audit7_present_shutdown", revPresentShutdown}, {"audit7_swap_destroy", revSwapDestroy}, {"audit7_reinit", revReinitCycles}, {"audit7_init_race", revInitRace}, {"audit5_readonly", testAudit5Readonly}, {"audit5_texbuf", testAudit5TexBuf}, {"audit5_index", testAudit5IndexRead}, {"audit5_balance", testAudit5Balance}, {"audit5_shutdown0", testAudit5Shutdown0}, {"audit5_shutdown1", testAudit5Shutdown1},
+        {"audit3_egl_last", testAudit3EglLast}, {"audit3_egl_refs", testAudit3EglRefs}, {"audit3_pbo", testAudit3Pbo}, {"audit3_xfer_shared", testAudit3XferShared}, {"audit3_stale_stamp", testAudit3StaleStamp}, {"audit4_xfer_own_pass", testAudit4XferOwnPass}, {"audit4_reads_b", testAudit4ReadsB}, {"audit4_reads_ctl", testAudit4ReadsCtl}, {"audit4_copygrow", testAudit4CopyGrow}, {"audit4_reinit", testAudit4Reinit}, {"audit5_perf", testAudit5Perf}, {"audit5_race", audit5ShutdownRace}, {"audit5_atomic_ro", audit5AtomicRO}, {"audit5_index_inplace", audit5IndexInPlace}, {"audit5_pass_split", audit5PassSplit}, {"audit5_after_shutdown", audit5AfterShutdown}, {"audit7_big_subdata", audit7BigSubData}, {"audit8_mixed_subdata", audit8MixedSubData}, {"audit9_ring_narrow", audit9RingNarrow}, {"audit9_threshold", audit9Threshold}, {"audit9_staging", audit9Staging}, {"audit9_presents", audit9Presents}, {"audit9_swap_alloc", audit9SwapAlloc}, {"audit8_present_throw", revPresentThrow}, {"audit6_compile_hook", r4CompileHook}, {"audit6_link_hook", r4LinkHook}, {"audit6_compile_shutdown", r4CompileShutdown}, {"audit6_after_create", r4AfterCreate}, {"audit7_present_shutdown", revPresentShutdown}, {"audit7_swap_destroy", revSwapDestroy}, {"audit7_reinit", revReinitCycles}, {"audit7_init_race", revInitRace}, {"audit5_readonly", testAudit5Readonly}, {"audit5_texbuf", testAudit5TexBuf}, {"audit5_index", testAudit5IndexRead}, {"audit5_balance", testAudit5Balance}, {"audit5_shutdown0", testAudit5Shutdown0}, {"audit5_shutdown1", testAudit5Shutdown1},
     };
     auto it = tests.find(argv[1]);
     if (ok && it != tests.end()) it->second();
@@ -8370,8 +8437,8 @@ int main(int argc, char** argv) {
 namespace {
 void* bigNew(size_t n, size_t align, bool nothrow) {
     if (n >= (64u << 10) && gBigNewArmed) ++gBigNews;
-    if (gFailLateNew && n == 16 && !nothrow) {
-        gFailLateNew = false;
+    if (gFailLateNew && !nothrow) {
+        ++gLateNewHits;
         throw std::bad_alloc();
     }
     void* p = align > alignof(std::max_align_t) ? std::aligned_alloc(align, (n + align - 1) / align * align) : std::malloc(n ? n : 1);

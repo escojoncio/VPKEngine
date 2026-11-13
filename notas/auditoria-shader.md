@@ -19,7 +19,7 @@ de GLES): intactos; compilan y pasan.
   viejo en los 17 `.lift` y 20000 programas mutados. Test `gcn.lift.scale` (6000 diamantes < 3 s).
 - S3 [A, pila] `gcn/src/lift.cpp:2949` (`dagAcyclic`): DFS recursivo con `std::function`, un nivel por bloque de una cadena: con 512 KB
   de pila (hilo secundario en macOS) SIGSEGV a ~8000 bloques. Ahora iterativo. `lift.cpp:3053` (`walk`): recursión por nivel de if
-  anidado; más de 200 niveles (`kMaxWalkDepth`) → bucle de despacho (siempre correcto). Tests `gcn.lift.scale` y `gcn.lift.scale_nested`
+  anidado; más de 240 niveles (`kMaxWalkDepth`; 200 al principio, subido 2026-11-13) → bucle de despacho (siempre correcto). Tests `gcn.lift.scale` y `gcn.lift.scale_nested`
   (levantan en un hilo de 512 KB).
 - S4 [B, pila] `gcn/src/lift.cpp:2873` (`liftFetchCall`): un fetch que contiene `s_swappc_b64` se inlinea a sí mismo sin fin (fuzzer:
   desborde de pila). Arreglo: error "s_swappc_b64 inside the fetch subroutine". Test `gcn.lift.fetch_recursion`.
@@ -44,8 +44,8 @@ de GLES): intactos; compilan y pasan.
 - S11 [B, CPU] `lower.cpp:700` (`analyse`/`use`): seguía los operandos de access chains (profundidad 32) sin recordar lo visitado:
   exponencial. Ahora un conjunto (id, bloque).
 - S12 [B, pila] `lower.cpp:1189,2661,3129,3157` (`resolve`, `flow`, `unrollForced`, `unrollDynamic`): recursión sin límite con un módulo
-  mal formado (chain cuya base es ella misma, bloque que lleva de vuelta a su constructo). Contador `Nest` (256 / 320 / 16 / 16).
-  320 niveles de `flow` = una cadena de 300 else-if; mal formado y válido se distinguen mal, ver A4.
+  mal formado (chain cuya base es ella misma, bloque que lleva de vuelta a su constructo). Contador `Nest` (256 / 4096 / 16 / 16; `flow` era 320 y se subió a 4096 el 2026-11-13, ver «Topes»).
+  Mal formado y válido se distinguen mal con un tope de niveles; el que manda es `stackLow()` (S21).
 - S13 [B, RAM] `ir/src/builder.cpp:34`, `lower.cpp:5536`: sin tope de nodos, un array de 2^31 elementos cargado entero pedía 1,2 GiB
   de `Node` (144 B). `FunctionBuilder::setNodeLimit` (lanza `std::length_error`, `lower` lo recoge como "internal error"); 2^20 nodos.
 - S14 [C, test] `gcn/tests/diff/vpir_eval.cpp:112-113`: el oráculo del test diferencial sumaba/restaba `int32_t` con desbordes (UB; con
@@ -92,15 +92,15 @@ shaders de visor.
 | nodos por función (`kMaxNodes`) | 2^20 | 411 (SPIR-V, `mesh_multiview.vert`); 9829 (lifter, `vs_cbuf_dword`, 631 instr.); 160003 el test sintético `wide_struct` | 2550x / 107x / 6,5x | RAM: `sizeof(Node)` = 144 B; RSS medido 370 MB al llegar al tope, 510 MB con 1M nodos terminados |
 | hojas de un compuesto (`kMaxLeaves`) | 65536 | 1 | 65536x | RAM |
 | elementos desenrollados (`kMaxUnroll`) | 1024 | 4 (array de interfaz y `unrollForced`); 100 (`dyn_index_big`, descriptores, tope propio 256) | 256x | tamaño del código emitido |
-| niveles de `flow` | 320 | 5 | 64x | pila |
-| niveles de `walk` (lifter) | 200 | 5 | 40x | pila |
+| niveles de `flow` (`Nest flowDepth_`, `lower.cpp:2688`) | 4096 (antes 320) | 5 | 800x | respaldo; la pila la acota `stackLow()` |
+| niveles de `walk` (lifter, `kMaxWalkDepth`) | 240 (antes 200) | 5 | 48x | pila (cae al bucle de despacho) |
 | fetch inlinado (`kMaxFetchInlined`) | 2^16 instr. | 9 | 7000x | RAM (~15 nodos por instrucción) |
 | `resolve` / `unroll*` | 256 / 16 | 3 / 1 | 85x / 16x | pila |
 Pila (gcc 13 x86-64, -O2, hilo de 512 KB, como el de macOS; topes sin tope con `VP_SCALE` temporal): `flow` (flow → arm → emitBlock) ≈ 0,85 KB
 por nivel: cadena de else-if o ifs anidados aguanta ~600 niveles y cae a ~650; bucles anidados ~450 (2 niveles de flow cada uno); con ASan -O1 cae
 a ~100-150 niveles (los tests de profundidad corren en el hilo principal). `walk` aguanta 1800 y cae a ~2800-3200 (≈ 0,17 KB por nivel).
-Conclusión: ningún tope de niveles/nodos se sube: ya tienen ≥ 8x sobre lo medido en shaders legítimos y subirlos solo abre memoria (nodos: +150 MB
-por cada 2^20). El límite de `flow` ya no depende de los marcos de cada arquitectura: ver S21.
+Conclusión original: no subir topes de nodos (+150 MB por cada 2^20). Revisado el 2026-11-13: `flow` pasó a 4096 y `walk` a 240 porque el límite real de
+pila lo pone `stackLow()` (S21), no el contador; los de nodos/hojas/unroll no cambian. Las cifras de pila de arriba son de antes de ese cambio.
 
 ## Pila (S21, cierra A8)
 - `vpir::StackGuard` (`ir/include/vpir/stack.h`, `ir/src/builder.cpp`): al entrar en `spirv::lower` y `vpgcn::lift` lee el tamaño real de la pila del hilo
@@ -108,13 +108,41 @@ por cada 2^20). El límite de `flow` ya no depende de los marcos de cada arquite
   un suelo = fondo de la pila + max(32 KB, 1/4 de lo disponible al entrar). `vpir::stackLow()` (una comparación) se consulta en `Nest` (todas las
   recursiones de `lower.cpp`: flow, resolve, unroll → `LowerError` "nested too deep for the stack of this thread") y en `walk` del lifter (cae al bucle de despacho).
   Los topes de niveles siguen como defensa secundaria. Sin cambio para módulos válidos: 181 tests de shader (goldens MSL/`shaderId` incluidos) en verde.
-- Cifras finales (Release -O2 x86-64, niveles de else-if que bajan con éxito antes de que el suelo o el tope 320 lo impidan): 512 KB = 319 (el tope), 256 KB = 230,
+- Cifras (medidas con el tope 320 de entonces; ya no hay tope bajo: ahora manda el suelo; Release -O2 x86-64, niveles de else-if que bajan con éxito antes de que el suelo o el tope lo impidan): 512 KB = 319 (el tope), 256 KB = 230,
   128 KB = 108, 64 KB = 28; bucles anidados 159 (512 KB) y 21 (64 KB). ASan -O1: 82 niveles a 512 KB; a 64 KB ni un shader trivial (error limpio, no SIGSEGV).
-  Un hilo de 512 KB llega, pues, al tope de 320 niveles; uno más pequeño recibe el error por pila en vez de caer.
+  Un hilo más pequeño recibe el error por pila en vez de caer. Con el tope actual (4096) un hilo de 512 KB queda limitado por el suelo (no re-medido).
 - Tests: `gpu_spirv.stack_limit` (escalera de 400 else-if en hilos de 512 KB y 64 KB: error con mensaje, sin SIGSEGV, bajo ASan; 300 niveles en 64 KB: error "stack";
   300 niveles en el hilo principal: baja bien), `gcn.lift.scale_nested_64k` / `_128k` (150 ifs anidados en hilos de 64/128 KB).
-- No cubierto: `emitMsl`/`verify` también recursan por la profundidad del IR (≤ 320 niveles tras `lower`, ≤ 200 tras el lifter) sin guarda propia; medido
-  en Release con hilo de 512 KB sin fallo (cadena de 600 niveles con `VP_SCALE`). macOS/arm64 sin medir: la guarda mide bytes reales, no depende de ello.
+- No cubierto: `emitMsl`/`verify` también recursan por la profundidad del IR sin guarda en `emitMsl`; `vpir::verify` (`verify.cpp:175`) y `vpir::optimize` (`optimize.cpp:20`)
+  comprueban `stackLow()` y lanzan `std::length_error` ("IR nests too deeply…"; solo `emitMsl` lo captura). Medido con el tope antiguo, Release, hilo de 512 KB, sin fallo. macOS/arm64 sin medir: la guarda mide bytes reales, no depende de ello.
+
+## Preprocesador/parser GLSL (`gpu/gles/glsl/`, auditoría 2026-11-13)
+Topes nuevos, todos con error de log (no caída). Valores leídos en el código:
+| Tope | Valor | Dónde |
+|---|---|---|
+| anidamiento sentencias/expresiones `kMaxNest` | 1200 | `parser.cpp:91` (`NestGuard`; también `vpir::stackLow()`) |
+| cadena de operadores `kMaxChain` | 20000 | `parser.cpp:92` (un eslabón por término; 100000 = 330 MB) |
+| tokens del fuente `kMaxLexTokens` / líneas `kMaxLexNewlines` | 1M / 1M | `pp.cpp:31,34` (`lex`) |
+| fuente `kMaxSourceBytes` | 64 MiB | `pp.cpp:33` |
+| salida del preprocesador `kMaxOutputTokens` | 1M tokens | `pp.cpp:454` |
+| trabajo de expansión `kMaxExpandSteps` | 1M tokens por flush (+4 por token del texto) | `pp.cpp:532` |
+| niveles de expansión anidada `kMaxExpandDepth` | 1000 (más `stackLow()`) | `pp.cpp:548` |
+| token pegado que no es nombre `kMaxPastedToken` | 256 caracteres | `pp.cpp:700` |
+Resto: `##` que no da un token válido = error duro; un nombre pegado a nombre/entero se concatena sin relexar (cadena de N = N, no N²).
+Medido: pico 537 MB → ~250–350 MB y lineal; `##` 5000 en 200 líneas 13,7 s → 0,03 s.
+
+Estado final del preprocesador (`pp.cpp`), para quien lo toque:
+- Llamada a macro de función repartida en líneas: `pending_` crece hasta expandirse; `flushPending(final)` escanea desde `scanned_` (coste N, no N²). Si la
+  expansión acaba en el NOMBRE de una macro de función sin `(`, se retiene solo ese nombre en `pending_` (retención) y lo anterior sale.
+- `(` abierto tras el `)` de una llamada (`A() (1` con `A(p) D`): `parenSusp_`/`parenPos_` marcan los sospechosos; la espera sigue mientras esté abierto.
+- Directiva con llamada abierta: `releaseForDirective()` no expande si hay llamada abierta ni si `confirmed_`; si no, prueba cada `(` sospechoso con una
+  expansión de prueba (se descartan log, `ok_` y `expandOverflow_`) del texto previo; si acaba en nombre de macro de función → `confirmed_`/`confirmedAt_`.
+  `tested_` y `testFrom_` evitan reexpandir (cada token se prueba una vez) y `carry_`/`hasCarry_` guardan el nombre generado, de modo que una cadena de
+  llamadas que se generan unas a otras cuesta su longitud, no su cuadrado. Al cerrar el `(` confirmado, `confirmed_` vuelve a false.
+- Directivas condicionales y `#define`/`#undef` llaman a `releaseForDirective()` (`pp.cpp:883,933`).
+Límites aceptados: `#define`/`#undef` dentro de una llamada abierta se aplican al cerrarla (UB C99 6.10.3p11; gcc usa la definición del punto del nombre: p. ej.
+`F(` / `#undef F` / `1)` da `[1]` en gcc y `F ( 1 )` aquí); macro objeto cuyo cuerpo acaba en `F (` con la llamada partida en varias líneas da «unterminated»
+donde cpp acepta (ya en `main`). Tests en `gpu/gles/tests/{glsl,audit_glsl}_tests.cpp`.
 
 ## Abierto
 - A8 [C] Con shaders reales del visor (UE4/Unity, log `vk.err what=shader`) repetir la tabla de arriba; ninguno estaba disponible aquí.

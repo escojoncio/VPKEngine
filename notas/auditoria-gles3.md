@@ -27,14 +27,31 @@ Estado: ARREGLADO = cambio aplicado + test; ABIERTO = no tocado (motivo indicado
 - P2 [B] `glsl/parser.cpp:1548` (`conditional`): el operando central de `?:` se analizaba como `assignment_expression`; la gramática (ES 1.00 y 3.00) es `expression`, así que `c ? a, b : d` se rechazaba. Arreglo: `expression()`. Test `sem` (`ternary_comma`; el binario de referencia da "expected ':'").
 - P3 [B] `glsl/link.cpp:474` (antes) y `varyingSlots`: los varyings `struct` se rechazaban con "struct varyings are not supported", aunque ES 3.00 los admite (el parser ya aplica `interfaceTypeOk`). Arreglo: se cuentan las ubicaciones (suma de miembros, matriz = columnas, array = elementos), y la comparación de tipos entre etapas usa `sameType` (estructural; `Type::operator==` compara la identidad del struct, así que un mismo struct declarado en las dos etapas daba "different types"). El lowering ya recorre los miembros con ubicaciones consecutivas. Test `iface` (ubicaciones 0..5 y miembros planos `flat`).
 - P4 [C] `src/formats.cpp` (`convertUpload` RGBA/UNSIGNED_BYTE a RGBA4 y RGB/UNSIGNED_BYTE a RGB565, y lectura de RGB565): truncaban (`>> 4`, `>> 3`, `>> 2`, `* 255 / 31`) en vez de redondear al más próximo (ES 3.0 §2.1.6.1/§3.8.2: conversión unorm). RGB5_A1 ya redondeaba. Arreglo: `(v * max + 127) / 255` y `(x * 255 + max/2) / max`. Test `audit_formats` (`testPackedRounding`: fallan 4 comprobaciones con el código anterior).
-- P5 [B] `src/xfb.cpp:32` `xfbAssemble`: el orden de captura de `TRIANGLE_FAN` era (v0, vi, vi+1); el orden de vértices de primitiva de GL/Vulkan es (vi, vi+1, v0) (el de `TRIANGLE_STRIP`, ya implementado, es el de la misma definición). Arreglo: `{s[i], s[i+1], s[0]}`. Test `audit_formats` (fallan 2 comprobaciones con el anterior). DUDA: sin texto de la especificación a mano; el orden sale de la definición de Vulkan; si el de GL difiriese, hay que invertir una línea y el test.
+- P5 [B] `src/xfb.cpp:32` `xfbAssemble`/`assembleSequence`: el orden de captura de `TRIANGLE_FAN` era (v0, vi, vi+1); se cambió a (vi, vi+1, v0) y después se REVIRTIÓ: el código actual (`xfb.cpp`) conserva el orden original `{s[0], s[i], s[i+1]}` (el de GL: el vértice provocador, el último, va el último; el de Vulkan con primer vértice provocador no es el de GL). Sin verificar contra dEQP/CTS (sus fuentes no están en el árbol). Test `audit_formats` (línea 265) comprueba ese orden.
 - P6 [C] `src/vk.cpp:20` `loadDevice`: ahora con test por inyección de cargador (`vpgles_audit_vk_tests`, falso `vkGetInstanceProcAddr`): sin `loadInstance` previa el código anterior da SIGSEGV; con él devuelve false. También comprueba que los dos hooks `vpvk_*` son opcionales y que un `vkCmd*` ausente hace fallar la carga.
 - P7 [C] `shader/spirv/src/lower.cpp:4183` análisis de rango de `round`: usaba `std::round` (empates hacia fuera) aunque `Round` se baja a `rint` (empates al par), con rangos del tipo [2.5, x] que excluían el 2 real. Arreglo: `nearbyint`. Sin test propio (sólo cambia una cota).
 - `round()` con empates: sin fallo. ES 3.00 §8.3 deja libre la dirección; el backend usa `rint` (par) tanto para `round` como para `roundEven`, lo que es conforme. Test `sem` (`round_ties`: `roundEven` exacto, `round` en {suelo, techo}).
 
 ## Abiertos
-- Ninguno de los de la primera pasada queda abierto. Límite: el orden de la captura del fan (P5) no tiene verificación contra el texto de GL, y el `[[point_coord]]` sólo está comprobado como texto MSL (no hay Metal en Linux).
+- Ninguno de los de la primera pasada queda abierto. Límite: el orden de captura del fan (P5) no tiene verificación contra el texto de GL ni dEQP (conserva el original), y el `[[point_coord]]` sólo está comprobado como texto MSL (no hay Metal en Linux).
 - Limpio: `types.cpp` (std140/std430), `builtins.cpp` (sobrecargas y tipos), `link.cpp` fuera de G4/G5/P3.
+
+## Estado final 2026-11-13: PS4 (`gpu/ps4/src/renderer.cpp`), límites aceptados
+Otro lote de la auditoría, anotado aquí por ser el límite de la zona GPU no-Vulkan. Solo Linux con backend nulo; nada en Metal real ni visionOS.
+- V# nulo, sin `num_records`, o fuera de memoria de guest: rango de tamaño 0 (`ResourceRange::bytes(dummy.id, 0, 0)`) para un `Buffer`; los shaders se emiten con
+  `eo.robustBuffers = true` (`renderer.cpp:631`): todo acceso se compara con el tamaño del rango, lecturas = 0, stores/atómicos descartados (sea RW, R o W). Ya no hay
+  buffer `sink`, ni bloques de ceros por anillo, ni tope de 32 (`renderer.cpp:1128-1134`). Un CB nulo o vacío se enlaza al bloque de ceros entero (`kDummyBytes`, 64 KiB).
+  Se apoya en que metal2 rellena `BufferSize` por binding: no verificado en Metal real.
+- `eo.robustPerWord = true` no tiene efecto hoy: el lifter GCN emite dwords sueltos, cada uno guardado (test `vpps4.robust_word`). Solo protegería a un lifter futuro con accesos vectoriales.
+- Desviación aceptada (stride != 0, sin medir en hardware): el rango es `stride * num_records` bytes y el shader compara bytes, mientras GCN compara el índice de registro; solo
+  difiere para un elemento cuyo offset+tamaño excede el stride en el último registro (se lee 0 más allá). Arreglarlo exigiría la comprobación de índice en el código levantado.
+- Evicción de targets: solo si el host llama a `Renderer::colorTargetAt/colorTargetSlice` (cuentan los flips); se liberan tras `kEvictIdleFlips` = 1200 flips sin uso cuando la
+  dirección ya tiene otra superficie, y por presupuesto (`Hooks::targetBudgetBytes`, 0 = `kDefaultTargetBudget` 2 GiB, sin verificar en visionOS); nunca los últimos `kPresentedKept` = 8 presentados.
+## Estado final 2026-11-13: GLES (`gpu/gles/src`)
+- `glBufferSubData` parcial ≥ 4 MiB = copia GPU ordenada en trozos ≤ `kOrderedPiece` (1 MiB, `context.h:704`); corte de pase solo si el pase abierto lee el rango (`BufferStorage::readsRange`, `device.cpp:742`).
+  8 MiB enteros enlazados = 65 pases (aceptado). El backend nulo no valida los bytes de las copias ordenadas.
+- `vpgles_shutdown` no espera presents en vuelo: el device se destruye cuando vuelve el último callback (`finalPending`, `device.cpp:142-163`); `eglInitialize`/creación/`MakeCurrent` tras
+  shutdown → `EGL_NOT_INITIALIZED`; `eglSwapBuffers` puede devolver `EGL_BAD_ALLOC`. `gl_PointCoord` invertido en Y para el emisor GLSL (P1).
 
 ## Verificación ejecutada
 - Binario de referencia (fuentes con mis cambios revertidos): `sem` falla 4 casos, `pp` falla y luego SIGFPE, `link` falla 4 comprobaciones.

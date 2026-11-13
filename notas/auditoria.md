@@ -1,7 +1,8 @@
 # Auditoría de gestión de recursos (2026-11-11, sobre main 4593325)
 
-Estado: **detenida a medias. Ningún arreglo aplicado.** Hechos: pasada con herramientas y lotes 1-3.
-Sin auditar: lote 4 `gpu/shader`; lote 5 `runtime` + `tools` + `platform/visionos` + `apps`.
+Estado (2026-11-13): **CERRADA. Todos los hallazgos de abajo (gravedad A, rendimiento y el resto) están ARREGLADOS** (ver «Estado de los arreglos»); los lotes
+4 y 5 (`gpu/shader`, `runtime`, `tools`, `platform`) se auditaron después (`auditoria-shader.md`, `auditoria-runtime.md`, `auditoria-misc.md`, `auditoria-x86.md`).
+El texto de cada hallazgo es el original de la primera pasada (11-11), no se ha reescrito.
 Todo se ejecutó en Linux con el backend nulo; los `.mm` de Metal están razonados, no ejecutados.
 Repros y benchmarks: no están en el repo (sólo locales); cada hallazgo describe el escenario para reescribirlos como test.
 Gravedad: A = caída, corrupción, carrera o fuga que crece; B = desperdicio real por frame, fuga
@@ -91,8 +92,30 @@ acotada o UB que hoy funciona; C = menor. "Linux" = comprobable con el backend n
 - P6 [C] `renderer.cpp:1044`: memset de 64 KiB por cada enlace de un V# nulo.
 - Dudosos: `BufferStorage::lastUse` global con `used_` por contexto; XFB crea un buffer scratch y corta el pase por draw; `share->labels` sin borrar; `vpgles_wrap_image_as` sin `keep()`; anillo PS4 reutilizado por cuenta y no por compleción.
 
+## Estado de los arreglos (2026-11-13)
+Ciclo por zona: corrige Sonnet, revisor nuevo hasta una ronda sin bloqueantes ni importantes. Probado solo en Linux con backend nulo; nada en visor ni macOS.
+- ARREGLADO T1 (`pending.cpp:164`, `unlock` solo si `owns_lock()`), T2/T3 (validación en `image.cpp` y `vp_loader.c`, ver `auditoria-runtime.md`), T4 (`frame_` atómico,
+  `device.h:86`), T5/T6 (cambian la salida de `vpaot`), T7 (`precompile.cpp:61`, `w.data() + i + 1`).
+- ARREGLADO Metal: C1 (trim exige `streak >= 1`), C6 (`waitForeground()` antes de `orderMutex`, `DeferredCommits`), C9 (pipelines internos en `warmQueue`), C15 (`CompletionFrontier`);
+  C2-C5, C7, C8, C10-C14, C16-C18 también (ver bitácora, «Riesgos de los arreglos»). Los `.mm` nunca se han compilado.
+- ARREGLADO Vulkan: V1-V4 (A), V5 (`RELEASE_RESOURCES` con histéresis: `kReleaseFrames` = 8, `commands.h:479`), V6-V21 (V7: `awaitFreshVariants` espera un solo presupuesto, `VPVK_PIPELINE_DRAW_WAIT_MS`).
+- ARREGLADO GLES: G1 (`Device::retire`, `device.cpp:256`: un error negativo como `VK_ERROR_DEVICE_LOST` cuenta como completado), G2, G3 (`glBeginQuery` ya no corta el pase), G4, G6-G10
+  (G7: `drawElements` con índice en sitio sin copia; G10: `glBufferSubData` parcial = copia GPU ordenada, `kOrderedPiece`, `BufferStorage::readsRange`), G11-G17, G14 (`eglTerminate` libera con el último).
+- ARREGLADO G18 (compilador sin límites): topes de preprocesador y parser con error en vez de SIGSEGV (`parser.cpp` `kMaxNest` 1200 / `kMaxChain` 20000; `pp.cpp` tokens,
+  fuente, salida, expansión, token pegado); valores y estado final del preprocesador en `auditoria-shader.md`, sección «Preprocesador/parser GLSL».
+- ARREGLADO PS4: P1 (evicción de targets: `Hooks::targetBudgetBytes`, `enforceTargetBudget`, `renderer.cpp`; solo si el host llama a `colorTargetAt/Slice`), P2-P6 (ver `auditoria-gles3.md`
+  para P5/robustBuffers).
+- Dudosos de cada lote: los que se confirmaron se arreglaron; los demás no se tocaron (sin evidencia).
+
 ## Cómo seguir
-1. Arreglar primero lo demostrado en Linux, con test que falle antes: T1, T2, T3, T4, T7, C2, V1, V2, V5, V8, G2, G16.
+La auditoría está cerrada: no queda nada abierto de esta lista. Quedan solo los «Menores aceptados» de `bitacora.md`:
+- pp: macro objeto cuyo cuerpo acaba en `F (` con la llamada partida en líneas da «unterminated» (cpp acepta; ya en `main`); `#define`/`#undef` dentro de una llamada abierta se aplica al
+  cerrarla (UB C99 6.10.3p11, difiere de gcc); lexer de CI con falsos negativos exóticos.
+- GLES: 8 MiB enteros enlazados = 65 pases (aceptado, igual que ANGLE); el backend nulo no valida los bytes de las copias ordenadas.
+- Tests intermitentes previos: `gpu_spirv.malformed` bajo TSan (tiempo), `copyhoistscale`, `host_races`.
+- Sin compilar/probar nunca: todos los `.mm`, Swift, `tools/vpconvert`, rama APPLE de `gpu/vulkan/CMakeLists.txt`, `robust_vec.metal`, workflows. Sin medir en visor: latencia Vulkan,
+  robustBuffers en Metal real, evicción PS4 en visionOS. Primer paso: el primer `[build]` en CI macOS.
+Antiguo plan (histórico):1. Arreglar primero lo demostrado en Linux, con test que falle antes: T1, T2, T3, T4, T7, C2, V1, V2, V5, V8, G2, G16.
 2. Rendimiento medido: C3, C4 (core); G3, G4, G6, G7, G8 (GLES); V10, V11 (Vulkan).
 3. Metal (solo compila en CI de macOS, validar en visor): C1, C7, C8 son cambios de pocas líneas.
 4. T5/T6 cambian la salida de `vpaot`: implican recompilar las traducciones.
